@@ -4195,6 +4195,125 @@ mod consensus_rule_tests {
         Ok((block, plan, utxo))
     }
 
+    /// Builds a block whose single non-coinbase tx spends a P2SH-template output with a
+    /// scriptSig that is VALID as a bare script but INVALID as P2SH.
+    ///
+    /// redeemScript = `OP_0` (single byte `0x00`), which executes to FALSE.
+    /// - prevout scriptPubKey = `OP_HASH160 <hash160(redeem)> OP_EQUAL` (P2SH template).
+    /// - scriptSig = push-only, pushing the redeem bytes `[0x00]` as the only item.
+    ///
+    /// BARE eval (P2SH OFF): scriptSig pushes `[0x00]`; scriptPubKey HASH160s it to `h`,
+    /// pushes `h`, OP_EQUAL -> TRUE. ACCEPTED.
+    /// P2SH eval (P2SH ON): the last scriptSig push `[0x00]` is deserialized as the
+    /// redeemScript `OP_0`, run with an empty stack -> pushes FALSE -> FAIL at input 0.
+    ///
+    /// Gated to a real script backend: the acceptance arm asserts `Ok`, which only
+    /// holds when scripts actually execute. With no backend the verifier returns a
+    /// `Script { .. "backend disabled" }` error, so the helper would be dead code.
+    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    fn p2sh_template_bare_spend_block()
+    -> Result<(bitcoin::Block, BlockTxPlan, Arc<UtxoSet>), Box<dyn std::error::Error>> {
+        use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
+        use bitcoin::script::Builder;
+
+        let redeem: [u8; 1] = [0x00];
+        let h = bitcoin::hashes::hash160::Hash::hash(&redeem);
+
+        let base_prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x67; 32]),
+            vout: 0,
+        };
+        let utxo = Arc::new(UtxoSet::new());
+        let mut changes = BlockChanges::default();
+        let txid = Hash256::from_le_bytes(base_prevout.txid.as_byte_array());
+        changes.add(UtxoAdd::new(
+            OutPoint::new(txid, base_prevout.vout),
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: Builder::new()
+                    .push_opcode(OP_HASH160)
+                    .push_slice(h.to_byte_array())
+                    .push_opcode(OP_EQUAL)
+                    .into_script(),
+            },
+            false,
+            1,
+        ));
+        utxo.commit_block(&changes, &Hash256::from_le_bytes(&[10; 32]))?;
+
+        let spend = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: base_prevout,
+                script_sig: Builder::new().push_slice(redeem).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true_script(),
+            }],
+        };
+        let block = block_with_transaction(spend);
+        let plan = tx_plan(&block);
+        Ok((block, plan, utxo))
+    }
+
+    // Asserts acceptance under the BIP16 exception, which needs a real script backend
+    // (the backend-less default build returns a "backend disabled" Script error).
+    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[test]
+    fn bip16_exception_accepts_bare_p2sh_template_spend_that_normal_p2sh_rejects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Build the exception-block hash via bitcoin's own parser (same independent path
+        // the network.rs orientation-lock test uses), and a non-exception sibling hash.
+        let exception_hash = Hash256::from_le_bytes(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+                .parse::<bitcoin::BlockHash>()?
+                .as_byte_array(),
+        );
+        let normal_hash = Hash256::from_le_bytes(&[0x11; 32]); // any non-exception block
+
+        // csv + segwit inactive: height 170060 predates both softforks.
+        let softforks = crate::bip9_context::ContextualSoftforkState {
+            csv_active: false,
+            segwit_active: false,
+        };
+
+        // At height 170060 the only height-gated flag is P2SH, so:
+        //   exception block -> compute_verify_flags drops P2SH
+        //   normal block    -> compute_verify_flags carries P2SH
+        let exc_flags = compute_verify_flags(Network::Mainnet, 170_060, exception_hash, softforks);
+        let normal_flags = compute_verify_flags(Network::Mainnet, 170_060, normal_hash, softforks);
+        assert!(!exc_flags.contains(bitcoin_rs_script::VerifyFlags::P2SH));
+        assert!(normal_flags.contains(bitcoin_rs_script::VerifyFlags::P2SH));
+
+        // Exception block: bare-valid P2SH-template spend is ACCEPTED.
+        let (block, plan, utxo) = p2sh_template_bare_spend_block()?;
+        let handles = apply_handles_with_assume_valid(utxo, 0); // full verification
+        verify_block_transactions(&handles, &block, &plan, 170_060, 0, exc_flags)?;
+
+        // Normal block at the same height: P2SH enforced -> REJECTED at input 0.
+        let (block2, plan2, utxo2) = p2sh_template_bare_spend_block()?;
+        let handles2 = apply_handles_with_assume_valid(utxo2, 0);
+        let err =
+            match verify_block_transactions(&handles2, &block2, &plan2, 170_060, 0, normal_flags) {
+                Ok(()) => {
+                    panic!("normal P2SH enforcement must reject the bare-script redeem spend")
+                }
+                Err(e) => e,
+            };
+        assert!(matches!(
+            err,
+            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
+                input_index: 0,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
     fn excess_value_spend_block()
     -> Result<(bitcoin::Block, BlockTxPlan, Arc<UtxoSet>), Box<dyn std::error::Error>> {
         // `utxo_with_output` funds the prevout with 1_000 sats (its second arg `1` is
