@@ -302,7 +302,7 @@ fn apply_block_inner(
     pow_limit_result?;
 
     let script_verify_started = quanta::Instant::now();
-    let verify_flags = compute_verify_flags(handles.network, height, softfork_state);
+    let verify_flags = compute_verify_flags(handles.network, height, block_hash, softfork_state);
     let script_verify_result = verify_block_transactions(
         handles,
         block,
@@ -1495,12 +1495,17 @@ fn applied_block_record(
 fn compute_verify_flags(
     network: Network,
     height: u32,
+    block_hash: Hash256,
     softfork_state: crate::bip9_context::ContextualSoftforkState,
 ) -> bitcoin_rs_script::VerifyFlags {
     use bitcoin_rs_script::VerifyFlags;
 
-    // P2SH (BIP16) is effectively always-on for supported validation paths.
-    let mut flags = VerifyFlags::P2SH;
+    // P2SH (BIP16) is enforced on every block except Core's single grandfathered
+    // `consensus.BIP16Exception` (mainnet block 170060), keyed by block hash.
+    let mut flags = VerifyFlags::NONE;
+    if !network.is_bip16_p2sh_exception(block_hash) {
+        flags = flags.union(VerifyFlags::P2SH);
+    }
     if network.is_bip66_active(height) {
         flags = flags.union(VerifyFlags::DERSIG);
     }
@@ -4536,15 +4541,49 @@ mod contextual_softfork_tests {
             segwit_active: true,
         };
 
-        let inactive_flags = compute_verify_flags(Network::Mainnet, 481_824, inactive);
+        let non_exception = Hash256::from_le_bytes(&[0u8; 32]);
+        let inactive_flags =
+            compute_verify_flags(Network::Mainnet, 481_824, non_exception, inactive);
         assert!(!inactive_flags.contains(VerifyFlags::CHECKSEQUENCEVERIFY));
         assert!(!inactive_flags.contains(VerifyFlags::WITNESS));
         assert!(!inactive_flags.contains(VerifyFlags::NULLDUMMY));
 
-        let active_flags = compute_verify_flags(Network::Mainnet, 1, active);
+        let active_flags = compute_verify_flags(Network::Mainnet, 1, non_exception, active);
         assert!(active_flags.contains(VerifyFlags::CHECKSEQUENCEVERIFY));
         assert!(active_flags.contains(VerifyFlags::WITNESS));
         assert!(active_flags.contains(VerifyFlags::NULLDUMMY));
+    }
+
+    #[test]
+    fn compute_verify_flags_drops_p2sh_only_for_bip16_exception_block()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::hashes::Hash as _;
+
+        let state = crate::bip9_context::ContextualSoftforkState {
+            csv_active: false,
+            segwit_active: false,
+        };
+
+        // Build the exception hash via bitcoin's own parser through the same byte path
+        // the call site uses, so the orientation can't silently drift.
+        let exception_display = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22";
+        let exception_hash = Hash256::from_le_bytes(
+            exception_display
+                .parse::<bitcoin::BlockHash>()?
+                .as_byte_array(),
+        );
+
+        // Core exempts exactly this block (its height) from P2SH; flags must not carry P2SH.
+        let exception_flags =
+            compute_verify_flags(Network::Mainnet, 170_060, exception_hash, state);
+        assert!(!exception_flags.contains(VerifyFlags::P2SH));
+
+        // Any other block at the same height still enforces P2SH.
+        let other_hash = Hash256::from_le_bytes(&[0u8; 32]);
+        let other_flags = compute_verify_flags(Network::Mainnet, 170_060, other_hash, state);
+        assert!(other_flags.contains(VerifyFlags::P2SH));
+
+        Ok(())
     }
 }
 #[cfg(test)]

@@ -2,6 +2,15 @@ use ruint::Uint;
 
 use crate::Hash256;
 
+/// Bitcoin Core's mainnet `consensus.BIP16Exception` — block 170060, whose display
+/// hash is `00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22`. Stored
+/// in consensus little-endian (display hex reversed byte-wise) so it compares directly
+/// against `Hash256::from_le_bytes(block.block_hash().as_byte_array())` at the call site.
+const BIP16_EXCEPTION_MAINNET: Hash256 = Hash256::from_le_bytes(&[
+    0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94, 0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc, 0x30, 0x8d,
+    0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
 /// A supported Bitcoin network.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -148,6 +157,16 @@ impl Network {
         height >= activation
     }
 
+    /// Returns `true` when `block_hash` is the single block Bitcoin Core grandfathers
+    /// from P2SH (BIP16) enforcement — its `consensus.BIP16Exception`. On mainnet this
+    /// is block 170060, which contains a P2SH-template spend invalid under P2SH rules
+    /// but valid under the rules in force at activation. Only mainnet has such a block;
+    /// all other networks return `false`.
+    #[must_use]
+    pub fn is_bip16_p2sh_exception(self, block_hash: Hash256) -> bool {
+        matches!(self, Self::Mainnet) && block_hash == BIP16_EXCEPTION_MAINNET
+    }
+
     /// Returns the default JSON-RPC port used by Bitcoin Core.
     #[must_use]
     pub const fn default_rpc_port(self) -> u16 {
@@ -285,6 +304,31 @@ impl Network {
 mod tests {
     use super::Network;
     use crate::Hash256;
+
+    #[test]
+    fn bip16_p2sh_exception_matches_core_block_170060() -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::hashes::Hash as _;
+
+        // Parse Core's BIP16Exception via bitcoin's own type (it handles the reversed
+        // display convention), then convert through the SAME path the call site uses
+        // (`Hash256::from_le_bytes(block.block_hash().as_byte_array())`). This locks the
+        // byte orientation against bitcoin's parser so the constant can't silently drift.
+        let display = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22";
+        let exception =
+            Hash256::from_le_bytes(display.parse::<bitcoin::BlockHash>()?.as_byte_array());
+
+        assert!(Network::Mainnet.is_bip16_p2sh_exception(exception));
+
+        // Only mainnet has this grandfathered block.
+        assert!(!Network::Testnet3.is_bip16_p2sh_exception(exception));
+        assert!(!Network::Regtest.is_bip16_p2sh_exception(exception));
+
+        // A different hash is not the exception, even on mainnet.
+        assert!(!Network::Mainnet.is_bip16_p2sh_exception(Network::Mainnet.genesis_block_hash()));
+        assert!(!Network::Mainnet.is_bip16_p2sh_exception(Hash256::from_le_bytes(&[0u8; 32])));
+
+        Ok(())
+    }
 
     #[test]
     fn mainnet_constants_match_core_chainparams() -> Result<(), crate::HashError> {
