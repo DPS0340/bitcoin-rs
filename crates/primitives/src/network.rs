@@ -11,6 +11,15 @@ const BIP16_EXCEPTION_MAINNET: Hash256 = Hash256::from_le_bytes(&[
     0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ]);
 
+/// Bitcoin Core's testnet3 `consensus.BIP16Exception` — block 394, whose display
+/// hash is `00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105`. Stored
+/// in consensus little-endian (display hex reversed byte-wise) so it compares directly
+/// against `Hash256::from_le_bytes(block.block_hash().as_byte_array())` at the call site.
+const BIP16_EXCEPTION_TESTNET3: Hash256 = Hash256::from_le_bytes(&[
+    0x05, 0xb1, 0x32, 0xa4, 0xf7, 0x4a, 0x87, 0x99, 0xa5, 0x7a, 0x42, 0x02, 0xd0, 0xee, 0xb0, 0x96,
+    0x12, 0xcc, 0x08, 0xd2, 0x95, 0x40, 0x1f, 0x00, 0x7c, 0x45, 0x30, 0xdd, 0x00, 0x00, 0x00, 0x00,
+]);
+
 /// A supported Bitcoin network.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -157,14 +166,18 @@ impl Network {
         height >= activation
     }
 
-    /// Returns `true` when `block_hash` is the single block Bitcoin Core grandfathers
-    /// from P2SH (BIP16) enforcement — its `consensus.BIP16Exception`. On mainnet this
-    /// is block 170060, which contains a P2SH-template spend invalid under P2SH rules
-    /// but valid under the rules in force at activation. Only mainnet has such a block;
-    /// all other networks return `false`.
+    /// Returns `true` when `block_hash` is a block Bitcoin Core grandfathers from P2SH
+    /// (BIP16) enforcement — its `consensus.BIP16Exception`. On mainnet this is block
+    /// 170060; on testnet3 it is block 394. Each contains a P2SH-template spend invalid
+    /// under P2SH rules but valid under the rules in force at activation. Only mainnet
+    /// and testnet3 have such a block; all other networks return `false`.
     #[must_use]
     pub fn is_bip16_p2sh_exception(self, block_hash: Hash256) -> bool {
-        matches!(self, Self::Mainnet) && block_hash == BIP16_EXCEPTION_MAINNET
+        match self {
+            Self::Mainnet => block_hash == BIP16_EXCEPTION_MAINNET,
+            Self::Testnet3 => block_hash == BIP16_EXCEPTION_TESTNET3,
+            _ => false,
+        }
     }
 
     /// Returns the default JSON-RPC port used by Bitcoin Core.
@@ -326,6 +339,41 @@ mod tests {
         // A different hash is not the exception, even on mainnet.
         assert!(!Network::Mainnet.is_bip16_p2sh_exception(Network::Mainnet.genesis_block_hash()));
         assert!(!Network::Mainnet.is_bip16_p2sh_exception(Hash256::from_le_bytes(&[0u8; 32])));
+
+        Ok(())
+    }
+
+    #[test]
+    fn bip16_p2sh_exception_matches_core_testnet3_block_394()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::hashes::Hash as _;
+
+        // Parse Core's testnet3 BIP16Exception via bitcoin's own type (it handles the
+        // reversed display convention), then convert through the SAME path the call site
+        // uses (`Hash256::from_le_bytes(block.block_hash().as_byte_array())`). This locks
+        // the byte orientation against bitcoin's parser so the constant can't silently
+        // drift.
+        let display = "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105";
+        let exception =
+            Hash256::from_le_bytes(display.parse::<bitcoin::BlockHash>()?.as_byte_array());
+
+        assert!(Network::Testnet3.is_bip16_p2sh_exception(exception));
+
+        // The testnet3 grandfathered block is not the mainnet exception, and other
+        // networks have no such block.
+        assert!(!Network::Mainnet.is_bip16_p2sh_exception(exception));
+        assert!(!Network::Testnet4.is_bip16_p2sh_exception(exception));
+        assert!(!Network::Regtest.is_bip16_p2sh_exception(exception));
+
+        // Cross-network isolation: the mainnet 170060 exception hash must NOT be excepted
+        // on testnet3.
+        let mainnet_display = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22";
+        let mainnet_exception = Hash256::from_le_bytes(
+            mainnet_display
+                .parse::<bitcoin::BlockHash>()?
+                .as_byte_array(),
+        );
+        assert!(!Network::Testnet3.is_bip16_p2sh_exception(mainnet_exception));
 
         Ok(())
     }
