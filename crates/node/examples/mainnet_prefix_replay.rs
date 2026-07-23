@@ -42,6 +42,7 @@ fn main() -> Result<()> {
             .context("install metrics recorder")?;
 
     let state = NodeState::open(config).context("open node state")?;
+    let apply_handles = state.apply_handles();
     let mut tx_count = 0_usize;
     let mut block_bytes = 0_usize;
     let mut fetch_time = Duration::ZERO;
@@ -71,8 +72,7 @@ fn main() -> Result<()> {
         decode_time += decode_started.elapsed();
         tx_count = tx_count.saturating_add(block.txdata.len());
         block_bytes = block_bytes.saturating_add(bytes.len());
-        state
-            .apply_block(&block)
+        bitcoin_rs_node::apply::apply_block_with_serialized(&apply_handles, &block, bytes.into())
             .with_context(|| format!("apply block at height {height}"))?;
     }
 
