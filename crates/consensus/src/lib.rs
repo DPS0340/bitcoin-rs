@@ -61,9 +61,9 @@ pub use verify_block::{
     verify_block_rules_contextual,
 };
 pub use verify_tx::{
-    is_final_tx, verify_coinbase_script_sig_size, verify_transaction, verify_transaction_borrowed,
-    verify_transaction_borrowed_non_script_with_mtp, verify_transaction_borrowed_with_mtp,
-    verify_transaction_with_mtp,
+    is_final_tx, verify_block_input_scripts, verify_coinbase_script_sig_size, verify_transaction,
+    verify_transaction_borrowed, verify_transaction_borrowed_non_script_with_mtp,
+    verify_transaction_borrowed_with_mtp, verify_transaction_with_mtp,
 };
 
 use thiserror::Error;
@@ -164,6 +164,14 @@ pub enum ConsensusError {
         bip: &'static str,
         /// Failure reason.
         reason: String,
+    },
+    /// Block-level verification received the wrong number of prevout rows.
+    #[error("block prevout matrix has {actual} rows for {expected} transactions")]
+    PrevoutMatrixSize {
+        /// Number of block transactions that require rows.
+        expected: usize,
+        /// Number of supplied prevout rows.
+        actual: usize,
     },
     /// Kernel path failed or is not configured for the requested operation.
     #[error("kernel validation failed: {0}")]

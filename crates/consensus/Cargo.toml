@@ -30,12 +30,12 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bitcoinkernel = { workspace = true, optional = true }
+rayon.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 anyhow.workspace = true
 hashbrown.workspace = true
-rayon.workspace = true
 
 [[bench]]
 name = "verify_tx"
