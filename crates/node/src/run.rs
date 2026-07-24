@@ -288,6 +288,11 @@ fn spawn_dns_peer_maintenance(
                 let resolver = bitcoin_rs_p2p::SystemDnsResolver::new(p2p_port);
                 let mut failed_backoff: hashbrown::HashMap<SocketAddr, std::time::Instant> =
                     hashbrown::HashMap::new();
+                let mut selection_cursor = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| {
+                        usize::try_from(duration.as_nanos()).unwrap_or(0)
+                    });
 
                 // Initial bootstrap: queue up to P2P_OUTBOUND_PEER_TARGET addresses immediately.
                 let queued = drain_dns_peer_deficit(
@@ -296,8 +301,10 @@ fn spawn_dns_peer_maintenance(
                     &peer_outbound,
                     &outbound_tx,
                     &mut failed_backoff,
+                    selection_cursor,
                     P2P_OUTBOUND_PEER_TARGET,
                 );
+                selection_cursor = selection_cursor.wrapping_add(1);
                 tracing::info!(queued, "dns peer bootstrap queued initial addresses");
 
                 while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -317,8 +324,10 @@ fn spawn_dns_peer_maintenance(
                         &peer_outbound,
                         &outbound_tx,
                         &mut failed_backoff,
+                        selection_cursor,
                         deficit,
                     );
+                    selection_cursor = selection_cursor.wrapping_add(1);
                     if queued > 0 {
                         tracing::info!(
                             live,
@@ -343,6 +352,9 @@ fn spawn_dns_peer_maintenance(
 /// timestamp so they are not re-queued on the next maintenance tick before the dial
 /// attempt completes.
 ///
+/// `selection_cursor` rotates both seed order and each resolved address list so a
+/// fresh process does not repeatedly dial the same cached DNS prefix.
+///
 /// Addresses that cannot be sent because the channel is full are silently skipped — the
 /// caller will retry on the next maintenance tick.  The channel being disconnected is
 /// treated as a transient error and logged; the loop stops.
@@ -354,6 +366,7 @@ fn drain_dns_peer_deficit<R>(
     peer_outbound: &PeerOutboundMap,
     outbound_tx: &crossbeam_channel::Sender<SocketAddr>,
     recently_queued: &mut hashbrown::HashMap<SocketAddr, std::time::Instant>,
+    selection_cursor: usize,
     needed: usize,
 ) -> usize
 where
@@ -372,14 +385,19 @@ where
     let mut queued = 0usize;
     let mut seen: hashbrown::HashSet<SocketAddr> = hashbrown::HashSet::new();
 
-    'outer: for seed in seeds {
-        let addresses = match resolver.resolve(seed) {
-            Ok(a) => a,
+    'outer: for seed_offset in 0..seeds.len() {
+        let seed = seeds[selection_cursor.wrapping_add(seed_offset) % seeds.len()];
+        let mut addresses = match resolver.resolve(seed) {
+            Ok(addresses) => addresses,
             Err(error) => {
                 tracing::warn!(seed = %seed, %error, "dns seed resolution failed");
                 continue;
             }
         };
+        if !addresses.is_empty() {
+            let address_offset = selection_cursor % addresses.len();
+            addresses.rotate_left(address_offset);
+        }
         for addr in addresses {
             if !seen.insert(addr) {
                 continue;
@@ -627,6 +645,22 @@ mod tests {
         }
     }
 
+    struct SeedAwareResolver;
+
+    impl bitcoin_rs_p2p::DnsResolver for SeedAwareResolver {
+        fn resolve(&self, seed: &str) -> Result<Vec<SocketAddr>, bitcoin_rs_p2p::PeerError> {
+            let base: u16 = match seed {
+                "seed-a" => 10_000,
+                "seed-b" => 11_000,
+                "seed-c" => 12_000,
+                _ => return Ok(Vec::new()),
+            };
+            Ok((0..4_u16)
+                .map(|offset| SocketAddr::from(([127, 0, 0, 1], base + offset)))
+                .collect())
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Helper
     // ---------------------------------------------------------------------------
@@ -637,6 +671,29 @@ mod tests {
 
     fn signet_seeds() -> Vec<&'static str> {
         bitcoin_rs_primitives::Network::Signet.dns_seeds().to_vec()
+    }
+
+    #[test]
+    fn selection_cursor_rotates_seed_and_address_prefix() {
+        let peer_outbound = empty_peer_outbound();
+        let (dial_tx, dial_rx) = crossbeam_channel::unbounded();
+        let mut recently_queued = hashbrown::HashMap::new();
+
+        let queued = drain_dns_peer_deficit(
+            &SeedAwareResolver,
+            &["seed-a", "seed-b", "seed-c"],
+            &peer_outbound,
+            &dial_tx,
+            &mut recently_queued,
+            1,
+            2,
+        );
+
+        assert_eq!(queued, 2);
+        assert_eq!(
+            dial_rx.try_iter().collect::<Vec<_>>(),
+            [11_001_u16, 11_002].map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -677,6 +734,7 @@ mod tests {
             &peer_outbound,
             &dial_tx,
             &mut recently_queued,
+            0,
             needed,
         );
 
@@ -712,6 +770,7 @@ mod tests {
             &peer_outbound,
             &dial_tx,
             &mut recently_queued,
+            0,
             1,
         );
         assert_eq!(q1, 1);
@@ -725,6 +784,7 @@ mod tests {
             &peer_outbound,
             &dial_tx,
             &mut recently_queued,
+            0,
             1,
         );
         assert_eq!(q2, 1);
@@ -754,6 +814,7 @@ mod tests {
             &peer_outbound,
             &dial_tx,
             &mut recently_queued,
+            0,
             8,
         );
 
