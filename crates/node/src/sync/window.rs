@@ -150,6 +150,13 @@ enum ColdFrontState {
         hash: Hash256,
     },
 }
+#[derive(Debug)]
+struct PrefixProbe {
+    owner: SocketAddr,
+    hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+    racers: HashMap<SocketAddr, u8>,
+    accepted: u8,
+}
 
 /// Episode age at which the one-shot stall-episode observability INFO line is
 /// emitted. Below the 2s conviction floor by design: the line exists to make
@@ -160,6 +167,12 @@ const STALL_EPISODE_LOG_AGE: Duration = Duration::from_secs(1);
 /// Maximum distinct cold-start front blocks hedged before the cadence EWMA
 /// seeds. Two advances are sufficient to produce the first cadence sample.
 const MAX_COLD_FRONT_HEDGES: usize = 2;
+/// One-shot duplicate prefix used to select a responsive deep-window peer.
+const PREFIX_PROBE_BLOCK_LIMIT: usize = 8;
+/// A peer must deliver the first four accepted prefix blocks to win.
+const PREFIX_PROBE_WIN_BLOCKS: usize = 4;
+/// Estimated duplicate bytes per alternate during the one-shot probe.
+const PREFIX_PROBE_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
 
 /// Stall-episode clearing reasons, the counter taxonomy for
 /// `node.sync.stall_episodes_cleared{reason}`. Every path that zeroes the
@@ -236,6 +249,11 @@ pub(super) struct DownloadWindow {
     /// Peer that proved it could deliver a blocked cold front before its
     /// tracked owner. It receives the replacement deep window.
     preferred_peer: Option<SocketAddr>,
+    /// One-shot same-prefix race used to select a responsive deep owner
+    /// without assigning unique height holes to alternate peers.
+    prefix_probe: Option<PrefixProbe>,
+    /// Deep owner already tested for the current pending assignment.
+    prefix_probe_attempted_owner: Option<SocketAddr>,
     /// First observation of an expired front request. Conviction needs a
     /// second tick so blocks delivered during synchronous apply can drain.
     pending_timeout_observation: Option<PendingTimeoutObservation>,
@@ -275,6 +293,8 @@ impl DownloadWindow {
             cold_front: None,
             cold_hedged_fronts: SmallVec::new(),
             preferred_peer: None,
+            prefix_probe: None,
+            prefix_probe_attempted_owner: None,
             pending_timeout_observation: None,
             recent_stallers: HashMap::new(),
         }
@@ -289,6 +309,9 @@ impl DownloadWindow {
             self.fanout_engaged = true;
         } else if count.saturating_add(1) < self.budget.min_peers_for_fanout {
             self.fanout_engaged = false;
+        }
+        if self.fanout_engaged {
+            self.prefix_probe = None;
         }
     }
 
@@ -810,6 +833,86 @@ impl DownloadWindow {
     pub(super) fn clear_preferred_peer(&mut self) {
         self.preferred_peer = None;
     }
+    /// Builds the one-shot common-prefix probe after a deep fallback request.
+    pub(super) fn prefix_probe_plan(
+        &self,
+    ) -> Option<(
+        SocketAddr,
+        SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+        u32,
+    )> {
+        if self.preferred_peer.is_some() || self.prefix_probe.is_some() || self.fanout_active() {
+            return None;
+        }
+        let owner = self
+            .pending
+            .values()
+            .min_by_key(|pending| pending.height)?
+            .peer_addr;
+        if self.prefix_probe_attempted_owner == Some(owner)
+            || self
+                .pending
+                .values()
+                .any(|pending| pending.peer_addr != owner)
+        {
+            return None;
+        }
+        let limit =
+            (PREFIX_PROBE_ESTIMATED_BYTES / self.ewma_block_bytes).min(PREFIX_PROBE_BLOCK_LIMIT);
+        if limit < PREFIX_PROBE_WIN_BLOCKS {
+            return None;
+        }
+        let mut ordered: Vec<(u32, Hash256)> = self
+            .pending
+            .iter()
+            .map(|(hash, pending)| (pending.height, *hash))
+            .collect();
+        ordered.sort_unstable_by_key(|(height, _)| *height);
+        let mut hashes = SmallVec::new();
+        let mut expected_height = ordered.first()?.0;
+        for (height, hash) in ordered {
+            if hashes.len() >= limit || height != expected_height {
+                break;
+            }
+            hashes.push(hash);
+            expected_height = expected_height.saturating_add(1);
+        }
+        (hashes.len() >= PREFIX_PROBE_WIN_BLOCKS).then_some((
+            owner,
+            hashes,
+            expected_height.saturating_sub(1),
+        ))
+    }
+
+    /// Starts the prefix race after at least one alternate accepted the probe.
+    pub(super) fn confirm_prefix_probe(
+        &mut self,
+        owner: SocketAddr,
+        hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+        alternates: &[SocketAddr],
+    ) {
+        if alternates.is_empty() {
+            return;
+        }
+        let valid_plan =
+            self.prefix_probe_plan()
+                .is_some_and(|(planned_owner, planned_hashes, _)| {
+                    planned_owner == owner && planned_hashes == hashes
+                });
+        self.prefix_probe_attempted_owner = Some(owner);
+        if !valid_plan {
+            return;
+        }
+        let mut racers = HashMap::with_capacity(alternates.len().saturating_add(1));
+        racers.insert(owner, 0);
+        racers.extend(alternates.iter().copied().map(|peer| (peer, 0)));
+        self.prefix_probe = Some(PrefixProbe {
+            owner,
+            hashes,
+            racers,
+            accepted: 0,
+        });
+    }
 
     /// Current adaptive stalling threshold (2s doubling to 64s).
     #[cfg(test)]
@@ -886,6 +989,15 @@ impl DownloadWindow {
         }
         if self.preferred_peer.is_some_and(|peer| !is_live_peer(&peer)) {
             self.preferred_peer = None;
+        }
+        let cancel_probe = if let Some(probe) = self.prefix_probe.as_mut() {
+            probe.racers.retain(|peer, _| is_live_peer(peer));
+            probe.racers.len() < 2
+        } else {
+            false
+        };
+        if cancel_probe {
+            self.prefix_probe = None;
         }
         let mut retry_height = self.next_request_height;
         let mut removed_earliest_deadline = false;
@@ -1107,6 +1219,50 @@ impl DownloadWindow {
         non_empty_request(peer_addr, entries, next_request_height)
     }
 
+    fn record_prefix_probe_delivery(
+        &mut self,
+        hash: Hash256,
+        delivery_peer: Option<SocketAddr>,
+        now: Instant,
+    ) {
+        let Some(mut probe) = self.prefix_probe.take() else {
+            return;
+        };
+        let Some(index) = probe.hashes.iter().position(|candidate| *candidate == hash) else {
+            self.prefix_probe = Some(probe);
+            return;
+        };
+        let Ok(shift) = u32::try_from(index) else {
+            self.prefix_probe = Some(probe);
+            return;
+        };
+        let bit = 1_u8 << shift;
+        probe.accepted |= bit;
+        if let Some(progress) = delivery_peer.and_then(|peer| probe.racers.get_mut(&peer)) {
+            *progress |= bit;
+        }
+        let win_mask = (1_u8 << u32::try_from(PREFIX_PROBE_WIN_BLOCKS).unwrap_or(0)) - 1;
+        let winner = probe
+            .racers
+            .iter()
+            .find_map(|(peer, progress)| ((*progress & win_mask) == win_mask).then_some(*peer));
+        let Some(winner) = winner else {
+            if probe.accepted & win_mask != win_mask {
+                self.prefix_probe = Some(probe);
+            }
+            return;
+        };
+        let owner = probe.owner;
+        self.cold_front = None;
+        self.pending_timeout_observation = None;
+        self.release_disconnected_peers(|peer| *peer == winner);
+        if winner != owner {
+            self.mark_peer_unresponsive(owner, now);
+        }
+        self.preferred_peer = Some(winner);
+        metrics::counter!("node.sync.prefix_probe_wins").increment(1);
+    }
+
     fn resolve_cold_front_delivery(
         &mut self,
         hash: Hash256,
@@ -1137,6 +1293,7 @@ impl DownloadWindow {
                 {
                     self.pending_timeout_observation = None;
                 }
+                self.prefix_probe = None;
                 self.release_disconnected_peers(|peer| *peer != owner);
                 self.mark_peer_unresponsive(owner, now);
                 self.preferred_peer = Some(alternate);
@@ -1147,6 +1304,9 @@ impl DownloadWindow {
     }
 
     pub(super) fn mark_requested(&mut self, request: &PeerRequest, now: Instant) -> bool {
+        if self.pending.is_empty() && !request.entries.is_empty() {
+            self.prefix_probe_attempted_owner = None;
+        }
         let estimated_bytes = self.ewma_block_bytes;
         let inflight = self.peer_inflight.entry(request.peer_addr).or_default();
         for entry in &request.entries {
@@ -1188,6 +1348,7 @@ impl DownloadWindow {
             self.pending_timeout_observation = None;
         }
         self.resolve_cold_front_delivery(hash, delivery_peer, now);
+        self.record_prefix_probe_delivery(hash, delivery_peer, now);
         let (height, needs_height_lookup) = if let Some(pending) = pending {
             if let Some(peer_addr) = delivery_peer {
                 self.record_delivery_progress(peer_addr, hash, pending.height, now);
@@ -3080,6 +3241,113 @@ mod tests {
             window.cold_front,
             Some(super::ColdFrontState::Racing { alternate, .. }) if alternate == peer_addr(2)
         ));
+    }
+
+    #[test]
+    fn mixed_prefix_sources_do_not_elect_a_winner() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let first = healthy_addr();
+        let second = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[first, second]);
+
+        for (byte, source) in [(1_u8, first), (2, second), (3, first), (4, second)] {
+            window.mark_received_from(hash(byte), 80, Some(source), now);
+        }
+
+        assert_eq!(window.preferred_peer(), None);
+        assert!(
+            window.prefix_probe_plan().is_none(),
+            "an inconclusive race must not probe the remaining suffix"
+        );
+        assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fanout_cancels_prefix_probe_without_rearming_it() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let mut window = DownloadWindow::new(SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        });
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, terminal_height) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        assert_eq!(terminal_height, 8);
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate]);
+        assert!(window.prefix_probe.is_some());
+
+        window.set_fanout_eligible_peers(2);
+
+        assert!(window.prefix_probe.is_none());
+        window.set_fanout_eligible_peers(0);
+        assert!(window.prefix_probe_plan().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn disconnected_prefix_racer_queued_deliveries_cannot_win()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let disconnected = healthy_addr();
+        let live_alternate = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[disconnected, live_alternate]);
+        window.release_disconnected_peers(|peer| *peer != disconnected);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(disconnected), now);
+        }
+
+        assert_eq!(window.preferred_peer(), None);
+        assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn late_prefix_loser_cannot_replace_winner() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let winner = healthy_addr();
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        let loser = peer_addr(2);
+        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser]);
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(winner), now);
+        }
+        assert_eq!(window.preferred_peer(), Some(winner));
+        window.mark_received_from(hash(5), 80, Some(owner), now);
+        assert_eq!(window.preferred_peer(), Some(winner));
+        window.release_disconnected_peers(|peer| *peer != winner);
+        assert_eq!(window.preferred_peer(), None);
+        assert!(!window.peer_in_staller_cooldown(loser, now));
+        Ok(())
     }
 
     fn test_budget() -> SyncBudget {

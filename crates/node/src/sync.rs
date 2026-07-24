@@ -158,6 +158,7 @@ struct SyncPeer {
 struct SyncPeerSelection {
     header_peer: Option<SyncPeer>,
     request_peers: Vec<SyncPeer>,
+    probe_peers: Vec<SyncPeer>,
 }
 
 /// A height-eligible sync candidate annotated with its fan-out eligibility
@@ -181,6 +182,31 @@ struct FanoutCandidate {
 fn statically_fanout_eligible(peer: &PeerInfo) -> bool {
     let witness = bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
     !peer.inbound && peer.services & witness != 0
+}
+
+fn configure_request_mode(
+    window: &mut DownloadWindow,
+    candidates: &[FanoutCandidate],
+) -> Option<SyncPeer> {
+    let preferred = window.preferred_peer().and_then(|addr| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.peer.addr == addr && !candidate.soft_blocked)
+            .map(|candidate| candidate.peer)
+    });
+    if preferred.is_some() {
+        window.set_fanout_eligible_peers(0);
+        return preferred;
+    }
+    if window.preferred_peer().is_some() {
+        window.clear_preferred_peer();
+    }
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.fanout_eligible)
+        .count();
+    window.set_fanout_eligible_peers(eligible);
+    None
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -248,6 +274,8 @@ impl BlockSync {
     pub fn tick(&self) {
         self.drain_inbound_headers();
         self.ensure_genesis_tip();
+        // Remove dead racers before queued blocks can affect peer election.
+        self.release_disconnected_peer_budget();
         self.drain_inbound_blocks();
 
         let applied_tip = self.handles.applied_tip.load_full();
@@ -286,6 +314,7 @@ impl BlockSync {
                 break;
             }
         }
+        self.send_prefix_probes(&sync_peer_selection.probe_peers);
         if let Some(peer) = sync_peer_selection.header_peer {
             let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
             if peer_best_height > header_height {
@@ -780,44 +809,27 @@ impl BlockSync {
                     || window.peer_in_staller_cooldown(candidate.peer.addr, now);
                 candidate.fanout_eligible = candidate.fanout_eligible && !candidate.soft_blocked;
             }
-            let cold_preferred = window.preferred_peer().and_then(|addr| {
-                candidates
-                    .iter()
-                    .find(|candidate| candidate.peer.addr == addr && !candidate.soft_blocked)
-                    .map(|candidate| candidate.peer)
-            });
-            if cold_preferred.is_some() {
-                window.set_fanout_eligible_peers(0);
-            } else {
-                if window.preferred_peer().is_some() {
-                    window.clear_preferred_peer();
-                }
-                let eligible = candidates
-                    .iter()
-                    .filter(|candidate| candidate.fanout_eligible)
-                    .count();
-                window.set_fanout_eligible_peers(eligible);
-            }
+            let cold_preferred = configure_request_mode(&mut window, &candidates);
             (
                 window.request_peer_scan_limit(now),
                 window.fanout_active(),
                 cold_preferred,
             )
         };
+        let probe_peers = candidates
+            .iter()
+            .filter(|candidate| candidate.fanout_eligible)
+            .map(|candidate| candidate.peer)
+            .collect();
         let mut request_peers: Vec<SyncPeer> = if let Some(preferred) = cold_preferred {
             alloc::vec![preferred]
         } else if fanout_active {
-            // Fan-out: only eligible peers receive block requests; ineligible
-            // (inbound / non-witness / behind / demoted) peers neither count
-            // toward the threshold nor get getdata.
             candidates
                 .iter()
                 .filter(|candidate| candidate.fanout_eligible)
                 .map(|candidate| candidate.peer)
                 .collect()
         } else if request_peer_limit > 1 {
-            // Fallback, multi-scan: the pre-fan-out shipped behavior — any
-            // candidate may serve (an inbound-only node must still sync).
             candidates.iter().map(|candidate| candidate.peer).collect()
         } else {
             // Fallback, single deep peer: the highest peer that the window
@@ -852,7 +864,52 @@ impl BlockSync {
         SyncPeerSelection {
             header_peer,
             request_peers,
+            probe_peers,
         }
+    }
+
+    /// Sends one estimated-2MiB common-prefix probe to each idle alternate.
+    ///
+    /// Every alternate receives the same earliest hashes, so the probe cannot
+    /// create a unique out-of-order height hole. It runs once per deep owner.
+    fn send_prefix_probes(&self, probe_peers: &[SyncPeer]) {
+        let Some((owner, hashes, required_height)) =
+            self.download_window.lock().prefix_probe_plan()
+        else {
+            return;
+        };
+        let candidates = probe_peers.iter().filter(|peer| {
+            peer.addr != owner
+                && u32::try_from(peer.start_height).is_ok_and(|height| height >= required_height)
+        });
+        let mut successful = SmallVec::<[SocketAddr; 8]>::new();
+        for peer in candidates {
+            let peer_addr = peer.addr;
+            let Some(tx) = self.peer_outbound.read().get(&peer_addr).cloned() else {
+                continue;
+            };
+            let inventory = hashes
+                .iter()
+                .map(|hash| Inventory::WitnessBlock(BlockHash::from_byte_array(hash.to_le_bytes())))
+                .collect();
+            if tx.send(NetworkMessage::GetData(inventory)).is_ok() {
+                successful.push(peer_addr);
+            }
+        }
+        if successful.is_empty() {
+            return;
+        }
+        metrics::counter!("node.sync.prefix_probe_peers")
+            .increment(u64::try_from(successful.len()).unwrap_or(u64::MAX));
+        tracing::info!(
+            owner = %owner,
+            alternates = successful.len(),
+            blocks = hashes.len(),
+            "block sync: started common-prefix peer probe"
+        );
+        self.download_window
+            .lock()
+            .confirm_prefix_probe(owner, hashes, &successful);
     }
 
     fn send_getdata_for_pending_blocks(
@@ -2354,12 +2411,11 @@ mod tests {
         let NetworkMessage::GetData(inventory) = rxs[0].try_recv()? else {
             return Err(std::io::Error::other("expected deep getdata for highest peer").into());
         };
-        // Below the threshold the shipped single-peer behavior holds: the
-        // highest peer fills the entire deep window in one batch (no
-        // under-fill regression).
+        // The tracked window remains single-owner. Idle eligible alternates
+        // receive only the same bounded frontier prefix for the one-shot race.
         assert_eq!(witness_block_inventory(inventory)?, expected);
         for rx in &rxs[1..] {
-            assert!(rx.try_recv().is_err());
+            assert_eq!(witness_block_inventory(next_getdata(rx)?)?, expected[..8]);
         }
         assert_eq!(
             sync.download_window.lock().pending_len(),
@@ -2440,7 +2496,7 @@ mod tests {
             );
         }
         for rx in &rxs[usize::from(!serves_fallback)..] {
-            assert!(rx.try_recv().is_err(), "fallback is single-peer");
+            assert_eq!(witness_block_inventory(next_getdata(rx)?)?, expected[..8]);
         }
         Ok(())
     }
@@ -2498,7 +2554,7 @@ mod tests {
             "demoted peer must receive no new block requests"
         );
         for rx in &rxs[1..] {
-            assert!(rx.try_recv().is_err());
+            assert_eq!(witness_block_inventory(next_getdata(rx)?)?, expected[..8]);
         }
         Ok(())
     }
@@ -2613,10 +2669,10 @@ mod tests {
     #[test]
     fn peer_disconnect_mid_window_requeues_blocks_to_remaining_peers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
-            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         const PEER_COUNT: usize = 9;
         const SELECTED_PEERS: usize = super::PENDING_BUDGET / super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+            sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
         let mut rxs = Vec::new();
         let mut addrs = Vec::new();
         // Nine eligible peers leave one beyond the eight-peer scan width at
@@ -2856,16 +2912,9 @@ mod tests {
     }
 
     #[test]
-    fn alternate_front_winner_takes_over_deep_window() -> Result<(), Box<dyn std::error::Error>> {
+    fn common_prefix_winner_takes_over_deep_window() -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, _applied_tip, blocks, blocks_tx) =
             sync_with_mined_chain(16)?;
-        install_budget(
-            &sync,
-            super::SyncBudget {
-                stall_timeout_initial: Duration::from_millis(100),
-                ..super::default_sync_budget()
-            },
-        );
         let owner = test_addr(9321, 0)?;
         let alternate = test_addr(9321, 1)?;
         let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner, 200));
@@ -2879,17 +2928,19 @@ mod tests {
                 .map(bitcoin::Block::block_hash)
                 .collect::<Vec<_>>()
         );
-        sync.tick();
-        std::thread::sleep(Duration::from_millis(150));
-        sync.tick();
         assert_eq!(
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
-            alloc::vec![blocks[0].block_hash()]
+            blocks[..8]
+                .iter()
+                .map(bitcoin::Block::block_hash)
+                .collect::<Vec<_>>()
         );
 
-        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source_peer = Some(alternate);
-        blocks_tx.send(inbound)?;
+        for block in &blocks[..4] {
+            let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
+            inbound.source_peer = Some(alternate);
+            blocks_tx.send(inbound)?;
+        }
         sync.tick();
 
         assert_eq!(
@@ -2903,7 +2954,7 @@ mod tests {
         );
         assert_eq!(
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
-            blocks[1..]
+            blocks[4..]
                 .iter()
                 .map(bitcoin::Block::block_hash)
                 .collect::<Vec<_>>()
