@@ -137,6 +137,19 @@ struct StallEpisode {
     /// [`STALL_EPISODE_LOG_AGE`]; see [`DownloadWindow::observe_stall`]).
     info_logged: bool,
 }
+#[derive(Clone, Copy, Debug)]
+enum ColdFrontState {
+    Waiting {
+        owner: SocketAddr,
+        hash: Hash256,
+        since: Instant,
+    },
+    Racing {
+        owner: SocketAddr,
+        alternate: SocketAddr,
+        hash: Hash256,
+    },
+}
 
 /// Episode age at which the one-shot stall-episode observability INFO line is
 /// emitted. Below the 2s conviction floor by design: the line exists to make
@@ -144,6 +157,9 @@ struct StallEpisode {
 /// clearing rule zeroed the clock, and what the front-cadence EWMA (the
 /// threshold's falsifier) was while the episode ran.
 const STALL_EPISODE_LOG_AGE: Duration = Duration::from_secs(1);
+/// Maximum distinct cold-start front blocks hedged before the cadence EWMA
+/// seeds. Two advances are sufficient to produce the first cadence sample.
+const MAX_COLD_FRONT_HEDGES: usize = 2;
 
 /// Stall-episode clearing reasons, the counter taxonomy for
 /// `node.sync.stall_episodes_cleared{reason}`. Every path that zeroes the
@@ -171,12 +187,10 @@ pub(super) struct DownloadWindow {
     ewma_block_bytes: usize,
     next_request_height: u32,
     next_pending_deadline: Option<Instant>,
-    /// Whether block requests currently fan out across peers. Driven by the
-    /// sync layer's per-tick count of fan-out-eligible peers (KTD6 predicate:
-    /// outbound, witness-serving, header chain above ours, not soft-demoted)
-    /// through [`Self::set_fanout_eligible_peers`]'s one-peer hysteresis.
-    /// Starts disengaged so a fresh window always begins in single-peer
-    /// fallback.
+    /// Eligible outbound witness peers available for new block assignments.
+    /// The count sizes each stripe; engagement keeps one-peer hysteresis so a
+    /// transient demotion does not switch candidate classes mid-window.
+    fanout_eligible_peers: usize,
     fanout_engaged: bool,
     /// Current window-blocked stall observation, if any (R8). Re-derived from
     /// the predicate every [`Self::observe_stall`] call; cleared whenever any
@@ -214,6 +228,14 @@ pub(super) struct DownloadWindow {
     /// When the window front last advanced (a front block arrived); the
     /// anchor for the next `front_interval_ewma_ms` sample.
     last_front_advance: Option<Instant>,
+    /// Cold-start front wait or active duplicate race. Unlike `stall`, this
+    /// needs no staged successors and can never disconnect a peer.
+    cold_front: Option<ColdFrontState>,
+    /// Distinct cold-start front hashes whose duplicate request was sent.
+    cold_hedged_fronts: SmallVec<[Hash256; MAX_COLD_FRONT_HEDGES]>,
+    /// Peer that proved it could deliver a blocked cold front before its
+    /// tracked owner. It receives the replacement deep window.
+    preferred_peer: Option<SocketAddr>,
     /// First observation of an expired front request. Conviction needs a
     /// second tick so blocks delivered during synchronous apply can drain.
     pending_timeout_observation: Option<PendingTimeoutObservation>,
@@ -244,30 +266,25 @@ impl DownloadWindow {
             ewma_block_bytes: 256 * 1024,
             next_request_height: 1,
             next_pending_deadline: None,
+            fanout_eligible_peers: 0,
             fanout_engaged: false,
             stall: None,
             stall_timeout: budget.stall_timeout_initial,
             front_interval_ewma_ms: None,
             last_front_advance: None,
+            cold_front: None,
+            cold_hedged_fronts: SmallVec::new(),
+            preferred_peer: None,
             pending_timeout_observation: None,
             recent_stallers: HashMap::new(),
         }
     }
 
-    /// Records how many peers currently satisfy the fan-out eligibility
-    /// predicate and updates the fan-out engagement with one-peer hysteresis:
-    /// engage at `min_peers_for_fanout`, hold at one below, disengage only
-    /// further down.
-    ///
-    /// The count keeps KTD6's demotion clause (a stalled peer must not count
-    /// toward fan-out), so without hysteresis a single transient soft-demotion
-    /// at the threshold would flap the mode tick-to-tick and re-concentrate
-    /// the whole window on one deep peer mid-stripe. Holding the mode one
-    /// peer below the threshold instead costs at most one undistributed
-    /// stripe (`fanout_peer_inflight` blocks) until the demotion clears or a
-    /// second peer drops out — at which point the drop is structural and the
-    /// single-peer fallback is the right mode.
+    /// Records the eligible population and updates engagement with one-peer
+    /// hysteresis. Dynamic stripe sizing prevents the old whole-window
+    /// re-concentration when the count dips.
     pub(super) fn set_fanout_eligible_peers(&mut self, count: usize) {
+        self.fanout_eligible_peers = count;
         if count >= self.budget.min_peers_for_fanout {
             self.fanout_engaged = true;
         } else if count.saturating_add(1) < self.budget.min_peers_for_fanout {
@@ -275,27 +292,24 @@ impl DownloadWindow {
         }
     }
 
-    /// Whether block requests fan out across peers (true) or collapse to the
-    /// single-peer deep window (false). Fan-out engages only when enough
-    /// eligible peers exist to fill the window at the shallow per-peer cap
-    /// (with [`Self::set_fanout_eligible_peers`]'s hysteresis); below that
-    /// the per-peer cap reverts to the deep fallback so one healthy peer can
-    /// fill the whole window (no under-fill regression).
+    /// Whether requests use a distributed cap or the one-peer deep fallback.
     pub(super) const fn fanout_active(&self) -> bool {
         self.fanout_engaged
     }
 
-    /// Per-peer in-flight cap for the current mode: the shallow fan-out cap
-    /// (Core's `MAX_BLOCKS_IN_TRANSIT_PER_PEER` shape) when fan-out is active,
-    /// the deep fallback cap otherwise. The fan-out cap never exceeds the
-    /// fallback cap, so injected shallow budgets stay binding in either mode.
-    const fn effective_peer_inflight(&self) -> usize {
-        if self.fanout_active() && self.budget.fanout_peer_inflight < self.budget.max_peer_inflight
-        {
-            self.budget.fanout_peer_inflight
-        } else {
-            self.budget.max_peer_inflight
+    /// Per-peer cap for new assignments. With multiple eligible peers, divide
+    /// the global window across them but never go below Core's 16-block cap.
+    /// One peer retains the deep fallback. Existing over-cap assignments drain
+    /// naturally after the eligible population changes.
+    fn effective_peer_inflight(&self) -> usize {
+        if !self.fanout_active() {
+            return self.budget.max_peer_inflight;
         }
+        self.budget
+            .max_pending_blocks
+            .div_ceil(self.fanout_eligible_peers.max(1))
+            .max(self.budget.fanout_peer_inflight)
+            .min(self.budget.max_peer_inflight)
     }
 
     pub(super) fn pending_len(&self) -> usize {
@@ -597,12 +611,6 @@ impl DownloadWindow {
                 "block sync: stall episode running"
             );
         }
-        // Cold start: while the front-cadence EWMA has no sample the decay
-        // floor cannot distinguish a slow network from a staller, so
-        // conviction defers to the 60s pending-timeout fallback — the
-        // pre-U7 status quo. The episode above still forms so the stall
-        // stays observable (`stalling_peer`, the stall_seconds gauge); only
-        // the fire is suppressed until the estimate has one real sample.
         self.front_interval_ewma_ms?;
         // The fire threshold (`effective_timeout` above) is the stored
         // adaptive value, never below the ADV-DRIP-1 decay floor: on a
@@ -723,6 +731,85 @@ impl DownloadWindow {
     pub(super) fn stalling_peer(&self) -> Option<(SocketAddr, Instant)> {
         self.stall.map(|episode| (episode.peer_addr, episode.since))
     }
+    /// Advances the cold-start front timer independently of the strong stall
+    /// predicate. Returns a duplicate request only after the same apply-front
+    /// hash remains pending to one owner for the initial stall timeout.
+    pub(super) fn observe_cold_front(
+        &mut self,
+        next_apply_height: u32,
+        apply_side_busy: bool,
+        now: Instant,
+    ) -> Option<(SocketAddr, Hash256)> {
+        if matches!(self.cold_front, Some(ColdFrontState::Racing { .. })) {
+            return None;
+        }
+        if apply_side_busy
+            || self.front_interval_ewma_ms.is_some()
+            || self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES
+        {
+            self.cold_front = None;
+            return None;
+        }
+        let Some((&hash, pending)) = self
+            .pending
+            .iter()
+            .find(|(_, pending)| pending.height == next_apply_height)
+        else {
+            self.cold_front = None;
+            return None;
+        };
+        match self.cold_front {
+            Some(ColdFrontState::Waiting {
+                owner,
+                hash: waiting_hash,
+                since,
+            }) if owner == pending.peer_addr && waiting_hash == hash => {
+                if now.duration_since(since) >= self.budget.stall_timeout_initial {
+                    Some((owner, hash))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.cold_front = Some(ColdFrontState::Waiting {
+                    owner: pending.peer_addr,
+                    hash,
+                    since: now,
+                });
+                None
+            }
+        }
+    }
+
+    /// Records a successfully sent cold-front duplicate request.
+    pub(super) fn confirm_cold_front_hedge(
+        &mut self,
+        owner: SocketAddr,
+        alternate: SocketAddr,
+        hash: Hash256,
+    ) {
+        if !self.cold_hedged_fronts.contains(&hash) {
+            if self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES {
+                return;
+            }
+            self.cold_hedged_fronts.push(hash);
+        }
+        self.cold_front = Some(ColdFrontState::Racing {
+            owner,
+            alternate,
+            hash,
+        });
+    }
+
+    /// Preferred deep-window peer after winning a cold-front race.
+    pub(super) const fn preferred_peer(&self) -> Option<SocketAddr> {
+        self.preferred_peer
+    }
+
+    /// Clears a preferred peer that is no longer serviceable.
+    pub(super) fn clear_preferred_peer(&mut self) {
+        self.preferred_peer = None;
+    }
 
     /// Current adaptive stalling threshold (2s doubling to 64s).
     #[cfg(test)]
@@ -785,8 +872,21 @@ impl DownloadWindow {
 
     pub(super) fn release_disconnected_peers(
         &mut self,
-        mut is_live_peer: impl FnMut(&SocketAddr) -> bool,
+        is_live_peer: impl Fn(&SocketAddr) -> bool,
     ) {
+        let cold_front_live = match self.cold_front {
+            Some(ColdFrontState::Waiting { owner, .. }) => is_live_peer(&owner),
+            Some(ColdFrontState::Racing {
+                owner, alternate, ..
+            }) => is_live_peer(&owner) && is_live_peer(&alternate),
+            None => true,
+        };
+        if !cold_front_live {
+            self.cold_front = None;
+        }
+        if self.preferred_peer.is_some_and(|peer| !is_live_peer(&peer)) {
+            self.preferred_peer = None;
+        }
         let mut retry_height = self.next_request_height;
         let mut removed_earliest_deadline = false;
         let pending_timeout = self.budget.pending_timeout;
@@ -1007,6 +1107,45 @@ impl DownloadWindow {
         non_empty_request(peer_addr, entries, next_request_height)
     }
 
+    fn resolve_cold_front_delivery(
+        &mut self,
+        hash: Hash256,
+        delivery_peer: Option<SocketAddr>,
+        now: Instant,
+    ) {
+        let Some(state) = self.cold_front else {
+            return;
+        };
+        match state {
+            ColdFrontState::Waiting {
+                hash: waiting_hash, ..
+            } if waiting_hash == hash => {
+                self.cold_front = None;
+            }
+            ColdFrontState::Racing {
+                owner,
+                alternate,
+                hash: racing_hash,
+            } if racing_hash == hash => {
+                self.cold_front = None;
+                if delivery_peer != Some(alternate) {
+                    return;
+                }
+                if self
+                    .pending_timeout_observation
+                    .is_some_and(|observation| observation.peer_addr == owner)
+                {
+                    self.pending_timeout_observation = None;
+                }
+                self.release_disconnected_peers(|peer| *peer != owner);
+                self.mark_peer_unresponsive(owner, now);
+                self.preferred_peer = Some(alternate);
+                metrics::counter!("node.sync.cold_front_wins").increment(1);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn mark_requested(&mut self, request: &PeerRequest, now: Instant) -> bool {
         let estimated_bytes = self.ewma_block_bytes;
         let inflight = self.peer_inflight.entry(request.peer_addr).or_default();
@@ -1048,6 +1187,7 @@ impl DownloadWindow {
         }) {
             self.pending_timeout_observation = None;
         }
+        self.resolve_cold_front_delivery(hash, delivery_peer, now);
         let (height, needs_height_lookup) = if let Some(pending) = pending {
             if let Some(peer_addr) = delivery_peer {
                 self.record_delivery_progress(peer_addr, hash, pending.height, now);
@@ -2410,8 +2550,7 @@ mod tests {
 
         assert_eq!(window.observe_stall(1, false, now), None);
         assert_eq!(info_logged(&window), Some(false));
-        // The episode ages far past every threshold: the INFO latch flips at
-        // 1s, but cold-start suppression keeps the fire from ever happening.
+        // The INFO latch flips at 1s, but an unseeded window never convicts.
         assert_eq!(
             window.observe_stall(1, false, now + Duration::from_secs(1)),
             None
@@ -2850,13 +2989,9 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_unseeded_ewma_never_fires_and_defers_to_fallback() {
-        // Cold-start suppression: while the front-cadence EWMA has no sample
-        // the decay floor cannot distinguish a slow network from a staller,
-        // so `observe_stall` never convicts — conviction belongs to the 60s
-        // pending-timeout fallback (the pre-U7 status quo) until the
-        // estimate seeds. The episode still forms: the stall must stay
-        // observable (gauge / `stalling_peer`) even while unconvictable.
+    fn cold_start_hedges_front_without_convicting_owner() {
+        // Cold recovery is independent of the strong staged-successor stall
+        // predicate. It races only the unchanged apply-front hash.
         let t0 = Instant::now();
         let mut window = DownloadWindow::new(stall_budget());
         insert_pending(&mut window, staller_addr(), hash(0x01), 1, t0);
@@ -2866,27 +3001,30 @@ mod tests {
         }
         assert_eq!(window.front_interval_ewma_ms(), None);
 
-        assert_eq!(window.observe_stall(1, false, t0), None);
-        assert_eq!(window.stalling_peer(), Some((staller_addr(), t0)));
-        // Well past `stall_timeout_initial` (2s) — pre-fix this convicted.
+        assert_eq!(window.observe_cold_front(1, false, t0), None);
         assert_eq!(
-            window.observe_stall(1, false, t0 + Duration::from_secs(2)),
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), healthy_addr(), hash(0x01));
+        assert_eq!(
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(30)),
             None
         );
-        assert_eq!(
-            window.observe_stall(1, false, t0 + Duration::from_secs(30)),
-            None,
-            "an unseeded window must defer conviction to the pending-timeout fallback"
-        );
-        assert_eq!(window.stalling_peer(), Some((staller_addr(), t0)));
         assert_eq!(window.stall_timeout(), Duration::from_secs(2));
         assert!(!window.peer_in_staller_cooldown(staller_addr(), t0 + Duration::from_secs(30)));
 
-        // The wedge resolves (the front finally arrives — first advance,
-        // anchor only) and a later front advance 3s after it seeds the EWMA:
-        // the cadence estimate now exists and conviction re-arms.
+        // The alternate wins the duplicate race. Only this delivery proof
+        // demotes the tracked owner and selects the replacement deep peer.
         let t1 = t0 + Duration::from_secs(30);
-        window.mark_received(hash(0x01), 80, t1);
+        window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
+            peer_addr: staller_addr(),
+            hash: hash(0x01),
+        });
+        window.mark_received_from(hash(0x01), 80, Some(healthy_addr()), t1);
+        assert_eq!(window.preferred_peer(), Some(healthy_addr()));
+        assert!(window.peer_in_staller_cooldown(staller_addr(), t1));
+        assert!(window.pending_timeout_observation.is_none());
         assert_eq!(window.front_interval_ewma_ms(), None);
         for byte in [0x01_u8, 0x02, 0x03, 0x04] {
             window.mark_received_applied(&hash(byte));
@@ -2916,6 +3054,32 @@ mod tests {
             Some(silent),
             "a seeded window must convict a true staller at the effective threshold"
         );
+    }
+
+    #[test]
+    fn disconnected_alternate_rearms_same_cold_front() {
+        let t0 = Instant::now();
+        let mut window = DownloadWindow::new(stall_budget());
+        insert_pending(&mut window, staller_addr(), hash(0x01), 1, t0);
+        assert_eq!(window.observe_cold_front(1, false, t0), None);
+        assert_eq!(
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), healthy_addr(), hash(0x01));
+
+        window.release_disconnected_peers(|peer| *peer != healthy_addr());
+        let retry_started = t0 + Duration::from_secs(3);
+        assert_eq!(window.observe_cold_front(1, false, retry_started), None);
+        assert_eq!(
+            window.observe_cold_front(1, false, retry_started + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), peer_addr(2), hash(0x01));
+        assert!(matches!(
+            window.cold_front,
+            Some(super::ColdFrontState::Racing { alternate, .. }) if alternate == peer_addr(2)
+        ));
     }
 
     fn test_budget() -> SyncBudget {

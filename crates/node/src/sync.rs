@@ -97,14 +97,10 @@ const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
 /// under-fill regression — both are pinned in
 /// `docs/solutions/architecture-patterns/multi-peer-block-download-requires-core-stalling-disconnect.md`.
 const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
-/// Minimum fan-out-eligible peers before block requests fan out: exactly
-/// enough peers to fill the deep window at the shallow fan-out cap
-/// (128 / 16 = 8). Below this, fan-out would under-fill the window versus the
-/// single-peer-deep fallback, so the fallback wins. This equals the outbound
-/// connection budget, leaving zero slack: a single transient soft-demotion
-/// sits exactly at the boundary, which is why engagement carries one-peer
-/// hysteresis in [`DownloadWindow::set_fanout_eligible_peers`] instead of
-/// being re-derived from the raw count each tick.
+/// Minimum peer population that can fill the 128-block window at Core's
+/// 16-block per-peer floor. Below this count, one healthy peer's deep
+/// sequential pipeline beats fragmented stripes on real mainnet peers; the
+/// bounded cold-front hedge handles a silent owner without under-filling.
 const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
 /// Initial window-blocked stalling threshold, mirroring Bitcoin Core's
 /// `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s, `net_processing.cpp`): when the
@@ -421,6 +417,23 @@ impl BlockSync {
         blocks: &mut Vec<InboundBlock>,
         next_expected_hash: Option<Hash256>,
     ) -> usize {
+        // A cold-start hedge can arrive after its original copy was applied.
+        // Drop only blocks proven to lie on the applied ancestry; a known
+        // side-chain block at the same or lower height must remain eligible.
+        if let Some(applied_tip) = self.handles.applied_tip.load_full() {
+            let tree = self.handles.block_tree.read();
+            blocks.retain(|inbound| {
+                let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
+                let Some(node_id) = tree.lookup(hash) else {
+                    return true;
+                };
+                let Ok(node) = tree.node(node_id) else {
+                    return true;
+                };
+                node.height > applied_tip.height
+                    || tree.node_at_height_from(applied_tip.tip_id, node.height) != Some(node_id)
+            });
+        }
         let mut staged_blocks = Vec::with_capacity(blocks.len());
         let now = Instant::now();
         {
@@ -760,27 +773,40 @@ impl BlockSync {
                 });
             }
         }
-        let (request_peer_limit, fanout_active) = {
+        let (request_peer_limit, fanout_active, cold_preferred) = {
             let mut window = self.download_window.lock();
             for candidate in &mut candidates {
-                // Final eligibility clauses (KTD6): not currently soft-demoted
-                // for expired pendings, and not inside the staller cooldown.
-                // Counting a stalled peer toward fan-out would let one dead
-                // peer flip the mode and under-fill the window; counting a
-                // just-disconnected staller that reconnected would hand it the
-                // window front back (RE-ADV-2).
                 candidate.soft_blocked = window.peer_has_expired_pending(candidate.peer.addr, now)
                     || window.peer_in_staller_cooldown(candidate.peer.addr, now);
                 candidate.fanout_eligible = candidate.fanout_eligible && !candidate.soft_blocked;
             }
-            let eligible = candidates
-                .iter()
-                .filter(|candidate| candidate.fanout_eligible)
-                .count();
-            window.set_fanout_eligible_peers(eligible);
-            (window.request_peer_scan_limit(now), window.fanout_active())
+            let cold_preferred = window.preferred_peer().and_then(|addr| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.peer.addr == addr && !candidate.soft_blocked)
+                    .map(|candidate| candidate.peer)
+            });
+            if cold_preferred.is_some() {
+                window.set_fanout_eligible_peers(0);
+            } else {
+                if window.preferred_peer().is_some() {
+                    window.clear_preferred_peer();
+                }
+                let eligible = candidates
+                    .iter()
+                    .filter(|candidate| candidate.fanout_eligible)
+                    .count();
+                window.set_fanout_eligible_peers(eligible);
+            }
+            (
+                window.request_peer_scan_limit(now),
+                window.fanout_active(),
+                cold_preferred,
+            )
         };
-        let mut request_peers: Vec<SyncPeer> = if fanout_active {
+        let mut request_peers: Vec<SyncPeer> = if let Some(preferred) = cold_preferred {
+            alloc::vec![preferred]
+        } else if fanout_active {
             // Fan-out: only eligible peers receive block requests; ineligible
             // (inbound / non-witness / behind / demoted) peers neither count
             // toward the threshold nor get getdata.
@@ -1035,36 +1061,76 @@ impl BlockSync {
             .release_disconnected_peers(|peer| outbound.contains_key(peer));
     }
 
+    /// Sends one untracked duplicate request for a cold-start stalled front.
+    ///
+    /// The original request remains the sole pending owner. This bounded
+    /// hedge therefore changes neither capacity accounting nor timeout state.
+    fn send_cold_front_hedge(
+        &self,
+        owner: SocketAddr,
+        front_hash: Hash256,
+        front_height: u32,
+        now: Instant,
+    ) -> Option<SocketAddr> {
+        let candidates: SmallVec<[SocketAddr; 8]> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|peer| {
+                peer.addr != owner
+                    && statically_fanout_eligible(peer)
+                    && u32::try_from(peer.start_height).is_ok_and(|height| height >= front_height)
+            })
+            .map(|peer| peer.addr)
+            .collect();
+        let candidates: SmallVec<[SocketAddr; 8]> = {
+            let window = self.download_window.lock();
+            candidates
+                .into_iter()
+                .filter(|addr| {
+                    !window.peer_has_expired_pending(*addr, now)
+                        && !window.peer_in_staller_cooldown(*addr, now)
+                })
+                .collect()
+        };
+        let mut message = NetworkMessage::GetData(vec![Inventory::WitnessBlock(
+            BlockHash::from_byte_array(front_hash.to_le_bytes()),
+        )]);
+        for peer_addr in candidates {
+            let tx = self.peer_outbound.read().get(&peer_addr).cloned();
+            let Some(tx) = tx else {
+                continue;
+            };
+            match tx.send(message) {
+                Ok(()) => {
+                    metrics::counter!("node.sync.cold_front_hedges").increment(1);
+                    tracing::info!(
+                        owner = %owner,
+                        hedge_peer = %peer_addr,
+                        %front_hash,
+                        front_height,
+                        "block sync: hedged cold-start stalled front"
+                    );
+                    return Some(peer_addr);
+                }
+                Err(error) => {
+                    message = error.0;
+                }
+            }
+        }
+        None
+    }
     /// R8: window-blocked staller detection and disconnect.
     ///
     /// Computes the sync-layer terms of the stall predicate and advances the
     /// window's stall state machine ([`DownloadWindow::observe_stall`] holds
-    /// the predicate itself):
-    /// - the no-blame guard: while the stager holds the next expected block
-    ///   the apply side owns the frontier, so the stall clock must not run —
-    ///   no peer is blamed for our own apply lag or a failed-apply restore.
+    /// the predicate itself). While the stager holds the next expected block,
+    /// the apply side owns the frontier and no peer is blamed.
     ///
-    /// There is deliberately no chain-tail arm: a caught-up peer taking >2s
-    /// on one tip block is the normal tip regime, where Core's stalling
-    /// logic does not engage; the last <window blocks of IBD fall back to
-    /// the pre-existing 60s pending-timeout machinery instead.
-    ///
-    /// On fire the peer's outbound entry is removed. That entry is the
-    /// connection's lease: the p2p message loop observes the removal within
-    /// its 1s read-timeout poll and tears the connection down (thread exit
-    /// also clears the peer registry), and the same removal makes
-    /// [`Self::release_disconnected_peer_budget`] — which runs right after in
-    /// the tick — re-queue the staller's in-flight blocks for healthy peers.
-    /// Re-acquisition by an immediately-reconnecting staller is held off by
-    /// the window's staller cooldown (fan-out ineligible, no requests except
-    /// as last resort). Core-faithfully this fires regardless of how many
-    /// peers remain: a stalled-forever peer is worse than no peer, the
-    /// re-queue is what frees the wedge, and a reconnecting sole peer is
-    /// still usable through the last-resort exemption.
-    ///
-    /// DNS maintenance replaces a disconnected outbound peer. The cooldown
-    /// below prevents an immediately re-dialed address from reacquiring the
-    /// same block stripe; inbound peers remain fallback-only.
+    /// On fire the peer's outbound entry is removed. The p2p loop observes
+    /// that lease removal and exits; the next tick releases and reassigns the
+    /// peer's in-flight blocks. The cooldown prevents an immediate reconnect
+    /// from reacquiring the same stripe.
     fn disconnect_window_staller(&self, applied_tip: Option<&TipSnapshot>, now: Instant) -> bool {
         let Some(applied_tip) = applied_tip else {
             return false;
@@ -1075,28 +1141,37 @@ impl BlockSync {
         let apply_side_busy = self
             .next_expected_block_hash()
             .is_some_and(|hash| self.block_stager.lock().contains(&hash));
-        let fired = {
+        let (fired, cold_hedge) = {
             let mut window = self.download_window.lock();
+            let cold_hedge = window.observe_cold_front(next_apply_height, apply_side_busy, now);
             let fired = window.observe_stall(next_apply_height, apply_side_busy, now);
             let stall_seconds = window
                 .stalling_peer()
                 .map_or(0.0, |(_, since)| now.duration_since(since).as_secs_f64());
             metrics::gauge!("node.sync.stall_seconds").set(stall_seconds);
-            fired
+            (fired, cold_hedge)
         };
-        let Some(peer_addr) = fired else {
-            return false;
-        };
-        if self.peer_outbound.write().remove(&peer_addr).is_none() {
-            return false;
+        if let Some(peer_addr) = fired {
+            if self.peer_outbound.write().remove(&peer_addr).is_none() {
+                return false;
+            }
+            metrics::counter!("node.sync.staller_disconnects").increment(1);
+            tracing::warn!(
+                peer_addr = %peer_addr,
+                next_apply_height,
+                "block sync: peer is stalling the download window; disconnecting and re-queueing its blocks"
+            );
+            return true;
         }
-        metrics::counter!("node.sync.staller_disconnects").increment(1);
-        tracing::warn!(
-            peer_addr = %peer_addr,
-            next_apply_height,
-            "block sync: peer is stalling the download window; disconnecting and re-queueing its blocks"
-        );
-        true
+        if let Some((owner, front_hash)) = cold_hedge
+            && let Some(alternate) =
+                self.send_cold_front_hedge(owner, front_hash, next_apply_height, now)
+        {
+            self.download_window
+                .lock()
+                .confirm_cold_front_hedge(owner, alternate, front_hash);
+        }
+        false
     }
 
     fn disconnect_timed_out_peer(&self, now: Instant) -> bool {
@@ -2229,7 +2304,7 @@ mod tests {
         sync.tick();
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
-        let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
         for (idx, rx) in rxs.iter().enumerate() {
             let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
                 return Err(
@@ -2512,7 +2587,7 @@ mod tests {
             "a timed-out peer must not immediately reacquire the same block stripe"
         );
 
-        let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
+        let cap = super::PENDING_BUDGET.div_ceil(super::MIN_PEERS_FOR_FANOUT);
         for (idx, rx) in rxs.iter().enumerate() {
             let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected getdata for eligible peer").into());
@@ -2540,11 +2615,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
             sync_with_header_chain(u32::try_from(super::PENDING_BUDGET)?)?;
+        const PEER_COUNT: usize = 9;
+        const SELECTED_PEERS: usize = super::PENDING_BUDGET / super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
         let mut rxs = Vec::new();
         let mut addrs = Vec::new();
-        // One spare peer beyond the fan-out scan width: it gets nothing on
-        // the first tick and picks up the re-queued blocks on the second.
-        for idx in 0..=super::MIN_PEERS_FOR_FANOUT {
+        // Nine eligible peers leave one beyond the eight-peer scan width at
+        // the 16-block floor. It picks up the released stripe on tick two.
+        for idx in 0..PEER_COUNT {
             let addr = test_addr(9261, idx)?;
             addrs.push(addr);
             rxs.push(connect_peer(
@@ -2558,7 +2635,7 @@ mod tests {
 
         assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
         let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-        for (idx, rx) in rxs[..super::MIN_PEERS_FOR_FANOUT].iter().enumerate() {
+        for (idx, rx) in rxs[..SELECTED_PEERS].iter().enumerate() {
             let NetworkMessage::GetData(inventory) = rx.try_recv()? else {
                 return Err(std::io::Error::other("expected getdata for eligible peer").into());
             };
@@ -2568,7 +2645,7 @@ mod tests {
             );
         }
         let _headers = rxs[0].try_recv()?;
-        let spare_rx = &rxs[super::MIN_PEERS_FOR_FANOUT];
+        let spare_rx = &rxs[SELECTED_PEERS];
         assert!(spare_rx.try_recv().is_err());
 
         // The second-highest peer disconnects mid-window, owning the second
@@ -2590,7 +2667,7 @@ mod tests {
             sync.download_window.lock().pending_len(),
             super::PENDING_BUDGET
         );
-        for rx in &rxs[..super::MIN_PEERS_FOR_FANOUT] {
+        for rx in &rxs[..SELECTED_PEERS] {
             assert!(rx.try_recv().is_err());
         }
         Ok(())
@@ -2735,6 +2812,138 @@ mod tests {
                 assert!(window.contains_pending(&Hash256::from_le_bytes(&front.to_byte_array())));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cold_start_stall_hedges_front_without_reassigning_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let budget = super::SyncBudget {
+            stall_timeout_initial: Duration::from_millis(100),
+            ..wedge_budget(super::PENDING_TIMEOUT)
+        };
+        let (sync, _peers, peer_outbound, expected, rxs, _blocks_tx) = staged_count_wedge(budget)?;
+        let owner = test_addr(9320, 0)?;
+
+        // The first drain builds the asymmetric wedge and starts the episode.
+        sync.tick();
+        assert_eq!(sync.download_window.lock().pending_len(), 2);
+        std::thread::sleep(Duration::from_millis(150));
+        sync.tick();
+
+        assert!(
+            peer_outbound.read().contains_key(&owner),
+            "a cold-start hedge must not disconnect the pending owner"
+        );
+        let mut hedged = Vec::new();
+        for rx in &rxs[1..] {
+            while let Ok(message) = rx.try_recv() {
+                if let NetworkMessage::GetData(inventory) = message {
+                    hedged.extend(witness_block_inventory(inventory)?);
+                }
+            }
+        }
+        assert_eq!(hedged, expected[..1]);
+        assert_eq!(sync.download_window.lock().pending_len(), 2);
+
+        // The confirmed front hash is not duplicated again on later ticks.
+        std::thread::sleep(Duration::from_millis(50));
+        sync.tick();
+        for rx in &rxs[1..] {
+            assert_no_getdata(rx)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alternate_front_winner_takes_over_deep_window() -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _applied_tip, blocks, blocks_tx) =
+            sync_with_mined_chain(16)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                stall_timeout_initial: Duration::from_millis(100),
+                ..super::default_sync_budget()
+            },
+        );
+        let owner = test_addr(9321, 0)?;
+        let alternate = test_addr(9321, 1)?;
+        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner, 200));
+        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate, 100));
+
+        sync.tick();
+        assert_eq!(
+            witness_block_inventory(next_getdata(&owner_rx)?)?,
+            blocks
+                .iter()
+                .map(bitcoin::Block::block_hash)
+                .collect::<Vec<_>>()
+        );
+        sync.tick();
+        std::thread::sleep(Duration::from_millis(150));
+        sync.tick();
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            alloc::vec![blocks[0].block_hash()]
+        );
+
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
+        inbound.source_peer = Some(alternate);
+        blocks_tx.send(inbound)?;
+        sync.tick();
+
+        assert_eq!(
+            sync.download_window.lock().preferred_peer(),
+            Some(alternate)
+        );
+        assert!(
+            sync.download_window
+                .lock()
+                .peer_in_staller_cooldown(owner, Instant::now())
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            blocks[1..]
+                .iter()
+                .map(bitcoin::Block::block_hash)
+                .collect::<Vec<_>>()
+        );
+        assert!(peer_outbound.read().contains_key(&owner));
+        Ok(())
+    }
+
+    #[test]
+    fn late_duplicate_of_applied_block_is_not_staged() -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
+            sync_with_mined_chain(1)?;
+        let peer = test_addr(9321, 0)?;
+        let rx = connect_peer(&peers, &peer_outbound, eligible_peer(peer, 100));
+
+        sync.tick();
+        let requested = next_getdata(&rx)?;
+        assert_eq!(
+            witness_block_inventory(requested)?,
+            alloc::vec![blocks[0].block_hash()]
+        );
+        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
+            blocks[0].clone(),
+        ))?;
+        sync.tick();
+        assert_eq!(
+            applied_tip
+                .load_full()
+                .ok_or_else(|| std::io::Error::other("apply did not publish tip"))?
+                .height,
+            1
+        );
+
+        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
+            blocks[0].clone(),
+        ))?;
+        sync.drain_inbound_blocks();
+
+        assert_eq!(sync.block_stager.lock().received_len(), 0);
+        assert_eq!(sync.download_window.lock().received_len(), 0);
         Ok(())
     }
 
@@ -3481,6 +3690,7 @@ mod tests {
 
     #[test]
     fn transient_demotion_does_not_flap_fanout_mode() -> Result<(), Box<dyn std::error::Error>> {
+        const PEER_COUNT: usize = 8;
         let ((sync, peers, peer_outbound, block_tree, applied_tip, expected), blocks_tx) =
             sync_with_header_chain_and_blocks(64)?;
         install_budget(
@@ -3501,7 +3711,7 @@ mod tests {
             },
         );
         let mut rxs = Vec::new();
-        for idx in 0..super::MIN_PEERS_FOR_FANOUT {
+        for idx in 0..PEER_COUNT {
             let addr = test_addr(9340, idx)?;
             rxs.push(connect_peer(
                 &peers,
@@ -3543,14 +3753,15 @@ mod tests {
         );
         assert_no_getdata(&rxs[0])?;
         let mut redistributed = Vec::new();
+        let redistributed_cap = 16_usize.div_ceil(PEER_COUNT - 1);
         for rx in &rxs[1..] {
             while let Ok(message) = rx.try_recv() {
                 if let NetworkMessage::GetData(inventory) = message {
                     let hashes = witness_block_inventory(inventory)?;
                     assert!(
-                        hashes.len() <= 2,
-                        "per-peer batches must stay at the installed fan-out \
-                         cap (2); a deep batch is the mode-flap signature"
+                        hashes.len() <= redistributed_cap,
+                        "per-peer batches must stay at the dynamic cap; a deep \
+                         batch is the mode-flap signature"
                     );
                     redistributed.extend(hashes);
                 }
@@ -5066,9 +5277,10 @@ mod tests {
     ) -> Result<WedgeFixture, Box<dyn std::error::Error>> {
         let ((sync, peers, peer_outbound, block_tree, applied_tip, expected), blocks_tx) =
             sync_with_header_chain_and_blocks(64)?;
+        let peer_count = budget.min_peers_for_fanout;
         install_budget(&sync, budget);
         let mut rxs = Vec::new();
-        for idx in 0..super::MIN_PEERS_FOR_FANOUT {
+        for idx in 0..peer_count {
             let addr = test_addr(9320, idx)?;
             rxs.push(connect_peer(
                 &peers,
