@@ -4271,7 +4271,7 @@ mod consensus_rule_tests {
     /// - scriptSig = push-only, pushing the redeem bytes `[0x00]` as the only item.
     ///
     /// BARE eval (P2SH OFF): scriptSig pushes `[0x00]`; scriptPubKey HASH160s it to `h`,
-    /// pushes `h`, OP_EQUAL -> TRUE. ACCEPTED.
+    /// pushes `h`, `OP_EQUAL` -> TRUE. ACCEPTED.
     /// P2SH eval (P2SH ON): the last scriptSig push `[0x00]` is deserialized as the
     /// redeemScript `OP_0`, run with an empty stack -> pushes FALSE -> FAIL at input 0.
     ///
