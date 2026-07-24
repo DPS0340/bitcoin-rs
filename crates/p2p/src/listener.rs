@@ -39,10 +39,11 @@ impl InboundSyncSinks {
     }
 
     fn send_block(&self, peer_addr: SocketAddr, block: bitcoin::Block, serialized: bytes::Bytes) {
-        if let Err(error) = self
-            .blocks_tx
-            .send(crate::InboundBlock { block, serialized })
-        {
+        if let Err(error) = self.blocks_tx.send(crate::InboundBlock {
+            block,
+            serialized,
+            source_peer: Some(peer_addr),
+        }) {
             tracing::warn!(
                 peer_addr = %peer_addr,
                 %error,
@@ -640,6 +641,27 @@ mod lease_tests {
             blocks_tx,
             wake_tx: None,
         }
+    }
+
+    #[test]
+    fn block_sink_preserves_delivery_peer() -> Result<(), Box<dyn std::error::Error>> {
+        let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let sinks = InboundSyncSinks {
+            headers_tx,
+            blocks_tx,
+            wake_tx: None,
+        };
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 8333));
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+
+        sinks.send_block(peer_addr, block, serialized.clone());
+
+        let received = blocks_rx.try_recv()?;
+        assert_eq!(received.source_peer, Some(peer_addr));
+        assert_eq!(received.serialized, serialized);
+        Ok(())
     }
 
     /// A stream that revokes the connection's `peer_outbound` lease on the

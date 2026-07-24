@@ -112,6 +112,12 @@ struct PendingBlock {
     estimated_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingTimeoutObservation {
+    peer_addr: SocketAddr,
+    hash: Hash256,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PeerInflight {
     blocks: usize,
@@ -208,10 +214,13 @@ pub(super) struct DownloadWindow {
     /// When the window front last advanced (a front block arrived); the
     /// anchor for the next `front_interval_ewma_ms` sample.
     last_front_advance: Option<Instant>,
-    /// Peers disconnected for stalling, by fire time. While inside
-    /// `staller_cooldown` such a peer is not fan-out eligible and receives no
-    /// block requests except as the last-resort peer — the re-acquisition
-    /// guard for a staller that immediately reconnects on the same address.
+    /// First observation of an expired front request. Conviction needs a
+    /// second tick so blocks delivered during synchronous apply can drain.
+    pending_timeout_observation: Option<PendingTimeoutObservation>,
+    /// Peers disconnected for stalling or an expired block request, by fire
+    /// time. While inside `staller_cooldown` such a peer is not fan-out
+    /// eligible and receives no block requests except as the last-resort peer.
+    /// This prevents immediate re-acquisition of the same block stripe.
     recent_stallers: HashMap<SocketAddr, Instant>,
 }
 
@@ -240,6 +249,7 @@ impl DownloadWindow {
             stall_timeout: budget.stall_timeout_initial,
             front_interval_ewma_ms: None,
             last_front_advance: None,
+            pending_timeout_observation: None,
             recent_stallers: HashMap::new(),
         }
     }
@@ -462,6 +472,46 @@ impl DownloadWindow {
         })
     }
 
+    /// Observes the lowest expired request and convicts only on a second idle tick.
+    ///
+    /// A block may arrive while synchronous apply is running and wait in the
+    /// inbound channel after its request timestamp expires. The first
+    /// observation records suspicion only. Delivery from that same peer
+    /// clears it; delivery of a retry from another peer does not.
+    pub(super) fn observe_pending_timeout(
+        &mut self,
+        apply_side_busy: bool,
+        now: Instant,
+    ) -> Option<SocketAddr> {
+        if apply_side_busy {
+            self.pending_timeout_observation = None;
+            return None;
+        }
+        if let Some(observation) = self.pending_timeout_observation {
+            self.pending_timeout_observation = None;
+            self.mark_peer_unresponsive(observation.peer_addr, now);
+            return Some(observation.peer_addr);
+        }
+        if self
+            .next_pending_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
+            return None;
+        }
+        self.pending_timeout_observation = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                now.duration_since(pending.requested_at) >= self.budget.pending_timeout
+            })
+            .min_by_key(|(_, pending)| pending.height)
+            .map(|(hash, pending)| PendingTimeoutObservation {
+                peer_addr: pending.peer_addr,
+                hash: *hash,
+            });
+        None
+    }
+
     /// Advances the window-blocked stall state machine one observation (R8).
     ///
     /// Inputs computed by the sync layer each tick, after the apply drain:
@@ -491,9 +541,6 @@ impl DownloadWindow {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<SocketAddr> {
-        let staller_cooldown = self.budget.staller_cooldown;
-        self.recent_stallers
-            .retain(|_, fired_at| now.duration_since(*fired_at) < staller_cooldown);
         if apply_side_busy {
             if self.stall.take().is_some() {
                 count_stall_episode_cleared("apply_busy");
@@ -577,7 +624,7 @@ impl DownloadWindow {
         self.stall_timeout = effective_timeout
             .saturating_mul(2)
             .min(self.budget.stall_timeout_max);
-        self.recent_stallers.insert(peer_addr, now);
+        self.mark_peer_unresponsive(peer_addr, now);
         Some(peer_addr)
     }
 
@@ -681,6 +728,14 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(super) const fn stall_timeout(&self) -> Duration {
         self.stall_timeout
+    }
+
+    /// Starts the re-acquisition cooldown for an unresponsive peer.
+    pub(super) fn mark_peer_unresponsive(&mut self, peer_addr: SocketAddr, now: Instant) {
+        let cooldown = self.budget.staller_cooldown;
+        self.recent_stallers
+            .retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        self.recent_stallers.insert(peer_addr, now);
     }
 
     /// Whether `peer_addr` was disconnected for stalling within the cooldown.
@@ -978,9 +1033,25 @@ impl DownloadWindow {
         self.has_request_capacity()
     }
 
-    pub(super) fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
-        let (height, needs_height_lookup) = if let Some(pending) = self.remove_pending(&hash) {
-            self.record_delivery_progress(pending.peer_addr, hash, pending.height, now);
+    pub(super) fn mark_received_from(
+        &mut self,
+        hash: Hash256,
+        bytes: usize,
+        source_peer: Option<SocketAddr>,
+        now: Instant,
+    ) -> bool {
+        let pending = self.remove_pending(&hash);
+        let delivery_peer =
+            source_peer.or_else(|| pending.as_ref().map(|pending| pending.peer_addr));
+        if self.pending_timeout_observation.is_some_and(|observation| {
+            observation.hash == hash && Some(observation.peer_addr) == delivery_peer
+        }) {
+            self.pending_timeout_observation = None;
+        }
+        let (height, needs_height_lookup) = if let Some(pending) = pending {
+            if let Some(peer_addr) = delivery_peer {
+                self.record_delivery_progress(peer_addr, hash, pending.height, now);
+            }
             (pending.height, false)
         } else {
             (0, true)
@@ -997,6 +1068,11 @@ impl DownloadWindow {
             / 8;
         self.ewma_block_bytes = self.ewma_block_bytes.max(80);
         needs_height_lookup
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
+        self.mark_received_from(hash, bytes, None, now)
     }
 
     /// Delivery progress for the stall state machine, charged per peer
@@ -1274,6 +1350,64 @@ mod tests {
             .insert(peer_addr, super::PeerInflight { blocks: 2 });
 
         assert_eq!(window.request_peer_scan_limit(now), 2);
+    }
+
+    #[test]
+    fn pending_timeout_waits_for_second_delivery_drain() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let block_hash = hash(0x90);
+        window.pending.insert(
+            block_hash,
+            super::PendingBlock {
+                peer_addr,
+                requested_at,
+                height: 1,
+                estimated_bytes: 80,
+            },
+        );
+        window.next_pending_deadline = Some(observed_at);
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        window.mark_received(block_hash, 80, observed_at);
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
+    }
+
+    #[test]
+    fn retry_delivery_does_not_clear_original_peer_timeout() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let original_peer = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let retry_peer = std::net::SocketAddr::from(([127, 0, 0, 2], 8333));
+        let block_hash = hash(0x91);
+        window.pending.insert(
+            block_hash,
+            super::PendingBlock {
+                peer_addr: original_peer,
+                requested_at,
+                height: 1,
+                estimated_bytes: 80,
+            },
+        );
+        window.next_pending_deadline = Some(observed_at);
+
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        window.mark_received_from(block_hash, 80, Some(retry_peer), observed_at);
+        assert_eq!(
+            window.observe_pending_timeout(false, observed_at),
+            Some(original_peer)
+        );
+        assert!(window.peer_in_staller_cooldown(original_peer, observed_at));
+        assert!(!window.peer_in_staller_cooldown(retry_peer, observed_at));
     }
 
     #[test]

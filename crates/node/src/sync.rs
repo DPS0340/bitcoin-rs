@@ -258,11 +258,12 @@ impl BlockSync {
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let chain_tip = self.handles.chain_tip.load_full();
         let now = Instant::now();
-        // Staller detection runs after the apply drain (so it sees real
-        // frontier progress) and before peer release + selection, so a fired
-        // disconnect re-queues the staller's blocks and re-requests them from
-        // healthy peers within the same tick.
-        self.disconnect_window_staller(applied_tip.as_deref(), now);
+        // Peer conviction runs after the apply drain and before peer release
+        // so released blocks can be re-requested in the same tick. At most
+        // one peer is disconnected per tick.
+        if !self.disconnect_window_staller(applied_tip.as_deref(), now) {
+            self.disconnect_timed_out_peer(now);
+        }
         self.release_disconnected_peer_budget();
         let sync_peer_selection = self.sync_peer_selection(applied_height, now);
         if sync_peer_selection.header_peer.is_none() {
@@ -426,6 +427,7 @@ impl BlockSync {
             let mut stager = self.block_stager.lock();
             for inbound in blocks.drain(..) {
                 let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
+                let source_peer = inbound.source_peer;
                 let staged = stager.insert(
                     hash,
                     next_expected_hash,
@@ -433,7 +435,7 @@ impl BlockSync {
                     inbound.serialized,
                     now,
                 );
-                staged_blocks.push((hash, staged));
+                staged_blocks.push((hash, source_peer, staged));
             }
         }
 
@@ -441,11 +443,11 @@ impl BlockSync {
         let staged_count = staged_blocks.len();
         {
             let mut window = self.download_window.lock();
-            for (hash, staged) in staged_blocks {
+            for (hash, source_peer, staged) in staged_blocks {
                 match staged {
                     StagedBlock::AlreadyStaged => {}
                     StagedBlock::Memory { bytes, dropped } => {
-                        window.mark_received(hash, bytes, now);
+                        window.mark_received_from(hash, bytes, source_peer, now);
                         for dropped in dropped {
                             window.drop_received_for_retry(&dropped.hash);
                             retry_count = retry_count.saturating_add(1);
@@ -1060,22 +1062,15 @@ impl BlockSync {
     /// re-queue is what frees the wedge, and a reconnecting sole peer is
     /// still usable through the last-resort exemption.
     ///
-    /// Net-layer boundary, stated honestly: this node has no autonomous peer
-    /// rotation. `--connect` peers are re-dialed every 2s by the fixed-peer
-    /// bootstrap, so a disconnected sole staller reconnects promptly; under
-    /// DNS bootstrap (one-shot at startup) a disconnect is not followed by a
-    /// replacement dial, and sync waits for an inbound peer or the staller's
-    /// own reconnect. Reconnect handling itself lives in the p2p layer, out
-    /// of reach here — the cooldown keys on the socket address, stable for
-    /// outbound dials but rotating with the ephemeral port for inbound peers
-    /// (inbound peers are never fan-out eligible, so that exposure is limited
-    /// to the fallback last-resort path Core shares).
-    fn disconnect_window_staller(&self, applied_tip: Option<&TipSnapshot>, now: Instant) {
+    /// DNS maintenance replaces a disconnected outbound peer. The cooldown
+    /// below prevents an immediately re-dialed address from reacquiring the
+    /// same block stripe; inbound peers remain fallback-only.
+    fn disconnect_window_staller(&self, applied_tip: Option<&TipSnapshot>, now: Instant) -> bool {
         let Some(applied_tip) = applied_tip else {
-            return;
+            return false;
         };
         let Some(next_apply_height) = applied_tip.height.checked_add(1) else {
-            return;
+            return false;
         };
         let apply_side_busy = self
             .next_expected_block_hash()
@@ -1090,15 +1085,40 @@ impl BlockSync {
             fired
         };
         let Some(peer_addr) = fired else {
-            return;
+            return false;
         };
-        self.peer_outbound.write().remove(&peer_addr);
+        if self.peer_outbound.write().remove(&peer_addr).is_none() {
+            return false;
+        }
         metrics::counter!("node.sync.staller_disconnects").increment(1);
         tracing::warn!(
             peer_addr = %peer_addr,
             next_apply_height,
             "block sync: peer is stalling the download window; disconnecting and re-queueing its blocks"
         );
+        true
+    }
+
+    fn disconnect_timed_out_peer(&self, now: Instant) -> bool {
+        let apply_side_busy = self
+            .next_expected_block_hash()
+            .is_some_and(|hash| self.block_stager.lock().contains(&hash));
+        let peer_addr = self
+            .download_window
+            .lock()
+            .observe_pending_timeout(apply_side_busy, now);
+        let Some(peer_addr) = peer_addr else {
+            return false;
+        };
+        if self.peer_outbound.write().remove(&peer_addr).is_none() {
+            return false;
+        }
+        metrics::counter!("node.sync.pending_timeout_disconnects").increment(1);
+        tracing::warn!(
+            peer_addr = %peer_addr,
+            "block sync: peer missed the block request timeout; disconnecting and re-queueing its blocks"
+        );
+        true
     }
 
     fn record_sync_metrics(&self) {
@@ -2478,6 +2498,19 @@ mod tests {
         // Let the lone peer's pendings expire (demoting it) before fanning out.
         std::thread::sleep(Duration::from_millis(300));
         sync.tick();
+        // Conviction requires a second drain opportunity so a block delivered
+        // during synchronous apply is not mistaken for a network timeout.
+        sync.tick();
+        assert!(
+            !peer_outbound.read().contains_key(&test_addr(9250, 0)?),
+            "a peer that misses the request timeout must release its outbound slot"
+        );
+        assert!(
+            sync.download_window
+                .lock()
+                .peer_in_staller_cooldown(test_addr(9250, 0)?, Instant::now()),
+            "a timed-out peer must not immediately reacquire the same block stripe"
+        );
 
         let cap = super::MAX_BLOCKS_IN_TRANSIT_PER_PEER;
         for (idx, rx) in rxs.iter().enumerate() {

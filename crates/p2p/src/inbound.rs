@@ -1,4 +1,5 @@
 //! Inbound payloads received from peers.
+use std::net::SocketAddr;
 
 /// A block received from a peer with its wire payload preserved.
 ///
@@ -9,6 +10,8 @@ pub struct InboundBlock {
     pub block: bitcoin::Block,
     /// Wire-format block payload bytes.
     pub serialized: bytes::Bytes,
+    /// Network peer that delivered the block, or `None` for local injection.
+    pub source_peer: Option<SocketAddr>,
 }
 
 impl InboundBlock {
@@ -18,6 +21,10 @@ impl InboundBlock {
     #[must_use]
     pub fn from_decoded(block: bitcoin::Block) -> Self {
         let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
-        Self { block, serialized }
+        Self {
+            block,
+            serialized,
+            source_peer: None,
+        }
     }
 }
