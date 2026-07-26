@@ -95,9 +95,12 @@ fn has_block_service(services: ServiceFlags) -> bool {
     services.has(ServiceFlags::NETWORK) || services.has(ServiceFlags::WITNESS)
 }
 
-// Mirrors Bitcoin Core CNetAddr::IsRoutable, with conservative exclusions
-// from the IANA IPv4/IPv6 special-purpose registries.
-fn is_routable(ip: IpAddr) -> bool {
+/// Returns whether an IP address is suitable for public peer discovery.
+///
+/// Mirrors Bitcoin Core `CNetAddr::IsRoutable`, with conservative exclusions
+/// from the IANA IPv4/IPv6 special-purpose registries.
+#[must_use]
+pub fn is_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();

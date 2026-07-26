@@ -8,6 +8,10 @@
 
 extern crate alloc;
 
+// Task 4 consumes this module from the runner; Task 3 keeps its contract
+// independently testable before orchestration is wired.
+#[allow(dead_code)]
+mod address_book;
 /// Block-apply pipeline executed by `NodeState::apply_block` and `BlockSync::tick`.
 pub mod apply;
 /// BIP9 deployment-state adapter over `BlockTree`.
