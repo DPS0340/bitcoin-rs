@@ -865,6 +865,11 @@ impl DownloadWindow {
         self.preferred_peer
     }
 
+    /// Number of eligible peers that activates striped fanout.
+    pub(super) const fn min_peers_for_fanout(&self) -> usize {
+        self.budget.min_peers_for_fanout
+    }
+
     /// Clears a preferred peer that is no longer serviceable.
     pub(super) fn clear_preferred_peer(&mut self) {
         self.preferred_peer = None;
@@ -3410,14 +3415,11 @@ mod tests {
 
     /// A probe cancellation before the deferral deadline lets fanout engage
     /// immediately on the next evaluation, with no leftover deferral state.
-    /// This is the production path where the young-probe guard matters: a
-    /// winner sets `preferred_peer`, so [`configure_request_mode`] routes
-    /// through the preferred branch and never reaches the threshold
-    /// evaluation. A cancellation (racers drop below two in
-    /// [`DownloadWindow::release_disconnected_peers`]) clears the probe
-    /// without setting a preferred peer, so the next threshold evaluation is
-    /// the real path — and it must not be held by a deferral for a probe
-    /// that no longer exists.
+    /// A healthy preferred winner remains selected only while the eligible
+    /// population is below the fanout threshold. A cancellation clears the
+    /// probe without setting a preferred peer, so the next threshold
+    /// evaluation must not be held by a deferral for a probe that no longer
+    /// exists.
     ///
     /// The test first proves the deferral itself: with a fresh live probe it
     /// crosses the fanout threshold and asserts fanout stays off and the

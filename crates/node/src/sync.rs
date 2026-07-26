@@ -189,23 +189,23 @@ fn configure_request_mode(
     candidates: &[FanoutCandidate],
     now: Instant,
 ) -> Option<SyncPeer> {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.fanout_eligible)
+        .count();
     let preferred = window.preferred_peer().and_then(|addr| {
         candidates
             .iter()
             .find(|candidate| candidate.peer.addr == addr && !candidate.soft_blocked)
             .map(|candidate| candidate.peer)
     });
-    if preferred.is_some() {
+    if eligible < window.min_peers_for_fanout() && preferred.is_some() {
         window.set_fanout_eligible_peers(0, now);
         return preferred;
     }
     if window.preferred_peer().is_some() {
         window.clear_preferred_peer();
     }
-    let eligible = candidates
-        .iter()
-        .filter(|candidate| candidate.fanout_eligible)
-        .count();
     window.set_fanout_eligible_peers(eligible, now);
     None
 }
@@ -3056,6 +3056,69 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(peer_outbound.read().contains_key(&owner));
+        Ok(())
+    }
+
+    #[test]
+    fn fanout_replaces_preferred_peer_when_eligible_pool_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _applied_tip, blocks, blocks_tx) =
+            sync_with_mined_chain(48)?;
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 16,
+                max_pending_bytes: usize::MAX,
+                max_peer_inflight: 16,
+                fanout_peer_inflight: 2,
+                min_peers_for_fanout: super::MIN_PEERS_FOR_FANOUT,
+                getdata_batch_limit: 16,
+                ..super::default_sync_budget()
+            },
+        );
+        let owner = test_addr(9322, 0)?;
+        let alternate = test_addr(9322, 1)?;
+        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner, 200));
+        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate, 100));
+
+        sync.tick();
+        let _ = next_getdata(&owner_rx)?;
+        let _ = next_getdata(&alternate_rx)?;
+        for block in &blocks[..4] {
+            let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
+            inbound.source_peer = Some(alternate);
+            blocks_tx.send(inbound)?;
+        }
+        sync.tick();
+        let _ = next_getdata(&alternate_rx)?;
+        assert_eq!(
+            sync.download_window.lock().preferred_peer(),
+            Some(alternate)
+        );
+
+        let mut recovered_rxs = Vec::new();
+        for idx in 2..=8 {
+            recovered_rxs.push(connect_peer(
+                &peers,
+                &peer_outbound,
+                eligible_peer(test_addr(9322, idx)?, 100),
+            ));
+        }
+        for block in &blocks[4..8] {
+            let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
+            inbound.source_peer = Some(alternate);
+            blocks_tx.send(inbound)?;
+        }
+        sync.tick();
+
+        let window = sync.download_window.lock();
+        assert!(window.preferred_peer().is_none());
+        assert!(window.fanout_active());
+        drop(window);
+        assert!(
+            recovered_rxs.iter().any(|rx| rx.try_recv().is_ok()),
+            "a recovered eligible peer must receive a fanout request"
+        );
         Ok(())
     }
 
