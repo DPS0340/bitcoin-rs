@@ -8,6 +8,15 @@ use crate::{
 };
 
 /// Accepts a contiguous batch of headers after proof-of-work validation.
+///
+/// An already-present header is treated as an idempotent input: before any
+/// validation or insertion the header hash is derived and looked up in the
+/// tree, and when found the existing [`NodeId`] is appended to the returned
+/// vector and the header is skipped. This preserves a 1:1 positional
+/// correspondence between input headers and returned ids (including duplicate
+/// Genesis on a non-empty tree) without relaxing validation or error
+/// propagation for unknown headers, which continue through proof-of-work and
+/// contextual nBits validation before insertion.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
@@ -15,6 +24,11 @@ pub fn accept_headers(
 ) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
     for header in headers {
+        let hash = hash_from_header(header);
+        if let Some(existing_id) = tree.lookup(hash) {
+            accepted.push(existing_id);
+            continue;
+        }
         validate_pow(header, network)?;
         validate_empty_tree_root(tree, header, network)?;
         validate_candidate_nbits(tree, header, network)?;
