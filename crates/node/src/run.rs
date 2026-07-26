@@ -26,6 +26,10 @@ const P2P_OUTBOUND_PEER_TARGET: usize = 8;
 const FAILED_ADDR_BACKOFF_SECS: u64 = 60;
 /// How often the DNS peer maintenance loop wakes to check the live peer count.
 const DNS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+/// Retry a connectionless bootstrap before normal DNS maintenance.
+const DNS_BOOTSTRAP_REFILL_INTERVAL: Duration = Duration::from_secs(1);
+/// Maximum fast refills before returning to the normal maintenance cadence.
+const DNS_BOOTSTRAP_FAST_REFILL_LIMIT: u8 = 2;
 
 type PeerRegistry = Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>;
 type PeerOutboundMap = Arc<
@@ -40,6 +44,26 @@ type BannedSubnets = Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>
 type P2pChainQuery = Arc<dyn bitcoin_rs_p2p::ChainQuery>;
 type OutboundConnectionHandle =
     std::thread::JoinHandle<core::result::Result<(), bitcoin_rs_p2p::PeerError>>;
+
+/// Bounds rapid DNS retries while the initial outbound pool is still empty.
+#[derive(Default)]
+struct DnsBootstrapRefill {
+    fast_refills: u8,
+}
+
+impl DnsBootstrapRefill {
+    fn next_delay(&mut self, live: usize, queued: usize) -> Duration {
+        if live > 0 {
+            self.fast_refills = 0;
+            return DNS_MAINTENANCE_INTERVAL;
+        }
+        if queued == 0 || self.fast_refills >= DNS_BOOTSTRAP_FAST_REFILL_LIMIT {
+            return DNS_MAINTENANCE_INTERVAL;
+        }
+        self.fast_refills = self.fast_refills.saturating_add(1);
+        DNS_BOOTSTRAP_REFILL_INTERVAL
+    }
+}
 
 fn build_rpc_auth(node_auth: &crate::Auth) -> Result<bitcoin_rs_rpc::Auth> {
     match node_auth {
@@ -306,15 +330,18 @@ fn spawn_dns_peer_maintenance(
                 );
                 selection_cursor = selection_cursor.wrapping_add(1);
                 tracing::info!(queued, "dns peer bootstrap queued initial addresses");
+                let mut bootstrap_refill = DnsBootstrapRefill::default();
+                let mut maintenance_delay = bootstrap_refill.next_delay(0, queued);
 
                 while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                    std::thread::sleep(DNS_MAINTENANCE_INTERVAL);
+                    std::thread::sleep(maintenance_delay);
                     if shutdown.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
 
                     let live = peer_outbound.read().len();
                     if live >= P2P_OUTBOUND_PEER_TARGET {
+                        maintenance_delay = DNS_MAINTENANCE_INTERVAL;
                         continue;
                     }
                     let deficit = P2P_OUTBOUND_PEER_TARGET - live;
@@ -328,11 +355,13 @@ fn spawn_dns_peer_maintenance(
                         deficit,
                     );
                     selection_cursor = selection_cursor.wrapping_add(1);
+                    maintenance_delay = bootstrap_refill.next_delay(live, queued);
                     if queued > 0 {
                         tracing::info!(
                             live,
                             queued,
                             deficit,
+                            fast_refills = bootstrap_refill.fast_refills,
                             "dns peer maintenance refilled outbound queue"
                         );
                     }
@@ -671,6 +700,29 @@ mod tests {
 
     fn signet_seeds() -> Vec<&'static str> {
         bitcoin_rs_primitives::Network::Signet.dns_seeds().to_vec()
+    }
+
+    #[test]
+    fn connectionless_bootstrap_refills_are_fast_and_bounded() {
+        let mut refill = DnsBootstrapRefill::default();
+
+        assert_eq!(
+            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            DNS_BOOTSTRAP_REFILL_INTERVAL
+        );
+        assert_eq!(
+            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            DNS_BOOTSTRAP_REFILL_INTERVAL
+        );
+        assert_eq!(
+            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            DNS_MAINTENANCE_INTERVAL
+        );
+        assert_eq!(refill.next_delay(1, 0), DNS_MAINTENANCE_INTERVAL);
+        assert_eq!(
+            refill.next_delay(0, P2P_OUTBOUND_PEER_TARGET),
+            DNS_BOOTSTRAP_REFILL_INTERVAL
+        );
     }
 
     #[test]
