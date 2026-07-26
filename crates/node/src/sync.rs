@@ -187,6 +187,7 @@ fn statically_fanout_eligible(peer: &PeerInfo) -> bool {
 fn configure_request_mode(
     window: &mut DownloadWindow,
     candidates: &[FanoutCandidate],
+    now: Instant,
 ) -> Option<SyncPeer> {
     let preferred = window.preferred_peer().and_then(|addr| {
         candidates
@@ -195,7 +196,7 @@ fn configure_request_mode(
             .map(|candidate| candidate.peer)
     });
     if preferred.is_some() {
-        window.set_fanout_eligible_peers(0);
+        window.set_fanout_eligible_peers(0, now);
         return preferred;
     }
     if window.preferred_peer().is_some() {
@@ -205,7 +206,7 @@ fn configure_request_mode(
         .iter()
         .filter(|candidate| candidate.fanout_eligible)
         .count();
-    window.set_fanout_eligible_peers(eligible);
+    window.set_fanout_eligible_peers(eligible, now);
     None
 }
 
@@ -314,7 +315,7 @@ impl BlockSync {
                 break;
             }
         }
-        self.send_prefix_probes(&sync_peer_selection.probe_peers);
+        self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
         if let Some(peer) = sync_peer_selection.header_peer {
             let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
             if peer_best_height > header_height {
@@ -809,7 +810,7 @@ impl BlockSync {
                     || window.peer_in_staller_cooldown(candidate.peer.addr, now);
                 candidate.fanout_eligible = candidate.fanout_eligible && !candidate.soft_blocked;
             }
-            let cold_preferred = configure_request_mode(&mut window, &candidates);
+            let cold_preferred = configure_request_mode(&mut window, &candidates, now);
             (
                 window.request_peer_scan_limit(now),
                 window.fanout_active(),
@@ -872,7 +873,7 @@ impl BlockSync {
     ///
     /// Every alternate receives the same earliest hashes, so the probe cannot
     /// create a unique out-of-order height hole. It runs once per deep owner.
-    fn send_prefix_probes(&self, probe_peers: &[SyncPeer]) {
+    fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
         let Some((owner, hashes, required_height)) =
             self.download_window.lock().prefix_probe_plan()
         else {
@@ -909,7 +910,7 @@ impl BlockSync {
         );
         self.download_window
             .lock()
-            .confirm_prefix_probe(owner, hashes, &successful);
+            .confirm_prefix_probe(owner, hashes, &successful, now);
     }
 
     fn send_getdata_for_pending_blocks(
@@ -2420,6 +2421,101 @@ mod tests {
         assert_eq!(
             sync.download_window.lock().pending_len(),
             super::PENDING_BUDGET
+        );
+        Ok(())
+    }
+
+    /// Cross-tick regression for the bounded prefix-race-before-fanout
+    /// handoff: a probe created below the threshold must defer fanout when the
+    /// eligible count reaches the threshold on a following tick while the
+    /// probe is still fresh, then fanout must engage once the injected time
+    /// crosses the `stall_timeout_initial` deadline. Exercises the real
+    /// `tick()` / `configure_request_mode` / `set_fanout_eligible_peers`
+    /// path for probe creation and the deferral, then injects a future
+    /// `Instant` (the only available time seam, since `tick()` reads
+    /// `Instant::now()`) to cross the deadline. This is the exact cross-tick
+    /// boundary test; the direct window-boundary test lives in
+    /// `window::tests::fanout_cancels_prefix_probe_without_rearming_it`. No
+    /// sleeps, no network.
+    #[test]
+    fn tick_fanout_deferred_for_fresh_probe_engages_at_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A 16-block chain: the deep single-peer window takes all 16 while
+        // the one-shot probe sends the first 8 (PREFIX_PROBE_BLOCK_LIMIT), so
+        // the probe getdata is distinguishable from the deep getdata.
+        let (sync, peers, peer_outbound, block_tree, applied_tip, expected) =
+            sync_with_header_chain(16)?;
+        install_budget(&sync, super::default_sync_budget());
+
+        // Two eligible peers: below the 8-peer fanout threshold. The owner
+        // (highest) takes the deep window; the alternate is the probe racer.
+        let owner_addr = test_addr(9401, 0)?;
+        let alternate_addr = test_addr(9401, 1)?;
+        let owner_rx = connect_peer(&peers, &peer_outbound, eligible_peer(owner_addr, 200));
+        let alternate_rx = connect_peer(&peers, &peer_outbound, eligible_peer(alternate_addr, 200));
+
+        // Tick 1: below the threshold, a prefix probe is created. The owner
+        // receives the deep getdata (all 16) and the alternate receives the
+        // one-shot probe getdata (the first 8).
+        sync.tick();
+        assert_applied_genesis(&applied_tip, &block_tree, &sync.handles)?;
+        assert_eq!(
+            witness_block_inventory(next_getdata(&owner_rx)?)?,
+            expected,
+            "the deep owner must receive the full window"
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            expected[..8],
+            "the alternate must receive the one-shot probe prefix"
+        );
+        assert!(
+            !sync.download_window.lock().fanout_active(),
+            "below the threshold fanout must stay off"
+        );
+
+        // Reach the fanout threshold on the following tick: add six more
+        // eligible peers (eight total) and tick again. The probe is still
+        // fresh (age well under stall_timeout_initial = 2s), so the bounded
+        // deferral holds fanout off and the probe survives the transition.
+        for idx in 2..super::MIN_PEERS_FOR_FANOUT {
+            connect_peer(
+                &peers,
+                &peer_outbound,
+                eligible_peer(test_addr(9401, idx)?, 200),
+            );
+        }
+        sync.tick();
+        assert!(
+            !sync.download_window.lock().fanout_active(),
+            "a fresh prefix probe must defer the threshold-crossing tick"
+        );
+
+        // Cross the injected time deadline measured from the active probe's
+        // stored `started_at`. The cross-tick path cannot control the
+        // `Instant::now()` used when the probe is created, so read it back and
+        // add exactly `stall_timeout_initial`. Then assert the planned
+        // duration equals the budget before engaging fanout.
+        let mut window = sync.download_window.lock();
+        let started_at = window
+            .active_prefix_probe_started_at()
+            .ok_or_else(|| std::io::Error::other("probe must remain active after deferral"))?;
+        let budget = super::default_sync_budget();
+        let planned_duration = budget.stall_timeout_initial;
+        let deadline = started_at + planned_duration;
+        assert_eq!(
+            deadline - started_at,
+            planned_duration,
+            "planned deadline must be exactly stall_timeout_initial after probe start"
+        );
+        window.set_fanout_eligible_peers(super::MIN_PEERS_FOR_FANOUT, deadline);
+        assert!(
+            window.fanout_active(),
+            "fanout must engage at the stall_timeout_initial deadline"
+        );
+        assert!(
+            window.prefix_probe_plan().is_none(),
+            "no probe plan may remain once fanout engages"
         );
         Ok(())
     }

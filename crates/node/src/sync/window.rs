@@ -156,6 +156,7 @@ struct PrefixProbe {
     hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
     racers: HashMap<SocketAddr, u8>,
     accepted: u8,
+    started_at: Instant,
 }
 
 /// Episode age at which the one-shot stall-episode observability INFO line is
@@ -303,12 +304,47 @@ impl DownloadWindow {
     /// Records the eligible population and updates engagement with one-peer
     /// hysteresis. Dynamic stripe sizing prevents the old whole-window
     /// re-concentration when the count dips.
-    pub(super) fn set_fanout_eligible_peers(&mut self, count: usize) {
+    ///
+    /// Bounded prefix-race-before-fanout handoff: when the eligible count
+    /// reaches the fanout threshold while a prefix probe is active and
+    /// younger than `stall_timeout_initial`, defer only fanout engagement so
+    /// the one-shot race (typically sub-second) can elect a preferred peer
+    /// instead of being cancelled by the engagement. After the probe
+    /// resolves/cancels or the fixed `stall_timeout_initial` interval
+    /// expires, existing hysteresis and immediate prefix-probe cancellation
+    /// behavior resume unchanged. `now` is injected (not read here) so the
+    /// tick/selection path controls the clock; see [`Self::observe_stall`]
+    /// for the same discipline.
+    pub(super) fn set_fanout_eligible_peers(&mut self, count: usize, now: Instant) {
+        let was_engaged = self.fanout_engaged;
         self.fanout_eligible_peers = count;
-        if count >= self.budget.min_peers_for_fanout {
+        let would_engage = count >= self.budget.min_peers_for_fanout;
+        // Bound the deferral: while a fresh prefix probe (age <
+        // stall_timeout_initial) is racing, hold fanout disengaged so the
+        // race is not cancelled mid-flight. The probe's elapsed time is
+        // computed from the injected `now` against the probe's
+        // `started_at` (itself an injected `Instant`), never
+        // `Instant::now()`. The bound is a strict less-than: at an elapsed
+        // time exactly equal to `stall_timeout_initial` the probe is no
+        // longer fresh (the race had its full budget), so fanout engages at
+        // the deadline — `<` rather than `<=`. The boundary is pinned by
+        // tests that cross at exactly `stall_timeout_initial`.
+        let probe_young = self.prefix_probe.as_ref().is_some_and(|probe| {
+            now.duration_since(probe.started_at) < self.budget.stall_timeout_initial
+        });
+        let engaging = would_engage && !probe_young;
+        if engaging {
             self.fanout_engaged = true;
         } else if count.saturating_add(1) < self.budget.min_peers_for_fanout {
             self.fanout_engaged = false;
+        }
+        if self.fanout_engaged != was_engaged {
+            tracing::info!(
+                eligible = count,
+                fanout_active = self.fanout_active(),
+                min_peers_for_fanout = self.budget.min_peers_for_fanout,
+                "fanout engagement changed"
+            );
         }
         if self.fanout_engaged {
             self.prefix_probe = None;
@@ -890,6 +926,7 @@ impl DownloadWindow {
         owner: SocketAddr,
         hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
         alternates: &[SocketAddr],
+        now: Instant,
     ) {
         if alternates.is_empty() {
             return;
@@ -911,6 +948,7 @@ impl DownloadWindow {
             hashes,
             racers,
             accepted: 0,
+            started_at: now,
         });
     }
 
@@ -947,6 +985,11 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(super) fn contains_pending(&self, hash: &Hash256) -> bool {
         self.pending.contains_key(hash)
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_prefix_probe_started_at(&self) -> Option<Instant> {
+        self.prefix_probe.as_ref().map(|probe| probe.started_at)
     }
 
     fn pending_deadline(&self, requested_at: Instant) -> Instant {
@@ -1260,6 +1303,14 @@ impl DownloadWindow {
             self.mark_peer_unresponsive(owner, now);
         }
         self.preferred_peer = Some(winner);
+        tracing::info!(
+            owner = %owner,
+            winner = %winner,
+            winner_is_owner = winner == owner,
+            blocks = probe.hashes.len(),
+            elapsed_ms = u64::try_from(now.duration_since(probe.started_at).as_millis()).unwrap_or(u64::MAX),
+            "block sync: prefix probe elected winner"
+        );
         metrics::counter!("node.sync.prefix_probe_wins").increment(1);
     }
 
@@ -1885,13 +1936,13 @@ mod tests {
 
         // Below the threshold: single-peer deep window — one peer can take
         // the full 128, so only one peer needs scanning.
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
         assert_eq!(window.request_peer_scan_limit(now), 1);
 
         // At the threshold: shallow per-peer cap engages and the scan fans
         // out to enough peers to fill the window (128 / 16 = 8).
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
         assert_eq!(window.request_peer_scan_limit(now), 8);
     }
@@ -1994,27 +2045,28 @@ mod tests {
             min_peers_for_fanout: 8,
             ..test_budget()
         });
+        let now = Instant::now();
 
         // Fresh window: disengaged until the threshold is reached.
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
 
         // One transient demotion at the threshold must not flap the mode.
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
 
         // A second peer dropping out is structural: disengage, and stay
         // disengaged at one-below until the full threshold returns.
-        window.set_fanout_eligible_peers(6);
+        window.set_fanout_eligible_peers(6, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
     }
 
@@ -3256,7 +3308,7 @@ mod tests {
         let (planned_owner, hashes, _) = window
             .prefix_probe_plan()
             .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
-        window.confirm_prefix_probe(planned_owner, hashes, &[first, second]);
+        window.confirm_prefix_probe(planned_owner, hashes, &[first, second], now);
 
         for (byte, source) in [(1_u8, first), (2, second), (3, first), (4, second)] {
             window.mark_received_from(hash(byte), 80, Some(source), now);
@@ -3271,8 +3323,59 @@ mod tests {
         Ok(())
     }
 
+    /// Direct window-boundary test for the bounded prefix-race-before-fanout
+    /// handoff: fanout cancels the probe at exactly `stall_timeout_initial`,
+    /// neither before nor after. The exact cross-tick boundary is pinned in
+    /// `sync::tests::tick_fanout_deferred_for_fresh_probe_engages_at_deadline`.
+
     #[test]
     fn fanout_cancels_prefix_probe_without_rearming_it() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let budget = SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        };
+        // Direct window-boundary pin: the deferral must expire at exactly
+        // `stall_timeout_initial`, not one tick beyond it. With the production
+        // `<` operator, an elapsed time equal to the budget makes the probe
+        // no longer fresh, so fanout engages at the deadline and clears the
+        // probe. Flipping the operator to `<=` would keep the probe young at
+        // the deadline and this assertion would fail (fanout stays deferred).
+        // The exact cross-tick boundary is tested in
+        // `sync::tests::tick_fanout_deferred_for_fresh_probe_engages_at_deadline`.
+        let stall_timeout_initial = budget.stall_timeout_initial;
+        let mut window = DownloadWindow::new(budget);
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, terminal_height) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        assert_eq!(terminal_height, 8);
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
+        assert!(window.prefix_probe.is_some());
+        // At exactly the `stall_timeout_initial` deadline (direct
+        // window-boundary): the bounded deferral expires, fanout engages, and
+        // the probe is cleared exactly as before the deferral existed.
+        let now = now + stall_timeout_initial;
+
+        window.set_fanout_eligible_peers(2, now);
+
+        assert!(window.prefix_probe.is_none());
+        window.set_fanout_eligible_peers(0, now);
+        assert!(window.prefix_probe_plan().is_none());
+        Ok(())
+    }
+
+    /// A fanout threshold transition during a fresh prefix probe retains the
+    /// probe and keeps fanout inactive: the bounded deferral holds engagement
+    /// while the one-shot race (age < `stall_timeout_initial`) is still in
+    /// flight, instead of cancelling it.
+    #[test]
+    fn fanout_threshold_during_fresh_probe_defers_engagement()
+    -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let owner = staller_addr();
         let alternate = healthy_addr();
@@ -3283,18 +3386,94 @@ mod tests {
         for height in 1..=8_u8 {
             insert_pending(&mut window, owner, hash(height), u32::from(height), now);
         }
-        let (planned_owner, hashes, terminal_height) = window
+        let (planned_owner, hashes, _) = window
             .prefix_probe_plan()
             .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
-        assert_eq!(terminal_height, 8);
-        window.confirm_prefix_probe(planned_owner, hashes, &[alternate]);
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
         assert!(window.prefix_probe.is_some());
 
-        window.set_fanout_eligible_peers(2);
+        // The eligible count reaches the fanout threshold while the probe is
+        // still younger than stall_timeout_initial (2s): fanout engagement is
+        // deferred and the probe survives.
+        window.set_fanout_eligible_peers(2, now);
 
-        assert!(window.prefix_probe.is_none());
-        window.set_fanout_eligible_peers(0);
-        assert!(window.prefix_probe_plan().is_none());
+        assert!(
+            !window.fanout_active(),
+            "fanout must stay deferred for a fresh probe"
+        );
+        assert!(
+            window.prefix_probe.is_some(),
+            "a fresh prefix probe must survive the threshold transition"
+        );
+        Ok(())
+    }
+
+    /// A probe cancellation before the deferral deadline lets fanout engage
+    /// immediately on the next evaluation, with no leftover deferral state.
+    /// This is the production path where the young-probe guard matters: a
+    /// winner sets `preferred_peer`, so [`configure_request_mode`] routes
+    /// through the preferred branch and never reaches the threshold
+    /// evaluation. A cancellation (racers drop below two in
+    /// [`DownloadWindow::release_disconnected_peers`]) clears the probe
+    /// without setting a preferred peer, so the next threshold evaluation is
+    /// the real path — and it must not be held by a deferral for a probe
+    /// that no longer exists.
+    ///
+    /// The test first proves the deferral itself: with a fresh live probe it
+    /// crosses the fanout threshold and asserts fanout stays off and the
+    /// probe survives. Only then does it cancel the probe and prove the next
+    /// threshold evaluation engages immediately — so the immediate-engagement
+    /// assertion is meaningful (the deferral was actually holding).
+    #[test]
+    fn probe_resolution_before_deadline_allows_fanout_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let mut window = DownloadWindow::new(SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        });
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
+        assert!(window.prefix_probe.is_some());
+
+        // First prove the deferral holds: cross the fanout threshold while
+        // the probe is fresh (age 0 < stall_timeout_initial). Fanout must stay
+        // off and the probe must survive — this is the guarded transition.
+        window.set_fanout_eligible_peers(2, now);
+        assert!(
+            !window.fanout_active(),
+            "a fresh live probe must defer the threshold transition"
+        );
+        assert!(
+            window.prefix_probe.is_some(),
+            "a fresh live probe must survive the threshold transition"
+        );
+
+        // The alternate disconnects before the deadline, dropping racers
+        // below two and cancelling the probe — without electing a winner or
+        // setting a preferred peer.
+        window.release_disconnected_peers(|peer| *peer != alternate);
+        assert!(window.prefix_probe.is_none(), "the probe must be cancelled");
+        assert!(
+            window.preferred_peer().is_none(),
+            "cancellation must not elect a winner"
+        );
+
+        // With the probe gone, the next threshold evaluation engages fanout
+        // immediately — the young-probe guard no longer holds and no
+        // deferral state lingers.
+        window.set_fanout_eligible_peers(2, now);
+        assert!(
+            window.fanout_active(),
+            "fanout must engage once the probe is cancelled"
+        );
         Ok(())
     }
 
@@ -3312,7 +3491,7 @@ mod tests {
         let (planned_owner, hashes, _) = window
             .prefix_probe_plan()
             .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
-        window.confirm_prefix_probe(planned_owner, hashes, &[disconnected, live_alternate]);
+        window.confirm_prefix_probe(planned_owner, hashes, &[disconnected, live_alternate], now);
         window.release_disconnected_peers(|peer| *peer != disconnected);
 
         for byte in 1..=4_u8 {
@@ -3337,7 +3516,7 @@ mod tests {
             .prefix_probe_plan()
             .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
         let loser = peer_addr(2);
-        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser]);
+        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser], now);
         for byte in 1..=4_u8 {
             window.mark_received_from(hash(byte), 80, Some(winner), now);
         }
