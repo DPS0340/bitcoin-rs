@@ -918,71 +918,55 @@ fn verify_block_transactions(
         }
         return Ok(());
     }
-    if !tx_plan.needs_local_utxo_overlay {
-        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
-        // Serial verification: measured on the 0->150k replay (U4 candidate 1,
-        // kernel backend), per-tx rayon fan-out on this path costs more than it
-        // wins — width 1 ran 57.3s vs 66.3s at default width — because shared
-        // UTXO-set reads contend and typical blocks are small. The overlay path
-        // below keeps its parallel verify: per-tx snapshots are contention-free
-        // and measured faster wide (73.5s vs 101.1s).
-        block.txdata.iter().try_for_each(|tx| {
+    // Full-verify: resolve every transaction's prevouts serially in block order
+    // into an owned `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec), then
+    // hand it to consensus, which runs the per-input script checks concurrently
+    // and returns the first failure in block order. Resolution is the only
+    // order-sensitive step: the overlay walk advances a `BlockLocalUtxoView` so a
+    // later transaction sees outputs an earlier one created (or spent) in the same
+    // block; the non-overlay case reads the committed shared set directly.
+    let resolved: Vec<Vec<Option<bitcoin::TxOut>>> = if tx_plan.needs_local_utxo_overlay {
+        let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
+        let mut resolved = Vec::with_capacity(block.txdata.len());
+        for (tx, txid) in block.txdata.iter().zip(txids) {
             if tx.is_coinbase() {
-                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                return Ok(());
+                resolved.push(Vec::new());
+                view.add_outputs(tx, *txid, height)?;
+                continue;
             }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_with_mtp(
-                tx,
-                &view,
-                height,
-                locktime_cutoff,
-                flags,
-            )
-        })?;
-        return Ok(());
-    }
-    // Consensus connects transactions in block order. A later transaction may
-    // spend an output created earlier in the same block. Coinbase outputs enter
-    // this view too, so maturity failures stay in the maturity pass instead of
-    // degrading into bogus missing-prevout script checks.
-    //
-    // Resolution is order-sensitive; script verification is not. Walk the block
-    // serially resolving each transaction's prevouts against the overlay frozen
-    // at its position (cheap map reads), then run the expensive script checks in
-    // parallel against the per-transaction snapshots. Each transaction sees
-    // byte-identical prevouts to the old interleaved serial loop; a prevout
-    // created later in the block (or already spent) is absent from its snapshot
-    // and fails verification exactly as before.
-    let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
-    let mut resolved: Vec<(
-        usize,
-        std::collections::BTreeMap<bitcoin::OutPoint, bitcoin::TxOut>,
-    )> = Vec::with_capacity(block.txdata.len());
-    for (index, (tx, txid)) in block.txdata.iter().zip(txids).enumerate() {
-        if tx.is_coinbase() {
-            bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
+            let inputs = tx
+                .input
+                .iter()
+                .map(|input| view.lookup(&input.previous_output))
+                .collect();
+            resolved.push(inputs);
+            view.spend_inputs(tx);
             view.add_outputs(tx, *txid, height)?;
-            continue;
         }
-        let mut prevouts = std::collections::BTreeMap::new();
-        for input in &tx.input {
-            if let Some(txout) = view.lookup(&input.previous_output) {
-                prevouts.insert(input.previous_output, txout);
-            }
-        }
-        resolved.push((index, prevouts));
-        view.spend_inputs(tx);
-        view.add_outputs(tx, *txid, height)?;
-    }
-    resolved.par_iter().try_for_each(|(index, prevouts)| {
-        bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_with_mtp(
-            &block.txdata[*index],
-            prevouts,
-            height,
-            locktime_cutoff,
-            flags,
-        )
-    })?;
+        resolved
+    } else {
+        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
+        block
+            .txdata
+            .iter()
+            .map(|tx| {
+                if tx.is_coinbase() {
+                    return Vec::new();
+                }
+                tx.input
+                    .iter()
+                    .map(|input| view.lookup(&input.previous_output))
+                    .collect()
+            })
+            .collect()
+    };
+    bitcoin_rs_consensus::verify_block_input_scripts(
+        &block.txdata,
+        resolved,
+        height,
+        locktime_cutoff,
+        flags,
+    )?;
     Ok(())
 }
 
@@ -1791,6 +1775,90 @@ mod consensus_rule_tests {
                 ref reason,
             }) if reason.starts_with("kernel script verification failed:")
         ));
+        Ok(())
+    }
+
+    /// The unified full-verify path resolves same-block spends in order (tx1 spends
+    /// tx0's output, forcing the overlay walk) yet still surfaces the *earlier*
+    /// transaction's script failure deterministically — the node rewrite preserves
+    /// error identity through `verify_block_input_scripts`. Feature-agnostic: the
+    /// Script reason differs between the portable and kernel engines, so only the
+    /// variant and input index are asserted.
+    #[test]
+    fn verify_block_transactions_same_block_spend_surfaces_earlier_bad_script()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::opcodes::all::OP_EQUAL;
+        use bitcoin::script::Builder;
+
+        let base_prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x68; 32]),
+            vout: 0,
+        };
+        let utxo = Arc::new(UtxoSet::new());
+        let mut changes = BlockChanges::default();
+        let txid = Hash256::from_le_bytes(base_prevout.txid.as_byte_array());
+        changes.add(UtxoAdd::new(
+            OutPoint::new(txid, base_prevout.vout),
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
+            },
+            false,
+            1,
+        ));
+        utxo.commit_block(&changes, &Hash256::from_le_bytes(&[9; 32]))?;
+        let handles = apply_handles(utxo);
+
+        // tx0 (funding) fails its script against the OP_EQUAL prevout.
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: base_prevout,
+                script_sig: Builder::new().push_int(7).push_int(8).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true_script(),
+            }],
+        };
+        let funding_outpoint = bitcoin::OutPoint {
+            txid: funding_tx.compute_txid(),
+            vout: 0,
+        };
+        // tx1 spends tx0's output inside the block, forcing the overlay walk.
+        let same_block_spend = spending_transaction_to_script(
+            funding_outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let block = block_with_transactions(vec![funding_tx, same_block_spend]);
+        let plan = tx_plan(&block);
+        assert!(plan.needs_local_utxo_overlay);
+
+        let error = match verify_block_transactions(
+            &handles,
+            &block,
+            &plan,
+            2,
+            0,
+            bitcoin_rs_script::VerifyFlags::MANDATORY,
+        ) {
+            Ok(()) => panic!("earlier tx bad script must reject the block"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
+                    input_index: 0,
+                    ..
+                })
+            ),
+            "expected earlier-tx Script error at input 0, got {error:?}"
+        );
         Ok(())
     }
 
