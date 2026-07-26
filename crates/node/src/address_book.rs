@@ -474,7 +474,7 @@ mod tests {
     use crate::Network;
 
     fn now() -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+        UNIX_EPOCH + Duration::from_hours(500_000)
     }
 
     fn addr(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(
             book.select(
                 1,
-                &filter(&active, &queued, &[], now() + Duration::from_secs(3_600))
+                &filter(&active, &queued, &[], now() + Duration::from_hours(1))
             ),
             vec![peer]
         );
