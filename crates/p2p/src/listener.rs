@@ -2,7 +2,7 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use bitcoin::p2p::Magic;
 use crossbeam_channel::Sender;
@@ -10,9 +10,6 @@ use parking_lot::RwLock;
 
 use thiserror::Error;
 
-use crate::discovery::{
-    PeerDiscoveryEvent, PeerTerminalOutcome, candidate_from_addr, candidate_from_addr_v2,
-};
 use crate::handshake::run_inbound_handshake;
 use crate::peer::Peer;
 
@@ -168,9 +165,11 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     Ok(())
 }
 
-/// Spawns an outbound TCP connection and enters the shared message loop.
+/// Spawns an outbound TCP connection to `addr`, performs the outbound P2P
+/// handshake, and enters the same message loop the inbound path uses.
 ///
-/// This compatibility entry point does not request or emit peer discovery.
+/// Returns a `JoinHandle` for the spawned thread. Errors during connect or
+/// handshake bubble up via the `JoinHandle`'s `Result`.
 #[allow(clippy::needless_pass_by_value)]
 pub fn spawn_outbound_connection(
     addr: SocketAddr,
@@ -181,7 +180,7 @@ pub fn spawn_outbound_connection(
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
-    spawn_outbound_connection_with_chain_sync_and_discovery(
+    spawn_outbound_connection_with_chain_and_sync_wake(
         addr,
         magic,
         peer_registry,
@@ -191,13 +190,10 @@ pub fn spawn_outbound_connection(
         banned,
         None,
         None,
-        None,
     )
 }
 
 /// Spawns an outbound connection with active-chain and sync-wake handles.
-///
-/// This compatibility entry point does not request or emit peer discovery.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     addr: SocketAddr,
@@ -210,40 +206,11 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
-    spawn_outbound_connection_with_chain_sync_and_discovery(
-        addr,
-        magic,
-        peer_registry,
-        peer_outbound,
-        inbound_headers_tx,
-        inbound_blocks_tx,
-        banned,
-        chain_query,
-        sync_wake_tx,
-        None,
-    )
-}
-
-/// Spawns an outbound connection with chain, sync-wake, and discovery handles.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-pub fn spawn_outbound_connection_with_chain_sync_and_discovery(
-    addr: SocketAddr,
-    magic: Magic,
-    peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
-    inbound_blocks_tx: Sender<crate::InboundBlock>,
-    banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
-    chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
-    sync_wake_tx: Option<Sender<()>>,
-    discovery_tx: Option<Sender<PeerDiscoveryEvent>>,
-) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
         blocks_tx: inbound_blocks_tx,
         wake_tx: sync_wake_tx,
     };
-    let spawn_failure_tx = discovery_tx.clone();
     let thread_name = format!("bitcoin-rs-p2p-outbound-{addr}");
     let result = std::thread::Builder::new()
         .name(thread_name)
@@ -256,7 +223,6 @@ pub fn spawn_outbound_connection_with_chain_sync_and_discovery(
                 &inbound_sync_sinks,
                 &banned,
                 &chain_query,
-                discovery_tx.as_ref(),
             )
         });
 
@@ -267,15 +233,6 @@ pub fn spawn_outbound_connection_with_chain_sync_and_discovery(
                 addr = %addr,
                 %error,
                 "p2p outbound spawn failed",
-            );
-            send_discovery_event(
-                spawn_failure_tx.as_ref(),
-                PeerDiscoveryEvent::Terminal {
-                    addr,
-                    handshake_completed: false,
-                    connected_for: None,
-                    outcome: PeerTerminalOutcome::Io,
-                },
             );
             std::thread::spawn(move || Err(crate::wire::PeerError::Io(error)))
         }
@@ -290,46 +247,7 @@ fn run_outbound_connection(
     inbound_sync_sinks: &InboundSyncSinks,
     banned: &RwLock<Vec<crate::BannedSubnet>>,
     chain_query: &ChainQueryHandle,
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
 ) -> Result<(), crate::wire::PeerError> {
-    let mut handshake_completed = false;
-    let mut ready_at = None;
-    let detailed_result = run_outbound_connection_inner(
-        addr,
-        magic,
-        peer_registry,
-        peer_outbound,
-        inbound_sync_sinks,
-        banned,
-        chain_query,
-        discovery_tx,
-        &mut handshake_completed,
-        &mut ready_at,
-    );
-    send_terminal_event(
-        discovery_tx,
-        addr,
-        handshake_completed,
-        ready_at,
-        &detailed_result,
-        Instant::now(),
-    );
-    detailed_result.map(|_| ())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_outbound_connection_inner(
-    addr: SocketAddr,
-    magic: Magic,
-    peer_registry: &RwLock<Vec<crate::PeerInfo>>,
-    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
-    inbound_sync_sinks: &InboundSyncSinks,
-    banned: &RwLock<Vec<crate::BannedSubnet>>,
-    chain_query: &ChainQueryHandle,
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-    handshake_completed: &mut bool,
-    ready_at: &mut Option<Instant>,
-) -> Result<PeerTerminalOutcome, crate::wire::PeerError> {
     if crate::subnet::is_banned(&banned.read(), addr.ip(), SystemTime::now()) {
         return Err(crate::wire::PeerError::BannedDestination(addr.ip()));
     }
@@ -346,16 +264,13 @@ fn run_outbound_connection_inner(
     let nonce = generate_nonce(addr);
     let mut peer = Peer::new(stream, magic);
     run_outbound_handshake(&mut peer, nonce, 0)?;
-    *handshake_completed = true;
-    *ready_at = Some(Instant::now());
 
     let Some(remote_version) = peer.remote_version.as_ref() else {
         return Err(crate::wire::PeerError::Protocol(
             "missing remote version after outbound handshake",
         ));
     };
-    let remote_services = remote_version.services;
-    let conn_time = SystemTime::now()
+    let conn_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let info = crate::PeerInfo::outbound_from_version(addr, remote_version, conn_time);
@@ -369,7 +284,6 @@ fn run_outbound_connection_inner(
     let writer = spawn_connection_writer(writer_stream, magic, outbound_rx, addr)
         .map_err(crate::wire::PeerError::Io)?;
     peer_outbound.write().insert(addr, outbound_tx.clone());
-    begin_peer_discovery(discovery_tx, &outbound_tx, addr, remote_services);
 
     tracing::info!(
         peer_addr = %addr,
@@ -387,7 +301,6 @@ fn run_outbound_connection_inner(
             peer_outbound,
             inbound_sync_sinks,
             chain_query.as_deref(),
-            discovery_tx,
         )
     })();
 
@@ -423,89 +336,6 @@ fn run_outbound_handshake<S: std::io::Read + std::io::Write>(
     }
 
     Ok(())
-}
-
-fn begin_peer_discovery(
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-    outbound_tx: &Sender<crate::Message>,
-    addr: SocketAddr,
-    services: bitcoin::p2p::ServiceFlags,
-) {
-    let Some(discovery_tx) = discovery_tx else {
-        return;
-    };
-    let _ = discovery_tx.try_send(PeerDiscoveryEvent::HandshakeReady { addr, services });
-    let _ = outbound_tx.try_send(bitcoin::p2p::message::NetworkMessage::GetAddr);
-}
-
-fn send_announced_peers(
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-    message: &bitcoin::p2p::message::NetworkMessage,
-) {
-    let Some(discovery_tx) = discovery_tx else {
-        return;
-    };
-    match message {
-        bitcoin::p2p::message::NetworkMessage::Addr(entries) => {
-            for (time, address) in entries {
-                if let Some(candidate) = candidate_from_addr(*time, address) {
-                    let _ = discovery_tx.try_send(PeerDiscoveryEvent::Announced(candidate));
-                }
-            }
-        }
-        bitcoin::p2p::message::NetworkMessage::AddrV2(entries) => {
-            for entry in entries {
-                if let Some(candidate) = candidate_from_addr_v2(entry) {
-                    let _ = discovery_tx.try_send(PeerDiscoveryEvent::Announced(candidate));
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn send_terminal_event(
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-    addr: SocketAddr,
-    handshake_completed: bool,
-    ready_at: Option<Instant>,
-    result: &Result<PeerTerminalOutcome, crate::wire::PeerError>,
-    finished_at: Instant,
-) {
-    let outcome = match result {
-        Ok(outcome) => *outcome,
-        Err(crate::wire::PeerError::Io(_)) => PeerTerminalOutcome::Io,
-        Err(
-            crate::wire::PeerError::BannedDestination(_)
-            | crate::wire::PeerError::InvalidBanEntry(_),
-        ) => PeerTerminalOutcome::Policy,
-        Err(
-            crate::wire::PeerError::Encode(_)
-            | crate::wire::PeerError::InvalidCommand(_)
-            | crate::wire::PeerError::WrongNetwork { .. }
-            | crate::wire::PeerError::PayloadTooLarge(_)
-            | crate::wire::PeerError::BadChecksum
-            | crate::wire::PeerError::Protocol(_),
-        ) => PeerTerminalOutcome::Protocol,
-    };
-    send_discovery_event(
-        discovery_tx,
-        PeerDiscoveryEvent::Terminal {
-            addr,
-            handshake_completed,
-            connected_for: ready_at.map(|started| finished_at.saturating_duration_since(started)),
-            outcome,
-        },
-    );
-}
-
-fn send_discovery_event(
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-    event: PeerDiscoveryEvent,
-) {
-    if let Some(discovery_tx) = discovery_tx {
-        let _ = discovery_tx.try_send(event);
-    }
 }
 
 fn spawn_handshake_thread(
@@ -608,7 +438,6 @@ fn run_handshake(
             peer_outbound,
             inbound_sync_sinks,
             chain_query.as_deref(),
-            None,
         )
     })();
 
@@ -622,7 +451,7 @@ fn run_handshake(
     } else {
         tracing::debug!(peer_addr = %peer_addr, "p2p peer disconnected cleanly");
     }
-    loop_result.map(|_| ())
+    loop_result
 }
 
 fn run_message_loop<S: std::io::Read + std::io::Write>(
@@ -632,8 +461,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
     inbound_sync_sinks: &InboundSyncSinks,
     chain_query: Option<&dyn crate::dispatch::ChainQuery>,
-    discovery_tx: Option<&Sender<PeerDiscoveryEvent>>,
-) -> Result<PeerTerminalOutcome, crate::wire::PeerError> {
+) -> Result<(), crate::wire::PeerError> {
     use crate::peer::PeerState;
     use std::time::Instant;
 
@@ -643,7 +471,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 
     loop {
         if peer.state == PeerState::Disconnecting {
-            return Ok(PeerTerminalOutcome::Clean);
+            return Ok(());
         }
 
         // The peer's entry in `peer_outbound` is the connection's lease: it
@@ -654,12 +482,12 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
         // latency.
         if !peer_outbound.read().contains_key(&peer_addr) {
             tracing::debug!(peer_addr = %peer_addr, "p2p peer lease revoked; closing");
-            return Ok(PeerTerminalOutcome::Other);
+            return Ok(());
         }
 
         if last_inbound.elapsed() >= IDLE_DISCONNECT {
             tracing::debug!(peer_addr = %peer_addr, "p2p peer idle 60s; closing");
-            return Ok(PeerTerminalOutcome::Other);
+            return Ok(());
         }
 
         match crate::wire::read_message(&mut peer.stream, peer.magic) {
@@ -670,7 +498,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     command = ?std::mem::discriminant(&message),
                     "p2p message received",
                 );
-                send_announced_peers(discovery_tx, &message);
                 let responses =
                     crate::dispatch::dispatch_inbound_with_chain(peer, &message, chain_query)?;
                 match message {
@@ -684,7 +511,9 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 }
                 for response in responses {
                     if outbound_tx.send(response).is_err() {
-                        return Ok(PeerTerminalOutcome::Other);
+                        return Err(crate::wire::PeerError::Protocol(
+                            "outbound writer disconnected",
+                        ));
                     }
                 }
             }
@@ -747,17 +576,11 @@ fn generate_nonce(peer_addr: SocketAddr) -> u64 {
 mod outbound_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::sync::Arc;
-    use std::time::Duration;
 
-    use bitcoin::p2p::{Magic, ServiceFlags, address::Address, message::NetworkMessage};
+    use bitcoin::p2p::Magic;
     use parking_lot::RwLock;
 
-    use super::{
-        run_inbound_handshake, spawn_outbound_connection,
-        spawn_outbound_connection_with_chain_sync_and_discovery,
-    };
-    use crate::discovery::{PeerDiscoveryEvent, PeerTerminalOutcome};
-    use crate::peer::Peer;
+    use super::spawn_outbound_connection;
 
     #[test]
     fn spawn_outbound_connection_to_closed_port_fails_quickly()
@@ -793,139 +616,11 @@ mod outbound_tests {
 
         Ok(())
     }
-
-    #[test]
-    fn discovery_spawn_emits_one_terminal_for_connect_failure()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-        let registry = Arc::new(RwLock::new(Vec::new()));
-        let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
-        let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
-        let banned = Arc::new(RwLock::new(Vec::new()));
-        let (discovery_tx, discovery_rx) = crossbeam_channel::bounded(2);
-
-        let handle = spawn_outbound_connection_with_chain_sync_and_discovery(
-            addr,
-            Magic::BITCOIN,
-            registry,
-            outbound,
-            headers_tx,
-            blocks_tx,
-            banned,
-            None,
-            None,
-            Some(discovery_tx),
-        );
-        let inner = match handle.join() {
-            Ok(inner) => inner,
-            Err(error) => std::panic::resume_unwind(error),
-        };
-        assert!(inner.is_err());
-        assert_eq!(
-            discovery_rx.try_recv()?,
-            PeerDiscoveryEvent::Terminal {
-                addr,
-                handshake_completed: false,
-                connected_for: None,
-                outcome: PeerTerminalOutcome::Io,
-            }
-        );
-        assert!(
-            discovery_rx.try_recv().is_err(),
-            "terminal must be emitted once"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn discovery_spawn_routes_handshake_getaddr_announcement_and_terminal()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
-        let addr = listener.local_addr()?;
-        let announced_addr = SocketAddr::from(([1, 1, 1, 1], 8333));
-        let server = std::thread::spawn(move || -> Result<(), crate::wire::PeerError> {
-            let (stream, peer_addr) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-            let mut peer = Peer::new(stream, Magic::BITCOIN);
-            run_inbound_handshake(&mut peer, 7, 0)?;
-            let (message, _) = crate::wire::read_message(&mut peer.stream, Magic::BITCOIN)?;
-            if !matches!(message, NetworkMessage::GetAddr) {
-                return Err(crate::wire::PeerError::Protocol(
-                    "expected getaddr after outbound handshake",
-                ));
-            }
-            peer.send(&NetworkMessage::Addr(vec![(
-                1,
-                Address::new(&announced_addr, ServiceFlags::WITNESS),
-            )]))?;
-            tracing::trace!(%peer_addr, "test discovery peer closing");
-            Ok(())
-        });
-
-        let registry = Arc::new(RwLock::new(Vec::new()));
-        let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
-        let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
-        let banned = Arc::new(RwLock::new(Vec::new()));
-        let (discovery_tx, discovery_rx) = crossbeam_channel::bounded(4);
-        let client = spawn_outbound_connection_with_chain_sync_and_discovery(
-            addr,
-            Magic::BITCOIN,
-            registry,
-            outbound,
-            headers_tx,
-            blocks_tx,
-            banned,
-            None,
-            None,
-            Some(discovery_tx),
-        );
-
-        let server_result = match server.join() {
-            Ok(result) => result,
-            Err(error) => std::panic::resume_unwind(error),
-        };
-        server_result?;
-        let client_result = match client.join() {
-            Ok(result) => result,
-            Err(error) => std::panic::resume_unwind(error),
-        };
-        assert!(client_result.is_err(), "server close must end the client");
-
-        let events: Vec<_> = discovery_rx.try_iter().collect();
-        assert_eq!(events.len(), 3);
-        assert!(matches!(
-            events[0],
-            PeerDiscoveryEvent::HandshakeReady { addr: event_addr, services }
-                if event_addr == addr
-                    && services.has(ServiceFlags::NETWORK)
-                    && services.has(ServiceFlags::WITNESS)
-        ));
-        assert!(matches!(
-            events[1],
-            PeerDiscoveryEvent::Announced(candidate)
-                if candidate.addr == announced_addr
-        ));
-        assert!(matches!(
-            events[2],
-            PeerDiscoveryEvent::Terminal {
-                addr: event_addr,
-                handshake_completed: true,
-                connected_for: Some(_),
-                outcome: PeerTerminalOutcome::Io,
-            } if event_addr == addr
-        ));
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod lease_tests {
-    use std::io::{self, Cursor};
+    use std::io;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
@@ -933,7 +628,6 @@ mod lease_tests {
     use parking_lot::RwLock;
 
     use super::{InboundSyncSinks, run_message_loop};
-    use crate::discovery::PeerTerminalOutcome;
     use crate::peer::{Peer, PeerState};
 
     type OutboundMap =
@@ -1030,10 +724,9 @@ mod lease_tests {
             &peer_outbound,
             &sinks(),
             None,
-            None,
         );
 
-        assert!(matches!(result, Ok(PeerTerminalOutcome::Other)));
+        assert!(result.is_ok(), "revoked lease must close the loop cleanly");
     }
 
     #[test]
@@ -1058,42 +751,13 @@ mod lease_tests {
             &peer_outbound,
             &sinks(),
             None,
-            None,
         );
 
-        assert!(matches!(result, Ok(PeerTerminalOutcome::Other)));
+        assert!(
+            result.is_ok(),
+            "lease revocation mid-loop must close the loop cleanly"
+        );
         assert!(!peer_outbound.read().contains_key(&addr));
-    }
-
-    #[test]
-    fn message_loop_classifies_local_writer_loss_as_other() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_446));
-        let peer_outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
-        drop(outbound_rx);
-        peer_outbound.write().insert(addr, outbound_tx.clone());
-        let mut wire = Vec::new();
-        crate::wire::write_message(
-            &mut wire,
-            Magic::BITCOIN,
-            &bitcoin::p2p::message::NetworkMessage::Ping(1),
-        )?;
-        let mut peer = Peer::new(Cursor::new(wire), Magic::BITCOIN);
-        peer.state = PeerState::Ready;
-
-        let result = run_message_loop(
-            &mut peer,
-            addr,
-            &outbound_tx,
-            &peer_outbound,
-            &sinks(),
-            None,
-            None,
-        );
-
-        assert!(matches!(result, Ok(PeerTerminalOutcome::Other)));
-        Ok(())
     }
 }
 
@@ -1114,179 +778,5 @@ mod sync_wake_tests {
     #[test]
     fn missing_sync_wake_is_noop() {
         wake_sync(None);
-    }
-}
-
-#[cfg(test)]
-mod discovery_tests {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::time::{Duration, Instant};
-
-    use bitcoin::p2p::{
-        ServiceFlags,
-        address::{AddrV2, AddrV2Message, Address},
-        message::NetworkMessage,
-    };
-
-    use crate::discovery::{PeerDiscoveryEvent, PeerTerminalOutcome};
-
-    use super::{begin_peer_discovery, send_announced_peers, send_terminal_event};
-
-    fn public_addr(octets: [u8; 4]) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), 8333))
-    }
-
-    #[test]
-    fn discovery_lifecycle_is_ordered_and_bounded() -> Result<(), Box<dyn std::error::Error>> {
-        let peer_addr = public_addr([8, 8, 8, 8]);
-        let announced_addr = public_addr([8, 8, 4, 4]);
-        let (discovery_tx, discovery_rx) = crossbeam_channel::bounded(3);
-        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
-        let started = Instant::now();
-
-        begin_peer_discovery(
-            Some(&discovery_tx),
-            &outbound_tx,
-            peer_addr,
-            ServiceFlags::NETWORK,
-        );
-        let announced = NetworkMessage::Addr(vec![(
-            1,
-            Address::new(&announced_addr, ServiceFlags::WITNESS),
-        )]);
-        send_announced_peers(Some(&discovery_tx), &announced);
-        send_terminal_event(
-            Some(&discovery_tx),
-            peer_addr,
-            true,
-            Some(started),
-            &Ok(PeerTerminalOutcome::Clean),
-            started + Duration::from_secs(3),
-        );
-
-        assert!(matches!(outbound_rx.try_recv()?, NetworkMessage::GetAddr));
-        assert!(outbound_rx.try_recv().is_err(), "getaddr must be one-shot");
-        let events: Vec<_> = discovery_rx.try_iter().collect();
-        assert_eq!(
-            events,
-            vec![
-                PeerDiscoveryEvent::HandshakeReady {
-                    addr: peer_addr,
-                    services: ServiceFlags::NETWORK,
-                },
-                PeerDiscoveryEvent::Announced(crate::discovery::DiscoveredPeer {
-                    addr: announced_addr,
-                    services: ServiceFlags::WITNESS,
-                    seen_at: 1,
-                }),
-                PeerDiscoveryEvent::Terminal {
-                    addr: peer_addr,
-                    handshake_completed: true,
-                    connected_for: Some(Duration::from_secs(3)),
-                    outcome: PeerTerminalOutcome::Clean,
-                },
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn addrv2_announcements_are_filtered() {
-        let (discovery_tx, discovery_rx) = crossbeam_channel::bounded(2);
-        let valid = AddrV2Message {
-            time: 1,
-            services: ServiceFlags::NETWORK,
-            addr: AddrV2::Ipv4(Ipv4Addr::new(1, 1, 1, 1)),
-            port: 8333,
-        };
-        let private = AddrV2Message {
-            time: 1,
-            services: ServiceFlags::NETWORK,
-            addr: AddrV2::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),
-            port: 8333,
-        };
-
-        send_announced_peers(
-            Some(&discovery_tx),
-            &NetworkMessage::AddrV2(vec![private, valid]),
-        );
-
-        let events: Vec<_> = discovery_rx.try_iter().collect();
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], PeerDiscoveryEvent::Announced(_)));
-    }
-
-    #[test]
-    fn discovery_backpressure_never_blocks_getaddr() -> Result<(), Box<dyn std::error::Error>> {
-        let addr = public_addr([8, 8, 8, 8]);
-        let (discovery_tx, discovery_rx) = crossbeam_channel::bounded(1);
-        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
-        discovery_tx.try_send(PeerDiscoveryEvent::HandshakeReady {
-            addr,
-            services: ServiceFlags::NETWORK,
-        })?;
-
-        begin_peer_discovery(
-            Some(&discovery_tx),
-            &outbound_tx,
-            addr,
-            ServiceFlags::NETWORK,
-        );
-
-        assert!(matches!(outbound_rx.try_recv()?, NetworkMessage::GetAddr));
-        assert_eq!(discovery_rx.try_iter().count(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn missing_discovery_sink_preserves_message_stream() {
-        let addr = public_addr([8, 8, 8, 8]);
-        let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded();
-
-        begin_peer_discovery(None, &outbound_tx, addr, ServiceFlags::NETWORK);
-        send_announced_peers(
-            None,
-            &NetworkMessage::Addr(vec![(1, Address::new(&addr, ServiceFlags::NETWORK))]),
-        );
-
-        assert!(outbound_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn terminal_errors_have_stable_small_classifications() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let addr = public_addr([8, 8, 8, 8]);
-        let cases = [
-            (
-                crate::wire::PeerError::Io(std::io::ErrorKind::ConnectionReset.into()),
-                PeerTerminalOutcome::Io,
-            ),
-            (
-                crate::wire::PeerError::Protocol("bad message"),
-                PeerTerminalOutcome::Protocol,
-            ),
-            (
-                crate::wire::PeerError::BannedDestination(addr.ip()),
-                PeerTerminalOutcome::Policy,
-            ),
-        ];
-
-        for (error, expected) in cases {
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            send_terminal_event(Some(&tx), addr, false, None, &Err(error), Instant::now());
-            let PeerDiscoveryEvent::Terminal {
-                handshake_completed,
-                connected_for,
-                outcome,
-                ..
-            } = rx.try_recv()?
-            else {
-                return Err(std::io::Error::other("expected terminal event").into());
-            };
-            assert!(!handshake_completed);
-            assert_eq!(connected_for, None);
-            assert_eq!(outcome, expected);
-        }
-        Ok(())
     }
 }

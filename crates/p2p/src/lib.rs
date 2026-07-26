@@ -5,8 +5,6 @@
 pub mod addrv2;
 /// Peer banning and persistence.
 pub mod banlist;
-/// Peer discovery events and address filtering.
-pub mod discovery;
 /// Inbound message dispatcher.
 pub mod dispatch;
 /// Peer finite-state machine.
