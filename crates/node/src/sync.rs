@@ -18,7 +18,7 @@ use bitcoin::BlockHash;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_p2p::InboundBlock;
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
@@ -193,17 +193,20 @@ fn configure_request_mode(
         .iter()
         .filter(|candidate| candidate.fanout_eligible)
         .count();
-    let preferred = window.preferred_peer().and_then(|addr| {
+    let preferred_addr = window.preferred_peer();
+    let preferred_candidate = preferred_addr.and_then(|addr| {
         candidates
             .iter()
-            .find(|candidate| candidate.peer.addr == addr && !candidate.soft_blocked)
-            .map(|candidate| candidate.peer)
+            .find(|candidate| candidate.peer.addr == addr)
     });
-    if eligible < window.min_peers_for_fanout() && preferred.is_some() {
+    let preferred = preferred_candidate
+        .filter(|candidate| !candidate.soft_blocked)
+        .map(|candidate| candidate.peer);
+    if eligible < window.min_peers_for_fanout() && preferred_candidate.is_some() {
         window.set_fanout_eligible_peers(0, now);
         return preferred;
     }
-    if window.preferred_peer().is_some() {
+    if preferred_addr.is_some() {
         window.clear_preferred_peer();
     }
     window.set_fanout_eligible_peers(eligible, now);
@@ -442,6 +445,17 @@ impl BlockSync {
         false
     }
 
+    /// Uses the active-chain height index only while the applied tip is its prefix.
+    ///
+    /// During a header-first reorg the caller retains old-height blocks rather
+    /// than walking the applied ancestry or dropping a body from the new branch.
+    fn indexed_applied_ancestry_tip(tree: &BlockTree, applied_tip: &TipSnapshot) -> Option<NodeId> {
+        let active_tip = tree.tip()?;
+        (tree.node_at_height_from(active_tip.tip_id, applied_tip.height)
+            == Some(applied_tip.tip_id))
+        .then_some(active_tip.tip_id)
+    }
+
     fn buffer_received_block_chunk(
         &self,
         blocks: &mut Vec<InboundBlock>,
@@ -452,6 +466,7 @@ impl BlockSync {
         // side-chain block at the same or lower height must remain eligible.
         if let Some(applied_tip) = self.handles.applied_tip.load_full() {
             let tree = self.handles.block_tree.read();
+            let indexed_tip = Self::indexed_applied_ancestry_tip(&tree, &applied_tip);
             blocks.retain(|inbound| {
                 let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
                 let Some(node_id) = tree.lookup(hash) else {
@@ -461,7 +476,9 @@ impl BlockSync {
                     return true;
                 };
                 node.height > applied_tip.height
-                    || tree.node_at_height_from(applied_tip.tip_id, node.height) != Some(node_id)
+                    || indexed_tip.is_none_or(|tip_id| {
+                        tree.node_at_height_from(tip_id, node.height) != Some(node_id)
+                    })
             });
         }
         let mut staged_blocks = Vec::with_capacity(blocks.len());
@@ -3056,6 +3073,15 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(peer_outbound.read().contains_key(&owner));
+        sync.download_window
+            .lock()
+            .mark_peer_unresponsive(alternate, Instant::now());
+        sync.tick();
+        assert_eq!(
+            sync.download_window.lock().preferred_peer(),
+            Some(alternate),
+            "a temporary soft block skips the winner without erasing its election"
+        );
         Ok(())
     }
 
@@ -3123,9 +3149,67 @@ mod tests {
     }
 
     #[test]
-    fn late_duplicate_of_applied_block_is_not_staged() -> Result<(), Box<dyn std::error::Error>> {
+    fn applied_ancestry_lookup_uses_active_index_only_for_applied_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let main1 =
+            mined_block_with_prev_hash(genesis.block_hash(), 1, vec![coinbase_transaction(1)]);
+        let main2 =
+            mined_block_with_prev_hash(main1.block_hash(), 2, vec![coinbase_transaction(2)]);
+        let main3 =
+            mined_block_with_prev_hash(main2.block_hash(), 3, vec![coinbase_transaction(3)]);
+        let main4 =
+            mined_block_with_prev_hash(main3.block_hash(), 4, vec![coinbase_transaction(4)]);
+        let mut tree = BlockTree::new();
+        let genesis_id = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+        let main1_id = tree.insert_node(Some(genesis_id), main1.header, NodeStatus::HeaderValid)?;
+        let main2_id = tree.insert_node(Some(main1_id), main2.header, NodeStatus::HeaderValid)?;
+        let applied_tip = tree
+            .tip()
+            .ok_or_else(|| std::io::Error::other("main tip was not published"))?;
+        let main3_id = tree.insert_node(Some(main2_id), main3.header, NodeStatus::HeaderValid)?;
+        tree.insert_node(Some(main3_id), main4.header, NodeStatus::HeaderValid)?;
+        let active_tip = tree
+            .tip()
+            .ok_or_else(|| std::io::Error::other("extended main tip was not published"))?;
+
+        assert_eq!(
+            BlockSync::indexed_applied_ancestry_tip(&tree, &applied_tip),
+            Some(active_tip.tip_id),
+            "an applied prefix must use the indexed active tip"
+        );
+
+        let mut fork_parent = genesis_id;
+        let mut fork_prev = genesis.block_hash();
+        for height in 1_u32..=5 {
+            let fork = mined_block_with_prev_hash(
+                fork_prev,
+                height.saturating_add(100),
+                vec![coinbase_transaction(height.saturating_add(100))],
+            );
+            fork_prev = fork.block_hash();
+            fork_parent =
+                tree.insert_node(Some(fork_parent), fork.header, NodeStatus::HeaderValid)?;
+        }
+        assert_ne!(
+            tree.tip()
+                .ok_or_else(|| std::io::Error::other("fork tip was not published"))?
+                .tip_id,
+            active_tip.tip_id
+        );
+        assert_eq!(
+            BlockSync::indexed_applied_ancestry_tip(&tree, &applied_tip),
+            None,
+            "an applied tip outside the active header chain must retain side-chain bodies"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn far_behind_duplicate_of_applied_block_is_not_staged()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, applied_tip, blocks, blocks_tx) =
-            sync_with_mined_chain(1)?;
+            sync_with_mined_chain(64)?;
         let peer = test_addr(9321, 0)?;
         let rx = connect_peer(&peers, &peer_outbound, eligible_peer(peer, 100));
 
@@ -3133,27 +3217,38 @@ mod tests {
         let requested = next_getdata(&rx)?;
         assert_eq!(
             witness_block_inventory(requested)?,
-            alloc::vec![blocks[0].block_hash()]
+            blocks
+                .iter()
+                .map(bitcoin::Block::block_hash)
+                .collect::<Vec<_>>()
         );
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[0].clone(),
-        ))?;
+        for block in &blocks {
+            blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))?;
+        }
         sync.tick();
         assert_eq!(
             applied_tip
                 .load_full()
                 .ok_or_else(|| std::io::Error::other("apply did not publish tip"))?
                 .height,
-            1
+            64
+        );
+        let stale_hash = Hash256::from_le_bytes(blocks[0].block_hash().as_byte_array());
+        assert!(
+            !sync.download_window.lock().contains_pending(&stale_hash),
+            "the replay must be unsolicited after its request was applied"
         );
 
         blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
             blocks[0].clone(),
         ))?;
-        sync.drain_inbound_blocks();
+        sync.tick();
 
-        assert_eq!(sync.block_stager.lock().received_len(), 0);
-        assert_eq!(sync.download_window.lock().received_len(), 0);
+        assert!(!sync.block_stager.lock().contains(&stale_hash));
+        let window = sync.download_window.lock();
+        assert_eq!(window.pending_len(), 0);
+        assert_eq!(window.received_len(), 0);
+        assert!(!window.contains_pending(&stale_hash));
         Ok(())
     }
 

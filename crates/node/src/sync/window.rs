@@ -172,6 +172,10 @@ const MAX_COLD_FRONT_HEDGES: usize = 2;
 const PREFIX_PROBE_BLOCK_LIMIT: usize = 8;
 /// A peer must deliver the first four accepted prefix blocks to win.
 const PREFIX_PROBE_WIN_BLOCKS: usize = 4;
+const _: () = assert!(PREFIX_PROBE_WIN_BLOCKS > 0);
+const _: () = assert!(PREFIX_PROBE_WIN_BLOCKS <= PREFIX_PROBE_BLOCK_LIMIT);
+const _: () = assert!(PREFIX_PROBE_BLOCK_LIMIT <= 8);
+const PREFIX_PROBE_WIN_MASK: u8 = (1_u8 << PREFIX_PROBE_WIN_BLOCKS) - 1;
 /// Estimated duplicate bytes per alternate during the one-shot probe.
 const PREFIX_PROBE_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
 
@@ -1047,12 +1051,20 @@ impl DownloadWindow {
         if cancel_probe {
             self.prefix_probe = None;
         }
+        self.retain_peer_assignments(is_live_peer);
+    }
+
+    fn release_peer_assignments(&mut self, peer_addr: SocketAddr) {
+        self.retain_peer_assignments(|peer| *peer != peer_addr);
+    }
+
+    fn retain_peer_assignments(&mut self, retain_peer: impl Fn(&SocketAddr) -> bool) {
         let mut retry_height = self.next_request_height;
         let mut removed_earliest_deadline = false;
         let pending_timeout = self.budget.pending_timeout;
         let next_pending_deadline = self.next_pending_deadline;
         self.pending.retain(|_hash, pending| {
-            if is_live_peer(&pending.peer_addr) {
+            if retain_peer(&pending.peer_addr) {
                 return true;
             }
             retry_height = retry_height.min(pending.height);
@@ -1067,7 +1079,7 @@ impl DownloadWindow {
             false
         });
         self.peer_inflight
-            .retain(|peer, _inflight| is_live_peer(peer));
+            .retain(|peer, _inflight| retain_peer(peer));
         if removed_earliest_deadline {
             self.refresh_next_pending_deadline();
         }
@@ -1289,7 +1301,7 @@ impl DownloadWindow {
         if let Some(progress) = delivery_peer.and_then(|peer| probe.racers.get_mut(&peer)) {
             *progress |= bit;
         }
-        let win_mask = (1_u8 << u32::try_from(PREFIX_PROBE_WIN_BLOCKS).unwrap_or(0)) - 1;
+        let win_mask = PREFIX_PROBE_WIN_MASK;
         let winner = probe
             .racers
             .iter()
@@ -1303,7 +1315,7 @@ impl DownloadWindow {
         let owner = probe.owner;
         self.cold_front = None;
         self.pending_timeout_observation = None;
-        self.release_disconnected_peers(|peer| *peer == winner);
+        self.retain_peer_assignments(|peer| *peer == winner || !probe.racers.contains_key(peer));
         if winner != owner {
             self.mark_peer_unresponsive(owner, now);
         }
@@ -1350,7 +1362,7 @@ impl DownloadWindow {
                     self.pending_timeout_observation = None;
                 }
                 self.prefix_probe = None;
-                self.release_disconnected_peers(|peer| *peer != owner);
+                self.release_peer_assignments(owner);
                 self.mark_peer_unresponsive(owner, now);
                 self.preferred_peer = Some(alternate);
                 metrics::counter!("node.sync.cold_front_wins").increment(1);
@@ -1732,6 +1744,24 @@ mod tests {
         assert_eq!(window.observe_pending_timeout(false, observed_at), None);
         window.mark_received(block_hash, 80, observed_at);
         assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
+    }
+
+    #[test]
+    fn pending_timeout_apply_busy_clears_suspicion_without_blame() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = staller_addr();
+        insert_pending(&mut window, peer_addr, hash(0x92), 1, requested_at);
+
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+        assert_eq!(window.observe_pending_timeout(true, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
         assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
     }
 
@@ -3301,6 +3331,24 @@ mod tests {
     }
 
     #[test]
+    fn cold_front_distinct_hedge_cap_blocks_another_probe() {
+        let now = Instant::now();
+        let mut window = DownloadWindow::new(stall_budget());
+        window.cold_hedged_fronts.extend([hash(0x01), hash(0x02)]);
+        insert_pending(&mut window, staller_addr(), hash(0x03), 3, now);
+
+        assert_eq!(
+            window.observe_cold_front(3, false, now + Duration::from_secs(2)),
+            None
+        );
+        assert!(window.cold_front.is_none());
+        assert_eq!(
+            window.cold_hedged_fronts.len(),
+            super::MAX_COLD_FRONT_HEDGES
+        );
+    }
+
+    #[test]
     fn mixed_prefix_sources_do_not_elect_a_winner() -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let owner = staller_addr();
@@ -3325,6 +3373,25 @@ mod tests {
             "an inconclusive race must not probe the remaining suffix"
         );
         assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_probe_respects_estimated_byte_cutoff() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+
+        window.ewma_block_bytes = 512 * 1024 + 1;
+        assert!(window.prefix_probe_plan().is_none());
+        window.ewma_block_bytes = 512 * 1024;
+        let (_, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("cutoff-sized probe must be planned"))?;
+        assert_eq!(hashes.len(), super::PREFIX_PROBE_WIN_BLOCKS);
         Ok(())
     }
 
@@ -3528,6 +3595,74 @@ mod tests {
         window.release_disconnected_peers(|peer| *peer != winner);
         assert_eq!(window.preferred_peer(), None);
         assert!(!window.peer_in_staller_cooldown(loser, now));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_owner_win_keeps_unrelated_peer_requests() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let loser = healthy_addr();
+        let unrelated = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[loser], now);
+        insert_pending(&mut window, unrelated, hash(9), 9, now);
+        insert_pending(&mut window, loser, hash(10), 10, now);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(owner), now);
+        }
+
+        assert_eq!(window.preferred_peer(), Some(owner));
+        assert!(window.contains_pending(&hash(9)));
+        assert!(window.peer_inflight.contains_key(&owner));
+        assert!(window.peer_inflight.contains_key(&unrelated));
+        assert!(!window.contains_pending(&hash(10)));
+        assert!(!window.peer_inflight.contains_key(&loser));
+        assert!(!window.peer_in_staller_cooldown(owner, now));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_alternate_win_releases_only_probe_losers() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let winner = healthy_addr();
+        let loser = peer_addr(2);
+        let unrelated = peer_addr(3);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser], now);
+        insert_pending(&mut window, unrelated, hash(9), 9, now);
+        insert_pending(&mut window, loser, hash(10), 10, now);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(winner), now);
+        }
+
+        assert_eq!(window.preferred_peer(), Some(winner));
+        for byte in 5..=8_u8 {
+            assert!(!window.contains_pending(&hash(byte)));
+        }
+        assert!(window.contains_pending(&hash(9)));
+        assert!(!window.contains_pending(&hash(10)));
+        assert!(!window.peer_inflight.contains_key(&owner));
+        assert!(!window.peer_inflight.contains_key(&loser));
+        assert!(window.peer_inflight.contains_key(&unrelated));
+        assert_eq!(window.next_request_height, 1);
+        assert!(window.next_pending_deadline.is_some());
+        assert!(window.peer_in_staller_cooldown(owner, now));
         Ok(())
     }
 
