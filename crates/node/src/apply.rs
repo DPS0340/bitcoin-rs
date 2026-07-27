@@ -554,7 +554,7 @@ fn apply_block_inner(
     let total_dur = total_started.elapsed();
     metrics::histogram!("node.apply_block.total_seconds").record(total_dur.as_secs_f64());
     metrics::counter!("node.apply_block.txs_applied").increment(tx_count_delta);
-    tracing::info!(
+    tracing::debug!(
         height,
         %block_hash,
         tx_count = block.txdata.len(),
