@@ -461,6 +461,150 @@ mod tests {
         OwnedUtxoOut::new(vout, value, script.to_vec(), false, 1)
     }
 
+    const MODEL_INLINE_CAPACITY: usize = 8;
+
+    struct LegacyArrayVecModel {
+        inline: Vec<OwnedUtxoOut>,
+        overflow: Vec<OwnedUtxoOut>,
+    }
+
+    impl LegacyArrayVecModel {
+        fn from_outputs(outputs: &[OwnedUtxoOut]) -> Self {
+            let inline_len = outputs.len().min(MODEL_INLINE_CAPACITY);
+            Self {
+                inline: outputs[..inline_len].to_vec(),
+                overflow: outputs[inline_len..].to_vec(),
+            }
+        }
+
+        fn output_count(&self) -> usize {
+            self.inline.len() + self.overflow.len()
+        }
+
+        fn outputs(&self) -> impl Iterator<Item = &OwnedUtxoOut> {
+            self.inline.iter().chain(self.overflow.iter())
+        }
+
+        fn add_run(
+            &mut self,
+            additions: Vec<OwnedUtxoOut>,
+            add_unique: bool,
+        ) -> Vec<Option<OwnedUtxoOut>> {
+            let mut overwritten = Vec::with_capacity(additions.len());
+            for addition in additions {
+                let old = if add_unique {
+                    None
+                } else {
+                    self.remove(addition.vout)
+                };
+                self.push(addition);
+                overwritten.push(old);
+            }
+            overwritten
+        }
+
+        fn remove_run(&mut self, vouts: &[u32]) -> Vec<Option<OwnedUtxoOut>> {
+            vouts.iter().map(|&vout| self.remove(vout)).collect()
+        }
+
+        fn push(&mut self, output: OwnedUtxoOut) {
+            if self.inline.len() < MODEL_INLINE_CAPACITY {
+                self.inline.push(output);
+            } else {
+                self.overflow.push(output);
+            }
+        }
+
+        fn remove(&mut self, vout: u32) -> Option<OwnedUtxoOut> {
+            if let Some(index) = self.inline.iter().position(|output| output.vout == vout) {
+                return Some(self.inline.swap_remove(index));
+            }
+            self.overflow
+                .iter()
+                .position(|output| output.vout == vout)
+                .map(|index| self.overflow.swap_remove(index))
+        }
+
+        fn encode(&self, txid: Hash256) -> Result<Vec<u8>, UtxoError> {
+            if self.inline.len() > MODEL_INLINE_CAPACITY {
+                return Err(UtxoError::CorruptRecord);
+            }
+
+            let output_count =
+                u32::try_from(self.output_count()).map_err(|_| UtxoError::RecordTooLarge {
+                    len: self.output_count(),
+                })?;
+            let inline_len =
+                u8::try_from(self.inline.len()).map_err(|_| UtxoError::CorruptRecord)?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&txid.to_le_bytes());
+            bytes.extend_from_slice(&output_count.to_le_bytes());
+            bytes.push(inline_len);
+            for output in self.outputs() {
+                let script_len = u16::try_from(output.script_pubkey.len()).map_err(|_| {
+                    UtxoError::ScriptTooLarge {
+                        len: output.script_pubkey.len(),
+                    }
+                })?;
+                bytes.extend_from_slice(&output.vout.to_le_bytes());
+                bytes.extend_from_slice(&output.value.to_le_bytes());
+                bytes.extend_from_slice(&output.height.to_le_bytes());
+                bytes.push(u8::from(output.coinbase));
+                bytes.extend_from_slice(&script_len.to_le_bytes());
+                bytes.extend_from_slice(&output.script_pubkey);
+            }
+            Ok(bytes)
+        }
+    }
+
+    enum EditorOperation {
+        Add {
+            additions: Vec<OwnedUtxoOut>,
+            add_unique: bool,
+        },
+        Remove {
+            vouts: Vec<u32>,
+        },
+    }
+
+    fn assert_record_matches_model(
+        record: &UtxoRecord,
+        txid: Hash256,
+        model: &LegacyArrayVecModel,
+    ) -> Result<(), UtxoError> {
+        assert_eq!(record.output_count(), model.output_count());
+        let expected_bytes = model.encode(txid)?;
+        assert_eq!(record.encoded_bytes(), expected_bytes.as_slice());
+
+        let actual_outputs = record
+            .outputs()
+            .map(|output| {
+                OwnedUtxoOut::new(
+                    output.vout,
+                    output.value,
+                    output.script_pubkey.to_vec(),
+                    output.coinbase,
+                    output.height,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_outputs, model.outputs().cloned().collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn codec_accepts_exact_script_length_limit() -> Result<(), UtxoError> {
+        let script = vec![0xA5; usize::from(u16::MAX)];
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::default(),
+            &[OwnedUtxoOut::new(64, 42, script.clone(), false, u32::MAX)],
+        )?;
+        let output = record.outputs().next().ok_or(UtxoError::CorruptRecord)?;
+        assert_eq!(output.script_pubkey, script.as_slice());
+        assert_eq!(record.output_count(), 1);
+        Ok(())
+    }
+
     #[test]
     fn compact_owner_is_one_fat_pointer() {
         assert_eq!(
@@ -496,24 +640,55 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_noncanonical_payload_is_rejected() -> Result<(), UtxoError> {
-        let record = UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51], 1)])?;
-        let mut truncated = record.encoded_bytes().to_vec();
-        truncated.pop();
+    fn malformed_encoded_boundaries_are_rejected() -> Result<(), UtxoError> {
+        let record =
+            UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51, 0xAC], 1)])?;
+        let encoded = record.encoded_bytes();
+
+        let truncated_metadata = encoded
+            .get(..RECORD_HEADER_LEN + OUTPUT_METADATA_LEN - 1)
+            .ok_or(UtxoError::CorruptRecord)?
+            .to_vec();
         assert!(matches!(
-            UtxoRecord::from_encoded(truncated.into_boxed_slice()),
+            UtxoRecord::from_encoded(truncated_metadata.into_boxed_slice()),
             Err(UtxoError::CorruptRecord)
         ));
 
-        let mut trailing = record.encoded_bytes().to_vec();
+        let truncated_script_end = encoded
+            .len()
+            .checked_sub(1)
+            .ok_or(UtxoError::CorruptRecord)?;
+        let truncated_script = encoded
+            .get(..truncated_script_end)
+            .ok_or(UtxoError::CorruptRecord)?
+            .to_vec();
+        assert!(matches!(
+            UtxoRecord::from_encoded(truncated_script.into_boxed_slice()),
+            Err(UtxoError::CorruptRecord)
+        ));
+
+        let mut trailing = encoded.to_vec();
         trailing.push(0);
         assert!(matches!(
             UtxoRecord::from_encoded(trailing.into_boxed_slice()),
             Err(UtxoError::CorruptRecord)
         ));
 
-        let mut invalid_bool = record.encoded_bytes().to_vec();
-        invalid_bool[RECORD_HEADER_LEN + 16] = 2;
+        let mut count_mismatch = encoded.to_vec();
+        let count = count_mismatch
+            .get_mut(OUTPUT_COUNT_OFFSET..LEGACY_INLINE_LEN_OFFSET)
+            .ok_or(UtxoError::CorruptRecord)?;
+        count.copy_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            UtxoRecord::from_encoded(count_mismatch.into_boxed_slice()),
+            Err(UtxoError::CorruptRecord)
+        ));
+
+        let mut invalid_bool = encoded.to_vec();
+        let bool_byte = invalid_bool
+            .get_mut(RECORD_HEADER_LEN + 16)
+            .ok_or(UtxoError::CorruptRecord)?;
+        *bool_byte = 2;
         assert!(matches!(
             UtxoRecord::from_encoded(invalid_bool.into_boxed_slice()),
             Err(UtxoError::CorruptRecord)
@@ -522,34 +697,95 @@ mod tests {
     }
 
     #[test]
-    fn staged_editor_preserves_legacy_partition_order() -> Result<(), UtxoError> {
-        let record = UtxoRecord::from_owned_outputs(
-            Hash256::default(),
-            &(0_u32..10)
-                .map(|vout| output(vout, &[], 1))
-                .collect::<Vec<_>>(),
-        )?;
-        let (after_remove, removed) = record.stage_remove_run(&[0])?;
-        let after_remove = after_remove.ok_or(UtxoError::CorruptRecord)?;
-        assert!(removed[0].is_some());
-        assert_eq!(
-            after_remove
-                .outputs()
-                .map(|output| output.vout)
-                .collect::<Vec<_>>(),
-            vec![7, 1, 2, 3, 4, 5, 6, 8, 9]
-        );
+    fn editor_matches_legacy_arrayvec_partition_reference_model() -> Result<(), UtxoError> {
+        let txid = Hash256::from_le_bytes(&[0xA5; TXID_LEN]);
+        let initial = vec![
+            OwnedUtxoOut::new(0, 100, vec![], false, 0),
+            OwnedUtxoOut::new(1, 101, vec![0x51], true, 1),
+            OwnedUtxoOut::new(2, 102, vec![0x51, 0xAC], false, u32::MAX),
+            OwnedUtxoOut::new(3, 103, vec![0x6A, 0x01, 0x03], true, 3),
+            OwnedUtxoOut::new(4, 104, vec![0x00, 0x04], false, 4),
+            OwnedUtxoOut::new(5, 105, vec![0x51, 0x51, 0x05], true, 5),
+            OwnedUtxoOut::new(6, 106, vec![0xAC], false, 6),
+        ];
+        let mut model = LegacyArrayVecModel::from_outputs(&initial);
+        let mut record = UtxoRecord::from_owned_outputs(txid, &initial)?;
+        assert_record_matches_model(&record, txid, &model)?;
 
-        let (after_add, overwritten) =
-            after_remove.stage_add_run(vec![output(10, &[], 1)], true)?;
-        assert_eq!(overwritten, vec![None]);
-        assert_eq!(
-            after_add
-                .outputs()
-                .map(|output| output.vout)
-                .collect::<Vec<_>>(),
-            vec![7, 1, 2, 3, 4, 5, 6, 10, 8, 9]
-        );
+        let operations = vec![
+            EditorOperation::Add {
+                additions: vec![OwnedUtxoOut::new(63, 163, vec![0x63, 0x00], true, u32::MAX)],
+                add_unique: true,
+            },
+            EditorOperation::Add {
+                additions: vec![OwnedUtxoOut::new(
+                    64,
+                    164,
+                    vec![0x64, 0x01, 0x00],
+                    false,
+                    64,
+                )],
+                add_unique: true,
+            },
+            EditorOperation::Add {
+                additions: vec![OwnedUtxoOut::new(
+                    u32::MAX,
+                    1_000,
+                    vec![0xFF, 0x00, 0xFE, 0x01],
+                    true,
+                    u32::MAX,
+                )],
+                add_unique: true,
+            },
+            EditorOperation::Remove { vouts: vec![0] },
+            EditorOperation::Add {
+                additions: vec![OwnedUtxoOut::new(0, 200, vec![0x00, 0x51], false, 200)],
+                add_unique: true,
+            },
+            EditorOperation::Remove { vouts: vec![64] },
+            EditorOperation::Add {
+                additions: vec![OwnedUtxoOut::new(64, 264, vec![0x64], true, 264)],
+                add_unique: true,
+            },
+            EditorOperation::Add {
+                additions: vec![
+                    OwnedUtxoOut::new(63, 263, vec![0x63, 0x01], false, 263),
+                    OwnedUtxoOut::new(63, 363, vec![0x63, 0x02, 0x03], true, 363),
+                ],
+                add_unique: false,
+            },
+            EditorOperation::Remove {
+                vouts: vec![63, 63, u32::MAX, u32::MAX],
+            },
+            EditorOperation::Remove {
+                vouts: vec![63, u32::MAX],
+            },
+        ];
+
+        for operation in operations {
+            match operation {
+                EditorOperation::Add {
+                    additions,
+                    add_unique,
+                } => {
+                    let expected_overwritten = model.add_run(additions.clone(), add_unique);
+                    let (replacement, overwritten) = record.stage_add_run(additions, add_unique)?;
+                    assert_eq!(overwritten, expected_overwritten);
+                    record = replacement;
+                }
+                EditorOperation::Remove { vouts } => {
+                    let expected_removed = model.remove_run(&vouts);
+                    let (replacement, removed) = record.stage_remove_run(&vouts)?;
+                    assert_eq!(removed, expected_removed);
+                    if expected_removed.iter().any(Option::is_some) {
+                        record = replacement.ok_or(UtxoError::CorruptRecord)?;
+                    } else {
+                        assert!(replacement.is_none());
+                    }
+                }
+            }
+            assert_record_matches_model(&record, txid, &model)?;
+        }
         Ok(())
     }
 

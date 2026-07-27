@@ -189,3 +189,110 @@ fn owned_reclamation_undo_restores_state() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+#[test]
+fn owned_reclamation_high_fanout_partial_spend_then_small_live_set_churn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let live_txid = txid(5000);
+
+    // 1. High fanout: add 500 outputs crossing partition boundaries (8 -> 9+ overflow)
+    let mut preload = BlockChanges::default();
+    for vout in 0_u32..500 {
+        preload.add(UtxoAdd::new(
+            OutPoint::new(live_txid, vout),
+            txout(u64::from(vout) + 5000),
+            false,
+            100,
+        ));
+    }
+    set.commit_block(&preload, &txid(5001))?;
+    assert_eq!(set.len(), 500);
+    assert_eq!(set.record_count(), 1);
+
+    // 2. High-fanout partial spend: spend 490 outputs, leaving 10 live outputs
+    let mut partial_spend = BlockChanges::default();
+    for vout in 0_u32..490 {
+        partial_spend.remove(OutPoint::new(live_txid, vout));
+    }
+    set.commit_block(&partial_spend, &txid(5002))?;
+    assert_eq!(set.len(), 10);
+    assert_eq!(set.record_count(), 1);
+    for vout in 490_u32..500 {
+        assert!(set.get(&OutPoint::new(live_txid, vout)).is_some());
+    }
+
+    // 3. Small-live-set churn on remaining outputs across 20 iterations
+    for i in 0_u64..20 {
+        let mut churn = BlockChanges::default();
+        // Replace one remaining output with updated height/txout
+        let target_vout = 490 + u32::try_from(i % 10)?;
+        churn.add(UtxoAdd::new(
+            OutPoint::new(live_txid, target_vout),
+            txout(6000 + i),
+            i % 2 == 0,
+            u32::try_from(105 + i)?,
+        ));
+        set.commit_block(&churn, &txid(5003 + i))?;
+        assert_eq!(set.len(), 10);
+        assert_eq!(set.record_count(), 1);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn owned_reclamation_full_record_reclamation_after_multi_tx_sweep()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+
+    // Preload 10 transactions with 64 outputs each (640 total outputs)
+    let mut preload = BlockChanges::default();
+    for t in 0_u64..10 {
+        let current_txid = txid(6000 + t);
+        for vout in 0_u32..64 {
+            preload.add(UtxoAdd::new(
+                OutPoint::new(current_txid, vout),
+                txout(u64::from(vout) + t * 100),
+                false,
+                200,
+            ));
+        }
+    }
+    set.commit_block(&preload, &txid(7000))?;
+    assert_eq!(set.len(), 640);
+    assert_eq!(set.record_count(), 10);
+
+    // Full spend sweep across all 10 transactions
+    let mut sweep = BlockChanges::default();
+    for t in 0_u64..10 {
+        let current_txid = txid(6000 + t);
+        for vout in 0_u32..64 {
+            sweep.remove(OutPoint::new(current_txid, vout));
+        }
+    }
+    set.commit_block(&sweep, &txid(7001))?;
+
+    // Full record reclamation assertions
+    assert_eq!(set.len(), 0);
+    assert_eq!(set.record_count(), 0);
+    assert_eq!(
+        bitcoin_rs_utxo::hash_serialized_3(&set)?,
+        bitcoin_rs_utxo::hash_serialized_3(&UtxoSet::new())?
+    );
+
+    // Re-add 5 single-output transactions to confirm set works cleanly post reclamation
+    let mut readd = BlockChanges::default();
+    for t in 0_u64..5 {
+        readd.add(UtxoAdd::new(
+            OutPoint::new(txid(8000 + t), 0),
+            txout(8000 + t),
+            true,
+            300,
+        ));
+    }
+    set.commit_block(&readd, &txid(7002))?;
+    assert_eq!(set.len(), 5);
+    assert_eq!(set.record_count(), 5);
+
+    Ok(())
+}
