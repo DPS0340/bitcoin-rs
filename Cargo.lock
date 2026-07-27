@@ -97,9 +97,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-swap"
@@ -130,11 +130,12 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "base58ck"
-version = "0.1.100"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec5dc7e09f7bb15f0062da7c03086d6b71a2c84e0af4fccbbc7d8c6559847816"
+checksum = "2c8d66485a3a2ea485c1913c4572ce0256067a5377ac8c75c4960e1cda98605f"
 dependencies = [
- "bitcoin_hashes 0.14.100",
+ "bitcoin-internals 0.3.0",
+ "bitcoin_hashes 0.14.0",
 ]
 
 [[package]]
@@ -175,15 +176,15 @@ dependencies = [
 
 [[package]]
 name = "bitcoin"
-version = "0.32.100"
+version = "0.32.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39581299241111285f3268ba75ddf372746fd041620918b145c1af9d75e91b6c"
+checksum = "7ca0f87890d2398219d15182cb6af9681722bd891758dab4ca01896e2038a510"
 dependencies = [
  "base58ck",
  "bech32",
- "bitcoin-io 0.1.100",
+ "bitcoin-io 0.1.4",
  "bitcoin-units",
- "bitcoin_hashes 0.14.100",
+ "bitcoin_hashes 0.14.0",
  "bitcoinconsensus",
  "hex-conservative 0.2.2",
  "hex_lit",
@@ -211,6 +212,12 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-internals"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30bdbe14aa07b06e6cfeffc529a1f099e5fbe249524f8125358604df99a4bed2"
+
+[[package]]
+name = "bitcoin-internals"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a90bbbfa552b49101a230fb2668f3f9ef968c81e6f83cf577e1d4b80f689e1aa"
@@ -229,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-io"
-version = "0.1.100"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11301df0b06f22dea7bb1916403fdd88a371031e495c49b8f96931b28189e175"
+checksum = "2dee39a0ee5b4095224a0cfc6bf4cc1baf0f9624b96b367e53b66d974e51d953"
 
 [[package]]
 name = "bitcoin-io"
@@ -495,7 +502,7 @@ name = "bitcoin-rs-primitives"
 version = "0.3.1"
 dependencies = [
  "bitcoin",
- "bitcoin_hashes 0.14.100",
+ "bitcoin_hashes 0.14.0",
  "bytemuck",
  "proptest",
  "ruint",
@@ -668,20 +675,20 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-units"
-version = "0.1.100"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57bad157b78d0d1b22c4cbb6a35a566211fc4d14866a37f2c780652b50f3b845"
+checksum = "c202276cab20ab02cf6cc9d4df0d4284f7c784031619d3842236de8bc2bd5c6c"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "bitcoin_hashes"
-version = "0.14.100"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9901a56e133a1fc86eeb1113e2591f45f4682451ca893bff494d2f88918e3f"
+checksum = "bb18c03d0db0247e147a21a6faafd5a7eb851c743db062de72018b6b7e8e4d16"
 dependencies = [
- "bitcoin-io 0.1.100",
+ "bitcoin-io 0.1.4",
  "hex-conservative 0.2.2",
  "serde",
 ]
@@ -715,7 +722,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82b80fcc031ed36f91c31639a4d97acb1487985fdee34565651b2f52f4346859"
 dependencies = [
  "bitcoin",
- "bitcoin_hashes 0.14.100",
+ "bitcoin_hashes 0.14.0",
  "sha2 0.10.9",
 ]
 
@@ -1074,9 +1081,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1207,7 +1214,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1247,9 +1254,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fjall"
-version = "3.1.5"
+version = "3.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038acd422d607e0eca09e093f299f9eccf9bd097554343d93746afff81a45113"
+checksum = "420a84699b8ccbb1ed573e38e88f4f23637b45beab6432066452f834be469c57"
 dependencies = [
  "byteorder-lite",
  "byteview",
@@ -1798,9 +1805,9 @@ dependencies = [
 
 [[package]]
 name = "lsm-tree"
-version = "3.1.5"
+version = "3.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ef86c3c797c10eefcc73407c43ae48c19d4df686131a8334b2895a513e91df4"
+checksum = "055a908d502129cf63bedae52f2db222e4436d2da32a69df9b84ac9fb9147761"
 dependencies = [
  "byteorder-lite",
  "byteview",
@@ -2515,7 +2522,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2605,7 +2612,7 @@ version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
- "bitcoin_hashes 0.14.100",
+ "bitcoin_hashes 0.14.0",
  "rand 0.8.6",
  "secp256k1-sys 0.10.1",
  "serde",
@@ -2617,7 +2624,7 @@ version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c3c81b43dc2d8877c216a3fccf76677ee1ebccd429566d3e67447290d0c42b2"
 dependencies = [
- "bitcoin_hashes 0.14.100",
+ "bitcoin_hashes 0.14.0",
  "rand 0.9.4",
  "secp256k1-sys 0.11.0",
  "serde",
@@ -2890,9 +2897,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
@@ -2955,7 +2962,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3443,7 +3450,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
