@@ -81,6 +81,9 @@ impl UtxoRecord {
     }
 
     /// Builds a record from snapshot-owned outputs in their serialized order.
+    ///
+    /// This is a snapshot/untrusted boundary, so the encoded payload is
+    /// re-validated through [`Self::from_encoded`] before it is trusted.
     pub(crate) fn from_owned_outputs(
         txid: Hash256,
         outputs: &[OwnedUtxoOut],
@@ -127,79 +130,296 @@ impl UtxoRecord {
         self.outputs().map(|output| output.vout).max()
     }
 
-    /// Stages a coalesced add run for a transaction that has no live record.
-    pub(crate) fn stage_new_add_run(
-        txid: Hash256,
-        additions: Vec<OwnedUtxoOut>,
-        add_unique: bool,
-    ) -> Result<(Self, Vec<Option<OwnedUtxoOut>>), UtxoError> {
-        stage_add_to_parts(txid, Vec::new(), 0, additions, add_unique)
-    }
-
-    /// Stages an entire coalesced add run without changing this record.
+    /// Stages an entire coalesced add run without changing this record,
+    /// materializing the overwritten slots for listener/event consumers.
     ///
     /// `add_unique` is the strictly-increasing-vout fast path. Callers prove
     /// that it cannot encounter an existing vout before selecting it.
+    #[cfg(test)]
     pub(crate) fn stage_add_run(
         &self,
-        additions: Vec<OwnedUtxoOut>,
+        additions: &[OwnedUtxoOut],
         add_unique: bool,
     ) -> Result<(Self, Vec<Option<OwnedUtxoOut>>), UtxoError> {
-        let (outputs, legacy_inline_len) = self.owned_outputs();
-        stage_add_to_parts(
-            self.txid(),
-            outputs,
-            legacy_inline_len,
-            additions,
-            add_unique,
-        )
+        self.add_replacement_tracked(&owned_parts(additions), add_unique)
     }
 
-    /// Stages an entire coalesced remove run without changing this record.
-    /// The returned slots correspond to the requested vouts in order.
+    /// Builds the replacement record for a coalesced add run, borrowing every
+    /// surviving output straight from this record's payload (no per-output
+    /// script clone) and copying each addition's script exactly once. Used by
+    /// the no-listener commit path, which never materializes overwritten
+    /// outputs.
+    pub(crate) fn add_replacement<'a>(
+        &'a self,
+        additions: &'a [OutputParts<'a>],
+        add_unique: bool,
+    ) -> Result<Self, UtxoError> {
+        if add_unique {
+            if let Some(record) = self.append_unique_run(additions)? {
+                return Ok(record);
+            }
+        }
+        let mut parts = self.output_parts();
+        let mut legacy_inline_len = self.header().legacy_inline_len;
+        apply_additions(
+            &mut parts,
+            &mut legacy_inline_len,
+            additions,
+            add_unique,
+            None,
+        );
+        Self::from_output_parts(self.txid(), legacy_inline_len, &parts)
+    }
+
+    /// Add-run replacement that also materializes the overwritten outputs (owned,
+    /// so they outlive the record swap) for listener/event consumers.
+    pub(crate) fn add_replacement_tracked<'a>(
+        &'a self,
+        additions: &'a [OutputParts<'a>],
+        add_unique: bool,
+    ) -> Result<(Self, Vec<Option<OwnedUtxoOut>>), UtxoError> {
+        if add_unique {
+            // The unique fast path can never overwrite a live vout.
+            let record = self.add_replacement(additions, true)?;
+            return Ok((record, vec![None; additions.len()]));
+        }
+        let mut parts = self.output_parts();
+        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut overwritten = Vec::with_capacity(additions.len());
+        apply_additions(
+            &mut parts,
+            &mut legacy_inline_len,
+            additions,
+            false,
+            Some(&mut overwritten),
+        );
+        let record = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        Ok((record, overwritten))
+    }
+
+    /// Builds a fresh record for a coalesced add run on a transaction that has
+    /// no live record. Only additions contribute bytes.
+    pub(crate) fn new_add_replacement(
+        txid: Hash256,
+        additions: &[OutputParts<'_>],
+        add_unique: bool,
+    ) -> Result<Self, UtxoError> {
+        if add_unique {
+            // Unique adds on an empty record encode in slice order with the
+            // inline partition filled to capacity; no dedup pass is needed.
+            let legacy_inline_len = additions.len().min(LEGACY_INLINE_CAPACITY);
+            return Self::from_output_parts(txid, legacy_inline_len, additions);
+        }
+        let mut parts = Vec::with_capacity(additions.len());
+        let mut legacy_inline_len = 0;
+        apply_additions(&mut parts, &mut legacy_inline_len, additions, false, None);
+        Self::from_output_parts(txid, legacy_inline_len, &parts)
+    }
+
+    pub(crate) fn new_add_replacement_tracked(
+        txid: Hash256,
+        additions: &[OutputParts<'_>],
+        add_unique: bool,
+    ) -> Result<(Self, Vec<Option<OwnedUtxoOut>>), UtxoError> {
+        if add_unique {
+            let legacy_inline_len = additions.len().min(LEGACY_INLINE_CAPACITY);
+            let record = Self::from_output_parts(txid, legacy_inline_len, additions)?;
+            return Ok((record, vec![None; additions.len()]));
+        }
+        let mut parts = Vec::with_capacity(additions.len());
+        let mut legacy_inline_len = 0;
+        let mut overwritten = Vec::with_capacity(additions.len());
+        apply_additions(
+            &mut parts,
+            &mut legacy_inline_len,
+            additions,
+            false,
+            Some(&mut overwritten),
+        );
+        let record = Self::from_output_parts(txid, legacy_inline_len, &parts)?;
+        Ok((record, overwritten))
+    }
+
+    /// Increasing-unique append-copy fast path. Returns `None` when appending
+    /// would reorder the legacy partition bytes, so the caller must rebuild.
+    fn append_unique_run(&self, additions: &[OutputParts<'_>]) -> Result<Option<Self>, UtxoError> {
+        let header = self.header();
+        let appends_at_end = header.output_count == header.legacy_inline_len
+            || header.legacy_inline_len == LEGACY_INLINE_CAPACITY;
+        if !appends_at_end {
+            return Ok(None);
+        }
+
+        let new_count =
+            header
+                .output_count
+                .checked_add(additions.len())
+                .ok_or(UtxoError::RecordTooLarge {
+                    len: header.output_count,
+                })?;
+        let output_count =
+            u32::try_from(new_count).map_err(|_| UtxoError::RecordTooLarge { len: new_count })?;
+        let legacy_inline_len =
+            (header.legacy_inline_len + additions.len()).min(LEGACY_INLINE_CAPACITY);
+        let legacy_inline_len_u8 =
+            u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
+
+        let mut additions_len = 0usize;
+        for addition in additions {
+            additions_len = additions_len
+                .checked_add(addition.encoded_len()?)
+                .ok_or(UtxoError::RecordTooLarge { len: additions_len })?;
+        }
+        let payload_len = self
+            .bytes
+            .len()
+            .checked_add(additions_len)
+            .ok_or(UtxoError::RecordTooLarge { len: additions_len })?;
+        if payload_len > usize::try_from(isize::MAX).unwrap_or(usize::MAX) {
+            return Err(UtxoError::RecordTooLarge { len: payload_len });
+        }
+
+        let mut bytes = Vec::with_capacity(payload_len);
+        bytes.extend_from_slice(&header.txid.to_le_bytes());
+        bytes.extend_from_slice(&output_count.to_le_bytes());
+        bytes.push(legacy_inline_len_u8);
+        bytes.extend_from_slice(&self.bytes[RECORD_HEADER_LEN..]);
+        for addition in additions {
+            write_output(&mut bytes, addition)?;
+        }
+        debug_assert_eq!(bytes.len(), payload_len);
+        // Invariant: the copied prefix came from this validated record and every
+        // appended addition was size-checked above, so the payload is canonical
+        // and needs no re-decode.
+        Ok(Some(Self {
+            bytes: bytes.into_boxed_slice(),
+        }))
+    }
+
+    /// Stages an entire coalesced remove run without changing this record,
+    /// materializing the removed outputs (in request order) for listener/event
+    /// consumers. Only removed outputs are cloned; survivors stay borrowed.
     pub(crate) fn stage_remove_run(
         &self,
         vouts: &[u32],
     ) -> Result<(Option<Self>, Vec<Option<OwnedUtxoOut>>), UtxoError> {
-        let (mut outputs, mut legacy_inline_len) = self.owned_outputs();
+        let mut parts = self.output_parts();
+        let mut legacy_inline_len = self.header().legacy_inline_len;
         let mut removed = Vec::with_capacity(vouts.len());
 
         for &vout in vouts {
-            let output = outputs
+            let output = parts
                 .iter()
-                .position(|output| output.vout == vout)
-                .map(|index| remove_output_at(&mut outputs, &mut legacy_inline_len, index));
-            removed.push(output);
+                .position(|part| part.vout == vout)
+                .map(|index| remove_part_at(&mut parts, &mut legacy_inline_len, index));
+            removed.push(output.map(OutputParts::into_owned));
         }
 
         if removed.iter().all(Option::is_none) {
             return Ok((None, removed));
         }
 
-        let replacement = Self::from_owned_parts(self.txid(), legacy_inline_len, &outputs)?;
+        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
         Ok((Some(replacement), removed))
     }
 
+    /// Builds the replacement for a coalesced remove run without materializing
+    /// any removed output. A full removal returns [`RemovedRecord::Emptied`]
+    /// with no replacement allocation. Used by the no-listener commit path.
+    pub(crate) fn remove_replacement(&self, vouts: &[u32]) -> Result<RemovedRecord, UtxoError> {
+        if self.is_full_removal(vouts) {
+            return Ok(RemovedRecord::Emptied);
+        }
+        let mut parts = self.output_parts();
+        let mut legacy_inline_len = self.header().legacy_inline_len;
+        let mut any_removed = false;
+        for &vout in vouts {
+            if let Some(index) = parts.iter().position(|part| part.vout == vout) {
+                remove_part_at(&mut parts, &mut legacy_inline_len, index);
+                any_removed = true;
+            }
+        }
+        if !any_removed {
+            return Ok(RemovedRecord::Unchanged);
+        }
+        if parts.is_empty() {
+            return Ok(RemovedRecord::Emptied);
+        }
+        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        Ok(RemovedRecord::Replaced(replacement))
+    }
+
+    /// Builds the replacement for a coalesced remove run followed by a
+    /// coalesced add run on this record, in one borrowed descriptor pass with a
+    /// single encode. Removes model legacy-partition removal in `vouts` request
+    /// order; the adds then overwrite or append in `additions` payload order.
+    /// Used by the no-listener commit path when one record identity is both
+    /// spent and rebuilt in the same batch; no removed or overwritten output is
+    /// materialized, and each surviving output stays borrowed. A failed encode
+    /// returns `Err` before any buffer is produced, so the caller's record is
+    /// left byte-identical.
+    pub(crate) fn edit_replacement<'a>(
+        &'a self,
+        vouts: &[u32],
+        additions: &'a [OutputParts<'a>],
+        add_unique: bool,
+    ) -> Result<RemovedRecord, UtxoError> {
+        if self.is_full_removal(vouts) {
+            // Every live output is spent, so the additions alone form the final
+            // record; survivors are never collected.
+            if additions.is_empty() {
+                return Ok(RemovedRecord::Emptied);
+            }
+            let record = Self::new_add_replacement(self.txid(), additions, add_unique)?;
+            return Ok(RemovedRecord::Replaced(record));
+        }
+        let mut parts = self.output_parts();
+        let mut legacy_inline_len = self.header().legacy_inline_len;
+        for &vout in vouts {
+            if let Some(index) = parts.iter().position(|part| part.vout == vout) {
+                remove_part_at(&mut parts, &mut legacy_inline_len, index);
+            }
+        }
+        apply_additions(
+            &mut parts,
+            &mut legacy_inline_len,
+            additions,
+            add_unique,
+            None,
+        );
+        if parts.is_empty() {
+            return Ok(RemovedRecord::Emptied);
+        }
+        let replacement = Self::from_output_parts(self.txid(), legacy_inline_len, &parts)?;
+        Ok(RemovedRecord::Replaced(replacement))
+    }
+
     /// Returns the requested outputs in request order only when the request
-    /// spends this whole record exactly once per live vout.
+    /// spends this whole record exactly once per live vout. Materializes the
+    /// removed outputs for listener/event consumers; survivors are never built.
     pub(crate) fn full_removals_by_vout(&self, vouts: &[u32]) -> Option<Vec<OwnedUtxoOut>> {
-        let (outputs, _) = self.owned_outputs();
-        if outputs.len() != vouts.len() {
+        if !self.is_full_removal(vouts) {
             return None;
         }
-
         let mut removed = Vec::with_capacity(vouts.len());
         for &vout in vouts {
-            if removed
-                .iter()
-                .any(|output: &OwnedUtxoOut| output.vout == vout)
-            {
-                return None;
-            }
-            let output = outputs.iter().find(|output| output.vout == vout)?;
-            removed.push(output.clone());
+            removed.push(OutputParts::from_view(&self.find_output(vout)?).into_owned());
         }
         Some(removed)
+    }
+
+    /// True when `vouts` removes every live output exactly once (no duplicate
+    /// and no absent request). Borrowed header/output scan; allocates nothing.
+    fn is_full_removal(&self, vouts: &[u32]) -> bool {
+        if self.output_count() != vouts.len() {
+            return false;
+        }
+        for (index, &vout) in vouts.iter().enumerate() {
+            if vouts[..index].contains(&vout) || self.find_output(vout).is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     #[cfg(test)]
@@ -210,131 +430,236 @@ impl UtxoRecord {
     fn header(&self) -> RecordHeader {
         match decode_header(&self.bytes) {
             Ok(header) => header,
-            // `UtxoRecord` is only built through `from_encoded`, which runs
-            // `validate_encoded` -> `decode_header`; a header decode failure
-            // means the validated record was mutated in place.
+            // `UtxoRecord` is only built through `from_encoded` or
+            // `from_output_parts`, both of which produce a canonical payload; a
+            // header decode failure means the validated record was mutated in
+            // place.
             Err(error) => panic!("UtxoRecord is validated at construction: {error:?}"),
         }
     }
 
-    fn owned_outputs(&self) -> (Vec<OwnedUtxoOut>, usize) {
-        let legacy_inline_len = self.header().legacy_inline_len;
-        let outputs = self
-            .outputs()
-            .map(|output| {
-                OwnedUtxoOut::new(
-                    output.vout,
-                    output.value,
-                    output.script_pubkey.to_vec(),
-                    output.coinbase,
-                    output.height,
-                )
-            })
-            .collect();
-        (outputs, legacy_inline_len)
+    /// Borrowed descriptors for every live output, in serialized order. Scripts
+    /// point straight into this record's payload; nothing is cloned.
+    fn output_parts(&self) -> Vec<OutputParts<'_>> {
+        self.outputs()
+            .map(|output| OutputParts::from_view(&output))
+            .collect()
     }
 
+    /// Snapshot/untrusted boundary constructor: re-validates through
+    /// [`Self::from_encoded`].
     fn from_owned_parts(
         txid: Hash256,
         legacy_inline_len: usize,
         outputs: &[OwnedUtxoOut],
     ) -> Result<Self, UtxoError> {
-        let output_count = u32::try_from(outputs.len())
-            .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
-        if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
-            return Err(UtxoError::CorruptRecord);
-        }
+        let bytes = encode_record(txid, legacy_inline_len, &owned_parts(outputs))?;
+        Self::from_encoded(bytes)
+    }
 
-        let mut payload_len = RECORD_HEADER_LEN;
-        for output in outputs {
-            let script_len = output.script_pubkey.len();
-            let _ = u16::try_from(script_len)
-                .map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
-            payload_len = payload_len
-                .checked_add(OUTPUT_METADATA_LEN)
-                .and_then(|len| len.checked_add(script_len))
-                .ok_or(UtxoError::RecordTooLarge { len: payload_len })?;
-        }
-        if payload_len > usize::try_from(isize::MAX).unwrap_or(usize::MAX) {
-            return Err(UtxoError::RecordTooLarge { len: payload_len });
-        }
-
-        let legacy_inline_len_u8 =
-            u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
-        let mut bytes = Vec::with_capacity(payload_len);
-        bytes.extend_from_slice(&txid.to_le_bytes());
-        bytes.extend_from_slice(&output_count.to_le_bytes());
-        bytes.push(legacy_inline_len_u8);
-        for output in outputs {
-            let script_len = u16::try_from(output.script_pubkey.len()).map_err(|_| {
-                UtxoError::ScriptTooLarge {
-                    len: output.script_pubkey.len(),
-                }
-            })?;
-            bytes.extend_from_slice(&output.vout.to_le_bytes());
-            bytes.extend_from_slice(&output.value.to_le_bytes());
-            bytes.extend_from_slice(&output.height.to_le_bytes());
-            bytes.push(u8::from(output.coinbase));
-            bytes.extend_from_slice(&script_len.to_le_bytes());
-            bytes.extend_from_slice(&output.script_pubkey);
-        }
-        debug_assert_eq!(bytes.len(), payload_len);
-        Self::from_encoded(bytes.into_boxed_slice())
+    /// Internal constructor from borrowed descriptors. Every descriptor is
+    /// either a validated existing output or a prevalidated addition, so the
+    /// encoded payload is canonical by construction and needs no re-decode.
+    fn from_output_parts(
+        txid: Hash256,
+        legacy_inline_len: usize,
+        outputs: &[OutputParts<'_>],
+    ) -> Result<Self, UtxoError> {
+        let bytes = encode_record(txid, legacy_inline_len, outputs)?;
+        Ok(Self { bytes })
     }
 }
 
-fn stage_add_to_parts(
-    txid: Hash256,
-    mut outputs: Vec<OwnedUtxoOut>,
-    mut legacy_inline_len: usize,
-    additions: Vec<OwnedUtxoOut>,
-    add_unique: bool,
-) -> Result<(UtxoRecord, Vec<Option<OwnedUtxoOut>>), UtxoError> {
-    let mut overwritten = Vec::with_capacity(additions.len());
-    for addition in additions {
-        if add_unique {
-            debug_assert!(outputs.iter().all(|output| output.vout != addition.vout));
-            push_output(&mut outputs, &mut legacy_inline_len, addition);
-            overwritten.push(None);
-        } else {
-            let old = outputs
-                .iter()
-                .position(|output| output.vout == addition.vout)
-                .map(|index| remove_output_at(&mut outputs, &mut legacy_inline_len, index));
-            push_output(&mut outputs, &mut legacy_inline_len, addition);
-            overwritten.push(old);
-        }
-    }
-    let replacement = UtxoRecord::from_owned_parts(txid, legacy_inline_len, &outputs)?;
-    Ok((replacement, overwritten))
+/// Borrowed descriptor of one output to encode into a replacement buffer.
+///
+/// Scripts borrow from a validated source record or a prevalidated addition, so
+/// building a replacement copies each script exactly once into the new buffer
+/// and never clones a surviving output.
+#[derive(Copy, Clone)]
+pub(crate) struct OutputParts<'a> {
+    pub(crate) vout: u32,
+    pub(crate) value: u64,
+    pub(crate) script: &'a [u8],
+    pub(crate) coinbase: bool,
+    pub(crate) height: u32,
 }
 
-fn push_output(
-    outputs: &mut Vec<OwnedUtxoOut>,
+impl<'a> OutputParts<'a> {
+    pub(crate) const fn new(
+        vout: u32,
+        value: u64,
+        script: &'a [u8],
+        coinbase: bool,
+        height: u32,
+    ) -> Self {
+        Self {
+            vout,
+            value,
+            script,
+            coinbase,
+            height,
+        }
+    }
+
+    fn from_owned(output: &'a OwnedUtxoOut) -> Self {
+        Self::new(
+            output.vout,
+            output.value,
+            &output.script_pubkey,
+            output.coinbase,
+            output.height,
+        )
+    }
+
+    fn from_view(output: &OneUtxoOut<'a>) -> Self {
+        Self::new(
+            output.vout,
+            output.value,
+            output.script_pubkey,
+            output.coinbase,
+            output.height,
+        )
+    }
+
+    fn into_owned(self) -> OwnedUtxoOut {
+        OwnedUtxoOut::new(
+            self.vout,
+            self.value,
+            self.script.to_vec(),
+            self.coinbase,
+            self.height,
+        )
+    }
+
+    /// Validated encoded size (19-byte metadata + script) of this output.
+    fn encoded_len(&self) -> Result<usize, UtxoError> {
+        let script_len = self.script.len();
+        u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
+        OUTPUT_METADATA_LEN
+            .checked_add(script_len)
+            .ok_or(UtxoError::RecordTooLarge { len: script_len })
+    }
+}
+
+/// Outcome of staging a coalesced remove run without materializing removals.
+pub(crate) enum RemovedRecord {
+    /// No requested vout was live; the record is unchanged.
+    Unchanged,
+    /// Every live output was removed; the record must be deleted.
+    Emptied,
+    /// A partial removal produced this replacement record.
+    Replaced(UtxoRecord),
+}
+
+fn owned_parts(outputs: &[OwnedUtxoOut]) -> Vec<OutputParts<'_>> {
+    outputs.iter().map(OutputParts::from_owned).collect()
+}
+
+/// Applies a coalesced add run to `parts` with overwrite semantics, preserving
+/// the legacy inline/overflow partition order. When `overwritten` is supplied,
+/// each displaced output is cloned owned into it in addition order.
+fn apply_additions<'a>(
+    parts: &mut Vec<OutputParts<'a>>,
     legacy_inline_len: &mut usize,
-    output: OwnedUtxoOut,
+    additions: &[OutputParts<'a>],
+    add_unique: bool,
+    mut overwritten: Option<&mut Vec<Option<OwnedUtxoOut>>>,
+) {
+    for &addition in additions {
+        let old = if add_unique {
+            debug_assert!(parts.iter().all(|part| part.vout != addition.vout));
+            None
+        } else {
+            parts
+                .iter()
+                .position(|part| part.vout == addition.vout)
+                .map(|index| remove_part_at(parts, legacy_inline_len, index))
+        };
+        push_part(parts, legacy_inline_len, addition);
+        if let Some(sink) = overwritten.as_deref_mut() {
+            sink.push(old.map(OutputParts::into_owned));
+        }
+    }
+}
+
+fn push_part<'a>(
+    parts: &mut Vec<OutputParts<'a>>,
+    legacy_inline_len: &mut usize,
+    part: OutputParts<'a>,
 ) {
     if *legacy_inline_len < LEGACY_INLINE_CAPACITY {
-        outputs.insert(*legacy_inline_len, output);
+        parts.insert(*legacy_inline_len, part);
         *legacy_inline_len += 1;
     } else {
-        outputs.push(output);
+        parts.push(part);
     }
 }
 
-fn remove_output_at(
-    outputs: &mut Vec<OwnedUtxoOut>,
+fn remove_part_at<'a>(
+    parts: &mut Vec<OutputParts<'a>>,
     legacy_inline_len: &mut usize,
     index: usize,
-) -> OwnedUtxoOut {
+) -> OutputParts<'a> {
     if index < *legacy_inline_len {
         let last_inline = *legacy_inline_len - 1;
-        outputs.swap(index, last_inline);
+        parts.swap(index, last_inline);
         *legacy_inline_len -= 1;
-        outputs.remove(last_inline)
+        parts.remove(last_inline)
     } else {
-        outputs.swap_remove(index)
+        parts.swap_remove(index)
     }
+}
+
+/// Encodes a canonical record payload into one exact-capacity buffer. Every
+/// script must be `<= u16::MAX`; existing outputs satisfy this by construction
+/// and additions are prevalidated here.
+fn encode_record(
+    txid: Hash256,
+    legacy_inline_len: usize,
+    outputs: &[OutputParts<'_>],
+) -> Result<Box<[u8]>, UtxoError> {
+    let output_count = u32::try_from(outputs.len())
+        .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
+    if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
+        return Err(UtxoError::CorruptRecord);
+    }
+
+    let mut payload_len = RECORD_HEADER_LEN;
+    for output in outputs {
+        payload_len = payload_len
+            .checked_add(output.encoded_len()?)
+            .ok_or(UtxoError::RecordTooLarge { len: payload_len })?;
+    }
+    if payload_len > usize::try_from(isize::MAX).unwrap_or(usize::MAX) {
+        return Err(UtxoError::RecordTooLarge { len: payload_len });
+    }
+
+    let legacy_inline_len_u8 =
+        u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
+    let mut bytes = Vec::with_capacity(payload_len);
+    bytes.extend_from_slice(&txid.to_le_bytes());
+    bytes.extend_from_slice(&output_count.to_le_bytes());
+    bytes.push(legacy_inline_len_u8);
+    for output in outputs {
+        write_output(&mut bytes, output)?;
+    }
+    debug_assert_eq!(bytes.len(), payload_len);
+    Ok(bytes.into_boxed_slice())
+}
+
+/// Appends one output's canonical 19-byte metadata + script, validating the
+/// script length fits the `u16` length field.
+fn write_output(bytes: &mut Vec<u8>, output: &OutputParts<'_>) -> Result<(), UtxoError> {
+    let script_len = u16::try_from(output.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
+        len: output.script.len(),
+    })?;
+    bytes.extend_from_slice(&output.vout.to_le_bytes());
+    bytes.extend_from_slice(&output.value.to_le_bytes());
+    bytes.extend_from_slice(&output.height.to_le_bytes());
+    bytes.push(u8::from(output.coinbase));
+    bytes.extend_from_slice(&script_len.to_le_bytes());
+    bytes.extend_from_slice(output.script);
+    Ok(())
 }
 
 fn validate_encoded(bytes: &[u8]) -> Result<RecordHeader, UtxoError> {
@@ -769,7 +1094,8 @@ mod tests {
                     add_unique,
                 } => {
                     let expected_overwritten = model.add_run(additions.clone(), add_unique);
-                    let (replacement, overwritten) = record.stage_add_run(additions, add_unique)?;
+                    let (replacement, overwritten) =
+                        record.stage_add_run(&additions, add_unique)?;
                     assert_eq!(overwritten, expected_overwritten);
                     record = replacement;
                 }
@@ -795,7 +1121,7 @@ mod tests {
         let original = record.clone();
         let too_large = OwnedUtxoOut::new(1, 2, vec![0_u8; usize::from(u16::MAX) + 1], false, 1);
         assert!(matches!(
-            record.stage_add_run(vec![too_large], true),
+            record.stage_add_run(&[too_large], true),
             Err(UtxoError::ScriptTooLarge { .. })
         ));
         assert_eq!(record, original);

@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 use crate::{
     UtxoError, UtxoKey,
-    record::{OwnedUtxoOut, UtxoRecord},
+    record::{OutputParts, OwnedUtxoOut, RemovedRecord, UtxoRecord},
     set::{
         BuildPayload, ScannedUtxo, SpendPayload, UtxoAddView, UtxoChangeEvents, UtxoChangeListener,
         UtxoInserted, UtxoRemoved, UtxoScan,
@@ -225,9 +225,8 @@ impl Default for Shard {
     }
 }
 
-struct StagedAdd<'a> {
+struct StagedAdd {
     replacement: UtxoRecord,
-    payloads: Vec<BuildPayload<'a>>,
     overwritten: Vec<Option<OwnedUtxoOut>>,
     add_unique: bool,
 }
@@ -339,29 +338,15 @@ fn commit_batch_coalesced(
     adds: &[(UtxoKey, Hash256, BuildPayload<'_>)],
     removes: &[SpendPayload<'_>],
 ) -> Result<(), UtxoError> {
-    let mut remaining_removes = removes;
-    while let Some((first, rest)) = remaining_removes.split_first() {
-        let run_len = rest
-            .iter()
-            .take_while(|remove| remove.key == first.key && remove.txid == first.txid)
-            .count()
-            .saturating_add(1);
-        apply_remove_run(table, &remaining_removes[..run_len])?;
-        remaining_removes = &remaining_removes[run_len..];
-    }
-
-    reserve_add_runs(table, coalesced_add_run_count(adds));
-    let mut remaining_adds = adds;
-    while let Some((first, rest)) = remaining_adds.split_first() {
-        let run_len = rest
-            .iter()
-            .take_while(|(key, txid, _payload)| *key == first.0 && *txid == first.1)
-            .count()
-            .saturating_add(1);
-        apply_add_run(table, first.0, first.1, &remaining_adds[..run_len])?;
-        remaining_adds = &remaining_adds[run_len..];
-    }
-    Ok(())
+    let remove_spans = sorted_run_spans(removes, |remove| (remove.key, remove.txid));
+    let add_spans = sorted_run_spans(adds, |add| (add.0, add.1));
+    merge_commit_runs(
+        table,
+        &remove_spans,
+        &add_spans,
+        |index| removes[index].vout,
+        |index| payload_parts(&adds[index].2),
+    )
 }
 
 fn commit_single_shard_coalesced<A: UtxoAddView>(
@@ -370,33 +355,136 @@ fn commit_single_shard_coalesced<A: UtxoAddView>(
     removes: &[OutPoint],
     shard_idx: usize,
 ) -> Result<(), UtxoError> {
-    let mut remaining_removes = removes;
-    while let Some((first, rest)) = remaining_removes.split_first() {
-        let key = UtxoKey::from_txid(&first.txid);
-        debug_assert_eq!(usize::from(key.shard()), shard_idx);
-        let run_len = rest
-            .iter()
-            .take_while(|remove| remove.txid == first.txid)
-            .count()
-            .saturating_add(1);
-        let run = spend_payloads(&remaining_removes[..run_len]);
-        apply_remove_run(table, &run)?;
-        remaining_removes = &remaining_removes[run_len..];
+    let remove_spans = sorted_run_spans(removes, |remove| {
+        (UtxoKey::from_txid(&remove.txid), remove.txid)
+    });
+    let add_spans = sorted_run_spans(adds, |add| {
+        let txid = add.outpoint().txid;
+        (UtxoKey::from_txid(&txid), txid)
+    });
+    if cfg!(debug_assertions) {
+        for span in remove_spans.iter().chain(&add_spans) {
+            debug_assert_eq!(usize::from(span.key.shard()), shard_idx);
+        }
     }
+    merge_commit_runs(
+        table,
+        &remove_spans,
+        &add_spans,
+        |index| removes[index].vout,
+        |index| {
+            let payload = adds[index].payload();
+            payload_parts(&payload)
+        },
+    )
+}
 
-    reserve_add_runs(table, utxo_add_run_count(adds));
-    let mut remaining_adds = adds;
-    while let Some((first, rest)) = remaining_adds.split_first() {
-        let key = UtxoKey::from_txid(&first.outpoint().txid);
-        debug_assert_eq!(usize::from(key.shard()), shard_idx);
-        let run_len = rest
-            .iter()
-            .take_while(|add| add.outpoint().txid == first.outpoint().txid)
-            .count()
-            .saturating_add(1);
-        let payloads = build_payloads(&remaining_adds[..run_len]);
-        apply_add_payload_run(table, key, first.outpoint().txid, &payloads)?;
-        remaining_adds = &remaining_adds[run_len..];
+/// One maximal run of consecutive same-identity payloads in a commit stream.
+#[derive(Copy, Clone)]
+struct RunSpan {
+    key: UtxoKey,
+    txid: Hash256,
+    start: usize,
+    len: usize,
+}
+
+/// Splits a commit stream into `(key, txid)` runs and sorts them by full
+/// identity, letting the two no-listener sides be merged in one ordered pass
+/// regardless of the caller's input order. The single-shard path never sorts
+/// its input and the multi-shard path only groups runs for `<= 8` active
+/// shards, so this sort is what makes the merge sound. It is stable, so
+/// payloads keep their request/payload order within an identity. Spans
+/// reference the original slice; no payload is copied here.
+fn sorted_run_spans<T>(
+    items: &[T],
+    identity: impl Fn(&T) -> (UtxoKey, Hash256),
+) -> SmallVec<[RunSpan; 8]> {
+    let mut spans: SmallVec<[RunSpan; 8]> = SmallVec::new();
+    let mut start = 0usize;
+    while start < items.len() {
+        let (key, txid) = identity(&items[start]);
+        let mut len = 1usize;
+        while start + len < items.len() {
+            let (next_key, next_txid) = identity(&items[start + len]);
+            if next_key != key || next_txid != txid {
+                break;
+            }
+            len += 1;
+        }
+        spans.push(RunSpan {
+            key,
+            txid,
+            start,
+            len,
+        });
+        start += len;
+    }
+    spans.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.txid.cmp(&right.txid))
+    });
+    spans
+}
+
+/// Merges the sorted remove and add run streams by full identity. When both
+/// sides carry the same record identity the combined editor rebuilds it once;
+/// a one-sided identity keeps its existing optimized remove/add path. New-record
+/// table capacity is reserved once up front, before any record borrow, so no
+/// insert can reallocate the table mid-merge.
+fn merge_commit_runs<'src>(
+    table: &mut ShardTable,
+    remove_spans: &[RunSpan],
+    add_spans: &[RunSpan],
+    vout_at: impl Fn(usize) -> u32,
+    part_at: impl Fn(usize) -> OutputParts<'src>,
+) -> Result<(), UtxoError> {
+    reserve_add_runs(table, add_spans.len());
+    let mut vouts: SmallVec<[u32; 8]> = SmallVec::new();
+    let mut parts: SmallVec<[OutputParts<'src>; 8]> = SmallVec::new();
+    let mut remove_index = 0usize;
+    let mut add_index = 0usize;
+    while remove_index < remove_spans.len() || add_index < add_spans.len() {
+        let identity = match (remove_spans.get(remove_index), add_spans.get(add_index)) {
+            (Some(remove), Some(add)) => {
+                core::cmp::min((remove.key, remove.txid), (add.key, add.txid))
+            }
+            (Some(remove), None) => (remove.key, remove.txid),
+            (None, Some(add)) => (add.key, add.txid),
+            (None, None) => break,
+        };
+        let (key, txid) = identity;
+
+        vouts.clear();
+        while remove_spans
+            .get(remove_index)
+            .is_some_and(|remove| (remove.key, remove.txid) == identity)
+        {
+            let span = remove_spans[remove_index];
+            for index in span.start..span.start + span.len {
+                vouts.push(vout_at(index));
+            }
+            remove_index += 1;
+        }
+
+        parts.clear();
+        while add_spans
+            .get(add_index)
+            .is_some_and(|add| (add.key, add.txid) == identity)
+        {
+            let span = add_spans[add_index];
+            for index in span.start..span.start + span.len {
+                parts.push(part_at(index));
+            }
+            add_index += 1;
+        }
+
+        match (vouts.is_empty(), parts.is_empty()) {
+            (false, false) => apply_combined_run(table, key, txid, &vouts, &parts)?,
+            (false, true) => apply_remove_by_vouts(table, key, txid, &vouts)?,
+            (true, false) => apply_add_by_parts(table, key, txid, &parts)?,
+            (true, true) => {}
+        }
     }
     Ok(())
 }
@@ -504,12 +592,21 @@ fn build_payloads<A: UtxoAddView>(adds: &[A]) -> Vec<BuildPayload<'_>> {
     adds.iter().map(|add| add.payload()).collect()
 }
 
-fn apply_remove_run(table: &mut ShardTable, removes: &[SpendPayload<'_>]) -> Result<(), UtxoError> {
-    let Some(first) = removes.first() else {
-        return Ok(());
+fn apply_remove_by_vouts(
+    table: &mut ShardTable,
+    key: UtxoKey,
+    txid: Hash256,
+    vouts: &[u32],
+) -> Result<(), UtxoError> {
+    let mutation = match find_record(table, key, txid) {
+        Some(record) => match record.remove_replacement(vouts)? {
+            RemovedRecord::Unchanged => RecordMutation::NoChange,
+            RemovedRecord::Emptied => RecordMutation::Delete,
+            RemovedRecord::Replaced(replacement) => RecordMutation::Replace(replacement),
+        },
+        None => RecordMutation::NoChange,
     };
-    let staged = stage_remove_run(table, first.key, first.txid, removes)?;
-    apply_record_mutation(table, first.key, first.txid, staged.mutation);
+    apply_record_mutation(table, key, txid, mutation);
     Ok(())
 }
 
@@ -552,26 +649,57 @@ fn apply_remove_run_collect_events(
     Ok(())
 }
 
-fn apply_add_run(
+fn apply_add_by_parts(
     table: &mut ShardTable,
     key: UtxoKey,
     txid: Hash256,
-    adds: &[(UtxoKey, Hash256, BuildPayload<'_>)],
+    parts: &[OutputParts<'_>],
 ) -> Result<(), UtxoError> {
-    let payloads: Vec<BuildPayload<'_>> =
-        adds.iter().map(|(_key, _txid, payload)| *payload).collect();
-    apply_add_payload_run(table, key, txid, &payloads)
+    let existing = find_record(table, key, txid);
+    let add_unique = parts_are_increasing_unique(existing, parts);
+    let replacement = match existing {
+        Some(record) => record.add_replacement(parts, add_unique)?,
+        None => UtxoRecord::new_add_replacement(txid, parts, add_unique)?,
+    };
+    replace_record(table, key, txid, replacement);
+    Ok(())
 }
 
-fn apply_add_payload_run(
+/// Applies a coalesced remove run followed by a coalesced add run to one record
+/// identity in a single probe, borrowed-descriptor pass, encode, and swap. A
+/// missing record makes the removes no-ops and the additions build a fresh
+/// record. A failed encode leaves the table byte-identical.
+fn apply_combined_run(
     table: &mut ShardTable,
     key: UtxoKey,
     txid: Hash256,
-    payloads: &[BuildPayload<'_>],
+    vouts: &[u32],
+    parts: &[OutputParts<'_>],
 ) -> Result<(), UtxoError> {
-    let staged = stage_add_run(table, key, txid, payloads.iter().copied())?;
-    replace_record(table, key, txid, staged.replacement);
+    let mutation = if let Some(record) = find_record(table, key, txid) {
+        let add_unique = parts_are_increasing_unique(Some(record), parts);
+        match record.edit_replacement(vouts, parts, add_unique)? {
+            RemovedRecord::Unchanged => RecordMutation::NoChange,
+            RemovedRecord::Emptied => RecordMutation::Delete,
+            RemovedRecord::Replaced(replacement) => RecordMutation::Replace(replacement),
+        }
+    } else {
+        let add_unique = parts_are_increasing_unique(None, parts);
+        RecordMutation::Replace(UtxoRecord::new_add_replacement(txid, parts, add_unique)?)
+    };
+    apply_record_mutation(table, key, txid, mutation);
     Ok(())
+}
+
+fn parts_are_increasing_unique(record: Option<&UtxoRecord>, parts: &[OutputParts<'_>]) -> bool {
+    let mut previous = record.and_then(UtxoRecord::max_vout);
+    for part in parts {
+        if previous.is_some_and(|vout| part.vout <= vout) {
+            return false;
+        }
+        previous = Some(part.vout);
+    }
+    true
 }
 
 fn apply_add_run_with_listener(
@@ -593,15 +721,13 @@ fn apply_add_payload_run_with_listener(
     payloads: &[BuildPayload<'_>],
     listener: &(dyn UtxoChangeListener + Send + Sync),
 ) -> Result<(), UtxoError> {
-    let staged = stage_add_run(table, key, txid, payloads.iter().copied())?;
     let StagedAdd {
         replacement,
-        payloads,
         overwritten,
         add_unique: _,
-    } = staged;
+    } = stage_add_run(table, key, txid, payloads)?;
     replace_record(table, key, txid, replacement);
-    replay_add_listener(listener, &payloads, &overwritten);
+    replay_add_listener(listener, payloads, &overwritten);
     Ok(())
 }
 
@@ -615,13 +741,11 @@ fn apply_add_run_collect_events<'add>(
 ) -> Result<(), UtxoError> {
     let payloads: Vec<BuildPayload<'add>> =
         adds.iter().map(|(_key, _txid, payload)| *payload).collect();
-    let staged = stage_add_run(table, key, txid, payloads)?;
     let StagedAdd {
         replacement,
-        payloads,
         overwritten,
         add_unique,
-    } = staged;
+    } = stage_add_run(table, key, txid, &payloads)?;
     replace_record(table, key, txid, replacement);
     collect_add_events(events, &payloads, &overwritten, add_unique, coalesce_events);
     Ok(())
@@ -633,16 +757,14 @@ fn stage_remove_run(
     txid: Hash256,
     removes: &[SpendPayload<'_>],
 ) -> Result<StagedRemove, UtxoError> {
-    let Some(record) = table.table.find(key.hash(), |record| {
-        record.key() == key && record.txid() == txid
-    }) else {
+    let Some(record) = find_record(table, key, txid) else {
         return Ok(StagedRemove {
             found_record: false,
             mutation: RecordMutation::NoChange,
             removed: vec![None; removes.len()],
         });
     };
-    let vouts = removes.iter().map(|remove| remove.vout).collect::<Vec<_>>();
+    let vouts: SmallVec<[u32; 8]> = removes.iter().map(|remove| remove.vout).collect();
     if let Some(removed) = record.full_removals_by_vout(&vouts) {
         return Ok(StagedRemove {
             found_record: true,
@@ -664,44 +786,44 @@ fn stage_remove_run(
     })
 }
 
-fn stage_add_run<'a>(
+fn stage_add_run(
     table: &ShardTable,
     key: UtxoKey,
     txid: Hash256,
-    payloads: impl IntoIterator<Item = BuildPayload<'a>>,
-) -> Result<StagedAdd<'a>, UtxoError> {
-    let payloads = payloads.into_iter().collect::<Vec<_>>();
-    let additions = payloads
-        .iter()
-        .map(owned_from_payload)
-        .collect::<Result<Vec<_>, _>>()?;
-    let add_unique = adds_extend_record_vouts(table, key, txid, &payloads);
-    let (replacement, overwritten) = match table.table.find(key.hash(), |record| {
-        record.key() == key && record.txid() == txid
-    }) {
-        Some(record) => record.stage_add_run(additions, add_unique)?,
-        None => UtxoRecord::stage_new_add_run(txid, additions, add_unique)?,
+    payloads: &[BuildPayload<'_>],
+) -> Result<StagedAdd, UtxoError> {
+    let parts: SmallVec<[OutputParts<'_>; 8]> = payloads.iter().map(payload_parts).collect();
+    let existing = find_record(table, key, txid);
+    let add_unique = adds_are_increasing_unique(existing, payloads);
+    let (replacement, overwritten) = match existing {
+        Some(record) => record.add_replacement_tracked(&parts, add_unique)?,
+        None => UtxoRecord::new_add_replacement_tracked(txid, &parts, add_unique)?,
     };
     Ok(StagedAdd {
         replacement,
-        payloads,
         overwritten,
         add_unique,
     })
 }
 
-fn adds_extend_record_vouts(
-    table: &ShardTable,
-    key: UtxoKey,
-    txid: Hash256,
-    payloads: &[BuildPayload<'_>],
-) -> bool {
-    let mut previous = match table.table.find(key.hash(), |record| {
+fn find_record(table: &ShardTable, key: UtxoKey, txid: Hash256) -> Option<&UtxoRecord> {
+    table.table.find(key.hash(), |record| {
         record.key() == key && record.txid() == txid
-    }) {
-        Some(record) => record.max_vout(),
-        None => None,
-    };
+    })
+}
+
+fn payload_parts<'a>(payload: &BuildPayload<'a>) -> OutputParts<'a> {
+    OutputParts::new(
+        payload.vout,
+        payload.txout.value.to_sat(),
+        payload.txout.script_pubkey.as_bytes(),
+        payload.coinbase,
+        payload.height,
+    )
+}
+
+fn adds_are_increasing_unique(record: Option<&UtxoRecord>, payloads: &[BuildPayload<'_>]) -> bool {
+    let mut previous = record.and_then(UtxoRecord::max_vout);
     for payload in payloads {
         if previous.is_some_and(|vout| payload.vout <= vout) {
             return false;
@@ -746,19 +868,6 @@ fn remove_record(table: &mut ShardTable, key: UtxoKey, txid: Hash256) {
         return;
     };
     let (_record, _vacant) = entry.remove();
-}
-
-fn owned_from_payload(payload: &BuildPayload<'_>) -> Result<OwnedUtxoOut, UtxoError> {
-    let script = payload.txout.script_pubkey.as_bytes();
-    let _ =
-        u16::try_from(script.len()).map_err(|_| UtxoError::ScriptTooLarge { len: script.len() })?;
-    Ok(OwnedUtxoOut::new(
-        payload.vout,
-        payload.txout.value.to_sat(),
-        script.to_vec(),
-        payload.coinbase,
-        payload.height,
-    ))
 }
 
 fn removed_events(
