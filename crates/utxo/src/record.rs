@@ -274,14 +274,24 @@ impl core::fmt::Debug for ThinRecordBuf {
 struct RecordWriter<'a> {
     buf: &'a mut ThinRecordBuf,
     written: usize,
+    /// Immutable buffer capacity captured in [`new`](Self::new) from
+    /// `AllocHeader.cap`, which is fixed for the buffer's lifetime. Hoisting the
+    /// load out of [`push`](Self::push) keeps every existing bounds check and
+    /// `CorruptRecord` branch intact.
+    capacity: usize,
 }
 
 impl<'a> RecordWriter<'a> {
     /// Starts writing at offset zero. The caller must have reserved enough
     /// capacity for the whole payload; `push` still bounds-checks each segment.
     fn new(buf: &'a mut ThinRecordBuf) -> Self {
+        let capacity = buf.capacity();
         buf.header_mut().len = 0;
-        Self { buf, written: 0 }
+        Self {
+            buf,
+            written: 0,
+            capacity,
+        }
     }
 
     /// Copies `src` into the capacity immediately after the previously written
@@ -291,7 +301,7 @@ impl<'a> RecordWriter<'a> {
             .written
             .checked_add(src.len())
             .ok_or(UtxoError::RecordTooLarge { len: self.written })?;
-        if end > self.buf.capacity() {
+        if end > self.capacity {
             return Err(UtxoError::CorruptRecord);
         }
         if !src.is_empty() {
@@ -371,7 +381,13 @@ impl<'a> Iterator for UtxoOutputIter<'a> {
         self.remaining -= 1;
         Some(output)
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl ExactSizeIterator for UtxoOutputIter<'_> {}
 
 impl UtxoRecord {
     /// Parses a complete encoded record. The returned record is always safe to
@@ -664,19 +680,28 @@ impl UtxoRecord {
         &'a self,
         vouts: &[u32],
         additions: &'a [OutputParts<'a>],
-        add_unique: bool,
     ) -> Result<RemovedRecord, UtxoError> {
         if self.is_full_removal(vouts) {
             // Every live output is spent, so the additions alone form the final
-            // record; survivors are never collected.
+            // record; survivors are never collected. No survivor remains to
+            // dedup against, so the strictly-increasing test starts from `None`
+            // and is byte-identical to the pre-removal-max form (a full removal
+            // makes the dedup scan a no-op either way).
             if additions.is_empty() {
                 return Ok(RemovedRecord::Emptied);
             }
+            let add_unique = additions_are_strictly_increasing(None, additions);
             let record = Self::new_add_replacement(self.txid(), additions, add_unique)?;
             return Ok(RemovedRecord::Replaced(record));
         }
         let mut parts = self.output_parts();
         let mut legacy_inline_len = self.header().legacy_inline_len;
+        // `add_unique` is the strictly-increasing fast path. `parts` are the
+        // pre-removal live outputs, so their max is exactly the record's
+        // pre-removal `max_vout`; computing it here from the already-built
+        // descriptors avoids a second full decode of every output.
+        let add_unique =
+            additions_are_strictly_increasing(parts.iter().map(|part| part.vout).max(), additions);
         for &vout in vouts {
             if let Some(index) = parts.iter().position(|part| part.vout == vout) {
                 remove_part_at(&mut parts, &mut legacy_inline_len, index);
@@ -743,9 +768,9 @@ impl UtxoRecord {
     /// Borrowed descriptors for every live output, in serialized order. Scripts
     /// point straight into this record's payload; nothing is cloned.
     fn output_parts(&self) -> Vec<OutputParts<'_>> {
-        self.outputs()
-            .map(|output| OutputParts::from_view(&output))
-            .collect()
+        let mut parts = Vec::with_capacity(self.header().output_count);
+        parts.extend(self.outputs().map(|output| OutputParts::from_view(&output)));
+        parts
     }
 
     /// Snapshot/untrusted boundary constructor: re-validates through
@@ -912,6 +937,21 @@ fn remove_part_at<'a>(
     }
 }
 
+/// Strictly-increasing-vout test for the `add_unique` fast path, seeded with
+/// the pre-removal maximum vout of the surviving set (`None` when nothing
+/// survives). Mirrors `parts_are_increasing_unique` exactly: a non-strictly
+/// greater addition fails on `<=`.
+fn additions_are_strictly_increasing(previous: Option<u32>, additions: &[OutputParts<'_>]) -> bool {
+    let mut previous = previous;
+    for addition in additions {
+        if previous.is_some_and(|vout| addition.vout <= vout) {
+            return false;
+        }
+        previous = Some(addition.vout);
+    }
+    true
+}
+
 /// Encodes a canonical record payload into one exact-capacity buffer. Every
 /// script must be `<= u16::MAX`; existing outputs satisfy this by construction
 /// and additions are prevalidated here.
@@ -957,11 +997,17 @@ fn write_output(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Resu
     let script_len = u16::try_from(output.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
         len: output.script.len(),
     })?;
-    writer.push(&output.vout.to_le_bytes())?;
-    writer.push(&output.value.to_le_bytes())?;
-    writer.push(&output.height.to_le_bytes())?;
-    writer.push(&[u8::from(output.coinbase)])?;
-    writer.push(&script_len.to_le_bytes())?;
+    // Pack the canonical 19-byte metadata header (`vout || value || height ||
+    // coinbase || script_len`, all little-endian) into one stack array, then
+    // emit it followed by the script in a single two-push sequence. The range
+    // layout is byte-identical to the former six-segment push chain.
+    let mut meta = [0_u8; OUTPUT_METADATA_LEN];
+    meta[0..4].copy_from_slice(&output.vout.to_le_bytes());
+    meta[4..12].copy_from_slice(&output.value.to_le_bytes());
+    meta[12..16].copy_from_slice(&output.height.to_le_bytes());
+    meta[16] = u8::from(output.coinbase);
+    meta[17..19].copy_from_slice(&script_len.to_le_bytes());
+    writer.push(&meta)?;
     writer.push(output.script)?;
     Ok(())
 }

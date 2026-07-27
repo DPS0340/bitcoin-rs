@@ -461,6 +461,7 @@ fn merge_commit_runs<'src>(
             .is_some_and(|remove| (remove.key, remove.txid) == identity)
         {
             let span = remove_spans[remove_index];
+            vouts.reserve(span.len);
             for index in span.start..span.start + span.len {
                 vouts.push(vout_at(index));
             }
@@ -473,6 +474,7 @@ fn merge_commit_runs<'src>(
             .is_some_and(|add| (add.key, add.txid) == identity)
         {
             let span = add_spans[add_index];
+            parts.reserve(span.len);
             for index in span.start..span.start + span.len {
                 parts.push(part_at(index));
             }
@@ -677,8 +679,7 @@ fn apply_combined_run(
     parts: &[OutputParts<'_>],
 ) -> Result<(), UtxoError> {
     let mutation = if let Some(record) = find_record(table, key, txid) {
-        let add_unique = parts_are_increasing_unique(Some(record), parts);
-        match record.edit_replacement(vouts, parts, add_unique)? {
+        match record.edit_replacement(vouts, parts)? {
             RemovedRecord::Unchanged => RecordMutation::NoChange,
             RemovedRecord::Emptied => RecordMutation::Delete,
             RemovedRecord::Replaced(replacement) => RecordMutation::Replace(replacement),
