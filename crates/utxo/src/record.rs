@@ -1,3 +1,7 @@
+use core::ptr::{self, NonNull};
+use core::slice;
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+
 use bitcoin_rs_primitives::Hash256;
 
 use crate::{UtxoError, UtxoKey};
@@ -28,12 +32,309 @@ pub struct OneUtxoOut<'a> {
 ///
 /// The payload is `txid || output_count || legacy_inline_len || outputs`, where
 /// every output is `vout || value || height || coinbase || script_len || script`
-/// in little-endian canonical form. The record owns exactly its boxed payload;
-/// output views borrow directly from that payload.
+/// in little-endian canonical form. The record owns exactly one pointer-sized
+/// [`ThinRecordBuf`]; output views borrow directly from its payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct UtxoRecord {
-    bytes: Box<[u8]>,
+    buf: ThinRecordBuf,
+}
+
+/// Fixed 8-byte prefix stored at the front of every [`ThinRecordBuf`]
+/// allocation: the immutable capacity and the current live length, both counted
+/// in payload bytes. `#[repr(C)]` fixes the field order and size so the exact
+/// deallocation layout is recoverable from `cap` alone.
+#[repr(C)]
+struct AllocHeader {
+    cap: u32,
+    len: u32,
+}
+
+/// Byte offset of the payload within a [`ThinRecordBuf`] allocation.
+const THIN_HEADER_LEN: usize = core::mem::size_of::<AllocHeader>();
+/// Allocation alignment; the header dominates (payload is raw `u8`).
+const THIN_ALIGN: usize = core::mem::align_of::<AllocHeader>();
+
+/// Pointer-sized owner of one encoded record payload.
+///
+/// The single `NonNull` points at a heap block laid out as
+/// `AllocHeader || payload`. The header stores an immutable capacity (fixed at
+/// allocation) and the current length; the payload holds `len` initialized
+/// bytes followed by `cap - len` uninitialized spare capacity. Growth never
+/// reallocates in place: it allocates a fresh block and drops the old one, so
+/// the `(size, align)` pair used to allocate is always exactly reproducible for
+/// deallocation.
+///
+/// # Invariants
+/// - `ptr` was returned by the global allocator for
+///   `Layout::from_size_align(THIN_HEADER_LEN + cap, THIN_ALIGN)` and is still
+///   live and uniquely owned by this value.
+/// - `len <= cap`, and the first `len` payload bytes are initialized.
+/// - No interior mutability: every mutator takes `&mut self`.
+#[repr(transparent)]
+pub(crate) struct ThinRecordBuf {
+    ptr: NonNull<u8>,
+}
+
+// SAFETY: `ThinRecordBuf` uniquely owns a heap allocation of plain bytes with no
+// interior mutability, and every mutator requires `&mut self`. Moving that sole
+// owner between threads is sound, exactly like the `Box<[u8]>` it replaces.
+unsafe impl Send for ThinRecordBuf {}
+// SAFETY: shared access (`&ThinRecordBuf`) only reads immutable bytes through
+// `as_bytes`/`len`/`capacity`; with no interior mutability, concurrent shared
+// reads cannot race.
+unsafe impl Sync for ThinRecordBuf {}
+
+impl ThinRecordBuf {
+    /// Computes the exact allocation layout and validated `u32` capacity for
+    /// `cap` payload bytes. Fails when `cap` exceeds `u32::MAX` or the total
+    /// size would overflow the allocator's `isize` bound.
+    fn layout_and_cap(cap: usize) -> Result<(Layout, u32), UtxoError> {
+        let cap_u32 = u32::try_from(cap).map_err(|_| UtxoError::RecordTooLarge { len: cap })?;
+        let size = THIN_HEADER_LEN
+            .checked_add(cap)
+            .ok_or(UtxoError::RecordTooLarge { len: cap })?;
+        let layout = Layout::from_size_align(size, THIN_ALIGN)
+            .map_err(|_| UtxoError::RecordTooLarge { len: cap })?;
+        Ok((layout, cap_u32))
+    }
+
+    /// Allocates a block for `layout` (whose size is always `>= THIN_HEADER_LEN`,
+    /// hence non-zero) and writes the header with `cap` capacity and zero length.
+    /// Aborts via `handle_alloc_error` on allocation failure.
+    fn alloc_with(layout: Layout, cap: u32) -> Self {
+        // SAFETY: `layout` comes from `layout_and_cap`, so its size is
+        // `THIN_HEADER_LEN + cap >= THIN_HEADER_LEN > 0`; allocating a non-zero
+        // layout is the documented precondition of `alloc`.
+        let raw = unsafe { alloc(layout) };
+        let ptr = match NonNull::new(raw) {
+            Some(ptr) => ptr,
+            None => handle_alloc_error(layout),
+        };
+        // SAFETY: `ptr` is freshly allocated for `layout`, whose size covers a
+        // whole `AllocHeader` and whose alignment is `THIN_ALIGN ==
+        // align_of::<AllocHeader>()`, so this write is in-bounds and aligned.
+        unsafe {
+            ptr.cast::<AllocHeader>()
+                .as_ptr()
+                .write(AllocHeader { cap, len: 0 });
+        }
+        Self { ptr }
+    }
+
+    /// Allocates an owner with `cap` bytes of capacity and zero length.
+    fn with_capacity(cap: usize) -> Result<Self, UtxoError> {
+        let (layout, cap_u32) = Self::layout_and_cap(cap)?;
+        Ok(Self::alloc_with(layout, cap_u32))
+    }
+
+    /// Allocates an exact-capacity owner (`capacity == len`) holding a copy of
+    /// `src`, retaining no slack. Backs deep clones and the strict decode
+    /// boundary.
+    fn from_slice(src: &[u8]) -> Result<Self, UtxoError> {
+        let mut buf = Self::with_capacity(src.len())?;
+        buf.write_payload(src);
+        Ok(buf)
+    }
+
+    fn header(&self) -> &AllocHeader {
+        // SAFETY: `ptr` points at a live allocation whose first
+        // `THIN_HEADER_LEN` bytes are an initialized `AllocHeader` (written at
+        // construction, never deinitialized) aligned to `THIN_ALIGN`. The borrow
+        // is tied to `&self`, excluding concurrent mutation.
+        unsafe { self.ptr.cast::<AllocHeader>().as_ref() }
+    }
+
+    fn header_mut(&mut self) -> &mut AllocHeader {
+        // SAFETY: as `header`, and `&mut self` guarantees exclusive access.
+        unsafe { self.ptr.cast::<AllocHeader>().as_mut() }
+    }
+
+    fn capacity(&self) -> usize {
+        usize::try_from(self.header().cap).unwrap_or(usize::MAX)
+    }
+
+    fn len(&self) -> usize {
+        usize::try_from(self.header().len).unwrap_or(usize::MAX)
+    }
+
+    /// Returns the `len` initialized live payload bytes.
+    fn as_bytes(&self) -> &[u8] {
+        let len = self.len();
+        if len == 0 {
+            return &[];
+        }
+        // SAFETY: the payload starts `THIN_HEADER_LEN` bytes into the allocation
+        // (in-bounds) and its first `len` bytes are initialized (invariant `len
+        // <= cap`, and `len > 0` here implies `cap > 0`, so the pointer is
+        // interior). `u8` needs only alignment 1. The slice borrows `&self`.
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr().add(THIN_HEADER_LEN), len) }
+    }
+
+    /// Overwrites the payload with `src` and sets the length to `src.len()`.
+    /// The caller must ensure `capacity() >= src.len()`.
+    fn write_payload(&mut self, src: &[u8]) {
+        debug_assert!(self.capacity() >= src.len());
+        if !src.is_empty() {
+            // SAFETY: the destination `[THIN_HEADER_LEN, THIN_HEADER_LEN +
+            // src.len())` lies within the allocation (`src.len() <= capacity`),
+            // `src` is valid for `src.len()` reads, and `src` borrows a distinct
+            // object from this buffer, so the ranges do not overlap. Afterwards
+            // the first `src.len()` payload bytes are initialized.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    self.ptr.as_ptr().add(THIN_HEADER_LEN),
+                    src.len(),
+                );
+            }
+        }
+        // `src.len() <= capacity() <= u32::MAX`, so the conversion is lossless.
+        self.header_mut().len = u32::try_from(src.len()).unwrap_or(u32::MAX);
+    }
+
+    /// Ensures the buffer can hold `cap` bytes and resets the length to zero,
+    /// ready for a fresh off-table encode. Reuses the current allocation when
+    /// its immutable capacity already suffices; otherwise replaces it with a
+    /// fresh exact allocation (capacity is never grown in place).
+    ///
+    /// Shard two-phase-commit surface; wired by the shard integration phase.
+    #[allow(dead_code)]
+    fn reserve(&mut self, cap: usize) -> Result<(), UtxoError> {
+        if self.capacity() >= cap {
+            self.header_mut().len = 0;
+            return Ok(());
+        }
+        *self = Self::with_capacity(cap)?;
+        Ok(())
+    }
+
+    /// Reserves exact `src.len()` capacity if needed, copies `src` into the
+    /// payload, and sets the length to `src.len()` — every live byte is provably
+    /// copied from an initialized source.
+    ///
+    /// Shard two-phase-commit surface; wired by the shard integration phase.
+    #[allow(dead_code)]
+    fn store(&mut self, src: &[u8]) -> Result<(), UtxoError> {
+        self.reserve(src.len())?;
+        self.write_payload(src);
+        Ok(())
+    }
+}
+
+impl Clone for ThinRecordBuf {
+    fn clone(&self) -> Self {
+        // Exact-size copy: `capacity == len`, retaining no slack. `self` is a
+        // live allocation whose (>=) layout already satisfied the size/align
+        // bound, so the exact layout for `len` bytes is always valid; genuine
+        // allocator exhaustion aborts inside `alloc_with` via
+        // `handle_alloc_error` rather than reaching the fallback here.
+        match Self::from_slice(self.as_bytes()) {
+            Ok(buf) => buf,
+            Err(_) => handle_alloc_error(Layout::new::<AllocHeader>()),
+        }
+    }
+}
+
+impl Drop for ThinRecordBuf {
+    fn drop(&mut self) {
+        if let Ok((layout, _)) = Self::layout_and_cap(self.capacity()) {
+            // SAFETY: `ptr` was allocated by the global allocator for exactly
+            // this layout — capacity is immutable for the allocation's lifetime,
+            // so `layout_and_cap(capacity)` reproduces the original layout. The
+            // block is still live and, in `drop` with `&mut self`, has no other
+            // references; it is freed exactly once.
+            unsafe { dealloc(self.ptr.as_ptr(), layout) }
+        }
+    }
+}
+
+impl PartialEq for ThinRecordBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ThinRecordBuf {}
+
+impl core::fmt::Debug for ThinRecordBuf {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ThinRecordBuf")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .field("bytes", &self.as_bytes())
+            .finish()
+    }
+}
+
+/// Cursor over a [`ThinRecordBuf`]'s capacity that copies fully-formed byte
+/// segments in and, on [`RecordWriter::finish`], commits the total copied count
+/// as the new length. Because the length is set only to the number of bytes
+/// actually copied, uninitialized capacity is never exposed as live.
+struct RecordWriter<'a> {
+    buf: &'a mut ThinRecordBuf,
+    written: usize,
+}
+
+impl<'a> RecordWriter<'a> {
+    /// Starts writing at offset zero. The caller must have reserved enough
+    /// capacity for the whole payload; `push` still bounds-checks each segment.
+    fn new(buf: &'a mut ThinRecordBuf) -> Self {
+        buf.header_mut().len = 0;
+        Self { buf, written: 0 }
+    }
+
+    /// Copies `src` into the capacity immediately after the previously written
+    /// bytes. Fails if it would exceed the buffer's capacity.
+    fn push(&mut self, src: &[u8]) -> Result<(), UtxoError> {
+        let end = self
+            .written
+            .checked_add(src.len())
+            .ok_or(UtxoError::RecordTooLarge { len: self.written })?;
+        if end > self.buf.capacity() {
+            return Err(UtxoError::CorruptRecord);
+        }
+        if !src.is_empty() {
+            // SAFETY: the destination `[THIN_HEADER_LEN + written,
+            // THIN_HEADER_LEN + end)` is within the allocation (`end <=
+            // capacity`), `src` is valid for `src.len()` reads, and `src` borrows
+            // a distinct object from the buffer (the encoder's sources are the
+            // caller's descriptors or a different record), so the ranges do not
+            // overlap. The written bytes become initialized.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    self.buf.ptr.as_ptr().add(THIN_HEADER_LEN + self.written),
+                    src.len(),
+                );
+            }
+        }
+        self.written = end;
+        Ok(())
+    }
+
+    /// Commits the copied byte count as the buffer's live length.
+    fn finish(self) -> Result<(), UtxoError> {
+        // `written <= capacity() <= u32::MAX`, so the conversion is lossless.
+        let len = u32::try_from(self.written)
+            .map_err(|_| UtxoError::RecordTooLarge { len: self.written })?;
+        self.buf.header_mut().len = len;
+        Ok(())
+    }
+}
+
+impl UtxoRecord {
+    /// Swaps this record's owned buffer with `scratch` in O(1). The shard commit
+    /// path builds the next payload in a retained scratch buffer and swaps it in
+    /// here, reclaiming the old allocation as the next scratch. The swapped-in
+    /// bytes must already be a canonical encoded record (trusted, so no
+    /// re-decode); the strict boundary stays [`UtxoRecord::from_encoded`].
+    ///
+    /// Shard two-phase-commit surface; wired by the shard integration phase.
+    #[allow(dead_code)]
+    pub(crate) fn swap_buffer(&mut self, scratch: &mut ThinRecordBuf) {
+        core::mem::swap(&mut self.buf, scratch);
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -75,9 +376,9 @@ impl<'a> Iterator for UtxoOutputIter<'a> {
 impl UtxoRecord {
     /// Parses a complete encoded record. The returned record is always safe to
     /// expose through zero-copy output views.
-    pub(crate) fn from_encoded(bytes: Box<[u8]>) -> Result<Self, UtxoError> {
-        validate_encoded(&bytes)?;
-        Ok(Self { bytes })
+    pub(crate) fn from_encoded(buf: ThinRecordBuf) -> Result<Self, UtxoError> {
+        validate_encoded(buf.as_bytes())?;
+        Ok(Self { buf })
     }
 
     /// Builds a record from snapshot-owned outputs in their serialized order.
@@ -116,7 +417,7 @@ impl UtxoRecord {
     pub(crate) fn outputs(&self) -> UtxoOutputIter<'_> {
         let header = self.header();
         UtxoOutputIter {
-            bytes: &self.bytes,
+            bytes: self.buf.as_bytes(),
             cursor: RECORD_HEADER_LEN,
             remaining: header.output_count,
         }
@@ -271,7 +572,8 @@ impl UtxoRecord {
                 .ok_or(UtxoError::RecordTooLarge { len: additions_len })?;
         }
         let payload_len = self
-            .bytes
+            .buf
+            .as_bytes()
             .len()
             .checked_add(additions_len)
             .ok_or(UtxoError::RecordTooLarge { len: additions_len })?;
@@ -279,21 +581,21 @@ impl UtxoRecord {
             return Err(UtxoError::RecordTooLarge { len: payload_len });
         }
 
-        let mut bytes = Vec::with_capacity(payload_len);
-        bytes.extend_from_slice(&header.txid.to_le_bytes());
-        bytes.extend_from_slice(&output_count.to_le_bytes());
-        bytes.push(legacy_inline_len_u8);
-        bytes.extend_from_slice(&self.bytes[RECORD_HEADER_LEN..]);
+        let mut buf = ThinRecordBuf::with_capacity(payload_len)?;
+        let mut writer = RecordWriter::new(&mut buf);
+        writer.push(&header.txid.to_le_bytes())?;
+        writer.push(&output_count.to_le_bytes())?;
+        writer.push(&[legacy_inline_len_u8])?;
+        writer.push(&self.buf.as_bytes()[RECORD_HEADER_LEN..])?;
         for addition in additions {
-            write_output(&mut bytes, addition)?;
+            write_output(&mut writer, addition)?;
         }
-        debug_assert_eq!(bytes.len(), payload_len);
+        writer.finish()?;
+        debug_assert_eq!(buf.as_bytes().len(), payload_len);
         // Invariant: the copied prefix came from this validated record and every
         // appended addition was size-checked above, so the payload is canonical
         // and needs no re-decode.
-        Ok(Some(Self {
-            bytes: bytes.into_boxed_slice(),
-        }))
+        Ok(Some(Self { buf }))
     }
 
     /// Stages an entire coalesced remove run without changing this record,
@@ -424,11 +726,11 @@ impl UtxoRecord {
 
     #[cfg(test)]
     pub(crate) fn encoded_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.buf.as_bytes()
     }
 
     fn header(&self) -> RecordHeader {
-        match decode_header(&self.bytes) {
+        match decode_header(self.buf.as_bytes()) {
             Ok(header) => header,
             // `UtxoRecord` is only built through `from_encoded` or
             // `from_output_parts`, both of which produce a canonical payload; a
@@ -453,8 +755,8 @@ impl UtxoRecord {
         legacy_inline_len: usize,
         outputs: &[OwnedUtxoOut],
     ) -> Result<Self, UtxoError> {
-        let bytes = encode_record(txid, legacy_inline_len, &owned_parts(outputs))?;
-        Self::from_encoded(bytes)
+        let buf = encode_record(txid, legacy_inline_len, &owned_parts(outputs))?;
+        Self::from_encoded(buf)
     }
 
     /// Internal constructor from borrowed descriptors. Every descriptor is
@@ -465,8 +767,8 @@ impl UtxoRecord {
         legacy_inline_len: usize,
         outputs: &[OutputParts<'_>],
     ) -> Result<Self, UtxoError> {
-        let bytes = encode_record(txid, legacy_inline_len, outputs)?;
-        Ok(Self { bytes })
+        let buf = encode_record(txid, legacy_inline_len, outputs)?;
+        Ok(Self { buf })
     }
 }
 
@@ -617,7 +919,7 @@ fn encode_record(
     txid: Hash256,
     legacy_inline_len: usize,
     outputs: &[OutputParts<'_>],
-) -> Result<Box<[u8]>, UtxoError> {
+) -> Result<ThinRecordBuf, UtxoError> {
     let output_count = u32::try_from(outputs.len())
         .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
     if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
@@ -636,29 +938,31 @@ fn encode_record(
 
     let legacy_inline_len_u8 =
         u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
-    let mut bytes = Vec::with_capacity(payload_len);
-    bytes.extend_from_slice(&txid.to_le_bytes());
-    bytes.extend_from_slice(&output_count.to_le_bytes());
-    bytes.push(legacy_inline_len_u8);
+    let mut buf = ThinRecordBuf::with_capacity(payload_len)?;
+    let mut writer = RecordWriter::new(&mut buf);
+    writer.push(&txid.to_le_bytes())?;
+    writer.push(&output_count.to_le_bytes())?;
+    writer.push(&[legacy_inline_len_u8])?;
     for output in outputs {
-        write_output(&mut bytes, output)?;
+        write_output(&mut writer, output)?;
     }
-    debug_assert_eq!(bytes.len(), payload_len);
-    Ok(bytes.into_boxed_slice())
+    writer.finish()?;
+    debug_assert_eq!(buf.as_bytes().len(), payload_len);
+    Ok(buf)
 }
 
 /// Appends one output's canonical 19-byte metadata + script, validating the
 /// script length fits the `u16` length field.
-fn write_output(bytes: &mut Vec<u8>, output: &OutputParts<'_>) -> Result<(), UtxoError> {
+fn write_output(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Result<(), UtxoError> {
     let script_len = u16::try_from(output.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
         len: output.script.len(),
     })?;
-    bytes.extend_from_slice(&output.vout.to_le_bytes());
-    bytes.extend_from_slice(&output.value.to_le_bytes());
-    bytes.extend_from_slice(&output.height.to_le_bytes());
-    bytes.push(u8::from(output.coinbase));
-    bytes.extend_from_slice(&script_len.to_le_bytes());
-    bytes.extend_from_slice(output.script);
+    writer.push(&output.vout.to_le_bytes())?;
+    writer.push(&output.value.to_le_bytes())?;
+    writer.push(&output.height.to_le_bytes())?;
+    writer.push(&[u8::from(output.coinbase)])?;
+    writer.push(&script_len.to_le_bytes())?;
+    writer.push(output.script)?;
     Ok(())
 }
 
@@ -931,12 +1235,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_owner_is_one_fat_pointer() {
+    fn compact_owner_is_one_pointer() {
         assert_eq!(
             core::mem::size_of::<UtxoRecord>(),
-            core::mem::size_of::<Box<[u8]>>()
+            core::mem::size_of::<usize>()
         );
-        assert_eq!(core::mem::size_of::<UtxoRecord>(), 16);
+        assert_eq!(
+            core::mem::size_of::<UtxoRecord>(),
+            core::mem::size_of::<core::ptr::NonNull<u8>>()
+        );
     }
 
     #[test]
@@ -975,7 +1282,7 @@ mod tests {
             .ok_or(UtxoError::CorruptRecord)?
             .to_vec();
         assert!(matches!(
-            UtxoRecord::from_encoded(truncated_metadata.into_boxed_slice()),
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&truncated_metadata)?),
             Err(UtxoError::CorruptRecord)
         ));
 
@@ -988,14 +1295,14 @@ mod tests {
             .ok_or(UtxoError::CorruptRecord)?
             .to_vec();
         assert!(matches!(
-            UtxoRecord::from_encoded(truncated_script.into_boxed_slice()),
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&truncated_script)?),
             Err(UtxoError::CorruptRecord)
         ));
 
         let mut trailing = encoded.to_vec();
         trailing.push(0);
         assert!(matches!(
-            UtxoRecord::from_encoded(trailing.into_boxed_slice()),
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&trailing)?),
             Err(UtxoError::CorruptRecord)
         ));
 
@@ -1005,7 +1312,7 @@ mod tests {
             .ok_or(UtxoError::CorruptRecord)?;
         count.copy_from_slice(&2_u32.to_le_bytes());
         assert!(matches!(
-            UtxoRecord::from_encoded(count_mismatch.into_boxed_slice()),
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&count_mismatch)?),
             Err(UtxoError::CorruptRecord)
         ));
 
@@ -1015,7 +1322,7 @@ mod tests {
             .ok_or(UtxoError::CorruptRecord)?;
         *bool_byte = 2;
         assert!(matches!(
-            UtxoRecord::from_encoded(invalid_bool.into_boxed_slice()),
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&invalid_bool)?),
             Err(UtxoError::CorruptRecord)
         ));
         Ok(())
@@ -1125,6 +1432,100 @@ mod tests {
             Err(UtxoError::ScriptTooLarge { .. })
         ));
         assert_eq!(record, original);
+        Ok(())
+    }
+
+    #[test]
+    fn thin_owner_exact_constructor_has_no_slack() -> Result<(), UtxoError> {
+        let record =
+            UtxoRecord::from_owned_outputs(Hash256::default(), &[output(0, &[0x51, 0xAC], 1)])?;
+        assert_eq!(record.buf.len(), record.encoded_bytes().len());
+        assert_eq!(record.buf.capacity(), record.buf.len());
+        Ok(())
+    }
+
+    #[test]
+    fn thin_owner_deep_clone_is_independent_and_exact() -> Result<(), UtxoError> {
+        let record = UtxoRecord::from_owned_outputs(
+            Hash256::from_le_bytes(&[0x11; TXID_LEN]),
+            &[output(0, &[0x51], 1), output(1, &[0x6A, 0xAC], 2)],
+        )?;
+        let clone = record.clone();
+        assert_eq!(clone, record);
+        assert_eq!(clone.encoded_bytes(), record.encoded_bytes());
+        // Clones retain no slack and own a distinct allocation.
+        assert_eq!(clone.buf.capacity(), clone.buf.len());
+        assert_ne!(
+            record.buf.as_bytes().as_ptr(),
+            clone.buf.as_bytes().as_ptr()
+        );
+        // Dropping the source must leave the clone fully valid; Miri verifies the
+        // allocations are independent.
+        drop(record);
+        assert_eq!(clone.output_count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn thin_scratch_writer_builds_exact_payload() -> Result<(), UtxoError> {
+        let mut buf = ThinRecordBuf::with_capacity(6)?;
+        {
+            let mut writer = RecordWriter::new(&mut buf);
+            writer.push(&[1, 2, 3])?;
+            writer.push(&[])?;
+            writer.push(&[4, 5, 6])?;
+            writer.finish()?;
+        }
+        assert_eq!(buf.as_bytes(), &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(buf.len(), 6);
+        assert_eq!(buf.capacity(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn thin_scratch_writer_rejects_capacity_overflow() -> Result<(), UtxoError> {
+        let mut buf = ThinRecordBuf::with_capacity(2)?;
+        let mut writer = RecordWriter::new(&mut buf);
+        writer.push(&[1, 2])?;
+        assert!(matches!(writer.push(&[3]), Err(UtxoError::CorruptRecord)));
+        Ok(())
+    }
+
+    #[test]
+    fn thin_scratch_reserve_reuses_then_grows() -> Result<(), UtxoError> {
+        let mut scratch = ThinRecordBuf::with_capacity(8)?;
+        scratch.store(&[9; 5])?;
+        assert_eq!(scratch.capacity(), 8);
+        assert_eq!(scratch.as_bytes(), &[9; 5]);
+        // Reusing within capacity keeps the immutable capacity and resets length.
+        scratch.store(&[7; 3])?;
+        assert_eq!(scratch.capacity(), 8);
+        assert_eq!(scratch.as_bytes(), &[7; 3]);
+        // Growth beyond capacity replaces the allocation with an exact one.
+        scratch.store(&[1; 20])?;
+        assert_eq!(scratch.capacity(), 20);
+        assert_eq!(scratch.as_bytes(), &[1; 20]);
+        Ok(())
+    }
+
+    #[test]
+    fn thin_swap_buffer_exchanges_payloads() -> Result<(), UtxoError> {
+        let txid = Hash256::from_le_bytes(&[0x22; TXID_LEN]);
+        let mut record = UtxoRecord::from_owned_outputs(txid, &[output(0, &[0x51], 1)])?;
+        let original = record.encoded_bytes().to_vec();
+
+        let replacement = UtxoRecord::from_owned_outputs(
+            txid,
+            &[output(0, &[0x51], 1), output(1, &[0x6A, 0xAC], 2)],
+        )?;
+        let mut scratch = ThinRecordBuf::with_capacity(0)?;
+        scratch.store(replacement.encoded_bytes())?;
+
+        record.swap_buffer(&mut scratch);
+        assert_eq!(record.encoded_bytes(), replacement.encoded_bytes());
+        assert_eq!(record.output_count(), 2);
+        // The old payload is reclaimed into the scratch buffer for reuse.
+        assert_eq!(scratch.as_bytes(), original.as_slice());
         Ok(())
     }
 }
