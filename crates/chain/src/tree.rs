@@ -401,6 +401,16 @@ impl BlockTree {
         header: BlockHeader,
         status: NodeStatus,
     ) -> Result<NodeId, ChainError> {
+        let hash = hash_from_header(&header);
+        self.insert_header_with_hash(header, hash, status)
+    }
+
+    pub(crate) fn insert_header_with_hash(
+        &mut self,
+        header: BlockHeader,
+        hash: Hash256,
+        status: NodeStatus,
+    ) -> Result<NodeId, ChainError> {
         let parent = if self.nodes.is_empty() {
             None
         } else {
@@ -410,7 +420,7 @@ impl BlockTree {
                     .ok_or(ChainError::MissingParent { prev_hash })?,
             )
         };
-        self.insert_node(parent, header, status)
+        self.insert_node_with_hash(parent, header, hash, status)
     }
 
     /// Inserts a header under an explicit parent.
@@ -421,6 +431,16 @@ impl BlockTree {
         status: NodeStatus,
     ) -> Result<NodeId, ChainError> {
         let hash = hash_from_header(&header);
+        self.insert_node_with_hash(parent, header, hash, status)
+    }
+
+    fn insert_node_with_hash(
+        &mut self,
+        parent: Option<NodeId>,
+        header: BlockHeader,
+        hash: Hash256,
+        status: NodeStatus,
+    ) -> Result<NodeId, ChainError> {
         if self.lookup(hash).is_some() {
             return Err(ChainError::DuplicateHeader { hash });
         }
