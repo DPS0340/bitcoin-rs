@@ -656,7 +656,6 @@ pub(crate) struct SpendPayload<'a> {
 /// In-memory 256-shard UTXO set.
 pub struct UtxoSet {
     pub(crate) shards: [Shard; UtxoKey::SHARD_COUNT],
-    pub(crate) last_defragged_shard: Mutex<u8>,
     stable_view_lock: RwLock<()>,
     listener: Option<Box<dyn UtxoChangeListener + Send + Sync>>,
 }
@@ -684,12 +683,6 @@ impl UtxoSetView<'_> {
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.set.shards.iter().map(Shard::record_count).sum()
-    }
-
-    /// Returns each shard's script-slab high-water mark in this stable view.
-    #[must_use]
-    pub fn arena_high_water_by_shard(&self) -> [usize; UtxoKey::SHARD_COUNT] {
-        core::array::from_fn(|idx| self.set.shards[idx].arena_high_water())
     }
 
     /// Computes Bitcoin Core's `hash_serialized_3` commitment for this stable view.
@@ -724,7 +717,6 @@ impl UtxoSet {
     pub fn new() -> Self {
         Self {
             shards: [(); UtxoKey::SHARD_COUNT].map(|()| Shard::new()),
-            last_defragged_shard: Mutex::new(0),
             stable_view_lock: RwLock::new(()),
             listener: None,
         }
@@ -824,12 +816,6 @@ impl UtxoSet {
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.with_stable_view(stable_view_record_count)
-    }
-
-    /// Returns each shard's script-slab high-water mark.
-    #[must_use]
-    pub fn arena_high_water_by_shard(&self) -> [usize; UtxoKey::SHARD_COUNT] {
-        self.with_stable_view(stable_view_arena_high_water_by_shard)
     }
 
     pub(crate) fn insert_snapshot_record(
@@ -950,10 +936,6 @@ impl UtxoSet {
             return Ok(());
         }
 
-        for &shard_idx in &active_shards[..active_shard_count] {
-            self.shards[shard_idx].validate_script_capacity(buckets.adds(shard_idx))?;
-        }
-
         let errors = Mutex::new(Vec::new());
         let shard_events: Vec<_> = active_shards[..active_shard_count]
             .par_iter()
@@ -997,10 +979,6 @@ impl UtxoSet {
         buckets: &ShardCommitBuckets<'_>,
         listener: &(dyn UtxoChangeListener + Send + Sync),
     ) -> Result<(), UtxoError> {
-        for &shard_idx in &active_shards[..active_shard_count] {
-            self.shards[shard_idx].validate_script_capacity(buckets.adds(shard_idx))?;
-        }
-
         let mut error = None;
         let mut shard_events =
             SmallVec::<[UtxoChangeEvents<'_>; PARALLEL_LISTENER_SHARD_THRESHOLD]>::new();
@@ -1368,8 +1346,4 @@ fn stable_view_len(view: &UtxoSetView<'_>) -> usize {
 
 fn stable_view_record_count(view: &UtxoSetView<'_>) -> usize {
     view.record_count()
-}
-
-fn stable_view_arena_high_water_by_shard(view: &UtxoSetView<'_>) -> [usize; UtxoKey::SHARD_COUNT] {
-    view.arena_high_water_by_shard()
 }

@@ -1,5 +1,8 @@
 //! Snapshot dump/load round-trip coverage.
-use bitcoin::{Amount, ScriptBuf};
+use bitcoin::{
+    Amount, ScriptBuf,
+    hashes::{Hash as _, sha256},
+};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{
     BlockChanges, UtxoAdd, UtxoError, UtxoKey, UtxoSet, hash_serialized_3, read_snapshot,
@@ -122,6 +125,42 @@ fn snapshot_roundtrip_preserves_vout_64() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(loaded.set.get(&low), Some(low_txout));
     assert_eq!(loaded.set.get(&high), Some(high_txout));
     assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
+    Ok(())
+}
+
+#[test]
+fn snapshot_v3_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(
+        OutPoint::new(txid(1), 0),
+        txout(11),
+        false,
+        40,
+    ));
+    changes.add(UtxoAdd::new(
+        OutPoint::new(txid(2), 64),
+        txout(22),
+        true,
+        41,
+    ));
+    set.commit_block(&changes, &txid(3))?;
+
+    let mut file = tempfile()?;
+    write_snapshot(&set, &txid(99), 41, &mut file)?;
+    file.rewind()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+
+    assert_eq!(bytes.len(), 582);
+    assert_eq!(
+        sha256::Hash::hash(&bytes),
+        sha256::Hash::from_byte_array([
+            0x7e, 0x8a, 0x88, 0xe1, 0xc8, 0x97, 0xe4, 0x57, 0x63, 0x5e, 0x96, 0xed, 0xbf, 0xd4,
+            0x09, 0x11, 0xc9, 0xfe, 0x78, 0xde, 0xa1, 0x7f, 0xa7, 0xf6, 0x24, 0x8a, 0x4f, 0x22,
+            0xdc, 0x44, 0xbd, 0x0a,
+        ]),
+    );
     Ok(())
 }
 

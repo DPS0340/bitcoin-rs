@@ -7,7 +7,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::{
     UtxoError, UtxoKey, UtxoSet, UtxoSetView,
     record::{OneUtxoOut, OwnedUtxoOut, bitmap_vout_bit},
-    shard::ShardTable,
 };
 
 const SNAPSHOT_MAGIC: u32 = 0x55_54_58_4f;
@@ -101,7 +100,7 @@ pub fn write_snapshot(
                     };
                     writer.write_all(record_header.as_bytes())?;
                     for output in record.iter_outputs() {
-                        let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                        let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
                         let vout_header = SnapshotVoutHeader {
                             vout: output.vout.to_le(),
                             value: output.value.to_le(),
@@ -278,7 +277,7 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
             let mut entries = Vec::with_capacity(table.output_count());
             for record in &table.table {
                 for output in record.iter_outputs() {
-                    let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                    let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
                     entries.push(HashSerializedEntry {
                         txid_le: record.txid().to_le_bytes(),
                         output,
@@ -332,7 +331,7 @@ impl UtxoSetView<'_> {
                 for record in &table.table {
                     let txid = record.txid();
                     for output in record.iter_outputs() {
-                        let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                        let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
                         f(
                             txid,
                             output.vout,
@@ -383,14 +382,4 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     let mut out = [0_u8; 8];
     out.copy_from_slice(&bytes[offset..offset + 8]);
     u64::from_le_bytes(out)
-}
-
-fn script_slice<'table>(
-    table: &'table ShardTable<'_>,
-    output: &OneUtxoOut,
-) -> Option<&'table [u8]> {
-    let start = usize::try_from(output.script_pubkey_offset).ok()?;
-    let len = usize::from(output.script_pubkey_len);
-    let end = start.checked_add(len)?;
-    table.script_bytes.get(start..end)
 }

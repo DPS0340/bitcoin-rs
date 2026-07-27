@@ -1,17 +1,14 @@
 //! In-memory UTXO set for bitcoin-rs.
 //!
-//! The set is split into 256 first-byte shards. Each shard stores immutable
-//! transaction-level records in a `self_cell!`-pinned `bumpalo::Bump` arena,
-//! indexes them with `hashbrown::HashTable`, and guards mutation with a
-//! cache-padded `parking_lot::RwLock`.
+//! The set is split into 256 first-byte shards. Each shard stores owned
+//! transaction-level records in a `hashbrown::HashTable` of `Box<UtxoRecord>`,
+//! and guards mutation with a cache-padded `parking_lot::RwLock`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-/// Round-robin shard defragmentation.
-pub mod defrag;
 /// UTXO hash-table key.
 pub mod key;
-/// Arena-resident UTXO records.
+/// Owned UTXO records.
 pub mod record;
 /// UTXO-set mutations and lookup.
 pub mod set;

@@ -624,7 +624,6 @@ dependencies = [
  "bitcoin",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
- "bumpalo",
  "bytemuck",
  "criterion",
  "crossbeam-utils",
@@ -637,7 +636,6 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "rayon",
- "self_cell",
  "sha2 0.11.0",
  "smallvec",
  "tempfile",
@@ -779,9 +777,6 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-dependencies = [
- "allocator-api2",
-]
 
 [[package]]
 name = "bytemuck"
