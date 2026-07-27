@@ -6,7 +6,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::{
     UtxoError, UtxoKey, UtxoSet, UtxoSetView,
-    record::{OneUtxoOut, OwnedUtxoOut, bitmap_vout_bit},
+    record::{OneUtxoOut, OwnedUtxoOut},
 };
 
 const SNAPSHOT_MAGIC: u32 = 0x55_54_58_4f;
@@ -99,17 +99,22 @@ pub fn write_snapshot(
                         vout_count,
                     };
                     writer.write_all(record_header.as_bytes())?;
-                    for output in record.iter_outputs() {
-                        let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
+                    for output in record.outputs() {
+                        let script_len =
+                            u16::try_from(output.script_pubkey.len()).map_err(|_| {
+                                UtxoError::ScriptTooLarge {
+                                    len: output.script_pubkey.len(),
+                                }
+                            })?;
                         let vout_header = SnapshotVoutHeader {
                             vout: output.vout.to_le(),
                             value: output.value.to_le(),
                             height: output.height.to_le(),
                             coinbase: u8::from(output.coinbase),
-                            script_len: output.script_pubkey_len.to_le(),
+                            script_len: script_len.to_le(),
                         };
                         writer.write_all(vout_header.as_bytes())?;
-                        writer.write_all(script)?;
+                        writer.write_all(output.script_pubkey)?;
                     }
                 }
                 Ok::<(), UtxoError>(())
@@ -194,9 +199,10 @@ fn read_snapshot_record_v2(
     let mut outputs = Vec::with_capacity(usize::from(vout_count));
     for _ in 0..vout_count {
         let output = read_snapshot_output(reader)?;
-        let Some(bit) = bitmap_vout_bit(output.vout) else {
+        if output.vout >= 64 {
             return Err(UtxoError::VoutOutOfRange { vout: output.vout });
-        };
+        }
+        let bit = 1_u64 << output.vout;
         if vout_bitmap & bit == 0 {
             return Err(UtxoError::SnapshotVoutBitmapMismatch {
                 bitmap: vout_bitmap,
@@ -276,12 +282,10 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
         view.shard(usize::from(shard_idx)).with_table(|table| {
             let mut entries = Vec::with_capacity(table.output_count());
             for record in &table.table {
-                for output in record.iter_outputs() {
-                    let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
+                for output in record.outputs() {
                     entries.push(HashSerializedEntry {
                         txid_le: record.txid().to_le_bytes(),
                         output,
-                        script,
                     });
                 }
             }
@@ -298,13 +302,14 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
                 let code = (entry.output.height << 1) | u32::from(entry.output.coinbase);
                 engine.update(code.to_le_bytes());
                 engine.update(entry.output.value.to_le_bytes());
-                let script_len =
-                    u64::try_from(entry.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
-                        len: entry.script.len(),
-                    })?;
+                let script_len = u64::try_from(entry.output.script_pubkey.len()).map_err(|_| {
+                    UtxoError::ScriptTooLarge {
+                        len: entry.output.script_pubkey.len(),
+                    }
+                })?;
                 let encoded_len = varint::encode(script_len);
                 engine.update(encoded_len.as_slice());
-                engine.update(entry.script);
+                engine.update(entry.output.script_pubkey);
             }
             Ok::<(), UtxoError>(())
         })?;
@@ -319,7 +324,7 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
 impl UtxoSetView<'_> {
     /// Invokes `f` once per live coin in the stable view, passing
     /// `(txid, vout, value, script_pubkey, height, coinbase)`. The script slice
-    /// borrows arena memory valid only for the duration of the call.
+    /// borrows the record payload only for the duration of the call.
     ///
     /// On-demand scan helper (e.g. `gettxoutsetinfo`); not on any hot path.
     pub fn for_each_coin<F>(&self, mut f: F) -> Result<(), UtxoError>
@@ -330,13 +335,12 @@ impl UtxoSetView<'_> {
             self.shard(usize::from(shard_idx)).with_table(|table| {
                 for record in &table.table {
                     let txid = record.txid();
-                    for output in record.iter_outputs() {
-                        let script = record.script_slice(output).ok_or(UtxoError::CorruptArena)?;
+                    for output in record.outputs() {
                         f(
                             txid,
                             output.vout,
                             output.value,
-                            script,
+                            output.script_pubkey,
                             output.height,
                             output.coinbase,
                         );
@@ -356,8 +360,7 @@ pub fn aggregate_hash(set: &UtxoSet) -> Result<Hash256, UtxoError> {
 
 struct HashSerializedEntry<'a> {
     txid_le: [u8; 32],
-    output: &'a OneUtxoOut,
-    script: &'a [u8],
+    output: OneUtxoOut<'a>,
 }
 
 fn read_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], UtxoError> {

@@ -1,8 +1,4 @@
-use std::{
-    io,
-    mem::{self, MaybeUninit},
-    time::Instant,
-};
+use std::{io, time::Instant};
 
 use bitcoin::ScriptBuf;
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
@@ -38,15 +34,15 @@ pub enum UtxoError {
         /// Script length in bytes.
         len: usize,
     },
-    /// The shard script slab exceeded the record `u32` offset field.
-    #[error("script arena offset exceeded u32 range at {len} bytes")]
-    ArenaOffsetOverflow {
-        /// Current script slab byte length.
+    /// One encoded record could not fit in the local address space.
+    #[error("encoded UTXO record exceeds addressable size at {len} bytes")]
+    RecordTooLarge {
+        /// Encoded record byte length.
         len: usize,
     },
-    /// Internal record offsets no longer point into the shard script slab.
-    #[error("UTXO record points outside its shard script arena")]
-    CorruptArena,
+    /// Encoded UTXO record bytes are truncated, trailing, or noncanonical.
+    #[error("invalid encoded UTXO record")]
+    CorruptRecord,
     /// Snapshot I/O failed.
     #[error("snapshot I/O failed: {0}")]
     Io(#[from] io::Error),
@@ -694,7 +690,7 @@ impl UtxoSetView<'_> {
     pub fn scan_script_pubkeys(&self, scripts: &[ScriptBuf]) -> Result<UtxoScan, UtxoError> {
         let mut scan = UtxoScan::default();
         for shard in &self.set.shards {
-            shard.scan_script_pubkeys(scripts, &mut scan)?;
+            shard.scan_script_pubkeys(scripts, &mut scan);
         }
         Ok(scan)
     }
@@ -1236,12 +1232,14 @@ fn scattered_adds<'a, A: UtxoAddView>(
     counts: &[usize; UtxoKey::SHARD_COUNT],
 ) -> ([(usize, usize); UtxoKey::SHARD_COUNT], Vec<AddPayload<'a>>) {
     let (ranges, mut cursors) = shard_ranges(counts);
-    let mut slots = uninit_slots(adds.len());
+    let mut slots = std::iter::repeat_with(|| None)
+        .take(adds.len())
+        .collect::<Vec<Option<AddPayload<'a>>>>();
     for add in adds {
         let key = UtxoKey::from_txid(&add.outpoint().txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor].write((key, add.outpoint().txid, add.payload()));
+        slots[*cursor] = Some((key, add.outpoint().txid, add.payload()));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));
@@ -1256,12 +1254,14 @@ fn scattered_removes<'a>(
     Vec<SpendPayload<'a>>,
 ) {
     let (ranges, mut cursors) = shard_ranges(counts);
-    let mut slots = uninit_slots(removes.len());
+    let mut slots = std::iter::repeat_with(|| None)
+        .take(removes.len())
+        .collect::<Vec<Option<SpendPayload<'a>>>>();
     for remove in removes {
         let key = UtxoKey::from_txid(&remove.txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor].write(spend_payload(remove, key));
+        slots[*cursor] = Some(spend_payload(remove, key));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));
@@ -1302,26 +1302,19 @@ fn range_ends(ranges: &[(usize, usize); UtxoKey::SHARD_COUNT]) -> [usize; UtxoKe
     ranges.map(|(_start, end)| end)
 }
 
-fn uninit_slots<T>(len: usize) -> Vec<MaybeUninit<T>> {
-    let mut slots = Vec::with_capacity(len);
-    // SAFETY: `MaybeUninit<T>` does not require initialization. The callers
-    // fill every slot before converting this allocation to `Vec<T>`.
-    unsafe {
-        slots.set_len(len);
-    }
+fn initialized_slots<T>(slots: Vec<Option<T>>) -> Vec<T> {
     slots
-}
-
-fn initialized_slots<T>(mut slots: Vec<MaybeUninit<T>>) -> Vec<T> {
-    let ptr = slots.as_mut_ptr().cast::<T>();
-    let len = slots.len();
-    let capacity = slots.capacity();
-    mem::forget(slots);
-    // SAFETY: `ShardCommitBuckets::new` writes exactly one initialized value
-    // into each slot before calling this helper. `MaybeUninit<T>` has the same
-    // layout as `T`, and ownership of the original allocation is transferred to
-    // the returned `Vec<T>` with the same length and capacity.
-    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+        .into_iter()
+        .map(|slot| match slot {
+            Some(value) => value,
+            // `shard_ranges` sizes each shard's range from the per-shard
+            // counts, and every add/remove writes its payload into the slot
+            // at its shard's running cursor; a missing slot means the bucket
+            // counts disagreed with the input length, which is an
+            // unrecoverable internal corrupt state.
+            None => panic!("shard bucket counts allocate every slot"),
+        })
+        .collect()
 }
 
 fn active_shards(

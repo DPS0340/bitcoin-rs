@@ -1,8 +1,9 @@
 //! In-memory UTXO set for bitcoin-rs.
 //!
-//! The set is split into 256 first-byte shards. Each shard stores owned
-//! transaction-level records in a `hashbrown::HashTable` of `Box<UtxoRecord>`,
-//! and guards mutation with a cache-padded `parking_lot::RwLock`.
+//! The set is split into 256 first-byte shards. Each shard stores compact,
+//! transaction-level `UtxoRecord` owners inline in a `hashbrown::HashTable`;
+//! every record owns one boxed encoded payload and mutations are guarded by a
+//! cache-padded `parking_lot::RwLock`.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
