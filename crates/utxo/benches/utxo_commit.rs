@@ -639,6 +639,70 @@ fn bench_spend_fanout(c: &mut Criterion) {
     });
 }
 
+/// Matched lookup benchmarks measuring compact-record cursor decode cost.
+///
+/// Reuses `same_txid_churn_case`, which preloads a single txid with 256 live
+/// outputs at vouts 0..=255 — a high-fanout same-txid record. The returned
+/// `BlockChanges` are intentionally not applied: lookups are read-only and the
+/// preloaded state is what the timed body probes. Setup (set construction +
+/// the 256-output preload commit + `OutPoint` materialization) happens once
+/// outside the timed body; each iteration performs only the public-API lookup
+/// call. The `Option<...>` result is wrapped in `black_box` so the decode
+/// cannot be dead-code eliminated.
+///
+/// Hits probe first (vout 0), middle (vout 127), and last (vout 255) outputs,
+/// exercising 1, 128, and 256 cursor `decode_output` steps respectively. The
+/// miss probes vout 256 on the same txid: the record is found but
+/// `find_output` scans all 256 entries and returns `None`, so the full cursor
+/// decode cost is measured rather than a hash-table short-circuit.
+fn bench_matched_lookup(c: &mut Criterion) {
+    let (set, _changes) = same_txid_churn_case(0x0102_0304);
+    let live_txid = txid(0x0102_0304);
+    let first = OutPoint::new(live_txid, 0);
+    let middle = OutPoint::new(live_txid, 127);
+    let last = OutPoint::new(live_txid, 255);
+    let miss = OutPoint::new(live_txid, 256);
+
+    c.bench_function("utxo_commit/same_txid_lookup_get_first", |b| {
+        b.iter(|| black_box(set.get(black_box(&first))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_middle", |b| {
+        b.iter(|| black_box(set.get(black_box(&middle))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_last", |b| {
+        b.iter(|| black_box(set.get(black_box(&last))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_miss", |b| {
+        b.iter(|| black_box(set.get(black_box(&miss))));
+    });
+
+    c.bench_function("utxo_commit/same_txid_lookup_get_entry_first", |b| {
+        b.iter(|| black_box(set.get_entry(black_box(&first))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_entry_middle", |b| {
+        b.iter(|| black_box(set.get_entry(black_box(&middle))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_entry_last", |b| {
+        b.iter(|| black_box(set.get_entry(black_box(&last))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_entry_miss", |b| {
+        b.iter(|| black_box(set.get_entry(black_box(&miss))));
+    });
+
+    c.bench_function("utxo_commit/same_txid_lookup_get_meta_first", |b| {
+        b.iter(|| black_box(set.get_meta(black_box(&first))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_meta_middle", |b| {
+        b.iter(|| black_box(set.get_meta(black_box(&middle))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_meta_last", |b| {
+        b.iter(|| black_box(set.get_meta(black_box(&last))));
+    });
+    c.bench_function("utxo_commit/same_txid_lookup_get_meta_miss", |b| {
+        b.iter(|| black_box(set.get_meta(black_box(&miss))));
+    });
+}
+
 fn bench_same_txid_cases(c: &mut Criterion) {
     c.bench_function("utxo_commit/same_txid_churn", |b| {
         b.iter_batched(
@@ -657,6 +721,7 @@ fn bench_same_txid_cases(c: &mut Criterion) {
     bench_same_txid_high_vout_full_spend(c);
     bench_same_txid_high_vout_full_spend_noop_listener(c);
     bench_spend_fanout(c);
+    bench_matched_lookup(c);
     c.bench_function("utxo_commit/interleaved_same_txid_churn", |b| {
         b.iter_batched(
             || interleaved_same_txid_churn_case(0x0304_0506),
