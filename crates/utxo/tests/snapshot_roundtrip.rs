@@ -542,7 +542,7 @@ fn snapshot_roundtrip_preserves_empty_script_pubkey() -> Result<(), Box<dyn std:
     changes.add(UtxoAdd::new(op, expect.clone(), false, 600));
     set.commit_block(&changes, &txid(100_099))?;
 
-    // Pin the script_len bytes (u16 LE = 0, 0) at output header offset 117
+    // Pin the script_len bytes (u16 LE = 0, 0) at file offset 111.
     let mut file = tempfile()?;
     write_snapshot(&set, &txid(100_100), 600, &mut file)?;
     file.rewind()?;
