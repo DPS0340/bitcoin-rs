@@ -341,7 +341,7 @@ fn spawn_dns_peer_maintenance(
 
                     let live = peer_outbound.read().len();
                     if live >= P2P_OUTBOUND_PEER_TARGET {
-                        maintenance_delay = DNS_MAINTENANCE_INTERVAL;
+                        maintenance_delay = bootstrap_refill.next_delay(live, 0);
                         continue;
                     }
                     let deficit = P2P_OUTBOUND_PEER_TARGET - live;
