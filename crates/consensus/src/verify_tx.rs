@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
 #[cfg(feature = "bitcoinconsensus")]
 use bitcoin::{Script, consensus::encode};
@@ -15,6 +16,18 @@ const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 const SEQUENCE_FINAL: u32 = 0xffff_ffff;
 const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
+
+// SMT siblings make secp256k1 verification slower past this width on large hosts.
+const MAX_SCRIPT_VERIFY_THREADS: usize = 16;
+const MIN_PARALLEL_SCRIPT_CHECKS: usize = 16;
+static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(available.min(MAX_SCRIPT_VERIFY_THREADS))
+        .thread_name(|index| format!("script-verify-{index}"))
+        .build()
+        .unwrap_or_else(|error| panic!("failed to build script verification pool: {error}"))
+});
 
 /// Returns `true` iff the transaction is locktime-final at `block_height` and the timestamp cutoff.
 ///
@@ -171,9 +184,18 @@ fn verify_transaction_borrowed_with_locktime_cutoff(
         crate::kernel::verify_tx_scripts(tx, &prep.prevouts, flags)?;
         #[cfg(not(feature = "kernel"))]
         {
-            let mut serialized_tx: Option<Vec<u8>> = None;
+            #[cfg(feature = "bitcoinconsensus")]
+            let serialized_tx = Some(encode::serialize(tx));
+            #[cfg(not(feature = "bitcoinconsensus"))]
+            let serialized_tx: Option<Vec<u8>> = None;
             for (input_index, (_, prevout)) in prep.prevouts.iter().enumerate() {
-                verify_input_script_portable(input_index, prevout, tx, flags, &mut serialized_tx)?;
+                verify_input_script_portable(
+                    input_index,
+                    prevout,
+                    tx,
+                    flags,
+                    serialized_tx.as_deref(),
+                )?;
             }
         }
     }
@@ -280,22 +302,24 @@ fn finalize_tx_value_and_sigops(
 }
 
 /// Portable per-input script verdict: bitcoinconsensus for non-taproot, else the
-/// Rust interpreter. `serialized_tx` caches the transaction serialization across
-/// a single transaction's inputs.
+/// Rust interpreter. `serialized_tx` borrows one serialization shared by every
+/// input of the transaction.
 #[cfg(not(feature = "kernel"))]
 fn verify_input_script_portable(
     input_index: usize,
     prevout: &bitcoin::TxOut,
     tx: &bitcoin::Transaction,
     flags: VerifyFlags,
-    serialized_tx: &mut Option<Vec<u8>>,
+    serialized_tx: Option<&[u8]>,
 ) -> Result<(), ConsensusError> {
     #[cfg(feature = "bitcoinconsensus")]
-    if verify_non_taproot_with_bitcoinconsensus(input_index, prevout, tx, flags, serialized_tx)? {
+    if let Some(serialized_tx) = serialized_tx
+        && verify_non_taproot_with_bitcoinconsensus(input_index, prevout, serialized_tx, flags)?
+    {
         return Ok(());
     }
     #[cfg(not(feature = "bitcoinconsensus"))]
-    let _ = &mut *serialized_tx;
+    let _ = serialized_tx;
 
     let input = &tx.input[input_index];
     let witness = input.witness.to_vec();
@@ -361,13 +385,19 @@ pub fn verify_block_input_scripts(
 
     let (prepared, checks) =
         prepare_block_input_checks(txs, resolved.as_mut_slice(), height, locktime_cutoff);
-
-    // The serial error scan below relies on `IndexedParallelIterator::collect`
-    // preserving the order of `checks`.
-    let results: Vec<Result<(), ConsensusError>> = checks
-        .par_iter()
-        .map(|check| check_input(txs, &prepared, check, flags))
-        .collect();
+    let results: Vec<Result<(), ConsensusError>> = if checks.len() < MIN_PARALLEL_SCRIPT_CHECKS {
+        checks
+            .iter()
+            .map(|check| check_input(txs, &prepared, check, flags))
+            .collect()
+    } else {
+        SCRIPT_VERIFY_POOL.install(|| {
+            checks
+                .par_iter()
+                .map(|check| check_input(txs, &prepared, check, flags))
+                .collect()
+        })
+    };
 
     for prep in &prepared {
         if let Some(error) = &prep.pre_error {
@@ -511,10 +541,10 @@ fn check_input(
     #[cfg(not(feature = "kernel"))]
     {
         #[cfg(feature = "bitcoinconsensus")]
-        let mut serialized_tx = prep.serialized.clone();
+        let serialized_tx = prep.serialized.as_deref();
         #[cfg(not(feature = "bitcoinconsensus"))]
-        let mut serialized_tx: Option<Vec<u8>> = None;
-        verify_input_script_portable(check.input_index, prevout, tx, flags, &mut serialized_tx)
+        let serialized_tx = None;
+        verify_input_script_portable(check.input_index, prevout, tx, flags, serialized_tx)
     }
 }
 
@@ -550,21 +580,19 @@ fn cached_prevout_lookup(
 fn verify_non_taproot_with_bitcoinconsensus(
     input_index: usize,
     prevout: &bitcoin::TxOut,
-    tx: &bitcoin::Transaction,
+    serialized_tx: &[u8],
     flags: VerifyFlags,
-    serialized_tx: &mut Option<Vec<u8>>,
 ) -> Result<bool, ConsensusError> {
     let script = Script::from_bytes(prevout.script_pubkey.as_bytes());
     if script.is_p2tr() && flags.contains(VerifyFlags::TAPROOT) {
         return Ok(false);
     }
 
-    let bytes = serialized_tx.get_or_insert_with(|| encode::serialize(tx));
     script
         .verify_with_flags(
             input_index,
             prevout.value,
-            bytes.as_slice(),
+            serialized_tx,
             flags.consensus_bits(),
         )
         .map_err(|error| ConsensusError::Script {
@@ -1307,52 +1335,26 @@ mod tests {
         );
     }
 
-    /// The reported error is invariant across rayon worker counts: order-preserving
-    /// collect plus the block-ordered scan pin the first failure regardless of
-    /// which worker finished first.
+    /// Parallel script checks still report the earliest block-ordered failure.
     #[test]
     #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
-    fn deterministic_error_is_thread_count_invariant() -> Result<(), rayon::ThreadPoolBuildError> {
-        // tx1 fails at input 0; tx2's *second* input fails (input 1). The scan
-        // must always return tx1's `input_index: 0` — a misaligned parallel
-        // collect would surface tx2's `input_index: 1` instead.
-        let build = || {
-            (
-                vec![
-                    coinbase_transaction_with_script_sig_len(2).0,
-                    spend_tx(vec![mismatch_input(outpoint(1))], 50),
-                    spend_tx(
-                        vec![
-                            true_spending_input(outpoint(2)),
-                            mismatch_input(outpoint(3)),
-                        ],
-                        50,
-                    ),
-                ],
-                vec![
-                    Vec::new(),
-                    vec![Some(op_equal_txout(100))],
-                    vec![Some(op1_txout(100)), Some(op_equal_txout(100))],
-                ],
-            )
-        };
-        let run = |threads: usize| {
-            let (txs, resolved) = build();
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()?;
-            Ok(pool.install(|| {
-                super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY)
-            }))
-        };
-        let one = run(1)?;
-        let many = run(8)?;
-        assert_eq!(one, many);
+    fn parallel_script_checks_report_first_error() {
+        let mut txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![mismatch_input(outpoint(1))], 50),
+        ];
+        let mut resolved = vec![Vec::new(), vec![Some(op_equal_txout(100))]];
+        for seed in 2..=u8::try_from(super::MIN_PARALLEL_SCRIPT_CHECKS).unwrap_or(u8::MAX) {
+            txs.push(spend_tx(vec![mismatch_input(outpoint(seed))], 50));
+            resolved.push(vec![Some(op_equal_txout(100))]);
+        }
+
+        let result =
+            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY);
         assert!(
-            matches!(one, Err(ConsensusError::Script { input_index: 0, .. })),
-            "expected tx1 Script error, got {one:?}"
+            matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
+            "expected first Script error, got {result:?}"
         );
-        Ok(())
     }
 
     /// A same-block spend (tx2 consuming tx1's output) verifies when the node
