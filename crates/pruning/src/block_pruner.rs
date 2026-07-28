@@ -2,11 +2,14 @@ use alloc::sync::Arc;
 
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
+use bitcoin_rs_storage::{FlatFileBlockStore, decode_block_file_max_height};
 
 use crate::{PruneError, PruneOutcome, PrunePolicy, row_len_u64};
 
 const BLOCK_BODY_PREFIX: u8 = b'b';
 pub(crate) const BLOCK_BODY_PREFIX_BYTES: &[u8] = b"b";
+const BLOCK_FILE_PREFIX_BYTES: &[u8] = b"blkfile";
+const BLOCK_FILE_KEY_LEN: usize = 11;
 const HEIGHT_START: usize = 1;
 const HEIGHT_END: usize = 5;
 const KEY_LEN: usize = 37;
@@ -125,6 +128,34 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
     }
 
     Ok(outcome)
+}
+
+pub(crate) fn flat_block_files_below_height<S: KvStore>(
+    store: &S,
+    block_files: &FlatFileBlockStore,
+    prune_below_height: u32,
+) -> Result<Vec<u32>, PruneError> {
+    let mut file_numbers = Vec::new();
+    for row in store.iter_prefix(BLOCK_DATA_CF, BLOCK_FILE_PREFIX_BYTES)? {
+        let (key, value) = row?;
+        if key.len() != BLOCK_FILE_KEY_LEN {
+            continue;
+        }
+        let Some(max_height) = decode_block_file_max_height(&value) else {
+            continue;
+        };
+        if max_height >= prune_below_height {
+            continue;
+        }
+
+        let mut encoded_file_no = [0_u8; 4];
+        encoded_file_no.copy_from_slice(&key[BLOCK_FILE_PREFIX_BYTES.len()..]);
+        let file_no = u32::from_be_bytes(encoded_file_no);
+        if file_no != block_files.current_file_number() {
+            file_numbers.push(file_no);
+        }
+    }
+    Ok(file_numbers)
 }
 
 fn row_height(key: &[u8], prefix: &[u8]) -> Option<u32> {

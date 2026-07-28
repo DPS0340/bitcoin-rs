@@ -21,7 +21,10 @@ use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 
 use crate::state::ApplyError;
-use bitcoin_rs_storage::{KvStore, StorageError};
+use bitcoin_rs_storage::{
+    BlockFilePosition, FlatFileBlockStore, KvStore, StorageError, WriteBatch,
+    block_file_max_height_key, decode_block_file_max_height, encode_block_file_max_height,
+};
 use scratch::{ApplyScratch, ApplyScratchCapacities, SameBlockSpentSet};
 
 /// Number of blocks after a coinbase that its outputs become spendable.
@@ -60,31 +63,71 @@ pub(crate) trait PruneBodyStore: Send + Sync {
     ) -> Result<Option<Vec<u8>>, StorageError>;
 }
 
-impl<S: KvStore> PruneBodyStore for S {
+pub(crate) struct FlatFilePruneBodyStore<S: KvStore> {
+    index: Arc<S>,
+    files: Arc<FlatFileBlockStore>,
+}
+
+impl<S: KvStore> FlatFilePruneBodyStore<S> {
+    pub(crate) fn open(
+        index: Arc<S>,
+        files: Arc<FlatFileBlockStore>,
+        data_dir: &std::path::Path,
+    ) -> Result<Self, StorageError> {
+        for row in index.iter_prefix(bitcoin_rs_pruning::BLOCK_DATA_CF, b"b")? {
+            let (key, value) = row?;
+            if key.len() == 37 && value.len() != BlockFilePosition::ENCODED_LEN {
+                return Err(StorageError::IncompatibleData(format!(
+                    "datadir {} predates the flat-file block store and must be resynced",
+                    data_dir.display()
+                )));
+            }
+        }
+        Ok(Self { index, files })
+    }
+}
+
+impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
     fn persist_block_body(
         &self,
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
         body: &[u8],
     ) -> Result<(), StorageError> {
-        self.put(
-            bitcoin_rs_pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_pruning::block_body_key(height, hash),
-            body,
-        )
-    }
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let existing = self
+            .index
+            .get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?
+            .map(|bytes| {
+                BlockFilePosition::decode(&bytes).ok_or_else(|| {
+                    StorageError::IncompatibleData(
+                        "block-body index row is not a 16-byte flat-file position".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        let position = self
+            .files
+            .persist(existing, height, *hash.as_byte_array(), body)?;
+        if existing == Some(position) {
+            return Ok(());
+        }
 
-    fn persist_block_body_value(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        body: bytes::Bytes,
-    ) -> Result<(), StorageError> {
-        self.put_value(
+        let max_height_key = block_file_max_height_key(position.file_no);
+        let max_height = self
+            .index
+            .get(bitcoin_rs_pruning::BLOCK_DATA_CF, &max_height_key)?
+            .as_deref()
+            .and_then(decode_block_file_max_height)
+            .map_or(height, |previous| previous.max(height));
+        let mut batch = self.index.new_batch();
+        batch.put(bitcoin_rs_pruning::BLOCK_DATA_CF, &key, &position.encode());
+        batch.put(
             bitcoin_rs_pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_pruning::block_body_key(height, hash),
-            body,
-        )
+            &max_height_key,
+            &encode_block_file_max_height(max_height),
+        );
+        self.index.write(batch)
     }
 
     fn load_block_body(
@@ -92,10 +135,14 @@ impl<S: KvStore> PruneBodyStore for S {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.get(
-            bitcoin_rs_pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_pruning::block_body_key(height, hash),
-        )
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+            return Ok(None);
+        };
+        let Some(position) = BlockFilePosition::decode(&encoded) else {
+            return Ok(None);
+        };
+        self.files.load(position, height, *hash.as_byte_array())
     }
 }
 

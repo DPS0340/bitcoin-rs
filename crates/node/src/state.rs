@@ -25,8 +25,10 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
-use bitcoin_rs_pruning::{PrunePolicy, stage_block_and_undo_prune};
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
+use bitcoin_rs_pruning::{
+    PrunePolicy, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
+};
+use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch};
 use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::{Mutex, RwLock};
 
@@ -196,6 +198,8 @@ impl NodeStorage {
 
     fn prune_service(
         &self,
+        block_files: &Arc<FlatFileBlockStore>,
+        block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     ) -> Result<Arc<dyn PruneService>> {
@@ -203,72 +207,87 @@ impl NodeStorage {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
         }
     }
 
-    fn block_body_store(&self) -> Arc<dyn crate::apply::PruneBodyStore> {
+    fn block_body_store(
+        &self,
+        files: Arc<FlatFileBlockStore>,
+        data_dir: &Path,
+    ) -> Result<Arc<dyn crate::apply::PruneBodyStore>> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::RocksDb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Fjall(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Redb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Mdbx(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
         }
     }
 
     #[cfg(test)]
-    fn seed_prune_rows(
+    fn seed_prune_undo(
         &self,
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
-        body: &[u8],
         undo: &[u8],
     ) -> Result<()> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::RocksDb(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Fjall(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Redb(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Mdbx(store) => seed_prune_undo(&**store, height, hash, undo),
         }
     }
 
@@ -344,6 +363,8 @@ fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
 /// Storage-backed implementation of RPC manual pruning.
 pub struct NodePruneService<S: KvStore> {
     store: Arc<S>,
+    block_files: Arc<FlatFileBlockStore>,
+    block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     blocks: Arc<RwLock<Vec<BlockRecord>>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     pruneheight: Mutex<Option<u32>>,
@@ -351,14 +372,18 @@ pub struct NodePruneService<S: KvStore> {
 
 impl<S: KvStore> NodePruneService<S> {
     /// Creates a manual pruning service over the chainstate store and RPC block cache.
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<S>,
+        block_files: Arc<FlatFileBlockStore>,
+        block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
             store,
+            block_files,
+            block_body_store,
             blocks,
             transactions,
             pruneheight: Mutex::new(pruneheight),
@@ -382,15 +407,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let pruner_tip = updated_pruneheight
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
-        let mut batch = self.store.new_batch();
-        let (block_outcome, undo_outcome) =
-            stage_block_and_undo_prune(&*self.store, &mut batch, pruner_tip, policy)
-                .map_err(|err| PruneServiceError::failed(err.to_string()))?;
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            PRUNEHEIGHT_METADATA_KEY,
-            &updated_pruneheight.to_be_bytes(),
-        );
 
         let mut pruned_txids = Vec::new();
         for record in blocks
@@ -401,13 +417,10 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
                 continue;
             }
             let bytes = if record.block_hex.is_empty() {
-                <S as crate::apply::PruneBodyStore>::load_block_body(
-                    &*self.store,
-                    record.height,
-                    record.hash,
-                )
-                .map_err(|error| PruneServiceError::failed(error.to_string()))?
-                .unwrap_or_default()
+                self.block_body_store
+                    .load_block_body(record.height, record.hash)
+                    .map_err(|error| PruneServiceError::failed(error.to_string()))?
+                    .unwrap_or_default()
             } else {
                 Vec::<u8>::from_hex(&record.block_hex).map_err(|error| {
                     PruneServiceError::failed(format!(
@@ -427,8 +440,24 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             })?;
             pruned_txids.extend(block.txdata.iter().map(Transaction::compute_txid));
         }
+        let mut batch = self.store.new_batch();
+        let (block_outcome, undo_outcome, prunable_files) = stage_block_and_undo_prune(
+            &*self.store,
+            &mut batch,
+            &self.block_files,
+            pruner_tip,
+            policy,
+        )
+        .map_err(|err| PruneServiceError::failed(err.to_string()))?;
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            PRUNEHEIGHT_METADATA_KEY,
+            &updated_pruneheight.to_be_bytes(),
+        );
         self.store
             .write(batch)
+            .map_err(|err| PruneServiceError::failed(err.to_string()))?;
+        reclaim_staged_flat_block_files(&*self.store, &self.block_files, &prunable_files)
             .map_err(|err| PruneServiceError::failed(err.to_string()))?;
 
         if !pruned_txids.is_empty() {
@@ -465,27 +494,17 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
 }
 
 #[cfg(test)]
-fn seed_prune_rows<S: KvStore>(
+fn seed_prune_undo<S: KvStore>(
     store: &S,
     height: u32,
     hash: bitcoin_rs_primitives::Hash256,
-    body: &[u8],
     undo: &[u8],
 ) -> Result<()> {
-    use bitcoin_rs_storage::WriteBatch as _;
-
-    let mut batch = store.new_batch();
-    batch.put(
-        bitcoin_rs_pruning::BLOCK_DATA_CF,
-        &bitcoin_rs_pruning::block_body_key(height, hash),
-        body,
-    );
-    batch.put(
+    store.put(
         ColumnFamily::BlockTree,
         &bitcoin_rs_pruning::block_undo_key(height, hash),
         undo,
-    );
-    store.write(batch)?;
+    )?;
     Ok(())
 }
 
@@ -690,6 +709,7 @@ pub struct NodeState {
     config: Config,
     data_dir: PathBuf,
     storage: NodeStorage,
+    block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
     tx_index: Option<TxIndexHandle>,
@@ -770,6 +790,10 @@ impl NodeState {
             }
         };
         let storage = NodeStorage::open(&config)?;
+        let block_files =
+            Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
+        let block_body_store =
+            storage.block_body_store(Arc::clone(&block_files), &config.data_dir)?;
         let tx_index_pair = open_tx_index(&config)?;
         let (tx_index, tx_index_storage) = tx_index_pair
             .map_or((None, None), |(tx_index, tx_index_storage)| {
@@ -841,7 +865,7 @@ impl NodeState {
             zmq_publisher: Arc::clone(&zmq_publisher),
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: false,
-            block_body_store: Some(storage.block_body_store()),
+            block_body_store: Some(Arc::clone(&block_body_store)),
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
             assume_valid_height: config.assume_valid_height,
@@ -854,7 +878,12 @@ impl NodeState {
             Arc::clone(&inbound_blocks_rx),
         ));
         let prune_service = if config.prune_target_mb > 0 {
-            Some(storage.prune_service(Arc::clone(&blocks), Arc::clone(&transactions))?)
+            Some(storage.prune_service(
+                &block_files,
+                &block_body_store,
+                Arc::clone(&blocks),
+                Arc::clone(&transactions),
+            )?)
         } else {
             None
         };
@@ -868,6 +897,7 @@ impl NodeState {
             config,
             data_dir,
             storage,
+            block_body_store,
             utxo,
             coin_stats,
             tx_index,
@@ -1021,7 +1051,9 @@ impl NodeState {
     /// Returns a durable block body reader for metadata-only block records.
     #[must_use]
     pub(crate) fn block_body_source(&self) -> Arc<dyn BlockBodySource> {
-        Arc::new(StoredBlockBodySource::new(self.storage.block_body_store()))
+        Arc::new(StoredBlockBodySource::new(Arc::clone(
+            &self.block_body_store,
+        )))
     }
 
     /// Returns the shared txid → transaction map exposed to RPC handlers.
@@ -1586,9 +1618,63 @@ mod tests {
             Some("")
         );
         assert_eq!(
-            state.storage.stored_prune_body(0, hash)?.as_deref(),
+            state.block_body_store.load_block_body(0, hash)?.as_deref(),
             Some(serialize(&block).as_slice())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn persisting_same_block_body_twice_appends_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[7_u8; 32]);
+        let body = b"idempotent block body";
+
+        state.block_body_store.persist_block_body(42, hash, body)?;
+        let block_file = state.data_dir.join("blocks").join("blk00000.dat");
+        let first_len = std::fs::metadata(&block_file)?.len();
+        state.block_body_store.persist_block_body(42, hash, body)?;
+        let second_len = std::fs::metadata(block_file)?.len();
+
+        assert_eq!(second_len, first_len);
+        assert_eq!(
+            state.block_body_store.load_block_body(42, hash)?.as_deref(),
+            Some(body.as_slice())
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn legacy_block_body_datadir_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("legacy-node");
+        config.p2p_listen.clear();
+        std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
+        let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
+        store.put(
+            bitcoin_rs_pruning::BLOCK_DATA_CF,
+            &bitcoin_rs_pruning::block_body_key(
+                1,
+                bitcoin_rs_primitives::Hash256::from_le_bytes(&[1_u8; 32]),
+            ),
+            b"legacy-inline-body",
+        )?;
+        drop(store);
+
+        let datadir = config.data_dir.display().to_string();
+        let Err(error) = NodeState::open(config) else {
+            anyhow::bail!("legacy inline block body unexpectedly opened");
+        };
+        let message = error.to_string();
+        assert!(message.contains(&datadir));
+        assert!(message.contains("predates the flat-file block store"));
+        assert!(message.contains("must be resynced"));
         Ok(())
     }
 
@@ -1620,12 +1706,12 @@ mod tests {
         crate::apply::apply_block_with_serialized(&state_b.apply_handles(), &block, serialized)?;
 
         let body_a = state_a
-            .storage
-            .stored_prune_body(0, hash)?
+            .block_body_store
+            .load_block_body(0, hash)?
             .ok_or_else(|| anyhow::anyhow!("apply_block body missing"))?;
         let body_b = state_b
-            .storage
-            .stored_prune_body(0, hash)?
+            .block_body_store
+            .load_block_body(0, hash)?
             .ok_or_else(|| anyhow::anyhow!("apply_block_with_serialized body missing"))?;
         assert_eq!(body_a, body_b);
         Ok(())
@@ -1649,8 +1735,9 @@ mod tests {
         for height in 10_u32..=12 {
             let hash = hash(height)?;
             state
-                .storage
-                .seed_prune_rows(height, hash, b"block-body", b"undo-body")?;
+                .block_body_store
+                .persist_block_body(height, hash, b"block-body")?;
+            state.storage.seed_prune_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
@@ -1706,6 +1793,90 @@ mod tests {
     }
 
     #[test]
+    fn prune_reclaims_whole_files_and_keeps_current_file() -> anyhow::Result<()> {
+        fn seed<S: KvStore>(
+            store: &S,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> anyhow::Result<()> {
+            let position = bitcoin_rs_storage::BlockFilePosition {
+                file_no: 0,
+                offset: 0,
+                len: 0,
+            };
+            let mut batch = store.new_batch();
+            batch.put(
+                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_pruning::block_body_key(height, hash),
+                &position.encode(),
+            );
+            batch.put(
+                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_storage::block_file_max_height_key(0),
+                &bitcoin_rs_storage::encode_block_file_max_height(height),
+            );
+            store.write(batch)?;
+            Ok(())
+        }
+
+        fn metadata_exists<S: KvStore>(store: &S) -> anyhow::Result<bool> {
+            Ok(store
+                .get(
+                    bitcoin_rs_pruning::BLOCK_DATA_CF,
+                    &bitcoin_rs_storage::block_file_max_height_key(0),
+                )?
+                .is_some())
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let blocks_dir = config.data_dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir)?;
+        let prunable_file = blocks_dir.join("blk00000.dat");
+        let current_file = blocks_dir.join("blk00001.dat");
+        std::fs::write(&prunable_file, [])?;
+        std::fs::write(&current_file, [])?;
+        let state = NodeState::open(config)?;
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
+
+        match &state.storage {
+            #[cfg(feature = "rocksdb")]
+            NodeStorage::RocksDb(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "fjall")]
+            NodeStorage::Fjall(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "redb")]
+            NodeStorage::Redb(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "mdbx")]
+            NodeStorage::Mdbx(store) => seed(&**store, 10, hash)?,
+        }
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        service
+            .prune_to_height(11)
+            .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+
+        assert!(!prunable_file.exists());
+        assert!(current_file.exists());
+        assert!(state.storage.stored_prune_body(10, hash)?.is_none());
+        let has_metadata = match &state.storage {
+            #[cfg(feature = "rocksdb")]
+            NodeStorage::RocksDb(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "fjall")]
+            NodeStorage::Fjall(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "redb")]
+            NodeStorage::Redb(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "mdbx")]
+            NodeStorage::Mdbx(store) => metadata_exists(&**store)?,
+        };
+        assert!(!has_metadata);
+        Ok(())
+    }
+
+    #[test]
     fn manual_prune_removes_pruned_block_transactions_from_cache() -> anyhow::Result<()> {
         use bitcoin::blockdata::constants::genesis_block;
         use bitcoin::consensus::encode::serialize;
@@ -1723,8 +1894,11 @@ mod tests {
             pruned_block.block_hash().as_byte_array(),
         );
         state
+            .block_body_store
+            .persist_block_body(10, pruned_hash, &serialize(&pruned_block))?;
+        state
             .storage
-            .seed_prune_rows(10, pruned_hash, &serialize(&pruned_block), b"undo-body")?;
+            .seed_prune_undo(10, pruned_hash, b"undo-body")?;
         state
             .blocks
             .write()

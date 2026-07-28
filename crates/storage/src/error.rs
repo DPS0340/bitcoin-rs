@@ -23,6 +23,9 @@ pub enum StorageError {
     /// Input would violate a backend-independent storage invariant.
     #[error("invalid operation: {0}")]
     InvalidOperation(&'static str),
+    /// Persisted data belongs to an incompatible on-disk format.
+    #[error("incompatible data: {0}")]
+    IncompatibleData(String),
 }
 
 impl StorageError {

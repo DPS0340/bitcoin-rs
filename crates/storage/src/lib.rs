@@ -1,6 +1,8 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+/// Append-only flat files for immutable block bodies.
+pub mod block_file;
 /// Logical column-family names shared by all storage backends.
 pub mod column_families;
 /// Storage error type.
@@ -21,6 +23,10 @@ pub mod redb_impl;
 /// RocksDB-backed [`KvStore`](trait_::KvStore) implementation.
 pub mod rocksdb_impl;
 
+pub use block_file::{
+    BLOCK_FILE_MAGIC, BLOCK_FILE_MAX_BYTES, BlockFilePosition, FlatFileBlockStore,
+    block_file_max_height_key, decode_block_file_max_height, encode_block_file_max_height,
+};
 pub use column_families::ColumnFamily;
 pub use error::StorageError;
 pub use trait_::{KvIter, KvPair, KvSnapshot, KvStore, WriteBatch};
