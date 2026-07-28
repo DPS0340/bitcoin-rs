@@ -192,34 +192,6 @@ impl ThinRecordBuf {
         // `src.len() <= capacity() <= u32::MAX`, so the conversion is lossless.
         self.header_mut().len = u32::try_from(src.len()).unwrap_or(u32::MAX);
     }
-
-    /// Ensures the buffer can hold `cap` bytes and resets the length to zero,
-    /// ready for a fresh off-table encode. Reuses the current allocation when
-    /// its immutable capacity already suffices; otherwise replaces it with a
-    /// fresh exact allocation (capacity is never grown in place).
-    ///
-    /// Shard two-phase-commit surface; wired by the shard integration phase.
-    #[allow(dead_code)]
-    fn reserve(&mut self, cap: usize) -> Result<(), UtxoError> {
-        if self.capacity() >= cap {
-            self.header_mut().len = 0;
-            return Ok(());
-        }
-        *self = Self::with_capacity(cap)?;
-        Ok(())
-    }
-
-    /// Reserves exact `src.len()` capacity if needed, copies `src` into the
-    /// payload, and sets the length to `src.len()` — every live byte is provably
-    /// copied from an initialized source.
-    ///
-    /// Shard two-phase-commit surface; wired by the shard integration phase.
-    #[allow(dead_code)]
-    fn store(&mut self, src: &[u8]) -> Result<(), UtxoError> {
-        self.reserve(src.len())?;
-        self.write_payload(src);
-        Ok(())
-    }
 }
 
 impl Clone for ThinRecordBuf {
@@ -330,20 +302,6 @@ impl<'a> RecordWriter<'a> {
             .map_err(|_| UtxoError::RecordTooLarge { len: self.written })?;
         self.buf.header_mut().len = len;
         Ok(())
-    }
-}
-
-impl UtxoRecord {
-    /// Swaps this record's owned buffer with `scratch` in O(1). The shard commit
-    /// path builds the next payload in a retained scratch buffer and swaps it in
-    /// here, reclaiming the old allocation as the next scratch. The swapped-in
-    /// bytes must already be a canonical encoded record (trusted, so no
-    /// re-decode); the strict boundary stays [`UtxoRecord::from_encoded`].
-    ///
-    /// Shard two-phase-commit surface; wired by the shard integration phase.
-    #[allow(dead_code)]
-    pub(crate) fn swap_buffer(&mut self, scratch: &mut ThinRecordBuf) {
-        core::mem::swap(&mut self.buf, scratch);
     }
 }
 
@@ -1534,44 +1492,6 @@ mod tests {
         let mut writer = RecordWriter::new(&mut buf);
         writer.push(&[1, 2])?;
         assert!(matches!(writer.push(&[3]), Err(UtxoError::CorruptRecord)));
-        Ok(())
-    }
-
-    #[test]
-    fn thin_scratch_reserve_reuses_then_grows() -> Result<(), UtxoError> {
-        let mut scratch = ThinRecordBuf::with_capacity(8)?;
-        scratch.store(&[9; 5])?;
-        assert_eq!(scratch.capacity(), 8);
-        assert_eq!(scratch.as_bytes(), &[9; 5]);
-        // Reusing within capacity keeps the immutable capacity and resets length.
-        scratch.store(&[7; 3])?;
-        assert_eq!(scratch.capacity(), 8);
-        assert_eq!(scratch.as_bytes(), &[7; 3]);
-        // Growth beyond capacity replaces the allocation with an exact one.
-        scratch.store(&[1; 20])?;
-        assert_eq!(scratch.capacity(), 20);
-        assert_eq!(scratch.as_bytes(), &[1; 20]);
-        Ok(())
-    }
-
-    #[test]
-    fn thin_swap_buffer_exchanges_payloads() -> Result<(), UtxoError> {
-        let txid = Hash256::from_le_bytes(&[0x22; TXID_LEN]);
-        let mut record = UtxoRecord::from_owned_outputs(txid, &[output(0, &[0x51], 1)])?;
-        let original = record.encoded_bytes().to_vec();
-
-        let replacement = UtxoRecord::from_owned_outputs(
-            txid,
-            &[output(0, &[0x51], 1), output(1, &[0x6A, 0xAC], 2)],
-        )?;
-        let mut scratch = ThinRecordBuf::with_capacity(0)?;
-        scratch.store(replacement.encoded_bytes())?;
-
-        record.swap_buffer(&mut scratch);
-        assert_eq!(record.encoded_bytes(), replacement.encoded_bytes());
-        assert_eq!(record.output_count(), 2);
-        // The old payload is reclaimed into the scratch buffer for reuse.
-        assert_eq!(scratch.as_bytes(), original.as_slice());
         Ok(())
     }
 }

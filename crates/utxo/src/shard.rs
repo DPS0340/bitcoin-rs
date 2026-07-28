@@ -16,7 +16,7 @@ use crate::{
 
 /// Per-shard hash table of compact, inline UTXO record owners.
 pub struct ShardTable {
-    /// Hash table of 16-byte `UtxoRecord` fat owners.
+    /// Hash table of pointer-sized compact `UtxoRecord` owners stored inline (8 bytes on `x86_64`).
     pub table: HashTable<UtxoRecord>,
 }
 
