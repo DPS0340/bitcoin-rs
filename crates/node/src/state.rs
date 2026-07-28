@@ -83,6 +83,9 @@ pub(crate) const INBOUND_BLOCK_CHANNEL_LIMIT: usize = 256;
 /// Errors produced when applying a block to the node state.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// Clean shutdown has closed block-apply admission.
+    #[error("block apply rejected because clean shutdown has begun")]
+    Shutdown,
     /// The block's previous header hash does not match the current tip's hash.
     #[error("prev hash mismatch: tip {tip}, block prev {prev}")]
     PrevHashMismatch {
@@ -715,6 +718,7 @@ fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
 pub struct NodeState {
     config: Config,
     data_dir: PathBuf,
+    checkpoint_data_dir: cap_std::fs::Dir,
     resume_source: ResumeSource,
     storage: NodeStorage,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
@@ -762,12 +766,14 @@ impl NodeState {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
+        let checkpoint_data_dir = crate::checkpoint_fs::open_data_dir(&config.data_dir)
+            .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
         let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
             network: config.network,
             genesis: config.network.genesis_block_hash(),
         };
         let checkpoint_load =
-            crate::checkpoint::load_checkpoint(&config.data_dir, checkpoint_config)?;
+            crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
         let g2_muhash_sampler = config
             .g2_muhash_samples
             .clone()
@@ -926,6 +932,7 @@ impl NodeState {
             block_body_store: Some(Arc::clone(&block_body_store)),
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
+            admission: Arc::new(crate::apply::ApplyAdmission::new()),
             assume_valid_height: config.assume_valid_height,
         };
         let sync = Arc::new(crate::BlockSync::new(
@@ -954,6 +961,7 @@ impl NodeState {
         Ok(Self {
             config,
             data_dir,
+            checkpoint_data_dir,
             resume_source,
             storage,
             block_body_store,
@@ -1008,9 +1016,10 @@ impl NodeState {
         &self,
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
+        let _exclusive_apply = self.apply_handles.admission.close();
         let applied_tip = self.applied_tip.load_full();
-        crate::checkpoint::write_checkpoint(
-            &self.data_dir,
+        crate::checkpoint::write_checkpoint_from_dir(
+            &self.checkpoint_data_dir,
             crate::checkpoint::HeaderCheckpointConfig {
                 network: self.config.network,
                 genesis: self.config.network.genesis_block_hash(),
@@ -2068,9 +2077,9 @@ mod tests {
         drop(state);
 
         let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
-        reopen_config.data_dir = data_dir;
+        reopen_config.data_dir = data_dir.clone();
         reopen_config.p2p_listen.clear();
-        let resumed = NodeState::open(reopen_config)?;
+        let resumed = NodeState::open(reopen_config.clone())?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
         let applied = resumed
             .applied_tip()
@@ -2098,6 +2107,65 @@ mod tests {
             next_tip.hash.to_le_bytes(),
             next.block_hash().to_byte_array()
         );
+        let listener_after_apply = resumed.coin_stats().snapshot();
+        let mut rescanned = resumed.utxo().with_stable_view(|view| {
+            bitcoin_rs_coinstats::scan_coin_stats(view, next_tip.height, true)
+        })?;
+        rescanned.tx_count = listener_after_apply.tx_count;
+        assert_ne!(
+            listener_after_apply.total_amount, rescanned.total_amount,
+            "G2-disabled resume must not receive rolling UTXO notifications"
+        );
+        resumed.write_clean_checkpoint()?;
+
+        let root = data_dir.join("chainstate-checkpoints");
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("CURRENT"))?)?;
+        let directory = current
+            .get("directory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| std::io::Error::other("CURRENT has no generation directory"))?;
+        let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v3.dat"))?;
+        let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
+        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut snapshot_reader)?;
+        assert_eq!(snapshot.muhash_trailer, [0_u8; 384]);
+        drop(resumed);
+
+        let resumed_again = NodeState::open(reopen_config)?;
+        assert_eq!(resumed_again.resume_source(), ResumeSource::Checkpoint);
+        assert_eq!(resumed_again.coin_stats().snapshot(), rescanned);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_checkpoint_lifecycle_is_backend_neutral() -> anyhow::Result<()> {
+        let backends = vec![
+            #[cfg(feature = "fjall")]
+            "fjall",
+            #[cfg(feature = "rocksdb")]
+            "rocksdb",
+            #[cfg(feature = "redb")]
+            "redb",
+            #[cfg(feature = "mdbx")]
+            "mdbx",
+        ];
+
+        for backend in backends {
+            let dir = tempfile::tempdir()?;
+            let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+            config.data_dir = dir.path().join(backend);
+            config.storage_backend = backend.to_owned();
+            config.p2p_listen.clear();
+            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let state = NodeState::open(config.clone())?;
+            state.apply_block(&genesis)?;
+            state.write_clean_checkpoint()?;
+            drop(state);
+
+            let resumed = NodeState::open(config)?;
+            assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+            resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
+        }
         Ok(())
     }
 

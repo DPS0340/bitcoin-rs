@@ -17,8 +17,9 @@ use bitcoin_rs_utxo::{
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
 use hashbrown::{HashMap, HashSet};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::state::ApplyError;
 use bitcoin_rs_storage::{
@@ -146,6 +147,38 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
     }
 }
 
+/// Admission barrier shared by every cloned apply handle.
+pub(crate) struct ApplyAdmission {
+    closed: AtomicBool,
+    barrier: RwLock<()>,
+}
+
+impl ApplyAdmission {
+    pub(crate) fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            barrier: RwLock::new(()),
+        }
+    }
+
+    fn enter(&self) -> Result<RwLockReadGuard<'_, ()>, ApplyError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ApplyError::Shutdown);
+        }
+        let permit = self.barrier.read();
+        if self.closed.load(Ordering::Acquire) {
+            drop(permit);
+            return Err(ApplyError::Shutdown);
+        }
+        Ok(permit)
+    }
+
+    pub(crate) fn close(&self) -> RwLockWriteGuard<'_, ()> {
+        self.closed.store(true, Ordering::Release);
+        self.barrier.write()
+    }
+}
+
 /// Owned shared handle set needed by `apply_block` to perform a block apply.
 #[derive(Clone)]
 pub struct ApplyHandles {
@@ -178,6 +211,7 @@ pub struct ApplyHandles {
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
+    pub(crate) admission: Arc<ApplyAdmission>,
     /// Block height at or below which interpreter / `bitcoinconsensus` script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
@@ -219,6 +253,7 @@ impl ApplyHandles {
             block_body_store: None,
             g2_muhash_sampler: None,
             g14_utxo_commit_sampler: None,
+            admission: Arc::new(ApplyAdmission::new()),
             assume_valid_height: 0,
         }
     }
@@ -259,6 +294,7 @@ fn apply_block_inner(
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     use bitcoin::hashes::Hash as _;
+    let _admission = handles.admission.enter()?;
 
     let total_started = quanta::Instant::now();
     let block_hash =
@@ -5096,6 +5132,36 @@ mod with_zmq_publisher_tests {
         // a simple field swap; this test just covers the publisher capture.
         publisher.publish_hashblock(bitcoin_rs_primitives::Hash256::default());
         assert_eq!(*publisher.tag.lock(), 42);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::ApplyAdmission;
+    use crate::ApplyError;
+
+    #[test]
+    fn shutdown_closes_admission_and_waits_for_in_flight_apply() {
+        let admission = Arc::new(ApplyAdmission::new());
+        let Ok(in_flight) = admission.enter() else {
+            panic!("initial apply must be admitted");
+        };
+        let closing = Arc::clone(&admission);
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let _exclusive = closing.close();
+            assert!(tx.send(()).is_ok());
+        });
+
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(in_flight);
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(thread.join().is_ok());
+        assert!(matches!(admission.enter(), Err(ApplyError::Shutdown)));
     }
 }
 

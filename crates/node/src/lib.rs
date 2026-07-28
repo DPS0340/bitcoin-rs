@@ -19,6 +19,7 @@ pub mod bitcoin_conf_compat;
 /// Bridges in-memory block records to the index crate's BlockSource trait.
 pub mod block_source;
 mod checkpoint;
+mod checkpoint_fs;
 /// Layered node configuration.
 pub mod config;
 /// Startup crash recovery.

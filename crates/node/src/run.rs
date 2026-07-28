@@ -731,6 +731,79 @@ mod tests {
     }
 
     #[test]
+    fn clean_shutdown_publishes_checkpoint_and_returns_success() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut config = Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = temp.path().join("node-success");
+        config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        config.rpc_auth = crate::Auth::basic("user", "password");
+        config.electrum_bind = None;
+        config.p2p_listen.clear();
+        config.metrics_bind = None;
+
+        let state = crate::state::NodeState::open(config.clone())?;
+        state.apply_block(&bitcoin::blockdata::constants::genesis_block(
+            bitcoin::Network::Regtest,
+        ))?;
+        state.write_clean_checkpoint()?;
+        drop(state);
+        let current_path = config
+            .data_dir
+            .join("chainstate-checkpoints")
+            .join("CURRENT");
+        let previous_current = std::fs::read(&current_path)?;
+
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        shutdown_tx.send(())?;
+        let reopen_config = config.clone();
+        config = config.with_shutdown_receiver(shutdown_rx);
+        run(config)?;
+        assert_ne!(std::fs::read(current_path)?, previous_current);
+
+        let resumed = crate::state::NodeState::open(reopen_config)?;
+        assert_eq!(
+            resumed.resume_source(),
+            crate::state::ResumeSource::Checkpoint
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_checkpoint_io_failure_is_returned_and_preserves_current() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut config = Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = temp.path().join("node");
+        config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        config.rpc_auth = crate::Auth::basic("user", "password");
+        config.electrum_bind = None;
+        config.p2p_listen.clear();
+        config.metrics_bind = None;
+
+        let state = crate::state::NodeState::open(config.clone())?;
+        state.apply_block(&bitcoin::blockdata::constants::genesis_block(
+            bitcoin::Network::Regtest,
+        ))?;
+        state.write_clean_checkpoint()?;
+        drop(state);
+
+        let current_path = config
+            .data_dir
+            .join("chainstate-checkpoints")
+            .join("CURRENT");
+        let previous_current = std::fs::read(&current_path)?;
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        shutdown_tx.send(())?;
+        config = config.with_shutdown_receiver(shutdown_rx);
+        crate::checkpoint::inject_next_checkpoint_failpoint(
+            crate::checkpoint::CheckpointFailpoint::ManifestWrite,
+        );
+
+        assert!(run(config).is_err());
+        assert_eq!(std::fs::read(current_path)?, previous_current);
+        Ok(())
+    }
+
+    #[test]
     fn connectionless_bootstrap_refills_are_fast_and_bounded() {
         let mut refill = DnsBootstrapRefill::default();
 

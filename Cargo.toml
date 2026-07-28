@@ -83,6 +83,9 @@ secp256k1 = { version = ">=0.31.1, <0.32", default-features = false, features = 
 
 # sha2 0.11: default features are alloc+oid; no std/asm feature is exposed.
 sha2 = { version = ">=0.11, <0.12", default-features = false }
+cap-std = "=4.0.2"
+cap-fs-ext = "=4.0.2"
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 # bitcoin_hashes 0.14 (aligned with bitcoin 0.32). NOTE: 0.14 has no `asm`
 # feature — bitcoin_hashes 1.0 breaks the bitcoin-io 0.3 transitive graph.

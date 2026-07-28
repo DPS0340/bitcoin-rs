@@ -1,6 +1,5 @@
-use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::{Encodable, encode::deserialize};
@@ -10,10 +9,17 @@ use bitcoin_rs_coinstats::{
 };
 use bitcoin_rs_primitives::{Hash256, Network};
 use bitcoin_rs_utxo::{UtxoSet, snapshot::read_snapshot_strict_v3, write_snapshot};
+use cap_std::fs::{Dir, File};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+#[cfg(test)]
+use crate::checkpoint_fs::open_data_dir;
+use crate::checkpoint_fs::{
+    CheckpointRoot, create_file, open_file, read_file, remove_known_dir, sync_dir,
+};
 
 const HEADER_MAGIC: [u8; 8] = *b"BRSHEAD\0";
 const HEADER_VERSION: u32 = 1;
@@ -37,6 +43,9 @@ const CURRENT_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const UTXO_VERSION: u32 = 3;
 const COINSTATS_VERSION: u32 = 1;
+const COINSTATS_MAGIC: [u8; 8] = *b"BRSSTAT\0";
+const COINSTATS_PAYLOAD_LEN: u32 = 804;
+const COINSTATS_ARTIFACT_LEN: u64 = 820;
 const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 64_u64 * 1024 * 1024 * 1024;
 const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
 
@@ -520,27 +529,31 @@ pub(crate) enum CheckpointError {
     Json(#[from] serde_json::Error),
     #[error("checkpoint invariant failed: {0}")]
     Invalid(String),
-    #[error("injected checkpoint publication failure at {0:?}")]
-    Injected(CheckpointFailpoint),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CheckpointFailpoint {
-    Headers,
-    Utxo,
-    CoinStats,
-    Manifest,
+    HeadersWrite,
+    HeadersSync,
+    UtxoWrite,
+    UtxoSync,
+    CoinStatsWrite,
+    CoinStatsSync,
+    ManifestWrite,
+    ManifestSync,
     StageSync,
     GenerationRename,
+    GenerationRootSync,
+    CurrentTempWrite,
     CurrentTempSync,
     CurrentRename,
+    CurrentRootSync,
 }
 
 struct GenerationPaths {
-    root: PathBuf,
-    staging: PathBuf,
-    final_dir: PathBuf,
-    current_temp: PathBuf,
+    staging: String,
+    final_dir: String,
+    current_temp: String,
     directory: String,
 }
 
@@ -548,14 +561,20 @@ struct HashingWriter<'a> {
     file: &'a mut File,
     hasher: Sha256,
     bytes: u64,
+    fail: bool,
 }
 
 impl<'a> HashingWriter<'a> {
-    fn new(file: &'a mut File) -> Self {
+    fn new(
+        file: &'a mut File,
+        configured: Option<CheckpointFailpoint>,
+        boundary: CheckpointFailpoint,
+    ) -> Self {
         Self {
             file,
             hasher: Sha256::new(),
             bytes: 0,
+            fail: configured == Some(boundary),
         }
     }
 
@@ -566,6 +585,9 @@ impl<'a> HashingWriter<'a> {
 
 impl Write for HashingWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.fail {
+            return Err(std::io::Error::from_raw_os_error(28));
+        }
         let written = self.file.write(bytes)?;
         self.hasher.update(&bytes[..written]);
         self.bytes = self
@@ -580,20 +602,19 @@ impl Write for HashingWriter<'_> {
     }
 }
 
-pub(crate) fn load_checkpoint(
-    data_dir: &Path,
+pub(crate) fn load_checkpoint_from_dir(
+    data_dir: &Dir,
     config: HeaderCheckpointConfig,
 ) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
-    let root = data_dir.join(CHECKPOINT_ROOT);
-    match checked_directory(&root) {
-        Ok(false) => return Ok(CheckpointLoad::Cold { reason: None }),
-        Ok(true) => {}
+    let root = match CheckpointRoot::open_existing(data_dir, CHECKPOINT_ROOT) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Ok(CheckpointLoad::Cold { reason: None }),
         Err(error) => {
             return Ok(CheckpointLoad::Cold {
                 reason: Some(error.to_string()),
             });
         }
-    }
+    };
 
     let current = match read_current(&root) {
         Ok(Some(current)) => current,
@@ -605,7 +626,15 @@ pub(crate) fn load_checkpoint(
             });
         }
     };
-    let manifest = match read_manifest(&root, &current, config) {
+    let generation_dir = match root.open_dir(&current.directory) {
+        Ok(dir) => dir,
+        Err(error) => {
+            return Ok(CheckpointLoad::Cold {
+                reason: Some(error.to_string()),
+            });
+        }
+    };
+    let manifest = match read_manifest(&generation_dir, &current, config) {
         Ok(manifest) => manifest,
         Err(LoadStageError::Incompatible(error)) => return Err(error),
         Err(LoadStageError::Candidate(error)) => {
@@ -629,9 +658,14 @@ pub(crate) fn load_checkpoint(
         });
     }
 
-    let generation_dir = root.join(&current.directory);
     let restored_headers = match load_headers(&generation_dir, config, &manifest) {
         Ok(headers) => headers,
+        Err(CheckpointError::Header(HeaderCheckpointError::UnsupportedVersion { actual })) => {
+            return Err(IncompatibleCheckpoint::UnsupportedVersion {
+                component: "headers",
+                version: actual,
+            });
+        }
         Err(error) => {
             return Ok(CheckpointLoad::Cold {
                 reason: Some(error.to_string()),
@@ -670,9 +704,24 @@ pub(crate) fn load_checkpoint(
         }
     }
 }
-
-pub(crate) fn write_checkpoint(
+#[cfg(test)]
+fn load_checkpoint(
     data_dir: &Path,
+    config: HeaderCheckpointConfig,
+) -> Result<CheckpointLoad, IncompatibleCheckpoint> {
+    let data_dir = match open_data_dir(data_dir) {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            return Ok(CheckpointLoad::Cold {
+                reason: Some(error.to_string()),
+            });
+        }
+    };
+    load_checkpoint_from_dir(&data_dir, config)
+}
+
+pub(crate) fn write_checkpoint_from_dir(
+    data_dir: &Dir,
     config: HeaderCheckpointConfig,
     block_tree: &RwLock<BlockTree>,
     utxo: &UtxoSet,
@@ -688,13 +737,34 @@ pub(crate) fn write_checkpoint(
         coin_stats,
         applied_tip,
         rolling_stats,
-        None,
+        test_failpoint(),
+    )
+}
+#[cfg(test)]
+fn write_checkpoint(
+    data_dir: &Path,
+    config: HeaderCheckpointConfig,
+    block_tree: &RwLock<BlockTree>,
+    utxo: &UtxoSet,
+    coin_stats: &CoinStatsListener,
+    applied_tip: Option<&TipSnapshot>,
+    rolling_stats: bool,
+) -> Result<CheckpointWrite, CheckpointError> {
+    let data_dir = open_data_dir(data_dir)?;
+    write_checkpoint_from_dir(
+        &data_dir,
+        config,
+        block_tree,
+        utxo,
+        coin_stats,
+        applied_tip,
+        rolling_stats,
     )
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_checkpoint_inner(
-    data_dir: &Path,
+    data_dir: &Dir,
     config: HeaderCheckpointConfig,
     block_tree: &RwLock<BlockTree>,
     utxo: &UtxoSet,
@@ -706,18 +776,25 @@ fn write_checkpoint_inner(
     let Some(applied_tip) = applied_tip else {
         return Ok(CheckpointWrite::SkippedNoAppliedTip);
     };
-    let root = prepare_root(data_dir)?;
-    let generation = next_generation(&root)?;
-    let paths = generation_paths(root, generation);
-    fs::create_dir(&paths.staging)?;
+    let root = CheckpointRoot::open_or_create(data_dir, CHECKPOINT_ROOT)?;
+    let current_generation = match read_current(&root) {
+        Ok(Some(current)) => current.generation,
+        Ok(None) => 0,
+        Err(LoadStageError::Candidate(error)) => return Err(error),
+        Err(LoadStageError::Incompatible(error)) => {
+            return Err(CheckpointError::Invalid(error.to_string()));
+        }
+    };
+    let (generation, paths, staging) = allocate_generation(&root, current_generation)?;
 
     let (headers_write, headers_bytes, headers_sha256) = {
         let tree = block_tree.read();
         let best_tip_id = tree.tip_id().ok_or_else(|| {
             CheckpointError::Invalid("applied tip exists without a best header tip".to_owned())
         })?;
-        let mut file = create_new_file(&paths.staging.join(HEADERS_FILE))?;
-        let mut writer = HashingWriter::new(&mut file);
+        let mut file = create_file(&staging, HEADERS_FILE)?;
+        let mut writer =
+            HashingWriter::new(&mut file, failpoint, CheckpointFailpoint::HeadersWrite);
         let metadata = write_headers(
             &mut writer,
             &tree,
@@ -730,13 +807,13 @@ fn write_checkpoint_inner(
         )?;
         writer.flush()?;
         let (bytes, digest) = writer.finish();
-        file.sync_all()?;
+        sync_file(&file, failpoint, CheckpointFailpoint::HeadersSync)?;
         (metadata, bytes, digest)
     };
-    fail_at(failpoint, CheckpointFailpoint::Headers)?;
 
-    let mut utxo_file = create_new_file(&paths.staging.join(UTXO_FILE))?;
-    let mut utxo_writer = HashingWriter::new(&mut utxo_file);
+    let mut utxo_file = create_file(&staging, UTXO_FILE)?;
+    let mut utxo_writer =
+        HashingWriter::new(&mut utxo_file, failpoint, CheckpointFailpoint::UtxoWrite);
     let trailer = write_snapshot(
         utxo,
         &applied_tip.hash,
@@ -745,8 +822,7 @@ fn write_checkpoint_inner(
     )?;
     utxo_writer.flush()?;
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish();
-    utxo_file.sync_all()?;
-    fail_at(failpoint, CheckpointFailpoint::Utxo)?;
+    sync_file(&utxo_file, failpoint, CheckpointFailpoint::UtxoSync)?;
 
     let listener_stats = coin_stats.snapshot();
     if listener_stats.height != applied_tip.height {
@@ -787,37 +863,46 @@ fn write_checkpoint_inner(
         scanned_stats
     };
 
-    let mut coinstats_file = create_new_file(&paths.staging.join(COINSTATS_FILE))?;
-    let mut coinstats_writer = HashingWriter::new(&mut coinstats_file);
+    let mut coinstats_file = create_file(&staging, COINSTATS_FILE)?;
+    let mut coinstats_writer = HashingWriter::new(
+        &mut coinstats_file,
+        failpoint,
+        CheckpointFailpoint::CoinStatsWrite,
+    );
+    coinstats_writer.write_all(&COINSTATS_MAGIC)?;
+    coinstats_writer.write_all(&COINSTATS_VERSION.to_le_bytes())?;
+    coinstats_writer.write_all(&COINSTATS_PAYLOAD_LEN.to_le_bytes())?;
     coinstats_writer.write_all(&persisted_stats.to_bytes())?;
     coinstats_writer.flush()?;
     let (coinstats_bytes, coinstats_sha256) = coinstats_writer.finish();
-    coinstats_file.sync_all()?;
-    fail_at(failpoint, CheckpointFailpoint::CoinStats)?;
+    sync_file(
+        &coinstats_file,
+        failpoint,
+        CheckpointFailpoint::CoinStatsSync,
+    )?;
 
-    {
-        let tree = block_tree.read();
-        let best_tip_id = tree.tip_id().ok_or_else(|| {
-            CheckpointError::Invalid("best header tip disappeared during checkpoint".to_owned())
-        })?;
-        let applied_id = tree.lookup(applied_tip.hash).ok_or_else(|| {
-            CheckpointError::Invalid("applied tip disappeared during checkpoint".to_owned())
-        })?;
-        if tree.node_at_height_from(best_tip_id, applied_tip.height) != Some(applied_id) {
-            return Err(CheckpointError::Invalid(
-                "applied tip moved off the active best chain during checkpoint".to_owned(),
-            ));
-        }
-        let best = tree.node(best_tip_id)?;
-        if best.hash != headers_write.metadata.best.hash
-            || best.height != headers_write.metadata.best.height
-            || best.chainwork != headers_write.metadata.best.chainwork
-        {
-            return Err(CheckpointError::Invalid(
-                "best header tip changed during checkpoint".to_owned(),
-            ));
-        }
+    let tree = block_tree.read();
+    let best_tip_id = tree.tip_id().ok_or_else(|| {
+        CheckpointError::Invalid("best header tip disappeared during checkpoint".to_owned())
+    })?;
+    let applied_id = tree.lookup(applied_tip.hash).ok_or_else(|| {
+        CheckpointError::Invalid("applied tip disappeared during checkpoint".to_owned())
+    })?;
+    if tree.node_at_height_from(best_tip_id, applied_tip.height) != Some(applied_id) {
+        return Err(CheckpointError::Invalid(
+            "applied tip moved off the active best chain during checkpoint".to_owned(),
+        ));
     }
+    let best = tree.node(best_tip_id)?;
+    if best.hash != headers_write.metadata.best.hash
+        || best.height != headers_write.metadata.best.height
+        || best.chainwork != headers_write.metadata.best.chainwork
+    {
+        return Err(CheckpointError::Invalid(
+            "best header tip changed during checkpoint".to_owned(),
+        ));
+    }
+    drop(tree);
 
     let record_count = u64::try_from(record_count)
         .map_err(|_| CheckpointError::Invalid("UTXO record count does not fit u64".to_owned()))?;
@@ -866,17 +951,25 @@ fn write_checkpoint_inner(
         },
     };
     let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let mut manifest_file = create_new_file(&paths.staging.join(MANIFEST_FILE))?;
-    manifest_file.write_all(&manifest_bytes)?;
+    let mut manifest_file = create_file(&staging, MANIFEST_FILE)?;
+    write_file(
+        &mut manifest_file,
+        &manifest_bytes,
+        failpoint,
+        CheckpointFailpoint::ManifestWrite,
+    )?;
     manifest_file.flush()?;
-    manifest_file.sync_all()?;
-    fail_at(failpoint, CheckpointFailpoint::Manifest)?;
+    sync_file(&manifest_file, failpoint, CheckpointFailpoint::ManifestSync)?;
 
-    sync_directory(&paths.staging)?;
-    fail_at(failpoint, CheckpointFailpoint::StageSync)?;
-    fs::rename(&paths.staging, &paths.final_dir)?;
-    sync_directory(&paths.root)?;
-    fail_at(failpoint, CheckpointFailpoint::GenerationRename)?;
+    sync_checkpoint_dir(&staging, failpoint, CheckpointFailpoint::StageSync)?;
+    rename_generation(
+        &root,
+        &paths.staging,
+        &paths.final_dir,
+        failpoint,
+        CheckpointFailpoint::GenerationRename,
+    )?;
+    sync_root(&root, failpoint, CheckpointFailpoint::GenerationRootSync)?;
 
     let current = CurrentV1 {
         format: CURRENT_FORMAT.to_owned(),
@@ -886,14 +979,28 @@ fn write_checkpoint_inner(
         manifest_sha256: hex_encode(&Sha256::digest(&manifest_bytes)),
     };
     let current_bytes = serde_json::to_vec(&current)?;
-    let mut current_file = create_new_file(&paths.current_temp)?;
-    current_file.write_all(&current_bytes)?;
+    let mut current_file = root.create_file(&paths.current_temp)?;
+    write_file(
+        &mut current_file,
+        &current_bytes,
+        failpoint,
+        CheckpointFailpoint::CurrentTempWrite,
+    )?;
     current_file.flush()?;
-    current_file.sync_all()?;
-    fail_at(failpoint, CheckpointFailpoint::CurrentTempSync)?;
-    fs::rename(&paths.current_temp, paths.root.join(CURRENT_FILE))?;
-    fail_at(failpoint, CheckpointFailpoint::CurrentRename)?;
-    sync_directory(&paths.root)?;
+    sync_file(
+        &current_file,
+        failpoint,
+        CheckpointFailpoint::CurrentTempSync,
+    )?;
+    rename_current(
+        &root,
+        &paths.current_temp,
+        failpoint,
+        CheckpointFailpoint::CurrentRename,
+    )?;
+    sync_root(&root, failpoint, CheckpointFailpoint::CurrentRootSync)?;
+
+    cleanup_after_publication(&root, &paths.directory);
     Ok(CheckpointWrite::Published { generation })
 }
 
@@ -908,8 +1015,9 @@ pub(crate) fn write_checkpoint_with_failpoint(
     rolling_stats: bool,
     failpoint: CheckpointFailpoint,
 ) -> Result<CheckpointWrite, CheckpointError> {
+    let data_dir = open_data_dir(data_dir)?;
     write_checkpoint_inner(
-        data_dir,
+        &data_dir,
         config,
         block_tree,
         utxo,
@@ -920,13 +1028,97 @@ pub(crate) fn write_checkpoint_with_failpoint(
     )
 }
 
-fn fail_at(
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_CHECKPOINT_FAILPOINT: std::cell::Cell<Option<CheckpointFailpoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_next_checkpoint_failpoint(failpoint: CheckpointFailpoint) {
+    NEXT_CHECKPOINT_FAILPOINT.with(|slot| slot.set(Some(failpoint)));
+}
+
+#[cfg(test)]
+fn test_failpoint() -> Option<CheckpointFailpoint> {
+    NEXT_CHECKPOINT_FAILPOINT.with(std::cell::Cell::take)
+}
+
+#[cfg(not(test))]
+const fn test_failpoint() -> Option<CheckpointFailpoint> {
+    None
+}
+
+fn injected_io(
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> std::io::Result<()> {
+    if configured == Some(boundary) {
+        return Err(std::io::Error::from_raw_os_error(28));
+    }
+    Ok(())
+}
+
+fn write_file(
+    file: &mut File,
+    bytes: &[u8],
     configured: Option<CheckpointFailpoint>,
     boundary: CheckpointFailpoint,
 ) -> Result<(), CheckpointError> {
-    if configured == Some(boundary) {
-        return Err(CheckpointError::Injected(boundary));
-    }
+    injected_io(configured, boundary)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+fn sync_file(
+    file: &File,
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> Result<(), CheckpointError> {
+    injected_io(configured, boundary)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sync_checkpoint_dir(
+    dir: &Dir,
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> Result<(), CheckpointError> {
+    injected_io(configured, boundary)?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+fn sync_root(
+    root: &CheckpointRoot,
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> Result<(), CheckpointError> {
+    injected_io(configured, boundary)?;
+    root.sync()?;
+    Ok(())
+}
+
+fn rename_generation(
+    root: &CheckpointRoot,
+    from: &str,
+    to: &str,
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> Result<(), CheckpointError> {
+    injected_io(configured, boundary)?;
+    root.rename_noreplace(from, to)?;
+    Ok(())
+}
+
+fn rename_current(
+    root: &CheckpointRoot,
+    from: &str,
+    configured: Option<CheckpointFailpoint>,
+    boundary: CheckpointFailpoint,
+) -> Result<(), CheckpointError> {
+    injected_io(configured, boundary)?;
+    root.rename(from, CURRENT_FILE)?;
     Ok(())
 }
 
@@ -941,14 +1133,12 @@ impl From<CheckpointError> for LoadStageError {
     }
 }
 
-fn read_current(root: &Path) -> Result<Option<CurrentV1>, LoadStageError> {
-    let path = root.join(CURRENT_FILE);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => {}
+fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, LoadStageError> {
+    let bytes = match read_file(root.dir(), CURRENT_FILE, MAX_CHECKPOINT_METADATA_BYTES) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(CheckpointError::Io(error).into()),
-    }
-    let bytes = read_metadata_file(&path)?;
+    };
     let current: CurrentV1 = serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if current.version != CURRENT_VERSION {
         return Err(LoadStageError::Incompatible(
@@ -978,18 +1168,12 @@ fn read_current(root: &Path) -> Result<Option<CurrentV1>, LoadStageError> {
 }
 
 fn read_manifest(
-    root: &Path,
+    generation_dir: &Dir,
     current: &CurrentV1,
     config: HeaderCheckpointConfig,
 ) -> Result<CheckpointManifestV1, LoadStageError> {
-    let generation_dir = root.join(&current.directory);
-    if !checked_directory(&generation_dir)? {
-        return Err(CheckpointError::Invalid(
-            "CURRENT generation is not a regular directory".to_owned(),
-        )
-        .into());
-    }
-    let bytes = read_metadata_file(&generation_dir.join(MANIFEST_FILE))?;
+    let bytes = read_file(generation_dir, MANIFEST_FILE, MAX_CHECKPOINT_METADATA_BYTES)
+        .map_err(CheckpointError::Io)?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if digest != decode_hex::<32>(&current.manifest_sha256)? {
         return Err(
@@ -1035,13 +1219,14 @@ fn read_manifest(
 }
 
 fn load_headers(
-    generation_dir: &Path,
+    generation_dir: &Dir,
     config: HeaderCheckpointConfig,
     manifest: &CheckpointManifestV1,
 ) -> Result<RestoredHeaders, CheckpointError> {
     require_filename(&manifest.headers.file, HEADERS_FILE)?;
-    verify_artifact(
-        &generation_dir.join(HEADERS_FILE),
+    let mut file = verify_artifact(
+        generation_dir,
+        HEADERS_FILE,
         manifest.headers.bytes,
         &manifest.headers.sha256,
     )?;
@@ -1052,12 +1237,11 @@ fn load_headers(
         best_chain_commitment: decode_hex::<32>(&manifest.headers.best_chain_sha256)?,
         applied_prefix_commitment: decode_hex::<32>(&manifest.headers.applied_chain_sha256)?,
     };
-    let mut file = open_regular_file(&generation_dir.join(HEADERS_FILE), manifest.headers.bytes)?;
     read_headers(&mut file, config, expected).map_err(CheckpointError::Header)
 }
 
 fn load_payloads(
-    generation_dir: &Path,
+    generation_dir: &Dir,
     manifest: &CheckpointManifestV1,
     headers: RestoredHeaders,
 ) -> Result<RestoredChainstate, Box<(BlockTree, CheckpointError)>> {
@@ -1090,32 +1274,30 @@ fn load_payloads(
 }
 
 fn load_payloads_inner(
-    generation_dir: &Path,
+    generation_dir: &Dir,
     manifest: &CheckpointManifestV1,
     headers: &RestoredHeaders,
 ) -> Result<(UtxoSet, CoinStats), CheckpointError> {
     require_filename(&manifest.utxo.file, UTXO_FILE)?;
     require_filename(&manifest.coinstats.file, COINSTATS_FILE)?;
-    let coinstats_len = u64::try_from(COIN_STATS_ENCODED_LEN).map_err(|_| {
-        CheckpointError::Invalid("CoinStats codec length does not fit u64".to_owned())
-    })?;
-    if manifest.coinstats.bytes != coinstats_len {
+    if manifest.coinstats.bytes != COINSTATS_ARTIFACT_LEN {
         return Err(CheckpointError::Invalid(
-            "CoinStats byte length is not the exact codec length".to_owned(),
+            "CoinStats artifact is not exactly 820 bytes".to_owned(),
         ));
     }
-    verify_artifact(
-        &generation_dir.join(UTXO_FILE),
+    let utxo_file = verify_artifact(
+        generation_dir,
+        UTXO_FILE,
         manifest.utxo.bytes,
         &manifest.utxo.sha256,
     )?;
-    verify_artifact(
-        &generation_dir.join(COINSTATS_FILE),
+    let mut coinstats_file = verify_artifact(
+        generation_dir,
+        COINSTATS_FILE,
         manifest.coinstats.bytes,
         &manifest.coinstats.sha256,
     )?;
 
-    let utxo_file = open_regular_file(&generation_dir.join(UTXO_FILE), manifest.utxo.bytes)?;
     let mut limited = BufReader::new(utxo_file).take(
         manifest
             .utxo
@@ -1147,11 +1329,9 @@ fn load_payloads_inner(
         ));
     }
 
-    let coinstats_bytes = read_regular_file(
-        &generation_dir.join(COINSTATS_FILE),
-        Some(manifest.coinstats.bytes),
-    )?;
-    let coin_stats = CoinStats::from_bytes(&coinstats_bytes)?;
+    let mut coinstats_bytes = Vec::with_capacity(COIN_STATS_ENCODED_LEN + 16);
+    coinstats_file.read_to_end(&mut coinstats_bytes)?;
+    let coin_stats = decode_coinstats_artifact(&coinstats_bytes)?;
     validate_coinstats_manifest(&coin_stats, &manifest.coinstats)?;
     let mut scanned = snapshot
         .set
@@ -1208,81 +1388,42 @@ fn validate_coinstats_manifest(
     Ok(())
 }
 
-fn prepare_root(data_dir: &Path) -> Result<PathBuf, CheckpointError> {
-    let root = data_dir.join(CHECKPOINT_ROOT);
-    match checked_directory(&root) {
-        Ok(true) => {}
-        Ok(false) => {
-            fs::create_dir(&root)?;
-            sync_directory(data_dir)?;
-        }
-        Err(error) => return Err(error),
-    }
-    Ok(root)
-}
-
-fn checked_directory(path: &Path) -> Result<bool, CheckpointError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(CheckpointError::Invalid(
-            format!("checkpoint path {} is a symlink", path.display()),
-        )),
-        Ok(metadata) if metadata.is_dir() => Ok(true),
-        Ok(_) => Err(CheckpointError::Invalid(format!(
-            "checkpoint path {} is not a directory",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn next_generation(root: &Path) -> Result<u64, CheckpointError> {
-    let mut greatest = 0_u64;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+fn allocate_generation(
+    root: &CheckpointRoot,
+    current_generation: u64,
+) -> Result<(u64, GenerationPaths, Dir), CheckpointError> {
+    let mut generation = current_generation.checked_add(1).ok_or_else(|| {
+        CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned())
+    })?;
+    loop {
+        let paths = generation_paths(generation);
+        if root.entry_exists(&paths.staging)?
+            || root.entry_exists(&paths.final_dir)?
+            || root.entry_exists(&paths.current_temp)?
+        {
+            generation = generation.checked_add(1).ok_or_else(|| {
+                CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned())
+            })?;
             continue;
-        };
-        if let Some(generation) = generation_from_known_name(name) {
-            greatest = greatest.max(generation);
+        }
+        match root.create_dir(&paths.staging) {
+            Ok(staging) => return Ok((generation, paths, staging)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                generation = generation.checked_add(1).ok_or_else(|| {
+                    CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
-    greatest
-        .checked_add(1)
-        .ok_or_else(|| CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned()))
 }
 
-fn generation_from_known_name(name: &str) -> Option<u64> {
-    if valid_generation_name(name) {
-        return name.get(4..)?.parse().ok();
-    }
-    if let Some(digits) = name
-        .strip_prefix(".gen-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-        && digits.len() == 20
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return digits.parse().ok();
-    }
-    if let Some(digits) = name
-        .strip_prefix(".CURRENT-")
-        .and_then(|name| name.strip_suffix(".tmp"))
-        && digits.len() == 20
-        && digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return digits.parse().ok();
-    }
-    None
-}
-
-fn generation_paths(root: PathBuf, generation: u64) -> GenerationPaths {
+fn generation_paths(generation: u64) -> GenerationPaths {
     let directory = generation_name(generation);
     GenerationPaths {
-        staging: root.join(format!(".{directory}.tmp")),
-        final_dir: root.join(&directory),
-        current_temp: root.join(format!(".CURRENT-{generation:020}.tmp")),
-        root,
+        staging: format!(".{directory}.tmp"),
+        final_dir: directory.clone(),
+        current_temp: format!(".CURRENT-{generation:020}.tmp"),
         directory,
     }
 }
@@ -1297,87 +1438,45 @@ fn valid_generation_name(name: &str) -> bool {
         && name[4..].bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn create_new_file(path: &Path) -> Result<File, CheckpointError> {
-    Ok(OpenOptions::new().write(true).create_new(true).open(path)?)
+fn valid_staging_name(name: &str) -> bool {
+    name.strip_prefix(".gen-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .is_some_and(|digits| {
+            digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
-fn open_regular_file(path: &Path, expected_len: u64) -> Result<File, CheckpointError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CheckpointError::Invalid(format!(
-            "checkpoint artifact {} is not a regular file",
-            path.display()
-        )));
-    }
-    if metadata.len() != expected_len {
-        return Err(CheckpointError::Invalid(format!(
-            "checkpoint artifact {} has {} bytes, expected {expected_len}",
-            path.display(),
-            metadata.len()
-        )));
-    }
-    Ok(File::open(path)?)
+fn valid_current_temp_name(name: &str) -> bool {
+    name.strip_prefix(".CURRENT-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+        .is_some_and(|digits| {
+            digits.len() == 20 && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
-fn read_metadata_file(path: &Path) -> Result<Vec<u8>, CheckpointError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.len() > MAX_CHECKPOINT_METADATA_BYTES {
+fn open_regular_file(dir: &Dir, name: &str, expected_len: u64) -> Result<File, CheckpointError> {
+    let file = open_file(dir, name)?;
+    let actual_len = file.metadata()?.len();
+    if actual_len != expected_len {
         return Err(CheckpointError::Invalid(format!(
-            "checkpoint metadata {} exceeds the metadata bound",
-            path.display()
+            "checkpoint artifact {name:?} has {actual_len} bytes, expected {expected_len}"
         )));
     }
-    read_regular_file(path, Some(metadata.len()))
-}
-
-fn read_regular_file(path: &Path, expected_len: Option<u64>) -> Result<Vec<u8>, CheckpointError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CheckpointError::Invalid(format!(
-            "checkpoint file {} is not regular",
-            path.display()
-        )));
-    }
-    if let Some(expected_len) = expected_len
-        && metadata.len() != expected_len
-    {
-        return Err(CheckpointError::Invalid(format!(
-            "checkpoint file {} has {} bytes, expected {expected_len}",
-            path.display(),
-            metadata.len()
-        )));
-    }
-    if metadata.len() > MAX_CHECKPOINT_PAYLOAD_BYTES {
-        return Err(CheckpointError::Invalid(format!(
-            "checkpoint file {} exceeds the payload bound",
-            path.display()
-        )));
-    }
-    let capacity = usize::try_from(metadata.len()).map_err(|_| {
-        CheckpointError::Invalid("checkpoint file length does not fit usize".to_owned())
-    })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    File::open(path)?.read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).ok() != Some(metadata.len()) {
-        return Err(CheckpointError::Invalid(
-            "checkpoint file changed while being read".to_owned(),
-        ));
-    }
-    Ok(bytes)
+    Ok(file)
 }
 
 fn verify_artifact(
-    path: &Path,
+    dir: &Dir,
+    name: &str,
     expected_len: u64,
     expected_sha256: &str,
-) -> Result<(), CheckpointError> {
+) -> Result<File, CheckpointError> {
     if expected_len > MAX_CHECKPOINT_PAYLOAD_BYTES {
         return Err(CheckpointError::Invalid(format!(
-            "checkpoint artifact {} exceeds the payload bound",
-            path.display()
+            "checkpoint artifact {name:?} exceeds the payload bound"
         )));
     }
-    let mut file = open_regular_file(path, expected_len)?;
+    let mut file = open_regular_file(dir, name, expected_len)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut bytes = 0_u64;
@@ -1394,11 +1493,93 @@ fn verify_artifact(
     let actual: [u8; 32] = hasher.finalize().into();
     if bytes != expected_len || actual != decode_hex::<32>(expected_sha256)? {
         return Err(CheckpointError::Invalid(format!(
-            "checkpoint artifact {} length or SHA256 mismatch",
-            path.display()
+            "checkpoint artifact {name:?} length or SHA256 mismatch"
         )));
     }
-    Ok(())
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+fn decode_coinstats_artifact(bytes: &[u8]) -> Result<CoinStats, CheckpointError> {
+    if u64::try_from(bytes.len()).ok() != Some(COINSTATS_ARTIFACT_LEN) {
+        return Err(CheckpointError::Invalid(
+            "CoinStats artifact is not exactly 820 bytes".to_owned(),
+        ));
+    }
+    if bytes[..8] != COINSTATS_MAGIC {
+        return Err(CheckpointError::Invalid(
+            "bad CoinStats artifact magic".to_owned(),
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| {
+        CheckpointError::Invalid("truncated CoinStats artifact version".to_owned())
+    })?);
+    if version != COINSTATS_VERSION {
+        return Err(CheckpointError::Invalid(format!(
+            "unsupported CoinStats artifact version {version}"
+        )));
+    }
+    let payload_len =
+        u32::from_le_bytes(bytes[12..16].try_into().map_err(|_| {
+            CheckpointError::Invalid("truncated CoinStats artifact length".to_owned())
+        })?);
+    if usize::try_from(payload_len).ok() != Some(COIN_STATS_ENCODED_LEN) {
+        return Err(CheckpointError::Invalid(format!(
+            "CoinStats artifact declares payload length {payload_len}"
+        )));
+    }
+    Ok(CoinStats::from_bytes(&bytes[16..])?)
+}
+
+fn cleanup_after_publication(root: &CheckpointRoot, current: &str) {
+    let entries = match root.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, "failed to enumerate checkpoint cleanup entries");
+            return;
+        }
+    };
+    let mut attempted = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect checkpoint cleanup entry");
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::warn!(%error, entry = name, "failed to classify checkpoint cleanup entry");
+                continue;
+            }
+        };
+        let result = if file_type.is_dir()
+            && name != current
+            && (valid_generation_name(name) || valid_staging_name(name))
+        {
+            attempted = true;
+            remove_known_dir(root, name)
+        } else if file_type.is_file() && valid_current_temp_name(name) {
+            attempted = true;
+            root.remove_file(name)
+        } else {
+            continue;
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, entry = name, "failed to remove checkpoint cleanup entry");
+        }
+    }
+    if attempted {
+        if let Err(error) = root.sync() {
+            tracing::warn!(%error, "failed to sync checkpoint directory after cleanup");
+        }
+    }
 }
 
 fn require_filename(actual: &str, expected: &str) -> Result<(), CheckpointError> {
@@ -1474,15 +1655,11 @@ fn decode_nibble(byte: u8) -> u8 {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), CheckpointError> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Cursor;
+    use std::path::Path;
 
     use bitcoin::block::{Header, Version};
     use bitcoin::consensus::encode::deserialize;
@@ -1496,11 +1673,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CHECKPOINT_ROOT, CURRENT_FILE, CheckpointFailpoint, CheckpointLoad, CheckpointManifestV1,
-        CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN, HeaderCheckpointConfig,
-        HeaderCheckpointError, HeaderCheckpointPoint, HeaderCheckpointTip, HeaderCheckpointWrite,
-        MANIFEST_FILE, UTXO_FILE, encode_header, load_checkpoint, read_headers,
-        write_checkpoint_with_failpoint, write_headers,
+        CHECKPOINT_ROOT, COINSTATS_FILE, CURRENT_FILE, CheckpointFailpoint, CheckpointLoad,
+        CheckpointManifestV1, CheckpointWrite, CurrentV1, HEADER_PREFIX_LEN, HEADERS_FILE,
+        HeaderCheckpointConfig, HeaderCheckpointError, HeaderCheckpointPoint, HeaderCheckpointTip,
+        HeaderCheckpointWrite, MANIFEST_FILE, UTXO_FILE, encode_header, load_checkpoint,
+        read_headers, write_checkpoint_with_failpoint, write_headers,
     };
 
     const NETWORK: Network = Network::Regtest;
@@ -1748,12 +1925,18 @@ mod tests {
         )?;
 
         for failpoint in [
-            CheckpointFailpoint::Headers,
-            CheckpointFailpoint::Utxo,
-            CheckpointFailpoint::CoinStats,
-            CheckpointFailpoint::Manifest,
+            CheckpointFailpoint::HeadersWrite,
+            CheckpointFailpoint::HeadersSync,
+            CheckpointFailpoint::UtxoWrite,
+            CheckpointFailpoint::UtxoSync,
+            CheckpointFailpoint::CoinStatsWrite,
+            CheckpointFailpoint::CoinStatsSync,
+            CheckpointFailpoint::ManifestWrite,
+            CheckpointFailpoint::ManifestSync,
             CheckpointFailpoint::StageSync,
             CheckpointFailpoint::GenerationRename,
+            CheckpointFailpoint::GenerationRootSync,
+            CheckpointFailpoint::CurrentTempWrite,
             CheckpointFailpoint::CurrentTempSync,
             CheckpointFailpoint::CurrentRename,
         ] {
@@ -1773,18 +1956,33 @@ mod tests {
                 .is_err(),
                 "{failpoint:?}"
             );
-            if failpoint != CheckpointFailpoint::CurrentRename {
-                assert_eq!(
-                    fs::read(&current_path)?,
-                    previous_current,
-                    "pre-CURRENT failure changed the authoritative pointer at {failpoint:?}"
-                );
-            }
+            assert_eq!(
+                fs::read(&current_path)?,
+                previous_current,
+                "pre-CURRENT failure changed the authoritative pointer at {failpoint:?}"
+            );
             assert!(matches!(
                 load_checkpoint(dir.path(), config())?,
                 CheckpointLoad::Complete(_)
             ));
         }
+        assert!(
+            write_checkpoint_with_failpoint(
+                dir.path(),
+                config(),
+                &tree,
+                &utxo,
+                &listener,
+                Some(&applied_tip),
+                false,
+                CheckpointFailpoint::CurrentRootSync,
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            load_checkpoint(dir.path(), config())?,
+            CheckpointLoad::Complete(_)
+        ));
         Ok(())
     }
 
@@ -1907,6 +2105,121 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_inner_header_version_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let tree = RwLock::new(tree);
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &tree,
+            &UtxoSet::new(),
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
+            bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        })?;
+
+        assert!(matches!(
+            load_checkpoint(dir.path(), config()),
+            Err(super::IncompatibleCheckpoint::UnsupportedVersion {
+                component: "headers",
+                version: 2
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_header_semantics_choose_cold_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(2, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let tree = RwLock::new(tree);
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &tree,
+            &UtxoSet::new(),
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
+            bytes[HEADER_PREFIX_LEN + 80 + 4] ^= 1;
+        })?;
+
+        assert!(matches!(
+            load_checkpoint(dir.path(), config())?,
+            CheckpointLoad::Cold { .. }
+        ));
+        Ok(())
+    }
+    #[test]
+    fn authenticated_header_tip_and_commitment_mutations_choose_cold()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for case in 0..4 {
+            let dir = tempfile::tempdir()?;
+            let (tree, _, applied) = chain_with_applied_height(2, 0)?;
+            let applied_tip = tip_snapshot(&tree, applied)?;
+            let tree = RwLock::new(tree);
+            super::write_checkpoint(
+                dir.path(),
+                config(),
+                &tree,
+                &UtxoSet::new(),
+                &CoinStatsListener::new(CoinStats::new()),
+                Some(&applied_tip),
+                false,
+            )?;
+            mutate_authenticated_manifest(dir.path(), |manifest| match case {
+                0 => manifest.best_header_tip.hash = "00".repeat(32),
+                1 => manifest.applied_tip.hash = "00".repeat(32),
+                2 => manifest.headers.best_chain_sha256 = "00".repeat(32),
+                _ => manifest.headers.applied_chain_sha256 = "00".repeat(32),
+            })?;
+            assert!(matches!(
+                load_checkpoint(dir.path(), config())?,
+                CheckpointLoad::Cold { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_coinstats_semantics_choose_headers_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for offset in [16, 16 + 768, 16 + 772, 16 + 780, 16 + 788, 16 + 796] {
+            let dir = tempfile::tempdir()?;
+            let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+            let applied_tip = tip_snapshot(&tree, applied)?;
+            let tree = RwLock::new(tree);
+            super::write_checkpoint(
+                dir.path(),
+                config(),
+                &tree,
+                &UtxoSet::new(),
+                &CoinStatsListener::new(CoinStats::new()),
+                Some(&applied_tip),
+                false,
+            )?;
+            mutate_authenticated_artifact(dir.path(), COINSTATS_FILE, |bytes| {
+                bytes[offset] ^= 1;
+            })?;
+
+            assert!(matches!(
+                load_checkpoint(dir.path(), config())?,
+                CheckpointLoad::HeadersOnly { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rolling_trailer_restores_full_coinstats_state() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
@@ -1954,20 +2267,92 @@ mod tests {
         let root = dir.path().join(CHECKPOINT_ROOT);
         let unknown = root.join("operator-note");
         fs::write(&unknown, b"keep")?;
-        let linked = root.join("gen-00000000000000000999");
+        let linked = root.join("gen-18446744073709551615");
         symlink(dir.path().join("outside"), &linked)?;
+        let stale_generation = root.join("gen-00000000000000000088");
+        let stale_staging = root.join(".gen-18446744073709551615.tmp");
+        let stale_current = root.join(".CURRENT-00000000000000000066.tmp");
+        fs::create_dir(&stale_generation)?;
+        fs::create_dir(&stale_staging)?;
+        fs::write(&stale_current, b"stale")?;
 
-        super::write_checkpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &utxo,
-            &listener,
-            Some(&applied_tip),
-            false,
-        )?;
+        assert_eq!(
+            super::write_checkpoint(
+                dir.path(),
+                config(),
+                &tree,
+                &utxo,
+                &listener,
+                Some(&applied_tip),
+                false,
+            )?,
+            CheckpointWrite::Published { generation: 2 }
+        );
         assert!(unknown.exists());
         assert!(fs::symlink_metadata(linked)?.file_type().is_symlink());
+        assert!(!stale_generation.exists());
+        assert!(!stale_staging.exists());
+        assert!(!stale_current.exists());
+        let current: CurrentV1 = serde_json::from_slice(&fs::read(root.join(CURRENT_FILE))?)?;
+        assert!(root.join(&current.directory).is_dir());
+        Ok(())
+    }
+
+    fn mutate_authenticated_artifact(
+        data_dir: &Path,
+        artifact: &str,
+        mutate: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = data_dir.join(CHECKPOINT_ROOT);
+        let current_path = root.join(CURRENT_FILE);
+        let mut current: CurrentV1 = serde_json::from_slice(&fs::read(&current_path)?)?;
+
+        let generation = root.join(&current.directory);
+        let manifest_path = generation.join(MANIFEST_FILE);
+        let mut manifest: CheckpointManifestV1 =
+            serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let artifact_path = generation.join(artifact);
+        let mut bytes = fs::read(&artifact_path)?;
+        mutate(&mut bytes);
+        fs::write(&artifact_path, &bytes)?;
+        let digest = super::hex_encode(&Sha256::digest(&bytes));
+        let length = u64::try_from(bytes.len())?;
+        match artifact {
+            HEADERS_FILE => {
+                manifest.headers.bytes = length;
+                manifest.headers.sha256 = digest;
+            }
+            UTXO_FILE => {
+                manifest.utxo.bytes = length;
+                manifest.utxo.sha256 = digest;
+            }
+            COINSTATS_FILE => {
+                manifest.coinstats.bytes = length;
+                manifest.coinstats.sha256 = digest;
+            }
+            _ => return Err("unknown checkpoint artifact".into()),
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        fs::write(&manifest_path, &manifest_bytes)?;
+        current.manifest_sha256 = super::hex_encode(&Sha256::digest(&manifest_bytes));
+        fs::write(current_path, serde_json::to_vec(&current)?)?;
+        Ok(())
+    }
+    fn mutate_authenticated_manifest(
+        data_dir: &Path,
+        mutate: impl FnOnce(&mut CheckpointManifestV1),
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = data_dir.join(CHECKPOINT_ROOT);
+        let current_path = root.join(CURRENT_FILE);
+        let mut current: CurrentV1 = serde_json::from_slice(&fs::read(&current_path)?)?;
+        let manifest_path = root.join(&current.directory).join(MANIFEST_FILE);
+        let mut manifest: CheckpointManifestV1 =
+            serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        mutate(&mut manifest);
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        fs::write(&manifest_path, &manifest_bytes)?;
+        current.manifest_sha256 = super::hex_encode(&Sha256::digest(&manifest_bytes));
+        fs::write(current_path, serde_json::to_vec(&current)?)?;
         Ok(())
     }
 
