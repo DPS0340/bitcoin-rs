@@ -27,6 +27,9 @@ const NARROW_EVENT_CHUNK_SIZE: usize = 16;
 const WIDE_EVENT_CHUNK_SIZE: usize = 4;
 const INLINE_EVENT_CHUNKS: usize = 64;
 
+/// Exact byte length of the stable `CoinStats` encoding.
+pub const COIN_STATS_ENCODED_LEN: usize = 804;
+
 /// Incremental UTXO set statistics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoinStats {
@@ -93,7 +96,7 @@ impl CoinStats {
     /// Serializes stats in a stable byte layout.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(824);
+        let mut out = Vec::with_capacity(COIN_STATS_ENCODED_LEN);
         out.extend_from_slice(&self.muhash.numerator_bytes());
         out.extend_from_slice(&self.muhash.denominator_bytes());
         out.extend_from_slice(&self.height.to_le_bytes());
@@ -104,7 +107,8 @@ impl CoinStats {
         out
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, CoinStatsDecodeError> {
+    /// Decodes one exact stable `CoinStats` encoding.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CoinStatsDecodeError> {
         let mut cursor = 0;
         let numerator = read_array::<384>(bytes, &mut cursor)?;
         let denominator = read_array::<384>(bytes, &mut cursor)?;

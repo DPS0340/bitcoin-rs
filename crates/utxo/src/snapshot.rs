@@ -131,13 +131,37 @@ pub fn write_snapshot(
 
 /// Streams a native bitcoin-rs UTXO snapshot from `reader` into a fresh set.
 pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
+    read_snapshot_with_policy(reader, SnapshotReadPolicy::Legacy)
+}
+
+/// Strictly decodes a complete v3 snapshot for a chainstate checkpoint.
+pub fn read_snapshot_strict_v3(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
+    read_snapshot_with_policy(reader, SnapshotReadPolicy::StrictV3)
+}
+
+#[derive(Copy, Clone)]
+enum SnapshotReadPolicy {
+    Legacy,
+    StrictV3,
+}
+
+fn read_snapshot_with_policy(
+    reader: &mut impl Read,
+    policy: SnapshotReadPolicy,
+) -> Result<SnapshotLoad, UtxoError> {
     let header_bytes = read_array::<{ core::mem::size_of::<SnapshotHeader>() }>(reader)?;
     let magic = read_u32(&header_bytes, 0);
     if magic != SNAPSHOT_MAGIC {
         return Err(UtxoError::InvalidSnapshotMagic { actual: magic });
     }
     let version = read_u32(&header_bytes, 4);
-    if version != SNAPSHOT_LEGACY_VERSION && version != SNAPSHOT_WRITE_VERSION {
+    let accepts_version = match policy {
+        SnapshotReadPolicy::Legacy => {
+            version == SNAPSHOT_LEGACY_VERSION || version == SNAPSHOT_WRITE_VERSION
+        }
+        SnapshotReadPolicy::StrictV3 => version == SNAPSHOT_WRITE_VERSION,
+    };
+    if !accepts_version {
         return Err(UtxoError::UnsupportedSnapshotVersion { version });
     }
     let mut tip_hash = [0_u8; 32];
@@ -160,10 +184,23 @@ pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> 
     }
 
     let mut muhash_trailer = [0_u8; MUHASH_TRAILER_LEN];
-    match reader.read_exact(&mut muhash_trailer) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(error) => return Err(error.into()),
+    match policy {
+        SnapshotReadPolicy::Legacy => match reader.read_exact(&mut muhash_trailer) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        },
+        SnapshotReadPolicy::StrictV3 => {
+            reader.read_exact(&mut muhash_trailer)?;
+            let mut trailing = [0_u8; 1];
+            if reader.read(&mut trailing)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "snapshot has trailing bytes",
+                )
+                .into());
+            }
+        }
     }
 
     Ok(SnapshotLoad {

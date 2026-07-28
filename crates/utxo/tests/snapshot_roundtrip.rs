@@ -213,6 +213,77 @@ fn legacy_v2_snapshot_rejects_vout_64() {
     assert!(matches!(error, UtxoError::VoutOutOfRange { vout: 64 }));
 }
 
+#[test]
+fn strict_v3_snapshot_requires_complete_exact_input() -> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let mut snapshot = Vec::new();
+    write_snapshot(&set, &txid(64_100), 64, &mut snapshot)?;
+
+    let loaded = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(&snapshot))?;
+    assert_eq!(loaded.tip_hash, txid(64_100));
+    assert_eq!(loaded.height, 64);
+    assert_eq!(loaded.muhash_trailer, [0_u8; 384]);
+
+    let missing_trailer = &snapshot[..snapshot.len() - 384];
+    assert!(
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(missing_trailer))
+            .is_err()
+    );
+    assert!(
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(
+            &snapshot[..snapshot.len() - 1]
+        ))
+        .is_err()
+    );
+
+    let mut trailing = snapshot.clone();
+    trailing.push(0);
+    assert!(
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(trailing)).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_v3_snapshot_rejects_v2_that_legacy_decoder_accepts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut v2 = Vec::new();
+    v2.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
+    v2.extend_from_slice(&2_u32.to_le_bytes());
+    v2.extend_from_slice(&txid(64_200).to_le_bytes());
+    v2.extend_from_slice(&64_u32.to_le_bytes());
+    v2.extend_from_slice(&0_u64.to_le_bytes());
+
+    assert_eq!(read_snapshot(&mut Cursor::new(&v2))?.height, 64);
+    let error = match bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(v2)) {
+        Err(error) => error,
+        Ok(_) => panic!("strict decoder must reject v2"),
+    };
+    assert!(matches!(
+        error,
+        UtxoError::UnsupportedSnapshotVersion { version: 2 }
+    ));
+    Ok(())
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn strict_v3_snapshot_rejects_record_count_that_overflows_usize() {
+    let mut snapshot = Vec::new();
+    snapshot.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
+    snapshot.extend_from_slice(&3_u32.to_le_bytes());
+    snapshot.extend_from_slice(&txid(64_300).to_le_bytes());
+    snapshot.extend_from_slice(&64_u32.to_le_bytes());
+    snapshot.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    let error = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(snapshot))
+        .expect_err("record count must fit usize");
+    assert!(matches!(
+        error,
+        UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX }
+    ));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Task 2: adversarial / boundary coverage
 // ─────────────────────────────────────────────────────────────────────────────
