@@ -348,6 +348,13 @@ impl BlockBodySource for StoredBlockBodySource {
 
 const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeSource {
+    Cold,
+    HeadersOnly,
+    Checkpoint,
+}
+
 fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
     let Some(bytes) = store.get(ColumnFamily::UtxoMeta, PRUNEHEIGHT_METADATA_KEY)? else {
         return Ok(None);
@@ -708,6 +715,7 @@ fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
 pub struct NodeState {
     config: Config,
     data_dir: PathBuf,
+    resume_source: ResumeSource,
     storage: NodeStorage,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
@@ -754,6 +762,12 @@ impl NodeState {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
+        let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
+            network: config.network,
+            genesis: config.network.genesis_block_hash(),
+        };
+        let checkpoint_load =
+            crate::checkpoint::load_checkpoint(&config.data_dir, checkpoint_config)?;
         let g2_muhash_sampler = config
             .g2_muhash_samples
             .clone()
@@ -816,10 +830,51 @@ impl NodeState {
         } else {
             Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
         };
-        let mut utxo_set = bitcoin_rs_utxo::UtxoSet::new();
-        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
-        );
+        let (
+            mut utxo_set,
+            initial_coin_stats,
+            block_tree_value,
+            restored_applied_tip,
+            resume_source,
+        ) = match checkpoint_load {
+            crate::checkpoint::CheckpointLoad::Cold { reason } => {
+                if let Some(reason) = reason {
+                    tracing::warn!(%reason, "chainstate checkpoint rejected; starting cold");
+                }
+                (
+                    bitcoin_rs_utxo::UtxoSet::new(),
+                    bitcoin_rs_coinstats::CoinStats::default(),
+                    bitcoin_rs_chain::BlockTree::new(),
+                    None,
+                    ResumeSource::Cold,
+                )
+            }
+            crate::checkpoint::CheckpointLoad::HeadersOnly { tree, reason } => {
+                tracing::warn!(%reason, "chainstate payload rejected; retaining validated headers only");
+                (
+                    bitcoin_rs_utxo::UtxoSet::new(),
+                    bitcoin_rs_coinstats::CoinStats::default(),
+                    tree,
+                    None,
+                    ResumeSource::HeadersOnly,
+                )
+            }
+            crate::checkpoint::CheckpointLoad::Complete(restored) => {
+                tracing::info!(
+                    height = restored.applied_tip.height,
+                    hash = %restored.applied_tip.hash,
+                    "restored chainstate checkpoint"
+                );
+                (
+                    restored.utxo,
+                    restored.coin_stats,
+                    restored.tree,
+                    Some(restored.applied_tip),
+                    ResumeSource::Checkpoint,
+                )
+            }
+        };
+        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(initial_coin_stats);
         // The rolling coin-stats listener does per-coin MuHash + event work on
         // the block-apply hot path. Bitcoin Core does not maintain rolling UTXO
         // stats during IBD by default; gettxoutsetinfo scans on demand instead
@@ -831,9 +886,12 @@ impl NodeState {
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let block_tree = Arc::new(RwLock::new(block_tree_value));
         let chain_tip = block_tree.read().tip_handle();
         let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
+        if let Some(restored_applied_tip) = restored_applied_tip {
+            applied_tip.store(Some(Arc::new(restored_applied_tip)));
+        }
         let blocks = Arc::new(RwLock::new(Vec::new()));
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         let network = Arc::new(RwLock::new(NetworkState::default()));
@@ -896,6 +954,7 @@ impl NodeState {
         Ok(Self {
             config,
             data_dir,
+            resume_source,
             storage,
             block_body_store,
             utxo,
@@ -939,6 +998,29 @@ impl NodeState {
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) const fn resume_source(&self) -> ResumeSource {
+        self.resume_source
+    }
+
+    pub(crate) fn write_clean_checkpoint(
+        &self,
+    ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
+    {
+        let applied_tip = self.applied_tip.load_full();
+        crate::checkpoint::write_checkpoint(
+            &self.data_dir,
+            crate::checkpoint::HeaderCheckpointConfig {
+                network: self.config.network,
+                genesis: self.config.network.genesis_block_hash(),
+            },
+            &self.block_tree,
+            &self.utxo,
+            &self.coin_stats,
+            applied_tip.as_deref(),
+            self.config.g2_muhash_samples.is_some(),
+        )
     }
 
     /// Returns the configured storage backend that was opened.
@@ -1208,6 +1290,7 @@ impl NodeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
 
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
@@ -1959,5 +2042,136 @@ mod tests {
         assert_eq!(service.status().pruneheight, Some(11));
 
         Ok(())
+    }
+
+    #[test]
+    fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
+        fn stable_hash(
+            view: &bitcoin_rs_utxo::UtxoSetView<'_>,
+        ) -> Result<bitcoin_rs_primitives::Hash256, bitcoin_rs_utxo::UtxoError> {
+            view.hash_serialized_3()
+        }
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_tip = state.apply_block(&genesis)?;
+        let expected_utxo_hash = state.utxo().with_stable_view(stable_hash)?;
+        let expected_stats = state.coin_stats().snapshot();
+        assert!(matches!(
+            state.write_clean_checkpoint()?,
+            crate::checkpoint::CheckpointWrite::Published { .. }
+        ));
+        drop(state);
+
+        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        reopen_config.data_dir = data_dir;
+        reopen_config.p2p_listen.clear();
+        let resumed = NodeState::open(reopen_config)?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+        let applied = resumed
+            .applied_tip()
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
+        assert_eq!(applied.height, genesis_tip.height);
+        assert_eq!(applied.hash, genesis_tip.hash);
+        assert_eq!(
+            resumed.chain_tip().load_full().as_deref(),
+            Some(applied.as_ref())
+        );
+        assert_eq!(
+            resumed.utxo().with_stable_view(stable_hash)?,
+            expected_utxo_hash
+        );
+        assert_eq!(resumed.coin_stats().snapshot(), expected_stats);
+        assert!(resumed.blocks().read().is_empty());
+        assert!(resumed.transactions().read().is_empty());
+        assert!(resumed.mempool().read().is_empty());
+
+        let next = mined_regtest_child(genesis.block_hash())?;
+        let next_tip = resumed.apply_block(&next)?;
+        assert_eq!(next_tip.height, 1);
+        assert_eq!(
+            next_tip.hash.to_le_bytes(),
+            next.block_hash().to_byte_array()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_coinstats_resume_continues_through_next_block() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node-g2");
+        let samples = dir.path().join("g2.samples");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        config.g2_muhash_samples = Some(samples.clone());
+        config.g2_muhash_tip_height = Some(2);
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        state.apply_block(&genesis)?;
+        let before = state.coin_stats().snapshot();
+        state.write_clean_checkpoint()?;
+        drop(state);
+
+        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        reopen_config.data_dir = data_dir;
+        reopen_config.p2p_listen.clear();
+        reopen_config.g2_muhash_samples = Some(samples);
+        reopen_config.g2_muhash_tip_height = Some(2);
+        let resumed = NodeState::open(reopen_config)?;
+        assert_eq!(resumed.coin_stats().snapshot(), before);
+        resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
+        let rolling = resumed.coin_stats().snapshot();
+        let mut scanned = resumed.utxo().with_stable_view(|view| {
+            bitcoin_rs_coinstats::scan_coin_stats(view, rolling.height, true)
+        })?;
+        scanned.tx_count = rolling.tx_count;
+        assert_eq!(rolling, scanned);
+        Ok(())
+    }
+
+    fn mined_regtest_child(prev_blockhash: bitcoin::BlockHash) -> anyhow::Result<bitcoin::Block> {
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 1]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_296_688_603,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .ok_or_else(|| std::io::Error::other("test block has no merkle root"))?;
+        let target = block.header.target();
+        while block.header.validate_pow(target).is_err() {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("test nonce exhausted"))?;
+        }
+        Ok(block)
     }
 }

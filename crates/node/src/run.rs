@@ -504,19 +504,22 @@ fn spawn_fixed_peer_bootstrap(
 /// Flow:
 /// 1. Install JSON tracing on stderr.
 /// 2. Open / create the node data directory and resolve state.
-/// 3. Run crash recovery against the persisted sidecar.
+/// 3. Resume an authenticated chainstate checkpoint, or run legacy crash recovery on cold/header-only startup.
 /// 4. Acquire a shutdown signal — either the in-process receiver wired via
 ///    [`Config::with_shutdown_receiver`] (tests) or a fresh SIGINT/SIGTERM
 ///    handler (production).
 /// 5. Spin the event loop until shutdown is requested.
 /// 6. Drain subsystems within [`DRAIN_DEADLINE`].
+/// 7. Publish one immutable clean-shutdown chainstate checkpoint.
 #[allow(clippy::too_many_lines)]
 pub fn run(mut config: Config) -> Result<()> {
     logging::install_tracing(&config.log_level)?;
 
     let injected_shutdown = config.shutdown_signal.take();
     let state = NodeState::open(config)?;
-    crash_recovery::recover_if_needed(&state)?;
+    if state.resume_source() != crate::state::ResumeSource::Checkpoint {
+        crash_recovery::recover_if_needed(&state)?;
+    }
 
     tracing::info!(
         network = ?state.config().network,
@@ -598,7 +601,7 @@ pub fn run(mut config: Config) -> Result<()> {
         sync_wake_tx.clone(),
         Arc::clone(&p2p_chain_query),
     )?;
-    let _outbound_worker = spawn_p2p_outbound_drain(
+    let outbound_worker = spawn_p2p_outbound_drain(
         state.config(),
         &state,
         &shutdown,
@@ -608,7 +611,7 @@ pub fn run(mut config: Config) -> Result<()> {
         sync_wake_tx,
         Arc::clone(&p2p_chain_query),
     )?;
-    let _bootstrap_worker = if state.config().connect.is_empty() {
+    let bootstrap_worker = if state.config().connect.is_empty() {
         spawn_dns_peer_maintenance(
             state.config(),
             Arc::clone(&shutdown),
@@ -645,8 +648,33 @@ pub fn run(mut config: Config) -> Result<()> {
             Err(_) => tracing::error!(thread = %thread_name, "p2p listener panicked"),
         }
     }
+    if matches!(outbound_worker.join(), Ok(())) {
+        tracing::info!("P2P outbound drain exited cleanly");
+    } else {
+        tracing::error!("P2P outbound drain panicked");
+    }
+    if let Some(handle) = bootstrap_worker {
+        let thread_name = handle
+            .thread()
+            .name()
+            .unwrap_or("bitcoin-rs-p2p-bootstrap")
+            .to_owned();
+        if matches!(handle.join(), Ok(())) {
+            tracing::info!(thread = %thread_name, "P2P bootstrap worker exited cleanly");
+        } else {
+            tracing::error!(thread = %thread_name, "P2P bootstrap worker panicked");
+        }
+    }
 
     shutdown::drain_and_shutdown(DRAIN_DEADLINE)?;
+    match state.write_clean_checkpoint()? {
+        crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
+            tracing::info!("no applied tip; clean checkpoint publication skipped");
+        }
+        crate::checkpoint::CheckpointWrite::Published { generation } => {
+            tracing::info!(generation, "published clean chainstate checkpoint");
+        }
+    }
     tracing::info!("bitcoin-rs node exited cleanly");
     Ok(())
 }
