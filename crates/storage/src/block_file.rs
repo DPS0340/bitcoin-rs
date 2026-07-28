@@ -196,7 +196,9 @@ impl FlatFileBlockStore {
             return Ok(None);
         }
 
-        let body_offset = body_offset(position.offset)?;
+        let Some(body_offset) = body_offset(position.offset) else {
+            return Ok(None);
+        };
         let body_len = usize::try_from(position.len)
             .map_err(|_| StorageError::InvalidOperation("block body length does not fit usize"))?;
         let mut body = vec![0_u8; body_len];
@@ -301,18 +303,12 @@ fn record_len(len: u32) -> Result<u64, StorageError> {
         ))
 }
 
-fn body_offset(offset: u64) -> Result<u64, StorageError> {
-    offset
-        .checked_add(RECORD_HEADER_LEN_U64)
-        .ok_or(StorageError::InvalidOperation(
-            "block record offset overflow",
-        ))
+fn body_offset(offset: u64) -> Option<u64> {
+    offset.checked_add(RECORD_HEADER_LEN_U64)
 }
 
-fn record_end(position: BlockFilePosition) -> Result<u64, StorageError> {
-    body_offset(position.offset)?
-        .checked_add(u64::from(position.len))
-        .ok_or(StorageError::InvalidOperation("block record end overflow"))
+fn record_end(position: BlockFilePosition) -> Option<u64> {
+    body_offset(position.offset)?.checked_add(u64::from(position.len))
 }
 
 fn record_matches(
@@ -321,7 +317,10 @@ fn record_matches(
     height: u32,
     hash: [u8; 32],
 ) -> Result<bool, StorageError> {
-    if record_end(position)? > file.metadata()?.len() {
+    let Some(record_end) = record_end(position) else {
+        return Ok(false);
+    };
+    if record_end > file.metadata()?.len() {
         return Ok(false);
     }
     let mut header = [0_u8; RECORD_HEADER_LEN];
@@ -419,7 +418,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{BLOCK_FILE_MAGIC, FlatFileBlockStore, RECORD_HEADER_LEN_U64};
+    use super::{BLOCK_FILE_MAGIC, BlockFilePosition, FlatFileBlockStore, RECORD_HEADER_LEN_U64};
 
     fn hash(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -498,6 +497,27 @@ mod tests {
 
         assert_eq!(store.load(position, 12, hash(1))?, None);
         assert_eq!(store.load(position, 11, hash(2))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn overflowing_position_returns_none() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let _ = store.append(11, hash(1), b"expected")?;
+
+        assert_eq!(
+            store.load(
+                BlockFilePosition {
+                    file_no: 0,
+                    offset: u64::MAX,
+                    len: 1,
+                },
+                11,
+                hash(1),
+            )?,
+            None
+        );
         Ok(())
     }
 

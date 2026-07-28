@@ -36,13 +36,12 @@ pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
         return Ok((PruneOutcome::default(), PruneOutcome::default(), Vec::new()));
     }
 
-    let block_outcome = block_pruner::prune_prefixed_rows_into_batch(
+    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
+    let (block_outcome, block_files) = block_pruner::stage_flat_block_file_prune(
         store,
         batch,
-        block_pruner::BLOCK_DATA_CF,
-        block_pruner::BLOCK_BODY_PREFIX_BYTES,
-        current_tip_height,
-        policy,
+        block_files,
+        prune_below_height,
     )?;
     let undo_outcome = block_pruner::prune_prefixed_rows_into_batch(
         store,
@@ -52,9 +51,6 @@ pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
         current_tip_height,
         policy,
     )?;
-    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
-    let block_files =
-        block_pruner::flat_block_files_below_height(store, block_files, prune_below_height)?;
 
     Ok((block_outcome, undo_outcome, block_files))
 }

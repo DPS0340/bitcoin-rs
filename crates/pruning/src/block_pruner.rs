@@ -1,8 +1,10 @@
 use alloc::sync::Arc;
 
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
-use bitcoin_rs_storage::{FlatFileBlockStore, decode_block_file_max_height};
+use bitcoin_rs_storage::{
+    BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch,
+    decode_block_file_max_height,
+};
 
 use crate::{PruneError, PruneOutcome, PrunePolicy, row_len_u64};
 
@@ -130,11 +132,13 @@ pub(crate) fn prune_prefixed_rows_into_batch<S: KvStore>(
     Ok(outcome)
 }
 
-pub(crate) fn flat_block_files_below_height<S: KvStore>(
+pub(crate) fn stage_flat_block_file_prune<S: KvStore>(
     store: &S,
+    batch: &mut S::WriteBatch,
     block_files: &FlatFileBlockStore,
     prune_below_height: u32,
-) -> Result<Vec<u32>, PruneError> {
+) -> Result<(PruneOutcome, Vec<u32>), PruneError> {
+    let current_file = block_files.current_file_number();
     let mut file_numbers = Vec::new();
     for row in store.iter_prefix(BLOCK_DATA_CF, BLOCK_FILE_PREFIX_BYTES)? {
         let (key, value) = row?;
@@ -151,11 +155,34 @@ pub(crate) fn flat_block_files_below_height<S: KvStore>(
         let mut encoded_file_no = [0_u8; 4];
         encoded_file_no.copy_from_slice(&key[BLOCK_FILE_PREFIX_BYTES.len()..]);
         let file_no = u32::from_be_bytes(encoded_file_no);
-        if file_no != block_files.current_file_number() {
+        if file_no != current_file {
             file_numbers.push(file_no);
         }
     }
-    Ok(file_numbers)
+
+    if file_numbers.is_empty() {
+        return Ok((PruneOutcome::default(), file_numbers));
+    }
+
+    let mut outcome = PruneOutcome::default();
+    for row in store.iter_prefix(BLOCK_DATA_CF, BLOCK_BODY_PREFIX_BYTES)? {
+        let (key, value) = row?;
+        if key.len() != KEY_LEN {
+            continue;
+        }
+        let Some(position) = BlockFilePosition::decode(&value) else {
+            continue;
+        };
+        // Ordered metadata keys use big-endian suffixes, keeping file_numbers sorted.
+        if file_numbers.binary_search(&position.file_no).is_err() {
+            continue;
+        }
+
+        batch.delete(BLOCK_DATA_CF, &key);
+        outcome.record_removed(row_len_u64(&value)?);
+    }
+
+    Ok((outcome, file_numbers))
 }
 
 fn row_height(key: &[u8], prefix: &[u8]) -> Option<u32> {
