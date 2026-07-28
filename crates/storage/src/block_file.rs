@@ -121,7 +121,7 @@ impl FlatFileBlockStore {
         let body_len = body_len(body)?;
         if let Some(position) = existing
             && position.len == body_len
-            && self.position_matches(position, height, hash)?
+            && self.load(position, height, hash)?.as_deref() == Some(body)
         {
             return Ok(position);
         }
@@ -285,18 +285,6 @@ impl FlatFileBlockStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }
-
-    fn position_matches(
-        &self,
-        position: BlockFilePosition,
-        height: u32,
-        hash: [u8; 32],
-    ) -> Result<bool, StorageError> {
-        let Some(mut file) = self.open_for_read(position.file_no)? else {
-            return Ok(false);
-        };
-        record_matches(&mut file, position, height, hash)
     }
 }
 
@@ -527,6 +515,13 @@ mod tests {
         assert_eq!(
             std::fs::metadata(store.file_path(position.file_no))?.len(),
             before
+        );
+
+        let corrected = store.persist(Some(position), 11, hash(1), b"replaced")?;
+        assert_ne!(corrected, position);
+        assert_eq!(
+            store.load(corrected, 11, hash(1))?.as_deref(),
+            Some(b"replaced".as_slice())
         );
 
         let replacement = store.persist(Some(position), 11, hash(2), b"expected")?;
