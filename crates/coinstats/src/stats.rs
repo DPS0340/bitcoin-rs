@@ -3,7 +3,7 @@ use core::convert::Infallible;
 
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use bitcoin_rs_utxo::{
-    UtxoChangeListener, UtxoInserted, UtxoRemoved,
+    SnapshotCoin, SnapshotCoinObserver, UtxoChangeListener, UtxoInserted, UtxoRemoved,
     set::{UtxoChangeEvents, UtxoCommittedEvent},
 };
 use parking_lot::Mutex;
@@ -137,7 +137,7 @@ impl Default for CoinStats {
     }
 }
 
-/// Computes UTXO-set statistics by scanning a stable view.
+/// Computes `CoinStats` statistics by scanning a stable view.
 ///
 /// Matches Bitcoin Core's on-demand model (no rolling listener required).
 /// `want_muhash` controls the expensive per-coin `MuHash` pass; callers needing
@@ -147,27 +147,96 @@ pub fn scan_coin_stats(
     height: u32,
     want_muhash: bool,
 ) -> Result<CoinStats, bitcoin_rs_utxo::UtxoError> {
-    let mut stats = CoinStats::new();
-    let mut scratch = Vec::new();
-    view.for_each_coin(|txid, vout, value, script, coin_height, coinbase| {
-        stats.total_amount = stats.total_amount.saturating_add(value);
-        let script_len = u64::try_from(script.len()).unwrap_or(u64::MAX);
-        stats.bogo_size = stats
+    let mut accumulator = if want_muhash {
+        CoinStatsAccumulator::with_muhash(height)
+    } else {
+        CoinStatsAccumulator::without_muhash(height)
+    };
+    view.for_each_coin(|txid, vout, value, script_pubkey, coin_height, coinbase| {
+        accumulator.observe_coin(SnapshotCoin {
+            txid,
+            vout,
+            value,
+            script_pubkey,
+            height: coin_height,
+            coinbase,
+        });
+    })?;
+    Ok(accumulator.into_stats())
+}
+
+/// Owned `CoinStats` fold for a snapshot coin traversal.
+///
+/// The accumulator borrows each script only for its callback and reuses one
+/// scratch buffer for optional `MuHash` preimages.
+/// Transaction count remains zero because live coins do not encode it.
+#[derive(Debug)]
+pub struct CoinStatsAccumulator {
+    stats: CoinStats,
+    scratch: Vec<u8>,
+    collect_muhash: bool,
+}
+
+impl CoinStatsAccumulator {
+    /// Creates an accumulator that derives `CoinStats` and a `MuHash` trailer.
+    #[must_use]
+    pub fn with_muhash(height: u32) -> Self {
+        Self::new(height, true)
+    }
+
+    /// Creates an accumulator that derives `CoinStats` without hashing coins.
+    #[must_use]
+    pub fn without_muhash(height: u32) -> Self {
+        Self::new(height, false)
+    }
+
+    fn new(height: u32, collect_muhash: bool) -> Self {
+        let mut stats = CoinStats::new();
+        stats.height = height;
+        Self {
+            stats,
+            scratch: Vec::new(),
+            collect_muhash,
+        }
+    }
+
+    /// Finishes the fold and returns the derived statistics.
+    #[must_use]
+    pub fn into_stats(self) -> CoinStats {
+        self.stats
+    }
+}
+
+impl SnapshotCoinObserver for CoinStatsAccumulator {
+    fn observe_coin(&mut self, coin: SnapshotCoin<'_>) {
+        self.stats.total_amount = self.stats.total_amount.saturating_add(coin.value);
+        let script_len = u64::try_from(coin.script_pubkey.len()).unwrap_or(u64::MAX);
+        self.stats.bogo_size = self
+            .stats
             .bogo_size
             .saturating_add(FIXED_BOGO_SIZE.saturating_add(script_len));
-        stats.utxo_count = stats.utxo_count.saturating_add(1);
-        if want_muhash {
-            let op = OutPoint::new(txid, vout);
-            let txout = TxOut {
-                value: bitcoin::Amount::from_sat(value),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(script.to_vec()),
-            };
-            coin_hash_bytes_into(&mut scratch, &op, &txout, coin_height, coinbase);
-            stats.muhash.insert(&scratch);
+        self.stats.utxo_count = self.stats.utxo_count.saturating_add(1);
+        if self.collect_muhash {
+            let op = OutPoint::new(coin.txid, coin.vout);
+            coin_hash_bytes_raw_into(
+                &mut self.scratch,
+                &op,
+                coin.value,
+                coin.script_pubkey,
+                coin.height,
+                coin.coinbase,
+            );
+            self.stats.muhash.insert(&self.scratch);
         }
-    })?;
-    stats.height = height;
-    Ok(stats)
+    }
+
+    fn select_trailer(&mut self, fallback: [u8; 384]) -> [u8; 384] {
+        if self.collect_muhash {
+            self.stats.muhash.finalize()
+        } else {
+            fallback
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -579,19 +648,42 @@ fn coin_hash_bytes_into(
     height: u32,
     coinbase: bool,
 ) {
+    coin_hash_bytes_raw_into(
+        out,
+        op,
+        txout.value.to_sat(),
+        txout.script_pubkey.as_bytes(),
+        height,
+        coinbase,
+    );
+}
+
+fn coin_hash_bytes_raw_into(
+    out: &mut Vec<u8>,
+    op: &OutPoint,
+    value: u64,
+    script_pubkey: &[u8],
+    height: u32,
+    coinbase: bool,
+) {
     out.clear();
     out.extend_from_slice(op.as_bytes());
     let coinbase_bit = u32::from(coinbase);
     out.extend_from_slice(&((height << 1) | coinbase_bit).to_le_bytes());
-    encode_txout_into(out, txout);
+    encode_value_and_script_into(out, value, script_pubkey);
+}
+
+#[cfg(test)]
+#[inline]
+fn encode_txout_into(out: &mut Vec<u8>, txout: &TxOut) {
+    encode_value_and_script_into(out, txout.value.to_sat(), txout.script_pubkey.as_bytes());
 }
 
 #[inline]
-fn encode_txout_into(out: &mut Vec<u8>, txout: &TxOut) {
-    out.extend_from_slice(&txout.value.to_sat().to_le_bytes());
-    let script = txout.script_pubkey.as_bytes();
-    encode_compact_size_into(out, script.len());
-    out.extend_from_slice(script);
+fn encode_value_and_script_into(out: &mut Vec<u8>, value: u64, script_pubkey: &[u8]) {
+    out.extend_from_slice(&value.to_le_bytes());
+    encode_compact_size_into(out, script_pubkey.len());
+    out.extend_from_slice(script_pubkey);
 }
 
 #[inline]
@@ -666,36 +758,75 @@ mod tests {
     #[test]
     fn scan_coin_stats_matches_rolling_listener() {
         use bitcoin_rs_primitives::{Hash256, OutPoint};
-        use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
+        use bitcoin_rs_utxo::{BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoSet};
 
         let mut utxo = UtxoSet::new();
         let listener = super::CoinStatsListener::new(super::CoinStats::new());
         utxo.set_listener(Box::new(listener.clone()));
-
         let mut changes = BlockChanges::default();
-        for i in 1_u8..=6 {
-            let outpoint = OutPoint::new(Hash256::from_le_bytes(&[i; 32]), u32::from(i % 3));
+        for (i, script_len) in [0_usize, 1, 252, 253, 65_535].into_iter().enumerate() {
+            let mut txid_bytes = [0_u8; 32];
+            txid_bytes[0] = u8::try_from(i + 1).unwrap_or(u8::MAX);
+            let output = OutPoint::new(Hash256::from_le_bytes(&txid_bytes), u32::MAX);
             let txout = TxOut {
-                value: Amount::from_sat(u64::from(i) * 100_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51; usize::from(i)]),
+                value: Amount::from_sat(if i == 4 {
+                    u64::MAX
+                } else {
+                    u64::try_from(i).unwrap_or(u64::MAX).saturating_mul(100_000)
+                }),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51; script_len]),
             };
-            changes.add(UtxoAdd::new(outpoint, txout, i == 1, u32::from(i)));
+            changes.add(UtxoAdd::new(
+                output,
+                txout,
+                i % 2 == 1,
+                if i == 4 {
+                    u32::MAX >> 1
+                } else {
+                    u32::try_from(i).unwrap_or(u32::MAX)
+                },
+            ));
         }
         utxo.commit_block(&changes, &Hash256::default())
             .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
 
         let rolling = listener.snapshot();
-        let scanned = utxo
-            .with_stable_view(|view| super::scan_coin_stats(view, rolling.height, true))
-            .unwrap_or_else(|err| panic!("scan_coin_stats failed: {err}"));
+        let (scanned, accumulated, without_muhash) = utxo.with_stable_view(|view| {
+            let scanned = super::scan_coin_stats(view, rolling.height, true)
+                .unwrap_or_else(|err| panic!("scan_coin_stats failed: {err}"));
+            let mut accumulated = super::CoinStatsAccumulator::with_muhash(rolling.height);
+            let mut without_muhash = super::CoinStatsAccumulator::without_muhash(rolling.height);
+            view.for_each_coin(|txid, vout, value, script_pubkey, height, coinbase| {
+                let coin = SnapshotCoin {
+                    txid,
+                    vout,
+                    value,
+                    script_pubkey,
+                    height,
+                    coinbase,
+                };
+                accumulated.observe_coin(coin);
+                without_muhash.observe_coin(coin);
+            })
+            .unwrap_or_else(|err| panic!("coin traversal failed: {err}"));
+            (
+                scanned,
+                accumulated.into_stats(),
+                without_muhash.into_stats(),
+            )
+        });
 
-        assert_eq!(scanned.utxo_count, rolling.utxo_count, "utxo_count");
-        assert_eq!(scanned.total_amount, rolling.total_amount, "total_amount");
-        assert_eq!(scanned.bogo_size, rolling.bogo_size, "bogo_size");
+        assert_eq!(accumulated, scanned, "snapshot accumulator");
+        assert_eq!(scanned, rolling, "rolling listener");
+        assert_eq!(without_muhash.height, scanned.height);
+        assert_eq!(without_muhash.total_amount, scanned.total_amount);
+        assert_eq!(without_muhash.bogo_size, scanned.bogo_size);
+        assert_eq!(without_muhash.tx_count, scanned.tx_count);
+        assert_eq!(without_muhash.utxo_count, scanned.utxo_count);
         assert_eq!(
-            scanned.muhash.finalize_hash(),
-            rolling.muhash.finalize_hash(),
-            "scan muhash must match the rolling listener"
+            without_muhash.muhash.finalize(),
+            super::MuHash3072::new().finalize(),
+            "without_muhash must leave the identity accumulator"
         );
     }
 }

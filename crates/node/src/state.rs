@@ -2125,10 +2125,15 @@ mod tests {
             .get("directory")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| std::io::Error::other("CURRENT has no generation directory"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join(directory).join("manifest-v1.json"),
+        )?)?;
+        assert_eq!(manifest["utxo"]["trailer_kind"], "scanned");
         let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v3.dat"))?;
         let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
         let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut snapshot_reader)?;
-        assert_eq!(snapshot.muhash_trailer, [0_u8; 384]);
+        assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
+        assert_eq!(snapshot.muhash_trailer, rescanned.muhash.finalize());
         drop(resumed);
 
         let resumed_again = NodeState::open(reopen_config)?;

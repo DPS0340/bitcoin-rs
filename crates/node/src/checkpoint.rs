@@ -5,10 +5,14 @@ use bitcoin::block::Header;
 use bitcoin::consensus::{Encodable, encode::deserialize};
 use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
 use bitcoin_rs_coinstats::{
-    CoinStats, CoinStatsListener, scan_coin_stats, stats::COIN_STATS_ENCODED_LEN,
+    CoinStats, CoinStatsAccumulator, CoinStatsListener, scan_coin_stats,
+    stats::COIN_STATS_ENCODED_LEN,
 };
 use bitcoin_rs_primitives::{Hash256, Network};
-use bitcoin_rs_utxo::{UtxoSet, snapshot::read_snapshot_strict_v3, write_snapshot};
+use bitcoin_rs_utxo::{
+    UtxoSet, read_snapshot_strict_v3_observed, snapshot::read_snapshot_strict_v3,
+    write_snapshot_observed,
+};
 use cap_std::fs::{Dir, File};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -448,6 +452,7 @@ struct UtxoArtifactV1 {
 #[serde(rename_all = "lowercase")]
 enum TrailerKindV1 {
     Rolling,
+    Scanned,
     Zero,
 }
 
@@ -814,11 +819,12 @@ fn write_checkpoint_inner(
     let mut utxo_file = create_file(&staging, UTXO_FILE)?;
     let mut utxo_writer =
         HashingWriter::new(&mut utxo_file, failpoint, CheckpointFailpoint::UtxoWrite);
-    let trailer = write_snapshot(
+    let (trailer, accumulator) = write_snapshot_observed(
         utxo,
         &applied_tip.hash,
         applied_tip.height,
         &mut utxo_writer,
+        CoinStatsAccumulator::with_muhash(applied_tip.height),
     )?;
     utxo_writer.flush()?;
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish();
@@ -831,16 +837,13 @@ fn write_checkpoint_inner(
             listener_stats.height, applied_tip.height
         )));
     }
-    let (scanned_stats, record_count) = utxo.with_stable_view(|view| {
-        let scanned = scan_coin_stats(view, applied_tip.height, true);
-        (scanned, view.record_count())
-    });
-    let mut scanned_stats = scanned_stats?;
-    scanned_stats.tx_count = listener_stats.tx_count;
+    let mut fused_stats = accumulator.into_stats();
+    fused_stats.tx_count = listener_stats.tx_count;
+    let record_count = utxo.record_count();
     let trailer_kind = if rolling_stats {
-        if listener_stats != scanned_stats {
+        if listener_stats != fused_stats {
             return Err(CheckpointError::Invalid(
-                "rolling CoinStats does not match the quiesced UTXO scan".to_owned(),
+                "rolling CoinStats does not match the quiesced UTXO traversal".to_owned(),
             ));
         }
         if trailer != listener_stats.muhash.finalize() {
@@ -850,17 +853,17 @@ fn write_checkpoint_inner(
         }
         TrailerKindV1::Rolling
     } else {
-        if trailer != [0_u8; 384] {
+        if trailer == [0_u8; 384] {
             return Err(CheckpointError::Invalid(
-                "non-rolling UTXO snapshot has a nonzero MuHash trailer".to_owned(),
+                "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
             ));
         }
-        TrailerKindV1::Zero
+        TrailerKindV1::Scanned
     };
     let persisted_stats = if rolling_stats {
         listener_stats
     } else {
-        scanned_stats
+        fused_stats
     };
 
     let mut coinstats_file = create_file(&staging, COINSTATS_FILE)?;
@@ -1297,16 +1300,14 @@ fn load_payloads_inner(
         manifest.coinstats.bytes,
         &manifest.coinstats.sha256,
     )?;
-
-    let mut limited = BufReader::new(utxo_file).take(
-        manifest
-            .utxo
-            .bytes
-            .checked_add(1)
-            .ok_or_else(|| CheckpointError::Invalid("UTXO byte length overflow".to_owned()))?,
-    );
-    let snapshot = read_snapshot_strict_v3(&mut limited)?;
     let expected_applied = parse_tip(&manifest.applied_tip)?;
+
+    let (snapshot, fused_stats) = read_checkpoint_snapshot(
+        utxo_file,
+        manifest.utxo.bytes,
+        manifest.utxo.trailer_kind,
+        expected_applied.height,
+    )?;
     let snapshot_tip = (snapshot.height, snapshot.tip_hash);
     let expected_tip = (expected_applied.height, expected_applied.hash);
     if snapshot_tip != expected_tip {
@@ -1333,13 +1334,17 @@ fn load_payloads_inner(
     coinstats_file.read_to_end(&mut coinstats_bytes)?;
     let coin_stats = decode_coinstats_artifact(&coinstats_bytes)?;
     validate_coinstats_manifest(&coin_stats, &manifest.coinstats)?;
-    let mut scanned = snapshot
-        .set
-        .with_stable_view(|view| scan_coin_stats(view, snapshot.height, true))?;
-    scanned.tx_count = coin_stats.tx_count;
-    if scanned != coin_stats {
+    let mut derived = match fused_stats {
+        Some(stats) => stats,
+        None => snapshot
+            .set
+            .with_stable_view(|view| scan_coin_stats(view, snapshot.height, true))?,
+    };
+    // Transaction count is chain metadata and cannot be derived from live coins.
+    derived.tx_count = coin_stats.tx_count;
+    if derived != coin_stats {
         return Err(CheckpointError::Invalid(
-            "CoinStats does not match loaded UTXO scan".to_owned(),
+            "CoinStats does not match loaded UTXO traversal".to_owned(),
         ));
     }
     if coin_stats.utxo_count != manifest.utxo.output_count {
@@ -1348,9 +1353,11 @@ fn load_payloads_inner(
         ));
     }
     match manifest.utxo.trailer_kind {
-        TrailerKindV1::Rolling if snapshot.muhash_trailer != coin_stats.muhash.finalize() => {
+        TrailerKindV1::Rolling | TrailerKindV1::Scanned
+            if snapshot.muhash_trailer != coin_stats.muhash.finalize() =>
+        {
             return Err(CheckpointError::Invalid(
-                "rolling UTXO trailer does not match restored CoinStats".to_owned(),
+                "UTXO trailer does not match restored CoinStats".to_owned(),
             ));
         }
         TrailerKindV1::Zero if snapshot.muhash_trailer != [0_u8; 384] => {
@@ -1358,7 +1365,7 @@ fn load_payloads_inner(
                 "zero UTXO trailer kind contains nonzero bytes".to_owned(),
             ));
         }
-        TrailerKindV1::Rolling | TrailerKindV1::Zero => {}
+        TrailerKindV1::Rolling | TrailerKindV1::Scanned | TrailerKindV1::Zero => {}
     }
     let applied = headers.tree.node(headers.applied_tip_id)?;
     let applied_tip = (applied.height, applied.hash);
@@ -1368,6 +1375,29 @@ fn load_payloads_inner(
         ));
     }
     Ok((snapshot.set, coin_stats))
+}
+
+fn read_checkpoint_snapshot(
+    utxo_file: File,
+    encoded_len: u64,
+    trailer_kind: TrailerKindV1,
+    height: u32,
+) -> Result<(bitcoin_rs_utxo::SnapshotLoad, Option<CoinStats>), CheckpointError> {
+    let mut limited = BufReader::new(utxo_file).take(
+        encoded_len
+            .checked_add(1)
+            .ok_or_else(|| CheckpointError::Invalid("UTXO byte length overflow".to_owned()))?,
+    );
+    match trailer_kind {
+        TrailerKindV1::Rolling | TrailerKindV1::Scanned => {
+            let (snapshot, accumulator) = read_snapshot_strict_v3_observed(
+                &mut limited,
+                CoinStatsAccumulator::with_muhash(height),
+            )?;
+            Ok((snapshot, Some(accumulator.into_stats())))
+        }
+        TrailerKindV1::Zero => Ok((read_snapshot_strict_v3(&mut limited)?, None)),
+    }
 }
 
 fn validate_coinstats_manifest(
@@ -1664,11 +1694,11 @@ mod tests {
     use bitcoin::block::{Header, Version};
     use bitcoin::consensus::encode::deserialize;
     use bitcoin::hashes::Hash as _;
-    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+    use bitcoin::{Amount, BlockHash, CompactTarget, ScriptBuf, TxMerkleNode, TxOut};
     use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot, accept_headers};
-    use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
-    use bitcoin_rs_primitives::{Hash256, Network};
-    use bitcoin_rs_utxo::UtxoSet;
+    use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener, scan_coin_stats};
+    use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
+    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use parking_lot::RwLock;
     use sha2::{Digest, Sha256};
 
@@ -2244,6 +2274,105 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn scanned_trailer_restores_independently_scanned_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let tree = RwLock::new(tree);
+        let utxo = populated_utxo()?;
+        let expected = utxo.with_stable_view(|view| scan_coin_stats(view, 0, true))?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &tree,
+            &utxo,
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+
+        let root = dir.path().join(CHECKPOINT_ROOT);
+        let current: CurrentV1 = serde_json::from_slice(&fs::read(root.join(CURRENT_FILE))?)?;
+        let generation = root.join(current.directory);
+        let manifest: CheckpointManifestV1 =
+            serde_json::from_slice(&fs::read(generation.join(MANIFEST_FILE))?)?;
+        assert_eq!(manifest.utxo.trailer_kind, super::TrailerKindV1::Scanned);
+        let mut reader = std::io::BufReader::new(std::fs::File::open(generation.join(UTXO_FILE))?);
+        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut reader)?;
+        assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
+        assert_eq!(snapshot.muhash_trailer, expected.muhash.finalize());
+
+        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
+            return Err(std::io::Error::other("scanned generation did not restore").into());
+        };
+        assert_eq!(restored.coin_stats, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_utxo_value_mutation_keeps_headers_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const FIRST_VALUE_OFFSET: usize = 52 + 42 + 4;
+
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &populated_utxo()?,
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+
+        mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
+            bytes[FIRST_VALUE_OFFSET] ^= 1;
+        })?;
+        assert!(matches!(
+            load_checkpoint(dir.path(), config())?,
+            CheckpointLoad::HeadersOnly { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_zero_trailer_generation_still_loads() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let utxo = populated_utxo()?;
+        let expected = utxo.with_stable_view(|view| scan_coin_stats(view, 0, true))?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &utxo,
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
+            let trailer = bytes.len() - 384;
+            bytes[trailer..].fill(0);
+        })?;
+        mutate_authenticated_manifest(dir.path(), |manifest| {
+            manifest.utxo.trailer_kind = super::TrailerKindV1::Zero;
+            manifest.utxo.muhash_trailer_sha256 = super::hex_encode(&Sha256::digest([0_u8; 384]));
+        })?;
+
+        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
+            return Err(
+                std::io::Error::other("legacy zero-trailer generation did not restore").into(),
+            );
+        };
+        assert_eq!(restored.coin_stats, expected);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn unknown_entries_and_symlinks_are_never_deleted() -> Result<(), Box<dyn std::error::Error>> {
@@ -2436,5 +2565,21 @@ mod tests {
 
     fn header_from_row(row: &[u8]) -> Result<Header, HeaderCheckpointError> {
         deserialize(row).map_err(|error| HeaderCheckpointError::Codec(error.to_string()))
+    }
+
+    fn populated_utxo() -> Result<UtxoSet, bitcoin_rs_utxo::UtxoError> {
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            OutPoint::new(Hash256::from_le_bytes(&[7_u8; 32]), 3),
+            TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+            },
+            true,
+            0,
+        ));
+        let utxo = UtxoSet::new();
+        utxo.commit_block(&changes, &Hash256::default())?;
+        Ok(utxo)
     }
 }
