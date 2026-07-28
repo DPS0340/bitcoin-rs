@@ -42,6 +42,7 @@ pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
         batch,
         block_files,
         prune_below_height,
+        policy,
     )?;
     let undo_outcome = block_pruner::prune_prefixed_rows_into_batch(
         store,

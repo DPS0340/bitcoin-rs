@@ -33,7 +33,8 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
     };
     std::fs::File::create(data_dir.path().join("blocks/blk00001.dat"))?;
     let block_files = FlatFileBlockStore::open(data_dir.path())?;
-    let current_position = block_files.append(800, *current_hash.as_byte_array(), b"current body")?;
+    let current_position =
+        block_files.append(800, *current_hash.as_byte_array(), b"current body")?;
 
     assert_eq!(first_old_position.file_no, 0);
     assert_eq!(second_old_position.file_no, 0);
@@ -54,11 +55,7 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
     let second_old_key = block_body_key(2, second_old_hash);
     let current_key = block_body_key(800, current_hash);
     let mut initial_batch = store.new_batch();
-    initial_batch.put(
-        BLOCK_DATA_CF,
-        &first_old_key,
-        &first_old_position.encode(),
-    );
+    initial_batch.put(BLOCK_DATA_CF, &first_old_key, &first_old_position.encode());
     initial_batch.put(
         BLOCK_DATA_CF,
         &second_old_key,
@@ -78,13 +75,8 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
     store.write(initial_batch)?;
 
     let mut prune_batch = store.new_batch();
-    let (block_outcome, undo_outcome, file_numbers) = stage_block_and_undo_prune(
-        &store,
-        &mut prune_batch,
-        &block_files,
-        1_000,
-        policy,
-    )?;
+    let (block_outcome, undo_outcome, file_numbers) =
+        stage_block_and_undo_prune(&store, &mut prune_batch, &block_files, 1_000, policy)?;
     assert_eq!(block_outcome.blocks_removed, 2);
     assert_eq!(block_outcome.bytes_freed, 32);
     assert!(undo_outcome.is_empty());
@@ -128,6 +120,47 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
     assert_eq!(
         block_files.load(current_position, 800, *current_hash.as_byte_array())?,
         Some(b"current body".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::default();
+    let data_dir = tempdir()?;
+    let hash = fake_hash(1);
+    let block_files = FlatFileBlockStore::open(data_dir.path())?;
+    let position = block_files.append(1, *hash.as_byte_array(), b"current old body")?;
+    let key = block_body_key(1, hash);
+    let mut initial_batch = store.new_batch();
+    initial_batch.put(BLOCK_DATA_CF, &key, &position.encode());
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &block_file_max_height_key(position.file_no),
+        &encode_block_file_max_height(1),
+    );
+    store.write(initial_batch)?;
+
+    let mut prune_batch = store.new_batch();
+    let (block_outcome, _undo_outcome, file_numbers) = stage_block_and_undo_prune(
+        &store,
+        &mut prune_batch,
+        &block_files,
+        1_000,
+        PrunePolicy::utreexo_only(),
+    )?;
+    assert!(file_numbers.is_empty());
+    assert_eq!(block_outcome.blocks_removed, 1);
+    assert_eq!(block_outcome.bytes_freed, 16);
+
+    store.write(prune_batch)?;
+    assert!(store.get(BLOCK_DATA_CF, &key)?.is_none());
+    assert!(block_files.file_path(position.file_no).exists());
+    assert!(
+        store
+            .get(BLOCK_DATA_CF, &block_file_max_height_key(position.file_no))?
+            .is_some()
     );
     Ok(())
 }

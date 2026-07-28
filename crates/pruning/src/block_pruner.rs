@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::{
-    BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch,
+    BlockFilePosition, ColumnFamily, FlatFileBlockStore, KvStore, StorageError, WriteBatch,
     decode_block_file_max_height,
 };
 
@@ -137,6 +137,7 @@ pub(crate) fn stage_flat_block_file_prune<S: KvStore>(
     batch: &mut S::WriteBatch,
     block_files: &FlatFileBlockStore,
     prune_below_height: u32,
+    policy: PrunePolicy,
 ) -> Result<(PruneOutcome, Vec<u32>), PruneError> {
     let current_file = block_files.current_file_number();
     let mut file_numbers = Vec::new();
@@ -160,26 +161,39 @@ pub(crate) fn stage_flat_block_file_prune<S: KvStore>(
         }
     }
 
-    if file_numbers.is_empty() {
-        return Ok((PruneOutcome::default(), file_numbers));
-    }
-
-    let mut outcome = PruneOutcome::default();
+    let target_bytes = policy.target_size_bytes();
+    let mut total_bytes = 0_u64;
+    let mut candidates = Vec::new();
     for row in store.iter_prefix(BLOCK_DATA_CF, BLOCK_BODY_PREFIX_BYTES)? {
         let (key, value) = row?;
         if key.len() != KEY_LEN {
             continue;
         }
-        let Some(position) = BlockFilePosition::decode(&value) else {
-            continue;
-        };
-        // Ordered metadata keys use big-endian suffixes, keeping file_numbers sorted.
-        if file_numbers.binary_search(&position.file_no).is_err() {
+        let row_bytes = row_len_u64(&value)?;
+        total_bytes = total_bytes.saturating_add(row_bytes);
+        let position = BlockFilePosition::decode(&value).ok_or_else(|| {
+            StorageError::IncompatibleData(
+                "block-body index row is not a 16-byte flat-file position".to_owned(),
+            )
+        })?;
+        let selected_file = file_numbers.binary_search(&position.file_no).is_ok();
+        let below_horizon = row_height(&key, BLOCK_BODY_PREFIX_BYTES)
+            .is_some_and(|height| height < prune_below_height);
+        if selected_file || below_horizon {
+            candidates.push((key, row_bytes, selected_file));
+        }
+    }
+
+    let mut remaining_bytes = total_bytes;
+    let mut outcome = PruneOutcome::default();
+    for (key, row_bytes, selected_file) in candidates {
+        if !selected_file && remaining_bytes <= target_bytes {
             continue;
         }
 
         batch.delete(BLOCK_DATA_CF, &key);
-        outcome.record_removed(row_len_u64(&value)?);
+        remaining_bytes = remaining_bytes.saturating_sub(row_bytes);
+        outcome.record_removed(row_bytes);
     }
 
     Ok((outcome, file_numbers))
