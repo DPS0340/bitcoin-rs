@@ -8,7 +8,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
-use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
 use bitcoin_rs_rpc::BlockRecord;
@@ -1527,6 +1527,9 @@ fn build_utxo_changes<'a>(
         let txid = bitcoin_rs_primitives::Hash256::from_le_bytes(txid.as_byte_array());
         let coinbase = tx.is_coinbase();
         for (vout_idx, txout) in tx.output.iter().enumerate() {
+            if txout.script_pubkey.is_op_return() || txout.script_pubkey.len() > MAX_SCRIPT_SIZE {
+                continue;
+            }
             let outpoint = OutPoint::new(
                 txid,
                 u32::try_from(vout_idx).map_err(|_| ApplyError::HeightOverflow(height))?,
@@ -2414,6 +2417,66 @@ mod consensus_rule_tests {
                 bitcoin_rs_consensus::ConsensusError::CoinbaseScriptSigSize { len: 1 }
             )
         ));
+    }
+
+    #[test]
+    fn build_utxo_changes_excludes_op_return_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        let mut coinbase = coinbase_transaction(0x6f);
+        coinbase.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(b"not a coin"),
+        });
+        let txid = coinbase.compute_txid();
+        let block = block_with_transaction(coinbase);
+        let scratch = ApplyScratch::new(&block, 1, false, false)?;
+        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let utxo = UtxoSet::new();
+
+        utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
+
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint::new(txid, 0)))
+                .is_some()
+        );
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint::new(txid, 1)))
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_utxo_changes_excludes_oversized_scripts() -> Result<(), Box<dyn std::error::Error>> {
+        let mut coinbase = coinbase_transaction(0x70);
+        coinbase.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE]),
+        });
+        coinbase.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1]),
+        });
+        let txid = coinbase.compute_txid();
+        let block = block_with_transaction(coinbase);
+        let scratch = ApplyScratch::new(&block, 1, false, false)?;
+        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let utxo = UtxoSet::new();
+
+        utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
+
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint::new(txid, 0)))
+                .is_some()
+        );
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint::new(txid, 1)))
+                .is_some()
+        );
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint::new(txid, 2)))
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]

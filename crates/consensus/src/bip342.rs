@@ -1,8 +1,6 @@
 use bitcoin::Script;
 
-use crate::ConsensusError;
-
-const MAX_SCRIPT_SIZE: usize = 10_000;
+use crate::{ConsensusError, MAX_SCRIPT_SIZE};
 
 /// Checks BIP342 tapscript size and non-empty script invariants.
 pub fn check_bip342(tapscript: &Script) -> Result<(), ConsensusError> {

@@ -41,7 +41,7 @@ const COINSTATS_FILE: &str = "coinstats-v1.dat";
 const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
 const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
 const HEADER_CODEC: &str = "bitcoin-rs-canonical-headers";
-const UTXO_CODEC: &str = "bitcoin-rs-utxo";
+const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
 const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats";
 const CURRENT_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
@@ -2040,6 +2040,32 @@ mod tests {
             CheckpointWrite::SkippedNoAppliedTip
         );
         assert_eq!(fs::read(current_path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_utxo_semantics_keep_headers_only() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &UtxoSet::new(),
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        mutate_authenticated_manifest(dir.path(), |manifest| {
+            manifest.utxo.codec = "bitcoin-rs-utxo".to_owned();
+        })?;
+
+        let CheckpointLoad::HeadersOnly { reason, .. } = load_checkpoint(dir.path(), config())?
+        else {
+            return Err("legacy UTXO semantics did not keep headers only".into());
+        };
+        assert!(reason.contains("unexpected payload codecs"));
         Ok(())
     }
 
