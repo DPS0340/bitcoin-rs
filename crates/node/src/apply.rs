@@ -13,7 +13,7 @@ use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
 use bitcoin_rs_rpc::BlockRecord;
 use bitcoin_rs_utxo::{
-    LiveOutput, LiveOutputMeta, UtxoSet,
+    LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
 use hashbrown::{HashMap, HashSet};
@@ -879,12 +879,17 @@ fn resolve_block_prevouts(
 ) -> core::result::Result<Vec<Vec<Option<bitcoin::TxOut>>>, ApplyError> {
     let txids = tx_plan.txids();
     if tx_plan.needs_local_utxo_overlay {
-        let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
+        let mut view = BlockLocalUtxoView::new(
+            Arc::clone(&handles.utxo),
+            &block.txdata,
+            height,
+            tx_plan.overlay_capacity,
+        );
         let mut resolved = Vec::with_capacity(block.txdata.len());
-        for (tx, txid) in block.txdata.iter().zip(txids) {
+        for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
             if tx.is_coinbase() {
                 resolved.push(Vec::new());
-                view.add_outputs(tx, *txid, height)?;
+                view.add_outputs(tx_index, *txid, tx.output.len())?;
                 continue;
             }
             let inputs = tx
@@ -894,7 +899,7 @@ fn resolve_block_prevouts(
                 .collect();
             resolved.push(inputs);
             view.spend_inputs(tx);
-            view.add_outputs(tx, *txid, height)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
         }
         Ok(resolved)
     } else {
@@ -914,7 +919,6 @@ fn resolve_block_prevouts(
             .collect())
     }
 }
-
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -950,11 +954,16 @@ fn verify_block_transactions(
         return Ok(());
     }
     if skip_scripts {
-        let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
-        for (tx, txid) in block.txdata.iter().zip(txids) {
+        let mut view = BlockLocalUtxoView::new(
+            Arc::clone(&handles.utxo),
+            &block.txdata,
+            height,
+            tx_plan.overlay_capacity,
+        );
+        for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
             if tx.is_coinbase() {
                 bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                view.add_outputs(tx, *txid, height)?;
+                view.add_outputs(tx_index, *txid, tx.output.len())?;
                 continue;
             }
             bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
@@ -964,7 +973,7 @@ fn verify_block_transactions(
                 locktime_cutoff,
             )?;
             view.spend_inputs(tx);
-            view.add_outputs(tx, *txid, height)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
         }
         return Ok(());
     }
@@ -1002,73 +1011,37 @@ fn verify_block_transactions(
     Ok(())
 }
 
-struct BlockLocalUtxoView {
+struct BlockLocalUtxoView<'b> {
     base: Arc<UtxoSet>,
-    overlay: HashMap<bitcoin::OutPoint, Option<LiveOutput>>,
+    txdata: &'b [bitcoin::Transaction],
+    height: u32,
+    overlay: HashMap<bitcoin::OutPoint, Option<u32>>,
 }
 
-impl BlockLocalUtxoView {
-    fn new(set: Arc<UtxoSet>, overlay_capacity: usize) -> Self {
-        Self {
-            base: set,
-            overlay: HashMap::with_capacity(overlay_capacity),
-        }
-    }
-
-    fn spend_inputs(&mut self, tx: &bitcoin::Transaction) {
-        for input in &tx.input {
-            self.overlay.insert(input.previous_output, None);
-        }
-    }
-
-    fn add_outputs(
-        &mut self,
-        tx: &bitcoin::Transaction,
-        txid: bitcoin::Txid,
+impl<'b> BlockLocalUtxoView<'b> {
+    fn new(
+        set: Arc<UtxoSet>,
+        txdata: &'b [bitcoin::Transaction],
         height: u32,
-    ) -> core::result::Result<(), ApplyError> {
-        for (vout, txout) in tx.output.iter().enumerate() {
-            let vout = u32::try_from(vout).map_err(|_| ApplyError::HeightOverflow(height))?;
-            self.overlay.insert(
-                bitcoin::OutPoint::new(txid, vout),
-                Some(LiveOutput {
-                    txout: txout.clone(),
-                    coinbase: tx.is_coinbase(),
-                    height,
-                }),
-            );
-        }
-        Ok(())
-    }
-}
-
-impl UtxoView for BlockLocalUtxoView {
-    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
-        if let Some(entry) = self.overlay.get(outpoint) {
-            return entry.as_ref().map(|entry| entry.txout.clone());
-        }
-        self.base
-            .get_entry(&internal_outpoint(outpoint))
-            .map(|entry| entry.txout)
-    }
-}
-
-struct BlockLocalUtxoMetaView {
-    base: Arc<UtxoSet>,
-    overlay: HashMap<bitcoin::OutPoint, Option<LiveOutputMeta>>,
-}
-
-impl BlockLocalUtxoMetaView {
-    fn new(set: Arc<UtxoSet>, overlay_capacity: usize) -> Self {
+        overlay_capacity: usize,
+    ) -> Self {
         Self {
             base: set,
+            txdata,
+            height,
             overlay: HashMap::with_capacity(overlay_capacity),
         }
     }
 
     fn lookup_meta(&self, outpoint: &bitcoin::OutPoint) -> Option<LiveOutputMeta> {
         if let Some(entry) = self.overlay.get(outpoint) {
-            return *entry;
+            let tx_index = usize::try_from((*entry)?).ok()?;
+            let vout = usize::try_from(outpoint.vout).ok()?;
+            self.txdata.get(tx_index)?.output.get(vout)?;
+            return Some(LiveOutputMeta {
+                coinbase: tx_index == 0,
+                height: self.height,
+            });
         }
         self.base.get_meta(&internal_outpoint(outpoint))
     }
@@ -1079,21 +1052,31 @@ impl BlockLocalUtxoMetaView {
         }
     }
 
-    fn add_output_meta(
+    fn add_outputs(
         &mut self,
-        tx: &bitcoin::Transaction,
+        tx_index: u32,
         txid: bitcoin::Txid,
-        height: u32,
+        output_count: usize,
     ) -> core::result::Result<(), ApplyError> {
-        let coinbase = tx.is_coinbase();
-        for (vout, _txout) in tx.output.iter().enumerate() {
-            let vout = u32::try_from(vout).map_err(|_| ApplyError::HeightOverflow(height))?;
-            self.overlay.insert(
-                bitcoin::OutPoint::new(txid, vout),
-                Some(LiveOutputMeta { coinbase, height }),
-            );
+        for vout in 0..output_count {
+            let vout = u32::try_from(vout).map_err(|_| ApplyError::HeightOverflow(self.height))?;
+            self.overlay
+                .insert(bitcoin::OutPoint::new(txid, vout), Some(tx_index));
         }
         Ok(())
+    }
+}
+
+impl UtxoView for BlockLocalUtxoView<'_> {
+    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+        if let Some(entry) = self.overlay.get(outpoint) {
+            let tx_index = usize::try_from((*entry)?).ok()?;
+            let vout = usize::try_from(outpoint.vout).ok()?;
+            return self.txdata.get(tx_index)?.output.get(vout).cloned();
+        }
+        self.base
+            .get_entry(&internal_outpoint(outpoint))
+            .map(|entry| entry.txout)
     }
 }
 
@@ -1120,10 +1103,10 @@ fn check_coinbase_maturity_with_tx_plan(
     // COINBASE_MATURITY: spent coinbase outputs must be at least 100 blocks deep.
     if !tx_plan.needs_local_utxo_overlay {
         for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
-            for tx_input in &tx.input {
+            for input in &tx.input {
                 let Some(entry) = handles
                     .utxo
-                    .get_meta(&internal_outpoint(&tx_input.previous_output))
+                    .get_meta(&internal_outpoint(&input.previous_output))
                 else {
                     continue;
                 };
@@ -1133,18 +1116,25 @@ fn check_coinbase_maturity_with_tx_plan(
         return Ok(());
     }
 
-    let mut view = BlockLocalUtxoMetaView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
-    for (tx, txid) in block.txdata.iter().zip(txids) {
+    let mut view = BlockLocalUtxoView::new(
+        Arc::clone(&handles.utxo),
+        &block.txdata,
+        height,
+        tx_plan.overlay_capacity,
+    );
+    for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
         if tx.is_coinbase() {
-            view.add_output_meta(tx, *txid, height)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
             continue;
         }
-        for tx_input in &tx.input {
-            let Some(entry) = view.lookup_meta(&tx_input.previous_output) else {
+        for input in &tx.input {
+            let Some(entry) = view.lookup_meta(&input.previous_output) else {
                 continue;
             };
             check_coinbase_input_maturity(entry, height)?;
         }
+        view.spend_inputs(tx);
+        view.add_outputs(tx_index, *txid, tx.output.len())?;
     }
     Ok(())
 }
@@ -1186,15 +1176,21 @@ fn check_bip68_sequence_locks(
 
     let txids = tx_plan.txids();
     debug_assert_eq!(block.txdata.len(), txids.len());
-    let mut view = BlockLocalUtxoMetaView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
+    let mut view = BlockLocalUtxoView::new(
+        Arc::clone(&handles.utxo),
+        &block.txdata,
+        height,
+        tx_plan.overlay_capacity,
+    );
     let mut prevout_mtp_by_height = None;
-    for (tx, txid) in block.txdata.iter().zip(txids) {
+    for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
         if tx.is_coinbase() {
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
             continue;
         }
         if tx.version.0 < 2 {
             view.spend_inputs(tx);
-            view.add_output_meta(tx, *txid, height)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
             continue;
         }
         for tx_input in &tx.input {
@@ -1258,7 +1254,7 @@ fn check_bip68_sequence_locks(
             }
         }
         view.spend_inputs(tx);
-        view.add_output_meta(tx, *txid, height)?;
+        view.add_outputs(tx_index, *txid, tx.output.len())?;
     }
 
     Ok(())
@@ -1711,6 +1707,165 @@ mod consensus_rule_tests {
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn block_local_utxo_view_resolves_earlier_same_block_output() -> Result<(), ApplyError> {
+        let created = coinbase_transaction(0x41);
+        let outpoint = bitcoin::OutPoint {
+            txid: created.compute_txid(),
+            vout: 0,
+        };
+        let spending = spending_transaction_to_script(
+            outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let block = block_with_transactions(vec![created, spending]);
+        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+
+        view.add_outputs(
+            0,
+            block.txdata[0].compute_txid(),
+            block.txdata[0].output.len(),
+        )?;
+        let resolved = view.lookup(&outpoint);
+
+        let output = resolved.ok_or(ApplyError::HeightOverflow(42))?;
+        assert_eq!(output.value, block.txdata[0].output[0].value);
+        assert_eq!(
+            output.script_pubkey,
+            block.txdata[0].output[0].script_pubkey
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_local_utxo_view_hides_same_block_double_spend() -> Result<(), ApplyError> {
+        let created = coinbase_transaction(0x42);
+        let outpoint = bitcoin::OutPoint {
+            txid: created.compute_txid(),
+            vout: 0,
+        };
+        let first_spend = spending_transaction_to_script(
+            outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let second_spend = spending_transaction_to_script(
+            outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let block = block_with_transactions(vec![created, first_spend, second_spend]);
+        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 3);
+
+        view.add_outputs(
+            0,
+            block.txdata[0].compute_txid(),
+            block.txdata[0].output.len(),
+        )?;
+        assert!(view.lookup(&outpoint).is_some());
+        view.spend_inputs(&block.txdata[1]);
+
+        assert_eq!(view.lookup(&outpoint), None);
+        Ok(())
+    }
+
+    #[test]
+    fn block_local_utxo_view_create_after_spend_uses_last_write() -> Result<(), ApplyError> {
+        let created = coinbase_transaction(0x43);
+        let outpoint = bitcoin::OutPoint {
+            txid: created.compute_txid(),
+            vout: 0,
+        };
+        let spending = spending_transaction_to_script(
+            outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let block = block_with_transactions(vec![spending, created]);
+        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+
+        view.spend_inputs(&block.txdata[0]);
+        view.add_outputs(
+            1,
+            block.txdata[1].compute_txid(),
+            block.txdata[1].output.len(),
+        )?;
+
+        assert_eq!(
+            view.lookup(&outpoint),
+            Some(block.txdata[1].output[0].clone())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_local_utxo_view_hides_later_same_block_output() -> Result<(), ApplyError> {
+        let earlier = coinbase_transaction(0x44);
+        let later = coinbase_transaction(0x45);
+        let later_outpoint = bitcoin::OutPoint {
+            txid: later.compute_txid(),
+            vout: 0,
+        };
+        let block = block_with_transactions(vec![earlier, later]);
+        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+
+        view.add_outputs(
+            0,
+            block.txdata[0].compute_txid(),
+            block.txdata[0].output.len(),
+        )?;
+
+        assert_eq!(view.lookup(&later_outpoint), None);
+        Ok(())
+    }
+
+    #[test]
+    fn block_local_utxo_view_metadata_tracks_coinbase_and_height() -> Result<(), ApplyError> {
+        let coinbase = coinbase_transaction(0x46);
+        let transaction = spending_transaction_to_script(
+            bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x47; 32]),
+                vout: 0,
+            },
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let coinbase_outpoint = bitcoin::OutPoint {
+            txid: coinbase.compute_txid(),
+            vout: 0,
+        };
+        let transaction_outpoint = bitcoin::OutPoint {
+            txid: transaction.compute_txid(),
+            vout: 0,
+        };
+        let block = block_with_transactions(vec![coinbase, transaction]);
+        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+
+        view.add_outputs(
+            0,
+            block.txdata[0].compute_txid(),
+            block.txdata[0].output.len(),
+        )?;
+        view.add_outputs(
+            1,
+            block.txdata[1].compute_txid(),
+            block.txdata[1].output.len(),
+        )?;
+
+        let coinbase_meta = view
+            .lookup_meta(&coinbase_outpoint)
+            .ok_or(ApplyError::HeightOverflow(42))?;
+        let transaction_meta = view
+            .lookup_meta(&transaction_outpoint)
+            .ok_or(ApplyError::HeightOverflow(42))?;
+        assert!(coinbase_meta.coinbase);
+        assert!(!transaction_meta.coinbase);
+        assert_eq!(coinbase_meta.height, 42);
+        assert_eq!(transaction_meta.height, 42);
         Ok(())
     }
 
