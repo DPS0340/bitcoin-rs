@@ -18,9 +18,8 @@ use bitcoin::BlockHash;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
-use bitcoin_rs_p2p::InboundBlock;
-use bitcoin_rs_p2p::{Message, PeerInfo};
+use bitcoin_rs_chain::{BlockTree, ChainError, NodeId, TipSnapshot};
+use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
 use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
@@ -140,7 +139,7 @@ pub struct BlockSync {
     handles: crate::apply::ApplyHandles,
     peers: Arc<RwLock<Vec<PeerInfo>>>,
     peer_outbound: Arc<RwLock<HashMap<SocketAddr, Sender<Message>>>>,
-    inbound_headers_rx: Arc<Mutex<Receiver<Vec<bitcoin::block::Header>>>>,
+    inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     download_window: Arc<Mutex<DownloadWindow>>,
     block_stager: Arc<Mutex<BlockStager>>,
@@ -250,6 +249,23 @@ struct GetdataRequestOutcome {
     has_request_capacity: bool,
 }
 
+fn is_peer_fault(error: &ChainError) -> bool {
+    match error {
+        ChainError::NbitsMismatch { .. }
+        | ChainError::InvalidPow { .. }
+        | ChainError::TargetExceedsLimit { .. }
+        | ChainError::ZeroTarget { .. }
+        | ChainError::NonContinuousHeader { .. }
+        | ChainError::ChainworkOverflow { .. }
+        | ChainError::HeightOverflow { .. } => true,
+        ChainError::DuplicateHeader { .. }
+        | ChainError::MissingParent { .. }
+        | ChainError::NodeIdOverflow { .. }
+        | ChainError::UnknownNode { .. }
+        | ChainError::NoCommonAncestor { .. } => false,
+    }
+}
+
 impl BlockSync {
     /// Constructs a new orchestrator over the supplied shared handles.
     #[must_use]
@@ -257,7 +273,7 @@ impl BlockSync {
         handles: crate::apply::ApplyHandles,
         peers: Arc<RwLock<Vec<PeerInfo>>>,
         peer_outbound: Arc<RwLock<HashMap<SocketAddr, Sender<Message>>>>,
-        inbound_headers_rx: Arc<Mutex<Receiver<Vec<bitcoin::block::Header>>>>,
+        inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
         inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     ) -> Self {
         Self {
@@ -333,17 +349,63 @@ impl BlockSync {
     fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
-        while let Ok(batch) = receiver.try_recv() {
-            let batch_len = batch.len();
+        while let Ok(InboundHeaders {
+            headers,
+            source_peer,
+        }) = receiver.try_recv()
+        {
+            let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
-            let mut tree = self.handles.block_tree.write();
-            match bitcoin_rs_chain::accept_headers(&mut tree, &batch, self.handles.network) {
+            let acceptance = {
+                let mut tree = self.handles.block_tree.write();
+                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network)
+            };
+            match acceptance {
                 Ok(node_ids) => {
+                    if let Some(peer_addr) = source_peer {
+                        let mut pending = self.pending_getheaders.lock();
+                        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+                            *pending = None;
+                        }
+                    }
                     tracing::debug!(
                         accepted = node_ids.len(),
                         received = batch_len,
                         "block sync: accepted inbound headers batch",
                     );
+                }
+                Err(error) if is_peer_fault(&error) => {
+                    if let Some(peer_addr) = source_peer {
+                        let removed_outbound =
+                            self.peer_outbound.write().remove(&peer_addr).is_some();
+                        let removed_peer = {
+                            let mut peers = self.peers.write();
+                            let present = peers.iter().any(|peer| peer.addr == peer_addr);
+                            peers.retain(|peer| peer.addr != peer_addr);
+                            present
+                        };
+                        if removed_outbound || removed_peer {
+                            self.download_window
+                                .lock()
+                                .mark_peer_unresponsive(peer_addr, Instant::now());
+                            let mut pending = self.pending_getheaders.lock();
+                            if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+                                *pending = None;
+                            }
+                            tracing::warn!(
+                                peer_addr = %peer_addr,
+                                received = batch_len,
+                                %error,
+                                "block sync: peer served invalid headers; disconnecting",
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            received = batch_len,
+                            %error,
+                            "block sync: rejected locally injected headers batch",
+                        );
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -1349,7 +1411,7 @@ mod tests {
     };
     use parking_lot::{Mutex, RwLock};
 
-    use super::{BlockHash, BlockSync, Inventory, Message, NetworkMessage};
+    use super::{BlockHash, BlockSync, InboundHeaders, Inventory, Message, NetworkMessage};
     use crate::{Network, apply::ApplyHandles};
 
     #[test]
@@ -1375,7 +1437,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -1532,7 +1594,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -1568,7 +1630,10 @@ mod tests {
         }
 
         let header = test_header(genesis.block_hash(), 1);
-        inbound_headers_tx.send(vec![header])?;
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![header],
+            source_peer: Some(addr),
+        })?;
         sync.tick();
         let second = rx.try_recv()?;
         if !matches!(second, NetworkMessage::GetHeaders(_)) {
@@ -1593,7 +1658,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -1633,7 +1698,10 @@ mod tests {
         // duplicate getheaders is sent before the request times out.
         let orphan_prev = BlockHash::from_byte_array([0x11; 32]);
         let orphan = test_header(orphan_prev, 5);
-        inbound_headers_tx.send(vec![orphan])?;
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![orphan],
+            source_peer: Some(addr),
+        })?;
         sync.tick();
         assert!(
             rx.try_recv().is_err(),
@@ -1643,6 +1711,124 @@ mod tests {
             .load_full()
             .ok_or_else(|| std::io::Error::other("missing header tip"))?;
         assert_eq!(tip.tip_id, genesis_id, "orphan header must not advance tip");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_nbits_headers_disconnect_source_and_rotate_getheaders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            genesis,
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+        } = header_sync_with_genesis()?;
+        let invalid_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        let other_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+        peers.write().extend([
+            synthetic_peer(invalid_peer, 9),
+            synthetic_peer(other_peer, 8),
+        ]);
+        let (invalid_tx, invalid_rx) = unbounded::<Message>();
+        let (other_tx, other_rx) = unbounded::<Message>();
+        peer_outbound
+            .write()
+            .extend([(invalid_peer, invalid_tx), (other_peer, other_tx)]);
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            source_peer: Some(invalid_peer),
+        })?;
+
+        sync.tick();
+
+        assert!(
+            !peers.read().iter().any(|peer| peer.addr == invalid_peer),
+            "invalid header source must be removed from peer selection"
+        );
+        assert!(
+            !peer_outbound.read().contains_key(&invalid_peer),
+            "invalid header source must lose its outbound lease"
+        );
+        assert!(
+            peers.read().iter().any(|peer| peer.addr == other_peer),
+            "healthy peer must remain eligible for rotation"
+        );
+        assert!(
+            peer_outbound.read().contains_key(&other_peer),
+            "healthy peer must retain its outbound lease"
+        );
+        assert!(
+            invalid_rx.try_recv().is_err(),
+            "the invalid peer must not receive another getheaders"
+        );
+        assert!(
+            matches!(other_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            "the next getheaders must rotate to the remaining peer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_headers_keep_source_peer_connected() -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+            ..
+        } = header_sync_with_genesis()?;
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        peers.write().push(synthetic_peer(peer_addr, 8));
+        let (tx, _rx) = unbounded::<Message>();
+        peer_outbound.write().insert(peer_addr, tx);
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![test_header(BlockHash::from_byte_array([0x11; 32]), 1)],
+            source_peer: Some(peer_addr),
+        })?;
+
+        sync.tick();
+
+        assert!(
+            peers.read().iter().any(|peer| peer.addr == peer_addr),
+            "orphan announcements are not evidence of a bad peer"
+        );
+        assert!(
+            peer_outbound.read().contains_key(&peer_addr),
+            "orphan announcements must not revoke the peer lease"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unattributed_invalid_headers_do_not_disconnect_any_peer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            genesis,
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+        } = header_sync_with_genesis()?;
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        peers.write().push(synthetic_peer(peer_addr, 8));
+        let (tx, _rx) = unbounded::<Message>();
+        peer_outbound.write().insert(peer_addr, tx);
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            source_peer: None,
+        })?;
+
+        sync.tick();
+
+        assert!(
+            peers.read().iter().any(|peer| peer.addr == peer_addr),
+            "local injection must not identify an arbitrary peer as faulty"
+        );
+        assert!(
+            peer_outbound.read().contains_key(&peer_addr),
+            "local injection must preserve peer outbound leases"
+        );
         Ok(())
     }
 
@@ -1948,7 +2134,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -2014,7 +2200,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -2194,7 +2380,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4365,7 +4551,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4454,7 +4640,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4542,7 +4728,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4731,7 +4917,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4904,7 +5090,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -4975,7 +5161,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -5117,7 +5303,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -5266,7 +5452,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -5453,7 +5639,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -5515,7 +5701,7 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<BlockHeader>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -5978,6 +6164,64 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: height,
         }
+    }
+
+    fn nbits_mismatch_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
+        let mut header = test_header(prev_blockhash, height);
+        header.bits = CompactTarget::from_consensus(0x207f_fffe);
+        for nonce in 0..=u32::MAX {
+            header.nonce = nonce;
+            if header.target().is_met_by(header.block_hash()) {
+                return header;
+            }
+        }
+        panic!("exhausted the header nonce space while mining a regtest fixture");
+    }
+
+    struct HeaderSyncFixture {
+        genesis: BlockHeader,
+        sync: BlockSync,
+        inbound_headers_tx: crossbeam_channel::Sender<InboundHeaders>,
+        peers: Arc<RwLock<Vec<PeerInfo>>>,
+        peer_outbound: Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+    }
+
+    fn header_sync_with_genesis() -> Result<HeaderSyncFixture, Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = genesis_header();
+        tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let chain_tip = tree.tip_handle();
+        let block_tree = Arc::new(RwLock::new(tree));
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let peers = Arc::new(RwLock::new(Vec::new()));
+        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
+        let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<InboundHeaders>();
+        let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
+        let (_inbound_blocks_tx, inbound_blocks_rx_raw) =
+            unbounded::<bitcoin_rs_p2p::InboundBlock>();
+        let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
+        let handles = apply_handles(chain_tip, applied_tip, block_tree);
+        let sync = BlockSync::new(
+            handles,
+            Arc::clone(&peers),
+            Arc::clone(&peer_outbound),
+            inbound_headers_rx,
+            inbound_blocks_rx,
+        );
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_pending_blocks: 0,
+                ..super::default_sync_budget()
+            },
+        );
+        Ok(HeaderSyncFixture {
+            genesis,
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+        })
     }
 
     fn genesis_header() -> BlockHeader {

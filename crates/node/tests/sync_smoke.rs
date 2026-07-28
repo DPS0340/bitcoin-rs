@@ -37,7 +37,8 @@ fn tick_sends_getheaders_to_best_peer_above_our_height() -> Result<(), Box<dyn s
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (_inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -89,7 +90,8 @@ fn tick_uses_applied_tip_height_when_selecting_sync_peer() {
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
     let block_tree = Arc::new(RwLock::new(BlockTree::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (_inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (_inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -127,7 +129,8 @@ fn tick_applies_inbound_blocks_before_sync_selection() -> Result<(), Box<dyn std
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (_inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -168,7 +171,8 @@ fn event_loop_sync_wake_applies_inbound_block_without_periodic_tick()
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (_inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -298,7 +302,8 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -316,7 +321,10 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
         inbound_blocks_rx,
     );
 
-    inbound_headers_tx.send(vec![genesis.header, block_one.header, block_two.header])?;
+    inbound_headers_tx.send(bitcoin_rs_p2p::InboundHeaders {
+        headers: vec![genesis.header, block_one.header, block_two.header],
+        source_peer: None,
+    })?;
     inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
         block_two.clone(),
     ))?;
@@ -352,7 +360,8 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
     let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
     let peers = Arc::new(RwLock::new(Vec::new()));
     let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-    let (inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<bitcoin::block::Header>>();
+    let (inbound_headers_tx, inbound_headers_rx_raw) =
+        unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
     let (inbound_blocks_tx, inbound_blocks_rx_raw) = unbounded::<bitcoin_rs_p2p::InboundBlock>();
     let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
@@ -370,7 +379,10 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
         inbound_blocks_rx,
     );
 
-    inbound_headers_tx.send(fixture.blocks.iter().map(|block| block.header).collect())?;
+    inbound_headers_tx.send(bitcoin_rs_p2p::InboundHeaders {
+        headers: fixture.blocks.iter().map(|block| block.header).collect(),
+        source_peer: None,
+    })?;
     for block in fixture.blocks.iter().skip(1) {
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))?;
     }

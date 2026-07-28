@@ -129,7 +129,7 @@ fn spawn_p2p_listeners(
     peers: &PeerRegistry,
     peer_outbound: &PeerOutboundMap,
     banned: BannedSubnets,
-    inbound_headers_tx: crossbeam_channel::Sender<Vec<bitcoin::block::Header>>,
+    inbound_headers_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundHeaders>,
     inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,

@@ -20,14 +20,17 @@ type SyncWakeHandle = Option<Sender<()>>;
 
 #[derive(Clone)]
 struct InboundSyncSinks {
-    headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    headers_tx: Sender<crate::InboundHeaders>,
     blocks_tx: Sender<crate::InboundBlock>,
     wake_tx: SyncWakeHandle,
 }
 
 impl InboundSyncSinks {
     fn send_headers(&self, peer_addr: SocketAddr, headers: Vec<bitcoin::block::Header>) {
-        if let Err(error) = self.headers_tx.send(headers) {
+        if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
+            headers,
+            source_peer: Some(peer_addr),
+        }) {
             tracing::warn!(
                 peer_addr = %peer_addr,
                 %error,
@@ -96,7 +99,7 @@ pub fn serve_with_shutdown(
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> Result<(), ListenerError> {
@@ -122,7 +125,7 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
@@ -176,7 +179,7 @@ pub fn spawn_outbound_connection(
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
@@ -200,7 +203,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,

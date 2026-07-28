@@ -485,7 +485,8 @@ impl SyncFixture {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<Header>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) =
+            unbounded::<bitcoin_rs_p2p::InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();

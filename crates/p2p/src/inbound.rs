@@ -14,6 +14,14 @@ pub struct InboundBlock {
     pub source_peer: Option<SocketAddr>,
 }
 
+/// A `headers` message batch and the peer that delivered it.
+pub struct InboundHeaders {
+    /// Decoded headers, in wire order.
+    pub headers: Vec<bitcoin::block::Header>,
+    /// Network peer that delivered the batch, or `None` for local injection.
+    pub source_peer: Option<SocketAddr>,
+}
+
 impl InboundBlock {
     /// Wraps a decoded block with freshly computed canonical serialization.
     ///

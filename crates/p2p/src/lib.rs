@@ -29,7 +29,7 @@ pub mod wire;
 pub mod wtxid;
 
 pub use dispatch::{ChainQuery, InventoryResponse};
-pub use inbound::InboundBlock;
+pub use inbound::{InboundBlock, InboundHeaders};
 pub use listener::spawn_outbound_connection;
 pub use peer::{DnsResolver, Peer, PeerManager, PeerState, SystemDnsResolver};
 pub use peer_info::PeerInfo;

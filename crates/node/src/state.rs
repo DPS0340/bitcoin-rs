@@ -8,7 +8,7 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hex::FromHex as _;
-use bitcoin::{Transaction, Txid, block::Header};
+use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_rpc::{
     BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService, PruneServiceError,
@@ -715,8 +715,8 @@ pub struct NodeState {
     banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
     p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
-    inbound_headers_tx: Sender<Vec<Header>>,
-    inbound_headers_rx: Arc<Mutex<Receiver<Vec<Header>>>>,
+    inbound_headers_tx: Sender<bitcoin_rs_p2p::InboundHeaders>,
+    inbound_headers_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>>,
     inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     apply_handles: crate::apply::ApplyHandles,
@@ -821,7 +821,7 @@ impl NodeState {
         let p2p_outbound_rx = Arc::new(Mutex::new(p2p_outbound_rx_raw));
         let mining_template_id = Arc::new(ArcSwap::from_pointee(CompactString::new("0")));
         let (inbound_headers_tx, inbound_headers_rx_raw) =
-            crossbeam_channel::unbounded::<Vec<Header>>();
+            crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
@@ -1080,7 +1080,7 @@ impl NodeState {
     /// `Headers` batches into. The matching `Receiver` is consumed by
     /// `BlockSync::tick` to extend the `BlockTree`.
     #[must_use]
-    pub fn inbound_headers_sender(&self) -> Sender<Vec<Header>> {
+    pub fn inbound_headers_sender(&self) -> Sender<bitcoin_rs_p2p::InboundHeaders> {
         self.inbound_headers_tx.clone()
     }
 
@@ -1089,7 +1089,9 @@ impl NodeState {
     /// Exposed so tests and `BlockSync::new` can wire the channel; production
     /// code calls `state.sync()` and lets the orchestrator own the drain.
     #[must_use]
-    pub fn inbound_headers_rx_handle(&self) -> Arc<Mutex<Receiver<Vec<Header>>>> {
+    pub fn inbound_headers_rx_handle(
+        &self,
+    ) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>> {
         Arc::clone(&self.inbound_headers_rx)
     }
 
@@ -1445,10 +1447,16 @@ mod tests {
         let state = NodeState::open(config)?;
         let tx1 = state.inbound_headers_sender();
         let tx2 = state.inbound_headers_sender();
-        tx1.send(Vec::new())
-            .map_err(|err| anyhow::anyhow!("send via tx1 failed: {err}"))?;
-        tx2.send(Vec::new())
-            .map_err(|err| anyhow::anyhow!("send via tx2 failed: {err}"))?;
+        tx1.send(bitcoin_rs_p2p::InboundHeaders {
+            headers: Vec::new(),
+            source_peer: None,
+        })
+        .map_err(|err| anyhow::anyhow!("send via tx1 failed: {err}"))?;
+        tx2.send(bitcoin_rs_p2p::InboundHeaders {
+            headers: Vec::new(),
+            source_peer: None,
+        })
+        .map_err(|err| anyhow::anyhow!("send via tx2 failed: {err}"))?;
         Ok(())
     }
 
