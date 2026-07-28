@@ -61,9 +61,10 @@ pub use verify_block::{
     verify_block_rules_contextual,
 };
 pub use verify_tx::{
-    is_final_tx, verify_block_input_scripts, verify_coinbase_script_sig_size, verify_transaction,
-    verify_transaction_borrowed, verify_transaction_borrowed_non_script_with_mtp,
-    verify_transaction_borrowed_with_mtp, verify_transaction_with_mtp,
+    ScriptStageTimings, is_final_tx, verify_block_input_scripts, verify_coinbase_script_sig_size,
+    verify_transaction, verify_transaction_borrowed,
+    verify_transaction_borrowed_non_script_with_mtp, verify_transaction_borrowed_with_mtp,
+    verify_transaction_with_mtp,
 };
 
 use thiserror::Error;

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 #[cfg(feature = "bitcoinconsensus")]
 use bitcoin::{Script, consensus::encode};
@@ -360,6 +361,23 @@ struct InputCheck {
     input_index: usize,
 }
 
+/// Sub-stage durations of [`verify_block_input_scripts`], reported to the caller.
+///
+/// The node layer uses these to attribute the script stage to its serial
+/// preparation and parallel execution without adding a `metrics` dependency to
+/// this crate. Both fields are written before the verdict is returned, so the
+/// caller records them on the success and error paths.
+#[derive(Clone, Copy, Default)]
+pub struct ScriptStageTimings {
+    /// Serial per-transaction preparation (`prepare_block_input_checks`), in
+    /// seconds.
+    pub prepare_seconds: f64,
+    /// Input-check fan-out (rayon pool install plus join, or the serial
+    /// fallback for small blocks), excluding the ordered error scan, in
+    /// seconds.
+    pub parallel_seconds: f64,
+}
+
 /// Verifies every input script across a block in one flat, block-ordered pass.
 ///
 /// `resolved[i]` holds transaction `i`'s prevouts in input order (empty for the
@@ -369,12 +387,18 @@ struct InputCheck {
 /// concurrently, yet the first failure is returned in block order (tx ascending,
 /// phase `pre < script < post`, input ascending) — byte-identical to applying
 /// the single-tx path tx by tx in block order.
+///
+/// `timings` receives the durations of the serial preparation and the parallel
+/// input-check fan-out (in seconds). Both are written before the verdict is
+/// returned, so the caller records them on the success and error paths. This
+/// crate has no `metrics` dependency, so the caller owns the histogram recording.
 pub fn verify_block_input_scripts(
     txs: &[bitcoin::Transaction],
     mut resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
+    timings: &mut ScriptStageTimings,
 ) -> Result<(), ConsensusError> {
     if txs.len() != resolved.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
@@ -383,8 +407,12 @@ pub fn verify_block_input_scripts(
         });
     }
 
+    let prepare_started = Instant::now();
     let (prepared, checks) =
         prepare_block_input_checks(txs, resolved.as_mut_slice(), height, locktime_cutoff);
+    timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
+
+    let parallel_started = Instant::now();
     let results: Vec<Result<(), ConsensusError>> = if checks.len() < MIN_PARALLEL_SCRIPT_CHECKS {
         checks
             .iter()
@@ -398,6 +426,7 @@ pub fn verify_block_input_scripts(
                 .collect()
         })
     };
+    timings.parallel_seconds = parallel_started.elapsed().as_secs_f64();
 
     for prep in &prepared {
         if let Some(error) = &prep.pre_error {
@@ -631,8 +660,8 @@ mod tests {
     use bitcoin_rs_script::VerifyFlags;
 
     use super::{
-        is_final_tx_with_locktime_cutoff, verify_coinbase_script_sig_size, verify_transaction,
-        verify_transaction_borrowed, verify_transaction_borrowed_with_mtp,
+        ScriptStageTimings, is_final_tx_with_locktime_cutoff, verify_coinbase_script_sig_size,
+        verify_transaction, verify_transaction_borrowed, verify_transaction_borrowed_with_mtp,
         verify_transaction_with_mtp,
     };
     use crate::{ConsensusError, rust_path::UtxoView};
@@ -1257,7 +1286,14 @@ mod tests {
     fn block_input_scripts_rejects_mismatched_prevout_matrix() {
         let txs = vec![coinbase_transaction_with_script_sig_len(2).0];
         assert_eq!(
-            super::verify_block_input_scripts(&txs, Vec::new(), 0, 0, VerifyFlags::MANDATORY),
+            super::verify_block_input_scripts(
+                &txs,
+                Vec::new(),
+                0,
+                0,
+                VerifyFlags::MANDATORY,
+                &mut ScriptStageTimings::default()
+            ),
             Err(ConsensusError::PrevoutMatrixSize {
                 expected: 1,
                 actual: 0,
@@ -1277,8 +1313,14 @@ mod tests {
             spend_tx(vec![true_spending_input(outpoint(2))], 50),
         ];
         let resolved = vec![Vec::new(), vec![Some(op_equal_txout(100))], vec![None]];
-        let result =
-            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY);
+        let result = super::verify_block_input_scripts(
+            &txs,
+            resolved,
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut ScriptStageTimings::default(),
+        );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
             "expected tx1 Script error, got {result:?}"
@@ -1295,8 +1337,14 @@ mod tests {
             spend_tx(vec![mismatch_input(outpoint(1))], 100),
         ];
         let resolved = vec![Vec::new(), vec![Some(op_equal_txout(50))]];
-        let result =
-            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY);
+        let result = super::verify_block_input_scripts(
+            &txs,
+            resolved,
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut ScriptStageTimings::default(),
+        );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
             "expected Script error over InputsLessThanOutputs, got {result:?}"
@@ -1324,8 +1372,14 @@ mod tests {
             vec![Some(op1_txout(50))],
             vec![Some(op1_txout(50)), Some(op1_txout(50))],
         ];
-        let result =
-            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY);
+        let result = super::verify_block_input_scripts(
+            &txs,
+            resolved,
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut ScriptStageTimings::default(),
+        );
         assert_eq!(
             result,
             Err(ConsensusError::InputsLessThanOutputs {
@@ -1349,8 +1403,14 @@ mod tests {
             resolved.push(vec![Some(op_equal_txout(100))]);
         }
 
-        let result =
-            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY);
+        let result = super::verify_block_input_scripts(
+            &txs,
+            resolved,
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut ScriptStageTimings::default(),
+        );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
             "expected first Script error, got {result:?}"
@@ -1377,7 +1437,14 @@ mod tests {
             vec![Some(tx1_output)],
         ];
         assert_eq!(
-            super::verify_block_input_scripts(&txs, resolved, 0, 0, VerifyFlags::MANDATORY),
+            super::verify_block_input_scripts(
+                &txs,
+                resolved,
+                0,
+                0,
+                VerifyFlags::MANDATORY,
+                &mut ScriptStageTimings::default()
+            ),
             Ok(())
         );
 
@@ -1398,8 +1465,14 @@ mod tests {
             vec![Some(op_equal_txout(100))],
             vec![Some(bad_tx1_output)],
         ];
-        let bad =
-            super::verify_block_input_scripts(&bad_txs, bad_resolved, 0, 0, VerifyFlags::MANDATORY);
+        let bad = super::verify_block_input_scripts(
+            &bad_txs,
+            bad_resolved,
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut ScriptStageTimings::default(),
+        );
         assert!(
             matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),
             "expected producing tx Script error, got {bad:?}"

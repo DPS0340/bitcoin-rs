@@ -865,6 +865,56 @@ fn compute_basic_filter(
     Some(filter.content)
 }
 
+/// Resolves every transaction's prevouts serially in block order into an owned
+/// `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec). This is the only
+/// order-sensitive step of full script verification: the overlay walk advances
+/// a `BlockLocalUtxoView` so a later transaction sees outputs an earlier one
+/// created (or spent) in the same block; the non-overlay case reads the
+/// committed shared set directly.
+fn resolve_block_prevouts(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    tx_plan: &BlockTxPlan,
+    height: u32,
+) -> core::result::Result<Vec<Vec<Option<bitcoin::TxOut>>>, ApplyError> {
+    let txids = tx_plan.txids();
+    if tx_plan.needs_local_utxo_overlay {
+        let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
+        let mut resolved = Vec::with_capacity(block.txdata.len());
+        for (tx, txid) in block.txdata.iter().zip(txids) {
+            if tx.is_coinbase() {
+                resolved.push(Vec::new());
+                view.add_outputs(tx, *txid, height)?;
+                continue;
+            }
+            let inputs = tx
+                .input
+                .iter()
+                .map(|input| view.lookup(&input.previous_output))
+                .collect();
+            resolved.push(inputs);
+            view.spend_inputs(tx);
+            view.add_outputs(tx, *txid, height)?;
+        }
+        Ok(resolved)
+    } else {
+        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
+        Ok(block
+            .txdata
+            .iter()
+            .map(|tx| {
+                if tx.is_coinbase() {
+                    return Vec::new();
+                }
+                tx.input
+                    .iter()
+                    .map(|input| view.lookup(&input.previous_output))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -925,48 +975,30 @@ fn verify_block_transactions(
     // order-sensitive step: the overlay walk advances a `BlockLocalUtxoView` so a
     // later transaction sees outputs an earlier one created (or spent) in the same
     // block; the non-overlay case reads the committed shared set directly.
-    let resolved: Vec<Vec<Option<bitcoin::TxOut>>> = if tx_plan.needs_local_utxo_overlay {
-        let mut view = BlockLocalUtxoView::new(Arc::clone(&handles.utxo), tx_plan.overlay_capacity);
-        let mut resolved = Vec::with_capacity(block.txdata.len());
-        for (tx, txid) in block.txdata.iter().zip(txids) {
-            if tx.is_coinbase() {
-                resolved.push(Vec::new());
-                view.add_outputs(tx, *txid, height)?;
-                continue;
-            }
-            let inputs = tx
-                .input
-                .iter()
-                .map(|input| view.lookup(&input.previous_output))
-                .collect();
-            resolved.push(inputs);
-            view.spend_inputs(tx);
-            view.add_outputs(tx, *txid, height)?;
-        }
-        resolved
-    } else {
-        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
-        block
-            .txdata
-            .iter()
-            .map(|tx| {
-                if tx.is_coinbase() {
-                    return Vec::new();
-                }
-                tx.input
-                    .iter()
-                    .map(|input| view.lookup(&input.previous_output))
-                    .collect()
-            })
-            .collect()
-    };
-    bitcoin_rs_consensus::verify_block_input_scripts(
+    let resolution_started = quanta::Instant::now();
+    let resolution_result = resolve_block_prevouts(handles, block, tx_plan, height);
+    metrics::histogram!("node.apply_block.script_resolution_seconds")
+        .record(resolution_started.elapsed().as_secs_f64());
+    let resolved = resolution_result?;
+
+    // Consensus has no `metrics` dependency, so it measures its serial
+    // preparation and parallel input-check fan-out internally and reports both
+    // sub-stage durations back; record them here on the success and error paths
+    // before propagating the verdict, mirroring the surrounding `*_result` idiom.
+    let mut script_timings = bitcoin_rs_consensus::ScriptStageTimings::default();
+    let script_input_result = bitcoin_rs_consensus::verify_block_input_scripts(
         &block.txdata,
         resolved,
         height,
         locktime_cutoff,
         flags,
-    )?;
+        &mut script_timings,
+    );
+    metrics::histogram!("node.apply_block.script_prepare_seconds")
+        .record(script_timings.prepare_seconds);
+    metrics::histogram!("node.apply_block.script_parallel_seconds")
+        .record(script_timings.parallel_seconds);
+    script_input_result?;
     Ok(())
 }
 
