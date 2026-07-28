@@ -376,29 +376,21 @@ impl BlockSync {
                 }
                 Err(error) if is_peer_fault(&error) => {
                     if let Some(peer_addr) = source_peer {
-                        let removed_outbound =
-                            self.peer_outbound.write().remove(&peer_addr).is_some();
-                        let removed_peer = {
-                            let mut peers = self.peers.write();
-                            let present = peers.iter().any(|peer| peer.addr == peer_addr);
-                            peers.retain(|peer| peer.addr != peer_addr);
-                            present
-                        };
-                        if removed_outbound || removed_peer {
-                            self.download_window
-                                .lock()
-                                .mark_peer_unresponsive(peer_addr, Instant::now());
-                            let mut pending = self.pending_getheaders.lock();
-                            if pending.is_some_and(|request| request.peer_addr == peer_addr) {
-                                *pending = None;
-                            }
-                            tracing::warn!(
-                                peer_addr = %peer_addr,
-                                received = batch_len,
-                                %error,
-                                "block sync: peer served invalid headers; disconnecting",
-                            );
+                        self.peer_outbound.write().remove(&peer_addr);
+                        self.peers.write().retain(|peer| peer.addr != peer_addr);
+                        self.download_window
+                            .lock()
+                            .mark_peer_unresponsive(peer_addr, Instant::now());
+                        let mut pending = self.pending_getheaders.lock();
+                        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+                            *pending = None;
                         }
+                        tracing::warn!(
+                            peer_addr = %peer_addr,
+                            received = batch_len,
+                            %error,
+                            "block sync: peer served invalid headers; disconnecting",
+                        );
                     } else {
                         tracing::warn!(
                             received = batch_len,
@@ -1726,22 +1718,40 @@ mod tests {
         } = header_sync_with_genesis()?;
         let invalid_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         let other_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
-        peers.write().extend([
-            synthetic_peer(invalid_peer, 9),
-            synthetic_peer(other_peer, 8),
-        ]);
         let (invalid_tx, invalid_rx) = unbounded::<Message>();
         let (other_tx, other_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(invalid_peer, invalid_tx), (other_peer, other_tx)]);
+
+        // Seed only the invalid peer so the first tick routes a GetHeaders to
+        // it and arms the pending gate against its address.
+        peers.write().push(synthetic_peer(invalid_peer, 9));
+        peer_outbound.write().insert(invalid_peer, invalid_tx);
+
+        sync.tick();
+        assert!(
+            matches!(invalid_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+            "the first getheaders must target the invalid peer"
+        );
+        assert!(
+            sync.pending_getheaders
+                .lock()
+                .is_some_and(|request| request.peer_addr == invalid_peer),
+            "a pending getheaders must name the invalid peer before its batch arrives"
+        );
+
+        // Deliver the attributed invalid batch while the gate is still armed
+        // against the invalid peer. No other selectable peer remains, so this
+        // tick cannot re-arm the gate against a different address: the only way
+        // `pending_getheaders` ends up clear is the peer-fault cleanup.
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
             source_peer: Some(invalid_peer),
         })?;
-
         sync.tick();
 
+        assert!(
+            sync.pending_getheaders.lock().is_none(),
+            "an attributed invalid-header fault must release the pending getheaders gate"
+        );
         assert!(
             !peers.read().iter().any(|peer| peer.addr == invalid_peer),
             "invalid header source must be removed from peer selection"
@@ -1750,6 +1760,11 @@ mod tests {
             !peer_outbound.read().contains_key(&invalid_peer),
             "invalid header source must lose its outbound lease"
         );
+
+        // Re-introduce a healthy peer; the next getheaders must rotate to it.
+        peers.write().push(synthetic_peer(other_peer, 8));
+        peer_outbound.write().insert(other_peer, other_tx);
+        sync.tick();
         assert!(
             peers.read().iter().any(|peer| peer.addr == other_peer),
             "healthy peer must remain eligible for rotation"
