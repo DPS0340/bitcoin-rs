@@ -824,7 +824,7 @@ fn write_checkpoint_inner(
         &applied_tip.hash,
         applied_tip.height,
         &mut utxo_writer,
-        CoinStatsAccumulator::with_muhash(applied_tip.height),
+        CoinStatsAccumulator::with_parallel_muhash(applied_tip.height),
     )?;
     utxo_writer.flush()?;
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish();
@@ -1392,7 +1392,7 @@ fn read_checkpoint_snapshot(
         TrailerKindV1::Rolling | TrailerKindV1::Scanned => {
             let (snapshot, accumulator) = read_snapshot_strict_v3_observed(
                 &mut limited,
-                CoinStatsAccumulator::with_muhash(height),
+                CoinStatsAccumulator::with_parallel_muhash(height),
             )?;
             Ok((snapshot, Some(accumulator.into_stats())))
         }
@@ -2304,10 +2304,30 @@ mod tests {
         assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
         assert_eq!(snapshot.muhash_trailer, expected.muhash.finalize());
 
-        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
+        let CheckpointLoad::Complete(mut restored) = load_checkpoint(dir.path(), config())? else {
             return Err(std::io::Error::other("scanned generation did not restore").into());
         };
         assert_eq!(restored.coin_stats, expected);
+
+        let listener = CoinStatsListener::new(restored.coin_stats.clone());
+        restored.utxo.set_listener(Box::new(listener.clone()));
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            OutPoint::new(Hash256::from_le_bytes(&[0x5a; 32]), 42),
+            TxOut {
+                value: Amount::from_sat(123_456),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0xac]),
+            },
+            false,
+            restored.applied_tip.height,
+        ));
+        restored
+            .utxo
+            .commit_block(&changes, &Hash256::from_le_bytes(&[0xa5; 32]))?;
+        let continued = restored
+            .utxo
+            .with_stable_view(|view| scan_coin_stats(view, restored.applied_tip.height, true))?;
+        assert_eq!(listener.snapshot().to_bytes(), continued.to_bytes());
         Ok(())
     }
 

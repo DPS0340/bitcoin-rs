@@ -16,6 +16,7 @@ use crate::MuHash3072;
 const OUTPOINT_BYTES: usize = 36;
 const COIN_HEADER_BYTES: u64 = 4;
 const AMOUNT_BYTES: u64 = 8;
+const AMOUNT_ENCODED_BYTES: usize = 8;
 const SCRIPT_LEN_BYTES: u64 = 2;
 const FIXED_BOGO_SIZE: u64 = 36 + COIN_HEADER_BYTES + AMOUNT_BYTES + SCRIPT_LEN_BYTES;
 const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4096;
@@ -26,6 +27,10 @@ const WIDE_EVENT_BATCH_SHARD_THRESHOLD: usize = 16;
 const NARROW_EVENT_CHUNK_SIZE: usize = 16;
 const WIDE_EVENT_CHUNK_SIZE: usize = 4;
 const INLINE_EVENT_CHUNKS: usize = 64;
+
+const PARALLEL_MUHASH_MAX_COINS: usize = 16_384;
+const PARALLEL_MUHASH_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PARALLEL_MUHASH_MAX_LANES: usize = 16;
 
 /// Exact byte length of the stable `CoinStats` encoding.
 pub const COIN_STATS_ENCODED_LEN: usize = 804;
@@ -173,36 +178,122 @@ pub fn scan_coin_stats(
 #[derive(Debug)]
 pub struct CoinStatsAccumulator {
     stats: CoinStats,
-    scratch: Vec<u8>,
-    collect_muhash: bool,
+    mode: MuHashMode,
+}
+
+#[derive(Debug)]
+enum MuHashMode {
+    Disabled,
+    Serial(Vec<u8>),
+    Parallel(EncodedPreimageArena),
+}
+
+#[derive(Debug)]
+struct EncodedPreimageArena {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl EncodedPreimageArena {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(PARALLEL_MUHASH_MAX_BYTES),
+            ends: Vec::with_capacity(PARALLEL_MUHASH_MAX_COINS),
+        }
+    }
+
+    fn push(&mut self, coin: SnapshotCoin<'_>) {
+        let op = OutPoint::new(coin.txid, coin.vout);
+        coin_hash_bytes_raw_append(
+            &mut self.bytes,
+            &op,
+            coin.value,
+            coin.script_pubkey,
+            coin.height,
+            coin.coinbase,
+        );
+        self.ends.push(self.bytes.len());
+    }
+
+    fn should_flush_before(&self, script_len: usize) -> bool {
+        !self.ends.is_empty()
+            && (self.ends.len() == PARALLEL_MUHASH_MAX_COINS
+                || coin_hash_encoded_len(script_len)
+                    > PARALLEL_MUHASH_MAX_BYTES.saturating_sub(self.bytes.len()))
+    }
+
+    fn flush_into(&mut self, muhash: &mut MuHash3072) {
+        if self.ends.is_empty() {
+            return;
+        }
+        if self.ends.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
+            for index in 0..self.ends.len() {
+                let start = if index == 0 { 0 } else { self.ends[index - 1] };
+                muhash.insert(&self.bytes[start..self.ends[index]]);
+            }
+        } else {
+            let lane_count = self.ends.len().min(PARALLEL_MUHASH_MAX_LANES);
+            let lane_len = self.ends.len().div_ceil(lane_count);
+            // Rayon collects scoped jobs before returning or propagating a panic,
+            // so no lane can retain arena slices after this flush.
+            let partials: Vec<_> = (0..lane_count)
+                .into_par_iter()
+                .map(|lane| {
+                    let first = lane * lane_len;
+                    let last = (first + lane_len).min(self.ends.len());
+                    let mut partial = MuHash3072::new();
+                    for index in first..last {
+                        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+                        partial.insert(&self.bytes[start..self.ends[index]]);
+                    }
+                    partial
+                })
+                .collect();
+            for partial in partials {
+                muhash.combine_numerator(&partial);
+            }
+        }
+        self.bytes.clear();
+        self.ends.clear();
+    }
 }
 
 impl CoinStatsAccumulator {
     /// Creates an accumulator that derives `CoinStats` and a `MuHash` trailer.
     #[must_use]
     pub fn with_muhash(height: u32) -> Self {
-        Self::new(height, true)
+        Self::new(height, MuHashMode::Serial(Vec::new()))
+    }
+
+    /// Creates an accumulator that buffers exact preimages and combines ordered
+    /// insert-only partial `MuHash` values for checkpoint traversals.
+    #[must_use]
+    pub fn with_parallel_muhash(height: u32) -> Self {
+        Self::new(height, MuHashMode::Parallel(EncodedPreimageArena::new()))
     }
 
     /// Creates an accumulator that derives `CoinStats` without hashing coins.
     #[must_use]
     pub fn without_muhash(height: u32) -> Self {
-        Self::new(height, false)
+        Self::new(height, MuHashMode::Disabled)
     }
 
-    fn new(height: u32, collect_muhash: bool) -> Self {
+    fn new(height: u32, mode: MuHashMode) -> Self {
         let mut stats = CoinStats::new();
         stats.height = height;
-        Self {
-            stats,
-            scratch: Vec::new(),
-            collect_muhash,
+        Self { stats, mode }
+    }
+
+    fn flush_parallel_muhash(&mut self) {
+        if let MuHashMode::Parallel(arena) = &mut self.mode {
+            arena.flush_into(&mut self.stats.muhash);
         }
     }
 
     /// Finishes the fold and returns the derived statistics.
     #[must_use]
-    pub fn into_stats(self) -> CoinStats {
+    pub fn into_stats(mut self) -> CoinStats {
+        self.flush_parallel_muhash();
         self.stats
     }
 }
@@ -216,25 +307,55 @@ impl SnapshotCoinObserver for CoinStatsAccumulator {
             .bogo_size
             .saturating_add(FIXED_BOGO_SIZE.saturating_add(script_len));
         self.stats.utxo_count = self.stats.utxo_count.saturating_add(1);
-        if self.collect_muhash {
-            let op = OutPoint::new(coin.txid, coin.vout);
-            coin_hash_bytes_raw_into(
-                &mut self.scratch,
-                &op,
-                coin.value,
-                coin.script_pubkey,
-                coin.height,
-                coin.coinbase,
-            );
-            self.stats.muhash.insert(&self.scratch);
+        match &mut self.mode {
+            MuHashMode::Disabled => {}
+            MuHashMode::Serial(scratch) => {
+                let op = OutPoint::new(coin.txid, coin.vout);
+                coin_hash_bytes_raw_into(
+                    scratch,
+                    &op,
+                    coin.value,
+                    coin.script_pubkey,
+                    coin.height,
+                    coin.coinbase,
+                );
+                self.stats.muhash.insert(scratch);
+            }
+            MuHashMode::Parallel(arena) => {
+                let encoded_len = coin_hash_encoded_len(coin.script_pubkey.len());
+                if encoded_len > PARALLEL_MUHASH_MAX_BYTES {
+                    arena.flush_into(&mut self.stats.muhash);
+                    let mut preimage = Vec::with_capacity(encoded_len);
+                    let op = OutPoint::new(coin.txid, coin.vout);
+                    coin_hash_bytes_raw_append(
+                        &mut preimage,
+                        &op,
+                        coin.value,
+                        coin.script_pubkey,
+                        coin.height,
+                        coin.coinbase,
+                    );
+                    self.stats.muhash.insert(&preimage);
+                    return;
+                }
+                if arena.should_flush_before(coin.script_pubkey.len()) {
+                    arena.flush_into(&mut self.stats.muhash);
+                }
+                arena.push(coin);
+                if arena.ends.len() == PARALLEL_MUHASH_MAX_COINS
+                    || arena.bytes.len() == PARALLEL_MUHASH_MAX_BYTES
+                {
+                    arena.flush_into(&mut self.stats.muhash);
+                }
+            }
         }
     }
 
     fn select_trailer(&mut self, fallback: [u8; 384]) -> [u8; 384] {
-        if self.collect_muhash {
-            self.stats.muhash.finalize()
-        } else {
-            fallback
+        self.flush_parallel_muhash();
+        match &self.mode {
+            MuHashMode::Disabled => fallback,
+            MuHashMode::Serial(_) | MuHashMode::Parallel(_) => self.stats.muhash.finalize(),
         }
     }
 }
@@ -667,6 +788,17 @@ fn coin_hash_bytes_raw_into(
     coinbase: bool,
 ) {
     out.clear();
+    coin_hash_bytes_raw_append(out, op, value, script_pubkey, height, coinbase);
+}
+
+fn coin_hash_bytes_raw_append(
+    out: &mut Vec<u8>,
+    op: &OutPoint,
+    value: u64,
+    script_pubkey: &[u8],
+    height: u32,
+    coinbase: bool,
+) {
     out.extend_from_slice(op.as_bytes());
     let coinbase_bit = u32::from(coinbase);
     out.extend_from_slice(&((height << 1) | coinbase_bit).to_le_bytes());
@@ -735,9 +867,33 @@ impl From<Infallible> for CoinStatsDecodeError {
     }
 }
 
+#[inline]
+fn coin_hash_encoded_len(script_len: usize) -> usize {
+    OUTPOINT_BYTES
+        .saturating_add(4)
+        .saturating_add(AMOUNT_ENCODED_BYTES)
+        .saturating_add(compact_size_len(script_len))
+        .saturating_add(script_len)
+}
+
+#[inline]
+const fn compact_size_len(len: usize) -> usize {
+    if len < 0xfd {
+        1
+    } else if len <= 0xffff {
+        3
+    } else if len <= 0xffff_ffff {
+        5
+    } else {
+        9
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{Amount, ScriptBuf};
+    use bitcoin_rs_utxo::{SnapshotCoin, SnapshotCoinObserver};
+    use proptest::prelude::*;
 
     use super::{TxOut, encode_txout_into};
 
@@ -828,5 +984,132 @@ mod tests {
             super::MuHash3072::new().finalize(),
             "without_muhash must leave the identity accumulator"
         );
+    }
+
+    struct TestCoin {
+        txid: bitcoin_rs_primitives::Hash256,
+        vout: u32,
+        value: u64,
+        script_pubkey: Vec<u8>,
+        height: u32,
+        coinbase: bool,
+    }
+
+    fn generated_coins(count: usize, script_lens: &[usize]) -> Vec<TestCoin> {
+        (0..count)
+            .map(|index| {
+                let mut txid = [0_u8; 32];
+                txid[..8].copy_from_slice(&u64::try_from(index).unwrap_or(u64::MAX).to_le_bytes());
+                txid[8] = u8::try_from(index.rotate_left(7)).unwrap_or(u8::MAX);
+                let script_len = script_lens[index % script_lens.len()];
+                TestCoin {
+                    txid: bitcoin_rs_primitives::Hash256::from_le_bytes(&txid),
+                    vout: u32::try_from(index).unwrap_or(u32::MAX),
+                    value: 50_000_u64.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+                    script_pubkey: (0..script_len)
+                        .map(|byte| u8::try_from(index.wrapping_add(byte)).unwrap_or(u8::MAX))
+                        .collect(),
+                    height: u32::try_from(index % 1_000).unwrap_or(u32::MAX),
+                    coinbase: index % 2 == 1,
+                }
+            })
+            .collect()
+    }
+
+    fn observe_all(accumulator: &mut super::CoinStatsAccumulator, coins: &[TestCoin]) {
+        for coin in coins {
+            accumulator.observe_coin(SnapshotCoin {
+                txid: coin.txid,
+                vout: coin.vout,
+                value: coin.value,
+                script_pubkey: &coin.script_pubkey,
+                height: coin.height,
+                coinbase: coin.coinbase,
+            });
+        }
+    }
+
+    fn assert_parallel_serialized_match(coins: &[TestCoin]) {
+        let mut serial = super::CoinStatsAccumulator::with_muhash(77);
+        let mut parallel = super::CoinStatsAccumulator::with_parallel_muhash(77);
+        observe_all(&mut serial, coins);
+        observe_all(&mut parallel, coins);
+
+        let serial_trailer = serial.select_trailer([0_u8; 384]);
+        let parallel_trailer = parallel.select_trailer([0_u8; 384]);
+        let serial_stats = serial.into_stats();
+        let parallel_stats = parallel.into_stats();
+
+        assert_eq!(
+            parallel_trailer, serial_trailer,
+            "MuHash trailer must be byte-identical"
+        );
+        assert_eq!(
+            parallel_stats.to_bytes(),
+            serial_stats.to_bytes(),
+            "CoinStats serialized form must be byte-identical despite noncanonical intermediate limbs"
+        );
+    }
+
+    #[test]
+    fn parallel_muhash_matches_serial_at_coin_flush_boundaries() {
+        for count in [
+            0,
+            1,
+            super::PARALLEL_COIN_BATCH_OP_THRESHOLD - 1,
+            super::PARALLEL_COIN_BATCH_OP_THRESHOLD,
+            super::PARALLEL_COIN_BATCH_OP_THRESHOLD + 1,
+            super::PARALLEL_MUHASH_MAX_COINS - 1,
+            super::PARALLEL_MUHASH_MAX_COINS,
+            super::PARALLEL_MUHASH_MAX_COINS + 1,
+        ] {
+            assert_parallel_serialized_match(&generated_coins(count, &[0, 1, 252, 253]));
+        }
+    }
+
+    #[test]
+    fn parallel_muhash_matches_serial_at_byte_flush_boundaries() {
+        let script_len = 2_048;
+        let encoded_len = super::coin_hash_encoded_len(script_len);
+        let exact_count = super::PARALLEL_MUHASH_MAX_BYTES / encoded_len;
+        for count in [exact_count - 1, exact_count, exact_count + 1] {
+            assert_parallel_serialized_match(&generated_coins(count, &[script_len]));
+        }
+    }
+
+    #[test]
+    fn parallel_muhash_flushes_oversized_preimage_and_reuses_arena() {
+        let mut coins = generated_coins(1, &[3]);
+        coins.extend(generated_coins(1, &[super::PARALLEL_MUHASH_MAX_BYTES + 1]));
+        coins.extend(generated_coins(1, &[5]));
+        coins[1].vout = 1;
+        coins[2].vout = 2;
+        coins[1].txid = bitcoin_rs_primitives::Hash256::from_le_bytes(&[1; 32]);
+        coins[2].txid = bitcoin_rs_primitives::Hash256::from_le_bytes(&[2; 32]);
+        assert_parallel_serialized_match(&coins);
+    }
+
+    #[test]
+    fn parallel_muhash_matches_serial_generated_stream_and_into_stats_flush() {
+        let coins = generated_coins(2_049, &[0, 1, 252, 253, 65_535]);
+        assert_parallel_serialized_match(&coins);
+
+        let mut parallel = super::CoinStatsAccumulator::with_parallel_muhash(77);
+        observe_all(&mut parallel, &coins);
+        let stats = parallel.into_stats();
+        let mut serial = super::CoinStatsAccumulator::with_muhash(77);
+        observe_all(&mut serial, &coins);
+        assert_eq!(stats.to_bytes(), serial.into_stats().to_bytes());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+        #[test]
+        fn parallel_muhash_property_matches_serial_generated_streams(
+            count in 0_usize..1_500,
+            script_lens in proptest::collection::vec(0_usize..512, 1..8),
+        ) {
+            assert_parallel_serialized_match(&generated_coins(count, &script_lens));
+        }
     }
 }
