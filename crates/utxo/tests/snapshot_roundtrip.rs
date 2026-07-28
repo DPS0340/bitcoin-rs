@@ -11,6 +11,41 @@ use bitcoin_rs_utxo::{
 use std::io::{Cursor, Read, Seek};
 use tempfile::tempfile;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeenSnapshotCoin {
+    txid: Hash256,
+    vout: u32,
+    value: u64,
+    script_pubkey: Vec<u8>,
+    height: u32,
+    coinbase: bool,
+}
+
+#[derive(Default)]
+struct RecordingSnapshotObserver {
+    coins: Vec<SeenSnapshotCoin>,
+    replacement_trailer: Option<[u8; 384]>,
+    trailer_calls: usize,
+}
+
+impl bitcoin_rs_utxo::SnapshotCoinObserver for RecordingSnapshotObserver {
+    fn observe_coin(&mut self, coin: bitcoin_rs_utxo::SnapshotCoin<'_>) {
+        self.coins.push(SeenSnapshotCoin {
+            txid: coin.txid,
+            vout: coin.vout,
+            value: coin.value,
+            script_pubkey: coin.script_pubkey.to_vec(),
+            height: coin.height,
+            coinbase: coin.coinbase,
+        });
+    }
+
+    fn select_trailer(&mut self, fallback: [u8; 384]) -> [u8; 384] {
+        self.trailer_calls += 1;
+        self.replacement_trailer.unwrap_or(fallback)
+    }
+}
+
 fn txid(seed: u64) -> Hash256 {
     let mut bytes = [0_u8; 32];
     bytes[..8].copy_from_slice(&seed.to_le_bytes());
@@ -1026,4 +1061,242 @@ fn snapshot_read_v3_rejects_txid_prefix_mismatch() {
         matches!(err, UtxoError::SnapshotTxidPrefixMismatch),
         "{err:?}"
     );
+}
+
+#[test]
+fn observed_snapshot_traversal_preserves_bytes_and_coin_fields()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let first_txid = txid(200_000);
+    let second_txid = txid(200_001);
+    let first = txout(200_010);
+    let second = empty_script_txout(200_011);
+    let third = txout(200_012);
+    let expected = vec![
+        SeenSnapshotCoin {
+            txid: first_txid,
+            vout: 0,
+            value: first.value.to_sat(),
+            script_pubkey: first.script_pubkey.as_bytes().to_vec(),
+            height: 2000,
+            coinbase: false,
+        },
+        SeenSnapshotCoin {
+            txid: first_txid,
+            vout: 9,
+            value: second.value.to_sat(),
+            script_pubkey: second.script_pubkey.as_bytes().to_vec(),
+            height: 2001,
+            coinbase: true,
+        },
+        SeenSnapshotCoin {
+            txid: second_txid,
+            vout: 2,
+            value: third.value.to_sat(),
+            script_pubkey: third.script_pubkey.as_bytes().to_vec(),
+            height: 2002,
+            coinbase: false,
+        },
+    ];
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(
+        OutPoint::new(first_txid, 0),
+        first,
+        false,
+        2000,
+    ));
+    changes.add(UtxoAdd::new(
+        OutPoint::new(first_txid, 9),
+        second,
+        true,
+        2001,
+    ));
+    changes.add(UtxoAdd::new(
+        OutPoint::new(second_txid, 2),
+        third,
+        false,
+        2002,
+    ));
+    set.commit_block(&changes, &txid(200_002))?;
+
+    let mut legacy = Vec::new();
+    let legacy_trailer = write_snapshot(&set, &txid(200_003), 2002, &mut legacy)?;
+    let mut observed = Vec::new();
+    let (trailer, writer_observer) = bitcoin_rs_utxo::write_snapshot_observed(
+        &set,
+        &txid(200_003),
+        2002,
+        &mut observed,
+        RecordingSnapshotObserver::default(),
+    )?;
+
+    assert_eq!(observed, legacy);
+    assert_eq!(trailer, legacy_trailer);
+    assert_eq!(writer_observer.trailer_calls, 1);
+    assert_eq!(writer_observer.coins.len(), expected.len());
+    for coin in &expected {
+        assert!(
+            writer_observer.coins.contains(coin),
+            "missing observed coin {coin:?}"
+        );
+    }
+
+    let writer_coins = writer_observer.coins;
+    let (_, reader_observer) = bitcoin_rs_utxo::read_snapshot_strict_v3_observed(
+        &mut Cursor::new(&observed),
+        RecordingSnapshotObserver::default(),
+    )?;
+    assert_eq!(reader_observer.coins, writer_coins);
+    Ok(())
+}
+
+#[test]
+fn observed_snapshot_writer_uses_observer_trailer() -> Result<(), Box<dyn std::error::Error>> {
+    let replacement = [0xA5; 384];
+    let mut bytes = Vec::new();
+    let (trailer, observer) = bitcoin_rs_utxo::write_snapshot_observed(
+        &UtxoSet::new(),
+        &txid(200_010),
+        2010,
+        &mut bytes,
+        RecordingSnapshotObserver {
+            replacement_trailer: Some(replacement),
+            ..RecordingSnapshotObserver::default()
+        },
+    )?;
+
+    assert_eq!(trailer, replacement);
+    assert_eq!(observer.trailer_calls, 1);
+    assert_eq!(&bytes[bytes.len() - 384..], replacement);
+    Ok(())
+}
+
+#[test]
+fn strict_v3_rejects_empty_records_but_legacy_accepts_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let record_txid = txid(200_020);
+    let key = UtxoKey::from_txid(&record_txid);
+    let mut bytes = v3_header(txid(200_021), 2020, 1);
+    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 0));
+    bytes.extend_from_slice(&[0_u8; 384]);
+
+    let legacy = read_snapshot(&mut Cursor::new(&bytes))?;
+    assert!(legacy.set.is_empty());
+    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(bytes))
+    else {
+        return Err("strict snapshot accepted an empty record".into());
+    };
+    assert!(matches!(
+        error,
+        UtxoError::SnapshotRecordCountMismatch {
+            declared: 1,
+            actual: 0
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn strict_v3_rejects_split_duplicate_records_but_legacy_accepts_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let record_txid = txid(200_030);
+    let key = UtxoKey::from_txid(&record_txid);
+    let mut bytes = v3_header(txid(200_031), 2030, 2);
+    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
+    append_v3_output(&mut bytes, 0, 3_000, 2030, false, &[0x51]);
+    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
+    append_v3_output(&mut bytes, 1, 3_001, 2031, true, &[0x52]);
+    bytes.extend_from_slice(&[0_u8; 384]);
+
+    let legacy = read_snapshot(&mut Cursor::new(&bytes))?;
+    assert_eq!(legacy.set.len(), 1);
+    assert!(legacy.set.get(&OutPoint::new(record_txid, 0)).is_none());
+    assert!(legacy.set.get(&OutPoint::new(record_txid, 1)).is_some());
+    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(bytes))
+    else {
+        return Err("strict snapshot accepted split duplicate records".into());
+    };
+    assert!(matches!(
+        error,
+        UtxoError::SnapshotRecordCountMismatch {
+            declared: 2,
+            actual: 1
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn strict_v3_observer_is_dropped_on_error() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct DropObserver {
+        observed: usize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl bitcoin_rs_utxo::SnapshotCoinObserver for DropObserver {
+        fn observe_coin(&mut self, _: bitcoin_rs_utxo::SnapshotCoin<'_>) {
+            self.observed = self.observed.saturating_add(1);
+        }
+    }
+
+    impl Drop for DropObserver {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let record_txid = txid(200_040);
+    let key = UtxoKey::from_txid(&record_txid);
+    let mut bytes = v3_header(txid(200_041), 2040, 2);
+    for vout in 0..2 {
+        bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
+        append_v3_output(
+            &mut bytes,
+            vout,
+            4_000 + u64::from(vout),
+            2040,
+            false,
+            &[0x51],
+        );
+    }
+    bytes.extend_from_slice(&[0_u8; 384]);
+
+    let dropped = Arc::new(AtomicBool::new(false));
+
+    let result = bitcoin_rs_utxo::read_snapshot_strict_v3_observed(
+        &mut Cursor::new(bytes),
+        DropObserver {
+            observed: 0,
+            dropped: Arc::clone(&dropped),
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(UtxoError::SnapshotRecordCountMismatch { .. })
+    ));
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+fn append_v3_output(
+    bytes: &mut Vec<u8>,
+    vout: u32,
+    value: u64,
+    height: u32,
+    coinbase: bool,
+    script_pubkey: &[u8],
+) {
+    let Ok(script_len) = u16::try_from(script_pubkey.len()) else {
+        panic!("test script does not fit snapshot encoding");
+    };
+    bytes.extend_from_slice(&vout.to_le_bytes());
+    bytes.extend_from_slice(&value.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.push(u8::from(coinbase));
+    bytes.extend_from_slice(&script_len.to_le_bytes());
+    bytes.extend_from_slice(script_pubkey);
 }

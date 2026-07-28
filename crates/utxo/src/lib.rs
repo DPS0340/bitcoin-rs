@@ -26,5 +26,6 @@ pub use set::{
 };
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
-    SnapshotLoad, aggregate_hash, hash_serialized_3, read_snapshot, write_snapshot,
+    SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,
+    read_snapshot, read_snapshot_strict_v3_observed, write_snapshot, write_snapshot_observed,
 };

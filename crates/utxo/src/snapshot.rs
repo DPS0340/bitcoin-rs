@@ -65,6 +65,45 @@ pub struct SnapshotLoad {
     pub muhash_trailer: [u8; MUHASH_TRAILER_LEN],
 }
 
+/// A live coin borrowed while a snapshot is traversed.
+///
+/// The script borrows the snapshot record only for the duration of the
+/// observer callback.
+#[derive(Copy, Clone)]
+pub struct SnapshotCoin<'a> {
+    /// Transaction identifier that created this output.
+    pub txid: Hash256,
+    /// Originating transaction output index.
+    pub vout: u32,
+    /// Output value in satoshis.
+    pub value: u64,
+    /// Borrowed scriptPubKey bytes.
+    pub script_pubkey: &'a [u8],
+    /// Block height that created the output.
+    pub height: u32,
+    /// Whether the originating transaction was coinbase.
+    pub coinbase: bool,
+}
+
+/// Observes each live coin traversed by snapshot serialization or strict loading.
+///
+/// A later I/O or validation error can follow an observation. Implementations
+/// must keep derived state inside the owned observer and publish only the
+/// observer returned by a successful traversal.
+pub trait SnapshotCoinObserver {
+    /// Observes one live coin.
+    fn observe_coin(&mut self, coin: SnapshotCoin<'_>);
+
+    /// Selects the final snapshot trailer, defaulting to the supplied fallback.
+    fn select_trailer(&mut self, fallback: [u8; MUHASH_TRAILER_LEN]) -> [u8; MUHASH_TRAILER_LEN] {
+        fallback
+    }
+}
+
+impl SnapshotCoinObserver for () {
+    fn observe_coin(&mut self, _: SnapshotCoin<'_>) {}
+}
+
 /// Streams a native bitcoin-rs UTXO snapshot to `writer`.
 pub fn write_snapshot(
     set: &UtxoSet,
@@ -72,6 +111,20 @@ pub fn write_snapshot(
     height: u32,
     writer: &mut impl Write,
 ) -> Result<[u8; MUHASH_TRAILER_LEN], UtxoError> {
+    write_snapshot_observed(set, tip_hash, height, writer, ()).map(|(trailer, ())| trailer)
+}
+
+/// Streams a native bitcoin-rs UTXO snapshot while observing every live coin.
+///
+/// Returns the selected trailer and observer only after the complete snapshot is
+/// written successfully.
+pub fn write_snapshot_observed<O: SnapshotCoinObserver>(
+    set: &UtxoSet,
+    tip_hash: &Hash256,
+    height: u32,
+    writer: &mut impl Write,
+    mut observer: O,
+) -> Result<([u8; MUHASH_TRAILER_LEN], O), UtxoError> {
     set.with_stable_view(|view| {
         let record_count = u64::try_from(view.record_count())
             .map_err(|_| UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX })?;
@@ -92,10 +145,11 @@ pub fn write_snapshot(
                             count: record.output_count(),
                         }
                     })?;
+                    let txid = record.txid();
                     let record_header = SnapshotRecordHeaderV3 {
                         shard_idx,
                         key_prefix: record.key().to_prefix(),
-                        txid: record.txid().to_le_bytes(),
+                        txid: txid.to_le_bytes(),
                         vout_count,
                     };
                     writer.write_all(record_header.as_bytes())?;
@@ -115,28 +169,49 @@ pub fn write_snapshot(
                         };
                         writer.write_all(vout_header.as_bytes())?;
                         writer.write_all(output.script_pubkey)?;
+                        observer.observe_coin(SnapshotCoin {
+                            txid,
+                            vout: output.vout,
+                            value: output.value,
+                            script_pubkey: output.script_pubkey,
+                            height: output.height,
+                            coinbase: output.coinbase,
+                        });
                     }
                 }
                 Ok::<(), UtxoError>(())
             })?;
         }
 
-        let trailer = view
+        let fallback = view
             .listener_muhash3072()
             .unwrap_or([0_u8; MUHASH_TRAILER_LEN]);
+        let trailer = observer.select_trailer(fallback);
         writer.write_all(&trailer)?;
-        Ok(trailer)
+        Ok((trailer, observer))
     })
 }
 
 /// Streams a native bitcoin-rs UTXO snapshot from `reader` into a fresh set.
 pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
-    read_snapshot_with_policy(reader, SnapshotReadPolicy::Legacy)
+    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::Legacy, ())
+        .map(|(snapshot, ())| snapshot)
 }
 
 /// Strictly decodes a complete v3 snapshot for a chainstate checkpoint.
 pub fn read_snapshot_strict_v3(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
-    read_snapshot_with_policy(reader, SnapshotReadPolicy::StrictV3)
+    read_snapshot_strict_v3_observed(reader, ()).map(|(snapshot, ())| snapshot)
+}
+
+/// Strictly decodes a complete v3 snapshot while observing each inserted coin.
+///
+/// The observer is returned only after trailer and EOF validation succeeds.
+/// Callbacks can precede a later error, so they must not publish external state.
+pub fn read_snapshot_strict_v3_observed<O: SnapshotCoinObserver>(
+    reader: &mut impl Read,
+    observer: O,
+) -> Result<(SnapshotLoad, O), UtxoError> {
+    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::StrictV3, observer)
 }
 
 #[derive(Copy, Clone)]
@@ -145,10 +220,11 @@ enum SnapshotReadPolicy {
     StrictV3,
 }
 
-fn read_snapshot_with_policy(
+fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
     reader: &mut impl Read,
     policy: SnapshotReadPolicy,
-) -> Result<SnapshotLoad, UtxoError> {
+    mut observer: O,
+) -> Result<(SnapshotLoad, O), UtxoError> {
     let header_bytes = read_array::<{ core::mem::size_of::<SnapshotHeader>() }>(reader)?;
     let magic = read_u32(&header_bytes, 0);
     if magic != SNAPSHOT_MAGIC {
@@ -181,6 +257,26 @@ fn read_snapshot_with_policy(
             _ => unreachable!("snapshot version was validated"),
         };
         set.insert_snapshot_record(key, txid, &outputs)?;
+        for output in &outputs {
+            observer.observe_coin(SnapshotCoin {
+                txid,
+                vout: output.vout,
+                value: output.value,
+                script_pubkey: &output.script_pubkey,
+                height: output.height,
+                coinbase: output.coinbase,
+            });
+        }
+    }
+
+    if matches!(policy, SnapshotReadPolicy::StrictV3) {
+        let actual = set.record_count();
+        if actual != record_count_usize {
+            return Err(UtxoError::SnapshotRecordCountMismatch {
+                declared: record_count,
+                actual,
+            });
+        }
     }
 
     let mut muhash_trailer = [0_u8; MUHASH_TRAILER_LEN];
@@ -203,12 +299,15 @@ fn read_snapshot_with_policy(
         }
     }
 
-    Ok(SnapshotLoad {
-        set,
-        tip_hash: Hash256::from_le_bytes(&tip_hash),
-        height,
-        muhash_trailer,
-    })
+    Ok((
+        SnapshotLoad {
+            set,
+            tip_hash: Hash256::from_le_bytes(&tip_hash),
+            height,
+            muhash_trailer,
+        },
+        observer,
+    ))
 }
 
 fn read_snapshot_record_v2(

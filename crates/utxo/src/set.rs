@@ -64,6 +64,14 @@ pub enum UtxoError {
         /// Record count from the header.
         count: u64,
     },
+    /// Strict snapshot records did not produce the declared number of records.
+    #[error("strict snapshot record count mismatch: declared {declared}, actual {actual}")]
+    SnapshotRecordCountMismatch {
+        /// Record count declared by the snapshot header.
+        declared: u64,
+        /// Number of records actually retained after insertion.
+        actual: usize,
+    },
     /// Snapshot output count does not fit the record header.
     #[error("snapshot record has too many live outputs: {count}")]
     SnapshotOutputCountTooLarge {
