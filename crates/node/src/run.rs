@@ -3,7 +3,7 @@
 use crate as bitcoin_rs_node;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -14,7 +14,34 @@ use crate::event_loop::EventLoop;
 use crate::state::NodeState;
 use crate::{crash_recovery, logging, shutdown};
 
+// Test-only observation seam: records that `run` reached the bounded
+// bootstrap-worker drain. Lets a regression that propagates a checkpoint
+// error with `?` *before* draining the worker be caught by a test that
+// actually spawns a bootstrap worker. Compiled out of non-test builds, so
+// it adds no production API surface.
+#[cfg(test)]
+std::thread_local! {
+    static BOOTSTRAP_DRAIN_REACHED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn mark_bootstrap_drain_reached() {
+    BOOTSTRAP_DRAIN_REACHED.with(|slot| slot.set(true));
+}
+
+#[cfg(not(test))]
+const fn mark_bootstrap_drain_reached() {}
+
+/// Test-only: returns and clears whether [`run`] reached the bootstrap-worker
+/// drain on the current thread since the last call.
+#[cfg(test)]
+fn bootstrap_drain_was_reached() -> bool {
+    BOOTSTRAP_DRAIN_REACHED.with(std::cell::Cell::take)
+}
+
 const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+const BOOTSTRAP_JOIN_DEADLINE: Duration = Duration::from_secs(1);
 const RPC_MAX_CONNECTIONS: usize = 128;
 const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const P2P_OUTBOUND_ACTIVE_LIMIT: usize = crate::state::P2P_OUTBOUND_QUEUE_LIMIT;
@@ -63,6 +90,18 @@ impl DnsBootstrapRefill {
         self.fast_refills = self.fast_refills.saturating_add(1);
         DNS_BOOTSTRAP_REFILL_INTERVAL
     }
+}
+
+fn wait_for_shutdown(shutdown: &AtomicBool, delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    while !shutdown.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    true
 }
 
 fn build_rpc_auth(node_auth: &crate::Auth) -> Result<bitcoin_rs_rpc::Auth> {
@@ -352,8 +391,7 @@ fn spawn_dns_peer_maintenance(
                 let mut maintenance_delay = bootstrap_refill.next_delay(0, queued);
 
                 while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                    std::thread::sleep(maintenance_delay);
-                    if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    if wait_for_shutdown(&shutdown, maintenance_delay) {
                         break;
                     }
 
@@ -511,7 +549,9 @@ fn spawn_fixed_peer_bootstrap(
                             break;
                         }
                     }
-                    std::thread::sleep(Duration::from_secs(2));
+                    if wait_for_shutdown(&bootstrap_shutdown, Duration::from_secs(2)) {
+                        break;
+                    }
                 }
             })?,
     ))
@@ -671,28 +711,45 @@ pub fn run(mut config: Config) -> Result<()> {
     } else {
         tracing::error!("P2P outbound drain panicked");
     }
+    shutdown::drain_and_shutdown(DRAIN_DEADLINE)?;
+    // Attempt the clean checkpoint before joining the bootstrap worker, but defer
+    // the result so a publication failure cannot bypass the bounded worker drain below.
+    let clean_checkpoint = state.write_clean_checkpoint();
+    match &clean_checkpoint {
+        Ok(crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip) => {
+            tracing::info!("no applied tip; clean checkpoint publication skipped");
+        }
+        Ok(crate::checkpoint::CheckpointWrite::Published { generation }) => {
+            tracing::info!(generation, "published clean chainstate checkpoint");
+        }
+        Err(error) => {
+            tracing::error!(%error, "clean checkpoint publication failed");
+        }
+    }
     if let Some(handle) = bootstrap_worker {
+        mark_bootstrap_drain_reached();
         let thread_name = handle
             .thread()
             .name()
             .unwrap_or("bitcoin-rs-p2p-bootstrap")
             .to_owned();
-        if matches!(handle.join(), Ok(())) {
-            tracing::info!(thread = %thread_name, "P2P bootstrap worker exited cleanly");
+        let deadline = std::time::Instant::now() + BOOTSTRAP_JOIN_DEADLINE;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            if matches!(handle.join(), Ok(())) {
+                tracing::info!(thread = %thread_name, "P2P bootstrap worker exited cleanly");
+            } else {
+                tracing::error!(thread = %thread_name, "P2P bootstrap worker panicked");
+            }
         } else {
-            tracing::error!(thread = %thread_name, "P2P bootstrap worker panicked");
+            tracing::warn!(thread = %thread_name, "P2P bootstrap worker still blocked; abandoning join");
         }
     }
-
-    shutdown::drain_and_shutdown(DRAIN_DEADLINE)?;
-    match state.write_clean_checkpoint()? {
-        crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
-            tracing::info!("no applied tip; clean checkpoint publication skipped");
-        }
-        crate::checkpoint::CheckpointWrite::Published { generation } => {
-            tracing::info!(generation, "published clean chainstate checkpoint");
-        }
-    }
+    // A checkpoint failure means the node did not exit cleanly; propagate it
+    // after the bounded bootstrap-worker drain above.
+    clean_checkpoint?;
     tracing::info!("bitcoin-rs node exited cleanly");
     Ok(())
 }
@@ -796,6 +853,11 @@ mod tests {
         config.electrum_bind = None;
         config.p2p_listen.clear();
         config.metrics_bind = None;
+        // Force a bootstrap worker to spawn (fixed-peer path) so the drain
+        // below is exercised — with an empty `connect`, `bootstrap_worker`
+        // would be `None` and the cleanup-ordering assertion could not catch a
+        // regression that moves `?` back onto `write_clean_checkpoint`.
+        config.connect = vec![SocketAddr::from(([127, 0, 0, 1], 1))];
 
         let state = crate::state::NodeState::open(config.clone())?;
         state.apply_block(&bitcoin::blockdata::constants::genesis_block(
@@ -818,6 +880,10 @@ mod tests {
 
         assert!(run(config).is_err());
         assert_eq!(std::fs::read(current_path)?, previous_current);
+        assert!(
+            bootstrap_drain_was_reached(),
+            "checkpoint publication error must not bypass the bounded bootstrap-worker drain"
+        );
         Ok(())
     }
 
