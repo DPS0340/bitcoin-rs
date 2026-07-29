@@ -3738,22 +3738,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_prefix_confirmation_after_forget_does_not_install_probe_or_gate() {
+    fn stale_prefix_confirmation_after_forget_does_not_install_probe_or_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
         let now = Instant::now();
         let owner = staller_addr();
         let mut window = DownloadWindow::new(test_budget());
-        for byte in 1..=super::PREFIX_PROBE_WIN_BLOCKS as u8 {
+        let win_blocks = u8::try_from(super::PREFIX_PROBE_WIN_BLOCKS)?;
+        for byte in 1..=win_blocks {
             insert_pending(&mut window, owner, hash(byte), u32::from(byte), now);
         }
-        let (planned_owner, hashes, _) = window
-            .prefix_probe_plan()
-            .expect("contiguous owner should produce a prefix plan");
-
+        let (planned_owner, hashes, _) = window.prefix_probe_plan().ok_or_else(|| {
+            std::io::Error::other("contiguous owner should produce a prefix plan")
+        })?;
         window.forget_peer(owner);
         window.confirm_prefix_probe(planned_owner, hashes, &[healthy_addr()], now);
 
         assert!(window.prefix_probe.is_none());
         assert!(window.prefix_probe_attempted_owner.is_none());
+        Ok(())
     }
 
     #[test]
@@ -3761,7 +3763,9 @@ mod tests {
         let mut window = DownloadWindow::new(test_budget());
         let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
         let now = Instant::now();
-        window.peer_inflight.insert(peer_addr, Default::default());
+        window
+            .peer_inflight
+            .insert(peer_addr, super::PeerInflight::default());
         window.preferred_peer = Some(peer_addr);
         window.mark_peer_unresponsive(peer_addr, now);
 

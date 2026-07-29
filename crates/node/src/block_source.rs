@@ -155,6 +155,32 @@ mod tests {
     use bitcoin::consensus::encode::serialize;
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_primitives::Hash256;
+    use std::error::Error;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    struct FixedBody {
+        height: u32,
+        hash: Hash256,
+        bytes: Vec<u8>,
+    }
+
+    impl BlockBodySource for FixedBody {
+        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            (self.height == height && self.hash == hash).then(|| self.bytes.clone())
+        }
+    }
+
+    struct CorrectBody {
+        hash: Hash256,
+        bytes: Vec<u8>,
+    }
+
+    impl BlockBodySource for CorrectBody {
+        fn block_body(&self, _height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            (hash == self.hash).then(|| self.bytes.clone())
+        }
+    }
 
     #[test]
     fn block_at_height_returns_some_after_record_added() {
@@ -226,48 +252,35 @@ mod tests {
     }
 
     #[test]
-    fn block_at_height_resolves_from_tree_with_empty_records() {
+    fn block_at_height_resolves_from_tree_with_empty_records() -> TestResult {
         let genesis = genesis_block(Network::Regtest);
         let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let body_bytes = serialize(&genesis);
 
         // Seed an active tree with the genesis header.
         let mut tree = BlockTree::new();
-        tree.insert_header(genesis.header, NodeStatus::HeaderValid)
-            .expect("insert genesis header");
+        tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
         let tree = Arc::new(RwLock::new(tree));
-
-        // Durable body source that serves the genesis block.
-        struct FixedBody {
-            height: u32,
-            hash: Hash256,
-            bytes: Vec<u8>,
-        }
-        impl BlockBodySource for FixedBody {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
-                (self.height == height && self.hash == hash).then(|| self.bytes.clone())
-            }
-        }
-        let body_source = Arc::new(FixedBody {
-            height: 0,
-            hash: genesis_hash,
-            bytes: body_bytes,
-        });
 
         // Empty record vector — simulates post-checkpoint-restore state.
         let blocks: Arc<RwLock<Vec<BlockRecord>>> = Arc::new(RwLock::new(Vec::new()));
         let source = NodeBlockSource::new(blocks)
-            .with_block_body_source(body_source)
+            .with_block_body_source(Arc::new(FixedBody {
+                height: 0,
+                hash: genesis_hash,
+                bytes: body_bytes,
+            }))
             .with_block_tree(tree);
 
-        let decoded = source
-            .block_at_height(0)
-            .expect("tree-authoritative resolution must succeed with empty records");
+        let decoded = source.block_at_height(0).ok_or_else(|| {
+            std::io::Error::other("tree-authoritative resolution must succeed with empty records")
+        })?;
         assert_eq!(decoded.block_hash(), genesis.block_hash());
+        Ok(())
     }
 
     #[test]
-    fn block_at_height_tree_rejects_stale_cache_entry() {
+    fn block_at_height_tree_rejects_stale_cache_entry() -> TestResult {
         let genesis = genesis_block(Network::Regtest);
         let mut stale_block = genesis.clone();
         stale_block.header.nonce = stale_block.header.nonce.wrapping_add(1);
@@ -277,24 +290,13 @@ mod tests {
 
         // Tree says height 0 = correct_hash.
         let mut tree = BlockTree::new();
-        tree.insert_header(genesis.header, NodeStatus::HeaderValid)
-            .expect("insert genesis header");
+        tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
         let tree = Arc::new(RwLock::new(tree));
 
         // Record vector has a STALE entry at height 0 (different hash).
         let stale_record = BlockRecord::from_block(0, &stale_block);
         let blocks = Arc::new(RwLock::new(vec![stale_record]));
 
-        // Body source only serves the correct block.
-        struct CorrectBody {
-            hash: Hash256,
-            bytes: Vec<u8>,
-        }
-        impl BlockBodySource for CorrectBody {
-            fn block_body(&self, _height: u32, hash: Hash256) -> Option<Vec<u8>> {
-                (hash == self.hash).then(|| self.bytes.clone())
-            }
-        }
         let body_source = Arc::new(CorrectBody {
             hash: correct_hash,
             bytes: serialize(&genesis),
@@ -304,10 +306,13 @@ mod tests {
             .with_block_body_source(body_source)
             .with_block_tree(tree);
 
-        // Must resolve via body source (stale cache hash doesn't match tree).
-        let decoded = source
-            .block_at_height(0)
-            .expect("must fall through to body source when cache hash mismatches tree");
+        // Must resolve via body source (stale cache hash doesn’t match tree).
+        let decoded = source.block_at_height(0).ok_or_else(|| {
+            std::io::Error::other(
+                "must fall through to body source when cache hash mismatches tree",
+            )
+        })?;
         assert_eq!(decoded.block_hash(), genesis.block_hash());
+        Ok(())
     }
 }
