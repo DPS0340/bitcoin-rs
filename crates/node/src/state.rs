@@ -758,9 +758,7 @@ pub struct NodeState {
     /// Per-peer outbound message senders, keyed by remote socket address.
     /// External code pushes messages here; the per-connection thread drains
     /// and writes them to the peer's TCP stream.
-    peer_outbound: Arc<
-        RwLock<HashMap<std::net::SocketAddr, crossbeam_channel::Sender<bitcoin_rs_p2p::Message>>>,
-    >,
+    peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
     banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
     p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
@@ -1203,9 +1201,7 @@ impl NodeState {
     #[must_use]
     pub fn peer_outbound(
         &self,
-    ) -> Arc<
-        RwLock<HashMap<std::net::SocketAddr, crossbeam_channel::Sender<bitcoin_rs_p2p::Message>>>,
-    > {
+    ) -> Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>> {
         Arc::clone(&self.peer_outbound)
     }
     /// Returns a cloned sender that RPC `addnode` uses to request outbound P2P connections.
@@ -1596,12 +1592,12 @@ mod tests {
         let tx2 = state.inbound_headers_sender();
         tx1.send(bitcoin_rs_p2p::InboundHeaders {
             headers: Vec::new(),
-            source_peer: None,
+            source: None,
         })
         .map_err(|err| anyhow::anyhow!("send via tx1 failed: {err}"))?;
         tx2.send(bitcoin_rs_p2p::InboundHeaders {
             headers: Vec::new(),
-            source_peer: None,
+            source: None,
         })
         .map_err(|err| anyhow::anyhow!("send via tx2 failed: {err}"))?;
         Ok(())

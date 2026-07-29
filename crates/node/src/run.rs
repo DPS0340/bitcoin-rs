@@ -59,14 +59,8 @@ const DNS_BOOTSTRAP_REFILL_INTERVAL: Duration = Duration::from_secs(1);
 const DNS_BOOTSTRAP_FAST_REFILL_LIMIT: u8 = 2;
 
 type PeerRegistry = Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>;
-type PeerOutboundMap = Arc<
-    parking_lot::RwLock<
-        hashbrown::HashMap<
-            std::net::SocketAddr,
-            crossbeam_channel::Sender<bitcoin_rs_p2p::Message>,
-        >,
-    >,
->;
+type PeerOutboundMap =
+    Arc<parking_lot::RwLock<hashbrown::HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>;
 type BannedSubnets = Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>;
 type P2pChainQuery = Arc<dyn bitcoin_rs_p2p::ChainQuery>;
 type OutboundConnectionHandle =
@@ -173,11 +167,7 @@ fn spawn_p2p_listeners(
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,
     peer_registered: Arc<
-        dyn Fn(
-                SocketAddr,
-                crossbeam_channel::Sender<bitcoin_rs_p2p::Message>,
-                bitcoin_rs_p2p::PeerInfo,
-            ) -> bool
+        dyn Fn(SocketAddr, bitcoin_rs_p2p::PeerLease, bitcoin_rs_p2p::PeerInfo) -> bool
             + Send
             + Sync,
     >,
@@ -264,11 +254,7 @@ fn spawn_p2p_outbound_drain(
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,
     peer_registered: Arc<
-        dyn Fn(
-                SocketAddr,
-                crossbeam_channel::Sender<bitcoin_rs_p2p::Message>,
-                bitcoin_rs_p2p::PeerInfo,
-            ) -> bool
+        dyn Fn(SocketAddr, bitcoin_rs_p2p::PeerLease, bitcoin_rs_p2p::PeerInfo) -> bool
             + Send
             + Sync,
     >,
@@ -957,7 +943,9 @@ mod tests {
         for port in 10_000_u16..10_003 {
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
             let (tx, _rx) = crossbeam_channel::unbounded();
-            peer_outbound.write().insert(addr, tx);
+            peer_outbound
+                .write()
+                .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
         }
 
         let (dial_tx, dial_rx) = crossbeam_channel::unbounded();
@@ -1176,7 +1164,9 @@ mod tests {
         let peers: PeerRegistry = Arc::new(parking_lot::RwLock::new(Vec::new()));
         let peer_outbound: PeerOutboundMap = empty_peer_outbound();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         assert!(!outbound_addr_available(
             addr,

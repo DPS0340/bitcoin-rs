@@ -61,7 +61,9 @@ fn tick_sends_getheaders_to_best_peer_above_our_height() -> Result<(), Box<dyn s
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     peers.write().push(synthetic_peer(addr, 100));
     let (tx, rx) = unbounded::<Message>();
-    peer_outbound.write().insert(addr, tx);
+    peer_outbound
+        .write()
+        .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
     sync.tick();
 
@@ -112,7 +114,9 @@ fn tick_uses_applied_tip_height_when_selecting_sync_peer() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     peers.write().push(synthetic_peer(addr, 50));
     let (tx, rx) = unbounded::<Message>();
-    peer_outbound.write().insert(addr, tx);
+    peer_outbound
+        .write()
+        .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
     sync.tick();
 
@@ -323,7 +327,7 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
 
     inbound_headers_tx.send(bitcoin_rs_p2p::InboundHeaders {
         headers: vec![genesis.header, block_one.header, block_two.header],
-        source_peer: None,
+        source: None,
     })?;
     inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
         block_two.clone(),
@@ -381,7 +385,7 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
 
     inbound_headers_tx.send(bitcoin_rs_p2p::InboundHeaders {
         headers: fixture.blocks.iter().map(|block| block.header).collect(),
-        source_peer: None,
+        source: None,
     })?;
     for block in fixture.blocks.iter().skip(1) {
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))?;

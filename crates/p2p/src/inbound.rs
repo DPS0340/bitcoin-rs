@@ -1,5 +1,4 @@
 //! Inbound payloads received from peers.
-use std::net::SocketAddr;
 
 /// A block received from a peer with its wire payload preserved.
 ///
@@ -10,16 +9,16 @@ pub struct InboundBlock {
     pub block: bitcoin::Block,
     /// Wire-format block payload bytes.
     pub serialized: bytes::Bytes,
-    /// Network peer that delivered the block, or `None` for local injection.
-    pub source_peer: Option<SocketAddr>,
+    /// Delivering connection, or `None` for local injection.
+    pub source: Option<crate::PeerSource>,
 }
 
 /// A `headers` message batch and the peer that delivered it.
 pub struct InboundHeaders {
     /// Decoded headers, in wire order.
     pub headers: Vec<bitcoin::block::Header>,
-    /// Network peer that delivered the batch, or `None` for local injection.
-    pub source_peer: Option<SocketAddr>,
+    /// Delivering connection, or `None` for local injection.
+    pub source: Option<crate::PeerSource>,
 }
 
 impl InboundBlock {
@@ -32,7 +31,17 @@ impl InboundBlock {
         Self {
             block,
             serialized,
-            source_peer: None,
+            source: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn from_decoded_is_source_less() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+
+        assert!(super::InboundBlock::from_decoded(block).source.is_none());
     }
 }

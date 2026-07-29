@@ -19,9 +19,11 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin_rs_chain::{BlockTree, ChainError, NodeId, TipSnapshot};
-use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, Message, PeerInfo};
+#[cfg(test)]
+use bitcoin_rs_p2p::Message;
+use bitcoin_rs_p2p::{InboundBlock, InboundHeaders, PeerInfo, PeerLease};
 use bitcoin_rs_primitives::Hash256;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
@@ -138,7 +140,7 @@ const fn at_least_one(value: usize) -> usize {
 pub struct BlockSync {
     handles: crate::apply::ApplyHandles,
     peers: Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: Arc<RwLock<HashMap<SocketAddr, Sender<Message>>>>,
+    peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
     inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     download_window: Arc<Mutex<DownloadWindow>>,
@@ -272,7 +274,7 @@ impl BlockSync {
     pub fn new(
         handles: crate::apply::ApplyHandles,
         peers: Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: Arc<RwLock<HashMap<SocketAddr, Sender<Message>>>>,
+        peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         inbound_headers_rx: Arc<Mutex<Receiver<InboundHeaders>>>,
         inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     ) -> Self {
@@ -295,19 +297,27 @@ impl BlockSync {
     #[must_use]
     pub fn peer_registration_handle(
         &self,
-    ) -> Arc<dyn Fn(SocketAddr, Sender<Message>, PeerInfo) -> bool + Send + Sync> {
+    ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
         let window = Arc::clone(&self.download_window);
         let outbound = Arc::clone(&self.peer_outbound);
         let peers = Arc::clone(&self.peers);
-        Arc::new(move |peer_addr, sender, info| {
+        let pending_getheaders = Arc::clone(&self.pending_getheaders);
+        Arc::new(move |peer_addr, lease, info| {
             let mut window = window.lock();
             let mut outbound = outbound.write();
-            let replaced = outbound.contains_key(&peer_addr);
+            let replaced = outbound.remove(&peer_addr).is_some_and(|prior| {
+                prior.cancel();
+                true
+            });
             window.forget_peer(peer_addr);
-            outbound.insert(peer_addr, sender);
+            outbound.insert(peer_addr, lease);
             let mut peers = peers.write();
             peers.retain(|peer| peer.addr != peer_addr);
             peers.push(info);
+            let mut pending = pending_getheaders.lock();
+            if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+                *pending = None;
+            }
             replaced
         })
     }
@@ -372,11 +382,7 @@ impl BlockSync {
     fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
-        while let Ok(InboundHeaders {
-            headers,
-            source_peer,
-        }) = receiver.try_recv()
-        {
+        while let Ok(InboundHeaders { headers, source }) = receiver.try_recv() {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
             let acceptance = {
@@ -385,10 +391,17 @@ impl BlockSync {
             };
             match acceptance {
                 Ok(node_ids) => {
-                    if let Some(peer_addr) = source_peer {
-                        let mut pending = self.pending_getheaders.lock();
-                        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
-                            *pending = None;
+                    if let Some(source) = source {
+                        let _window = self.download_window.lock();
+                        let outbound = self.peer_outbound.read();
+                        if outbound
+                            .get(&source.addr)
+                            .is_some_and(|lease| lease.is_current(source))
+                        {
+                            let mut pending = self.pending_getheaders.lock();
+                            if pending.is_some_and(|request| request.peer_addr == source.addr) {
+                                *pending = None;
+                            }
                         }
                     }
                     tracing::debug!(
@@ -398,16 +411,27 @@ impl BlockSync {
                     );
                 }
                 Err(error) if is_peer_fault(&error) => {
-                    if let Some(peer_addr) = source_peer {
-                        self.peer_outbound.write().remove(&peer_addr);
-                        self.peers.write().retain(|peer| peer.addr != peer_addr);
-                        self.download_window
-                            .lock()
-                            .mark_peer_unresponsive(peer_addr, Instant::now());
-                        let mut pending = self.pending_getheaders.lock();
-                        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
-                            *pending = None;
+                    let mut blamed_peer = None;
+                    if let Some(source) = source {
+                        let mut window = self.download_window.lock();
+                        let mut outbound = self.peer_outbound.write();
+                        if outbound
+                            .get(&source.addr)
+                            .is_some_and(|lease| lease.is_current(source))
+                        {
+                            if let Some(removed) = outbound.remove(&source.addr) {
+                                removed.cancel();
+                            }
+                            self.peers.write().retain(|peer| peer.addr != source.addr);
+                            window.mark_peer_unresponsive(source.addr, Instant::now());
+                            let mut pending = self.pending_getheaders.lock();
+                            if pending.is_some_and(|request| request.peer_addr == source.addr) {
+                                *pending = None;
+                            }
+                            blamed_peer = Some(source.addr);
                         }
+                    }
+                    if let Some(peer_addr) = blamed_peer {
                         tracing::warn!(
                             peer_addr = %peer_addr,
                             received = batch_len,
@@ -418,7 +442,7 @@ impl BlockSync {
                         tracing::warn!(
                             received = batch_len,
                             %error,
-                            "block sync: rejected locally injected headers batch",
+                            "block sync: rejected source-less or stale headers batch",
                         );
                     }
                 }
@@ -564,7 +588,7 @@ impl BlockSync {
             let mut stager = self.block_stager.lock();
             for inbound in blocks.drain(..) {
                 let hash = Hash256::from_le_bytes(inbound.block.block_hash().as_byte_array());
-                let source_peer = inbound.source_peer;
+                let source = inbound.source;
                 let staged = stager.insert(
                     hash,
                     next_expected_hash,
@@ -572,7 +596,7 @@ impl BlockSync {
                     inbound.serialized,
                     now,
                 );
-                staged_blocks.push((hash, source_peer, staged));
+                staged_blocks.push((hash, source, staged));
             }
         }
 
@@ -580,7 +604,15 @@ impl BlockSync {
         let staged_count = staged_blocks.len();
         {
             let mut window = self.download_window.lock();
-            for (hash, source_peer, staged) in staged_blocks {
+            let outbound = self.peer_outbound.read();
+            for (hash, source, staged) in staged_blocks {
+                let source_peer = source
+                    .filter(|source| {
+                        outbound
+                            .get(&source.addr)
+                            .is_some_and(|lease| lease.is_current(*source))
+                    })
+                    .map(|source| source.addr);
                 match staged {
                     StagedBlock::AlreadyStaged => {
                         if let Some(source_peer) = source_peer {
@@ -1308,9 +1340,10 @@ impl BlockSync {
             (fired, cold_hedge)
         };
         if let Some(peer_addr) = fired {
-            if self.peer_outbound.write().remove(&peer_addr).is_none() {
+            let Some(removed) = self.peer_outbound.write().remove(&peer_addr) else {
                 return false;
-            }
+            };
+            removed.cancel();
             metrics::counter!("node.sync.staller_disconnects").increment(1);
             tracing::warn!(
                 peer_addr = %peer_addr,
@@ -1341,9 +1374,10 @@ impl BlockSync {
         let Some(peer_addr) = peer_addr else {
             return false;
         };
-        if self.peer_outbound.write().remove(&peer_addr).is_none() {
+        let Some(removed) = self.peer_outbound.write().remove(&peer_addr) else {
             return false;
-        }
+        };
+        removed.cancel();
         metrics::counter!("node.sync.pending_timeout_disconnects").increment(1);
         tracing::warn!(
             peer_addr = %peer_addr,
@@ -1418,7 +1452,7 @@ mod tests {
     use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
     use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-    use bitcoin_rs_p2p::PeerInfo;
+    use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource};
     use bitcoin_rs_primitives::Hash256;
     use bitcoin_rs_storage::StorageError;
     use bitcoin_rs_utxo::UtxoSet;
@@ -1476,7 +1510,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -1529,7 +1565,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 3));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -1554,9 +1592,10 @@ mod tests {
             .extend([synthetic_peer(low_addr, 2), synthetic_peer(high_addr, 8)]);
         let (low_tx, low_rx) = unbounded::<Message>();
         let (high_tx, high_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(low_addr, low_tx), (high_addr, high_tx)]);
+        peer_outbound.write().extend([
+            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
+            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
+        ]);
 
         sync.tick();
 
@@ -1589,7 +1628,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 8));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -1640,7 +1681,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 8));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -1651,7 +1694,7 @@ mod tests {
         let header = test_header(genesis.block_hash(), 1);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![header],
-            source_peer: Some(addr),
+            source: Some(current_source(&peer_outbound, addr)),
         })?;
         sync.tick();
         let second = rx.try_recv()?;
@@ -1704,7 +1747,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 8));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
         let first = rx.try_recv()?;
@@ -1719,7 +1764,7 @@ mod tests {
         let orphan = test_header(orphan_prev, 5);
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![orphan],
-            source_peer: Some(addr),
+            source: Some(current_source(&peer_outbound, addr)),
         })?;
         sync.tick();
         assert!(
@@ -1751,7 +1796,9 @@ mod tests {
         // Seed only the invalid peer so the first tick routes a GetHeaders to
         // it and arms the pending gate against its address.
         peers.write().push(synthetic_peer(invalid_peer, 9));
-        peer_outbound.write().insert(invalid_peer, invalid_tx);
+        peer_outbound
+            .write()
+            .insert(invalid_peer, bitcoin_rs_p2p::PeerLease::new(invalid_tx));
 
         sync.tick();
         assert!(
@@ -1771,7 +1818,7 @@ mod tests {
         // `pending_getheaders` ends up clear is the peer-fault cleanup.
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
-            source_peer: Some(invalid_peer),
+            source: Some(current_source(&peer_outbound, invalid_peer)),
         })?;
         sync.tick();
 
@@ -1790,7 +1837,9 @@ mod tests {
 
         // Re-introduce a healthy peer; the next getheaders must rotate to it.
         peers.write().push(synthetic_peer(other_peer, 8));
-        peer_outbound.write().insert(other_peer, other_tx);
+        peer_outbound
+            .write()
+            .insert(other_peer, bitcoin_rs_p2p::PeerLease::new(other_tx));
         sync.tick();
         assert!(
             peers.read().iter().any(|peer| peer.addr == other_peer),
@@ -1823,10 +1872,12 @@ mod tests {
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(peer_addr, 8));
         let (tx, _rx) = unbounded::<Message>();
-        peer_outbound.write().insert(peer_addr, tx);
+        peer_outbound
+            .write()
+            .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![test_header(BlockHash::from_byte_array([0x11; 32]), 1)],
-            source_peer: Some(peer_addr),
+            source: Some(current_source(&peer_outbound, peer_addr)),
         })?;
 
         sync.tick();
@@ -1855,10 +1906,12 @@ mod tests {
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(peer_addr, 8));
         let (tx, _rx) = unbounded::<Message>();
-        peer_outbound.write().insert(peer_addr, tx);
+        peer_outbound
+            .write()
+            .insert(peer_addr, bitcoin_rs_p2p::PeerLease::new(tx));
         inbound_headers_tx.send(InboundHeaders {
             headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
-            source_peer: None,
+            source: None,
         })?;
 
         sync.tick();
@@ -1893,9 +1946,10 @@ mod tests {
             .extend([synthetic_peer(low_addr, 4), synthetic_peer(high_addr, 8)]);
         let (low_tx, low_rx) = unbounded::<Message>();
         let (high_tx, high_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(low_addr, low_tx), (high_addr, high_tx)]);
+        peer_outbound.write().extend([
+            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
+            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
+        ]);
 
         sync.tick();
 
@@ -1921,9 +1975,10 @@ mod tests {
         ]);
         let (first_tx, first_rx) = unbounded::<Message>();
         let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(first_addr, first_tx), (second_addr, second_tx)]);
+        peer_outbound.write().extend([
+            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
+            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
+        ]);
 
         sync.tick();
 
@@ -1958,7 +2013,9 @@ mod tests {
         let first_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(first_addr, 100));
         let (first_tx, first_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(first_addr, first_tx);
+        peer_outbound
+            .write()
+            .insert(first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx));
 
         sync.tick();
 
@@ -1975,7 +2032,9 @@ mod tests {
         let second_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
         peers.write().push(synthetic_peer(second_addr, 100));
         let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(second_addr, second_tx);
+        peer_outbound
+            .write()
+            .insert(second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx));
 
         sync.tick();
 
@@ -2009,7 +2068,9 @@ mod tests {
         let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
         peers.write().push(synthetic_peer(stale_addr, 100));
         let (stale_tx, stale_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(stale_addr, stale_tx);
+        peer_outbound
+            .write()
+            .insert(stale_addr, bitcoin_rs_p2p::PeerLease::new(stale_tx));
 
         sync.tick();
 
@@ -2025,7 +2086,9 @@ mod tests {
 
         peers.write().push(synthetic_peer(healthy_addr, 100));
         let (healthy_tx, healthy_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(healthy_addr, healthy_tx);
+        peer_outbound
+            .write()
+            .insert(healthy_addr, bitcoin_rs_p2p::PeerLease::new(healthy_tx));
 
         sync.tick();
 
@@ -2062,7 +2125,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2108,9 +2173,10 @@ mod tests {
         ]);
         let (first_tx, first_rx) = unbounded::<Message>();
         let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(first_addr, first_tx), (second_addr, second_tx)]);
+        peer_outbound.write().extend([
+            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
+            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
+        ]);
 
         sync.tick();
 
@@ -2203,7 +2269,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2262,7 +2330,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2312,7 +2382,9 @@ mod tests {
         assert_eq!(sync.download_window.lock().pending_len(), 0);
 
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2335,7 +2407,9 @@ mod tests {
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
         drop(rx);
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2352,7 +2426,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2450,7 +2526,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2498,7 +2576,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2525,7 +2605,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -2565,9 +2647,10 @@ mod tests {
         ]);
         let (first_tx, first_rx) = unbounded::<Message>();
         let (second_tx, second_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(first_addr, first_tx), (second_addr, second_tx)]);
+        peer_outbound.write().extend([
+            (first_addr, bitcoin_rs_p2p::PeerLease::new(first_tx)),
+            (second_addr, bitcoin_rs_p2p::PeerLease::new(second_tx)),
+        ]);
 
         sync.tick();
 
@@ -3279,7 +3362,7 @@ mod tests {
 
         for block in &blocks[..4] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source_peer = Some(alternate);
+            inbound.source = Some(current_source(&peer_outbound, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -3340,7 +3423,7 @@ mod tests {
         let _ = next_getdata(&alternate_rx)?;
         for block in &blocks[..4] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source_peer = Some(alternate);
+            inbound.source = Some(current_source(&peer_outbound, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -3360,7 +3443,7 @@ mod tests {
         }
         for block in &blocks[4..8] {
             let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone());
-            inbound.source_peer = Some(alternate);
+            inbound.source = Some(current_source(&peer_outbound, alternate));
             blocks_tx.send(inbound)?;
         }
         sync.tick();
@@ -3609,13 +3692,13 @@ mod tests {
 
         // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source_peer = Some(staller);
+        inbound.source = Some(current_source(&peer_outbound, staller));
         blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         std::thread::sleep(Duration::from_millis(60));
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
-        inbound.source_peer = Some(staller);
+        inbound.source = Some(current_source(&peer_outbound, staller));
         blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
@@ -3628,7 +3711,7 @@ mod tests {
         // The successor (block 4) arrives, the new front (block 3) never
         // does: wedge + episode on the staller, which owns the whole stripe.
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
-        inbound.source_peer = Some(staller);
+        inbound.source = Some(current_source(&peer_outbound, staller));
         blocks_tx.send(inbound)?;
         sync.tick();
         assert_eq!(
@@ -3660,9 +3743,11 @@ mod tests {
         // reconnected staller stays in cooldown and receives no block
         // requests.
         let (staller_tx2, staller_rx2) = unbounded::<Message>();
-        peer_outbound.write().insert(staller, staller_tx2);
+        peer_outbound
+            .write()
+            .insert(staller, bitcoin_rs_p2p::PeerLease::new(staller_tx2));
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
-        inbound.source_peer = Some(honest);
+        inbound.source = Some(current_source(&peer_outbound, honest));
         blocks_tx.send(inbound)?;
         sync.tick();
         // The re-request narrowed the expected-apply cache to the front, so
@@ -4015,13 +4100,13 @@ mod tests {
 
         // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
-        inbound.source_peer = Some(sole);
+        inbound.source = Some(current_source(&peer_outbound, sole));
         blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         std::thread::sleep(Duration::from_millis(60));
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
-        inbound.source_peer = Some(sole);
+        inbound.source = Some(current_source(&peer_outbound, sole));
         blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
@@ -4034,7 +4119,7 @@ mod tests {
         // The successor (block 4) arrives, the new front (block 3) never
         // does: wedge + episode on the sole peer.
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
-        inbound.source_peer = Some(sole);
+        inbound.source = Some(current_source(&peer_outbound, sole));
         blocks_tx.send(inbound)?;
         sync.tick();
         assert!(sync.download_window.lock().stalling_peer().is_some());
@@ -4054,7 +4139,9 @@ mod tests {
         // Net-layer re-dial: the same address reconnects and, being the only
         // candidate, serves as the last resort despite the cooldown.
         let (tx2, rx2) = unbounded::<Message>();
-        peer_outbound.write().insert(sole, tx2);
+        peer_outbound
+            .write()
+            .insert(sole, bitcoin_rs_p2p::PeerLease::new(tx2));
         sync.tick();
         let retry = next_getdata(&rx2)?;
         assert_eq!(
@@ -4063,7 +4150,7 @@ mod tests {
         );
 
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
-        inbound.source_peer = Some(sole);
+        inbound.source = Some(current_source(&peer_outbound, sole));
         blocks_tx.send(inbound)?;
         sync.tick();
         // The re-request narrowed the expected-apply cache to the front, so
@@ -4335,9 +4422,10 @@ mod tests {
             .extend([synthetic_peer(high_addr, 8), synthetic_peer(low_addr, 2)]);
         let (high_tx, high_rx) = unbounded::<Message>();
         let (low_tx, low_rx) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .extend([(high_addr, high_tx), (low_addr, low_tx)]);
+        peer_outbound.write().extend([
+            (high_addr, bitcoin_rs_p2p::PeerLease::new(high_tx)),
+            (low_addr, bitcoin_rs_p2p::PeerLease::new(low_tx)),
+        ]);
 
         sync.tick();
 
@@ -4368,7 +4456,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 2));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4400,7 +4490,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 3));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4423,7 +4515,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 200));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         let mut requested = Vec::new();
         let ticks = super::PENDING_BUDGET / super::GETDATA_BATCH_SIZE;
@@ -4467,7 +4561,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4505,7 +4601,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4549,7 +4647,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4613,7 +4713,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(genesis))?;
 
         sync.tick();
@@ -4711,7 +4813,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4799,7 +4903,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         sync.tick();
 
@@ -4991,7 +5097,9 @@ mod tests {
         let healthy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
         peers.write().push(synthetic_peer(stalled_addr, 100));
         let (stalled_tx, stalled_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(stalled_addr, stalled_tx);
+        peer_outbound
+            .write()
+            .insert(stalled_addr, bitcoin_rs_p2p::PeerLease::new(stalled_tx));
 
         sync.tick();
 
@@ -5014,7 +5122,9 @@ mod tests {
 
         peers.write().push(synthetic_peer(healthy_addr, 100));
         let (healthy_tx, healthy_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(healthy_addr, healthy_tx);
+        peer_outbound
+            .write()
+            .insert(healthy_addr, bitcoin_rs_p2p::PeerLease::new(healthy_tx));
 
         Ok(ExhaustionFixture {
             sync,
@@ -5165,7 +5275,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
         peers.write().push(synthetic_peer(addr, 100));
         let (tx, outbound_rx) = unbounded::<Message>();
-        peer_outbound.write().insert(addr, tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(tx));
 
         Ok(DeterministicProxyFixture {
             sync,
@@ -5643,7 +5755,7 @@ mod tests {
     type SyncFixture = (
         BlockSync,
         Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         Arc<RwLock<BlockTree>>,
         Arc<ArcSwapOption<TipSnapshot>>,
         Vec<BlockHash>,
@@ -5715,7 +5827,7 @@ mod tests {
     type MinedChainFixture = (
         BlockSync,
         Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         Arc<ArcSwapOption<TipSnapshot>>,
         Vec<bitcoin::Block>,
         InboundBlockSender,
@@ -5776,7 +5888,7 @@ mod tests {
     type WedgeFixture = (
         BlockSync,
         Arc<RwLock<Vec<PeerInfo>>>,
-        Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+        Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         Vec<BlockHash>,
         Vec<crossbeam_channel::Receiver<Message>>,
         InboundBlockSender,
@@ -6229,7 +6341,7 @@ mod tests {
         sync: BlockSync,
         inbound_headers_tx: crossbeam_channel::Sender<InboundHeaders>,
         peers: Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+        peer_outbound: Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
     }
 
     fn header_sync_with_genesis() -> Result<HeaderSyncFixture, Box<dyn std::error::Error>> {
@@ -6357,6 +6469,157 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn stale_queued_block_keeps_payload_without_peer_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _applied_tip, blocks, _blocks_tx) =
+            sync_with_mined_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_450));
+        peers.write().push(synthetic_peer(addr, 10));
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peer_outbound.write().insert(addr, old.clone());
+        sync.tick();
+        let _ = next_getdata(&old_rx)?;
+        let stale_source = old.source(addr);
+
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        assert!(sync.peer_registration_handle()(
+            addr,
+            replacement,
+            synthetic_peer(addr, 10),
+        ));
+        sync.tick();
+        let _ = next_getdata(&replacement_rx)?;
+        let observed_at = Instant::now() + super::PENDING_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(
+            sync.download_window
+                .lock()
+                .observe_pending_timeout(false, observed_at),
+            None
+        );
+
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
+        inbound.source = Some(stale_source);
+        sync.buffer_received_block_chunk(&mut vec![inbound], None);
+
+        assert_eq!(sync.block_stager.lock().received_len(), 1);
+        assert_eq!(
+            sync.download_window
+                .lock()
+                .observe_pending_timeout(false, observed_at),
+            Some(addr),
+            "stale delivery must not clear the replacement's timeout observation"
+        );
+
+        let (control, control_peers, control_outbound, _tip, control_blocks, _tx) =
+            sync_with_mined_chain(1)?;
+        control_peers.write().push(synthetic_peer(addr, 10));
+        let (control_tx, control_rx) = unbounded::<Message>();
+        let control_lease = PeerLease::new(control_tx);
+        control_outbound.write().insert(addr, control_lease.clone());
+        control.tick();
+        let _ = next_getdata(&control_rx)?;
+        assert_eq!(
+            control
+                .download_window
+                .lock()
+                .observe_pending_timeout(false, observed_at),
+            None
+        );
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(control_blocks[0].clone());
+        inbound.source = Some(control_lease.source(addr));
+        control.buffer_received_block_chunk(&mut vec![inbound], None);
+        assert_eq!(
+            control
+                .download_window
+                .lock()
+                .observe_pending_timeout(false, observed_at),
+            None,
+            "current delivery must receive credit and clear its timeout observation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_invalid_headers_cannot_evict_or_clear_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            genesis,
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+        } = header_sync_with_genesis()?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_451));
+        peers.write().push(synthetic_peer(addr, 10));
+        let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peer_outbound.write().insert(addr, old.clone());
+        let stale_source = old.source(addr);
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        assert!(sync.peer_registration_handle()(
+            addr,
+            replacement.clone(),
+            synthetic_peer(addr, 10),
+        ));
+        sync.tick();
+        assert!(matches!(
+            replacement_rx.try_recv()?,
+            NetworkMessage::GetHeaders(_)
+        ));
+
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            source: Some(stale_source),
+        })?;
+        sync.drain_inbound_headers();
+
+        assert!(!replacement.is_cancelled());
+        assert!(peer_outbound.read().contains_key(&addr));
+        assert!(peers.read().iter().any(|peer| peer.addr == addr));
+        assert!(
+            sync.pending_getheaders
+                .lock()
+                .is_some_and(|request| request.peer_addr == addr)
+        );
+        assert!(
+            !sync
+                .download_window
+                .lock()
+                .peer_in_staller_cooldown(addr, Instant::now())
+        );
+
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![nbits_mismatch_header(genesis.block_hash(), 1)],
+            source: Some(replacement.source(addr)),
+        })?;
+        sync.drain_inbound_headers();
+
+        assert!(replacement.is_cancelled());
+        assert!(!peer_outbound.read().contains_key(&addr));
+        assert!(!peers.read().iter().any(|peer| peer.addr == addr));
+        assert!(sync.pending_getheaders.lock().is_none());
+        assert!(
+            sync.download_window
+                .lock()
+                .peer_in_staller_cooldown(addr, Instant::now())
+        );
+        Ok(())
+    }
+
+    fn current_source(
+        peer_outbound: &Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
+        addr: SocketAddr,
+    ) -> PeerSource {
+        match peer_outbound.read().get(&addr) {
+            Some(lease) => lease.source(addr),
+            None => panic!("test peer {addr} must be connected"),
+        }
+    }
+
     fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
         PeerInfo {
             addr,
@@ -6377,7 +6640,9 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
         let (old_tx, _old_rx) = unbounded::<Message>();
         peers.write().push(synthetic_peer(addr, 1));
-        peer_outbound.write().insert(addr, old_tx);
+        peer_outbound
+            .write()
+            .insert(addr, bitcoin_rs_p2p::PeerLease::new(old_tx));
         let now = Instant::now();
         sync.download_window
             .lock()
@@ -6385,16 +6650,17 @@ mod tests {
 
         let registration = sync.peer_registration_handle();
         let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
         assert!(registration(
             addr,
-            replacement_tx.clone(),
+            replacement.clone(),
             synthetic_peer(addr, 2),
         ));
         assert!(
             peer_outbound
                 .read()
                 .get(&addr)
-                .is_some_and(|current| current.same_channel(&replacement_tx))
+                .is_some_and(|current| current.same_connection(&replacement))
         );
         assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
 
@@ -6404,12 +6670,17 @@ mod tests {
         peer_outbound.write().remove(&addr);
 
         let (new_tx, _new_rx) = unbounded::<Message>();
-        assert!(!registration(addr, new_tx.clone(), synthetic_peer(addr, 3),));
+        let new_lease = PeerLease::new(new_tx);
+        assert!(!registration(
+            addr,
+            new_lease.clone(),
+            synthetic_peer(addr, 3),
+        ));
         assert!(
             peer_outbound
                 .read()
                 .get(&addr)
-                .is_some_and(|current| current.same_channel(&new_tx))
+                .is_some_and(|current| current.same_connection(&new_lease))
         );
         assert_eq!(&*peers.read(), &[synthetic_peer(addr, 3)]);
         assert!(
@@ -6437,11 +6708,13 @@ mod tests {
 
     fn connect_peer(
         peers: &Arc<RwLock<Vec<PeerInfo>>>,
-        peer_outbound: &Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+        peer_outbound: &Arc<RwLock<HashMap<SocketAddr, PeerLease>>>,
         info: PeerInfo,
     ) -> crossbeam_channel::Receiver<Message> {
         let (tx, rx) = unbounded::<Message>();
-        peer_outbound.write().insert(info.addr, tx);
+        peer_outbound
+            .write()
+            .insert(info.addr, bitcoin_rs_p2p::PeerLease::new(tx));
         peers.write().push(info);
         rx
     }
