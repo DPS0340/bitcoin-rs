@@ -851,6 +851,16 @@ impl DownloadWindow {
         alternate: SocketAddr,
         hash: Hash256,
     ) {
+        if !matches!(
+            self.cold_front,
+            Some(ColdFrontState::Waiting {
+                owner: waiting_owner,
+                hash: waiting_hash,
+                ..
+            }) if waiting_owner == owner && waiting_hash == hash
+        ) {
+            return;
+        }
         if !self.cold_hedged_fronts.contains(&hash) {
             if self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES {
                 return;
@@ -945,10 +955,10 @@ impl DownloadWindow {
                 .is_some_and(|(planned_owner, planned_hashes, _)| {
                     planned_owner == owner && planned_hashes == hashes
                 });
-        self.prefix_probe_attempted_owner = Some(owner);
         if !valid_plan {
             return;
         }
+        self.prefix_probe_attempted_owner = Some(owner);
         let mut racers = HashMap::with_capacity(alternates.len().saturating_add(1));
         racers.insert(owner, 0);
         racers.extend(alternates.iter().copied().map(|peer| (peer, 0)));
@@ -3705,6 +3715,45 @@ mod tests {
         assert!(window.next_pending_deadline.is_some());
         assert!(window.peer_in_staller_cooldown(owner, now));
         Ok(())
+    }
+
+    #[test]
+    fn stale_cold_hedge_confirmation_after_forget_does_not_blame_replacement() {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let front = hash(0x51);
+        let mut window = DownloadWindow::new(stall_budget());
+        insert_pending(&mut window, owner, front, 1, now);
+        assert_eq!(window.observe_cold_front(1, false, now), None);
+
+        window.forget_peer(owner);
+        window.confirm_cold_front_hedge(owner, alternate, front);
+        window.mark_received_from(front, 80, Some(alternate), now);
+
+        assert!(window.cold_front.is_none());
+        assert!(window.cold_hedged_fronts.is_empty());
+        assert_eq!(window.preferred_peer(), None);
+        assert!(!window.peer_in_staller_cooldown(owner, now));
+    }
+
+    #[test]
+    fn stale_prefix_confirmation_after_forget_does_not_install_probe_or_gate() {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let mut window = DownloadWindow::new(test_budget());
+        for byte in 1..=super::PREFIX_PROBE_WIN_BLOCKS as u8 {
+            insert_pending(&mut window, owner, hash(byte), u32::from(byte), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .expect("contiguous owner should produce a prefix plan");
+
+        window.forget_peer(owner);
+        window.confirm_prefix_probe(planned_owner, hashes, &[healthy_addr()], now);
+
+        assert!(window.prefix_probe.is_none());
+        assert!(window.prefix_probe_attempted_owner.is_none());
     }
 
     #[test]

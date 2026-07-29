@@ -1004,9 +1004,8 @@ impl BlockSync {
     /// Every alternate receives the same earliest hashes, so the probe cannot
     /// create a unique out-of-order height hole. It runs once per deep owner.
     fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
-        let Some((owner, hashes, required_height)) =
-            self.download_window.lock().prefix_probe_plan()
-        else {
+        let mut window = self.download_window.lock();
+        let Some((owner, hashes, required_height)) = window.prefix_probe_plan() else {
             return;
         };
         let candidates = probe_peers.iter().filter(|peer| {
@@ -1030,17 +1029,16 @@ impl BlockSync {
         if successful.is_empty() {
             return;
         }
+        let block_count = hashes.len();
+        window.confirm_prefix_probe(owner, hashes, &successful, now);
         metrics::counter!("node.sync.prefix_probe_peers")
             .increment(u64::try_from(successful.len()).unwrap_or(u64::MAX));
         tracing::info!(
             owner = %owner,
             alternates = successful.len(),
-            blocks = hashes.len(),
+            blocks = block_count,
             "block sync: started common-prefix peer probe"
         );
-        self.download_window
-            .lock()
-            .confirm_prefix_probe(owner, hashes, &successful, now);
     }
 
     fn send_getdata_for_pending_blocks(
@@ -1058,7 +1056,8 @@ impl BlockSync {
 
         let now = Instant::now();
         let tree = self.handles.block_tree.read();
-        let request = self.download_window.lock().next_peer_request(
+        let mut window = self.download_window.lock();
+        let request = window.next_peer_request(
             sync_peer_addr,
             allow_expired_retry_from_peer,
             chain_tip,
@@ -1122,7 +1121,7 @@ impl BlockSync {
                 hashes: expected_hashes,
             });
         }
-        let has_request_capacity = self.download_window.lock().mark_requested(&request, now);
+        let has_request_capacity = window.mark_requested(&request, now);
         metrics::histogram!("node.sync.getdata_batch_size").record(metric_count(count));
         tracing::debug!(
             peer_addr = %request.peer_addr(),
@@ -1144,6 +1143,7 @@ impl BlockSync {
         };
         let target_height = u32::try_from(target_height).unwrap_or(0);
         let now = Instant::now();
+        let _window = self.download_window.lock();
         if self.has_pending_getheaders(sync_peer_addr, locator_tip_hash, target_height, now) {
             tracing::trace!(
                 peer_addr = %sync_peer_addr,
