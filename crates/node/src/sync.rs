@@ -6903,7 +6903,14 @@ mod tests {
 
         let (paused_tx, paused_rx) = unbounded();
         let (resume_tx, resume_rx) = unbounded();
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (registration_inside_tx, registration_inside_rx) = unbounded();
         let dispatch_sync = Arc::clone(&sync);
+        let dispatch_window = Arc::clone(&sync.download_window);
+        let dispatch_registration = Arc::clone(&registration);
+        let dispatch_replacement = replacement.clone();
         let dispatch = std::thread::spawn(move || {
             dispatch_sync.send_getdata_for_pending_blocks_after_selection(
                 addr,
@@ -6911,7 +6918,25 @@ mod tests {
                 10,
                 &chain_tip,
                 &applied_tip,
-                |_| {
+                move |_| {
+                    let replacement_ran_inside = match dispatch_window.try_lock() {
+                        None => false,
+                        Some(window_guard) => {
+                            drop(window_guard);
+                            assert!(
+                                dispatch_registration(
+                                    addr,
+                                    dispatch_replacement,
+                                    synthetic_peer(addr, 10),
+                                ),
+                                "test mutation must replace the original peer inside the getdata gap"
+                            );
+                            true
+                        }
+                    };
+                    registration_inside_tx
+                        .send(replacement_ran_inside)
+                        .expect("test must observe whether registration entered the getdata gap");
                     paused_tx
                         .send(())
                         .expect("test must observe getdata selection");
@@ -6920,30 +6945,6 @@ mod tests {
             )
         });
         paused_rx.recv()?;
-
-        let registration = sync.peer_registration_handle();
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        let (started_tx, started_rx) = unbounded();
-        let (registered_tx, registered_rx) = unbounded();
-        let registered = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test must observe registration start");
-            registered_tx
-                .send(registration(
-                    addr,
-                    replacement.clone(),
-                    synthetic_peer(addr, 10),
-                ))
-                .expect("test must observe registration completion");
-        });
-        started_rx.recv()?;
-        assert!(
-            registered_rx.try_recv().is_err(),
-            "same-address registration must remain behind the getdata window transaction"
-        );
-
         resume_tx.send(())?;
         assert!(
             dispatch
@@ -6951,10 +6952,22 @@ mod tests {
                 .map_err(|_| "getdata dispatch thread panicked")?
                 .sent
         );
-        registered
-            .join()
-            .map_err(|_| "registration thread panicked")?;
-        assert!(registered_rx.recv()?);
+        let replacement_ran_inside = registration_inside_rx.recv()?;
+        if replacement_ran_inside {
+            assert!(
+                matches!(replacement_rx.try_recv()?, NetworkMessage::GetData(_)),
+                "registration inside the getdata gap must route the in-flight request to replacement"
+            );
+            return Err(std::io::Error::other(
+                "getdata dispatch routed its in-flight request to a same-address replacement",
+            )
+            .into());
+        }
+        assert!(registration(
+            addr,
+            replacement.clone(),
+            synthetic_peer(addr, 10)
+        ));
         assert_eq!(witness_block_inventory(next_getdata(&old_rx)?)?, expected);
         assert!(replacement_rx.try_recv().is_err());
         assert!(old.is_cancelled());
@@ -7007,9 +7020,34 @@ mod tests {
         peer_outbound.write().insert(addr, old.clone());
         let (paused_tx, paused_rx) = unbounded();
         let (resume_tx, resume_rx) = unbounded();
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (registration_inside_tx, registration_inside_rx) = unbounded();
         let dispatch_sync = Arc::clone(&sync);
+        let dispatch_window = Arc::clone(&sync.download_window);
+        let dispatch_registration = Arc::clone(&registration);
+        let dispatch_replacement = replacement.clone();
         let dispatch = std::thread::spawn(move || {
-            dispatch_sync.send_getheaders_after_window(addr, 0, 10, |_| {
+            dispatch_sync.send_getheaders_after_window(addr, 0, 10, move |_| {
+                let replacement_ran_inside = match dispatch_window.try_lock() {
+                    None => false,
+                    Some(window_guard) => {
+                        drop(window_guard);
+                        assert!(
+                            dispatch_registration(
+                                addr,
+                                dispatch_replacement,
+                                synthetic_peer(addr, 10),
+                            ),
+                            "test mutation must replace the original peer inside the getheaders gap"
+                        );
+                        true
+                    }
+                };
+                registration_inside_tx
+                    .send(replacement_ran_inside)
+                    .expect("test must observe whether registration entered the getheaders gap");
                 paused_tx
                     .send(())
                     .expect("test must observe getheaders barrier");
@@ -7019,36 +7057,26 @@ mod tests {
             });
         });
         paused_rx.recv()?;
-        let registration = sync.peer_registration_handle();
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        let (started_tx, started_rx) = unbounded();
-        let (registered_tx, registered_rx) = unbounded();
-        let registered = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test must observe registration start");
-            registered_tx
-                .send(registration(
-                    addr,
-                    replacement.clone(),
-                    synthetic_peer(addr, 10),
-                ))
-                .expect("test must observe registration completion");
-        });
-        started_rx.recv()?;
-        assert!(
-            registered_rx.try_recv().is_err(),
-            "same-address registration must remain behind the getheaders window transaction"
-        );
         resume_tx.send(())?;
         dispatch
             .join()
             .map_err(|_| "getheaders dispatch thread panicked")?;
-        registered
-            .join()
-            .map_err(|_| "registration thread panicked")?;
-        assert!(registered_rx.recv()?);
+        let replacement_ran_inside = registration_inside_rx.recv()?;
+        if replacement_ran_inside {
+            assert!(
+                matches!(replacement_rx.try_recv()?, NetworkMessage::GetHeaders(_)),
+                "registration inside the getheaders gap must route the in-flight request to replacement"
+            );
+            return Err(std::io::Error::other(
+                "getheaders dispatch routed its in-flight request to a same-address replacement",
+            )
+            .into());
+        }
+        assert!(registration(
+            addr,
+            replacement.clone(),
+            synthetic_peer(addr, 10)
+        ));
         assert!(matches!(old_rx.try_recv()?, NetworkMessage::GetHeaders(_)));
         assert!(sync.pending_getheaders.lock().is_none());
         sync.tick();
