@@ -126,9 +126,23 @@ impl NodeP2pChainQuery {
             active_height(&tree, tree.tip()?.tip_id, hash)?
         };
         let hash256 = hash256(hash);
-        let blocks = self.blocks.read();
-        let record = record_at_height_and_hash(&blocks, current_height, hash256)?;
-        let bytes = self.block_body_bytes(record)?;
+        let cached = self
+            .blocks
+            .read()
+            .iter()
+            .find(|record| {
+                record.height == current_height
+                    && record.hash == hash256
+                    && !record.block_hex.is_empty()
+            })
+            .map(|record| record.block_hex.clone());
+        let bytes = match cached {
+            Some(hex) => Vec::<u8>::from_hex(&hex).ok()?,
+            None => self
+                .block_body_source
+                .as_ref()?
+                .block_body(current_height, hash256)?,
+        };
         let block = deserialize::<bitcoin::Block>(&bytes).ok()?;
         if block.block_hash() != hash {
             return None;
@@ -136,38 +150,6 @@ impl NodeP2pChainQuery {
         let tree = self.block_tree.read();
         (active_height(&tree, tree.tip()?.tip_id, hash) == Some(current_height)).then_some(block)
     }
-
-    fn block_body_bytes(&self, record: &BlockRecord) -> Option<Vec<u8>> {
-        if !record.block_hex.is_empty() {
-            return Vec::<u8>::from_hex(&record.block_hex).ok();
-        }
-        self.block_body_source
-            .as_ref()?
-            .block_body(record.height, record.hash)
-    }
-}
-
-fn record_at_height_and_hash(
-    records: &[BlockRecord],
-    height: u32,
-    hash: Hash256,
-) -> Option<&BlockRecord> {
-    let mut index = records
-        .binary_search_by_key(&height, |record| record.height)
-        .ok()?;
-    while index > 0 && records[index.saturating_sub(1)].height == height {
-        index = index.saturating_sub(1);
-    }
-    while let Some(record) = records.get(index) {
-        if record.height != height {
-            break;
-        }
-        if record.hash == hash {
-            return Some(record);
-        }
-        index = index.saturating_add(1);
-    }
-    None
 }
 
 fn header_for_active_stop(

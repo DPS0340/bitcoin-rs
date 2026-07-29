@@ -11,8 +11,8 @@ use bitcoin::hex::FromHex as _;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_rpc::{
-    BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService, PruneServiceError,
-    PruneStatus, ZmqNotification,
+    BlockBodyMetadata, BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService,
+    PruneServiceError, PruneStatus, ZmqNotification,
 };
 use compact_str::CompactString;
 use core::fmt;
@@ -347,6 +347,21 @@ impl BlockBodySource for StoredBlockBodySource {
     fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
         self.store.load_block_body(height, hash).ok().flatten()
     }
+
+    fn block_body_metadata(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<BlockBodyMetadata> {
+        self.store
+            .block_body_metadata(height, hash)
+            .ok()
+            .flatten()
+            .map(|(body_size, tx_count)| BlockBodyMetadata {
+                body_size,
+                tx_count,
+            })
+    }
 }
 
 const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
@@ -552,9 +567,11 @@ impl TxIndexStorage {
         &self,
         blocks: Arc<RwLock<Vec<bitcoin_rs_rpc::BlockRecord>>>,
         block_body_source: Arc<dyn BlockBodySource>,
+        block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
     ) -> Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> {
-        let block_source =
-            crate::NodeBlockSource::new(blocks).with_block_body_source(block_body_source);
+        let block_source = crate::NodeBlockSource::new(blocks)
+            .with_block_body_source(block_body_source)
+            .with_block_tree(block_tree);
         match self {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => {
@@ -1077,9 +1094,13 @@ impl NodeState {
     pub fn electrum_history_reader(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
-        self.tx_index_storage
-            .as_ref()
-            .map(|storage| storage.electrum_history_reader(self.blocks(), self.block_body_source()))
+        self.tx_index_storage.as_ref().map(|storage| {
+            storage.electrum_history_reader(
+                self.blocks(),
+                self.block_body_source(),
+                self.block_tree(),
+            )
+        })
     }
 
     /// Returns the shared compact-filter index handle.
