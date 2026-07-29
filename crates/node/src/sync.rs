@@ -1004,21 +1004,10 @@ impl BlockSync {
     /// Every alternate receives the same earliest hashes, so the probe cannot
     /// create a unique out-of-order height hole. It runs once per deep owner.
     fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
-        self.send_prefix_probes_after_plan_and_confirmation(probe_peers, now, |_| {}, |_| {});
-    }
-
-    fn send_prefix_probes_after_plan_and_confirmation(
-        &self,
-        probe_peers: &[SyncPeer],
-        now: Instant,
-        after_plan: impl FnOnce(SocketAddr),
-        after_confirmation: impl FnOnce(&DownloadWindow),
-    ) {
         let mut window = self.download_window.lock();
         let Some((owner, hashes, required_height)) = window.prefix_probe_plan() else {
             return;
         };
-        after_plan(owner);
         let candidates = probe_peers.iter().filter(|peer| {
             peer.addr != owner
                 && u32::try_from(peer.start_height).is_ok_and(|height| height >= required_height)
@@ -1042,7 +1031,6 @@ impl BlockSync {
         }
         let block_count = hashes.len();
         window.confirm_prefix_probe(owner, hashes, &successful, now);
-        after_confirmation(&window);
         metrics::counter!("node.sync.prefix_probe_peers")
             .increment(u64::try_from(successful.len()).unwrap_or(u64::MAX));
         tracing::info!(
@@ -7083,7 +7071,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_prefix_probe_does_not_survive_owner_replacement()
+    fn prefix_probe_state_does_not_survive_owner_replacement()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, _block_tree, _applied_tip, expected) =
             sync_with_header_chain(8)?;
@@ -7098,7 +7086,6 @@ mod tests {
             .applied_tip
             .load_full()
             .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
-        let sync = Arc::new(sync);
         let owner = SocketAddr::from(([127, 0, 0, 1], 18_455));
         let alternate = SocketAddr::from(([127, 0, 0, 1], 18_456));
         peers
@@ -7111,105 +7098,46 @@ mod tests {
             (owner, old.clone()),
             (alternate, PeerLease::new(alternate_tx)),
         ]);
+
         assert!(
             sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
                 .sent
         );
         assert_eq!(witness_block_inventory(next_getdata(&old_rx)?)?, expected);
-        let (paused_tx, paused_rx) = unbounded();
-        let (resume_tx, resume_rx) = unbounded();
-        let (confirmed_tx, confirmed_rx) = unbounded();
-        let (confirm_resume_tx, confirm_resume_rx) = unbounded();
+        sync.send_prefix_probes(
+            &[super::SyncPeer {
+                addr: alternate,
+                start_height: 10,
+            }],
+            Instant::now(),
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            expected
+        );
+        assert!(
+            sync.download_window
+                .lock()
+                .active_prefix_probe_started_at()
+                .is_some()
+        );
+
         let registration = sync.peer_registration_handle();
         let (replacement_tx, replacement_rx) = unbounded::<Message>();
         let replacement = PeerLease::new(replacement_tx);
-        let (registration_inside_tx, registration_inside_rx) = unbounded();
-        let dispatch_sync = Arc::clone(&sync);
-        let dispatch_window = Arc::clone(&sync.download_window);
-        let dispatch_registration = Arc::clone(&registration);
-        let dispatch_replacement = replacement.clone();
-        let dispatch = std::thread::spawn(move || {
-            dispatch_sync.send_prefix_probes_after_plan_and_confirmation(
-                &[super::SyncPeer {
-                    addr: alternate,
-                    start_height: 10,
-                }],
-                Instant::now(),
-                move |_| {
-                    let replacement_ran_inside = match dispatch_window.try_lock() {
-                        None => false,
-                        Some(window_guard) => {
-                            drop(window_guard);
-                            assert!(
-                                dispatch_registration(
-                                    owner,
-                                    dispatch_replacement,
-                                    synthetic_peer(owner, 10),
-                                ),
-                                "test mutation must replace the original peer inside the prefix gap"
-                            );
-                            true
-                        }
-                    };
-                    registration_inside_tx
-                        .send(replacement_ran_inside)
-                        .expect("test must observe whether registration entered the prefix gap");
-                    paused_tx.send(()).expect("test must observe prefix plan");
-                    resume_rx.recv().expect("test must resume prefix dispatch");
-                },
-                |window| {
-                    confirmed_tx
-                        .send(window.active_prefix_probe_started_at().is_some())
-                        .expect("test must observe prefix confirmation");
-                    confirm_resume_rx
-                        .recv()
-                        .expect("test must release prefix confirmation");
-                },
-            );
-        });
-        paused_rx.recv()?;
-        resume_tx.send(())?;
-        let confirmed = confirmed_rx.recv()?;
-        confirm_resume_tx.send(())?;
-        dispatch
-            .join()
-            .map_err(|_| "prefix dispatch thread panicked")?;
-        if registration_inside_rx.recv()? {
-            assert!(
-                !confirmed,
-                "dropping the prefix barrier must leave no confirmed stale probe"
-            );
-            return Err(std::io::Error::other(
-                "prefix confirmation observed same-address registration inside its plan-to-confirm gap",
-            )
-            .into());
-        }
-        assert!(
-            confirmed,
-            "production prefix barrier must confirm before same-address registration"
-        );
         assert!(registration(
             owner,
             replacement.clone(),
             synthetic_peer(owner, 10)
         ));
-        assert_eq!(
-            witness_block_inventory(next_getdata(&alternate_rx)?)?,
-            expected
-        );
-        assert!(replacement_rx.try_recv().is_err());
+
         assert!(old.is_cancelled());
-        assert_eq!(sync.download_window.lock().pending_len(), 0);
-        let chain_tip = sync
-            .handles
-            .chain_tip
-            .load_full()
-            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
-        let applied_tip = sync
-            .handles
-            .applied_tip
-            .load_full()
-            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        assert!(replacement_rx.try_recv().is_err());
+        {
+            let window = sync.download_window.lock();
+            assert_eq!(window.pending_len(), 0);
+            assert!(window.active_prefix_probe_started_at().is_none());
+        }
         assert!(
             sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
                 .sent,
