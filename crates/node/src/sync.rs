@@ -289,6 +289,29 @@ impl BlockSync {
         }
     }
 
+    /// Returns the sole production peer-registration operation. It preserves
+    /// the window-then-outbound lock order and purges old-address state before
+    /// the new sender becomes visible.
+    #[must_use]
+    pub fn peer_registration_handle(
+        &self,
+    ) -> Arc<dyn Fn(SocketAddr, Sender<Message>, PeerInfo) -> bool + Send + Sync> {
+        let window = Arc::clone(&self.download_window);
+        let outbound = Arc::clone(&self.peer_outbound);
+        let peers = Arc::clone(&self.peers);
+        Arc::new(move |peer_addr, sender, info| {
+            let mut window = window.lock();
+            let mut outbound = outbound.write();
+            let replaced = outbound.contains_key(&peer_addr);
+            window.forget_peer(peer_addr);
+            outbound.insert(peer_addr, sender);
+            let mut peers = peers.write();
+            peers.retain(|peer| peer.addr != peer_addr);
+            peers.push(info);
+            replaced
+        })
+    }
+
     /// Runs one orchestrator tick: requests pending blocks from eligible peers
     /// and asks them to extend the header chain.
     pub fn tick(&self) {
@@ -559,7 +582,11 @@ impl BlockSync {
             let mut window = self.download_window.lock();
             for (hash, source_peer, staged) in staged_blocks {
                 match staged {
-                    StagedBlock::AlreadyStaged => {}
+                    StagedBlock::AlreadyStaged => {
+                        if let Some(source_peer) = source_peer {
+                            window.credit_duplicate_delivery(hash, source_peer);
+                        }
+                    }
                     StagedBlock::Memory { bytes, dropped } => {
                         window.mark_received_from(hash, bytes, source_peer, now);
                         for dropped in dropped {
@@ -1184,10 +1211,10 @@ impl BlockSync {
     }
 
     fn release_disconnected_peer_budget(&self) {
-        let outbound = self.peer_outbound.read();
+        let live: SmallVec<[SocketAddr; 8]> = self.peer_outbound.read().keys().copied().collect();
         self.download_window
             .lock()
-            .release_disconnected_peers(|peer| outbound.contains_key(peer));
+            .release_disconnected_peers(|peer| live.contains(peer));
     }
 
     /// Sends one untracked duplicate request for a cold-start stalled front.
@@ -3581,15 +3608,15 @@ mod tests {
         assert!(honest_rx.try_recv().is_err());
 
         // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[0].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
+        inbound.source_peer = Some(staller);
+        blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         std::thread::sleep(Duration::from_millis(60));
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[1].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
+        inbound.source_peer = Some(staller);
+        blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         let ewma_ms = sync
@@ -3600,9 +3627,9 @@ mod tests {
 
         // The successor (block 4) arrives, the new front (block 3) never
         // does: wedge + episode on the staller, which owns the whole stripe.
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[3].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
+        inbound.source_peer = Some(staller);
+        blocks_tx.send(inbound)?;
         sync.tick();
         assert_eq!(
             sync.download_window
@@ -3634,9 +3661,9 @@ mod tests {
         // requests.
         let (staller_tx2, staller_rx2) = unbounded::<Message>();
         peer_outbound.write().insert(staller, staller_tx2);
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[2].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
+        inbound.source_peer = Some(honest);
+        blocks_tx.send(inbound)?;
         sync.tick();
         // The re-request narrowed the expected-apply cache to the front, so
         // the staged successor drains on the following tick's tree walk.
@@ -3987,15 +4014,15 @@ mod tests {
         );
 
         // Seed: blocks 1 and 2 arrive as window fronts >= 60ms apart.
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[0].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[0].clone());
+        inbound.source_peer = Some(sole);
+        blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         std::thread::sleep(Duration::from_millis(60));
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[1].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[1].clone());
+        inbound.source_peer = Some(sole);
+        blocks_tx.send(inbound)?;
         sync.tick();
         sync.tick();
         let ewma_ms = sync
@@ -4006,9 +4033,9 @@ mod tests {
 
         // The successor (block 4) arrives, the new front (block 3) never
         // does: wedge + episode on the sole peer.
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[3].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[3].clone());
+        inbound.source_peer = Some(sole);
+        blocks_tx.send(inbound)?;
         sync.tick();
         assert!(sync.download_window.lock().stalling_peer().is_some());
 
@@ -4035,9 +4062,9 @@ mod tests {
             alloc::vec![blocks[2].block_hash()]
         );
 
-        blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-            blocks[2].clone(),
-        ))?;
+        let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
+        inbound.source_peer = Some(sole);
+        blocks_tx.send(inbound)?;
         sync.tick();
         // The re-request narrowed the expected-apply cache to the front, so
         // the staged successor drains on the following tick's tree walk.
@@ -6076,6 +6103,10 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, StorageError> {
             Ok(self.persisted.lock().get(&height).cloned())
         }
+
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
     }
 
     fn witness_block_inventory(
@@ -6338,9 +6369,57 @@ mod tests {
         }
     }
 
-    /// A fan-out-eligible synthetic peer: outbound and witness-serving
-    /// (`NODE_NETWORK` | `NODE_WITNESS`), unlike [`synthetic_peer`] which models
-    /// the ineligible (inbound, flagless) shape.
+    #[test]
+    fn peer_registration_reconnects_after_outbound_map_removal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
+        let (old_tx, _old_rx) = unbounded::<Message>();
+        peers.write().push(synthetic_peer(addr, 1));
+        peer_outbound.write().insert(addr, old_tx);
+        let now = Instant::now();
+        sync.download_window
+            .lock()
+            .mark_peer_unresponsive(addr, now);
+
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+        assert!(registration(
+            addr,
+            replacement_tx.clone(),
+            synthetic_peer(addr, 2),
+        ));
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_channel(&replacement_tx))
+        );
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
+
+        // The prior connection has already removed its lease, but its registry
+        // metadata remains until its teardown finishes. The registration result
+        // still reports no sender replacement while the stale row is replaced.
+        peer_outbound.write().remove(&addr);
+
+        let (new_tx, _new_rx) = unbounded::<Message>();
+        assert!(!registration(addr, new_tx.clone(), synthetic_peer(addr, 3),));
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_channel(&new_tx))
+        );
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 3)]);
+        assert!(
+            sync.download_window
+                .lock()
+                .peer_in_staller_cooldown(addr, now)
+        );
+        Ok(())
+    }
+
     fn eligible_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
         PeerInfo {
             services: bitcoin::p2p::ServiceFlags::WITNESS.to_u64() | 1,

@@ -17,6 +17,48 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_mins(1);
 type ChainQueryHandle = Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>;
 type SyncWakeHandle = Option<Sender<()>>;
+type PeerRegistrationHandle =
+    Option<Arc<dyn Fn(SocketAddr, Sender<crate::Message>, crate::PeerInfo) -> bool + Send + Sync>>;
+
+fn register_peer(
+    peer_registry: &RwLock<Vec<crate::PeerInfo>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, Sender<crate::Message>, crate::PeerInfo) -> bool + Send + Sync),
+    >,
+    peer_addr: SocketAddr,
+    outbound_tx: Sender<crate::Message>,
+    info: crate::PeerInfo,
+) -> bool {
+    if let Some(peer_registered) = peer_registered {
+        return peer_registered(peer_addr, outbound_tx, info);
+    }
+
+    let mut outbound = peer_outbound.write();
+    let replaced = outbound.insert(peer_addr, outbound_tx).is_some();
+    let mut registry = peer_registry.write();
+    registry.retain(|peer| peer.addr != peer_addr);
+    registry.push(info);
+    replaced
+}
+
+fn remove_current_peer(
+    peer_registry: &RwLock<Vec<crate::PeerInfo>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
+    peer_addr: SocketAddr,
+    outbound_tx: &Sender<crate::Message>,
+) -> bool {
+    let mut outbound = peer_outbound.write();
+    if !outbound
+        .get(&peer_addr)
+        .is_some_and(|current| current.same_channel(outbound_tx))
+    {
+        return false;
+    }
+    outbound.remove(&peer_addr);
+    peer_registry.write().retain(|peer| peer.addr != peer_addr);
+    true
+}
 
 #[derive(Clone)]
 struct InboundSyncSinks {
@@ -114,6 +156,7 @@ pub fn serve_with_shutdown(
         banned,
         None,
         None,
+        None,
     )
 }
 
@@ -130,6 +173,7 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
+    peer_registered: PeerRegistrationHandle,
 ) -> Result<(), ListenerError> {
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
@@ -157,6 +201,7 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
                     Arc::clone(&peer_outbound),
                     inbound_sync_sinks.clone(),
                     chain_query.clone(),
+                    peer_registered.clone(),
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -193,6 +238,7 @@ pub fn spawn_outbound_connection(
         banned,
         None,
         None,
+        None,
     )
 }
 
@@ -208,6 +254,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
+    peer_registered: PeerRegistrationHandle,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
@@ -226,6 +273,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
                 &inbound_sync_sinks,
                 &banned,
                 &chain_query,
+                peer_registered.as_deref(),
             )
         });
 
@@ -250,6 +298,9 @@ fn run_outbound_connection(
     inbound_sync_sinks: &InboundSyncSinks,
     banned: &RwLock<Vec<crate::BannedSubnet>>,
     chain_query: &ChainQueryHandle,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, Sender<crate::Message>, crate::PeerInfo) -> bool + Send + Sync),
+    >,
 ) -> Result<(), crate::wire::PeerError> {
     if crate::subnet::is_banned(&banned.read(), addr.ip(), SystemTime::now()) {
         return Err(crate::wire::PeerError::BannedDestination(addr.ip()));
@@ -277,7 +328,6 @@ fn run_outbound_connection(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let info = crate::PeerInfo::outbound_from_version(addr, remote_version, conn_time);
-    peer_registry.write().push(info);
 
     let writer_stream = peer
         .stream
@@ -286,7 +336,14 @@ fn run_outbound_connection(
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
     let writer = spawn_connection_writer(writer_stream, magic, outbound_rx, addr)
         .map_err(crate::wire::PeerError::Io)?;
-    peer_outbound.write().insert(addr, outbound_tx.clone());
+    register_peer(
+        peer_registry,
+        peer_outbound,
+        peer_registered,
+        addr,
+        outbound_tx.clone(),
+        info,
+    );
 
     tracing::info!(
         peer_addr = %addr,
@@ -307,8 +364,14 @@ fn run_outbound_connection(
         )
     })();
 
-    peer_outbound.write().remove(&addr);
-    peer_registry.write().retain(|p| p.addr != addr);
+    let removed_current = remove_current_peer(peer_registry, peer_outbound, addr, &outbound_tx);
+    debug_assert!(
+        removed_current
+            || peer_outbound
+                .read()
+                .get(&addr)
+                .is_none_or(|current| !current.same_channel(&outbound_tx))
+    );
     let _ = peer.stream.shutdown(std::net::Shutdown::Both);
     drop(outbound_tx);
     let _ = writer.join();
@@ -349,6 +412,7 @@ fn spawn_handshake_thread(
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
     inbound_sync_sinks: InboundSyncSinks,
     chain_query: ChainQueryHandle,
+    peer_registered: PeerRegistrationHandle,
 ) {
     let thread_name = format!("bitcoin-rs-p2p-handshake-{peer_addr}");
     let spawn_result = std::thread::Builder::new()
@@ -362,6 +426,7 @@ fn spawn_handshake_thread(
                 &peer_outbound,
                 &inbound_sync_sinks,
                 &chain_query,
+                peer_registered.as_deref(),
             ) {
                 tracing::warn!(
                     peer_addr = %peer_addr,
@@ -390,6 +455,9 @@ fn run_handshake(
     peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
     inbound_sync_sinks: &InboundSyncSinks,
     chain_query: &ChainQueryHandle,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, Sender<crate::Message>, crate::PeerInfo) -> bool + Send + Sync),
+    >,
 ) -> Result<(), crate::wire::PeerError> {
     stream
         .set_nonblocking(false)
@@ -414,7 +482,6 @@ fn run_handshake(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let info = crate::PeerInfo::inbound_from_version(peer_addr, remote_version, conn_time);
-    registry.write().push(info);
 
     let writer_stream = peer
         .stream
@@ -423,7 +490,14 @@ fn run_handshake(
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
     let writer = spawn_connection_writer(writer_stream, magic, outbound_rx, peer_addr)
         .map_err(crate::wire::PeerError::Io)?;
-    peer_outbound.write().insert(peer_addr, outbound_tx.clone());
+    register_peer(
+        registry,
+        peer_outbound,
+        peer_registered,
+        peer_addr,
+        outbound_tx.clone(),
+        info,
+    );
 
     tracing::info!(
         peer_addr = %peer_addr,
@@ -444,8 +518,14 @@ fn run_handshake(
         )
     })();
 
-    peer_outbound.write().remove(&peer_addr);
-    registry.write().retain(|p| p.addr != peer_addr);
+    let removed_current = remove_current_peer(registry, peer_outbound, peer_addr, &outbound_tx);
+    debug_assert!(
+        removed_current
+            || peer_outbound
+                .read()
+                .get(&peer_addr)
+                .is_none_or(|current| !current.same_channel(&outbound_tx))
+    );
     let _ = peer.stream.shutdown(std::net::Shutdown::Both);
     drop(outbound_tx);
     let _ = writer.join();
@@ -636,6 +716,18 @@ mod lease_tests {
     type OutboundMap =
         Arc<RwLock<hashbrown::HashMap<SocketAddr, crossbeam_channel::Sender<crate::Message>>>>;
 
+    fn peer_info(addr: SocketAddr, conn_time: u64) -> crate::PeerInfo {
+        crate::PeerInfo {
+            addr,
+            version: 70_016,
+            services: 0,
+            user_agent: String::from("/test/"),
+            start_height: 0,
+            conn_time,
+            inbound: false,
+        }
+    }
+
     fn sinks() -> InboundSyncSinks {
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
@@ -761,6 +853,86 @@ mod lease_tests {
             "lease revocation mid-loop must close the loop cleanly"
         );
         assert!(!peer_outbound.read().contains_key(&addr));
+    }
+
+    #[test]
+    fn registration_replaces_same_address_registry_entry() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_446));
+        let registry = RwLock::new(vec![peer_info(addr, 1)]);
+        let outbound = RwLock::new(hashbrown::HashMap::new());
+        let (old_tx, _old_rx) = crossbeam_channel::unbounded();
+        let (new_tx, _new_rx) = crossbeam_channel::unbounded();
+        outbound.write().insert(addr, old_tx);
+
+        assert!(super::register_peer(
+            &registry,
+            &outbound,
+            None,
+            addr,
+            new_tx.clone(),
+            peer_info(addr, 2),
+        ));
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_channel(&new_tx))
+        );
+        assert_eq!(&*registry.read(), &[peer_info(addr, 2)]);
+    }
+
+    #[test]
+    fn registration_replaces_stale_registry_without_sender_replacement() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_449));
+        let registry = RwLock::new(vec![peer_info(addr, 1)]);
+        let outbound = RwLock::new(hashbrown::HashMap::new());
+        let (new_tx, _new_rx) = crossbeam_channel::unbounded();
+
+        assert!(!super::register_peer(
+            &registry,
+            &outbound,
+            None,
+            addr,
+            new_tx.clone(),
+            peer_info(addr, 2),
+        ));
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_channel(&new_tx))
+        );
+        assert_eq!(&*registry.read(), &[peer_info(addr, 2)]);
+    }
+
+    #[test]
+    fn stale_teardown_preserves_replacement_lease_and_registry() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
+        let registry = RwLock::new(vec![peer_info(addr, 2)]);
+        let outbound = RwLock::new(hashbrown::HashMap::new());
+        let (stale_tx, _stale_rx) = crossbeam_channel::unbounded();
+        let (current_tx, _current_rx) = crossbeam_channel::unbounded();
+        outbound.write().insert(addr, current_tx.clone());
+
+        assert!(!super::remove_current_peer(
+            &registry, &outbound, addr, &stale_tx,
+        ));
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_channel(&current_tx))
+        );
+        assert_eq!(&*registry.read(), &[peer_info(addr, 2)]);
+
+        assert!(super::remove_current_peer(
+            &registry,
+            &outbound,
+            addr,
+            &current_tx,
+        ));
+        assert!(outbound.read().is_empty());
+        assert!(registry.read().is_empty());
     }
 }
 

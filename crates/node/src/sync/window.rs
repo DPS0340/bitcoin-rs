@@ -1054,11 +1054,44 @@ impl DownloadWindow {
         self.retain_peer_assignments(is_live_peer);
     }
 
+    /// Drops every assignment and attribution fact owned by a replaced
+    /// connection before a new connection may reuse its socket address.
+    pub(super) fn forget_peer(&mut self, peer_addr: SocketAddr) {
+        self.release_peer_assignments(peer_addr);
+        if self.preferred_peer == Some(peer_addr) {
+            self.preferred_peer = None;
+        }
+        if self.prefix_probe_attempted_owner == Some(peer_addr) {
+            self.prefix_probe_attempted_owner = None;
+        }
+        if self.cold_front.is_some_and(|state| match state {
+            ColdFrontState::Waiting { owner, .. } => owner == peer_addr,
+            ColdFrontState::Racing {
+                owner, alternate, ..
+            } => owner == peer_addr || alternate == peer_addr,
+        }) {
+            self.cold_front = None;
+        }
+        if self
+            .prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.racers.contains_key(&peer_addr))
+        {
+            self.prefix_probe = None;
+        }
+    }
+
     fn release_peer_assignments(&mut self, peer_addr: SocketAddr) {
         self.retain_peer_assignments(|peer| *peer != peer_addr);
     }
 
     fn retain_peer_assignments(&mut self, retain_peer: impl Fn(&SocketAddr) -> bool) {
+        if self
+            .pending_timeout_observation
+            .is_some_and(|observation| !retain_peer(&observation.peer_addr))
+        {
+            self.pending_timeout_observation = None;
+        }
         let mut retry_height = self.next_request_height;
         let mut removed_earliest_deadline = false;
         let pending_timeout = self.budget.pending_timeout;
@@ -1355,12 +1388,6 @@ impl DownloadWindow {
                 if delivery_peer != Some(alternate) {
                     return;
                 }
-                if self
-                    .pending_timeout_observation
-                    .is_some_and(|observation| observation.peer_addr == owner)
-                {
-                    self.pending_timeout_observation = None;
-                }
                 self.prefix_probe = None;
                 self.release_peer_assignments(owner);
                 self.mark_peer_unresponsive(owner, now);
@@ -1408,8 +1435,9 @@ impl DownloadWindow {
         now: Instant,
     ) -> bool {
         let pending = self.remove_pending(&hash);
-        let delivery_peer =
-            source_peer.or_else(|| pending.as_ref().map(|pending| pending.peer_addr));
+        // A local injection releases the request but cannot establish that the
+        // requested peer delivered anything.
+        let delivery_peer = source_peer;
         if self.pending_timeout_observation.is_some_and(|observation| {
             observation.hash == hash && Some(observation.peer_addr) == delivery_peer
         }) {
@@ -1439,9 +1467,22 @@ impl DownloadWindow {
         needs_height_lookup
     }
 
+    /// Test-only shorthand for delivery by the pending owner.
     #[cfg(test)]
     pub(super) fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
-        self.mark_received_from(hash, bytes, None, now)
+        let source_peer = self.pending.get(&hash).map(|pending| pending.peer_addr);
+        self.mark_received_from(hash, bytes, source_peer, now)
+    }
+
+    /// Credits a duplicate after the first copy was already staged.
+    ///
+    /// The first copy owns all byte, EWMA, cold-front and probe accounting.
+    pub(super) fn credit_duplicate_delivery(&mut self, hash: Hash256, source_peer: SocketAddr) {
+        if self.pending_timeout_observation.is_some_and(|observation| {
+            observation.hash == hash && observation.peer_addr == source_peer
+        }) {
+            self.pending_timeout_observation = None;
+        }
     }
 
     /// Delivery progress for the stall state machine, charged per peer
@@ -3664,6 +3705,22 @@ mod tests {
         assert!(window.next_pending_deadline.is_some());
         assert!(window.peer_in_staller_cooldown(owner, now));
         Ok(())
+    }
+
+    #[test]
+    fn forget_peer_clears_connection_state_but_preserves_staller_cooldown() {
+        let mut window = DownloadWindow::new(test_budget());
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let now = Instant::now();
+        window.peer_inflight.insert(peer_addr, Default::default());
+        window.preferred_peer = Some(peer_addr);
+        window.mark_peer_unresponsive(peer_addr, now);
+
+        window.forget_peer(peer_addr);
+
+        assert!(!window.peer_inflight.contains_key(&peer_addr));
+        assert!(window.preferred_peer.is_none());
+        assert!(window.peer_in_staller_cooldown(peer_addr, now));
     }
 
     fn test_budget() -> SyncBudget {
