@@ -3,6 +3,7 @@
 > **Evidence status:** This page publishes completed historical runs and their raw JSON. It is not a current-HEAD full-tip result or a G14 performance-gate pass. No completed run here reaches height 957,600, no paired Bitcoin Core artifact exists, and none measures commit `4cfd3df`. Treat every number as descriptive unless a comparison below states that its range, source, validation posture, and commit match.
 >
 > This publication is provisional. A clean paired 0–957,600 G14 campaign remains separate follow-up work.
+> Commit `9ce0727ced19644e551d1eac7895993fe43a7db6` is an unpushed local research revision not resolvable from remote history. The historical `kernel` and `parverify` verification-engine labels are inferred from filenames and run notes, not machine-recorded Cargo feature metadata.
 
 The machine-readable attachments preserve every recorded field and stage timer. The source artifacts do not record the exact command line, compiler flags, CPU affinity, cache state, host identity, exit code, or replication count. Those missing fields prevent a reproducible controlled claim.
 
@@ -13,8 +14,8 @@ The machine-readable attachments preserve every recorded field and stage timer. 
 | Current-campaign control, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 88.667s | 1,691.726 blocks/s | 301.6 MiB | [`rs-parprep-current-control-r1.json`](data/end-to-end-sync/rs-parprep-current-control-r1.json) |
 | Current-campaign candidate, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `bitcoin-cli` | `9ce0727` | 96.732s | 1,550.684 blocks/s | 308.2 MiB | [`rs-parprep-current-candidate-r2.json`](data/end-to-end-sync/rs-parprep-current-candidate-r2.json) |
 | Long local replay, 0–642,000 | 0–642,000 | Assume-valid through 642,000 | `legacy-fjall-chainstate` | `9ce0727` | 2h 43m 58.256s | 65.256 blocks/s | 6.827 GiB | [`rs-spendable-local-nobody-a014.json`](data/end-to-end-sync/rs-spendable-local-nobody-a014.json) |
-| Portable full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json) |
-| Kernel full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json) |
+| Inferred `parverify` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `3023eb0` | 296.211s | 506.399 blocks/s | 2.210 GiB | [`rs-replay-150k-parverify.json`](data/end-to-end-sync/rs-replay-150k-parverify.json) |
+| Inferred `kernel` full-validation replay, 0–150,000 | 0–150,000 | Full (`assume_valid_height=0`) | `rest` | `fb2227e` | 232.208s | 645.977 blocks/s | 2.219 GiB | [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-kernel.json) |
 
 All five artifacts pass these structural checks: schema `mainnet-prefix-replay-v1`, genesis start hash, positive elapsed time and throughput, non-empty stage list, and `block_count = stop_height - start_height + 1`.
 
@@ -28,7 +29,7 @@ The two current-campaign 150,000-block files share the same recorded commit, hei
 
 These are observed differences only. They do not establish a regression, a causal treatment effect, or a population mean.
 
-The older portable and kernel replays share the 0–150,000 range, REST source, full-validation posture, and stop hash, but use different commits and verification engines. They are useful historical results, not a controlled A/B. The 642,000-block replay uses an assume-valid posture and a local legacy fjall chainstate, so it is not comparable to either 150,000-block group.
+The older `parverify` and `kernel` replays share the 0–150,000 range, REST source, full-validation posture, and stop hash, but use different commits and the `kernel`/`parverify` engine labels are inferred from filenames and run notes, not recorded Cargo features. They are useful historical results, not a controlled A/B. The 642,000-block replay uses an assume-valid posture and a local legacy fjall chainstate, so it is not comparable to either 150,000-block group.
 
 ## Historical live-network results
 
