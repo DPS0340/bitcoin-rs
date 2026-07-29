@@ -534,6 +534,8 @@ pub(crate) enum CheckpointError {
     Json(#[from] serde_json::Error),
     #[error("checkpoint invariant failed: {0}")]
     Invalid(String),
+    #[error("checkpoint block-body durability failed: {0}")]
+    Storage(#[from] bitcoin_rs_storage::StorageError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -968,6 +970,12 @@ fn write_checkpoint_inner(
     sync_file(&manifest_file, failpoint, CheckpointFailpoint::ManifestSync)?;
 
     sync_checkpoint_dir(&staging, failpoint, CheckpointFailpoint::StageSync)?;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     rename_generation(
         &root,
         &paths.staging,
@@ -975,6 +983,16 @@ fn write_checkpoint_inner(
         failpoint,
         CheckpointFailpoint::GenerationRename,
     )?;
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    injected_io(failpoint, CheckpointFailpoint::GenerationRename)?;
+    // On portable targets `allocate_generation` atomically reserved and this
+    // function wrote the final generation directory directly. CURRENT is the
+    // sole visibility commit point.
     sync_root(&root, failpoint, CheckpointFailpoint::GenerationRootSync)?;
 
     let current = CurrentV1 {
@@ -1105,6 +1123,12 @@ fn sync_root(
     Ok(())
 }
 
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
 fn rename_generation(
     root: &CheckpointRoot,
     from: &str,
@@ -1430,17 +1454,34 @@ fn allocate_generation(
     })?;
     loop {
         let paths = generation_paths(generation);
-        if root.entry_exists(&paths.staging)?
-            || root.entry_exists(&paths.final_dir)?
-            || root.entry_exists(&paths.current_temp)?
-        {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        ))]
+        if root.entry_exists(&paths.final_dir)? || root.entry_exists(&paths.current_temp)? {
             generation = generation.checked_add(1).ok_or_else(|| {
                 CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned())
             })?;
             continue;
         }
-        match root.create_dir(&paths.staging) {
-            Ok(staging) => return Ok((generation, paths, staging)),
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        ))]
+        let name = &paths.staging;
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        )))]
+        let name = &paths.final_dir;
+        match root.create_dir(name) {
+            Ok(dir) => return Ok((generation, paths, dir)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 generation = generation.checked_add(1).ok_or_else(|| {
                     CheckpointError::Invalid("checkpoint generation exhausted u64".to_owned())

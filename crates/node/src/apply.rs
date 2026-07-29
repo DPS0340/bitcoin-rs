@@ -5,6 +5,7 @@ mod scratch;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
+use bitcoin::consensus::{Decodable as _, encode::VarInt};
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
@@ -38,7 +39,14 @@ const BIP68_MASK: u32 = 0x0000_ffff;
 const BIP68_TIME_GRANULARITY_SECONDS: u32 = 512;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
+const SERIALIZED_BLOCK_METADATA_PREFIX_LEN: usize = SERIALIZED_BLOCK_HEADER_LEN + 9;
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
+
+fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
+    let mut cursor = bytes.get(SERIALIZED_BLOCK_HEADER_LEN..)?;
+    let count = VarInt::consensus_decode(&mut cursor).ok()?.0;
+    usize::try_from(count).ok()
+}
 
 pub(crate) trait PruneBodyStore: Send + Sync {
     fn persist_block_body(
@@ -62,6 +70,23 @@ pub(crate) trait PruneBodyStore: Send + Sync {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    fn block_body_metadata(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<(usize, usize)>, StorageError> {
+        let Some(body) = self.load_block_body(height, hash)? else {
+            return Ok(None);
+        };
+        let Some(tx_count) = decode_block_tx_count(&body) else {
+            return Ok(None);
+        };
+        Ok(Some((body.len(), tx_count)))
+    }
+
+    /// Makes body bytes durable before their checkpoint can be published.
+    fn sync(&self) -> Result<(), StorageError>;
 }
 
 pub(crate) struct FlatFilePruneBodyStore<S: KvStore> {
@@ -144,6 +169,40 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
             return Ok(None);
         };
         self.files.load(position, height, *hash.as_byte_array())
+    }
+
+    fn block_body_metadata(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<(usize, usize)>, StorageError> {
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+            return Ok(None);
+        };
+        let Some(position) = BlockFilePosition::decode(&encoded) else {
+            return Ok(None);
+        };
+        let Some(prefix) = self.files.load_prefix(
+            position,
+            height,
+            *hash.as_byte_array(),
+            SERIALIZED_BLOCK_METADATA_PREFIX_LEN,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(tx_count) = decode_block_tx_count(&prefix) else {
+            return Ok(None);
+        };
+        let body_size = usize::try_from(position.len)
+            .map_err(|_| StorageError::InvalidOperation("block body length does not fit usize"))?;
+        Ok(Some((body_size, tx_count)))
+    }
+
+    fn sync(&self) -> Result<(), StorageError> {
+        self.files.sync()?;
+        self.index.flush()
     }
 }
 
@@ -1660,6 +1719,14 @@ mod consensus_rule_tests {
         let block = block_with_transaction(coinbase_transaction(0x42));
         let block_bytes = bitcoin::consensus::encode::serialize(&block);
         let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        assert_eq!(
+            super::decode_block_tx_count(&block_bytes),
+            Some(block.txdata.len())
+        );
+        assert_eq!(
+            super::decode_block_tx_count(&block_bytes[..SERIALIZED_BLOCK_HEADER_LEN]),
+            None
+        );
 
         let cached = applied_block_record(7, block_hash, &block, &block_bytes, true);
         let expected_cached = BlockRecord::from_block_bytes(7, &block, &block_bytes);

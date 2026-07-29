@@ -1017,6 +1017,8 @@ impl NodeState {
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
         let _exclusive_apply = self.apply_handles.admission.close();
+        // A checkpoint may name this tip only after body files then index rows sync.
+        self.block_body_store.sync()?;
         let applied_tip = self.applied_tip.load_full();
         crate::checkpoint::write_checkpoint_from_dir(
             &self.checkpoint_data_dir,

@@ -96,6 +96,7 @@ struct WriterState {
     file: File,
     file_no: u32,
     append_offset: u64,
+    directory_dirty: bool,
 }
 
 impl FlatFileBlockStore {
@@ -148,12 +149,21 @@ impl FlatFileBlockStore {
                 .is_none_or(|end| end > self.max_file_bytes)
         {
             writer.file.flush()?;
-            writer.file_no = writer
+            writer.file.sync_data()?;
+            let file_no = writer
                 .file_no
                 .checked_add(1)
                 .ok_or(StorageError::InvalidOperation("block file number overflow"))?;
-            writer.file = open_new_block_file(&self.blocks_dir, writer.file_no)?;
+            let file = open_new_block_file(&self.blocks_dir, file_no)?;
+            // Install a self-consistent new writer before syncing its directory
+            // entry. A sync error therefore leaves a retryable dirty state, not
+            // a new file paired with the old append offset.
+            writer.file = file;
+            writer.file_no = file_no;
             writer.append_offset = 0;
+            writer.directory_dirty = true;
+            sync_blocks_dir(&self.blocks_dir)?;
+            writer.directory_dirty = false;
         }
 
         let position = BlockFilePosition {
@@ -176,6 +186,18 @@ impl FlatFileBlockStore {
             .checked_add(record_len)
             .ok_or(StorageError::InvalidOperation("block file offset overflow"))?;
         Ok(position)
+    }
+
+    /// Flushes the current append file to stable storage.
+    pub fn sync(&self) -> Result<(), StorageError> {
+        let mut writer = self.writer.lock();
+        writer.file.flush()?;
+        writer.file.sync_data()?;
+        if writer.directory_dirty {
+            sync_blocks_dir(&self.blocks_dir)?;
+            writer.directory_dirty = false;
+        }
+        Ok(())
     }
 
     /// Loads a body only when its frame completely matches the requested height and hash.
@@ -207,6 +229,37 @@ impl FlatFileBlockStore {
             return Ok(None);
         }
         Ok(Some(body))
+    }
+
+    /// Loads at most `limit` body bytes after validating the complete frame header.
+    ///
+    /// The returned prefix is bound to `height` and `hash`; malformed, missing,
+    /// mismatched, or short records return `Ok(None)`.
+    pub fn load_prefix(
+        &self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(mut file) = self.open_for_read(position.file_no)? else {
+            return Ok(None);
+        };
+        if !record_matches(&mut file, position, height, hash)? {
+            return Ok(None);
+        }
+
+        let Some(body_offset) = body_offset(position.offset) else {
+            return Ok(None);
+        };
+        let body_len = usize::try_from(position.len)
+            .map_err(|_| StorageError::InvalidOperation("block body length does not fit usize"))?;
+        let mut prefix = vec![0_u8; body_len.min(limit)];
+        file.seek(SeekFrom::Start(body_offset))?;
+        if !read_exact_or_none(&mut file, &mut prefix)? {
+            return Ok(None);
+        }
+        Ok(Some(prefix))
     }
 
     /// Returns the file currently receiving appends.
@@ -248,6 +301,9 @@ impl FlatFileBlockStore {
         }
         let blocks_dir = data_dir.join(BLOCK_FILE_DIRECTORY);
         fs::create_dir_all(&blocks_dir)?;
+        // Persist the blocks-directory entry in its parent. This runs once per
+        // store open, not on the append path.
+        sync_blocks_dir(data_dir)?;
         let file_no = highest_block_file_number(&blocks_dir)?.unwrap_or(0);
         let path = block_file_path(&blocks_dir, file_no);
         let mut file = OpenOptions::new()
@@ -256,6 +312,8 @@ impl FlatFileBlockStore {
             .read(true)
             .write(true)
             .open(path)?;
+        // The file may have been created above; persist its directory entry.
+        sync_blocks_dir(&blocks_dir)?;
         let file_len = file.metadata()?.len();
         let recovered_offset = recover_append_offset(&mut file, file_len)?;
         if recovered_offset != file_len {
@@ -277,6 +335,7 @@ impl FlatFileBlockStore {
                 file,
                 file_no,
                 append_offset: recovered_offset,
+                directory_dirty: false,
             }),
         })
     }
@@ -288,6 +347,19 @@ impl FlatFileBlockStore {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+#[cfg(unix)]
+fn sync_blocks_dir(blocks_dir: &Path) -> Result<(), StorageError> {
+    File::open(blocks_dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_blocks_dir(_blocks_dir: &Path) -> Result<(), StorageError> {
+    // std has no portable primitive for opening and syncing a directory.
+    // Keep the durability boundary explicit where the platform supports it.
+    Ok(())
 }
 
 fn body_len(body: &[u8]) -> Result<u32, StorageError> {
@@ -441,6 +513,10 @@ mod tests {
             Some(b"a longer second body".to_vec())
         );
         assert_eq!(store.load(third, 3, hash(3))?, Some(b"third".to_vec()));
+        assert_eq!(
+            store.load_prefix(second, 2, hash(2), 4)?,
+            Some(b"a lo".to_vec())
+        );
         Ok(())
     }
 

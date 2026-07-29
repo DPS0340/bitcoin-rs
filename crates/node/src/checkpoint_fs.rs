@@ -76,19 +76,6 @@ impl CheckpointRoot {
         .map_err(Into::into)
     }
 
-    #[cfg(not(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    )))]
-    pub(crate) fn rename_noreplace(&self, _from: &str, _to: &str) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic no-replace checkpoint publication is unsupported on this platform",
-        ))
-    }
-
     pub(crate) fn sync(&self) -> io::Result<()> {
         sync_dir(&self.dir)
     }
