@@ -164,7 +164,7 @@ fn snapshot_roundtrip_preserves_vout_64() -> Result<(), Box<dyn std::error::Erro
     file.read_exact(&mut header)?;
     let mut version = [0_u8; 4];
     version.copy_from_slice(&header[4..8]);
-    assert_eq!(u32::from_le_bytes(version), 3);
+    assert_eq!(u32::from_le_bytes(version), 4);
     file.rewind()?;
 
     let loaded = read_snapshot(&mut file)?;
@@ -178,7 +178,37 @@ fn snapshot_roundtrip_preserves_vout_64() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn snapshot_v3_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
+fn snapshot_roundtrip_preserves_440_outputs_from_one_transaction()
+-> Result<(), Box<dyn std::error::Error>> {
+    const OUTPUT_COUNT: u32 = 440;
+    let set = UtxoSet::new();
+    let live_txid = txid(43_000);
+    let mut changes = BlockChanges::default();
+    for vout in 0..OUTPUT_COUNT {
+        changes.add(UtxoAdd::new(
+            OutPoint::new(live_txid, vout),
+            txout(u64::from(vout)),
+            false,
+            402,
+        ));
+    }
+    set.commit_block(&changes, &txid(43_001))?;
+
+    let mut file = tempfile()?;
+    write_snapshot(&set, &txid(43_002), 402, &mut file)?;
+    file.rewind()?;
+    let loaded = read_snapshot(&mut file)?;
+
+    assert_eq!(loaded.set.len(), usize::try_from(OUTPUT_COUNT)?);
+    assert_eq!(
+        loaded.set.get(&OutPoint::new(live_txid, OUTPUT_COUNT - 1)),
+        Some(txout(u64::from(OUTPUT_COUNT - 1)))
+    );
+    Ok(())
+}
+
+#[test]
+fn snapshot_v4_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
@@ -201,13 +231,13 @@ fn snapshot_v3_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
 
-    assert_eq!(bytes.len(), 582);
+    assert_eq!(bytes.len(), 588);
     assert_eq!(
         sha256::Hash::hash(&bytes),
         sha256::Hash::from_byte_array([
-            0x7e, 0x8a, 0x88, 0xe1, 0xc8, 0x97, 0xe4, 0x57, 0x63, 0x5e, 0x96, 0xed, 0xbf, 0xd4,
-            0x09, 0x11, 0xc9, 0xfe, 0x78, 0xde, 0xa1, 0x7f, 0xa7, 0xf6, 0x24, 0x8a, 0x4f, 0x22,
-            0xdc, 0x44, 0xbd, 0x0a,
+            0x2d, 0xb8, 0xfa, 0xf3, 0x4a, 0x52, 0x3d, 0x7e, 0xb6, 0xf5, 0xfa, 0x75, 0x09, 0xe3,
+            0x5d, 0x74, 0xd0, 0x69, 0x2c, 0x2b, 0x9c, 0xf2, 0x52, 0x55, 0x52, 0x6a, 0x85, 0xff,
+            0x35, 0x9b, 0x0a, 0xda,
         ]),
     );
     Ok(())
@@ -249,23 +279,23 @@ fn legacy_v2_snapshot_rejects_vout_64() {
 }
 
 #[test]
-fn strict_v3_snapshot_requires_complete_exact_input() -> Result<(), Box<dyn std::error::Error>> {
+fn strict_v4_snapshot_requires_complete_exact_input() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let mut snapshot = Vec::new();
     write_snapshot(&set, &txid(64_100), 64, &mut snapshot)?;
 
-    let loaded = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(&snapshot))?;
+    let loaded = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(&snapshot))?;
     assert_eq!(loaded.tip_hash, txid(64_100));
     assert_eq!(loaded.height, 64);
     assert_eq!(loaded.muhash_trailer, [0_u8; 384]);
 
     let missing_trailer = &snapshot[..snapshot.len() - 384];
     assert!(
-        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(missing_trailer))
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(missing_trailer))
             .is_err()
     );
     assert!(
-        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(
             &snapshot[..snapshot.len() - 1]
         ))
         .is_err()
@@ -274,58 +304,63 @@ fn strict_v3_snapshot_requires_complete_exact_input() -> Result<(), Box<dyn std:
     let mut trailing = snapshot.clone();
     trailing.push(0);
     assert!(
-        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(trailing)).is_err()
+        bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(trailing)).is_err()
     );
     Ok(())
 }
 
 #[test]
-fn strict_v3_snapshot_rejects_v2_that_legacy_decoder_accepts()
+fn strict_v4_snapshot_rejects_legacy_versions_that_compatibility_decoder_accepts()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut v2 = Vec::new();
-    v2.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
-    v2.extend_from_slice(&2_u32.to_le_bytes());
-    v2.extend_from_slice(&txid(64_200).to_le_bytes());
-    v2.extend_from_slice(&64_u32.to_le_bytes());
-    v2.extend_from_slice(&0_u64.to_le_bytes());
+    for version in [2_u32, 3_u32] {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
+        legacy.extend_from_slice(&version.to_le_bytes());
+        legacy.extend_from_slice(&txid(64_200).to_le_bytes());
+        legacy.extend_from_slice(&64_u32.to_le_bytes());
+        legacy.extend_from_slice(&0_u64.to_le_bytes());
 
-    assert_eq!(read_snapshot(&mut Cursor::new(&v2))?.height, 64);
-    let error = match bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(v2)) {
-        Err(error) => error,
-        Ok(_) => panic!("strict decoder must reject v2"),
-    };
-    assert!(matches!(
-        error,
-        UtxoError::UnsupportedSnapshotVersion { version: 2 }
-    ));
+        assert_eq!(read_snapshot(&mut Cursor::new(&legacy))?.height, 64);
+        let error =
+            match bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(legacy)) {
+                Err(error) => error,
+                Ok(_) => panic!("strict decoder must reject a legacy snapshot"),
+            };
+        assert!(matches!(
+            error,
+            UtxoError::UnsupportedSnapshotVersion { version: actual } if actual == version
+        ));
+    }
     Ok(())
 }
 
 #[cfg(target_pointer_width = "32")]
 #[test]
-fn strict_v3_snapshot_rejects_record_count_that_overflows_usize() {
+fn strict_v4_snapshot_rejects_record_count_that_overflows_usize() {
     let mut snapshot = Vec::new();
     snapshot.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
-    snapshot.extend_from_slice(&3_u32.to_le_bytes());
+    snapshot.extend_from_slice(&4_u32.to_le_bytes());
     snapshot.extend_from_slice(&txid(64_300).to_le_bytes());
     snapshot.extend_from_slice(&64_u32.to_le_bytes());
     snapshot.extend_from_slice(&u64::MAX.to_le_bytes());
 
-    let error = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(snapshot))
-        .expect_err("record count must fit usize");
+    let error = match bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(snapshot))
+    {
+        Err(error) => error,
+        Ok(_) => panic!("record count must fit usize"),
+    };
     assert!(matches!(
         error,
         UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX }
     ));
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Task 2: adversarial / boundary coverage
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Single txid with 12 outputs crosses the legacy 8-inline threshold.
-/// Pins: header bytes, record header at file offset 52, `vout_count` at offset 93,
-/// per-output header at offsets 94/125/156, and each output's coinbase byte.
+/// Pins: header bytes, record header at file offset 52, `output_count` at offset 93,
+/// per-output headers at offsets 97/128/159, and each output's coinbase byte.
 /// Crosses 8 → overflow outputs must appear after inline outputs in
 /// snapshot record order.
 #[test]
@@ -353,23 +388,23 @@ fn snapshot_roundtrip_high_fanout_overflow_record_pins_byte_layout()
     let mut header = [0u8; 52];
     file.read_exact(&mut header)?;
     assert_eq!(&header[0..4], &0x55_54_58_4F_u32.to_le_bytes()); // magic "UTXO" LE
-    assert_eq!(&header[4..8], &3_u32.to_le_bytes()); // version 3
+    assert_eq!(&header[4..8], &4_u32.to_le_bytes()); // version 4
     assert_eq!(&header[40..44], &2010_u32.to_le_bytes()); // height
     assert_eq!(&header[44..52], &1_u64.to_le_bytes()); // record_count = 1
 
     // ── Record header at offset 52 ─────────────────────────────────────────
-    let mut rec_header = [0u8; 42];
+    let mut rec_header = [0u8; 45];
     file.read_exact(&mut rec_header)?;
     let key = UtxoKey::from_txid(&live_txid);
     assert_eq!(rec_header[0], key.shard()); // shard_idx
     assert_eq!(&rec_header[1..9], &key.to_prefix()); // key_prefix
     assert_eq!(&rec_header[9..41], &live_txid.to_le_bytes()); // txid
-    assert_eq!(rec_header[41], 12u8); // vout_count
+    assert_eq!(&rec_header[41..45], &12_u32.to_le_bytes()); // output_count
 
     // ── Per-output headers (vout u32 LE, value u64 LE, height u32 LE,
-    //     coinbase u8, script_len u16 LE) at offsets 94, 125, 156 ─────────
+    //     coinbase u8, script_len u16 LE) at offsets 97, 128, 159 ─────────
     for (i, expect_vout) in (0u32..12).enumerate() {
-        let offset = u64::try_from(94 + i * 31)?;
+        let offset = u64::try_from(97 + i * 31)?;
         file.seek(std::io::SeekFrom::Start(offset))?;
         let mut out_hdr = [0u8; 19];
         file.read_exact(&mut out_hdr)?;
@@ -599,14 +634,14 @@ fn snapshot_roundtrip_preserves_height_u32_max_both_coinbase_states()
     write_snapshot(&set, &txid(90_100), u32::MAX, &mut file)?;
     file.rewind()?;
 
-    // Read the coinbase byte of each output directly from the file
-    // Output 0 header starts at offset 94 (header=52, record header=41, output starts at 94)
+    // Read the coinbase byte of each output directly from the file.
+    // Output 0 starts at 97: snapshot header 52 + record header 45.
     let mut cb0 = [0u8; 1];
-    file.seek(std::io::SeekFrom::Start(94 + 16))?;
+    file.seek(std::io::SeekFrom::Start(97 + 16))?;
     file.read_exact(&mut cb0)?;
-    // Output 1 header starts at 94 + 19 + 12 = 125
+    // Output 1 starts after output 0's 19-byte header and 12-byte script.
     let mut cb1 = [0u8; 1];
-    file.seek(std::io::SeekFrom::Start(125 + 16))?;
+    file.seek(std::io::SeekFrom::Start(128 + 16))?;
     file.read_exact(&mut cb1)?;
 
     assert_eq!(
@@ -859,6 +894,16 @@ fn v3_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
     bytes
 }
 
+fn v4_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(52);
+    bytes.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
+    bytes.extend_from_slice(&4_u32.to_le_bytes());
+    bytes.extend_from_slice(&tip_hash.to_le_bytes());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&record_count.to_le_bytes());
+    bytes
+}
+
 fn v2_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(52);
     bytes.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
@@ -875,6 +920,15 @@ fn v3_record_body(key: UtxoKey, txid_bytes: &[u8; 32], vout_count: u8) -> Vec<u8
     bytes.extend_from_slice(&key.to_prefix());
     bytes.extend_from_slice(txid_bytes);
     bytes.push(vout_count);
+    bytes
+}
+
+fn v4_record_body(key: UtxoKey, txid_bytes: &[u8; 32], output_count: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.push(key.shard());
+    bytes.extend_from_slice(&key.to_prefix());
+    bytes.extend_from_slice(txid_bytes);
+    bytes.extend_from_slice(&output_count.to_le_bytes());
     bytes
 }
 
@@ -966,6 +1020,55 @@ fn snapshot_read_v3_rejects_duplicate_vout() {
         matches!(err, UtxoError::SnapshotDuplicateVout { vout } if vout == 42),
         "{err:?}"
     );
+}
+
+#[test]
+fn legacy_snapshot_duplicate_precedes_later_truncation() {
+    let record_txid = txid(160_005);
+    let key = UtxoKey::from_txid(&record_txid);
+    let txid_bytes = record_txid.to_le_bytes();
+
+    let mut v2 = v2_header(txid(160_006), 1600, 1);
+    let bitmap = (1_u64 << 7) | (1_u64 << 8) | (1_u64 << 9);
+    v2.extend_from_slice(&v2_record_body(key, &txid_bytes, bitmap, 3));
+    let mut v3 = v3_header(txid(160_007), 1600, 1);
+    v3.extend_from_slice(&v3_record_body(key, &txid_bytes, 3));
+    for bytes in [&mut v2, &mut v3] {
+        append_snapshot_output(bytes, 7, 1_000, 1600, false, &[0x51]);
+        append_snapshot_output(bytes, 7, 2_000, 1600, false, &[0x52]);
+    }
+
+    for bytes in [v2, v3] {
+        let error = match read_snapshot(&mut Cursor::new(bytes)) {
+            Err(error) => error,
+            Ok(_) => panic!("expected duplicate before truncated third output"),
+        };
+        assert!(matches!(
+            error,
+            UtxoError::SnapshotDuplicateVout { vout: 7 }
+        ));
+    }
+}
+
+#[test]
+fn snapshot_read_v4_reports_first_duplicate_in_record_order() {
+    let record_txid = txid(160_010);
+    let key = UtxoKey::from_txid(&record_txid);
+    let mut bytes = v4_header(txid(160_011), 1601, 1);
+    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 4));
+    for vout in [9, 1, 9, 1] {
+        append_snapshot_output(&mut bytes, vout, 1_000, 1601, false, &[0x51]);
+    }
+    bytes.extend_from_slice(&[0_u8; 384]);
+
+    let error = match read_snapshot(&mut Cursor::new(bytes)) {
+        Err(error) => error,
+        Ok(_) => panic!("expected duplicate vout error"),
+    };
+    assert!(matches!(
+        error,
+        UtxoError::SnapshotDuplicateVout { vout: 9 }
+    ));
 }
 
 #[test]
@@ -1142,7 +1245,7 @@ fn observed_snapshot_traversal_preserves_bytes_and_coin_fields()
     }
 
     let writer_coins = writer_observer.coins;
-    let (_, reader_observer) = bitcoin_rs_utxo::read_snapshot_strict_v3_observed(
+    let (_, reader_observer) = bitcoin_rs_utxo::read_snapshot_strict_v4_observed(
         &mut Cursor::new(&observed),
         RecordingSnapshotObserver::default(),
     )?;
@@ -1172,17 +1275,17 @@ fn observed_snapshot_writer_uses_observer_trailer() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn strict_v3_rejects_empty_records_but_legacy_accepts_them()
+fn strict_v4_rejects_empty_records_but_compatibility_reader_accepts_them()
 -> Result<(), Box<dyn std::error::Error>> {
     let record_txid = txid(200_020);
     let key = UtxoKey::from_txid(&record_txid);
-    let mut bytes = v3_header(txid(200_021), 2020, 1);
-    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 0));
+    let mut bytes = v4_header(txid(200_021), 2020, 1);
+    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 0));
     bytes.extend_from_slice(&[0_u8; 384]);
 
-    let legacy = read_snapshot(&mut Cursor::new(&bytes))?;
-    assert!(legacy.set.is_empty());
-    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(bytes))
+    let compatibility = read_snapshot(&mut Cursor::new(&bytes))?;
+    assert!(compatibility.set.is_empty());
+    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(bytes))
     else {
         return Err("strict snapshot accepted an empty record".into());
     };
@@ -1197,22 +1300,32 @@ fn strict_v3_rejects_empty_records_but_legacy_accepts_them()
 }
 
 #[test]
-fn strict_v3_rejects_split_duplicate_records_but_legacy_accepts_them()
+fn strict_v4_rejects_split_duplicate_records_but_compatibility_reader_accepts_them()
 -> Result<(), Box<dyn std::error::Error>> {
     let record_txid = txid(200_030);
     let key = UtxoKey::from_txid(&record_txid);
-    let mut bytes = v3_header(txid(200_031), 2030, 2);
-    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
-    append_v3_output(&mut bytes, 0, 3_000, 2030, false, &[0x51]);
-    bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
-    append_v3_output(&mut bytes, 1, 3_001, 2031, true, &[0x52]);
+    let mut bytes = v4_header(txid(200_031), 2030, 2);
+    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 1));
+    append_snapshot_output(&mut bytes, 0, 3_000, 2030, false, &[0x51]);
+    bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 1));
+    append_snapshot_output(&mut bytes, 1, 3_001, 2031, true, &[0x52]);
     bytes.extend_from_slice(&[0_u8; 384]);
 
-    let legacy = read_snapshot(&mut Cursor::new(&bytes))?;
-    assert_eq!(legacy.set.len(), 1);
-    assert!(legacy.set.get(&OutPoint::new(record_txid, 0)).is_none());
-    assert!(legacy.set.get(&OutPoint::new(record_txid, 1)).is_some());
-    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut Cursor::new(bytes))
+    let compatibility = read_snapshot(&mut Cursor::new(&bytes))?;
+    assert_eq!(compatibility.set.len(), 1);
+    assert!(
+        compatibility
+            .set
+            .get(&OutPoint::new(record_txid, 0))
+            .is_none()
+    );
+    assert!(
+        compatibility
+            .set
+            .get(&OutPoint::new(record_txid, 1))
+            .is_some()
+    );
+    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(bytes))
     else {
         return Err("strict snapshot accepted split duplicate records".into());
     };
@@ -1227,7 +1340,7 @@ fn strict_v3_rejects_split_duplicate_records_but_legacy_accepts_them()
 }
 
 #[test]
-fn strict_v3_observer_is_dropped_on_error() {
+fn strict_v4_observer_is_dropped_on_error() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1252,10 +1365,10 @@ fn strict_v3_observer_is_dropped_on_error() {
 
     let record_txid = txid(200_040);
     let key = UtxoKey::from_txid(&record_txid);
-    let mut bytes = v3_header(txid(200_041), 2040, 2);
+    let mut bytes = v4_header(txid(200_041), 2040, 2);
     for vout in 0..2 {
-        bytes.extend_from_slice(&v3_record_body(key, &record_txid.to_le_bytes(), 1));
-        append_v3_output(
+        bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 1));
+        append_snapshot_output(
             &mut bytes,
             vout,
             4_000 + u64::from(vout),
@@ -1268,7 +1381,7 @@ fn strict_v3_observer_is_dropped_on_error() {
 
     let dropped = Arc::new(AtomicBool::new(false));
 
-    let result = bitcoin_rs_utxo::read_snapshot_strict_v3_observed(
+    let result = bitcoin_rs_utxo::read_snapshot_strict_v4_observed(
         &mut Cursor::new(bytes),
         DropObserver {
             observed: 0,
@@ -1282,7 +1395,7 @@ fn strict_v3_observer_is_dropped_on_error() {
     assert!(dropped.load(Ordering::SeqCst));
 }
 
-fn append_v3_output(
+fn append_snapshot_output(
     bytes: &mut Vec<u8>,
     vout: u32,
     value: u64,

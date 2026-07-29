@@ -2129,9 +2129,9 @@ mod tests {
             root.join(directory).join("manifest-v1.json"),
         )?)?;
         assert_eq!(manifest["utxo"]["trailer_kind"], "scanned");
-        let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v3.dat"))?;
+        let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v4.dat"))?;
         let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
-        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut snapshot_reader)?;
+        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut snapshot_reader)?;
         assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
         assert_eq!(snapshot.muhash_trailer, rescanned.muhash.finalize());
         drop(resumed);

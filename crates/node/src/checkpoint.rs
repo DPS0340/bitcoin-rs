@@ -10,7 +10,7 @@ use bitcoin_rs_coinstats::{
 };
 use bitcoin_rs_primitives::{Hash256, Network};
 use bitcoin_rs_utxo::{
-    UtxoSet, read_snapshot_strict_v3_observed, snapshot::read_snapshot_strict_v3,
+    UtxoSet, read_snapshot_strict_v4_observed, snapshot::read_snapshot_strict_v4,
     write_snapshot_observed,
 };
 use cap_std::fs::{Dir, File};
@@ -36,7 +36,7 @@ const CHECKPOINT_ROOT: &str = "chainstate-checkpoints";
 const CURRENT_FILE: &str = "CURRENT";
 const MANIFEST_FILE: &str = "manifest-v1.json";
 const HEADERS_FILE: &str = "headers-v1.dat";
-const UTXO_FILE: &str = "utxo-v3.dat";
+const UTXO_FILE: &str = "utxo-v4.dat";
 const COINSTATS_FILE: &str = "coinstats-v1.dat";
 const CURRENT_FORMAT: &str = "bitcoin-rs-chainstate-current";
 const MANIFEST_FORMAT: &str = "bitcoin-rs-chainstate-checkpoint";
@@ -45,7 +45,7 @@ const UTXO_CODEC: &str = "bitcoin-rs-utxo-spendable-v1";
 const COINSTATS_CODEC: &str = "bitcoin-rs-coinstats";
 const CURRENT_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
-const UTXO_VERSION: u32 = 3;
+const UTXO_VERSION: u32 = 4;
 const COINSTATS_VERSION: u32 = 1;
 const COINSTATS_MAGIC: [u8; 8] = *b"BRSSTAT\0";
 const COINSTATS_PAYLOAD_LEN: u32 = 804;
@@ -678,9 +678,12 @@ pub(crate) fn load_checkpoint_from_dir(
         }
     };
     if manifest.utxo.version != UTXO_VERSION {
-        return Err(IncompatibleCheckpoint::UnsupportedVersion {
-            component: "UTXO",
-            version: manifest.utxo.version,
+        return Ok(CheckpointLoad::HeadersOnly {
+            tree: restored_headers.tree,
+            reason: format!(
+                "unsupported UTXO checkpoint version {}",
+                manifest.utxo.version
+            ),
         });
     }
     if manifest.coinstats.version != COINSTATS_VERSION {
@@ -1390,13 +1393,13 @@ fn read_checkpoint_snapshot(
     );
     match trailer_kind {
         TrailerKindV1::Rolling | TrailerKindV1::Scanned => {
-            let (snapshot, accumulator) = read_snapshot_strict_v3_observed(
+            let (snapshot, accumulator) = read_snapshot_strict_v4_observed(
                 &mut limited,
                 CoinStatsAccumulator::with_parallel_muhash(height),
             )?;
             Ok((snapshot, Some(accumulator.into_stats())))
         }
-        TrailerKindV1::Zero => Ok((read_snapshot_strict_v3(&mut limited)?, None)),
+        TrailerKindV1::Zero => Ok((read_snapshot_strict_v4(&mut limited)?, None)),
     }
 }
 
@@ -2070,6 +2073,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_utxo_snapshot_version_keeps_headers_only() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(1, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &UtxoSet::new(),
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        mutate_authenticated_manifest(dir.path(), |manifest| {
+            manifest.utxo.version = 3;
+        })?;
+
+        let CheckpointLoad::HeadersOnly { tree, reason } = load_checkpoint(dir.path(), config())?
+        else {
+            return Err("legacy UTXO snapshot did not keep headers only".into());
+        };
+        assert_eq!(tree.tip().map(|tip| tip.height), Some(1));
+        assert!(reason.contains("unsupported UTXO checkpoint version 3"));
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_current_version_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
@@ -2301,6 +2331,52 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_roundtrip_preserves_record_with_440_outputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const OUTPUT_COUNT: u32 = 440;
+        let dir = tempfile::tempdir()?;
+        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
+        let applied_tip = tip_snapshot(&tree, applied)?;
+        let record_txid = Hash256::from_le_bytes(&[0x44; 32]);
+        let mut changes = BlockChanges::default();
+        for vout in 0..OUTPUT_COUNT {
+            changes.add(UtxoAdd::new(
+                OutPoint::new(record_txid, vout),
+                TxOut {
+                    value: Amount::from_sat(u64::from(vout) + 1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                false,
+                0,
+            ));
+        }
+        let utxo = UtxoSet::new();
+        utxo.commit_block(&changes, &Hash256::default())?;
+
+        super::write_checkpoint(
+            dir.path(),
+            config(),
+            &RwLock::new(tree),
+            &utxo,
+            &CoinStatsListener::new(CoinStats::new()),
+            Some(&applied_tip),
+            false,
+        )?;
+        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
+            return Err("multi-output checkpoint did not restore".into());
+        };
+
+        assert_eq!(restored.utxo.len(), usize::try_from(OUTPUT_COUNT)?);
+        assert!(
+            restored
+                .utxo
+                .get(&OutPoint::new(record_txid, OUTPUT_COUNT - 1))
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn scanned_trailer_restores_independently_scanned_stats()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -2326,7 +2402,7 @@ mod tests {
             serde_json::from_slice(&fs::read(generation.join(MANIFEST_FILE))?)?;
         assert_eq!(manifest.utxo.trailer_kind, super::TrailerKindV1::Scanned);
         let mut reader = std::io::BufReader::new(std::fs::File::open(generation.join(UTXO_FILE))?);
-        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v3(&mut reader)?;
+        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut reader)?;
         assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
         assert_eq!(snapshot.muhash_trailer, expected.muhash.finalize());
 
@@ -2360,7 +2436,7 @@ mod tests {
     #[test]
     fn authenticated_utxo_value_mutation_keeps_headers_only()
     -> Result<(), Box<dyn std::error::Error>> {
-        const FIRST_VALUE_OFFSET: usize = 52 + 42 + 4;
+        const FIRST_VALUE_OFFSET: usize = 52 + 45 + 4;
 
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
