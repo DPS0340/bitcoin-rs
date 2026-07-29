@@ -1329,21 +1329,22 @@ impl BlockSync {
         let apply_side_busy = self
             .next_expected_block_hash()
             .is_some_and(|hash| self.block_stager.lock().contains(&hash));
-        let (fired, cold_hedge) = {
-            let mut window = self.download_window.lock();
-            let cold_hedge = window.observe_cold_front(next_apply_height, apply_side_busy, now);
-            let fired = window.observe_stall(next_apply_height, apply_side_busy, now);
+        let mut cold_hedge = None;
+        let mut fired = false;
+        let removed_peer = self.select_and_evict_window_peer(|window| {
+            cold_hedge = window.observe_cold_front(next_apply_height, apply_side_busy, now);
+            let selected = window.observe_stall(next_apply_height, apply_side_busy, now);
+            fired = selected.is_some();
             let stall_seconds = window
                 .stalling_peer()
                 .map_or(0.0, |(_, since)| now.duration_since(since).as_secs_f64());
             metrics::gauge!("node.sync.stall_seconds").set(stall_seconds);
-            (fired, cold_hedge)
-        };
-        if let Some(peer_addr) = fired {
-            let Some(removed) = self.peer_outbound.write().remove(&peer_addr) else {
+            selected
+        });
+        if fired {
+            let Some(peer_addr) = removed_peer else {
                 return false;
             };
-            removed.cancel();
             metrics::counter!("node.sync.staller_disconnects").increment(1);
             tracing::warn!(
                 peer_addr = %peer_addr,
@@ -1367,17 +1368,11 @@ impl BlockSync {
         let apply_side_busy = self
             .next_expected_block_hash()
             .is_some_and(|hash| self.block_stager.lock().contains(&hash));
-        let peer_addr = self
-            .download_window
-            .lock()
-            .observe_pending_timeout(apply_side_busy, now);
-        let Some(peer_addr) = peer_addr else {
+        let Some(peer_addr) = self.select_and_evict_window_peer(|window| {
+            window.observe_pending_timeout(apply_side_busy, now)
+        }) else {
             return false;
         };
-        let Some(removed) = self.peer_outbound.write().remove(&peer_addr) else {
-            return false;
-        };
-        removed.cancel();
         metrics::counter!("node.sync.pending_timeout_disconnects").increment(1);
         tracing::warn!(
             peer_addr = %peer_addr,
@@ -1399,6 +1394,37 @@ impl BlockSync {
         let window = self.download_window.lock();
         metrics::gauge!("node.sync.pending_blocks").set(metric_count(window.pending_len()));
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
+    }
+
+    /// Selects and evicts a download-window owner without letting a
+    /// same-address registration replace the lease in the middle.
+    ///
+    /// The lock order is window, outbound, peer registry, then pending headers.
+    /// Registration uses the same order, so once selection succeeds the removed
+    /// lease is necessarily the selected connection.
+    fn select_and_evict_window_peer(
+        &self,
+        select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        self.select_and_evict_window_peer_after_selection(select, |_| {})
+    }
+
+    fn select_and_evict_window_peer_after_selection(
+        &self,
+        select: impl FnOnce(&mut DownloadWindow) -> Option<SocketAddr>,
+        on_selected: impl FnOnce(SocketAddr),
+    ) -> Option<SocketAddr> {
+        let mut window = self.download_window.lock();
+        let peer_addr = select(&mut window)?;
+        on_selected(peer_addr);
+        let removed = self.peer_outbound.write().remove(&peer_addr)?;
+        removed.cancel();
+        self.peers.write().retain(|peer| peer.addr != peer_addr);
+        let mut pending = self.pending_getheaders.lock();
+        if pending.is_some_and(|request| request.peer_addr == peer_addr) {
+            *pending = None;
+        }
+        Some(peer_addr)
     }
 }
 
@@ -3743,9 +3769,11 @@ mod tests {
         // reconnected staller stays in cooldown and receives no block
         // requests.
         let (staller_tx2, staller_rx2) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(staller, bitcoin_rs_p2p::PeerLease::new(staller_tx2));
+        assert!(!sync.peer_registration_handle()(
+            staller,
+            bitcoin_rs_p2p::PeerLease::new(staller_tx2),
+            synthetic_peer(staller, 10_000),
+        ));
         let mut inbound = bitcoin_rs_p2p::InboundBlock::from_decoded(blocks[2].clone());
         inbound.source = Some(current_source(&peer_outbound, honest));
         blocks_tx.send(inbound)?;
@@ -4139,9 +4167,11 @@ mod tests {
         // Net-layer re-dial: the same address reconnects and, being the only
         // candidate, serves as the last resort despite the cooldown.
         let (tx2, rx2) = unbounded::<Message>();
-        peer_outbound
-            .write()
-            .insert(sole, bitcoin_rs_p2p::PeerLease::new(tx2));
+        assert!(!sync.peer_registration_handle()(
+            sole,
+            bitcoin_rs_p2p::PeerLease::new(tx2),
+            synthetic_peer(sole, 100),
+        ));
         sync.tick();
         let retry = next_getdata(&rx2)?;
         assert_eq!(
@@ -6717,5 +6747,83 @@ mod tests {
             .insert(info.addr, bitcoin_rs_p2p::PeerLease::new(tx));
         peers.write().push(info);
         rx
+    }
+
+    #[test]
+    fn same_address_registration_survives_selected_window_eviction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let sync = Arc::new(sync);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_452));
+        let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peers.write().push(synthetic_peer(addr, 1));
+        peer_outbound.write().insert(addr, old.clone());
+
+        let window = Arc::clone(&sync.download_window);
+        let (selected_tx, selected_rx) = unbounded();
+        let (resume_tx, resume_rx) = unbounded();
+        let eviction_sync = Arc::clone(&sync);
+        let eviction = std::thread::spawn(move || {
+            eviction_sync.select_and_evict_window_peer_after_selection(
+                |_| Some(addr),
+                |_| {
+                    let window_released = window.try_lock().is_some();
+                    selected_tx
+                        .send(window_released)
+                        .expect("test must observe selected eviction");
+                    resume_rx
+                        .recv()
+                        .expect("test must resume selected eviction");
+                },
+            )
+        });
+
+        let window_released = selected_rx.recv()?;
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, _replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (started_tx, started_rx) = unbounded();
+        let replacement_for_registration = replacement.clone();
+        let registered = std::thread::spawn(move || {
+            started_tx.send(())?;
+            Ok::<_, crossbeam_channel::SendError<()>>(registration(
+                addr,
+                replacement_for_registration,
+                synthetic_peer(addr, 2),
+            ))
+        });
+        started_rx.recv()?;
+
+        if window_released {
+            assert!(
+                registered
+                    .join()
+                    .map_err(|_| "registration thread panicked")??
+            );
+            resume_tx.send(())?;
+        } else {
+            resume_tx.send(())?;
+            assert!(
+                !registered
+                    .join()
+                    .map_err(|_| "registration thread panicked")??
+            );
+        }
+        assert_eq!(
+            eviction.join().map_err(|_| "eviction thread panicked")?,
+            Some(addr)
+        );
+        assert!(old.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_connection(&replacement))
+        );
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
+        Ok(())
     }
 }
