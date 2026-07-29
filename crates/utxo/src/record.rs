@@ -367,11 +367,15 @@ impl UtxoRecord {
     }
 
     pub(crate) fn key(&self) -> UtxoKey {
-        UtxoKey::from_txid(&self.txid())
+        let mut prefix = [0_u8; 8];
+        prefix.copy_from_slice(&self.buf.as_bytes()[..8]);
+        UtxoKey::from_prefix(prefix)
     }
 
     pub(crate) fn txid(&self) -> Hash256 {
-        self.header().txid
+        let mut txid = [0_u8; TXID_LEN];
+        txid.copy_from_slice(&self.buf.as_bytes()[..TXID_LEN]);
+        Hash256::from_le_bytes(&txid)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
