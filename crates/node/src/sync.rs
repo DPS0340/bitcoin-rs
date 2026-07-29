@@ -298,20 +298,12 @@ impl BlockSync {
     pub fn peer_registration_handle(
         &self,
     ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
-        self.peer_registration_handle_after_window_lock(|| {})
-    }
-
-    fn peer_registration_handle_after_window_lock(
-        &self,
-        after_window_lock: impl Fn() + Send + Sync + 'static,
-    ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
         let window = Arc::clone(&self.download_window);
         let outbound = Arc::clone(&self.peer_outbound);
         let peers = Arc::clone(&self.peers);
         let pending_getheaders = Arc::clone(&self.pending_getheaders);
         Arc::new(move |peer_addr, lease, info| {
             let mut window = window.lock();
-            after_window_lock();
             let mut outbound = outbound.write();
             let replaced = outbound.remove(&peer_addr).is_some_and(|prior| {
                 prior.cancel();
@@ -7128,7 +7120,14 @@ mod tests {
         let (resume_tx, resume_rx) = unbounded();
         let (confirmed_tx, confirmed_rx) = unbounded();
         let (confirm_resume_tx, confirm_resume_rx) = unbounded();
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (registration_inside_tx, registration_inside_rx) = unbounded();
         let dispatch_sync = Arc::clone(&sync);
+        let dispatch_window = Arc::clone(&sync.download_window);
+        let dispatch_registration = Arc::clone(&registration);
+        let dispatch_replacement = replacement.clone();
         let dispatch = std::thread::spawn(move || {
             dispatch_sync.send_prefix_probes_after_plan_and_confirmation(
                 &[super::SyncPeer {
@@ -7136,7 +7135,25 @@ mod tests {
                     start_height: 10,
                 }],
                 Instant::now(),
-                |_| {
+                move |_| {
+                    let replacement_ran_inside = match dispatch_window.try_lock() {
+                        None => false,
+                        Some(window_guard) => {
+                            drop(window_guard);
+                            assert!(
+                                dispatch_registration(
+                                    owner,
+                                    dispatch_replacement,
+                                    synthetic_peer(owner, 10),
+                                ),
+                                "test mutation must replace the original peer inside the prefix gap"
+                            );
+                            true
+                        }
+                    };
+                    registration_inside_tx
+                        .send(replacement_ran_inside)
+                        .expect("test must observe whether registration entered the prefix gap");
                     paused_tx.send(()).expect("test must observe prefix plan");
                     resume_rx.recv().expect("test must resume prefix dispatch");
                 },
@@ -7151,66 +7168,31 @@ mod tests {
             );
         });
         paused_rx.recv()?;
-        let (window_locked_tx, window_locked_rx) = unbounded();
-        let (registration_resume_tx, registration_resume_rx) = unbounded();
-        let registration = sync.peer_registration_handle_after_window_lock(move || {
-            window_locked_tx
-                .send(())
-                .expect("test must observe registration window acquisition");
-            registration_resume_rx
-                .recv()
-                .expect("test must release registration");
-        });
-        let (replacement_tx, replacement_rx) = unbounded::<Message>();
-        let replacement = PeerLease::new(replacement_tx);
-        let (started_tx, started_rx) = unbounded();
-        let (registered_tx, registered_rx) = unbounded();
-        let registered = std::thread::spawn(move || {
-            started_tx
-                .send(())
-                .expect("test must observe registration start");
-            registered_tx
-                .send(registration(
-                    owner,
-                    replacement.clone(),
-                    synthetic_peer(owner, 10),
-                ))
-                .expect("test must observe registration completion");
-        });
-        started_rx.recv()?;
         resume_tx.send(())?;
-        let confirmation_first = crossbeam_channel::select! {
-            recv(confirmed_rx) -> confirmed => confirmed?,
-            recv(window_locked_rx) -> _ => false,
-        };
-        if !confirmation_first {
-            registration_resume_tx.send(())?;
-            assert!(
-                !confirmed_rx.recv()?,
-                "dropping the prefix barrier must leave no confirmed stale probe"
-            );
-            confirm_resume_tx.send(())?;
-            dispatch
-                .join()
-                .map_err(|_| "prefix dispatch thread panicked")?;
-            registered
-                .join()
-                .map_err(|_| "registration thread panicked")?;
-            return Err(std::io::Error::other(
-                "registration acquired the prefix window before confirmation",
-            )
-            .into());
-        }
+        let confirmed = confirmed_rx.recv()?;
         confirm_resume_tx.send(())?;
-        window_locked_rx.recv()?;
-        registration_resume_tx.send(())?;
         dispatch
             .join()
             .map_err(|_| "prefix dispatch thread panicked")?;
-        registered
-            .join()
-            .map_err(|_| "registration thread panicked")?;
-        assert!(registered_rx.recv()?);
+        if registration_inside_rx.recv()? {
+            assert!(
+                !confirmed,
+                "dropping the prefix barrier must leave no confirmed stale probe"
+            );
+            return Err(std::io::Error::other(
+                "prefix confirmation observed same-address registration inside its plan-to-confirm gap",
+            )
+            .into());
+        }
+        assert!(
+            confirmed,
+            "production prefix barrier must confirm before same-address registration"
+        );
+        assert!(registration(
+            owner,
+            replacement.clone(),
+            synthetic_peer(owner, 10)
+        ));
         assert_eq!(
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
             expected
