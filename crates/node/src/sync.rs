@@ -298,12 +298,20 @@ impl BlockSync {
     pub fn peer_registration_handle(
         &self,
     ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
+        self.peer_registration_handle_after_window_lock(|| {})
+    }
+
+    fn peer_registration_handle_after_window_lock(
+        &self,
+        after_window_lock: impl Fn() + Send + Sync + 'static,
+    ) -> Arc<dyn Fn(SocketAddr, PeerLease, PeerInfo) -> bool + Send + Sync> {
         let window = Arc::clone(&self.download_window);
         let outbound = Arc::clone(&self.peer_outbound);
         let peers = Arc::clone(&self.peers);
         let pending_getheaders = Arc::clone(&self.pending_getheaders);
         Arc::new(move |peer_addr, lease, info| {
             let mut window = window.lock();
+            after_window_lock();
             let mut outbound = outbound.write();
             let replaced = outbound.remove(&peer_addr).is_some_and(|prior| {
                 prior.cancel();
@@ -1004,10 +1012,21 @@ impl BlockSync {
     /// Every alternate receives the same earliest hashes, so the probe cannot
     /// create a unique out-of-order height hole. It runs once per deep owner.
     fn send_prefix_probes(&self, probe_peers: &[SyncPeer], now: Instant) {
+        self.send_prefix_probes_after_plan_and_confirmation(probe_peers, now, |_| {}, |_| {});
+    }
+
+    fn send_prefix_probes_after_plan_and_confirmation(
+        &self,
+        probe_peers: &[SyncPeer],
+        now: Instant,
+        after_plan: impl FnOnce(SocketAddr),
+        after_confirmation: impl FnOnce(&DownloadWindow),
+    ) {
         let mut window = self.download_window.lock();
         let Some((owner, hashes, required_height)) = window.prefix_probe_plan() else {
             return;
         };
+        after_plan(owner);
         let candidates = probe_peers.iter().filter(|peer| {
             peer.addr != owner
                 && u32::try_from(peer.start_height).is_ok_and(|height| height >= required_height)
@@ -1031,6 +1050,7 @@ impl BlockSync {
         }
         let block_count = hashes.len();
         window.confirm_prefix_probe(owner, hashes, &successful, now);
+        after_confirmation(&window);
         metrics::counter!("node.sync.prefix_probe_peers")
             .increment(u64::try_from(successful.len()).unwrap_or(u64::MAX));
         tracing::info!(
@@ -1048,6 +1068,25 @@ impl BlockSync {
         peer_best_height: u32,
         chain_tip: &TipSnapshot,
         applied_tip: &TipSnapshot,
+    ) -> GetdataRequestOutcome {
+        self.send_getdata_for_pending_blocks_after_selection(
+            sync_peer_addr,
+            allow_expired_retry_from_peer,
+            peer_best_height,
+            chain_tip,
+            applied_tip,
+            |_| {},
+        )
+    }
+
+    fn send_getdata_for_pending_blocks_after_selection(
+        &self,
+        sync_peer_addr: SocketAddr,
+        allow_expired_retry_from_peer: bool,
+        peer_best_height: u32,
+        chain_tip: &TipSnapshot,
+        applied_tip: &TipSnapshot,
+        after_selection: impl FnOnce(SocketAddr),
     ) -> GetdataRequestOutcome {
         let applied_height = applied_tip.height;
         if chain_tip.height <= applied_height {
@@ -1071,6 +1110,7 @@ impl BlockSync {
             return GetdataRequestOutcome::default();
         };
 
+        after_selection(request.peer_addr());
         let count = request.len();
         let mut inventory = Vec::with_capacity(count);
         let mut expected_hashes = ExpectedBlockHashes::with_capacity(count);
@@ -1137,6 +1177,16 @@ impl BlockSync {
     }
 
     fn send_getheaders(&self, sync_peer_addr: SocketAddr, our_height: u32, target_height: i32) {
+        self.send_getheaders_after_window(sync_peer_addr, our_height, target_height, |_| {});
+    }
+
+    fn send_getheaders_after_window(
+        &self,
+        sync_peer_addr: SocketAddr,
+        our_height: u32,
+        target_height: i32,
+        after_window: impl FnOnce(SocketAddr),
+    ) {
         let locator = self.build_locator();
         let Some(locator_tip_hash) = locator.first().copied() else {
             return;
@@ -1153,6 +1203,7 @@ impl BlockSync {
             );
             return;
         }
+        after_window(sync_peer_addr);
         let locator_hashes: Vec<BlockHash> = locator
             .into_iter()
             .map(|hash| BlockHash::from_byte_array(hash.to_le_bytes()))
@@ -6824,6 +6875,351 @@ mod tests {
                 .is_some_and(|current| current.same_connection(&replacement))
         );
         assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
+        Ok(())
+    }
+
+    #[test]
+    fn paused_getdata_dispatch_does_not_transfer_request_to_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, expected) =
+            sync_with_header_chain(4)?;
+        sync.ensure_genesis_tip();
+        let chain_tip = sync
+            .handles
+            .chain_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
+        let applied_tip = sync
+            .handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        let sync = Arc::new(sync);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_453));
+        peers.write().push(synthetic_peer(addr, 10));
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peer_outbound.write().insert(addr, old.clone());
+
+        let (paused_tx, paused_rx) = unbounded();
+        let (resume_tx, resume_rx) = unbounded();
+        let dispatch_sync = Arc::clone(&sync);
+        let dispatch = std::thread::spawn(move || {
+            dispatch_sync.send_getdata_for_pending_blocks_after_selection(
+                addr,
+                false,
+                10,
+                &chain_tip,
+                &applied_tip,
+                |_| {
+                    paused_tx
+                        .send(())
+                        .expect("test must observe getdata selection");
+                    resume_rx.recv().expect("test must resume getdata dispatch");
+                },
+            )
+        });
+        paused_rx.recv()?;
+
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (started_tx, started_rx) = unbounded();
+        let (registered_tx, registered_rx) = unbounded();
+        let registered = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test must observe registration start");
+            registered_tx
+                .send(registration(
+                    addr,
+                    replacement.clone(),
+                    synthetic_peer(addr, 10),
+                ))
+                .expect("test must observe registration completion");
+        });
+        started_rx.recv()?;
+        assert!(
+            registered_rx.try_recv().is_err(),
+            "same-address registration must remain behind the getdata window transaction"
+        );
+
+        resume_tx.send(())?;
+        assert!(
+            dispatch
+                .join()
+                .map_err(|_| "getdata dispatch thread panicked")?
+                .sent
+        );
+        registered
+            .join()
+            .map_err(|_| "registration thread panicked")?;
+        assert!(registered_rx.recv()?);
+        assert_eq!(witness_block_inventory(next_getdata(&old_rx)?)?, expected);
+        assert!(replacement_rx.try_recv().is_err());
+        assert!(old.is_cancelled());
+        {
+            let window = sync.download_window.lock();
+            assert_eq!(window.pending_len(), 0);
+            assert!(
+                !window.peer_in_staller_cooldown(addr, Instant::now()),
+                "replacement must not inherit a cooldown"
+            );
+        }
+        assert!(sync.pending_getheaders.lock().is_none());
+
+        let chain_tip = sync
+            .handles
+            .chain_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
+        let applied_tip = sync
+            .handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        assert!(
+            sync.send_getdata_for_pending_blocks(addr, false, 10, &chain_tip, &applied_tip)
+                .sent,
+            "replacement must have no inherited peer inflight accounting"
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&replacement_rx)?)?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn paused_getheaders_dispatch_clears_gate_before_replacement_tick()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            sync,
+            peers,
+            peer_outbound,
+            ..
+        } = header_sync_with_genesis()?;
+        let sync = Arc::new(sync);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_454));
+        peers.write().push(synthetic_peer(addr, 10));
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        peer_outbound.write().insert(addr, old.clone());
+        let (paused_tx, paused_rx) = unbounded();
+        let (resume_tx, resume_rx) = unbounded();
+        let dispatch_sync = Arc::clone(&sync);
+        let dispatch = std::thread::spawn(move || {
+            dispatch_sync.send_getheaders_after_window(addr, 0, 10, |_| {
+                paused_tx
+                    .send(())
+                    .expect("test must observe getheaders barrier");
+                resume_rx
+                    .recv()
+                    .expect("test must resume getheaders dispatch");
+            });
+        });
+        paused_rx.recv()?;
+        let registration = sync.peer_registration_handle();
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (started_tx, started_rx) = unbounded();
+        let (registered_tx, registered_rx) = unbounded();
+        let registered = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test must observe registration start");
+            registered_tx
+                .send(registration(
+                    addr,
+                    replacement.clone(),
+                    synthetic_peer(addr, 10),
+                ))
+                .expect("test must observe registration completion");
+        });
+        started_rx.recv()?;
+        assert!(
+            registered_rx.try_recv().is_err(),
+            "same-address registration must remain behind the getheaders window transaction"
+        );
+        resume_tx.send(())?;
+        dispatch
+            .join()
+            .map_err(|_| "getheaders dispatch thread panicked")?;
+        registered
+            .join()
+            .map_err(|_| "registration thread panicked")?;
+        assert!(registered_rx.recv()?);
+        assert!(matches!(old_rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(sync.pending_getheaders.lock().is_none());
+        sync.tick();
+        assert!(matches!(
+            replacement_rx.try_recv()?,
+            NetworkMessage::GetHeaders(_)
+        ));
+        assert!(replacement_rx.try_recv().is_err());
+        assert!(old_rx.try_recv().is_err());
+        assert!(old.is_cancelled());
+        Ok(())
+    }
+
+    #[test]
+    fn paused_prefix_probe_does_not_survive_owner_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, expected) =
+            sync_with_header_chain(8)?;
+        sync.ensure_genesis_tip();
+        let chain_tip = sync
+            .handles
+            .chain_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
+        let applied_tip = sync
+            .handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        let sync = Arc::new(sync);
+        let owner = SocketAddr::from(([127, 0, 0, 1], 18_455));
+        let alternate = SocketAddr::from(([127, 0, 0, 1], 18_456));
+        peers
+            .write()
+            .extend([synthetic_peer(owner, 10), synthetic_peer(alternate, 10)]);
+        let (old_tx, old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
+        let (alternate_tx, alternate_rx) = unbounded::<Message>();
+        peer_outbound.write().extend([
+            (owner, old.clone()),
+            (alternate, PeerLease::new(alternate_tx)),
+        ]);
+        assert!(
+            sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
+                .sent
+        );
+        assert_eq!(witness_block_inventory(next_getdata(&old_rx)?)?, expected);
+        let (paused_tx, paused_rx) = unbounded();
+        let (resume_tx, resume_rx) = unbounded();
+        let (confirmed_tx, confirmed_rx) = unbounded();
+        let (confirm_resume_tx, confirm_resume_rx) = unbounded();
+        let dispatch_sync = Arc::clone(&sync);
+        let dispatch = std::thread::spawn(move || {
+            dispatch_sync.send_prefix_probes_after_plan_and_confirmation(
+                &[super::SyncPeer {
+                    addr: alternate,
+                    start_height: 10,
+                }],
+                Instant::now(),
+                |_| {
+                    paused_tx.send(()).expect("test must observe prefix plan");
+                    resume_rx.recv().expect("test must resume prefix dispatch");
+                },
+                |window| {
+                    confirmed_tx
+                        .send(window.active_prefix_probe_started_at().is_some())
+                        .expect("test must observe prefix confirmation");
+                    confirm_resume_rx
+                        .recv()
+                        .expect("test must release prefix confirmation");
+                },
+            );
+        });
+        paused_rx.recv()?;
+        let (window_locked_tx, window_locked_rx) = unbounded();
+        let (registration_resume_tx, registration_resume_rx) = unbounded();
+        let registration = sync.peer_registration_handle_after_window_lock(move || {
+            window_locked_tx
+                .send(())
+                .expect("test must observe registration window acquisition");
+            registration_resume_rx
+                .recv()
+                .expect("test must release registration");
+        });
+        let (replacement_tx, replacement_rx) = unbounded::<Message>();
+        let replacement = PeerLease::new(replacement_tx);
+        let (started_tx, started_rx) = unbounded();
+        let (registered_tx, registered_rx) = unbounded();
+        let registered = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("test must observe registration start");
+            registered_tx
+                .send(registration(
+                    owner,
+                    replacement.clone(),
+                    synthetic_peer(owner, 10),
+                ))
+                .expect("test must observe registration completion");
+        });
+        started_rx.recv()?;
+        resume_tx.send(())?;
+        let confirmation_first = crossbeam_channel::select! {
+            recv(confirmed_rx) -> confirmed => confirmed?,
+            recv(window_locked_rx) -> _ => false,
+        };
+        if !confirmation_first {
+            registration_resume_tx.send(())?;
+            assert!(
+                !confirmed_rx.recv()?,
+                "dropping the prefix barrier must leave no confirmed stale probe"
+            );
+            confirm_resume_tx.send(())?;
+            dispatch
+                .join()
+                .map_err(|_| "prefix dispatch thread panicked")?;
+            registered
+                .join()
+                .map_err(|_| "registration thread panicked")?;
+            return Err(std::io::Error::other(
+                "registration acquired the prefix window before confirmation",
+            )
+            .into());
+        }
+        confirm_resume_tx.send(())?;
+        window_locked_rx.recv()?;
+        registration_resume_tx.send(())?;
+        dispatch
+            .join()
+            .map_err(|_| "prefix dispatch thread panicked")?;
+        registered
+            .join()
+            .map_err(|_| "registration thread panicked")?;
+        assert!(registered_rx.recv()?);
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            expected
+        );
+        assert!(replacement_rx.try_recv().is_err());
+        assert!(old.is_cancelled());
+        assert_eq!(sync.download_window.lock().pending_len(), 0);
+        let chain_tip = sync
+            .handles
+            .chain_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing chain tip"))?;
+        let applied_tip = sync
+            .handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        assert!(
+            sync.send_getdata_for_pending_blocks(owner, false, 10, &chain_tip, &applied_tip)
+                .sent,
+            "replacement must have no inherited peer inflight accounting"
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&replacement_rx)?)?,
+            expected
+        );
+        sync.send_prefix_probes(
+            &[super::SyncPeer {
+                addr: alternate,
+                start_height: 10,
+            }],
+            Instant::now(),
+        );
+        assert_eq!(
+            witness_block_inventory(next_getdata(&alternate_rx)?)?,
+            expected
+        );
         Ok(())
     }
 }
