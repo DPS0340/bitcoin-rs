@@ -35,10 +35,25 @@ pub struct BlockRecord {
     pub time: u32,
 }
 
+/// Block payload facts available without materializing a full block body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockBodyMetadata {
+    /// Serialized block byte length.
+    pub body_size: usize,
+    /// Number of transactions encoded in the block.
+    pub tx_count: usize,
+}
+
 /// Storage-backed block body reader used when block records keep only metadata.
 pub trait BlockBodySource: Send + Sync {
     /// Returns serialized block bytes for `height` and `hash`, if available.
     fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>>;
+
+    /// Returns indexed body facts. Implementations that cannot answer without
+    /// I/O may leave this absent; header-only callers then remain header-only.
+    fn block_body_metadata(&self, _height: u32, _hash: Hash256) -> Option<BlockBodyMetadata> {
+        None
+    }
 }
 
 impl BlockRecord {
@@ -527,57 +542,127 @@ impl Context {
         out
     }
 
-    /// Returns the block hash for `height` when known without blocking I/O.
+    fn hash_at_height_from_tip(&self, tip: &TipSnapshot, height: u32) -> Option<Hash256> {
+        if height > tip.height {
+            return None;
+        }
+        if height == tip.height {
+            return Some(tip.hash);
+        }
+        let tree = self.block_tree.read();
+        let node_id = tree.node_at_height_from(tip.tip_id, height)?;
+        Some(tree.node(node_id).ok()?.hash)
+    }
+
+    /// Returns the applied-chain hash at `height`, from the restored header index.
     #[must_use]
-    pub fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
+    pub fn active_hash_at_height(&self, height: u32) -> Option<Hash256> {
+        let tip = self.applied_tip.load_full()?;
+        self.hash_at_height_from_tip(&tip, height)
+    }
+
+    fn header_record(&self, hash: Hash256) -> Option<BlockRecord> {
+        let tree = self.block_tree.read();
+        let node = tree.node_by_hash(hash)?;
+        Some(BlockRecord {
+            hash,
+            height: node.height,
+            block_hex: String::new(),
+            body_size: 0,
+            header_hex: serialize(&node.header).to_lower_hex_string(),
+            tx_count: 0,
+            time: node.header.time,
+        })
+    }
+
+    /// Resolves a block record for `hash`.
+    ///
+    /// The restored header tree is the identity authority: when it knows the
+    /// hash its `(hash, height)` pair wins, and the session vector contributes
+    /// only a matching payload cache or durable body metadata. When the tree
+    /// has no node for `hash` (cache-only fixtures, or a block seen before a
+    /// checkpoint restore) the vector supplies a record by exact hash as a
+    /// legacy fallback. A stale cached height can therefore never override an
+    /// active-tree identity.
+    #[must_use]
+    pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
+        // 1. Tree authority. When the restored header index knows this hash its
+        //    identity wins; enrich with a height-matched cached payload, else
+        //    with durable body metadata.
+        if let Some(mut record) = self.header_record(hash) {
+            if let Some(cached) = self
+                .blocks
+                .read()
+                .iter()
+                .find(|candidate| candidate.hash == hash && candidate.height == record.height)
+            {
+                return Some(cached.clone());
+            }
+            if let Some(metadata) = self
+                .block_body_source
+                .as_ref()
+                .and_then(|source| source.block_body_metadata(record.height, hash))
+            {
+                record.body_size = metadata.body_size;
+                record.tx_count = metadata.tx_count;
+            }
+            return Some(record);
+        }
+        // 2. Legacy/cache-only fallback. The tree cannot resolve this identity,
+        //    so accept a vector record by exact hash. Metadata-only records and
+        //    pruned-body payloads pass through unchanged via their own fields.
         self.blocks
             .read()
             .iter()
-            .find(|record| record.height == height)
-            .map(|record| record.hash)
-            .or_else(|| {
-                self.chain_tip.load_full().and_then(|tip| {
-                    if tip.height == height {
-                        Some(tip.hash)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .or_else(|| {
-                if height == 0 {
-                    let genesis_hash = bitcoin::blockdata::constants::genesis_block(
-                        bitcoin_network(self.chain_network),
-                    )
-                    .block_hash();
-                    Some(Hash256::from_le_bytes(genesis_hash.as_byte_array()))
-                } else {
-                    None
-                }
-            })
+            .find(|candidate| candidate.hash == hash)
+            .cloned()
+    }
+
+    /// Returns the block hash for an applied height.
+    ///
+    /// Once an applied tip exists, its ancestry is authoritative and heights
+    /// above it are absent even when header sync has found a better fork.
+    /// Before the first applied-tip publication, genesis and cache-only test
+    /// records remain available.
+    #[must_use]
+    pub fn block_hash_at_height(&self, height: u32) -> Option<Hash256> {
+        if let Some(tip) = self.applied_tip.load_full() {
+            return self.hash_at_height_from_tip(&tip, height);
+        }
+        if height == 0 {
+            return Some(Hash256::from_le_bytes(
+                bitcoin::blockdata::constants::genesis_block(bitcoin_network(self.chain_network))
+                    .block_hash()
+                    .as_byte_array(),
+            ));
+        }
+        self.blocks
+            .read()
+            .iter()
+            .find(|candidate| candidate.height == height)
+            .map(|candidate| candidate.hash)
     }
 
     /// Returns a known block by hash.
     #[must_use]
     pub fn block_by_hash(&self, hash: Hash256) -> Option<BlockRecord> {
-        self.blocks
-            .read()
-            .iter()
-            .find(|record| record.hash == hash)
-            .cloned()
+        self.record_for_hash(hash)
     }
 
-    /// Returns the `BlockRecord` at the given height, if known.
+    /// Returns the applied block at a height.
     ///
-    /// Linear scan over the in-memory block log. Returns the first matching
-    /// record. Suitable for handlers and Electrum resolvers needing a block
-    /// reference; not a hot path on an indexed store.
+    /// Once an applied tip exists, its ancestry is authoritative. The session
+    /// vector is a cache-only fallback before the first applied-tip publication.
     #[must_use]
     pub fn block_by_height(&self, height: u32) -> Option<BlockRecord> {
+        if let Some(tip) = self.applied_tip.load_full() {
+            let hash = self.hash_at_height_from_tip(&tip, height)?;
+            return self.record_for_hash(hash);
+        }
         self.blocks
             .read()
             .iter()
-            .find(|record| record.height == height)
+            .find(|candidate| candidate.height == height)
             .cloned()
     }
 
@@ -645,12 +730,7 @@ impl Context {
 
 impl bitcoin_rs_index::BlockSource for Context {
     fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {
-        let record = self
-            .blocks
-            .read()
-            .iter()
-            .find(|record| record.height == height)
-            .cloned()?;
+        let record = self.block_by_height(height)?;
         let bytes = self.block_body_bytes(&record)?;
         bitcoin::consensus::encode::deserialize::<bitcoin::Block>(&bytes).ok()
     }
@@ -845,5 +925,137 @@ mod tests {
         let unknown = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xff_u8; 32]);
 
         assert!(ctx.height_for_hash(unknown).is_none());
+    }
+    #[test]
+    fn block_by_height_prefers_tree_identity_over_stale_cache() {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
+
+        let ctx = Context::new();
+        let (child_hash, stale_hash) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            let genesis_id = tree
+                .insert_node(None, genesis, NodeStatus::Active)
+                .expect("genesis inserts");
+            let mut child = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_900,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            child.nonce = 1;
+            let child_id = tree
+                .insert_node(Some(genesis_id), child, NodeStatus::Active)
+                .expect("child inserts");
+            let child_hash = tree.node(child_id).expect("child node").hash;
+            let applied_tip = tree.tip().expect("child tip");
+            ctx.set_applied_tip((*applied_tip).clone());
+            // Stale cache entry at the SAME height as the tree child but with a
+            // different hash. The active-tree identity must win over this cache.
+            let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
+            ctx.add_block(BlockRecord::synthetic(1, stale_hash));
+            (child_hash, stale_hash)
+        };
+
+        assert_ne!(child_hash, stale_hash, "test fixture hashes must differ");
+        let found = ctx
+            .block_by_height(1)
+            .expect("tree child should resolve at height 1");
+        assert_eq!(
+            found.hash, child_hash,
+            "active-tree identity must win over a stale cached hash"
+        );
+        assert_eq!(found.height, 1);
+    }
+
+    #[test]
+    fn height_lookups_follow_applied_tip_when_header_fork_leads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
+
+        let ctx = Context::new();
+        let (applied_tip, header_tip) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            let applied = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_900,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            };
+            let applied_id = tree.insert_node(Some(genesis_id), applied, NodeStatus::Active)?;
+            let applied_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+            assert_eq!(applied_tip.tip_id, applied_id);
+
+            let fork = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_901,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 2,
+            };
+            let fork_id = tree.insert_node(Some(genesis_id), fork, NodeStatus::HeaderValid)?;
+            let fork_tip = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: fork.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_001_800,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 3,
+            };
+            let header_tip_id =
+                tree.insert_node(Some(fork_id), fork_tip, NodeStatus::HeaderValid)?;
+            let header_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing header tip"))?;
+            assert_eq!(header_tip.tip_id, header_tip_id);
+            (applied_tip, header_tip)
+        };
+
+        ctx.set_applied_tip((*applied_tip).clone());
+        ctx.set_chain_tip((*header_tip).clone());
+        ctx.add_block(BlockRecord::synthetic(2, header_tip.hash));
+
+        assert_eq!(
+            ctx.active_hash_at_height(1),
+            Some(applied_tip.hash),
+            "height lookup must stay on the applied branch"
+        );
+        assert_eq!(ctx.block_hash_at_height(1), Some(applied_tip.hash));
+        assert_eq!(
+            ctx.block_by_height(1).map(|record| record.hash),
+            Some(applied_tip.hash)
+        );
+        assert!(ctx.block_hash_at_height(2).is_none());
+        assert!(ctx.block_by_height(2).is_none());
+        Ok(())
     }
 }

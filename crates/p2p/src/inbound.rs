@@ -9,6 +9,16 @@ pub struct InboundBlock {
     pub block: bitcoin::Block,
     /// Wire-format block payload bytes.
     pub serialized: bytes::Bytes,
+    /// Delivering connection, or `None` for local injection.
+    pub source: Option<crate::PeerSource>,
+}
+
+/// A `headers` message batch and the peer that delivered it.
+pub struct InboundHeaders {
+    /// Decoded headers, in wire order.
+    pub headers: Vec<bitcoin::block::Header>,
+    /// Delivering connection, or `None` for local injection.
+    pub source: Option<crate::PeerSource>,
 }
 
 impl InboundBlock {
@@ -18,6 +28,20 @@ impl InboundBlock {
     #[must_use]
     pub fn from_decoded(block: bitcoin::Block) -> Self {
         let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
-        Self { block, serialized }
+        Self {
+            block,
+            serialized,
+            source: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn from_decoded_is_source_less() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+
+        assert!(super::InboundBlock::from_decoded(block).source.is_none());
     }
 }

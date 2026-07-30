@@ -5,6 +5,8 @@
 pub mod addrv2;
 /// Peer banning and persistence.
 pub mod banlist;
+/// Per-connection identity and cancellation.
+pub mod connection;
 /// Inbound message dispatcher.
 pub mod dispatch;
 /// Peer finite-state machine.
@@ -28,8 +30,9 @@ pub mod wire;
 /// BIP339 wtxid-relay state.
 pub mod wtxid;
 
+pub use connection::{ConnectionId, PeerLease, PeerSource};
 pub use dispatch::{ChainQuery, InventoryResponse};
-pub use inbound::InboundBlock;
+pub use inbound::{InboundBlock, InboundHeaders};
 pub use listener::spawn_outbound_connection;
 pub use peer::{DnsResolver, Peer, PeerManager, PeerState, SystemDnsResolver};
 pub use peer_info::PeerInfo;

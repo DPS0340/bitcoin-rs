@@ -5,9 +5,165 @@ use alloc::sync::Arc;
 use std::collections::BTreeMap;
 
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_pruning::{BLOCK_DATA_CF, BlockPruner, PrunePolicy, block_body_key};
-use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
+use bitcoin_rs_pruning::{
+    BLOCK_DATA_CF, BlockPruner, PrunePolicy, block_body_key, reclaim_staged_flat_block_files,
+    stage_block_and_undo_prune,
+};
+use bitcoin_rs_storage::{
+    ColumnFamily, FlatFileBlockStore, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch,
+    block_file_max_height_key, encode_block_file_max_height,
+};
 use parking_lot::RwLock;
+use tempfile::tempdir;
+
+#[test]
+fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::default();
+    let data_dir = tempdir()?;
+    let first_old_hash = fake_hash(1);
+    let second_old_hash = fake_hash(2);
+    let current_hash = fake_hash(800);
+    let (first_old_position, second_old_position) = {
+        let block_files = FlatFileBlockStore::open(data_dir.path())?;
+        (
+            block_files.append(1, *first_old_hash.as_byte_array(), b"first old body")?,
+            block_files.append(2, *second_old_hash.as_byte_array(), b"second old body")?,
+        )
+    };
+    std::fs::File::create(data_dir.path().join("blocks/blk00001.dat"))?;
+    let block_files = FlatFileBlockStore::open(data_dir.path())?;
+    let current_position =
+        block_files.append(800, *current_hash.as_byte_array(), b"current body")?;
+
+    assert_eq!(first_old_position.file_no, 0);
+    assert_eq!(second_old_position.file_no, 0);
+    assert_eq!(current_position.file_no, 1);
+    let policy = PrunePolicy {
+        target_size_mb: 1,
+        keep_below_tip: 0,
+    };
+    assert!(
+        u64::try_from(
+            first_old_position.encode().len()
+                + second_old_position.encode().len()
+                + current_position.encode().len(),
+        )? < policy.target_size_bytes()
+    );
+
+    let first_old_key = block_body_key(1, first_old_hash);
+    let second_old_key = block_body_key(2, second_old_hash);
+    let current_key = block_body_key(800, current_hash);
+    let mut initial_batch = store.new_batch();
+    initial_batch.put(BLOCK_DATA_CF, &first_old_key, &first_old_position.encode());
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &second_old_key,
+        &second_old_position.encode(),
+    );
+    initial_batch.put(BLOCK_DATA_CF, &current_key, &current_position.encode());
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &block_file_max_height_key(first_old_position.file_no),
+        &encode_block_file_max_height(2),
+    );
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &block_file_max_height_key(current_position.file_no),
+        &encode_block_file_max_height(800),
+    );
+    store.write(initial_batch)?;
+
+    let mut prune_batch = store.new_batch();
+    let (block_outcome, undo_outcome, file_numbers) =
+        stage_block_and_undo_prune(&store, &mut prune_batch, &block_files, 1_000, policy)?;
+    assert_eq!(block_outcome.blocks_removed, 2);
+    assert_eq!(block_outcome.bytes_freed, 32);
+    assert!(undo_outcome.is_empty());
+    assert_eq!(file_numbers, vec![first_old_position.file_no]);
+    assert!(store.get(BLOCK_DATA_CF, &first_old_key)?.is_some());
+    assert!(store.get(BLOCK_DATA_CF, &second_old_key)?.is_some());
+
+    store.write(prune_batch)?;
+    assert!(store.get(BLOCK_DATA_CF, &first_old_key)?.is_none());
+    assert!(store.get(BLOCK_DATA_CF, &second_old_key)?.is_none());
+    assert!(store.get(BLOCK_DATA_CF, &current_key)?.is_some());
+    assert!(
+        store
+            .get(
+                BLOCK_DATA_CF,
+                &block_file_max_height_key(first_old_position.file_no),
+            )?
+            .is_some()
+    );
+    assert!(block_files.file_path(first_old_position.file_no).exists());
+
+    reclaim_staged_flat_block_files(&store, &block_files, &file_numbers)?;
+    assert!(
+        store
+            .get(
+                BLOCK_DATA_CF,
+                &block_file_max_height_key(first_old_position.file_no),
+            )?
+            .is_none()
+    );
+    assert!(!block_files.file_path(first_old_position.file_no).exists());
+    assert!(store.get(BLOCK_DATA_CF, &current_key)?.is_some());
+    assert!(
+        store
+            .get(
+                BLOCK_DATA_CF,
+                &block_file_max_height_key(current_position.file_no),
+            )?
+            .is_some()
+    );
+    assert_eq!(
+        block_files.load(current_position, 800, *current_hash.as_byte_array())?,
+        Some(b"current body".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
+fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::default();
+    let data_dir = tempdir()?;
+    let hash = fake_hash(1);
+    let block_files = FlatFileBlockStore::open(data_dir.path())?;
+    let position = block_files.append(1, *hash.as_byte_array(), b"current old body")?;
+    let key = block_body_key(1, hash);
+    let mut initial_batch = store.new_batch();
+    initial_batch.put(BLOCK_DATA_CF, &key, &position.encode());
+    initial_batch.put(
+        BLOCK_DATA_CF,
+        &block_file_max_height_key(position.file_no),
+        &encode_block_file_max_height(1),
+    );
+    store.write(initial_batch)?;
+
+    let mut prune_batch = store.new_batch();
+    let (block_outcome, _undo_outcome, file_numbers) = stage_block_and_undo_prune(
+        &store,
+        &mut prune_batch,
+        &block_files,
+        1_000,
+        PrunePolicy::utreexo_only(),
+    )?;
+    assert!(file_numbers.is_empty());
+    assert_eq!(block_outcome.blocks_removed, 1);
+    assert_eq!(block_outcome.bytes_freed, 16);
+
+    store.write(prune_batch)?;
+    assert!(store.get(BLOCK_DATA_CF, &key)?.is_none());
+    assert!(block_files.file_path(position.file_no).exists());
+    assert!(
+        store
+            .get(BLOCK_DATA_CF, &block_file_max_height_key(position.file_no))?
+            .is_some()
+    );
+    Ok(())
+}
 
 #[test]
 fn pruning_keeps_core_reorg_floor_and_shallow_reorg_succeeds()

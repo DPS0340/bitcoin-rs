@@ -444,7 +444,7 @@ struct SyncFixture {
     inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
     outbound_rxs: Vec<crossbeam_channel::Receiver<Message>>,
     peers: Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+    peer_outbound: Arc<RwLock<HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     blocks: Vec<Block>,
     /// Inbound payloads pre-cloned and pre-serialized during (untimed) setup, in
@@ -485,7 +485,8 @@ impl SyncFixture {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let peers = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) = unbounded::<Vec<Header>>();
+        let (_inbound_headers_tx, inbound_headers_rx_raw) =
+            unbounded::<bitcoin_rs_p2p::InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
@@ -1019,7 +1020,7 @@ fn populate_header_chain_from_blocks(tree: &mut BlockTree, blocks: &[Block]) {
 
 fn install_synthetic_peers(
     peers: &Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: &Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+    peer_outbound: &Arc<RwLock<HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
     peer_count: usize,
 ) -> Vec<crossbeam_channel::Receiver<Message>> {
     let mut outbound_rxs = Vec::with_capacity(peer_count);
@@ -1031,7 +1032,7 @@ fn install_synthetic_peers(
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         peers.push(synthetic_peer(addr));
         let (outbound_tx, outbound_rx) = unbounded::<Message>();
-        peer_outbound.insert(addr, outbound_tx);
+        peer_outbound.insert(addr, bitcoin_rs_p2p::PeerLease::new(outbound_tx));
         outbound_rxs.push(outbound_rx);
     }
     outbound_rxs

@@ -1,4 +1,4 @@
-use bitcoin::pow::CompactTarget;
+use bitcoin::{BlockHash, hashes::Hash as _, pow::CompactTarget};
 use bitcoin_rs_primitives::Network;
 
 use crate::{
@@ -8,6 +8,15 @@ use crate::{
 };
 
 /// Accepts a contiguous batch of headers after proof-of-work validation.
+///
+/// An already-present header is treated as an idempotent input: before any
+/// validation or insertion the header hash is derived and looked up in the
+/// tree, and when found the existing [`NodeId`] is appended to the returned
+/// vector and the header is skipped. This preserves a 1:1 positional
+/// correspondence between input headers and returned ids (including duplicate
+/// Genesis on a non-empty tree) without relaxing validation or error
+/// propagation for unknown headers, which continue through proof-of-work and
+/// contextual nBits validation before insertion.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
@@ -15,10 +24,15 @@ pub fn accept_headers(
 ) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
     for header in headers {
-        validate_pow(header, network)?;
-        validate_empty_tree_root(tree, header, network)?;
+        let hash = hash_from_header(header);
+        if let Some(existing_id) = tree.lookup(hash) {
+            accepted.push(existing_id);
+            continue;
+        }
+        validate_pow(header, hash, network)?;
+        validate_empty_tree_root(tree, header, hash, network)?;
         validate_candidate_nbits(tree, header, network)?;
-        let id = tree.insert_header(*header, NodeStatus::HeaderValid)?;
+        let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
         accepted.push(id);
     }
     Ok(accepted)
@@ -27,9 +41,10 @@ pub fn accept_headers(
 fn validate_empty_tree_root(
     tree: &BlockTree,
     header: &BlockHeader,
+    hash: bitcoin_rs_primitives::Hash256,
     network: Network,
 ) -> Result<(), ChainError> {
-    if !tree.is_empty() || hash_from_header(header) == network.genesis_block_hash() {
+    if !tree.is_empty() || hash == network.genesis_block_hash() {
         return Ok(());
     }
 
@@ -76,8 +91,11 @@ fn validate_candidate_nbits(
     validate_header_nbits(tree, parent_id, header, network)
 }
 
-fn validate_pow(header: &BlockHeader, network: Network) -> Result<(), ChainError> {
-    let hash = hash_from_header(header);
+fn validate_pow(
+    header: &BlockHeader,
+    hash: bitcoin_rs_primitives::Hash256,
+    network: Network,
+) -> Result<(), ChainError> {
     let target = ChainWork::from_be_bytes(header.target().to_be_bytes());
     if target == ChainWork::ZERO {
         return Err(ChainError::ZeroTarget { hash });
@@ -92,7 +110,10 @@ fn validate_pow(header: &BlockHeader, network: Network) -> Result<(), ChainError
         });
     }
 
-    if !header.target().is_met_by(header.block_hash()) {
+    if !header
+        .target()
+        .is_met_by(BlockHash::from_byte_array(hash.to_le_bytes()))
+    {
         return Err(ChainError::InvalidPow { hash, target });
     }
 

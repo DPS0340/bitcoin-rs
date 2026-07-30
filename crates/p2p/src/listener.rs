@@ -17,37 +17,85 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_mins(1);
 type ChainQueryHandle = Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>;
 type SyncWakeHandle = Option<Sender<()>>;
+type PeerRegistrationHandle =
+    Option<Arc<dyn Fn(SocketAddr, crate::PeerLease, crate::PeerInfo) -> bool + Send + Sync>>;
+
+fn register_peer(
+    peer_registry: &RwLock<Vec<crate::PeerInfo>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, crate::PeerLease, crate::PeerInfo) -> bool + Send + Sync),
+    >,
+    peer_addr: SocketAddr,
+    lease: crate::PeerLease,
+    info: crate::PeerInfo,
+) -> bool {
+    if let Some(peer_registered) = peer_registered {
+        return peer_registered(peer_addr, lease, info);
+    }
+
+    let mut outbound = peer_outbound.write();
+    let replaced = outbound.insert(peer_addr, lease).is_some_and(|prior| {
+        prior.cancel();
+        true
+    });
+    let mut registry = peer_registry.write();
+    registry.retain(|peer| peer.addr != peer_addr);
+    registry.push(info);
+    replaced
+}
+
+fn remove_current_peer(
+    peer_registry: &RwLock<Vec<crate::PeerInfo>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>,
+    peer_addr: SocketAddr,
+    lease: &crate::PeerLease,
+) -> bool {
+    let mut outbound = peer_outbound.write();
+    if !outbound
+        .get(&peer_addr)
+        .is_some_and(|current| current.same_connection(lease))
+    {
+        return false;
+    }
+    if let Some(removed) = outbound.remove(&peer_addr) {
+        removed.cancel();
+    }
+    peer_registry.write().retain(|peer| peer.addr != peer_addr);
+    true
+}
 
 #[derive(Clone)]
 struct InboundSyncSinks {
-    headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    headers_tx: Sender<crate::InboundHeaders>,
     blocks_tx: Sender<crate::InboundBlock>,
     wake_tx: SyncWakeHandle,
 }
 
 impl InboundSyncSinks {
-    fn send_headers(&self, peer_addr: SocketAddr, headers: Vec<bitcoin::block::Header>) {
-        if let Err(error) = self.headers_tx.send(headers) {
-            tracing::warn!(
-                peer_addr = %peer_addr,
-                %error,
-                "p2p inbound headers channel disconnected",
-            );
+    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin::block::Header>) {
+        if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
+            headers,
+            source: Some(source),
+        }) {
+            tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound headers channel disconnected");
         } else {
             wake_sync(self.wake_tx.as_ref());
         }
     }
 
-    fn send_block(&self, peer_addr: SocketAddr, block: bitcoin::Block, serialized: bytes::Bytes) {
-        if let Err(error) = self
-            .blocks_tx
-            .send(crate::InboundBlock { block, serialized })
-        {
-            tracing::warn!(
-                peer_addr = %peer_addr,
-                %error,
-                "p2p inbound blocks channel disconnected",
-            );
+    fn send_block(
+        &self,
+        source: crate::PeerSource,
+        block: bitcoin::Block,
+        serialized: bytes::Bytes,
+    ) {
+        if let Err(error) = self.blocks_tx.send(crate::InboundBlock {
+            block,
+            serialized,
+            source: Some(source),
+        }) {
+            tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound blocks channel disconnected");
         } else {
             wake_sync(self.wake_tx.as_ref());
         }
@@ -94,8 +142,8 @@ pub fn serve_with_shutdown(
     shutdown: Arc<AtomicBool>,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> Result<(), ListenerError> {
@@ -110,6 +158,7 @@ pub fn serve_with_shutdown(
         banned,
         None,
         None,
+        None,
     )
 }
 
@@ -120,12 +169,13 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     shutdown: Arc<AtomicBool>,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
+    peer_registered: PeerRegistrationHandle,
 ) -> Result<(), ListenerError> {
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
@@ -153,6 +203,7 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
                     Arc::clone(&peer_outbound),
                     inbound_sync_sinks.clone(),
                     chain_query.clone(),
+                    peer_registered.clone(),
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -174,8 +225,8 @@ pub fn spawn_outbound_connection(
     addr: SocketAddr,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
@@ -189,6 +240,7 @@ pub fn spawn_outbound_connection(
         banned,
         None,
         None,
+        None,
     )
 }
 
@@ -198,12 +250,13 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     addr: SocketAddr,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
-    inbound_headers_tx: Sender<Vec<bitcoin::block::Header>>,
+    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
+    inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
+    peer_registered: PeerRegistrationHandle,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
@@ -222,6 +275,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
                 &inbound_sync_sinks,
                 &banned,
                 &chain_query,
+                peer_registered.as_deref(),
             )
         });
 
@@ -242,10 +296,13 @@ fn run_outbound_connection(
     addr: SocketAddr,
     magic: Magic,
     peer_registry: &RwLock<Vec<crate::PeerInfo>>,
-    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>,
     inbound_sync_sinks: &InboundSyncSinks,
     banned: &RwLock<Vec<crate::BannedSubnet>>,
     chain_query: &ChainQueryHandle,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, crate::PeerLease, crate::PeerInfo) -> bool + Send + Sync),
+    >,
 ) -> Result<(), crate::wire::PeerError> {
     if crate::subnet::is_banned(&banned.read(), addr.ip(), SystemTime::now()) {
         return Err(crate::wire::PeerError::BannedDestination(addr.ip()));
@@ -273,7 +330,6 @@ fn run_outbound_connection(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let info = crate::PeerInfo::outbound_from_version(addr, remote_version, conn_time);
-    peer_registry.write().push(info);
 
     let writer_stream = peer
         .stream
@@ -282,7 +338,15 @@ fn run_outbound_connection(
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
     let writer = spawn_connection_writer(writer_stream, magic, outbound_rx, addr)
         .map_err(crate::wire::PeerError::Io)?;
-    peer_outbound.write().insert(addr, outbound_tx.clone());
+    let lease = crate::PeerLease::new(outbound_tx);
+    register_peer(
+        peer_registry,
+        peer_outbound,
+        peer_registered,
+        addr,
+        lease.clone(),
+        info,
+    );
 
     tracing::info!(
         peer_addr = %addr,
@@ -296,17 +360,22 @@ fn run_outbound_connection(
         run_message_loop(
             &mut peer,
             addr,
-            &outbound_tx,
-            peer_outbound,
+            &lease,
             inbound_sync_sinks,
             chain_query.as_deref(),
         )
     })();
 
-    peer_outbound.write().remove(&addr);
-    peer_registry.write().retain(|p| p.addr != addr);
+    let removed_current = remove_current_peer(peer_registry, peer_outbound, addr, &lease);
+    debug_assert!(
+        removed_current
+            || peer_outbound
+                .read()
+                .get(&addr)
+                .is_none_or(|current| !current.same_connection(&lease))
+    );
     let _ = peer.stream.shutdown(std::net::Shutdown::Both);
-    drop(outbound_tx);
+    drop(lease);
     let _ = writer.join();
     if let Err(error) = &loop_result {
         tracing::warn!(peer_addr = %addr, %error, "p2p outbound peer disconnected with error");
@@ -342,9 +411,10 @@ fn spawn_handshake_thread(
     peer_addr: SocketAddr,
     magic: Magic,
     registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
-    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>>,
+    peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
     inbound_sync_sinks: InboundSyncSinks,
     chain_query: ChainQueryHandle,
+    peer_registered: PeerRegistrationHandle,
 ) {
     let thread_name = format!("bitcoin-rs-p2p-handshake-{peer_addr}");
     let spawn_result = std::thread::Builder::new()
@@ -358,6 +428,7 @@ fn spawn_handshake_thread(
                 &peer_outbound,
                 &inbound_sync_sinks,
                 &chain_query,
+                peer_registered.as_deref(),
             ) {
                 tracing::warn!(
                     peer_addr = %peer_addr,
@@ -383,9 +454,12 @@ fn run_handshake(
     peer_addr: SocketAddr,
     magic: Magic,
     registry: &RwLock<Vec<crate::PeerInfo>>,
-    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
+    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>,
     inbound_sync_sinks: &InboundSyncSinks,
     chain_query: &ChainQueryHandle,
+    peer_registered: Option<
+        &(dyn Fn(SocketAddr, crate::PeerLease, crate::PeerInfo) -> bool + Send + Sync),
+    >,
 ) -> Result<(), crate::wire::PeerError> {
     stream
         .set_nonblocking(false)
@@ -410,7 +484,6 @@ fn run_handshake(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let info = crate::PeerInfo::inbound_from_version(peer_addr, remote_version, conn_time);
-    registry.write().push(info);
 
     let writer_stream = peer
         .stream
@@ -419,7 +492,15 @@ fn run_handshake(
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<crate::Message>();
     let writer = spawn_connection_writer(writer_stream, magic, outbound_rx, peer_addr)
         .map_err(crate::wire::PeerError::Io)?;
-    peer_outbound.write().insert(peer_addr, outbound_tx.clone());
+    let lease = crate::PeerLease::new(outbound_tx);
+    register_peer(
+        registry,
+        peer_outbound,
+        peer_registered,
+        peer_addr,
+        lease.clone(),
+        info,
+    );
 
     tracing::info!(
         peer_addr = %peer_addr,
@@ -433,17 +514,22 @@ fn run_handshake(
         run_message_loop(
             &mut peer,
             peer_addr,
-            &outbound_tx,
-            peer_outbound,
+            &lease,
             inbound_sync_sinks,
             chain_query.as_deref(),
         )
     })();
 
-    peer_outbound.write().remove(&peer_addr);
-    registry.write().retain(|p| p.addr != peer_addr);
+    let removed_current = remove_current_peer(registry, peer_outbound, peer_addr, &lease);
+    debug_assert!(
+        removed_current
+            || peer_outbound
+                .read()
+                .get(&peer_addr)
+                .is_none_or(|current| !current.same_connection(&lease))
+    );
     let _ = peer.stream.shutdown(std::net::Shutdown::Both);
-    drop(outbound_tx);
+    drop(lease);
     let _ = writer.join();
     if let Err(error) = &loop_result {
         tracing::warn!(peer_addr = %peer_addr, %error, "p2p peer disconnected with error");
@@ -456,8 +542,7 @@ fn run_handshake(
 fn run_message_loop<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
     peer_addr: SocketAddr,
-    outbound_tx: &Sender<crate::Message>,
-    peer_outbound: &RwLock<hashbrown::HashMap<SocketAddr, Sender<crate::Message>>>,
+    lease: &crate::PeerLease,
     inbound_sync_sinks: &InboundSyncSinks,
     chain_query: Option<&dyn crate::dispatch::ChainQuery>,
 ) -> Result<(), crate::wire::PeerError> {
@@ -473,13 +558,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             return Ok(());
         }
 
-        // The peer's entry in `peer_outbound` is the connection's lease: it
-        // is inserted exactly once before this loop and normally removed only
-        // by this thread on exit, so an external removal (the node sync
-        // layer's staller disconnect) is a disconnect request. The loop wakes
-        // at least once per second (1s read timeout), bounding the teardown
-        // latency.
-        if !peer_outbound.read().contains_key(&peer_addr) {
+        if lease.is_cancelled() {
             tracing::debug!(peer_addr = %peer_addr, "p2p peer lease revoked; closing");
             return Ok(());
         }
@@ -489,7 +568,12 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             return Ok(());
         }
 
-        match crate::wire::read_message(&mut peer.stream, peer.magic) {
+        let read_result = crate::wire::read_message(&mut peer.stream, peer.magic);
+        if lease.is_cancelled() {
+            tracing::debug!(peer_addr = %peer_addr, "p2p peer lease revoked during read; closing");
+            return Ok(());
+        }
+        match read_result {
             Ok((message, raw)) => {
                 last_inbound = Instant::now();
                 tracing::trace!(
@@ -501,15 +585,15 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     crate::dispatch::dispatch_inbound_with_chain(peer, &message, chain_query)?;
                 match message {
                     bitcoin::p2p::message::NetworkMessage::Headers(headers) => {
-                        inbound_sync_sinks.send_headers(peer_addr, headers);
+                        inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
                     }
                     bitcoin::p2p::message::NetworkMessage::Block(block) => {
-                        inbound_sync_sinks.send_block(peer_addr, block, raw);
+                        inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
                     }
                     _ => {}
                 }
                 for response in responses {
-                    if outbound_tx.send(response).is_err() {
+                    if lease.send(response).is_err() {
                         return Err(crate::wire::PeerError::Protocol(
                             "outbound writer disconnected",
                         ));
@@ -622,6 +706,7 @@ mod lease_tests {
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::p2p::Magic;
     use parking_lot::RwLock;
@@ -629,8 +714,19 @@ mod lease_tests {
     use super::{InboundSyncSinks, run_message_loop};
     use crate::peer::{Peer, PeerState};
 
-    type OutboundMap =
-        Arc<RwLock<hashbrown::HashMap<SocketAddr, crossbeam_channel::Sender<crate::Message>>>>;
+    type OutboundMap = Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>;
+
+    fn peer_info(addr: SocketAddr, conn_time: u64) -> crate::PeerInfo {
+        crate::PeerInfo {
+            addr,
+            version: 70_016,
+            services: 0,
+            user_agent: String::from("/test/"),
+            start_height: 0,
+            conn_time,
+            inbound: false,
+        }
+    }
 
     fn sinks() -> InboundSyncSinks {
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
@@ -642,38 +738,11 @@ mod lease_tests {
         }
     }
 
-    /// A stream that revokes the connection's `peer_outbound` lease on the
-    /// first read, then reports `WouldBlock` — modelling the sync layer
-    /// removing the entry while the loop is blocked in its 1s read timeout.
-    struct RevokingStream {
-        peer_outbound: OutboundMap,
-        addr: SocketAddr,
-    }
-
-    impl io::Read for RevokingStream {
-        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            self.peer_outbound.write().remove(&self.addr);
-            Err(io::ErrorKind::WouldBlock.into())
-        }
-    }
-
-    impl io::Write for RevokingStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A stream the loop must never read from (the lease is already gone
-    /// before the first iteration).
     struct UnreadableStream;
 
     impl io::Read for UnreadableStream {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            panic!("message loop must check the lease before reading")
+            panic!("message loop must check cancellation before reading")
         }
     }
 
@@ -681,61 +750,225 @@ mod lease_tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             Ok(buf.len())
         }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
+    struct ReplacingStream {
+        registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
+        outbound: OutboundMap,
+        addr: SocketAddr,
+        replacement: Option<crate::PeerLease>,
+        bytes: io::Cursor<Vec<u8>>,
+    }
+
+    impl io::Read for ReplacingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(replacement) = self.replacement.take() {
+                super::register_peer(
+                    &self.registry,
+                    &self.outbound,
+                    None,
+                    self.addr,
+                    replacement,
+                    peer_info(self.addr, 2),
+                );
+            }
+            self.bytes.read(buf)
+        }
+    }
+
+    impl io::Write for ReplacingStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ContinuingStream(Arc<AtomicUsize>);
+
+    impl io::Read for ContinuingStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Err(io::ErrorKind::UnexpectedEof.into())
+            }
+        }
+    }
+
+    impl io::Write for ContinuingStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn message_loop_exits_cleanly_when_lease_already_revoked() {
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_444));
-        let peer_outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let (outbound_tx, _outbound_rx) = crossbeam_channel::unbounded();
-        let mut peer = Peer::new(UnreadableStream, Magic::BITCOIN);
-        peer.state = PeerState::Ready;
+    fn sinks_stamp_exact_connection_source() -> Result<(), Box<dyn std::error::Error>> {
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let sinks = InboundSyncSinks {
+            headers_tx,
+            blocks_tx,
+            wake_tx: None,
+        };
+        let addr = SocketAddr::from(([127, 0, 0, 1], 8333));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let source = lease.source(addr);
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
 
-        let result = run_message_loop(
-            &mut peer,
-            addr,
-            &outbound_tx,
-            &peer_outbound,
-            &sinks(),
-            None,
-        );
+        sinks.send_headers(source, Vec::new());
+        sinks.send_block(source, block, serialized.clone());
 
-        assert!(result.is_ok(), "revoked lease must close the loop cleanly");
+        assert_eq!(headers_rx.try_recv()?.source, Some(source));
+        let received = blocks_rx.try_recv()?;
+        assert_eq!(received.source, Some(source));
+        assert_eq!(received.serialized, serialized);
+        Ok(())
     }
 
     #[test]
-    fn message_loop_exits_after_external_lease_revocation() {
+    fn message_loop_exits_before_read_when_cancelled() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_444));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        lease.cancel();
+        let mut peer = Peer::new(UnreadableStream, Magic::BITCOIN);
+        peer.state = PeerState::Ready;
+
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None).is_ok());
+    }
+
+    #[test]
+    fn message_loop_exits_after_replacement_during_read() {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_445));
-        let peer_outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
-        let (outbound_tx, _outbound_rx) = crossbeam_channel::unbounded();
-        peer_outbound.write().insert(addr, outbound_tx.clone());
+        let registry = Arc::new(RwLock::new(vec![peer_info(addr, 1)]));
+        let outbound: OutboundMap = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+        let (old_tx, _old_rx) = crossbeam_channel::unbounded();
+        let old = crate::PeerLease::new(old_tx);
+        outbound.write().insert(addr, old.clone());
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
+        let replacement = crate::PeerLease::new(replacement_tx);
+        let mut bytes = Vec::new();
+        if let Err(error) = crate::wire::write_message(
+            &mut bytes,
+            Magic::BITCOIN,
+            &crate::Message::Headers(Vec::new()),
+        ) {
+            panic!("failed to encode test headers message: {error}");
+        }
+        let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
+        let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let test_sinks = InboundSyncSinks {
+            headers_tx,
+            blocks_tx,
+            wake_tx: None,
+        };
         let mut peer = Peer::new(
-            RevokingStream {
-                peer_outbound: Arc::clone(&peer_outbound),
+            ReplacingStream {
+                registry: Arc::clone(&registry),
+                outbound: Arc::clone(&outbound),
                 addr,
+                replacement: Some(replacement.clone()),
+                bytes: io::Cursor::new(bytes),
             },
             Magic::BITCOIN,
         );
         peer.state = PeerState::Ready;
 
-        let result = run_message_loop(
-            &mut peer,
-            addr,
-            &outbound_tx,
-            &peer_outbound,
-            &sinks(),
-            None,
-        );
-
+        assert!(run_message_loop(&mut peer, addr, &old, &test_sinks, None).is_ok());
         assert!(
-            result.is_ok(),
-            "lease revocation mid-loop must close the loop cleanly"
+            headers_rx.try_recv().is_err(),
+            "a message completed after replacement must not be enqueued"
         );
-        assert!(!peer_outbound.read().contains_key(&addr));
+        assert!(old.is_cancelled());
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_connection(&replacement))
+        );
+    }
+
+    #[test]
+    fn message_loop_keeps_current_lease_running() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_446));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let lease = crate::PeerLease::new(tx);
+        let mut peer = Peer::new(ContinuingStream(Arc::clone(&reads)), Magic::BITCOIN);
+        peer.state = PeerState::Ready;
+
+        assert!(run_message_loop(&mut peer, addr, &lease, &sinks(), None).is_err());
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn registration_cancels_replaced_lease() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));
+        let registry = RwLock::new(vec![peer_info(addr, 1)]);
+        let outbound = RwLock::new(hashbrown::HashMap::new());
+        let (old_tx, _old_rx) = crossbeam_channel::unbounded();
+        let old = crate::PeerLease::new(old_tx);
+        outbound.write().insert(addr, old.clone());
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::unbounded();
+        let replacement = crate::PeerLease::new(replacement_tx);
+
+        assert!(super::register_peer(
+            &registry,
+            &outbound,
+            None,
+            addr,
+            replacement.clone(),
+            peer_info(addr, 2)
+        ));
+        assert!(old.is_cancelled());
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_connection(&replacement))
+        );
+        assert_eq!(&*registry.read(), &[peer_info(addr, 2)]);
+    }
+
+    #[test]
+    fn stale_release_preserves_replacement_and_current_release_removes_it() {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_448));
+        let registry = RwLock::new(vec![peer_info(addr, 2)]);
+        let outbound = RwLock::new(hashbrown::HashMap::new());
+        let (stale_tx, _stale_rx) = crossbeam_channel::unbounded();
+        let stale = crate::PeerLease::new(stale_tx);
+        let (current_tx, _current_rx) = crossbeam_channel::unbounded();
+        let current = crate::PeerLease::new(current_tx);
+        outbound.write().insert(addr, current.clone());
+
+        assert!(!super::remove_current_peer(
+            &registry, &outbound, addr, &stale
+        ));
+        assert!(!current.is_cancelled());
+        assert!(
+            outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|lease| lease.same_connection(&current))
+        );
+        assert_eq!(&*registry.read(), &[peer_info(addr, 2)]);
+
+        assert!(super::remove_current_peer(
+            &registry, &outbound, addr, &current
+        ));
+        assert!(current.is_cancelled());
+        assert!(outbound.read().is_empty());
+        assert!(registry.read().is_empty());
     }
 }
 

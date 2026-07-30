@@ -17,7 +17,7 @@ pub use policy::PrunePolicy;
 pub use undo_pruner::{UndoPruner, block_undo_key};
 pub use utreexo_only::{BlockProcessed, UtreexoOnlyCoordinator};
 
-use bitcoin_rs_storage::StorageError;
+use bitcoin_rs_storage::{StorageError, WriteBatch as _};
 use thiserror::Error;
 
 /// Stages block-body and undo-row pruning into a caller-owned atomic batch.
@@ -28,19 +28,20 @@ use thiserror::Error;
 pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
     store: &S,
     batch: &mut S::WriteBatch,
+    block_files: &bitcoin_rs_storage::FlatFileBlockStore,
     current_tip_height: u32,
     policy: PrunePolicy,
-) -> Result<(PruneOutcome, PruneOutcome), PruneError> {
+) -> Result<(PruneOutcome, PruneOutcome, Vec<u32>), PruneError> {
     if policy.is_full_node() {
-        return Ok((PruneOutcome::default(), PruneOutcome::default()));
+        return Ok((PruneOutcome::default(), PruneOutcome::default(), Vec::new()));
     }
 
-    let block_outcome = block_pruner::prune_prefixed_rows_into_batch(
+    let prune_below_height = current_tip_height.saturating_sub(policy.retention_depth());
+    let (block_outcome, block_files) = block_pruner::stage_flat_block_file_prune(
         store,
         batch,
-        block_pruner::BLOCK_DATA_CF,
-        block_pruner::BLOCK_BODY_PREFIX_BYTES,
-        current_tip_height,
+        block_files,
+        prune_below_height,
         policy,
     )?;
     let undo_outcome = block_pruner::prune_prefixed_rows_into_batch(
@@ -52,7 +53,33 @@ pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
         policy,
     )?;
 
-    Ok((block_outcome, undo_outcome))
+    Ok((block_outcome, undo_outcome, block_files))
+}
+
+/// Deletes staged flat block files after their block-index rows are committed.
+#[doc(hidden)]
+pub fn reclaim_staged_flat_block_files<S: bitcoin_rs_storage::KvStore>(
+    store: &S,
+    block_files: &bitcoin_rs_storage::FlatFileBlockStore,
+    file_numbers: &[u32],
+) -> Result<(), PruneError> {
+    let mut batch = store.new_batch();
+    let mut removed_metadata = false;
+    for &file_no in file_numbers {
+        if file_no == block_files.current_file_number() {
+            continue;
+        }
+        let _ = block_files.delete_file_if_not_current(file_no)?;
+        batch.delete(
+            block_pruner::BLOCK_DATA_CF,
+            &bitcoin_rs_storage::block_file_max_height_key(file_no),
+        );
+        removed_metadata = true;
+    }
+    if removed_metadata {
+        store.write(batch)?;
+    }
+    Ok(())
 }
 
 /// Result of one pruning pass.

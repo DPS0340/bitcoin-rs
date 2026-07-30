@@ -1,7 +1,10 @@
 //! Coinstats persistence round-trip tests.
 
 use bitcoin::{Amount, ScriptBuf};
-use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener, load_coin_stats, store_coin_stats};
+use bitcoin_rs_coinstats::stats::COIN_STATS_ENCODED_LEN;
+use bitcoin_rs_coinstats::{
+    CoinStats, CoinStatsDecodeError, CoinStatsListener, load_coin_stats, store_coin_stats,
+};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
 
@@ -46,6 +49,49 @@ fn finish_block_applies_height_and_transaction_delta() {
 
     assert_eq!(snapshot.height, 10);
     assert_eq!(snapshot.tx_count, 6);
+}
+
+#[test]
+fn coin_stats_codec_is_exact_and_preserves_muhash_continuation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let old_op = OutPoint::new(txid(1_000), 3);
+    let old_txout = TxOut {
+        value: Amount::from_sat(12_345),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+    };
+    let mut original = CoinStats::new();
+    original.insert_utxo(&old_op, &old_txout, 100, true);
+    original.finish_block(100, 1);
+
+    let bytes = original.to_bytes();
+    assert_eq!(bytes.len(), COIN_STATS_ENCODED_LEN);
+    let mut restored = CoinStats::from_bytes(&bytes)?;
+    assert_eq!(restored, original);
+
+    assert!(matches!(
+        CoinStats::from_bytes(&bytes[..bytes.len() - 1]),
+        Err(CoinStatsDecodeError::Truncated)
+    ));
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(matches!(
+        CoinStats::from_bytes(&trailing),
+        Err(CoinStatsDecodeError::TrailingBytes)
+    ));
+
+    let new_op = OutPoint::new(txid(1_001), 4);
+    let new_txout = TxOut {
+        value: Amount::from_sat(54_321),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x22]),
+    };
+    original.remove_utxo(&old_op, &old_txout, 100, true);
+    restored.remove_utxo(&old_op, &old_txout, 100, true);
+    original.insert_utxo(&new_op, &new_txout, 101, false);
+    restored.insert_utxo(&new_op, &new_txout, 101, false);
+
+    assert_eq!(restored, original);
+    assert_eq!(restored.to_bytes(), original.to_bytes());
+    Ok(())
 }
 
 fn txid(index: u32) -> Hash256 {

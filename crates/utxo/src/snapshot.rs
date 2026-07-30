@@ -1,18 +1,19 @@
 use std::io::{Read, Write};
 
 use bitcoin_rs_primitives::{Hash256, varint};
+use hashbrown::HashSet;
 use sha2::{Digest, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::{
     UtxoError, UtxoKey, UtxoSet, UtxoSetView,
-    record::{OneUtxoOut, OwnedUtxoOut, bitmap_vout_bit},
-    shard::ShardTable,
+    record::{OneUtxoOut, OwnedUtxoOut},
 };
 
 const SNAPSHOT_MAGIC: u32 = 0x55_54_58_4f;
-const SNAPSHOT_WRITE_VERSION: u32 = 3;
-const SNAPSHOT_LEGACY_VERSION: u32 = 2;
+const SNAPSHOT_WRITE_VERSION: u32 = 4;
+const SNAPSHOT_V3_VERSION: u32 = 3;
+const SNAPSHOT_V2_VERSION: u32 = 2;
 const MUHASH_TRAILER_LEN: usize = 384;
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -46,6 +47,15 @@ struct SnapshotRecordHeaderV3 {
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C, packed)]
+struct SnapshotRecordHeaderV4 {
+    shard_idx: u8,
+    key_prefix: [u8; 8],
+    txid: [u8; 32],
+    output_count: u32,
+}
+
+#[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C, packed)]
 struct SnapshotVoutHeader {
     vout: u32,
     value: u64,
@@ -66,6 +76,45 @@ pub struct SnapshotLoad {
     pub muhash_trailer: [u8; MUHASH_TRAILER_LEN],
 }
 
+/// A live coin borrowed while a snapshot is traversed.
+///
+/// The script borrows the snapshot record only for the duration of the
+/// observer callback.
+#[derive(Copy, Clone)]
+pub struct SnapshotCoin<'a> {
+    /// Transaction identifier that created this output.
+    pub txid: Hash256,
+    /// Originating transaction output index.
+    pub vout: u32,
+    /// Output value in satoshis.
+    pub value: u64,
+    /// Borrowed scriptPubKey bytes.
+    pub script_pubkey: &'a [u8],
+    /// Block height that created the output.
+    pub height: u32,
+    /// Whether the originating transaction was coinbase.
+    pub coinbase: bool,
+}
+
+/// Observes each live coin traversed by snapshot serialization or strict loading.
+///
+/// A later I/O or validation error can follow an observation. Implementations
+/// must keep derived state inside the owned observer and publish only the
+/// observer returned by a successful traversal.
+pub trait SnapshotCoinObserver {
+    /// Observes one live coin.
+    fn observe_coin(&mut self, coin: SnapshotCoin<'_>);
+
+    /// Selects the final snapshot trailer, defaulting to the supplied fallback.
+    fn select_trailer(&mut self, fallback: [u8; MUHASH_TRAILER_LEN]) -> [u8; MUHASH_TRAILER_LEN] {
+        fallback
+    }
+}
+
+impl SnapshotCoinObserver for () {
+    fn observe_coin(&mut self, _: SnapshotCoin<'_>) {}
+}
+
 /// Streams a native bitcoin-rs UTXO snapshot to `writer`.
 pub fn write_snapshot(
     set: &UtxoSet,
@@ -73,6 +122,20 @@ pub fn write_snapshot(
     height: u32,
     writer: &mut impl Write,
 ) -> Result<[u8; MUHASH_TRAILER_LEN], UtxoError> {
+    write_snapshot_observed(set, tip_hash, height, writer, ()).map(|(trailer, ())| trailer)
+}
+
+/// Streams a native bitcoin-rs UTXO snapshot while observing every live coin.
+///
+/// Returns the selected trailer and observer only after the complete snapshot is
+/// written successfully.
+pub fn write_snapshot_observed<O: SnapshotCoinObserver>(
+    set: &UtxoSet,
+    tip_hash: &Hash256,
+    height: u32,
+    writer: &mut impl Write,
+    mut observer: O,
+) -> Result<([u8; MUHASH_TRAILER_LEN], O), UtxoError> {
     set.with_stable_view(|view| {
         let record_count = u64::try_from(view.record_count())
             .map_err(|_| UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX })?;
@@ -88,52 +151,105 @@ pub fn write_snapshot(
         for shard_idx in 0_u8..=u8::MAX {
             view.shard(usize::from(shard_idx)).with_table(|table| {
                 for record in &table.table {
-                    let vout_count = u8::try_from(record.output_count()).map_err(|_| {
+                    let output_count = u32::try_from(record.output_count()).map_err(|_| {
                         UtxoError::SnapshotOutputCountTooLarge {
                             count: record.output_count(),
                         }
                     })?;
-                    let record_header = SnapshotRecordHeaderV3 {
+                    let txid = record.txid();
+                    let record_header = SnapshotRecordHeaderV4 {
                         shard_idx,
                         key_prefix: record.key().to_prefix(),
-                        txid: record.txid().to_le_bytes(),
-                        vout_count,
+                        txid: txid.to_le_bytes(),
+                        output_count: output_count.to_le(),
                     };
                     writer.write_all(record_header.as_bytes())?;
-                    for output in record.iter_outputs() {
-                        let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                    for output in record.outputs() {
+                        let script_len =
+                            u16::try_from(output.script_pubkey.len()).map_err(|_| {
+                                UtxoError::ScriptTooLarge {
+                                    len: output.script_pubkey.len(),
+                                }
+                            })?;
                         let vout_header = SnapshotVoutHeader {
                             vout: output.vout.to_le(),
                             value: output.value.to_le(),
                             height: output.height.to_le(),
                             coinbase: u8::from(output.coinbase),
-                            script_len: output.script_pubkey_len.to_le(),
+                            script_len: script_len.to_le(),
                         };
                         writer.write_all(vout_header.as_bytes())?;
-                        writer.write_all(script)?;
+                        writer.write_all(output.script_pubkey)?;
+                        observer.observe_coin(SnapshotCoin {
+                            txid,
+                            vout: output.vout,
+                            value: output.value,
+                            script_pubkey: output.script_pubkey,
+                            height: output.height,
+                            coinbase: output.coinbase,
+                        });
                     }
                 }
                 Ok::<(), UtxoError>(())
             })?;
         }
 
-        let trailer = view
+        let fallback = view
             .listener_muhash3072()
             .unwrap_or([0_u8; MUHASH_TRAILER_LEN]);
+        let trailer = observer.select_trailer(fallback);
         writer.write_all(&trailer)?;
-        Ok(trailer)
+        Ok((trailer, observer))
     })
 }
 
 /// Streams a native bitcoin-rs UTXO snapshot from `reader` into a fresh set.
 pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
+    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::Legacy, ())
+        .map(|(snapshot, ())| snapshot)
+}
+
+/// Strictly decodes a complete v4 snapshot for a chainstate checkpoint.
+pub fn read_snapshot_strict_v4(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
+    read_snapshot_strict_v4_observed(reader, ()).map(|(snapshot, ())| snapshot)
+}
+
+/// Strictly decodes a complete v4 snapshot while observing each inserted coin.
+///
+/// The observer is returned only after trailer and EOF validation succeeds.
+/// Callbacks can precede a later error, so they must not publish external state.
+pub fn read_snapshot_strict_v4_observed<O: SnapshotCoinObserver>(
+    reader: &mut impl Read,
+    observer: O,
+) -> Result<(SnapshotLoad, O), UtxoError> {
+    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::StrictV4, observer)
+}
+
+#[derive(Copy, Clone)]
+enum SnapshotReadPolicy {
+    Legacy,
+    StrictV4,
+}
+
+fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
+    reader: &mut impl Read,
+    policy: SnapshotReadPolicy,
+    mut observer: O,
+) -> Result<(SnapshotLoad, O), UtxoError> {
     let header_bytes = read_array::<{ core::mem::size_of::<SnapshotHeader>() }>(reader)?;
     let magic = read_u32(&header_bytes, 0);
     if magic != SNAPSHOT_MAGIC {
         return Err(UtxoError::InvalidSnapshotMagic { actual: magic });
     }
     let version = read_u32(&header_bytes, 4);
-    if version != SNAPSHOT_LEGACY_VERSION && version != SNAPSHOT_WRITE_VERSION {
+    let accepts_version = match policy {
+        SnapshotReadPolicy::Legacy => matches!(
+            version,
+            SNAPSHOT_V2_VERSION | SNAPSHOT_V3_VERSION | SNAPSHOT_WRITE_VERSION
+        ),
+        SnapshotReadPolicy::StrictV4 => version == SNAPSHOT_WRITE_VERSION,
+    };
+    if !accepts_version {
         return Err(UtxoError::UnsupportedSnapshotVersion { version });
     }
     let mut tip_hash = [0_u8; 32];
@@ -146,43 +262,75 @@ pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> 
         })?;
 
     let set = UtxoSet::new();
+    let mut seen_vouts = HashSet::new();
     for _ in 0..record_count_usize {
         let (key, txid, outputs) = match version {
-            SNAPSHOT_LEGACY_VERSION => read_snapshot_record_v2(reader)?,
-            SNAPSHOT_WRITE_VERSION => read_snapshot_record_v3(reader)?,
+            SNAPSHOT_V2_VERSION => read_snapshot_record_v2(reader, &mut seen_vouts)?,
+            SNAPSHOT_V3_VERSION => read_snapshot_record_v3(reader, &mut seen_vouts)?,
+            SNAPSHOT_WRITE_VERSION => read_snapshot_record_v4(reader, &mut seen_vouts)?,
             _ => unreachable!("snapshot version was validated"),
         };
         set.insert_snapshot_record(key, txid, &outputs)?;
+        for output in &outputs {
+            observer.observe_coin(SnapshotCoin {
+                txid,
+                vout: output.vout,
+                value: output.value,
+                script_pubkey: &output.script_pubkey,
+                height: output.height,
+                coinbase: output.coinbase,
+            });
+        }
+    }
+
+    if matches!(policy, SnapshotReadPolicy::StrictV4) {
+        let actual = set.record_count();
+        if actual != record_count_usize {
+            return Err(UtxoError::SnapshotRecordCountMismatch {
+                declared: record_count,
+                actual,
+            });
+        }
     }
 
     let mut muhash_trailer = [0_u8; MUHASH_TRAILER_LEN];
-    match reader.read_exact(&mut muhash_trailer) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        Err(error) => return Err(error.into()),
+    match policy {
+        SnapshotReadPolicy::Legacy => match reader.read_exact(&mut muhash_trailer) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error.into()),
+        },
+        SnapshotReadPolicy::StrictV4 => {
+            reader.read_exact(&mut muhash_trailer)?;
+            let mut trailing = [0_u8; 1];
+            if reader.read(&mut trailing)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "snapshot has trailing bytes",
+                )
+                .into());
+            }
+        }
     }
 
-    Ok(SnapshotLoad {
-        set,
-        tip_hash: Hash256::from_le_bytes(&tip_hash),
-        height,
-        muhash_trailer,
-    })
+    Ok((
+        SnapshotLoad {
+            set,
+            tip_hash: Hash256::from_le_bytes(&tip_hash),
+            height,
+            muhash_trailer,
+        },
+        observer,
+    ))
 }
 
 fn read_snapshot_record_v2(
     reader: &mut impl Read,
+    seen_vouts: &mut HashSet<u32>,
 ) -> Result<(UtxoKey, Hash256, Vec<OwnedUtxoOut>), UtxoError> {
     let record_header_bytes =
         read_array::<{ core::mem::size_of::<SnapshotRecordHeader>() }>(reader)?;
-    let shard_idx = record_header_bytes[0];
-    let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&record_header_bytes[1..9]);
-    let mut txid_bytes = [0_u8; 32];
-    txid_bytes.copy_from_slice(&record_header_bytes[9..41]);
-    let txid = Hash256::from_le_bytes(&txid_bytes);
-    let key = UtxoKey::from_prefix(prefix);
-    validate_snapshot_key(key, txid, shard_idx)?;
+    let (key, txid) = decode_record_identity(&record_header_bytes)?;
     let vout_bitmap = read_u64(&record_header_bytes, 41);
     let vout_count = record_header_bytes[49];
     if vout_bitmap.count_ones() != u32::from(vout_count) {
@@ -192,19 +340,23 @@ fn read_snapshot_record_v2(
         });
     }
 
+    seen_vouts.clear();
     let mut outputs = Vec::with_capacity(usize::from(vout_count));
     for _ in 0..vout_count {
         let output = read_snapshot_output(reader)?;
-        let Some(bit) = bitmap_vout_bit(output.vout) else {
+        if output.vout >= 64 {
             return Err(UtxoError::VoutOutOfRange { vout: output.vout });
-        };
+        }
+        let bit = 1_u64 << output.vout;
         if vout_bitmap & bit == 0 {
             return Err(UtxoError::SnapshotVoutBitmapMismatch {
                 bitmap: vout_bitmap,
                 vout: output.vout,
             });
         }
-        reject_duplicate_vout(&outputs, output.vout)?;
+        if !seen_vouts.insert(output.vout) {
+            return Err(UtxoError::SnapshotDuplicateVout { vout: output.vout });
+        }
         outputs.push(output);
     }
     Ok((key, txid, outputs))
@@ -212,25 +364,54 @@ fn read_snapshot_record_v2(
 
 fn read_snapshot_record_v3(
     reader: &mut impl Read,
+    seen_vouts: &mut HashSet<u32>,
 ) -> Result<(UtxoKey, Hash256, Vec<OwnedUtxoOut>), UtxoError> {
     let record_header_bytes =
         read_array::<{ core::mem::size_of::<SnapshotRecordHeaderV3>() }>(reader)?;
-    let shard_idx = record_header_bytes[0];
+    let (key, txid) = decode_record_identity(&record_header_bytes)?;
+    let outputs = read_snapshot_outputs(reader, u32::from(record_header_bytes[41]), seen_vouts)?;
+    Ok((key, txid, outputs))
+}
+
+fn read_snapshot_record_v4(
+    reader: &mut impl Read,
+    seen_vouts: &mut HashSet<u32>,
+) -> Result<(UtxoKey, Hash256, Vec<OwnedUtxoOut>), UtxoError> {
+    let record_header_bytes =
+        read_array::<{ core::mem::size_of::<SnapshotRecordHeaderV4>() }>(reader)?;
+    let (key, txid) = decode_record_identity(&record_header_bytes)?;
+    let outputs = read_snapshot_outputs(reader, read_u32(&record_header_bytes, 41), seen_vouts)?;
+    Ok((key, txid, outputs))
+}
+
+fn decode_record_identity(header: &[u8]) -> Result<(UtxoKey, Hash256), UtxoError> {
+    let shard_idx = header[0];
     let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&record_header_bytes[1..9]);
+    prefix.copy_from_slice(&header[1..9]);
     let mut txid_bytes = [0_u8; 32];
-    txid_bytes.copy_from_slice(&record_header_bytes[9..41]);
+    txid_bytes.copy_from_slice(&header[9..41]);
     let txid = Hash256::from_le_bytes(&txid_bytes);
     let key = UtxoKey::from_prefix(prefix);
     validate_snapshot_key(key, txid, shard_idx)?;
-    let vout_count = record_header_bytes[41];
-    let mut outputs = Vec::with_capacity(usize::from(vout_count));
-    for _ in 0..vout_count {
+    Ok((key, txid))
+}
+
+fn read_snapshot_outputs(
+    reader: &mut impl Read,
+    output_count: u32,
+    seen_vouts: &mut HashSet<u32>,
+) -> Result<Vec<OwnedUtxoOut>, UtxoError> {
+    // The declared count is untrusted; grow only after bytes for an output arrive.
+    seen_vouts.clear();
+    let mut outputs = Vec::new();
+    for _ in 0..output_count {
         let output = read_snapshot_output(reader)?;
-        reject_duplicate_vout(&outputs, output.vout)?;
+        if !seen_vouts.insert(output.vout) {
+            return Err(UtxoError::SnapshotDuplicateVout { vout: output.vout });
+        }
         outputs.push(output);
     }
-    Ok((key, txid, outputs))
+    Ok(outputs)
 }
 
 fn validate_snapshot_key(key: UtxoKey, txid: Hash256, shard_idx: u8) -> Result<(), UtxoError> {
@@ -258,14 +439,6 @@ fn read_snapshot_output(reader: &mut impl Read) -> Result<OwnedUtxoOut, UtxoErro
     Ok(OwnedUtxoOut::new(vout, value, script, coinbase, height))
 }
 
-fn reject_duplicate_vout(outputs: &[OwnedUtxoOut], vout: u32) -> Result<(), UtxoError> {
-    if outputs.iter().any(|output| output.vout == vout) {
-        Err(UtxoError::SnapshotDuplicateVout { vout })
-    } else {
-        Ok(())
-    }
-}
-
 /// Computes Bitcoin Core's `hash_serialized_3` UTXO-set commitment.
 pub fn hash_serialized_3(set: &UtxoSet) -> Result<Hash256, UtxoError> {
     set.with_stable_view(hash_serialized_3_stable)
@@ -277,12 +450,10 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
         view.shard(usize::from(shard_idx)).with_table(|table| {
             let mut entries = Vec::with_capacity(table.output_count());
             for record in &table.table {
-                for output in record.iter_outputs() {
-                    let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                for output in record.outputs() {
                     entries.push(HashSerializedEntry {
                         txid_le: record.txid().to_le_bytes(),
                         output,
-                        script,
                     });
                 }
             }
@@ -299,13 +470,14 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
                 let code = (entry.output.height << 1) | u32::from(entry.output.coinbase);
                 engine.update(code.to_le_bytes());
                 engine.update(entry.output.value.to_le_bytes());
-                let script_len =
-                    u64::try_from(entry.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
-                        len: entry.script.len(),
-                    })?;
+                let script_len = u64::try_from(entry.output.script_pubkey.len()).map_err(|_| {
+                    UtxoError::ScriptTooLarge {
+                        len: entry.output.script_pubkey.len(),
+                    }
+                })?;
                 let encoded_len = varint::encode(script_len);
                 engine.update(encoded_len.as_slice());
-                engine.update(entry.script);
+                engine.update(entry.output.script_pubkey);
             }
             Ok::<(), UtxoError>(())
         })?;
@@ -320,7 +492,7 @@ pub(crate) fn hash_serialized_3_stable(view: &UtxoSetView<'_>) -> Result<Hash256
 impl UtxoSetView<'_> {
     /// Invokes `f` once per live coin in the stable view, passing
     /// `(txid, vout, value, script_pubkey, height, coinbase)`. The script slice
-    /// borrows arena memory valid only for the duration of the call.
+    /// borrows the record payload only for the duration of the call.
     ///
     /// On-demand scan helper (e.g. `gettxoutsetinfo`); not on any hot path.
     pub fn for_each_coin<F>(&self, mut f: F) -> Result<(), UtxoError>
@@ -331,13 +503,12 @@ impl UtxoSetView<'_> {
             self.shard(usize::from(shard_idx)).with_table(|table| {
                 for record in &table.table {
                     let txid = record.txid();
-                    for output in record.iter_outputs() {
-                        let script = script_slice(table, output).ok_or(UtxoError::CorruptArena)?;
+                    for output in record.outputs() {
                         f(
                             txid,
                             output.vout,
                             output.value,
-                            script,
+                            output.script_pubkey,
                             output.height,
                             output.coinbase,
                         );
@@ -357,8 +528,7 @@ pub fn aggregate_hash(set: &UtxoSet) -> Result<Hash256, UtxoError> {
 
 struct HashSerializedEntry<'a> {
     txid_le: [u8; 32],
-    output: &'a OneUtxoOut,
-    script: &'a [u8],
+    output: OneUtxoOut<'a>,
 }
 
 fn read_array<const N: usize>(reader: &mut impl Read) -> Result<[u8; N], UtxoError> {
@@ -383,14 +553,4 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     let mut out = [0_u8; 8];
     out.copy_from_slice(&bytes[offset..offset + 8]);
     u64::from_le_bytes(out)
-}
-
-fn script_slice<'table>(
-    table: &'table ShardTable<'_>,
-    output: &OneUtxoOut,
-) -> Option<&'table [u8]> {
-    let start = usize::try_from(output.script_pubkey_offset).ok()?;
-    let len = usize::from(output.script_pubkey_len);
-    let end = start.checked_add(len)?;
-    table.script_bytes.get(start..end)
 }

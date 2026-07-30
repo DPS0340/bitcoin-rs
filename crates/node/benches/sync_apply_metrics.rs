@@ -625,14 +625,14 @@ fn child_header(prev_blockhash: BlockHash, time: u32) -> Header {
 
 fn install_synthetic_peers(
     peers: &Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: &Arc<RwLock<HashMap<SocketAddr, crossbeam_channel::Sender<Message>>>>,
+    peer_outbound: &Arc<RwLock<HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
 ) -> Vec<crossbeam_channel::Receiver<Message>> {
     let mut peers = peers.write();
     let mut peer_outbound = peer_outbound.write();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8_333);
     let (outbound_tx, outbound_rx) = unbounded::<Message>();
     peers.push(synthetic_peer(addr));
-    peer_outbound.insert(addr, outbound_tx);
+    peer_outbound.insert(addr, bitcoin_rs_p2p::PeerLease::new(outbound_tx));
     vec![outbound_rx]
 }
 

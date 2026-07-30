@@ -1,8 +1,4 @@
-use std::{
-    io,
-    mem::{self, MaybeUninit},
-    time::Instant,
-};
+use std::{io, time::Instant};
 
 use bitcoin::ScriptBuf;
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
@@ -38,15 +34,15 @@ pub enum UtxoError {
         /// Script length in bytes.
         len: usize,
     },
-    /// The shard script slab exceeded the record `u32` offset field.
-    #[error("script arena offset exceeded u32 range at {len} bytes")]
-    ArenaOffsetOverflow {
-        /// Current script slab byte length.
+    /// One encoded record could not fit in the local address space.
+    #[error("encoded UTXO record exceeds addressable size at {len} bytes")]
+    RecordTooLarge {
+        /// Encoded record byte length.
         len: usize,
     },
-    /// Internal record offsets no longer point into the shard script slab.
-    #[error("UTXO record points outside its shard script arena")]
-    CorruptArena,
+    /// Encoded UTXO record bytes are truncated, trailing, or noncanonical.
+    #[error("invalid encoded UTXO record")]
+    CorruptRecord,
     /// Snapshot I/O failed.
     #[error("snapshot I/O failed: {0}")]
     Io(#[from] io::Error),
@@ -67,6 +63,14 @@ pub enum UtxoError {
     SnapshotRecordCountTooLarge {
         /// Record count from the header.
         count: u64,
+    },
+    /// Strict snapshot records did not produce the declared number of records.
+    #[error("strict snapshot record count mismatch: declared {declared}, actual {actual}")]
+    SnapshotRecordCountMismatch {
+        /// Record count declared by the snapshot header.
+        declared: u64,
+        /// Number of records actually retained after insertion.
+        actual: usize,
     },
     /// Snapshot output count does not fit the record header.
     #[error("snapshot record has too many live outputs: {count}")]
@@ -656,7 +660,6 @@ pub(crate) struct SpendPayload<'a> {
 /// In-memory 256-shard UTXO set.
 pub struct UtxoSet {
     pub(crate) shards: [Shard; UtxoKey::SHARD_COUNT],
-    pub(crate) last_defragged_shard: Mutex<u8>,
     stable_view_lock: RwLock<()>,
     listener: Option<Box<dyn UtxoChangeListener + Send + Sync>>,
 }
@@ -686,12 +689,6 @@ impl UtxoSetView<'_> {
         self.set.shards.iter().map(Shard::record_count).sum()
     }
 
-    /// Returns each shard's script-slab high-water mark in this stable view.
-    #[must_use]
-    pub fn arena_high_water_by_shard(&self) -> [usize; UtxoKey::SHARD_COUNT] {
-        core::array::from_fn(|idx| self.set.shards[idx].arena_high_water())
-    }
-
     /// Computes Bitcoin Core's `hash_serialized_3` commitment for this stable view.
     pub fn hash_serialized_3(&self) -> Result<Hash256, UtxoError> {
         crate::snapshot::hash_serialized_3_stable(self)
@@ -701,7 +698,7 @@ impl UtxoSetView<'_> {
     pub fn scan_script_pubkeys(&self, scripts: &[ScriptBuf]) -> Result<UtxoScan, UtxoError> {
         let mut scan = UtxoScan::default();
         for shard in &self.set.shards {
-            shard.scan_script_pubkeys(scripts, &mut scan)?;
+            shard.scan_script_pubkeys(scripts, &mut scan);
         }
         Ok(scan)
     }
@@ -724,7 +721,6 @@ impl UtxoSet {
     pub fn new() -> Self {
         Self {
             shards: [(); UtxoKey::SHARD_COUNT].map(|()| Shard::new()),
-            last_defragged_shard: Mutex::new(0),
             stable_view_lock: RwLock::new(()),
             listener: None,
         }
@@ -824,12 +820,6 @@ impl UtxoSet {
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.with_stable_view(stable_view_record_count)
-    }
-
-    /// Returns each shard's script-slab high-water mark.
-    #[must_use]
-    pub fn arena_high_water_by_shard(&self) -> [usize; UtxoKey::SHARD_COUNT] {
-        self.with_stable_view(stable_view_arena_high_water_by_shard)
     }
 
     pub(crate) fn insert_snapshot_record(
@@ -950,10 +940,6 @@ impl UtxoSet {
             return Ok(());
         }
 
-        for &shard_idx in &active_shards[..active_shard_count] {
-            self.shards[shard_idx].validate_script_capacity(buckets.adds(shard_idx))?;
-        }
-
         let errors = Mutex::new(Vec::new());
         let shard_events: Vec<_> = active_shards[..active_shard_count]
             .par_iter()
@@ -997,10 +983,6 @@ impl UtxoSet {
         buckets: &ShardCommitBuckets<'_>,
         listener: &(dyn UtxoChangeListener + Send + Sync),
     ) -> Result<(), UtxoError> {
-        for &shard_idx in &active_shards[..active_shard_count] {
-            self.shards[shard_idx].validate_script_capacity(buckets.adds(shard_idx))?;
-        }
-
         let mut error = None;
         let mut shard_events =
             SmallVec::<[UtxoChangeEvents<'_>; PARALLEL_LISTENER_SHARD_THRESHOLD]>::new();
@@ -1258,12 +1240,14 @@ fn scattered_adds<'a, A: UtxoAddView>(
     counts: &[usize; UtxoKey::SHARD_COUNT],
 ) -> ([(usize, usize); UtxoKey::SHARD_COUNT], Vec<AddPayload<'a>>) {
     let (ranges, mut cursors) = shard_ranges(counts);
-    let mut slots = uninit_slots(adds.len());
+    let mut slots = std::iter::repeat_with(|| None)
+        .take(adds.len())
+        .collect::<Vec<Option<AddPayload<'a>>>>();
     for add in adds {
         let key = UtxoKey::from_txid(&add.outpoint().txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor].write((key, add.outpoint().txid, add.payload()));
+        slots[*cursor] = Some((key, add.outpoint().txid, add.payload()));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));
@@ -1278,12 +1262,14 @@ fn scattered_removes<'a>(
     Vec<SpendPayload<'a>>,
 ) {
     let (ranges, mut cursors) = shard_ranges(counts);
-    let mut slots = uninit_slots(removes.len());
+    let mut slots = std::iter::repeat_with(|| None)
+        .take(removes.len())
+        .collect::<Vec<Option<SpendPayload<'a>>>>();
     for remove in removes {
         let key = UtxoKey::from_txid(&remove.txid);
         let shard_idx = usize::from(key.shard());
         let cursor = &mut cursors[shard_idx];
-        slots[*cursor].write(spend_payload(remove, key));
+        slots[*cursor] = Some(spend_payload(remove, key));
         *cursor = cursor.saturating_add(1);
     }
     debug_assert_eq!(cursors, range_ends(&ranges));
@@ -1324,26 +1310,19 @@ fn range_ends(ranges: &[(usize, usize); UtxoKey::SHARD_COUNT]) -> [usize; UtxoKe
     ranges.map(|(_start, end)| end)
 }
 
-fn uninit_slots<T>(len: usize) -> Vec<MaybeUninit<T>> {
-    let mut slots = Vec::with_capacity(len);
-    // SAFETY: `MaybeUninit<T>` does not require initialization. The callers
-    // fill every slot before converting this allocation to `Vec<T>`.
-    unsafe {
-        slots.set_len(len);
-    }
+fn initialized_slots<T>(slots: Vec<Option<T>>) -> Vec<T> {
     slots
-}
-
-fn initialized_slots<T>(mut slots: Vec<MaybeUninit<T>>) -> Vec<T> {
-    let ptr = slots.as_mut_ptr().cast::<T>();
-    let len = slots.len();
-    let capacity = slots.capacity();
-    mem::forget(slots);
-    // SAFETY: `ShardCommitBuckets::new` writes exactly one initialized value
-    // into each slot before calling this helper. `MaybeUninit<T>` has the same
-    // layout as `T`, and ownership of the original allocation is transferred to
-    // the returned `Vec<T>` with the same length and capacity.
-    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+        .into_iter()
+        .map(|slot| match slot {
+            Some(value) => value,
+            // `shard_ranges` sizes each shard's range from the per-shard
+            // counts, and every add/remove writes its payload into the slot
+            // at its shard's running cursor; a missing slot means the bucket
+            // counts disagreed with the input length, which is an
+            // unrecoverable internal corrupt state.
+            None => panic!("shard bucket counts allocate every slot"),
+        })
+        .collect()
 }
 
 fn active_shards(
@@ -1368,8 +1347,4 @@ fn stable_view_len(view: &UtxoSetView<'_>) -> usize {
 
 fn stable_view_record_count(view: &UtxoSetView<'_>) -> usize {
     view.record_count()
-}
-
-fn stable_view_arena_high_water_by_shard(view: &UtxoSetView<'_>) -> [usize; UtxoKey::SHARD_COUNT] {
-    view.arena_high_water_by_shard()
 }

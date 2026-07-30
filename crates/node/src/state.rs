@@ -8,11 +8,11 @@
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hex::FromHex as _;
-use bitcoin::{Transaction, Txid, block::Header};
+use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_rpc::{
-    BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService, PruneServiceError,
-    PruneStatus, ZmqNotification,
+    BlockBodyMetadata, BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService,
+    PruneServiceError, PruneStatus, ZmqNotification,
 };
 use compact_str::CompactString;
 use core::fmt;
@@ -25,8 +25,10 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
-use bitcoin_rs_pruning::{PrunePolicy, stage_block_and_undo_prune};
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
+use bitcoin_rs_pruning::{
+    PrunePolicy, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
+};
+use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch};
 use bitcoin_rs_utxo::UtxoSet;
 use parking_lot::{Mutex, RwLock};
 
@@ -81,6 +83,9 @@ pub(crate) const INBOUND_BLOCK_CHANNEL_LIMIT: usize = 256;
 /// Errors produced when applying a block to the node state.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
+    /// Clean shutdown has closed block-apply admission.
+    #[error("block apply rejected because clean shutdown has begun")]
+    Shutdown,
     /// The block's previous header hash does not match the current tip's hash.
     #[error("prev hash mismatch: tip {tip}, block prev {prev}")]
     PrevHashMismatch {
@@ -196,6 +201,8 @@ impl NodeStorage {
 
     fn prune_service(
         &self,
+        block_files: &Arc<FlatFileBlockStore>,
+        block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     ) -> Result<Arc<dyn PruneService>> {
@@ -203,72 +210,87 @@ impl NodeStorage {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
                 Arc::clone(store),
+                Arc::clone(block_files),
+                Arc::clone(block_body_store),
                 blocks,
                 transactions,
             )?)),
         }
     }
 
-    fn block_body_store(&self) -> Arc<dyn crate::apply::PruneBodyStore> {
+    fn block_body_store(
+        &self,
+        files: Arc<FlatFileBlockStore>,
+        data_dir: &Path,
+    ) -> Result<Arc<dyn crate::apply::PruneBodyStore>> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::RocksDb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Fjall(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Redb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => {
-                let store: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
-                store
-            }
+            Self::Mdbx(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+                Arc::clone(store),
+                files,
+                data_dir,
+            )?)),
         }
     }
 
     #[cfg(test)]
-    fn seed_prune_rows(
+    fn seed_prune_undo(
         &self,
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
-        body: &[u8],
         undo: &[u8],
     ) -> Result<()> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::RocksDb(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Fjall(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Redb(store) => seed_prune_undo(&**store, height, hash, undo),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => seed_prune_rows(&**store, height, hash, body, undo),
+            Self::Mdbx(store) => seed_prune_undo(&**store, height, hash, undo),
         }
     }
 
@@ -325,9 +347,31 @@ impl BlockBodySource for StoredBlockBodySource {
     fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
         self.store.load_block_body(height, hash).ok().flatten()
     }
+
+    fn block_body_metadata(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Option<BlockBodyMetadata> {
+        self.store
+            .block_body_metadata(height, hash)
+            .ok()
+            .flatten()
+            .map(|(body_size, tx_count)| BlockBodyMetadata {
+                body_size,
+                tx_count,
+            })
+    }
 }
 
 const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeSource {
+    Cold,
+    HeadersOnly,
+    Checkpoint,
+}
 
 fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
     let Some(bytes) = store.get(ColumnFamily::UtxoMeta, PRUNEHEIGHT_METADATA_KEY)? else {
@@ -344,6 +388,8 @@ fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
 /// Storage-backed implementation of RPC manual pruning.
 pub struct NodePruneService<S: KvStore> {
     store: Arc<S>,
+    block_files: Arc<FlatFileBlockStore>,
+    block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     blocks: Arc<RwLock<Vec<BlockRecord>>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     pruneheight: Mutex<Option<u32>>,
@@ -351,14 +397,18 @@ pub struct NodePruneService<S: KvStore> {
 
 impl<S: KvStore> NodePruneService<S> {
     /// Creates a manual pruning service over the chainstate store and RPC block cache.
-    pub fn new(
+    pub(crate) fn new(
         store: Arc<S>,
+        block_files: Arc<FlatFileBlockStore>,
+        block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
             store,
+            block_files,
+            block_body_store,
             blocks,
             transactions,
             pruneheight: Mutex::new(pruneheight),
@@ -382,15 +432,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         let pruner_tip = updated_pruneheight
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
-        let mut batch = self.store.new_batch();
-        let (block_outcome, undo_outcome) =
-            stage_block_and_undo_prune(&*self.store, &mut batch, pruner_tip, policy)
-                .map_err(|err| PruneServiceError::failed(err.to_string()))?;
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            PRUNEHEIGHT_METADATA_KEY,
-            &updated_pruneheight.to_be_bytes(),
-        );
 
         let mut pruned_txids = Vec::new();
         for record in blocks
@@ -401,13 +442,10 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
                 continue;
             }
             let bytes = if record.block_hex.is_empty() {
-                <S as crate::apply::PruneBodyStore>::load_block_body(
-                    &*self.store,
-                    record.height,
-                    record.hash,
-                )
-                .map_err(|error| PruneServiceError::failed(error.to_string()))?
-                .unwrap_or_default()
+                self.block_body_store
+                    .load_block_body(record.height, record.hash)
+                    .map_err(|error| PruneServiceError::failed(error.to_string()))?
+                    .unwrap_or_default()
             } else {
                 Vec::<u8>::from_hex(&record.block_hex).map_err(|error| {
                     PruneServiceError::failed(format!(
@@ -427,8 +465,24 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             })?;
             pruned_txids.extend(block.txdata.iter().map(Transaction::compute_txid));
         }
+        let mut batch = self.store.new_batch();
+        let (block_outcome, undo_outcome, prunable_files) = stage_block_and_undo_prune(
+            &*self.store,
+            &mut batch,
+            &self.block_files,
+            pruner_tip,
+            policy,
+        )
+        .map_err(|err| PruneServiceError::failed(err.to_string()))?;
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            PRUNEHEIGHT_METADATA_KEY,
+            &updated_pruneheight.to_be_bytes(),
+        );
         self.store
             .write(batch)
+            .map_err(|err| PruneServiceError::failed(err.to_string()))?;
+        reclaim_staged_flat_block_files(&*self.store, &self.block_files, &prunable_files)
             .map_err(|err| PruneServiceError::failed(err.to_string()))?;
 
         if !pruned_txids.is_empty() {
@@ -465,27 +519,17 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
 }
 
 #[cfg(test)]
-fn seed_prune_rows<S: KvStore>(
+fn seed_prune_undo<S: KvStore>(
     store: &S,
     height: u32,
     hash: bitcoin_rs_primitives::Hash256,
-    body: &[u8],
     undo: &[u8],
 ) -> Result<()> {
-    use bitcoin_rs_storage::WriteBatch as _;
-
-    let mut batch = store.new_batch();
-    batch.put(
-        bitcoin_rs_pruning::BLOCK_DATA_CF,
-        &bitcoin_rs_pruning::block_body_key(height, hash),
-        body,
-    );
-    batch.put(
+    store.put(
         ColumnFamily::BlockTree,
         &bitcoin_rs_pruning::block_undo_key(height, hash),
         undo,
-    );
-    store.write(batch)?;
+    )?;
     Ok(())
 }
 
@@ -523,9 +567,11 @@ impl TxIndexStorage {
         &self,
         blocks: Arc<RwLock<Vec<bitcoin_rs_rpc::BlockRecord>>>,
         block_body_source: Arc<dyn BlockBodySource>,
+        block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
     ) -> Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> {
-        let block_source =
-            crate::NodeBlockSource::new(blocks).with_block_body_source(block_body_source);
+        let block_source = crate::NodeBlockSource::new(blocks)
+            .with_block_body_source(block_body_source)
+            .with_block_tree(block_tree);
         match self {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => {
@@ -689,7 +735,10 @@ fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
 pub struct NodeState {
     config: Config,
     data_dir: PathBuf,
+    checkpoint_data_dir: cap_std::fs::Dir,
+    resume_source: ResumeSource,
     storage: NodeStorage,
+    block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
     tx_index: Option<TxIndexHandle>,
@@ -709,14 +758,12 @@ pub struct NodeState {
     /// Per-peer outbound message senders, keyed by remote socket address.
     /// External code pushes messages here; the per-connection thread drains
     /// and writes them to the peer's TCP stream.
-    peer_outbound: Arc<
-        RwLock<HashMap<std::net::SocketAddr, crossbeam_channel::Sender<bitcoin_rs_p2p::Message>>>,
-    >,
+    peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
     banned: Arc<RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     p2p_outbound_tx: crossbeam_channel::Sender<std::net::SocketAddr>,
     p2p_outbound_rx: Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>>,
-    inbound_headers_tx: Sender<Vec<Header>>,
-    inbound_headers_rx: Arc<Mutex<Receiver<Vec<Header>>>>,
+    inbound_headers_tx: Sender<bitcoin_rs_p2p::InboundHeaders>,
+    inbound_headers_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>>,
     inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     apply_handles: crate::apply::ApplyHandles,
@@ -734,6 +781,14 @@ impl NodeState {
         config.validate()?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
+        let checkpoint_data_dir = crate::checkpoint_fs::open_data_dir(&config.data_dir)
+            .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
+        let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
+            network: config.network,
+            genesis: config.network.genesis_block_hash(),
+        };
+        let checkpoint_load =
+            crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
         let g2_muhash_sampler = config
             .g2_muhash_samples
             .clone()
@@ -770,6 +825,10 @@ impl NodeState {
             }
         };
         let storage = NodeStorage::open(&config)?;
+        let block_files =
+            Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
+        let block_body_store =
+            storage.block_body_store(Arc::clone(&block_files), &config.data_dir)?;
         let tx_index_pair = open_tx_index(&config)?;
         let (tx_index, tx_index_storage) = tx_index_pair
             .map_or((None, None), |(tx_index, tx_index_storage)| {
@@ -792,10 +851,51 @@ impl NodeState {
         } else {
             Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
         };
-        let mut utxo_set = bitcoin_rs_utxo::UtxoSet::new();
-        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
-        );
+        let (
+            mut utxo_set,
+            initial_coin_stats,
+            block_tree_value,
+            restored_applied_tip,
+            resume_source,
+        ) = match checkpoint_load {
+            crate::checkpoint::CheckpointLoad::Cold { reason } => {
+                if let Some(reason) = reason {
+                    tracing::warn!(%reason, "chainstate checkpoint rejected; starting cold");
+                }
+                (
+                    bitcoin_rs_utxo::UtxoSet::new(),
+                    bitcoin_rs_coinstats::CoinStats::default(),
+                    bitcoin_rs_chain::BlockTree::new(),
+                    None,
+                    ResumeSource::Cold,
+                )
+            }
+            crate::checkpoint::CheckpointLoad::HeadersOnly { tree, reason } => {
+                tracing::warn!(%reason, "chainstate payload rejected; retaining validated headers only");
+                (
+                    bitcoin_rs_utxo::UtxoSet::new(),
+                    bitcoin_rs_coinstats::CoinStats::default(),
+                    tree,
+                    None,
+                    ResumeSource::HeadersOnly,
+                )
+            }
+            crate::checkpoint::CheckpointLoad::Complete(restored) => {
+                tracing::info!(
+                    height = restored.applied_tip.height,
+                    hash = %restored.applied_tip.hash,
+                    "restored chainstate checkpoint"
+                );
+                (
+                    restored.utxo,
+                    restored.coin_stats,
+                    restored.tree,
+                    Some(restored.applied_tip),
+                    ResumeSource::Checkpoint,
+                )
+            }
+        };
+        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(initial_coin_stats);
         // The rolling coin-stats listener does per-coin MuHash + event work on
         // the block-apply hot path. Bitcoin Core does not maintain rolling UTXO
         // stats during IBD by default; gettxoutsetinfo scans on demand instead
@@ -807,9 +907,12 @@ impl NodeState {
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
+        let block_tree = Arc::new(RwLock::new(block_tree_value));
         let chain_tip = block_tree.read().tip_handle();
         let applied_tip: Arc<ArcSwapOption<TipSnapshot>> = Arc::new(ArcSwapOption::empty());
+        if let Some(restored_applied_tip) = restored_applied_tip {
+            applied_tip.store(Some(Arc::new(restored_applied_tip)));
+        }
         let blocks = Arc::new(RwLock::new(Vec::new()));
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         let network = Arc::new(RwLock::new(NetworkState::default()));
@@ -821,7 +924,7 @@ impl NodeState {
         let p2p_outbound_rx = Arc::new(Mutex::new(p2p_outbound_rx_raw));
         let mining_template_id = Arc::new(ArcSwap::from_pointee(CompactString::new("0")));
         let (inbound_headers_tx, inbound_headers_rx_raw) =
-            crossbeam_channel::unbounded::<Vec<Header>>();
+            crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
@@ -841,9 +944,10 @@ impl NodeState {
             zmq_publisher: Arc::clone(&zmq_publisher),
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: false,
-            block_body_store: Some(storage.block_body_store()),
+            block_body_store: Some(Arc::clone(&block_body_store)),
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
+            admission: Arc::new(crate::apply::ApplyAdmission::new()),
             assume_valid_height: config.assume_valid_height,
         };
         let sync = Arc::new(crate::BlockSync::new(
@@ -854,7 +958,12 @@ impl NodeState {
             Arc::clone(&inbound_blocks_rx),
         ));
         let prune_service = if config.prune_target_mb > 0 {
-            Some(storage.prune_service(Arc::clone(&blocks), Arc::clone(&transactions))?)
+            Some(storage.prune_service(
+                &block_files,
+                &block_body_store,
+                Arc::clone(&blocks),
+                Arc::clone(&transactions),
+            )?)
         } else {
             None
         };
@@ -867,7 +976,10 @@ impl NodeState {
         Ok(Self {
             config,
             data_dir,
+            checkpoint_data_dir,
+            resume_source,
             storage,
+            block_body_store,
             utxo,
             coin_stats,
             tx_index,
@@ -909,6 +1021,32 @@ impl NodeState {
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub(crate) const fn resume_source(&self) -> ResumeSource {
+        self.resume_source
+    }
+
+    pub(crate) fn write_clean_checkpoint(
+        &self,
+    ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
+    {
+        let _exclusive_apply = self.apply_handles.admission.close();
+        // A checkpoint may name this tip only after body files then index rows sync.
+        self.block_body_store.sync()?;
+        let applied_tip = self.applied_tip.load_full();
+        crate::checkpoint::write_checkpoint_from_dir(
+            &self.checkpoint_data_dir,
+            crate::checkpoint::HeaderCheckpointConfig {
+                network: self.config.network,
+                genesis: self.config.network.genesis_block_hash(),
+            },
+            &self.block_tree,
+            &self.utxo,
+            &self.coin_stats,
+            applied_tip.as_deref(),
+            self.config.g2_muhash_samples.is_some(),
+        )
     }
 
     /// Returns the configured storage backend that was opened.
@@ -954,9 +1092,13 @@ impl NodeState {
     pub fn electrum_history_reader(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
-        self.tx_index_storage
-            .as_ref()
-            .map(|storage| storage.electrum_history_reader(self.blocks(), self.block_body_source()))
+        self.tx_index_storage.as_ref().map(|storage| {
+            storage.electrum_history_reader(
+                self.blocks(),
+                self.block_body_source(),
+                self.block_tree(),
+            )
+        })
     }
 
     /// Returns the shared compact-filter index handle.
@@ -1021,7 +1163,9 @@ impl NodeState {
     /// Returns a durable block body reader for metadata-only block records.
     #[must_use]
     pub(crate) fn block_body_source(&self) -> Arc<dyn BlockBodySource> {
-        Arc::new(StoredBlockBodySource::new(self.storage.block_body_store()))
+        Arc::new(StoredBlockBodySource::new(Arc::clone(
+            &self.block_body_store,
+        )))
     }
 
     /// Returns the shared txid → transaction map exposed to RPC handlers.
@@ -1057,9 +1201,7 @@ impl NodeState {
     #[must_use]
     pub fn peer_outbound(
         &self,
-    ) -> Arc<
-        RwLock<HashMap<std::net::SocketAddr, crossbeam_channel::Sender<bitcoin_rs_p2p::Message>>>,
-    > {
+    ) -> Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>> {
         Arc::clone(&self.peer_outbound)
     }
     /// Returns a cloned sender that RPC `addnode` uses to request outbound P2P connections.
@@ -1080,7 +1222,7 @@ impl NodeState {
     /// `Headers` batches into. The matching `Receiver` is consumed by
     /// `BlockSync::tick` to extend the `BlockTree`.
     #[must_use]
-    pub fn inbound_headers_sender(&self) -> Sender<Vec<Header>> {
+    pub fn inbound_headers_sender(&self) -> Sender<bitcoin_rs_p2p::InboundHeaders> {
         self.inbound_headers_tx.clone()
     }
 
@@ -1089,7 +1231,9 @@ impl NodeState {
     /// Exposed so tests and `BlockSync::new` can wire the channel; production
     /// code calls `state.sync()` and lets the orchestrator own the drain.
     #[must_use]
-    pub fn inbound_headers_rx_handle(&self) -> Arc<Mutex<Receiver<Vec<Header>>>> {
+    pub fn inbound_headers_rx_handle(
+        &self,
+    ) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>> {
         Arc::clone(&self.inbound_headers_rx)
     }
 
@@ -1174,6 +1318,7 @@ impl NodeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
 
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
@@ -1445,10 +1590,16 @@ mod tests {
         let state = NodeState::open(config)?;
         let tx1 = state.inbound_headers_sender();
         let tx2 = state.inbound_headers_sender();
-        tx1.send(Vec::new())
-            .map_err(|err| anyhow::anyhow!("send via tx1 failed: {err}"))?;
-        tx2.send(Vec::new())
-            .map_err(|err| anyhow::anyhow!("send via tx2 failed: {err}"))?;
+        tx1.send(bitcoin_rs_p2p::InboundHeaders {
+            headers: Vec::new(),
+            source: None,
+        })
+        .map_err(|err| anyhow::anyhow!("send via tx1 failed: {err}"))?;
+        tx2.send(bitcoin_rs_p2p::InboundHeaders {
+            headers: Vec::new(),
+            source: None,
+        })
+        .map_err(|err| anyhow::anyhow!("send via tx2 failed: {err}"))?;
         Ok(())
     }
 
@@ -1578,9 +1729,63 @@ mod tests {
             Some("")
         );
         assert_eq!(
-            state.storage.stored_prune_body(0, hash)?.as_deref(),
+            state.block_body_store.load_block_body(0, hash)?.as_deref(),
             Some(serialize(&block).as_slice())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn persisting_same_block_body_twice_appends_once() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[7_u8; 32]);
+        let body = b"idempotent block body";
+
+        state.block_body_store.persist_block_body(42, hash, body)?;
+        let block_file = state.data_dir.join("blocks").join("blk00000.dat");
+        let first_len = std::fs::metadata(&block_file)?.len();
+        state.block_body_store.persist_block_body(42, hash, body)?;
+        let second_len = std::fs::metadata(block_file)?.len();
+
+        assert_eq!(second_len, first_len);
+        assert_eq!(
+            state.block_body_store.load_block_body(42, hash)?.as_deref(),
+            Some(body.as_slice())
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn legacy_block_body_datadir_is_refused() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("legacy-node");
+        config.p2p_listen.clear();
+        std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
+        let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
+        store.put(
+            bitcoin_rs_pruning::BLOCK_DATA_CF,
+            &bitcoin_rs_pruning::block_body_key(
+                1,
+                bitcoin_rs_primitives::Hash256::from_le_bytes(&[1_u8; 32]),
+            ),
+            b"legacy-inline-body",
+        )?;
+        drop(store);
+
+        let datadir = config.data_dir.display().to_string();
+        let Err(error) = NodeState::open(config) else {
+            anyhow::bail!("legacy inline block body unexpectedly opened");
+        };
+        let message = error.to_string();
+        assert!(message.contains(&datadir));
+        assert!(message.contains("predates the flat-file block store"));
+        assert!(message.contains("must be resynced"));
         Ok(())
     }
 
@@ -1612,12 +1817,12 @@ mod tests {
         crate::apply::apply_block_with_serialized(&state_b.apply_handles(), &block, serialized)?;
 
         let body_a = state_a
-            .storage
-            .stored_prune_body(0, hash)?
+            .block_body_store
+            .load_block_body(0, hash)?
             .ok_or_else(|| anyhow::anyhow!("apply_block body missing"))?;
         let body_b = state_b
-            .storage
-            .stored_prune_body(0, hash)?
+            .block_body_store
+            .load_block_body(0, hash)?
             .ok_or_else(|| anyhow::anyhow!("apply_block_with_serialized body missing"))?;
         assert_eq!(body_a, body_b);
         Ok(())
@@ -1641,8 +1846,9 @@ mod tests {
         for height in 10_u32..=12 {
             let hash = hash(height)?;
             state
-                .storage
-                .seed_prune_rows(height, hash, b"block-body", b"undo-body")?;
+                .block_body_store
+                .persist_block_body(height, hash, b"block-body")?;
+            state.storage.seed_prune_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
@@ -1698,6 +1904,90 @@ mod tests {
     }
 
     #[test]
+    fn prune_reclaims_whole_files_and_keeps_current_file() -> anyhow::Result<()> {
+        fn seed<S: KvStore>(
+            store: &S,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> anyhow::Result<()> {
+            let position = bitcoin_rs_storage::BlockFilePosition {
+                file_no: 0,
+                offset: 0,
+                len: 0,
+            };
+            let mut batch = store.new_batch();
+            batch.put(
+                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_pruning::block_body_key(height, hash),
+                &position.encode(),
+            );
+            batch.put(
+                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_storage::block_file_max_height_key(0),
+                &bitcoin_rs_storage::encode_block_file_max_height(height),
+            );
+            store.write(batch)?;
+            Ok(())
+        }
+
+        fn metadata_exists<S: KvStore>(store: &S) -> anyhow::Result<bool> {
+            Ok(store
+                .get(
+                    bitcoin_rs_pruning::BLOCK_DATA_CF,
+                    &bitcoin_rs_storage::block_file_max_height_key(0),
+                )?
+                .is_some())
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let blocks_dir = config.data_dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir)?;
+        let prunable_file = blocks_dir.join("blk00000.dat");
+        let current_file = blocks_dir.join("blk00001.dat");
+        std::fs::write(&prunable_file, [])?;
+        std::fs::write(&current_file, [])?;
+        let state = NodeState::open(config)?;
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
+
+        match &state.storage {
+            #[cfg(feature = "rocksdb")]
+            NodeStorage::RocksDb(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "fjall")]
+            NodeStorage::Fjall(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "redb")]
+            NodeStorage::Redb(store) => seed(&**store, 10, hash)?,
+            #[cfg(feature = "mdbx")]
+            NodeStorage::Mdbx(store) => seed(&**store, 10, hash)?,
+        }
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        service
+            .prune_to_height(11)
+            .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+
+        assert!(!prunable_file.exists());
+        assert!(current_file.exists());
+        assert!(state.storage.stored_prune_body(10, hash)?.is_none());
+        let has_metadata = match &state.storage {
+            #[cfg(feature = "rocksdb")]
+            NodeStorage::RocksDb(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "fjall")]
+            NodeStorage::Fjall(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "redb")]
+            NodeStorage::Redb(store) => metadata_exists(&**store)?,
+            #[cfg(feature = "mdbx")]
+            NodeStorage::Mdbx(store) => metadata_exists(&**store)?,
+        };
+        assert!(!has_metadata);
+        Ok(())
+    }
+
+    #[test]
     fn manual_prune_removes_pruned_block_transactions_from_cache() -> anyhow::Result<()> {
         use bitcoin::blockdata::constants::genesis_block;
         use bitcoin::consensus::encode::serialize;
@@ -1715,8 +2005,11 @@ mod tests {
             pruned_block.block_hash().as_byte_array(),
         );
         state
+            .block_body_store
+            .persist_block_body(10, pruned_hash, &serialize(&pruned_block))?;
+        state
             .storage
-            .seed_prune_rows(10, pruned_hash, &serialize(&pruned_block), b"undo-body")?;
+            .seed_prune_undo(10, pruned_hash, b"undo-body")?;
         state
             .blocks
             .write()
@@ -1777,5 +2070,200 @@ mod tests {
         assert_eq!(service.status().pruneheight, Some(11));
 
         Ok(())
+    }
+
+    #[test]
+    fn clean_checkpoint_reopens_and_applies_the_next_block() -> anyhow::Result<()> {
+        fn stable_hash(
+            view: &bitcoin_rs_utxo::UtxoSetView<'_>,
+        ) -> Result<bitcoin_rs_primitives::Hash256, bitcoin_rs_utxo::UtxoError> {
+            view.hash_serialized_3()
+        }
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_tip = state.apply_block(&genesis)?;
+        let expected_utxo_hash = state.utxo().with_stable_view(stable_hash)?;
+        let expected_stats = state.coin_stats().snapshot();
+        assert!(matches!(
+            state.write_clean_checkpoint()?,
+            crate::checkpoint::CheckpointWrite::Published { .. }
+        ));
+        drop(state);
+
+        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        reopen_config.data_dir = data_dir.clone();
+        reopen_config.p2p_listen.clear();
+        let resumed = NodeState::open(reopen_config.clone())?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+        let applied = resumed
+            .applied_tip()
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
+        assert_eq!(applied.height, genesis_tip.height);
+        assert_eq!(applied.hash, genesis_tip.hash);
+        assert_eq!(
+            resumed.chain_tip().load_full().as_deref(),
+            Some(applied.as_ref())
+        );
+        assert_eq!(
+            resumed.utxo().with_stable_view(stable_hash)?,
+            expected_utxo_hash
+        );
+        assert_eq!(resumed.coin_stats().snapshot(), expected_stats);
+        assert!(resumed.blocks().read().is_empty());
+        assert!(resumed.transactions().read().is_empty());
+        assert!(resumed.mempool().read().is_empty());
+
+        let next = mined_regtest_child(genesis.block_hash())?;
+        let next_tip = resumed.apply_block(&next)?;
+        assert_eq!(next_tip.height, 1);
+        assert_eq!(
+            next_tip.hash.to_le_bytes(),
+            next.block_hash().to_byte_array()
+        );
+        let listener_after_apply = resumed.coin_stats().snapshot();
+        let mut rescanned = resumed.utxo().with_stable_view(|view| {
+            bitcoin_rs_coinstats::scan_coin_stats(view, next_tip.height, true)
+        })?;
+        rescanned.tx_count = listener_after_apply.tx_count;
+        assert_ne!(
+            listener_after_apply.total_amount, rescanned.total_amount,
+            "G2-disabled resume must not receive rolling UTXO notifications"
+        );
+        resumed.write_clean_checkpoint()?;
+
+        let root = data_dir.join("chainstate-checkpoints");
+        let current: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("CURRENT"))?)?;
+        let directory = current
+            .get("directory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| std::io::Error::other("CURRENT has no generation directory"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            root.join(directory).join("manifest-v1.json"),
+        )?)?;
+        assert_eq!(manifest["utxo"]["trailer_kind"], "scanned");
+        let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v4.dat"))?;
+        let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
+        let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut snapshot_reader)?;
+        assert_ne!(snapshot.muhash_trailer, [0_u8; 384]);
+        assert_eq!(snapshot.muhash_trailer, rescanned.muhash.finalize());
+        drop(resumed);
+
+        let resumed_again = NodeState::open(reopen_config)?;
+        assert_eq!(resumed_again.resume_source(), ResumeSource::Checkpoint);
+        assert_eq!(resumed_again.coin_stats().snapshot(), rescanned);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_checkpoint_lifecycle_is_backend_neutral() -> anyhow::Result<()> {
+        let backends = vec![
+            #[cfg(feature = "fjall")]
+            "fjall",
+            #[cfg(feature = "rocksdb")]
+            "rocksdb",
+            #[cfg(feature = "redb")]
+            "redb",
+            #[cfg(feature = "mdbx")]
+            "mdbx",
+        ];
+
+        for backend in backends {
+            let dir = tempfile::tempdir()?;
+            let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+            config.data_dir = dir.path().join(backend);
+            config.storage_backend = backend.to_owned();
+            config.p2p_listen.clear();
+            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let state = NodeState::open(config.clone())?;
+            state.apply_block(&genesis)?;
+            state.write_clean_checkpoint()?;
+            drop(state);
+
+            let resumed = NodeState::open(config)?;
+            assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+            resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rolling_coinstats_resume_continues_through_next_block() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node-g2");
+        let samples = dir.path().join("g2.samples");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        config.g2_muhash_samples = Some(samples.clone());
+        config.g2_muhash_tip_height = Some(2);
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        state.apply_block(&genesis)?;
+        let before = state.coin_stats().snapshot();
+        state.write_clean_checkpoint()?;
+        drop(state);
+
+        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
+        reopen_config.data_dir = data_dir;
+        reopen_config.p2p_listen.clear();
+        reopen_config.g2_muhash_samples = Some(samples);
+        reopen_config.g2_muhash_tip_height = Some(2);
+        let resumed = NodeState::open(reopen_config)?;
+        assert_eq!(resumed.coin_stats().snapshot(), before);
+        resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
+        let rolling = resumed.coin_stats().snapshot();
+        let mut scanned = resumed.utxo().with_stable_view(|view| {
+            bitcoin_rs_coinstats::scan_coin_stats(view, rolling.height, true)
+        })?;
+        scanned.tx_count = rolling.tx_count;
+        assert_eq!(rolling, scanned);
+        Ok(())
+    }
+
+    fn mined_regtest_child(prev_blockhash: bitcoin::BlockHash) -> anyhow::Result<bitcoin::Block> {
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 1]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_296_688_603,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .ok_or_else(|| std::io::Error::other("test block has no merkle root"))?;
+        let target = block.header.target();
+        while block.header.validate_pow(target).is_err() {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("test nonce exhausted"))?;
+        }
+        Ok(block)
     }
 }

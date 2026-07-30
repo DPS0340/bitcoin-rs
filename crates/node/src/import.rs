@@ -96,7 +96,8 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("genesis block has no transactions"))?;
         let txid = coinbase.compute_txid();
         let source = crate::block_source::NodeBlockSource::new(state.blocks())
-            .with_block_body_source(state.block_body_source());
+            .with_block_body_source(state.block_body_source())
+            .with_block_tree(state.block_tree());
         let tx_index = state
             .tx_index()
             .ok_or_else(|| anyhow::anyhow!("txindex missing after enabled open"))?;

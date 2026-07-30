@@ -112,6 +112,12 @@ struct PendingBlock {
     estimated_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingTimeoutObservation {
+    peer_addr: SocketAddr,
+    hash: Hash256,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PeerInflight {
     blocks: usize,
@@ -131,6 +137,27 @@ struct StallEpisode {
     /// [`STALL_EPISODE_LOG_AGE`]; see [`DownloadWindow::observe_stall`]).
     info_logged: bool,
 }
+#[derive(Clone, Copy, Debug)]
+enum ColdFrontState {
+    Waiting {
+        owner: SocketAddr,
+        hash: Hash256,
+        since: Instant,
+    },
+    Racing {
+        owner: SocketAddr,
+        alternate: SocketAddr,
+        hash: Hash256,
+    },
+}
+#[derive(Debug)]
+struct PrefixProbe {
+    owner: SocketAddr,
+    hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+    racers: HashMap<SocketAddr, u8>,
+    accepted: u8,
+    started_at: Instant,
+}
 
 /// Episode age at which the one-shot stall-episode observability INFO line is
 /// emitted. Below the 2s conviction floor by design: the line exists to make
@@ -138,6 +165,19 @@ struct StallEpisode {
 /// clearing rule zeroed the clock, and what the front-cadence EWMA (the
 /// threshold's falsifier) was while the episode ran.
 const STALL_EPISODE_LOG_AGE: Duration = Duration::from_secs(1);
+/// Maximum distinct cold-start front blocks hedged before the cadence EWMA
+/// seeds. Two advances are sufficient to produce the first cadence sample.
+const MAX_COLD_FRONT_HEDGES: usize = 2;
+/// One-shot duplicate prefix used to select a responsive deep-window peer.
+const PREFIX_PROBE_BLOCK_LIMIT: usize = 8;
+/// A peer must deliver the first four accepted prefix blocks to win.
+const PREFIX_PROBE_WIN_BLOCKS: usize = 4;
+const _: () = assert!(PREFIX_PROBE_WIN_BLOCKS > 0);
+const _: () = assert!(PREFIX_PROBE_WIN_BLOCKS <= PREFIX_PROBE_BLOCK_LIMIT);
+const _: () = assert!(PREFIX_PROBE_BLOCK_LIMIT <= 8);
+const PREFIX_PROBE_WIN_MASK: u8 = (1_u8 << PREFIX_PROBE_WIN_BLOCKS) - 1;
+/// Estimated duplicate bytes per alternate during the one-shot probe.
+const PREFIX_PROBE_ESTIMATED_BYTES: usize = 2 * 1024 * 1024;
 
 /// Stall-episode clearing reasons, the counter taxonomy for
 /// `node.sync.stall_episodes_cleared{reason}`. Every path that zeroes the
@@ -165,12 +205,10 @@ pub(super) struct DownloadWindow {
     ewma_block_bytes: usize,
     next_request_height: u32,
     next_pending_deadline: Option<Instant>,
-    /// Whether block requests currently fan out across peers. Driven by the
-    /// sync layer's per-tick count of fan-out-eligible peers (KTD6 predicate:
-    /// outbound, witness-serving, header chain above ours, not soft-demoted)
-    /// through [`Self::set_fanout_eligible_peers`]'s one-peer hysteresis.
-    /// Starts disengaged so a fresh window always begins in single-peer
-    /// fallback.
+    /// Eligible outbound witness peers available for new block assignments.
+    /// The count sizes each stripe; engagement keeps one-peer hysteresis so a
+    /// transient demotion does not switch candidate classes mid-window.
+    fanout_eligible_peers: usize,
     fanout_engaged: bool,
     /// Current window-blocked stall observation, if any (R8). Re-derived from
     /// the predicate every [`Self::observe_stall`] call; cleared whenever any
@@ -208,10 +246,26 @@ pub(super) struct DownloadWindow {
     /// When the window front last advanced (a front block arrived); the
     /// anchor for the next `front_interval_ewma_ms` sample.
     last_front_advance: Option<Instant>,
-    /// Peers disconnected for stalling, by fire time. While inside
-    /// `staller_cooldown` such a peer is not fan-out eligible and receives no
-    /// block requests except as the last-resort peer — the re-acquisition
-    /// guard for a staller that immediately reconnects on the same address.
+    /// Cold-start front wait or active duplicate race. Unlike `stall`, this
+    /// needs no staged successors and can never disconnect a peer.
+    cold_front: Option<ColdFrontState>,
+    /// Distinct cold-start front hashes whose duplicate request was sent.
+    cold_hedged_fronts: SmallVec<[Hash256; MAX_COLD_FRONT_HEDGES]>,
+    /// Peer that proved it could deliver a blocked cold front before its
+    /// tracked owner. It receives the replacement deep window.
+    preferred_peer: Option<SocketAddr>,
+    /// One-shot same-prefix race used to select a responsive deep owner
+    /// without assigning unique height holes to alternate peers.
+    prefix_probe: Option<PrefixProbe>,
+    /// Deep owner already tested for the current pending assignment.
+    prefix_probe_attempted_owner: Option<SocketAddr>,
+    /// First observation of an expired front request. Conviction needs a
+    /// second tick so blocks delivered during synchronous apply can drain.
+    pending_timeout_observation: Option<PendingTimeoutObservation>,
+    /// Peers disconnected for stalling or an expired block request, by fire
+    /// time. While inside `staller_cooldown` such a peer is not fan-out
+    /// eligible and receives no block requests except as the last-resort peer.
+    /// This prevents immediate re-acquisition of the same block stripe.
     recent_stallers: HashMap<SocketAddr, Instant>,
 }
 
@@ -235,57 +289,90 @@ impl DownloadWindow {
             ewma_block_bytes: 256 * 1024,
             next_request_height: 1,
             next_pending_deadline: None,
+            fanout_eligible_peers: 0,
             fanout_engaged: false,
             stall: None,
             stall_timeout: budget.stall_timeout_initial,
             front_interval_ewma_ms: None,
             last_front_advance: None,
+            cold_front: None,
+            cold_hedged_fronts: SmallVec::new(),
+            preferred_peer: None,
+            prefix_probe: None,
+            prefix_probe_attempted_owner: None,
+            pending_timeout_observation: None,
             recent_stallers: HashMap::new(),
         }
     }
 
-    /// Records how many peers currently satisfy the fan-out eligibility
-    /// predicate and updates the fan-out engagement with one-peer hysteresis:
-    /// engage at `min_peers_for_fanout`, hold at one below, disengage only
-    /// further down.
+    /// Records the eligible population and updates engagement with one-peer
+    /// hysteresis. Dynamic stripe sizing prevents the old whole-window
+    /// re-concentration when the count dips.
     ///
-    /// The count keeps KTD6's demotion clause (a stalled peer must not count
-    /// toward fan-out), so without hysteresis a single transient soft-demotion
-    /// at the threshold would flap the mode tick-to-tick and re-concentrate
-    /// the whole window on one deep peer mid-stripe. Holding the mode one
-    /// peer below the threshold instead costs at most one undistributed
-    /// stripe (`fanout_peer_inflight` blocks) until the demotion clears or a
-    /// second peer drops out — at which point the drop is structural and the
-    /// single-peer fallback is the right mode.
-    pub(super) fn set_fanout_eligible_peers(&mut self, count: usize) {
-        if count >= self.budget.min_peers_for_fanout {
+    /// Bounded prefix-race-before-fanout handoff: when the eligible count
+    /// reaches the fanout threshold while a prefix probe is active and
+    /// younger than `stall_timeout_initial`, defer only fanout engagement so
+    /// the one-shot race (typically sub-second) can elect a preferred peer
+    /// instead of being cancelled by the engagement. After the probe
+    /// resolves/cancels or the fixed `stall_timeout_initial` interval
+    /// expires, existing hysteresis and immediate prefix-probe cancellation
+    /// behavior resume unchanged. `now` is injected (not read here) so the
+    /// tick/selection path controls the clock; see [`Self::observe_stall`]
+    /// for the same discipline.
+    pub(super) fn set_fanout_eligible_peers(&mut self, count: usize, now: Instant) {
+        let was_engaged = self.fanout_engaged;
+        self.fanout_eligible_peers = count;
+        let would_engage = count >= self.budget.min_peers_for_fanout;
+        // Bound the deferral: while a fresh prefix probe (age <
+        // stall_timeout_initial) is racing, hold fanout disengaged so the
+        // race is not cancelled mid-flight. The probe's elapsed time is
+        // computed from the injected `now` against the probe's
+        // `started_at` (itself an injected `Instant`), never
+        // `Instant::now()`. The bound is a strict less-than: at an elapsed
+        // time exactly equal to `stall_timeout_initial` the probe is no
+        // longer fresh (the race had its full budget), so fanout engages at
+        // the deadline — `<` rather than `<=`. The boundary is pinned by
+        // tests that cross at exactly `stall_timeout_initial`.
+        let probe_young = self.prefix_probe.as_ref().is_some_and(|probe| {
+            now.duration_since(probe.started_at) < self.budget.stall_timeout_initial
+        });
+        let engaging = would_engage && !probe_young;
+        if engaging {
             self.fanout_engaged = true;
         } else if count.saturating_add(1) < self.budget.min_peers_for_fanout {
             self.fanout_engaged = false;
         }
+        if self.fanout_engaged != was_engaged {
+            tracing::info!(
+                eligible = count,
+                fanout_active = self.fanout_active(),
+                min_peers_for_fanout = self.budget.min_peers_for_fanout,
+                "fanout engagement changed"
+            );
+        }
+        if self.fanout_engaged {
+            self.prefix_probe = None;
+        }
     }
 
-    /// Whether block requests fan out across peers (true) or collapse to the
-    /// single-peer deep window (false). Fan-out engages only when enough
-    /// eligible peers exist to fill the window at the shallow per-peer cap
-    /// (with [`Self::set_fanout_eligible_peers`]'s hysteresis); below that
-    /// the per-peer cap reverts to the deep fallback so one healthy peer can
-    /// fill the whole window (no under-fill regression).
+    /// Whether requests use a distributed cap or the one-peer deep fallback.
     pub(super) const fn fanout_active(&self) -> bool {
         self.fanout_engaged
     }
 
-    /// Per-peer in-flight cap for the current mode: the shallow fan-out cap
-    /// (Core's `MAX_BLOCKS_IN_TRANSIT_PER_PEER` shape) when fan-out is active,
-    /// the deep fallback cap otherwise. The fan-out cap never exceeds the
-    /// fallback cap, so injected shallow budgets stay binding in either mode.
-    const fn effective_peer_inflight(&self) -> usize {
-        if self.fanout_active() && self.budget.fanout_peer_inflight < self.budget.max_peer_inflight
-        {
-            self.budget.fanout_peer_inflight
-        } else {
-            self.budget.max_peer_inflight
+    /// Per-peer cap for new assignments. With multiple eligible peers, divide
+    /// the global window across them but never go below Core's 16-block cap.
+    /// One peer retains the deep fallback. Existing over-cap assignments drain
+    /// naturally after the eligible population changes.
+    fn effective_peer_inflight(&self) -> usize {
+        if !self.fanout_active() {
+            return self.budget.max_peer_inflight;
         }
+        self.budget
+            .max_pending_blocks
+            .div_ceil(self.fanout_eligible_peers.max(1))
+            .max(self.budget.fanout_peer_inflight)
+            .min(self.budget.max_peer_inflight)
     }
 
     pub(super) fn pending_len(&self) -> usize {
@@ -462,6 +549,46 @@ impl DownloadWindow {
         })
     }
 
+    /// Observes the lowest expired request and convicts only on a second idle tick.
+    ///
+    /// A block may arrive while synchronous apply is running and wait in the
+    /// inbound channel after its request timestamp expires. The first
+    /// observation records suspicion only. Delivery from that same peer
+    /// clears it; delivery of a retry from another peer does not.
+    pub(super) fn observe_pending_timeout(
+        &mut self,
+        apply_side_busy: bool,
+        now: Instant,
+    ) -> Option<SocketAddr> {
+        if apply_side_busy {
+            self.pending_timeout_observation = None;
+            return None;
+        }
+        if let Some(observation) = self.pending_timeout_observation {
+            self.pending_timeout_observation = None;
+            self.mark_peer_unresponsive(observation.peer_addr, now);
+            return Some(observation.peer_addr);
+        }
+        if self
+            .next_pending_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
+            return None;
+        }
+        self.pending_timeout_observation = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| {
+                now.duration_since(pending.requested_at) >= self.budget.pending_timeout
+            })
+            .min_by_key(|(_, pending)| pending.height)
+            .map(|(hash, pending)| PendingTimeoutObservation {
+                peer_addr: pending.peer_addr,
+                hash: *hash,
+            });
+        None
+    }
+
     /// Advances the window-blocked stall state machine one observation (R8).
     ///
     /// Inputs computed by the sync layer each tick, after the apply drain:
@@ -491,9 +618,6 @@ impl DownloadWindow {
         apply_side_busy: bool,
         now: Instant,
     ) -> Option<SocketAddr> {
-        let staller_cooldown = self.budget.staller_cooldown;
-        self.recent_stallers
-            .retain(|_, fired_at| now.duration_since(*fired_at) < staller_cooldown);
         if apply_side_busy {
             if self.stall.take().is_some() {
                 count_stall_episode_cleared("apply_busy");
@@ -550,12 +674,6 @@ impl DownloadWindow {
                 "block sync: stall episode running"
             );
         }
-        // Cold start: while the front-cadence EWMA has no sample the decay
-        // floor cannot distinguish a slow network from a staller, so
-        // conviction defers to the 60s pending-timeout fallback — the
-        // pre-U7 status quo. The episode above still forms so the stall
-        // stays observable (`stalling_peer`, the stall_seconds gauge); only
-        // the fire is suppressed until the estimate has one real sample.
         self.front_interval_ewma_ms?;
         // The fire threshold (`effective_timeout` above) is the stored
         // adaptive value, never below the ADV-DRIP-1 decay floor: on a
@@ -577,7 +695,7 @@ impl DownloadWindow {
         self.stall_timeout = effective_timeout
             .saturating_mul(2)
             .min(self.budget.stall_timeout_max);
-        self.recent_stallers.insert(peer_addr, now);
+        self.mark_peer_unresponsive(peer_addr, now);
         Some(peer_addr)
     }
 
@@ -676,11 +794,195 @@ impl DownloadWindow {
     pub(super) fn stalling_peer(&self) -> Option<(SocketAddr, Instant)> {
         self.stall.map(|episode| (episode.peer_addr, episode.since))
     }
+    /// Advances the cold-start front timer independently of the strong stall
+    /// predicate. Returns a duplicate request only after the same apply-front
+    /// hash remains pending to one owner for the initial stall timeout.
+    pub(super) fn observe_cold_front(
+        &mut self,
+        next_apply_height: u32,
+        apply_side_busy: bool,
+        now: Instant,
+    ) -> Option<(SocketAddr, Hash256)> {
+        if matches!(self.cold_front, Some(ColdFrontState::Racing { .. })) {
+            return None;
+        }
+        if apply_side_busy
+            || self.front_interval_ewma_ms.is_some()
+            || self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES
+        {
+            self.cold_front = None;
+            return None;
+        }
+        let Some((&hash, pending)) = self
+            .pending
+            .iter()
+            .find(|(_, pending)| pending.height == next_apply_height)
+        else {
+            self.cold_front = None;
+            return None;
+        };
+        match self.cold_front {
+            Some(ColdFrontState::Waiting {
+                owner,
+                hash: waiting_hash,
+                since,
+            }) if owner == pending.peer_addr && waiting_hash == hash => {
+                if now.duration_since(since) >= self.budget.stall_timeout_initial {
+                    Some((owner, hash))
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.cold_front = Some(ColdFrontState::Waiting {
+                    owner: pending.peer_addr,
+                    hash,
+                    since: now,
+                });
+                None
+            }
+        }
+    }
+
+    /// Records a successfully sent cold-front duplicate request.
+    pub(super) fn confirm_cold_front_hedge(
+        &mut self,
+        owner: SocketAddr,
+        alternate: SocketAddr,
+        hash: Hash256,
+    ) {
+        if !matches!(
+            self.cold_front,
+            Some(ColdFrontState::Waiting {
+                owner: waiting_owner,
+                hash: waiting_hash,
+                ..
+            }) if waiting_owner == owner && waiting_hash == hash
+        ) {
+            return;
+        }
+        if !self.cold_hedged_fronts.contains(&hash) {
+            if self.cold_hedged_fronts.len() >= MAX_COLD_FRONT_HEDGES {
+                return;
+            }
+            self.cold_hedged_fronts.push(hash);
+        }
+        self.cold_front = Some(ColdFrontState::Racing {
+            owner,
+            alternate,
+            hash,
+        });
+    }
+
+    /// Preferred deep-window peer after winning a cold-front race.
+    pub(super) const fn preferred_peer(&self) -> Option<SocketAddr> {
+        self.preferred_peer
+    }
+
+    /// Number of eligible peers that activates striped fanout.
+    pub(super) const fn min_peers_for_fanout(&self) -> usize {
+        self.budget.min_peers_for_fanout
+    }
+
+    /// Clears a preferred peer that is no longer serviceable.
+    pub(super) fn clear_preferred_peer(&mut self) {
+        self.preferred_peer = None;
+    }
+    /// Builds the one-shot common-prefix probe after a deep fallback request.
+    pub(super) fn prefix_probe_plan(
+        &self,
+    ) -> Option<(
+        SocketAddr,
+        SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+        u32,
+    )> {
+        if self.preferred_peer.is_some() || self.prefix_probe.is_some() || self.fanout_active() {
+            return None;
+        }
+        let owner = self
+            .pending
+            .values()
+            .min_by_key(|pending| pending.height)?
+            .peer_addr;
+        if self.prefix_probe_attempted_owner == Some(owner)
+            || self
+                .pending
+                .values()
+                .any(|pending| pending.peer_addr != owner)
+        {
+            return None;
+        }
+        let limit =
+            (PREFIX_PROBE_ESTIMATED_BYTES / self.ewma_block_bytes).min(PREFIX_PROBE_BLOCK_LIMIT);
+        if limit < PREFIX_PROBE_WIN_BLOCKS {
+            return None;
+        }
+        let mut ordered: Vec<(u32, Hash256)> = self
+            .pending
+            .iter()
+            .map(|(hash, pending)| (pending.height, *hash))
+            .collect();
+        ordered.sort_unstable_by_key(|(height, _)| *height);
+        let mut hashes = SmallVec::new();
+        let mut expected_height = ordered.first()?.0;
+        for (height, hash) in ordered {
+            if hashes.len() >= limit || height != expected_height {
+                break;
+            }
+            hashes.push(hash);
+            expected_height = expected_height.saturating_add(1);
+        }
+        (hashes.len() >= PREFIX_PROBE_WIN_BLOCKS).then_some((
+            owner,
+            hashes,
+            expected_height.saturating_sub(1),
+        ))
+    }
+
+    /// Starts the prefix race after at least one alternate accepted the probe.
+    pub(super) fn confirm_prefix_probe(
+        &mut self,
+        owner: SocketAddr,
+        hashes: SmallVec<[Hash256; PREFIX_PROBE_BLOCK_LIMIT]>,
+        alternates: &[SocketAddr],
+        now: Instant,
+    ) {
+        if alternates.is_empty() {
+            return;
+        }
+        let valid_plan =
+            self.prefix_probe_plan()
+                .is_some_and(|(planned_owner, planned_hashes, _)| {
+                    planned_owner == owner && planned_hashes == hashes
+                });
+        if !valid_plan {
+            return;
+        }
+        self.prefix_probe_attempted_owner = Some(owner);
+        let mut racers = HashMap::with_capacity(alternates.len().saturating_add(1));
+        racers.insert(owner, 0);
+        racers.extend(alternates.iter().copied().map(|peer| (peer, 0)));
+        self.prefix_probe = Some(PrefixProbe {
+            owner,
+            hashes,
+            racers,
+            accepted: 0,
+            started_at: now,
+        });
+    }
 
     /// Current adaptive stalling threshold (2s doubling to 64s).
     #[cfg(test)]
     pub(super) const fn stall_timeout(&self) -> Duration {
         self.stall_timeout
+    }
+
+    /// Starts the re-acquisition cooldown for an unresponsive peer.
+    pub(super) fn mark_peer_unresponsive(&mut self, peer_addr: SocketAddr, now: Instant) {
+        let cooldown = self.budget.staller_cooldown;
+        self.recent_stallers
+            .retain(|_, fired_at| now.duration_since(*fired_at) < cooldown);
+        self.recent_stallers.insert(peer_addr, now);
     }
 
     /// Whether `peer_addr` was disconnected for stalling within the cooldown.
@@ -702,6 +1004,11 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(super) fn contains_pending(&self, hash: &Hash256) -> bool {
         self.pending.contains_key(hash)
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_prefix_probe_started_at(&self) -> Option<Instant> {
+        self.prefix_probe.as_ref().map(|probe| probe.started_at)
     }
 
     fn pending_deadline(&self, requested_at: Instant) -> Instant {
@@ -730,14 +1037,77 @@ impl DownloadWindow {
 
     pub(super) fn release_disconnected_peers(
         &mut self,
-        mut is_live_peer: impl FnMut(&SocketAddr) -> bool,
+        is_live_peer: impl Fn(&SocketAddr) -> bool,
     ) {
+        let cold_front_live = match self.cold_front {
+            Some(ColdFrontState::Waiting { owner, .. }) => is_live_peer(&owner),
+            Some(ColdFrontState::Racing {
+                owner, alternate, ..
+            }) => is_live_peer(&owner) && is_live_peer(&alternate),
+            None => true,
+        };
+        if !cold_front_live {
+            self.cold_front = None;
+        }
+        if self.preferred_peer.is_some_and(|peer| !is_live_peer(&peer)) {
+            self.preferred_peer = None;
+        }
+        let cancel_probe = if let Some(probe) = self.prefix_probe.as_mut() {
+            probe.racers.retain(|peer, _| is_live_peer(peer));
+            probe.racers.len() < 2
+        } else {
+            false
+        };
+        if cancel_probe {
+            self.prefix_probe = None;
+        }
+        self.retain_peer_assignments(is_live_peer);
+    }
+
+    /// Drops every assignment and attribution fact owned by a replaced
+    /// connection before a new connection may reuse its socket address.
+    pub(super) fn forget_peer(&mut self, peer_addr: SocketAddr) {
+        self.release_peer_assignments(peer_addr);
+        if self.preferred_peer == Some(peer_addr) {
+            self.preferred_peer = None;
+        }
+        if self.prefix_probe_attempted_owner == Some(peer_addr) {
+            self.prefix_probe_attempted_owner = None;
+        }
+        if self.cold_front.is_some_and(|state| match state {
+            ColdFrontState::Waiting { owner, .. } => owner == peer_addr,
+            ColdFrontState::Racing {
+                owner, alternate, ..
+            } => owner == peer_addr || alternate == peer_addr,
+        }) {
+            self.cold_front = None;
+        }
+        if self
+            .prefix_probe
+            .as_ref()
+            .is_some_and(|probe| probe.racers.contains_key(&peer_addr))
+        {
+            self.prefix_probe = None;
+        }
+    }
+
+    fn release_peer_assignments(&mut self, peer_addr: SocketAddr) {
+        self.retain_peer_assignments(|peer| *peer != peer_addr);
+    }
+
+    fn retain_peer_assignments(&mut self, retain_peer: impl Fn(&SocketAddr) -> bool) {
+        if self
+            .pending_timeout_observation
+            .is_some_and(|observation| !retain_peer(&observation.peer_addr))
+        {
+            self.pending_timeout_observation = None;
+        }
         let mut retry_height = self.next_request_height;
         let mut removed_earliest_deadline = false;
         let pending_timeout = self.budget.pending_timeout;
         let next_pending_deadline = self.next_pending_deadline;
         self.pending.retain(|_hash, pending| {
-            if is_live_peer(&pending.peer_addr) {
+            if retain_peer(&pending.peer_addr) {
                 return true;
             }
             retry_height = retry_height.min(pending.height);
@@ -752,7 +1122,7 @@ impl DownloadWindow {
             false
         });
         self.peer_inflight
-            .retain(|peer, _inflight| is_live_peer(peer));
+            .retain(|peer, _inflight| retain_peer(peer));
         if removed_earliest_deadline {
             self.refresh_next_pending_deadline();
         }
@@ -952,7 +1322,96 @@ impl DownloadWindow {
         non_empty_request(peer_addr, entries, next_request_height)
     }
 
+    fn record_prefix_probe_delivery(
+        &mut self,
+        hash: Hash256,
+        delivery_peer: Option<SocketAddr>,
+        now: Instant,
+    ) {
+        let Some(mut probe) = self.prefix_probe.take() else {
+            return;
+        };
+        let Some(index) = probe.hashes.iter().position(|candidate| *candidate == hash) else {
+            self.prefix_probe = Some(probe);
+            return;
+        };
+        let Ok(shift) = u32::try_from(index) else {
+            self.prefix_probe = Some(probe);
+            return;
+        };
+        let bit = 1_u8 << shift;
+        probe.accepted |= bit;
+        if let Some(progress) = delivery_peer.and_then(|peer| probe.racers.get_mut(&peer)) {
+            *progress |= bit;
+        }
+        let win_mask = PREFIX_PROBE_WIN_MASK;
+        let winner = probe
+            .racers
+            .iter()
+            .find_map(|(peer, progress)| ((*progress & win_mask) == win_mask).then_some(*peer));
+        let Some(winner) = winner else {
+            if probe.accepted & win_mask != win_mask {
+                self.prefix_probe = Some(probe);
+            }
+            return;
+        };
+        let owner = probe.owner;
+        self.cold_front = None;
+        self.pending_timeout_observation = None;
+        self.retain_peer_assignments(|peer| *peer == winner || !probe.racers.contains_key(peer));
+        if winner != owner {
+            self.mark_peer_unresponsive(owner, now);
+        }
+        self.preferred_peer = Some(winner);
+        tracing::info!(
+            owner = %owner,
+            winner = %winner,
+            winner_is_owner = winner == owner,
+            blocks = probe.hashes.len(),
+            elapsed_ms = u64::try_from(now.duration_since(probe.started_at).as_millis()).unwrap_or(u64::MAX),
+            "block sync: prefix probe elected winner"
+        );
+        metrics::counter!("node.sync.prefix_probe_wins").increment(1);
+    }
+
+    fn resolve_cold_front_delivery(
+        &mut self,
+        hash: Hash256,
+        delivery_peer: Option<SocketAddr>,
+        now: Instant,
+    ) {
+        let Some(state) = self.cold_front else {
+            return;
+        };
+        match state {
+            ColdFrontState::Waiting {
+                hash: waiting_hash, ..
+            } if waiting_hash == hash => {
+                self.cold_front = None;
+            }
+            ColdFrontState::Racing {
+                owner,
+                alternate,
+                hash: racing_hash,
+            } if racing_hash == hash => {
+                self.cold_front = None;
+                if delivery_peer != Some(alternate) {
+                    return;
+                }
+                self.prefix_probe = None;
+                self.release_peer_assignments(owner);
+                self.mark_peer_unresponsive(owner, now);
+                self.preferred_peer = Some(alternate);
+                metrics::counter!("node.sync.cold_front_wins").increment(1);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn mark_requested(&mut self, request: &PeerRequest, now: Instant) -> bool {
+        if self.pending.is_empty() && !request.entries.is_empty() {
+            self.prefix_probe_attempted_owner = None;
+        }
         let estimated_bytes = self.ewma_block_bytes;
         let inflight = self.peer_inflight.entry(request.peer_addr).or_default();
         for entry in &request.entries {
@@ -978,9 +1437,28 @@ impl DownloadWindow {
         self.has_request_capacity()
     }
 
-    pub(super) fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
-        let (height, needs_height_lookup) = if let Some(pending) = self.remove_pending(&hash) {
-            self.record_delivery_progress(pending.peer_addr, hash, pending.height, now);
+    pub(super) fn mark_received_from(
+        &mut self,
+        hash: Hash256,
+        bytes: usize,
+        source_peer: Option<SocketAddr>,
+        now: Instant,
+    ) -> bool {
+        let pending = self.remove_pending(&hash);
+        // A local injection releases the request but cannot establish that the
+        // requested peer delivered anything.
+        let delivery_peer = source_peer;
+        if self.pending_timeout_observation.is_some_and(|observation| {
+            observation.hash == hash && Some(observation.peer_addr) == delivery_peer
+        }) {
+            self.pending_timeout_observation = None;
+        }
+        self.resolve_cold_front_delivery(hash, delivery_peer, now);
+        self.record_prefix_probe_delivery(hash, delivery_peer, now);
+        let (height, needs_height_lookup) = if let Some(pending) = pending {
+            if let Some(peer_addr) = delivery_peer {
+                self.record_delivery_progress(peer_addr, hash, pending.height, now);
+            }
             (pending.height, false)
         } else {
             (0, true)
@@ -997,6 +1475,24 @@ impl DownloadWindow {
             / 8;
         self.ewma_block_bytes = self.ewma_block_bytes.max(80);
         needs_height_lookup
+    }
+
+    /// Test-only shorthand for delivery by the pending owner.
+    #[cfg(test)]
+    pub(super) fn mark_received(&mut self, hash: Hash256, bytes: usize, now: Instant) -> bool {
+        let source_peer = self.pending.get(&hash).map(|pending| pending.peer_addr);
+        self.mark_received_from(hash, bytes, source_peer, now)
+    }
+
+    /// Credits a duplicate after the first copy was already staged.
+    ///
+    /// The first copy owns all byte, EWMA, cold-front and probe accounting.
+    pub(super) fn credit_duplicate_delivery(&mut self, hash: Hash256, source_peer: SocketAddr) {
+        if self.pending_timeout_observation.is_some_and(|observation| {
+            observation.hash == hash && observation.peer_addr == source_peer
+        }) {
+            self.pending_timeout_observation = None;
+        }
     }
 
     /// Delivery progress for the stall state machine, charged per peer
@@ -1277,6 +1773,82 @@ mod tests {
     }
 
     #[test]
+    fn pending_timeout_waits_for_second_delivery_drain() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let block_hash = hash(0x90);
+        window.pending.insert(
+            block_hash,
+            super::PendingBlock {
+                peer_addr,
+                requested_at,
+                height: 1,
+                estimated_bytes: 80,
+            },
+        );
+        window.next_pending_deadline = Some(observed_at);
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        window.mark_received(block_hash, 80, observed_at);
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
+    }
+
+    #[test]
+    fn pending_timeout_apply_busy_clears_suspicion_without_blame() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let peer_addr = staller_addr();
+        insert_pending(&mut window, peer_addr, hash(0x92), 1, requested_at);
+
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        assert!(window.pending_timeout_observation.is_some());
+        assert_eq!(window.observe_pending_timeout(true, observed_at), None);
+        assert!(window.pending_timeout_observation.is_none());
+        assert!(!window.peer_in_staller_cooldown(peer_addr, observed_at));
+    }
+
+    #[test]
+    fn retry_delivery_does_not_clear_original_peer_timeout() {
+        let mut window = DownloadWindow::new(SyncBudget {
+            pending_timeout: Duration::from_secs(10),
+            ..test_budget()
+        });
+        let requested_at = Instant::now();
+        let observed_at = requested_at + Duration::from_secs(10);
+        let original_peer = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let retry_peer = std::net::SocketAddr::from(([127, 0, 0, 2], 8333));
+        let block_hash = hash(0x91);
+        window.pending.insert(
+            block_hash,
+            super::PendingBlock {
+                peer_addr: original_peer,
+                requested_at,
+                height: 1,
+                estimated_bytes: 80,
+            },
+        );
+        window.next_pending_deadline = Some(observed_at);
+
+        assert_eq!(window.observe_pending_timeout(false, observed_at), None);
+        window.mark_received_from(block_hash, 80, Some(retry_peer), observed_at);
+        assert_eq!(
+            window.observe_pending_timeout(false, observed_at),
+            Some(original_peer)
+        );
+        assert!(window.peer_in_staller_cooldown(original_peer, observed_at));
+        assert!(!window.peer_in_staller_cooldown(retry_peer, observed_at));
+    }
+
+    #[test]
     fn default_budget_keeps_full_request_window_for_large_blocks() {
         let mut window = DownloadWindow::new(crate::sync::default_sync_budget());
         window.ewma_block_bytes = 2 * 1024 * 1024;
@@ -1450,13 +2022,13 @@ mod tests {
 
         // Below the threshold: single-peer deep window — one peer can take
         // the full 128, so only one peer needs scanning.
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
         assert_eq!(window.request_peer_scan_limit(now), 1);
 
         // At the threshold: shallow per-peer cap engages and the scan fans
         // out to enough peers to fill the window (128 / 16 = 8).
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
         assert_eq!(window.request_peer_scan_limit(now), 8);
     }
@@ -1559,27 +2131,28 @@ mod tests {
             min_peers_for_fanout: 8,
             ..test_budget()
         });
+        let now = Instant::now();
 
         // Fresh window: disengaged until the threshold is reached.
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
 
         // One transient demotion at the threshold must not flap the mode.
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
 
         // A second peer dropping out is structural: disengage, and stay
         // disengaged at one-below until the full threshold returns.
-        window.set_fanout_eligible_peers(6);
+        window.set_fanout_eligible_peers(6, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(7);
+        window.set_fanout_eligible_peers(7, now);
         assert!(!window.fanout_active());
-        window.set_fanout_eligible_peers(8);
+        window.set_fanout_eligible_peers(8, now);
         assert!(window.fanout_active());
     }
 
@@ -2276,8 +2849,7 @@ mod tests {
 
         assert_eq!(window.observe_stall(1, false, now), None);
         assert_eq!(info_logged(&window), Some(false));
-        // The episode ages far past every threshold: the INFO latch flips at
-        // 1s, but cold-start suppression keeps the fire from ever happening.
+        // The INFO latch flips at 1s, but an unseeded window never convicts.
         assert_eq!(
             window.observe_stall(1, false, now + Duration::from_secs(1)),
             None
@@ -2716,13 +3288,9 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_unseeded_ewma_never_fires_and_defers_to_fallback() {
-        // Cold-start suppression: while the front-cadence EWMA has no sample
-        // the decay floor cannot distinguish a slow network from a staller,
-        // so `observe_stall` never convicts — conviction belongs to the 60s
-        // pending-timeout fallback (the pre-U7 status quo) until the
-        // estimate seeds. The episode still forms: the stall must stay
-        // observable (gauge / `stalling_peer`) even while unconvictable.
+    fn cold_start_hedges_front_without_convicting_owner() {
+        // Cold recovery is independent of the strong staged-successor stall
+        // predicate. It races only the unchanged apply-front hash.
         let t0 = Instant::now();
         let mut window = DownloadWindow::new(stall_budget());
         insert_pending(&mut window, staller_addr(), hash(0x01), 1, t0);
@@ -2732,27 +3300,30 @@ mod tests {
         }
         assert_eq!(window.front_interval_ewma_ms(), None);
 
-        assert_eq!(window.observe_stall(1, false, t0), None);
-        assert_eq!(window.stalling_peer(), Some((staller_addr(), t0)));
-        // Well past `stall_timeout_initial` (2s) — pre-fix this convicted.
+        assert_eq!(window.observe_cold_front(1, false, t0), None);
         assert_eq!(
-            window.observe_stall(1, false, t0 + Duration::from_secs(2)),
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), healthy_addr(), hash(0x01));
+        assert_eq!(
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(30)),
             None
         );
-        assert_eq!(
-            window.observe_stall(1, false, t0 + Duration::from_secs(30)),
-            None,
-            "an unseeded window must defer conviction to the pending-timeout fallback"
-        );
-        assert_eq!(window.stalling_peer(), Some((staller_addr(), t0)));
         assert_eq!(window.stall_timeout(), Duration::from_secs(2));
         assert!(!window.peer_in_staller_cooldown(staller_addr(), t0 + Duration::from_secs(30)));
 
-        // The wedge resolves (the front finally arrives — first advance,
-        // anchor only) and a later front advance 3s after it seeds the EWMA:
-        // the cadence estimate now exists and conviction re-arms.
+        // The alternate wins the duplicate race. Only this delivery proof
+        // demotes the tracked owner and selects the replacement deep peer.
         let t1 = t0 + Duration::from_secs(30);
-        window.mark_received(hash(0x01), 80, t1);
+        window.pending_timeout_observation = Some(super::PendingTimeoutObservation {
+            peer_addr: staller_addr(),
+            hash: hash(0x01),
+        });
+        window.mark_received_from(hash(0x01), 80, Some(healthy_addr()), t1);
+        assert_eq!(window.preferred_peer(), Some(healthy_addr()));
+        assert!(window.peer_in_staller_cooldown(staller_addr(), t1));
+        assert!(window.pending_timeout_observation.is_none());
         assert_eq!(window.front_interval_ewma_ms(), None);
         for byte in [0x01_u8, 0x02, 0x03, 0x04] {
             window.mark_received_applied(&hash(byte));
@@ -2782,6 +3353,427 @@ mod tests {
             Some(silent),
             "a seeded window must convict a true staller at the effective threshold"
         );
+    }
+
+    #[test]
+    fn disconnected_alternate_rearms_same_cold_front() {
+        let t0 = Instant::now();
+        let mut window = DownloadWindow::new(stall_budget());
+        insert_pending(&mut window, staller_addr(), hash(0x01), 1, t0);
+        assert_eq!(window.observe_cold_front(1, false, t0), None);
+        assert_eq!(
+            window.observe_cold_front(1, false, t0 + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), healthy_addr(), hash(0x01));
+
+        window.release_disconnected_peers(|peer| *peer != healthy_addr());
+        let retry_started = t0 + Duration::from_secs(3);
+        assert_eq!(window.observe_cold_front(1, false, retry_started), None);
+        assert_eq!(
+            window.observe_cold_front(1, false, retry_started + Duration::from_secs(2)),
+            Some((staller_addr(), hash(0x01)))
+        );
+        window.confirm_cold_front_hedge(staller_addr(), peer_addr(2), hash(0x01));
+        assert!(matches!(
+            window.cold_front,
+            Some(super::ColdFrontState::Racing { alternate, .. }) if alternate == peer_addr(2)
+        ));
+    }
+
+    #[test]
+    fn cold_front_distinct_hedge_cap_blocks_another_probe() {
+        let now = Instant::now();
+        let mut window = DownloadWindow::new(stall_budget());
+        window.cold_hedged_fronts.extend([hash(0x01), hash(0x02)]);
+        insert_pending(&mut window, staller_addr(), hash(0x03), 3, now);
+
+        assert_eq!(
+            window.observe_cold_front(3, false, now + Duration::from_secs(2)),
+            None
+        );
+        assert!(window.cold_front.is_none());
+        assert_eq!(
+            window.cold_hedged_fronts.len(),
+            super::MAX_COLD_FRONT_HEDGES
+        );
+    }
+
+    #[test]
+    fn mixed_prefix_sources_do_not_elect_a_winner() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let first = healthy_addr();
+        let second = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[first, second], now);
+
+        for (byte, source) in [(1_u8, first), (2, second), (3, first), (4, second)] {
+            window.mark_received_from(hash(byte), 80, Some(source), now);
+        }
+
+        assert_eq!(window.preferred_peer(), None);
+        assert!(
+            window.prefix_probe_plan().is_none(),
+            "an inconclusive race must not probe the remaining suffix"
+        );
+        assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_probe_respects_estimated_byte_cutoff() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+
+        window.ewma_block_bytes = 512 * 1024 + 1;
+        assert!(window.prefix_probe_plan().is_none());
+        window.ewma_block_bytes = 512 * 1024;
+        let (_, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("cutoff-sized probe must be planned"))?;
+        assert_eq!(hashes.len(), super::PREFIX_PROBE_WIN_BLOCKS);
+        Ok(())
+    }
+
+    /// Direct window-boundary test for the bounded prefix-race-before-fanout
+    /// handoff: fanout cancels the probe at exactly `stall_timeout_initial`,
+    /// neither before nor after. The exact cross-tick boundary is pinned in
+    /// `sync::tests::tick_fanout_deferred_for_fresh_probe_engages_at_deadline`.
+
+    #[test]
+    fn fanout_cancels_prefix_probe_without_rearming_it() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let budget = SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        };
+        // Direct window-boundary pin: the deferral must expire at exactly
+        // `stall_timeout_initial`, not one tick beyond it. With the production
+        // `<` operator, an elapsed time equal to the budget makes the probe
+        // no longer fresh, so fanout engages at the deadline and clears the
+        // probe. Flipping the operator to `<=` would keep the probe young at
+        // the deadline and this assertion would fail (fanout stays deferred).
+        // The exact cross-tick boundary is tested in
+        // `sync::tests::tick_fanout_deferred_for_fresh_probe_engages_at_deadline`.
+        let stall_timeout_initial = budget.stall_timeout_initial;
+        let mut window = DownloadWindow::new(budget);
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, terminal_height) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        assert_eq!(terminal_height, 8);
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
+        assert!(window.prefix_probe.is_some());
+        // At exactly the `stall_timeout_initial` deadline (direct
+        // window-boundary): the bounded deferral expires, fanout engages, and
+        // the probe is cleared exactly as before the deferral existed.
+        let now = now + stall_timeout_initial;
+
+        window.set_fanout_eligible_peers(2, now);
+
+        assert!(window.prefix_probe.is_none());
+        window.set_fanout_eligible_peers(0, now);
+        assert!(window.prefix_probe_plan().is_none());
+        Ok(())
+    }
+
+    /// A fanout threshold transition during a fresh prefix probe retains the
+    /// probe and keeps fanout inactive: the bounded deferral holds engagement
+    /// while the one-shot race (age < `stall_timeout_initial`) is still in
+    /// flight, instead of cancelling it.
+    #[test]
+    fn fanout_threshold_during_fresh_probe_defers_engagement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let mut window = DownloadWindow::new(SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        });
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
+        assert!(window.prefix_probe.is_some());
+
+        // The eligible count reaches the fanout threshold while the probe is
+        // still younger than stall_timeout_initial (2s): fanout engagement is
+        // deferred and the probe survives.
+        window.set_fanout_eligible_peers(2, now);
+
+        assert!(
+            !window.fanout_active(),
+            "fanout must stay deferred for a fresh probe"
+        );
+        assert!(
+            window.prefix_probe.is_some(),
+            "a fresh prefix probe must survive the threshold transition"
+        );
+        Ok(())
+    }
+
+    /// A probe cancellation before the deferral deadline lets fanout engage
+    /// immediately on the next evaluation, with no leftover deferral state.
+    /// A healthy preferred winner remains selected only while the eligible
+    /// population is below the fanout threshold. A cancellation clears the
+    /// probe without setting a preferred peer, so the next threshold
+    /// evaluation must not be held by a deferral for a probe that no longer
+    /// exists.
+    ///
+    /// The test first proves the deferral itself: with a fresh live probe it
+    /// crosses the fanout threshold and asserts fanout stays off and the
+    /// probe survives. Only then does it cancel the probe and prove the next
+    /// threshold evaluation engages immediately — so the immediate-engagement
+    /// assertion is meaningful (the deferral was actually holding).
+    #[test]
+    fn probe_resolution_before_deadline_allows_fanout_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let mut window = DownloadWindow::new(SyncBudget {
+            min_peers_for_fanout: 2,
+            ..stall_budget()
+        });
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[alternate], now);
+        assert!(window.prefix_probe.is_some());
+
+        // First prove the deferral holds: cross the fanout threshold while
+        // the probe is fresh (age 0 < stall_timeout_initial). Fanout must stay
+        // off and the probe must survive — this is the guarded transition.
+        window.set_fanout_eligible_peers(2, now);
+        assert!(
+            !window.fanout_active(),
+            "a fresh live probe must defer the threshold transition"
+        );
+        assert!(
+            window.prefix_probe.is_some(),
+            "a fresh live probe must survive the threshold transition"
+        );
+
+        // The alternate disconnects before the deadline, dropping racers
+        // below two and cancelling the probe — without electing a winner or
+        // setting a preferred peer.
+        window.release_disconnected_peers(|peer| *peer != alternate);
+        assert!(window.prefix_probe.is_none(), "the probe must be cancelled");
+        assert!(
+            window.preferred_peer().is_none(),
+            "cancellation must not elect a winner"
+        );
+
+        // With the probe gone, the next threshold evaluation engages fanout
+        // immediately — the young-probe guard no longer holds and no
+        // deferral state lingers.
+        window.set_fanout_eligible_peers(2, now);
+        assert!(
+            window.fanout_active(),
+            "fanout must engage once the probe is cancelled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disconnected_prefix_racer_queued_deliveries_cannot_win()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let disconnected = healthy_addr();
+        let live_alternate = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[disconnected, live_alternate], now);
+        window.release_disconnected_peers(|peer| *peer != disconnected);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(disconnected), now);
+        }
+
+        assert_eq!(window.preferred_peer(), None);
+        assert!(window.prefix_probe.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn late_prefix_loser_cannot_replace_winner() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let winner = healthy_addr();
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        let loser = peer_addr(2);
+        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser], now);
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(winner), now);
+        }
+        assert_eq!(window.preferred_peer(), Some(winner));
+        window.mark_received_from(hash(5), 80, Some(owner), now);
+        assert_eq!(window.preferred_peer(), Some(winner));
+        window.release_disconnected_peers(|peer| *peer != winner);
+        assert_eq!(window.preferred_peer(), None);
+        assert!(!window.peer_in_staller_cooldown(loser, now));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_owner_win_keeps_unrelated_peer_requests() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let loser = healthy_addr();
+        let unrelated = peer_addr(2);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[loser], now);
+        insert_pending(&mut window, unrelated, hash(9), 9, now);
+        insert_pending(&mut window, loser, hash(10), 10, now);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(owner), now);
+        }
+
+        assert_eq!(window.preferred_peer(), Some(owner));
+        assert!(window.contains_pending(&hash(9)));
+        assert!(window.peer_inflight.contains_key(&owner));
+        assert!(window.peer_inflight.contains_key(&unrelated));
+        assert!(!window.contains_pending(&hash(10)));
+        assert!(!window.peer_inflight.contains_key(&loser));
+        assert!(!window.peer_in_staller_cooldown(owner, now));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_alternate_win_releases_only_probe_losers() -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let winner = healthy_addr();
+        let loser = peer_addr(2);
+        let unrelated = peer_addr(3);
+        let mut window = DownloadWindow::new(stall_budget());
+        for height in 1..=8_u8 {
+            insert_pending(&mut window, owner, hash(height), u32::from(height), now);
+        }
+        let (planned_owner, hashes, _) = window
+            .prefix_probe_plan()
+            .ok_or_else(|| std::io::Error::other("missing probe plan"))?;
+        window.confirm_prefix_probe(planned_owner, hashes, &[winner, loser], now);
+        insert_pending(&mut window, unrelated, hash(9), 9, now);
+        insert_pending(&mut window, loser, hash(10), 10, now);
+
+        for byte in 1..=4_u8 {
+            window.mark_received_from(hash(byte), 80, Some(winner), now);
+        }
+
+        assert_eq!(window.preferred_peer(), Some(winner));
+        for byte in 5..=8_u8 {
+            assert!(!window.contains_pending(&hash(byte)));
+        }
+        assert!(window.contains_pending(&hash(9)));
+        assert!(!window.contains_pending(&hash(10)));
+        assert!(!window.peer_inflight.contains_key(&owner));
+        assert!(!window.peer_inflight.contains_key(&loser));
+        assert!(window.peer_inflight.contains_key(&unrelated));
+        assert_eq!(window.next_request_height, 1);
+        assert!(window.next_pending_deadline.is_some());
+        assert!(window.peer_in_staller_cooldown(owner, now));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cold_hedge_confirmation_after_forget_does_not_blame_replacement() {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let alternate = healthy_addr();
+        let front = hash(0x51);
+        let mut window = DownloadWindow::new(stall_budget());
+        insert_pending(&mut window, owner, front, 1, now);
+        assert_eq!(window.observe_cold_front(1, false, now), None);
+
+        window.forget_peer(owner);
+        window.confirm_cold_front_hedge(owner, alternate, front);
+        window.mark_received_from(front, 80, Some(alternate), now);
+
+        assert!(window.cold_front.is_none());
+        assert!(window.cold_hedged_fronts.is_empty());
+        assert_eq!(window.preferred_peer(), None);
+        assert!(!window.peer_in_staller_cooldown(owner, now));
+    }
+
+    #[test]
+    fn stale_prefix_confirmation_after_forget_does_not_install_probe_or_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = Instant::now();
+        let owner = staller_addr();
+        let mut window = DownloadWindow::new(test_budget());
+        let win_blocks = u8::try_from(super::PREFIX_PROBE_WIN_BLOCKS)?;
+        for byte in 1..=win_blocks {
+            insert_pending(&mut window, owner, hash(byte), u32::from(byte), now);
+        }
+        let (planned_owner, hashes, _) = window.prefix_probe_plan().ok_or_else(|| {
+            std::io::Error::other("contiguous owner should produce a prefix plan")
+        })?;
+        window.forget_peer(owner);
+        window.confirm_prefix_probe(planned_owner, hashes, &[healthy_addr()], now);
+
+        assert!(window.prefix_probe.is_none());
+        assert!(window.prefix_probe_attempted_owner.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn forget_peer_clears_connection_state_but_preserves_staller_cooldown() {
+        let mut window = DownloadWindow::new(test_budget());
+        let peer_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 8333));
+        let now = Instant::now();
+        window
+            .peer_inflight
+            .insert(peer_addr, super::PeerInflight::default());
+        window.preferred_peer = Some(peer_addr);
+        window.mark_peer_unresponsive(peer_addr, now);
+
+        window.forget_peer(peer_addr);
+
+        assert!(!window.peer_inflight.contains_key(&peer_addr));
+        assert!(window.preferred_peer.is_none());
+        assert!(window.peer_in_staller_cooldown(peer_addr, now));
     }
 
     fn test_budget() -> SyncBudget {

@@ -928,3 +928,303 @@ fn duplicate_remove_does_not_fast_delete_unspent_vout() -> Result<(), Box<dyn st
     assert_eq!(set.len(), 1);
     Ok(())
 }
+#[test]
+fn height_u32_max_with_both_coinbase_states_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let live_txid = txid(800);
+    let first = OutPoint::new(live_txid, 0);
+    let second = OutPoint::new(live_txid, 1);
+    let first_txout = txout(800);
+    let second_txout = txout(801);
+
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(first, first_txout.clone(), true, u32::MAX));
+    changes.add(UtxoAdd::new(second, second_txout.clone(), false, u32::MAX));
+    set.commit_block(&changes, &txid(802))?;
+
+    let entry1 = set.get_entry(&first).ok_or("expected first entry")?;
+    assert_eq!(entry1.txout, first_txout);
+    assert!(entry1.coinbase);
+    assert_eq!(entry1.height, u32::MAX);
+
+    let entry2 = set.get_entry(&second).ok_or("expected second entry")?;
+    assert_eq!(entry2.txout, second_txout);
+    assert!(!entry2.coinbase);
+    assert_eq!(entry2.height, u32::MAX);
+
+    let scan = set.scan_script_pubkeys(std::slice::from_ref(&first_txout.script_pubkey))?;
+    assert_eq!(scan.unspents.len(), 1);
+    assert_eq!(scan.unspents[0].height, u32::MAX);
+    assert!(scan.unspents[0].coinbase);
+    Ok(())
+}
+
+#[test]
+fn vout_u32_max_roundtrips_and_spends() -> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let live_txid = txid(810);
+    let max_vout_op = OutPoint::new(live_txid, u32::MAX);
+    let txout_val = txout(810);
+
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(max_vout_op, txout_val.clone(), false, 500));
+    set.commit_block(&changes, &txid(811))?;
+
+    assert_eq!(set.get(&max_vout_op), Some(txout_val.clone()));
+    let entry = set
+        .get_entry(&max_vout_op)
+        .ok_or("expected live max vout")?;
+    assert_eq!(entry.txout, txout_val);
+    assert_eq!(entry.height, 500);
+    assert!(set.has_live_outputs_for_txid(&live_txid));
+
+    let mut spend = BlockChanges::default();
+    spend.remove(max_vout_op);
+    set.commit_block(&spend, &txid(812))?;
+
+    assert_eq!(set.get(&max_vout_op), None);
+    assert!(!set.has_live_outputs_for_txid(&live_txid));
+    assert_eq!(set.record_count(), 0);
+    assert_eq!(set.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn zero_and_unequal_script_lengths_roundtrip_and_scan() -> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let live_txid = txid(820);
+
+    let script_empty = ScriptBuf::new();
+    let script_1b = ScriptBuf::from_bytes(vec![0x51]);
+    let script_34b = ScriptBuf::from_bytes(vec![0x00; 34]);
+    let script_520b = ScriptBuf::from_bytes(vec![0x51; 520]);
+    let script_10kb = ScriptBuf::from_bytes(vec![0x52; 10_000]);
+
+    let txout_empty = TxOut {
+        value: Amount::from_sat(100),
+        script_pubkey: script_empty.clone(),
+    };
+    let txout_1b = TxOut {
+        value: Amount::from_sat(200),
+        script_pubkey: script_1b,
+    };
+    let txout_34b = TxOut {
+        value: Amount::from_sat(300),
+        script_pubkey: script_34b,
+    };
+    let txout_520b = TxOut {
+        value: Amount::from_sat(400),
+        script_pubkey: script_520b,
+    };
+    let txout_10kb = TxOut {
+        value: Amount::from_sat(500),
+        script_pubkey: script_10kb.clone(),
+    };
+
+    let op0 = OutPoint::new(live_txid, 0);
+    let op1 = OutPoint::new(live_txid, 1);
+    let op2 = OutPoint::new(live_txid, 2);
+    let op3 = OutPoint::new(live_txid, 3);
+    let op4 = OutPoint::new(live_txid, 4);
+
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(op0, txout_empty.clone(), false, 10));
+    changes.add(UtxoAdd::new(op1, txout_1b.clone(), true, 11));
+    changes.add(UtxoAdd::new(op2, txout_34b.clone(), false, 12));
+    changes.add(UtxoAdd::new(op3, txout_520b.clone(), true, 13));
+    changes.add(UtxoAdd::new(op4, txout_10kb.clone(), false, 14));
+    set.commit_block(&changes, &txid(821))?;
+
+    assert_eq!(set.get(&op0), Some(txout_empty.clone()));
+    assert_eq!(set.get(&op1), Some(txout_1b.clone()));
+    assert_eq!(set.get(&op2), Some(txout_34b.clone()));
+    assert_eq!(set.get(&op3), Some(txout_520b.clone()));
+    assert_eq!(set.get(&op4), Some(txout_10kb.clone()));
+
+    let scan_empty = set.scan_script_pubkeys(&[script_empty])?;
+    assert_eq!(scan_empty.unspents.len(), 1);
+    assert_eq!(scan_empty.unspents[0].outpoint, op0);
+
+    let scan_10k = set.scan_script_pubkeys(&[script_10kb])?;
+    assert_eq!(scan_10k.unspents.len(), 1);
+    assert_eq!(scan_10k.unspents[0].outpoint, op4);
+
+    let entries = vec![
+        (op0, txout_empty, false, 10),
+        (op1, txout_1b, true, 11),
+        (op2, txout_34b, false, 12),
+        (op3, txout_520b, true, 13),
+        (op4, txout_10kb, false, 14),
+    ];
+    let expected_hash = expected_hash_serialized_3(&entries)?;
+    assert_eq!(hash_serialized_3(&set)?, expected_hash);
+    Ok(())
+}
+
+#[test]
+fn owned_commit_repeated_same_vout_overwrite_in_single_run()
+-> Result<(), Box<dyn std::error::Error>> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut set = UtxoSet::new();
+    set.set_listener(Box::new(RecordingListener {
+        events: Arc::clone(&events),
+    }));
+    let live_txid = txid(830);
+    let op = OutPoint::new(live_txid, 0);
+
+    let txout1 = txout(830);
+    let txout2 = txout(831);
+    let txout3 = txout(832);
+
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(op, txout1, false, 100));
+    changes.add(UtxoAdd::new(op, txout2, true, 101));
+    changes.add(UtxoAdd::new(op, txout3.clone(), false, 102));
+    set.commit_block(&changes, &txid(831))?;
+
+    assert_eq!(set.get(&op), Some(txout3.clone()));
+    let entry = set.get_entry(&op).ok_or("expected live output")?;
+    assert_eq!(entry.txout, txout3);
+    assert!(!entry.coinbase);
+    assert_eq!(entry.height, 102);
+
+    assert_eq!(set.record_count(), 1);
+    assert_eq!(set.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn multi_shard_invalid_add_preserves_commit_rejection_atomicity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let shard0_op = OutPoint::new(txid_in_shard(0, 100), 0);
+    let shard1_op = OutPoint::new(txid_in_shard(1, 100), 0);
+    let shard0_txout = txout(100);
+    let shard1_txout = txout(101);
+
+    let mut initial = BlockChanges::default();
+    initial.add(UtxoAdd::new(shard0_op, shard0_txout.clone(), false, 10));
+    initial.add(UtxoAdd::new(shard1_op, shard1_txout.clone(), false, 10));
+    set.commit_block(&initial, &txid(102))?;
+
+    let mut invalid_changes = BlockChanges::default();
+    invalid_changes.remove(shard0_op);
+    invalid_changes.add(UtxoAdd::new(
+        OutPoint::new(txid_in_shard(0, 101), 0),
+        txout(102),
+        false,
+        11,
+    ));
+    invalid_changes.add(UtxoAdd::new(
+        OutPoint::new(txid_in_shard(1, 101), 0),
+        TxOut {
+            value: Amount::from_sat(103),
+            script_pubkey: ScriptBuf::from_bytes(vec![0; usize::from(u16::MAX) + 1]),
+        },
+        false,
+        11,
+    ));
+
+    let err = match set.commit_block(&invalid_changes, &txid(103)) {
+        Ok(()) => return Err("expected ScriptTooLarge error".into()),
+        Err(e) => e,
+    };
+    assert!(matches!(err, UtxoError::ScriptTooLarge { len } if len == usize::from(u16::MAX) + 1));
+
+    // Verify rejection atomicity across shards
+    assert_eq!(set.get(&shard0_op), Some(shard0_txout));
+    assert_eq!(set.get(&shard1_op), Some(shard1_txout));
+    assert_eq!(set.get(&OutPoint::new(txid_in_shard(0, 101), 0)), None);
+    assert_eq!(set.get(&OutPoint::new(txid_in_shard(1, 101), 0)), None);
+    assert_eq!(set.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn hash_serialized_3_matches_independent_core_serialization_for_edge_cases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let op1 = OutPoint::new(txid(840), 0);
+    let op2 = OutPoint::new(txid(841), u32::MAX);
+    let op3 = OutPoint::new(txid(842), 64);
+
+    let txout1 = TxOut {
+        value: Amount::from_sat(0),
+        script_pubkey: ScriptBuf::new(),
+    };
+    let txout2 = TxOut {
+        value: Amount::from_sat(u64::MAX),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51; 520]),
+    };
+    let txout3 = TxOut {
+        value: Amount::from_sat(12_345),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+    };
+
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(op1, txout1.clone(), true, u32::MAX));
+    changes.add(UtxoAdd::new(op2, txout2.clone(), false, u32::MAX));
+    changes.add(UtxoAdd::new(op3, txout3.clone(), true, 0));
+    set.commit_block(&changes, &txid(843))?;
+
+    let entries = vec![
+        (op1, txout1, true, u32::MAX),
+        (op2, txout2, false, u32::MAX),
+        (op3, txout3, true, 0),
+    ];
+    let expected = expected_hash_serialized_3(&entries)?;
+    assert_eq!(hash_serialized_3(&set)?, expected);
+    Ok(())
+}
+
+#[test]
+fn listener_multi_shard_remove_before_insert_ordering_trace()
+-> Result<(), Box<dyn std::error::Error>> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut set = UtxoSet::new();
+    set.set_listener(Box::new(RecordingListener {
+        events: Arc::clone(&events),
+    }));
+
+    let op_shard0_old = OutPoint::new(txid_in_shard(0, 500), 0);
+    let op_shard1_old = OutPoint::new(txid_in_shard(1, 500), 0);
+    let op_shard0_new = OutPoint::new(txid_in_shard(0, 501), 1);
+    let op_shard1_new = OutPoint::new(txid_in_shard(1, 501), 1);
+
+    let mut initial = BlockChanges::default();
+    initial.add(UtxoAdd::new(op_shard0_old, txout(500), false, 1));
+    initial.add(UtxoAdd::new(op_shard1_old, txout(501), false, 1));
+    set.commit_block(&initial, &txid(502))?;
+    events.lock().clear();
+
+    let mut mixed = BlockChanges::default();
+    mixed.remove(op_shard0_old);
+    mixed.remove(op_shard1_old);
+    mixed.add(UtxoAdd::new(op_shard0_new, txout(502), false, 2));
+    mixed.add(UtxoAdd::new(op_shard1_new, txout(503), false, 2));
+    set.commit_block(&mixed, &txid(504))?;
+
+    let recorded = events.lock().clone();
+    let remove_0_idx = recorded.iter().position(|e| e == &ListenerEvent::Remove(0));
+    let insert_batch_indices: Vec<_> = recorded
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            ListenerEvent::InsertBatch(_) | ListenerEvent::Insert(_) => Some(i),
+            ListenerEvent::Remove(_) => None,
+        })
+        .collect();
+
+    assert!(remove_0_idx.is_some(), "expected remove event for vout 0");
+    assert!(!insert_batch_indices.is_empty(), "expected insert event(s)");
+    if let Some(first_insert) = insert_batch_indices.first() {
+        if let Some(r0) = remove_0_idx {
+            assert!(r0 < *first_insert, "remove must precede inserts");
+        }
+    }
+    assert_eq!(set.get(&op_shard0_old), None);
+    assert_eq!(set.get(&op_shard1_old), None);
+    assert_eq!(set.get(&op_shard0_new), Some(txout(502)));
+    assert_eq!(set.get(&op_shard1_new), Some(txout(503)));
+    Ok(())
+}
