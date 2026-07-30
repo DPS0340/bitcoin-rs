@@ -1,0 +1,129 @@
+{
+  "assume_valid_height": 642000,
+  "bitcoin_cli": "bitcoin-cli",
+  "bitcoin_cli_args": [],
+  "block_bytes": 291475980916,
+  "block_count": 642001,
+  "block_source": "legacy-fjall-chainstate",
+  "blockfilterindex": false,
+  "blocks_per_second": 65.25556968411264,
+  "data_dir": "/home/alpha/bench-g14/rs-spendable-local-nobody-a014",
+  "decode_seconds": 1112.344593023,
+  "elapsed_seconds": 9838.256000335,
+  "fetch_seconds": 2.789232627,
+  "git_head": "9ce0727ced19644e551d1eac7895993fe43a7db6",
+  "measurement_target": "mainnet-prefix-replay",
+  "rest_url": null,
+  "rss_high_water_bytes": 7330131968,
+  "schema": "mainnet-prefix-replay-v1",
+  "source_chainstate": "/home/alpha/bench-g14/rs-thin-final-20260727/chainstate",
+  "stage_seconds": [
+    {
+      "count": 642001,
+      "stage": "node.apply_block.total_seconds",
+      "sum_seconds": 8059.159316124981
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.block_rules_seconds",
+      "sum_seconds": 2039.3014868940388
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.script_verify_seconds",
+      "sum_seconds": 1943.2414133509953
+    },
+    {
+      "count": 485284,
+      "stage": "node.apply_block.script_verify_serial_overlay_seconds",
+      "sum_seconds": 1928.596317897989
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.coinbase_maturity_seconds",
+      "sum_seconds": 1020.5662368230198
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.utxo_commit_seconds",
+      "sum_seconds": 516.3519315530074
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.utxo_changes_seconds",
+      "sum_seconds": 153.32236281100242
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.bip68_seconds",
+      "sum_seconds": 60.704907881001034
+    },
+    {
+      "count": 67761,
+      "stage": "node.apply_block.script_verify_parallel_seconds",
+      "sum_seconds": 14.639741829999988
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.bip30_bip34_seconds",
+      "sum_seconds": 4.441684902000147
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.block_tree_insert_seconds",
+      "sum_seconds": 3.910462024999979
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.block_record_seconds",
+      "sum_seconds": 2.3286623749999795
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.pow_self_consistency_seconds",
+      "sum_seconds": 1.0346224329999223
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.pow_limit_continuity_seconds",
+      "sum_seconds": 0.16112257000002833
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.coin_stats_finish_seconds",
+      "sum_seconds": 0.1146286260000087
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.mempool_evict_seconds",
+      "sum_seconds": 0.06560732200001153
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.block_body_persist_seconds",
+      "sum_seconds": 0.039601792999996284
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.filter_index_seconds",
+      "sum_seconds": 0.024322936999914984
+    },
+    {
+      "count": 642001,
+      "stage": "node.apply_block.tx_index_ingest_seconds",
+      "sum_seconds": 0.00790762599996381
+    },
+    {
+      "count": 88956,
+      "stage": "node.apply_block.script_verify_coinbase_only_seconds",
+      "sum_seconds": 0.005353623000000225
+    }
+  ],
+  "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+  "start_height": 0,
+  "stop_hash": "00000000000000000008d02622c7a1b96735ed23bbbcdeb2d9fd04d2e4c71a73",
+  "stop_height": 642000,
+  "storage_backend": "fjall",
+  "tx_count": 554786295,
+  "txindex": false
+}

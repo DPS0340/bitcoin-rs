@@ -1,0 +1,143 @@
+{
+  "assume_valid_height": 0,
+  "bitcoin_cli": "bitcoin-cli",
+  "bitcoin_cli_args": [],
+  "block_bytes": 687984205,
+  "block_count": 150001,
+  "block_source": "bitcoin-cli",
+  "blockfilterindex": false,
+  "blocks_per_second": 1550.6835049918768,
+  "data_dir": "/home/alpha/bench-g14/rs-parprep-current-candidate-r2",
+  "decode_seconds": 2.407282162,
+  "elapsed_seconds": 96.732182626,
+  "fetch_seconds": 0.828116771,
+  "git_head": "9ce0727ced19644e551d1eac7895993fe43a7db6",
+  "measurement_target": "mainnet-prefix-replay",
+  "rest_url": null,
+  "rss_high_water_bytes": 323145728,
+  "schema": "mainnet-prefix-replay-v1",
+  "stage_seconds": [
+    {
+      "count": 150001,
+      "stage": "node.apply_block.total_seconds",
+      "sum_seconds": 91.9682967469997
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.script_verify_seconds",
+      "sum_seconds": 63.885183343999266
+    },
+    {
+      "count": 67891,
+      "stage": "node.apply_block.script_parallel_seconds",
+      "sum_seconds": 47.51026043799994
+    },
+    {
+      "count": 23883,
+      "stage": "node.apply_block.script_verify_serial_overlay_seconds",
+      "sum_seconds": 35.02858236799989
+    },
+    {
+      "count": 44008,
+      "stage": "node.apply_block.script_verify_parallel_seconds",
+      "sum_seconds": 28.854060556000043
+    },
+    {
+      "count": 67891,
+      "stage": "node.apply_block.script_prepare_seconds",
+      "sum_seconds": 10.500164023000002
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.utxo_commit_seconds",
+      "sum_seconds": 4.511884360000024
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.block_body_persist_seconds",
+      "sum_seconds": 4.481973903000005
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.block_rules_seconds",
+      "sum_seconds": 3.785610447999989
+    },
+    {
+      "count": 67891,
+      "stage": "node.apply_block.script_resolution_seconds",
+      "sum_seconds": 2.643067947000027
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.coinbase_maturity_seconds",
+      "sum_seconds": 1.5670060759999969
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.bip30_bip34_seconds",
+      "sum_seconds": 0.5460412000000004
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.block_tree_insert_seconds",
+      "sum_seconds": 0.48337798199999515
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.utxo_changes_seconds",
+      "sum_seconds": 0.4317700860000012
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.block_record_seconds",
+      "sum_seconds": 0.2578473729999959
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.pow_self_consistency_seconds",
+      "sum_seconds": 0.21510853200000582
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.pow_limit_continuity_seconds",
+      "sum_seconds": 0.016593728000000765
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.coin_stats_finish_seconds",
+      "sum_seconds": 0.00825527999999868
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.mempool_evict_seconds",
+      "sum_seconds": 0.007420944000000361
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.bip68_seconds",
+      "sum_seconds": 0.004973045000000162
+    },
+    {
+      "count": 82110,
+      "stage": "node.apply_block.script_verify_coinbase_only_seconds",
+      "sum_seconds": 0.002540420000000228
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.tx_index_ingest_seconds",
+      "sum_seconds": 0.001990643000000897
+    },
+    {
+      "count": 150001,
+      "stage": "node.apply_block.filter_index_seconds",
+      "sum_seconds": 0.0019376150000010887
+    }
+  ],
+  "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+  "start_height": 0,
+  "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+  "stop_height": 150000,
+  "storage_backend": "fjall",
+  "tx_count": 1718407,
+  "txindex": false
+}
