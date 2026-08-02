@@ -14,11 +14,15 @@ use crate::{
     tip::TipSnapshot,
 };
 
+#[path = "active_index.rs"]
+mod active_index;
+use active_index::ActiveHeightIndex;
+
 /// In-memory block tree keyed by compact slab ids and header hashes.
 pub struct BlockTree {
     nodes: Slab<BlockTreeNode>,
     by_hash: HashTable<NodeId>,
-    active_by_height: Vec<NodeId>,
+    active_by_height: ActiveHeightIndex,
     tip: Arc<ArcSwapOption<TipSnapshot>>,
     bip9_cache: Bip9Cache,
 }
@@ -30,7 +34,7 @@ impl BlockTree {
         Self {
             nodes: Slab::new(),
             by_hash: HashTable::new(),
-            active_by_height: Vec::new(),
+            active_by_height: ActiveHeightIndex::new(),
             tip: Arc::new(ArcSwapOption::empty()),
             bip9_cache: Bip9Cache::new(),
         }
@@ -63,10 +67,10 @@ impl BlockTree {
     pub fn node_mut(&mut self, id: NodeId) -> Result<&mut BlockTreeNode, ChainError> {
         let is_indexed_active_node = {
             let node = self.node(id)?;
-            active_node_id_at_height(&self.active_by_height, node.height) == Some(id)
+            self.active_by_height.contains_at_height(node.height, id)
         };
         if is_indexed_active_node {
-            self.active_by_height.clear();
+            self.active_by_height.taint(); // BEFORE yielding mut
         }
         self.node_mut_without_index_invalidation(id)
     }
@@ -298,7 +302,8 @@ impl BlockTree {
         let mut locator = Vec::with_capacity(max_entries.min(32));
 
         if max_entries > 0
-            && self.active_by_height.last().copied() == Some(tip_id)
+            && self.active_by_height.is_trusted()
+            && self.active_by_height.last() == Some(tip_id)
             && let Ok(tip) = self.node(tip_id)
         {
             let mut target_height = tip.height;
@@ -306,8 +311,7 @@ impl BlockTree {
             let mut indexed = true;
 
             while locator.len() < max_entries {
-                let Some(node_id) = active_node_id_at_height(&self.active_by_height, target_height)
-                else {
+                let Some(node_id) = self.active_by_height.get(target_height) else {
                     indexed = false;
                     break;
                 };
@@ -329,10 +333,7 @@ impl BlockTree {
                     matches!(
                         (
                             node.parent,
-                            active_node_id_at_height(
-                                &self.active_by_height,
-                                target_height - 1,
-                            ),
+                            self.active_by_height.get(target_height - 1),
                         ),
                         (Some(parent), Some(expected)) if parent == expected
                     )
@@ -342,8 +343,7 @@ impl BlockTree {
                     break;
                 }
                 if let Some(child_height) = target_height.checked_add(1)
-                    && let Some(child_id) =
-                        active_node_id_at_height(&self.active_by_height, child_height)
+                    && let Some(child_id) = self.active_by_height.get(child_height)
                 {
                     let Ok(child) = self.node(child_id) else {
                         indexed = false;
@@ -410,8 +410,8 @@ impl BlockTree {
     /// `None` instead of hanging.
     #[must_use]
     pub fn node_at_height_from(&self, start_id: NodeId, target_height: u32) -> Option<NodeId> {
-        if self.active_by_height.last().copied() == Some(start_id) {
-            return active_node_id_at_height(&self.active_by_height, target_height);
+        if self.active_by_height.is_trusted() && self.active_by_height.last() == Some(start_id) {
+            return self.active_by_height.get(target_height);
         }
 
         let Ok(start_node) = self.node(start_id) else {
@@ -661,30 +661,31 @@ impl BlockTree {
 
     fn refresh_active_height_index(&mut self, tip_id: NodeId) {
         let Ok(tip) = self.node(tip_id) else {
-            self.active_by_height.clear();
+            self.active_by_height.clear_tainted();
             return;
         };
         let tip_parent = tip.parent;
         let tip_height = tip.height;
 
         if let Some(parent) = tip_parent
-            && self.active_by_height.last().copied() == Some(parent)
-            && u32::try_from(self.active_by_height.len()).ok() == Some(tip_height)
+            && self
+                .active_by_height
+                .extend_validated(parent, tip_height, tip_id)
         {
-            self.active_by_height.push(tip_id);
             return;
         }
 
+        // Full rebuild into temporary Vec (do not mutate live index mid-validation)
         let mut rebuilt = Vec::new();
         let mut cursor = Some(tip_id);
         let mut seen: hashbrown::HashSet<NodeId> = hashbrown::HashSet::new();
         while let Some(id) = cursor {
             if !seen.insert(id) {
-                self.active_by_height.clear();
+                self.active_by_height.clear_tainted();
                 return;
             }
             let Ok(node) = self.node(id) else {
-                self.active_by_height.clear();
+                self.active_by_height.clear_tainted();
                 return;
             };
             let parent = node.parent;
@@ -695,16 +696,16 @@ impl BlockTree {
 
         for (offset, id) in rebuilt.iter().enumerate() {
             let Ok(node) = self.node(*id) else {
-                self.active_by_height.clear();
+                self.active_by_height.clear_tainted();
                 return;
             };
             if usize::try_from(node.height).ok() != Some(offset) {
-                self.active_by_height.clear();
+                self.active_by_height.clear_tainted();
                 return;
             }
         }
 
-        self.active_by_height = rebuilt;
+        self.active_by_height.commit_validated_rebuild(rebuilt);
     }
 }
 
@@ -732,11 +733,6 @@ fn node_hash_key(nodes: &Slab<BlockTreeNode>, id: NodeId) -> u64 {
         .map_or(0, |node| hash_table_key(node.hash))
 }
 
-fn active_node_id_at_height(active_by_height: &[NodeId], height: u32) -> Option<NodeId> {
-    let index = usize::try_from(height).ok()?;
-    active_by_height.get(index).copied()
-}
-
 fn work_from_header(header: &BlockHeader) -> ChainWork {
     ChainWork::from_be_bytes(header.work().to_be_bytes())
 }
@@ -753,7 +749,7 @@ mod tests {
 
     use super::{BlockTree, Hash256, hash_from_header};
     use crate::{
-        node::{ChainWork, NodeStatus},
+        node::{ChainWork, NodeId, NodeStatus},
         tip::TipSnapshot,
     };
 
@@ -834,15 +830,19 @@ mod tests {
             tree.insert_node(Some(genesis_id), fork_child, NodeStatus::HeaderValid)?;
         let fork_hash = tree.node(fork_child_id)?.hash;
 
-        assert_eq!(tree.active_by_height.last().copied(), Some(main_tip_id));
-        assert_eq!(tree.active_by_height.get(1).copied(), Some(main_child_id));
+        assert_eq!(tree.active_by_height.last(), Some(main_tip_id));
+        assert_eq!(tree.active_by_height.get(1), Some(main_child_id));
 
         // Corrupt the height-1 index slot to the same-height fork node while
         // leaving the tip slot intact so the indexed path is still attempted.
-        tree.active_by_height[1] = fork_child_id;
+        // Seam taints first; trust gate then forces parent-walk for both locators.
+        assert!(
+            tree.active_by_height
+                .replace_slot_for_test(1, fork_child_id)
+        );
 
         let corrupted_locator = tree.block_locator(main_tip_id, 32);
-        tree.active_by_height.clear();
+        tree.active_by_height.taint();
         let parent_walk_locator = tree.block_locator(main_tip_id, 32);
 
         assert_eq!(corrupted_locator, parent_walk_locator);
@@ -855,6 +855,108 @@ mod tests {
                 tree.node(genesis_id)?.hash,
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn block_locator_rejects_coherent_side_fork_index_substitution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let mut tip_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let mut main_ids = vec![tip_id];
+
+        for height in 1..=40_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let header = test_header(parent_hash, height);
+            tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+            main_ids.push(tip_id);
+        }
+
+        // Side branch from main[18] at heights 19..=26; must not become tip.
+        let mut side_parent_id = main_ids[18];
+        let mut side_parent_hash =
+            BlockHash::from_byte_array(tree.node(side_parent_id)?.hash.to_le_bytes());
+        let mut side_ids = Vec::new();
+        let mut side_hashes = Vec::new();
+        for height in 19..=26_u32 {
+            let header = test_header(side_parent_hash, height.wrapping_add(1000));
+            let side_id =
+                tree.insert_node(Some(side_parent_id), header, NodeStatus::HeaderValid)?;
+            side_ids.push(side_id);
+            side_hashes.push(tree.node(side_id)?.hash);
+            side_parent_id = side_id;
+            side_parent_hash = BlockHash::from_byte_array(tree.node(side_id)?.hash.to_le_bytes());
+        }
+
+        assert_eq!(tree.tip_id(), Some(main_ids[40]));
+        assert!(tree.active_by_height.is_trusted());
+
+        for (offset, side_id) in side_ids.iter().enumerate() {
+            let height = 19 + offset as u32;
+            assert!(
+                tree.active_by_height
+                    .replace_slot_for_test(height, *side_id)
+            );
+        }
+        assert!(tree.active_by_height.is_tainted_for_test());
+
+        // Local neighborhood coherence at h=24 would pass the old adjacency guard.
+        let i24 = tree.active_by_height.get(24).expect("corrupted slot 24");
+        let i23 = tree.active_by_height.get(23).expect("corrupted slot 23");
+        let i25 = tree.active_by_height.get(25).expect("corrupted slot 25");
+        assert_eq!(tree.node(i24)?.height, 24);
+        assert_eq!(tree.node(i24)?.parent, Some(i23));
+        assert_eq!(tree.node(i25)?.parent, Some(i24));
+
+        for (offset, &side_id) in side_ids.iter().enumerate() {
+            let height = 19 + offset as u32;
+            assert_eq!(tree.node(side_id)?.height, height);
+            if height == 19 {
+                assert_eq!(tree.node(side_id)?.parent, Some(main_ids[18]));
+            } else {
+                assert_eq!(tree.node(side_id)?.parent, Some(side_ids[offset - 1]));
+            }
+        }
+
+        let expected = parent_walk_locator_schedule(&tree, main_ids[40], 32);
+        assert_eq!(tree.block_locator(main_ids[40], 32), expected);
+        for side_hash in &side_hashes {
+            assert!(!expected.contains(side_hash));
+            assert!(!tree.block_locator(main_ids[40], 32).contains(side_hash));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn node_at_height_from_ignores_tainted_index_slot() -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let mut tip_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let mut main_ids = vec![tip_id];
+
+        for height in 1..=40_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let header = test_header(parent_hash, height);
+            tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+            main_ids.push(tip_id);
+        }
+
+        let side_header = test_header(
+            BlockHash::from_byte_array(tree.node(main_ids[18])?.hash.to_le_bytes()),
+            1019,
+        );
+        let side_id = tree.insert_node(Some(main_ids[18]), side_header, NodeStatus::HeaderValid)?;
+
+        // Height 19 is not in the tip-40 locator sample set (40..30,28,24,16,0).
+        assert!(tree.active_by_height.replace_slot_for_test(19, side_id));
+        assert!(tree.active_by_height.is_tainted_for_test());
+
+        assert_eq!(
+            tree.node_at_height_from(main_ids[40], 19),
+            Some(main_ids[19])
+        );
+        assert_ne!(tree.node_at_height_from(main_ids[40], 19), Some(side_id));
         Ok(())
     }
 
@@ -917,7 +1019,7 @@ mod tests {
         }
 
         let indexed = tree.block_locator(tip_id, 32);
-        tree.active_by_height.clear();
+        tree.active_by_height.taint();
         let walked = tree.block_locator(tip_id, 32);
         assert_eq!(indexed, walked);
 
@@ -1499,7 +1601,7 @@ mod tests {
         let c = tree.insert_node(Some(b), c_header, NodeStatus::HeaderValid)?;
 
         assert_eq!(tree.tip_id(), Some(c));
-        assert!(tree.active_by_height.is_empty());
+        assert!(tree.active_by_height.is_empty_for_test());
         Ok(())
     }
 
@@ -1529,7 +1631,7 @@ mod tests {
         let d = tree.insert_node(Some(c), d_header, NodeStatus::HeaderValid)?;
 
         assert_eq!(tree.tip_id(), Some(d));
-        assert!(tree.active_by_height.is_empty());
+        assert!(tree.active_by_height.is_empty_for_test());
         Ok(())
     }
 
@@ -1559,12 +1661,51 @@ mod tests {
         let d = tree.insert_node(Some(c), d_header, NodeStatus::HeaderValid)?;
 
         assert_eq!(tree.tip_id(), Some(d));
-        assert!(tree.active_by_height.is_empty());
+        assert!(tree.active_by_height.is_empty_for_test());
         assert!(
             tree.active_node_at_height(1)
                 .is_none_or(|node| node.height == 1)
         );
         Ok(())
+    }
+
+    /// Independent parent-walk locator using the production exponential schedule.
+    /// Used so expected locators are not tautological with a tainted `block_locator`.
+    fn parent_walk_locator_schedule(
+        tree: &BlockTree,
+        tip_id: NodeId,
+        max_entries: usize,
+    ) -> Vec<Hash256> {
+        let mut locator = Vec::with_capacity(max_entries.min(32));
+        let mut current = tip_id;
+        let mut step: u64 = 1;
+        while locator.len() < max_entries {
+            let Ok(node) = tree.node(current) else {
+                break;
+            };
+            locator.push(node.hash);
+
+            let mut walker = current;
+            let mut walked = false;
+            for _ in 0..step {
+                let Ok(walker_node) = tree.node(walker) else {
+                    break;
+                };
+                let Some(parent) = walker_node.parent else {
+                    break;
+                };
+                walker = parent;
+                walked = true;
+            }
+            if !walked {
+                break;
+            }
+            current = walker;
+            if locator.len() >= 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+        locator
     }
 
     fn test_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
