@@ -64,36 +64,30 @@ verification loop immediately after the dup-input check routes each **non-taproo
 `bitcoinconsensus` (libbitcoinconsensus — Bitcoin Core's *own* extracted script-verification engine).
 The feature is on by default (`crates/consensus/Cargo.toml:15`, `default = ["bitcoinconsensus"]`) and the
 call site is gated by `#[cfg(feature = "bitcoinconsensus")]` (`verify_tx.rs:202`). The `seen` set holds
-only a handful of outpoints per transaction, so its container choice cannot move a path whose time is
-spent inside an external C verifier call. Worse, at tiny N (a few elements), `HashSet`'s allocation plus
+only a handful of outpoints per transaction, so swapping its container for a small N set without profiling
+adds overhead rather than leverage. Worse, at tiny N (a few elements), `HashSet`'s allocation plus
 hashing constant-factor costs *more* than `BTreeSet`'s. Pure downside.
 
 ## Guidance
 
-**The default non-taproot script-verification path is not where a speed advantage over Core can live,
-because it is literally Bitcoin Core's code.** With the shipping default (`bitcoinconsensus`),
-**non-taproot** per-input script verification is delegated to Core's own extracted C engine (taproot
-inputs run bitcoin-rs's Rust `Interpreter` instead — see Scope above). That C path is byte-identical to
-Core *and* essentially equal-speed to Core — you are calling the same compiled engine. No amount of
-Rust-side container or allocator tuning around that call changes the wall-clock, because the time is
-spent inside the C call, not in the surrounding Rust.
+**Non-taproot script evaluation delegates to `bitcoinconsensus`; this narrows likely Rust-side leverage but does not rule out a measured cache hit or wrapper/data-preparation win.** With the shipping default (`bitcoinconsensus`), **non-taproot** per-input script verification is delegated to Core's own extracted C engine (taproot inputs run bitcoin-rs's Rust `Interpreter` instead — see Scope below). Delegating script evaluation to `bitcoinconsensus` means execution runs C code, but Rust wrapper overhead, data-preparation structures, or caching can still impact total execution time. Any proposed optimization on this path must measure actual hit rates, caching potential, or wrapper costs rather than assuming zero headroom or guaranteed speedup.
 
 > Scope — non-taproot only: on the default build the per-input routing is **split**. Non-taproot inputs
 > go to the `bitcoinconsensus` C engine (`verify_tx.rs:203`, then `continue`); taproot (P2TR) inputs fall
-> through to bitcoin-rs's own Rust `Interpreter` (`verify_tx.rs:215`) *even on the default build*. The
-> "you cannot beat Core here" claim therefore applies to the **non-taproot** path — which is exactly what
-> the regression evidence exercises (the bench script is OP_1, non-taproot). The taproot path is Rust and
+> through to bitcoin-rs's own Rust `Interpreter` (`verify_tx.rs:215`) *even on the default build*. Delegating
+> non-taproot script evaluation to `bitcoinconsensus` narrows likely Rust-side leverage on that path — which is
+> what the regression evidence exercises (the bench script is OP_1, non-taproot). The taproot path is Rust and
 > carries its own optimization story; see the parallel Rust validation path.
 
 Concretely:
 
-- **Do not micro-optimize Rust data structures that sit on either side of the `bitcoinconsensus` call.**
-  The `seen` duplicate-input set, input/output vector container choices, and similar small-N collections
-  in `verify_tx` are not the bottleneck and cannot become one on the default path.
-- **Genuine speed advantage over Core must come from non-script paths:** the UTXO cache (hit rate,
-  eviction, layout), parallelism and commit batching, block download (multi-peer, bandwidth-bound), and
-  the storage engine (the four `KvStore` backends). These are the paths where bitcoin-rs owns the
-  implementation and Core does not get a vote.
+- **Do not micro-optimize small-N Rust data structures adjacent to `bitcoinconsensus` without profiling.**
+  The `seen` duplicate-input set and similar small-N collections in `verify_tx` are small enough that unprofiled
+  container swaps often add hashing or allocation overhead without delivering measurable wins.
+- **Profile non-script and wrapper paths alongside script execution:** the UTXO cache (hit rate,
+  eviction, layout), parallelism and commit batching, block download (multi-peer, bandwidth-bound),
+  storage backends, and wrapper/data-preparation overhead. Measure actual hit rates or wrapper costs before
+  accepting or rejecting Rust-side changes.
 - **Process discipline that would have caught this before the edit:** (a) define the success metric and
   comparison harness *before* micro-optimizing; (b) profile to learn where time actually goes before
   picking what to change; (c) benchmark a candidate *before* editing dependencies or containers; (d)
@@ -103,12 +97,7 @@ Concretely:
 
 This is the load-bearing strategic corollary, and it generalizes beyond one benchmark:
 
-**You cannot out-optimize a competitor on a path where you run the competitor's own code.** Because the
-default non-taproot path *is* Core's extracted engine, that share of script verification is a fixed cost
-shared with the thing you are trying to beat. Effort spent there has a hard ceiling of "tie," and a
-realistic outcome of "regression" once you add Rust-side wrapper overhead. Recognizing this redirects all
-optimization budget to the paths where bitcoin-rs has architectural freedom — UTXO cache, parallel
-commit batching, download, storage — which are the only places a win is even *possible*.
+**Delegating non-taproot script evaluation to `bitcoinconsensus` narrows likely Rust-side leverage, but does not rule out a measured cache hit or wrapper/data-preparation win.** While core script execution runs in C, surrounding Rust wrappers, container choices, and caching layers can still affect overall performance. Unprofiled micro-optimizations risk adding wrapper overhead or allocation costs (as shown by the `BTreeSet`-to-`HashSet` regression), whereas measured caching or data-preparation wins remain possible. Work on this path requires empirical profiling and benchmarking of actual hit rates and wrapper overhead before drawing conclusions.
 
 It also reinforces a pattern that already shows up in this codebase: **optimize the actual bottleneck,
 not the convenient one.** The sibling doc
@@ -124,8 +113,8 @@ first, find the rate-limiting stage, and spend there.
   `bitcoinconsensus` call — stop and confirm the path is not dominated by the external C verifier.
 - When the optimization target is small-N (a handful of elements): question whether a hash-based
   container beats an ordered or array one at all; constant factors and allocation often lose at tiny N.
-- When proposing "faster than Core" work: verify the path is one where bitcoin-rs actually owns the
-  implementation (UTXO cache, parallelism, download, storage) — not one delegated to `bitcoinconsensus`.
+- When proposing "faster than Core" work on non-taproot script paths: profile and benchmark actual hit rates,
+  caching potential, or wrapper costs rather than assuming automatic speedup or absolute limits.
 - Whenever you are tempted to edit a dependency or swap a container without a baseline benchmark and a
   profile — the prerequisite is the measurement, not the edit.
 - When a candidate change shows a statistically significant regression: revert immediately; do not enter
@@ -163,15 +152,15 @@ if !seen.insert(input.previous_output) {
 | Baseline (HEAD)  | `BTreeSet`            | 3.6312 ms | —                      | —                  |
 | Experiment       | `hashbrown::HashSet`  | 3.7297 ms | **+2.7% (regression)** | p<0.05 significant |
 
-The `seen` set holds only a few outpoints per tx; per-input time is spent inside the `bitcoinconsensus`
-C call. The container swap added `HashSet` allocation plus hashing constant-factor at tiny N on top of a
-path it cannot influence — pure downside. Outcome: reverted.
+The `seen` set holds only a handful of outpoints per tx; the container swap added `HashSet` allocation
+plus hashing constant-factor at tiny N without delivering a measured cache or data-preparation win —
+producing a net +2.7% regression. Outcome: reverted.
 
 ## Related
 
 - `multi-peer-block-download-requires-core-stalling-disconnect.md` — sibling instance of the same
   "optimize the actual bottleneck / know which paths have headroom" principle. That doc covers the
   **download/scheduler** path (the lever that *does* move IBD wall time); this one covers the
-  **default script-verify** path (no Rust headroom — it is Core's own C via the default
-  `bitcoinconsensus` feature). See its guidance point 1, which makes the identical argument for the
-  apply/UTXO/wire path.
+  **default script-verify** path (delegated to `bitcoinconsensus` — narrows likely Rust leverage,
+  requiring empirical measurement of cache hit rates and wrapper costs). See its guidance point 1,
+  which makes the identical argument for the apply/UTXO/wire path.
