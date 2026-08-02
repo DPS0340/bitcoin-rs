@@ -57,7 +57,24 @@ impl BlockTree {
     }
 
     /// Returns a mutable node by id.
+    ///
+    /// Invalidates the active-height index when callers mutate an indexed node,
+    /// because they can change its parent or height.
     pub fn node_mut(&mut self, id: NodeId) -> Result<&mut BlockTreeNode, ChainError> {
+        let is_indexed_active_node = {
+            let node = self.node(id)?;
+            active_node_id_at_height(&self.active_by_height, node.height) == Some(id)
+        };
+        if is_indexed_active_node {
+            self.active_by_height.clear();
+        }
+        self.node_mut_without_index_invalidation(id)
+    }
+
+    fn node_mut_without_index_invalidation(
+        &mut self,
+        id: NodeId,
+    ) -> Result<&mut BlockTreeNode, ChainError> {
         let Some(index) = id.index() else {
             return Err(ChainError::UnknownNode { id });
         };
@@ -311,6 +328,10 @@ impl BlockTree {
     /// Walks backward from `start_id` via parent pointers to the node at
     /// `target_height`. Returns the `NodeId` at that height, or None if
     /// `target_height > start_id.height` or the chain is broken.
+    ///
+    /// Parent heights must strictly decrease on the fallback walk. A cycle or
+    /// other public height/parent mutation that violates that bound returns
+    /// `None` instead of hanging.
     #[must_use]
     pub fn node_at_height_from(&self, start_id: NodeId, target_height: u32) -> Option<NodeId> {
         if self.active_by_height.last().copied() == Some(start_id) {
@@ -328,16 +349,21 @@ impl BlockTree {
         }
 
         let mut cursor = start_id;
+        let mut prev_height = start_node.height;
         loop {
             let Ok(node) = self.node(cursor) else {
                 return None;
             };
+            if cursor != start_id && node.height >= prev_height {
+                return None;
+            }
             if node.height == target_height {
                 return Some(cursor);
             }
             if node.height < target_height {
                 return None;
             }
+            prev_height = node.height;
             let parent = node.parent?;
             cursor = parent;
         }
@@ -542,9 +568,10 @@ impl BlockTree {
         if let Some(old_tip) = self.tip.load_full()
             && old_tip.tip_id != node_id
         {
-            self.node_mut(old_tip.tip_id)?.status = NodeStatus::Stale;
+            self.node_mut_without_index_invalidation(old_tip.tip_id)?
+                .status = NodeStatus::Stale;
         }
-        self.node_mut(node_id)?.status = NodeStatus::Active;
+        self.node_mut_without_index_invalidation(node_id)?.status = NodeStatus::Active;
         let node = self.node(node_id)?;
         self.tip.store(Some(Arc::new(TipSnapshot {
             tip_id: node_id,
@@ -552,30 +579,56 @@ impl BlockTree {
             chainwork: node.chainwork,
             hash: node.hash,
         })));
-        self.refresh_active_height_index(node_id)?;
+        self.refresh_active_height_index(node_id);
         Ok(())
     }
 
-    fn refresh_active_height_index(&mut self, tip_id: NodeId) -> Result<(), ChainError> {
-        let tip = self.node(tip_id)?;
-        if let Some(parent) = tip.parent
+    fn refresh_active_height_index(&mut self, tip_id: NodeId) {
+        let Ok(tip) = self.node(tip_id) else {
+            self.active_by_height.clear();
+            return;
+        };
+        let tip_parent = tip.parent;
+        let tip_height = tip.height;
+
+        if let Some(parent) = tip_parent
             && self.active_by_height.last().copied() == Some(parent)
-            && u32::try_from(self.active_by_height.len()).ok() == Some(tip.height)
+            && u32::try_from(self.active_by_height.len()).ok() == Some(tip_height)
         {
             self.active_by_height.push(tip_id);
-            return Ok(());
+            return;
         }
 
-        let mut active_by_height = Vec::new();
+        let mut rebuilt = Vec::new();
         let mut cursor = Some(tip_id);
+        let mut seen: hashbrown::HashSet<NodeId> = hashbrown::HashSet::new();
         while let Some(id) = cursor {
-            let node = self.node(id)?;
-            active_by_height.push(id);
-            cursor = node.parent;
+            if !seen.insert(id) {
+                self.active_by_height.clear();
+                return;
+            }
+            let Ok(node) = self.node(id) else {
+                self.active_by_height.clear();
+                return;
+            };
+            let parent = node.parent;
+            rebuilt.push(id);
+            cursor = parent;
         }
-        active_by_height.reverse();
-        self.active_by_height = active_by_height;
-        Ok(())
+        rebuilt.reverse();
+
+        for (offset, id) in rebuilt.iter().enumerate() {
+            let Ok(node) = self.node(*id) else {
+                self.active_by_height.clear();
+                return;
+            };
+            if usize::try_from(node.height).ok() != Some(offset) {
+                self.active_by_height.clear();
+                return;
+            }
+        }
+
+        self.active_by_height = rebuilt;
     }
 }
 
@@ -1179,6 +1232,116 @@ mod tests {
         let leaf_b = tree.insert_node(Some(genesis_id), variant_b, NodeStatus::HeaderValid)?;
 
         assert_eq!(tree.find_common_ancestor(leaf_a, leaf_b), Some(genesis_id));
+        Ok(())
+    }
+
+    #[test]
+    fn node_at_height_from_terminates_on_two_node_cycle_with_malformed_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let a = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let b_header = test_header(
+            BlockHash::from_byte_array(tree.node(a)?.hash.to_le_bytes()),
+            1,
+        );
+        let b = tree.insert_node(Some(a), b_header, NodeStatus::HeaderValid)?;
+
+        // Two-node parent cycle with a non-decreasing height so the fallback
+        // walk cannot reach the target by ordinary height descent.
+        tree.node_mut(a)?.parent = Some(b);
+        tree.node_mut(a)?.height = 2;
+
+        assert_eq!(tree.node_at_height_from(b, 0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_active_height_index_terminates_on_parent_cycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let a = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let b_header = test_header(
+            BlockHash::from_byte_array(tree.node(a)?.hash.to_le_bytes()),
+            1,
+        );
+        let b = tree.insert_node(Some(a), b_header, NodeStatus::HeaderValid)?;
+
+        tree.node_mut(a)?.parent = Some(b);
+
+        let c_header = test_header(
+            BlockHash::from_byte_array(tree.node(b)?.hash.to_le_bytes()),
+            2,
+        );
+        let c = tree.insert_node(Some(b), c_header, NodeStatus::HeaderValid)?;
+
+        assert_eq!(tree.tip_id(), Some(c));
+        assert!(tree.active_by_height.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_active_height_index_clears_on_unknown_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let a = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let b_header = test_header(
+            BlockHash::from_byte_array(tree.node(a)?.hash.to_le_bytes()),
+            1,
+        );
+        let b = tree.insert_node(Some(a), b_header, NodeStatus::HeaderValid)?;
+        let c_header = test_header(
+            BlockHash::from_byte_array(tree.node(b)?.hash.to_le_bytes()),
+            2,
+        );
+        let c = tree.insert_node(Some(b), c_header, NodeStatus::HeaderValid)?;
+
+        tree.node_mut(b)?.parent = Some(crate::node::NodeId::new(u32::MAX));
+
+        let d_header = test_header(
+            BlockHash::from_byte_array(tree.node(c)?.hash.to_le_bytes()),
+            3,
+        );
+        let d = tree.insert_node(Some(c), d_header, NodeStatus::HeaderValid)?;
+
+        assert_eq!(tree.tip_id(), Some(d));
+        assert!(tree.active_by_height.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_active_height_index_clears_on_changed_height_republish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let a = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let b_header = test_header(
+            BlockHash::from_byte_array(tree.node(a)?.hash.to_le_bytes()),
+            1,
+        );
+        let b = tree.insert_node(Some(a), b_header, NodeStatus::HeaderValid)?;
+        let c_header = test_header(
+            BlockHash::from_byte_array(tree.node(b)?.hash.to_le_bytes()),
+            2,
+        );
+        let c = tree.insert_node(Some(b), c_header, NodeStatus::HeaderValid)?;
+
+        tree.node_mut(b)?.height = 99;
+
+        let d_header = test_header(
+            BlockHash::from_byte_array(tree.node(c)?.hash.to_le_bytes()),
+            3,
+        );
+        let d = tree.insert_node(Some(c), d_header, NodeStatus::HeaderValid)?;
+
+        assert_eq!(tree.tip_id(), Some(d));
+        assert!(tree.active_by_height.is_empty());
+        assert!(
+            tree.active_node_at_height(1)
+                .is_none_or(|node| node.height == 1)
+        );
         Ok(())
     }
 
