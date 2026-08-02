@@ -101,7 +101,8 @@ impl BlockStager {
             Entry::Occupied(_) => return StagedBlock::AlreadyStaged,
             Entry::Vacant(entry) => entry,
         };
-        let bytes = block_size(&block);
+        let bytes = serialized.len();
+        debug_assert_eq!(bytes, block_size(&block));
         if bytes > self.budget.max_received_bytes {
             return StagedBlock::DroppedForRetry {
                 dropped: DroppedBlock { hash },
