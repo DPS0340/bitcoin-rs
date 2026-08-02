@@ -288,13 +288,89 @@ impl BlockTree {
         self.bip9_cache.len()
     }
 
-    /// Builds a block locator starting from `tip_id`. Returns the chain of
-    /// header hashes at offsets 0, 1, 2, ..., 9, 11, 15, 23, 39, ... walking
-    /// back through parents with exponential backoff after the 10th entry.
-    /// Stops at the genesis (no parent) or after `max_entries` hashes.
+    /// Builds a block locator starting from `tip_id`. For active tips, returns
+    /// header hashes at offsets 0, 1, 2, ..., 9, 10, 12, 16, 24, 40, ... by
+    /// sampling the height index. Side-chain, malformed, and disconnected tips
+    /// walk back through parents with exponential backoff. Stops at the genesis
+    /// (no parent) or after `max_entries` hashes.
     #[must_use]
     pub fn block_locator(&self, tip_id: NodeId, max_entries: usize) -> Vec<Hash256> {
         let mut locator = Vec::with_capacity(max_entries.min(32));
+
+        if max_entries > 0
+            && self.active_by_height.last().copied() == Some(tip_id)
+            && let Ok(tip) = self.node(tip_id)
+        {
+            let mut target_height = tip.height;
+            let mut step = 1_u32;
+            let mut indexed = true;
+
+            while locator.len() < max_entries {
+                let Some(node_id) = active_node_id_at_height(&self.active_by_height, target_height)
+                else {
+                    indexed = false;
+                    break;
+                };
+                let Ok(node) = self.node(node_id) else {
+                    indexed = false;
+                    break;
+                };
+                if (locator.is_empty() && node_id != tip_id) || node.height != target_height {
+                    indexed = false;
+                    break;
+                }
+
+                // O(1) local active-vector adjacency: parent must match the
+                // entry at h-1 (or be absent at h=0), and if h+1 exists its
+                // parent must be this node. Rejects same-height fork swaps.
+                let parent_matches = if target_height == 0 {
+                    node.parent.is_none()
+                } else {
+                    matches!(
+                        (
+                            node.parent,
+                            active_node_id_at_height(
+                                &self.active_by_height,
+                                target_height - 1,
+                            ),
+                        ),
+                        (Some(parent), Some(expected)) if parent == expected
+                    )
+                };
+                if !parent_matches {
+                    indexed = false;
+                    break;
+                }
+                if let Some(child_height) = target_height.checked_add(1)
+                    && let Some(child_id) =
+                        active_node_id_at_height(&self.active_by_height, child_height)
+                {
+                    let Ok(child) = self.node(child_id) else {
+                        indexed = false;
+                        break;
+                    };
+                    if child.parent != Some(node_id) {
+                        indexed = false;
+                        break;
+                    }
+                }
+
+                locator.push(node.hash);
+                if target_height == 0 {
+                    break;
+                }
+                target_height = target_height.saturating_sub(step);
+                if locator.len() >= 10 {
+                    step = step.saturating_mul(2);
+                }
+            }
+
+            if indexed {
+                return locator;
+            }
+            locator.clear();
+        }
+
         let mut current = tip_id;
         let mut step: u64 = 1;
         while locator.len() < max_entries {
@@ -705,6 +781,152 @@ mod tests {
         assert_eq!(locator[3], hashes[1]);
         assert_eq!(locator[4], hashes[0]);
         assert_eq!(locator.last(), hashes.first());
+        Ok(())
+    }
+
+    #[test]
+    fn block_locator_falls_back_after_active_parent_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let a = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let b_header = test_header(
+            BlockHash::from_byte_array(tree.node(a)?.hash.to_le_bytes()),
+            1,
+        );
+        let b = tree.insert_node(Some(a), b_header, NodeStatus::HeaderValid)?;
+        let c_header = test_header(
+            BlockHash::from_byte_array(tree.node(b)?.hash.to_le_bytes()),
+            2,
+        );
+        let c = tree.insert_node(Some(b), c_header, NodeStatus::HeaderValid)?;
+
+        // Mutating an indexed active node's parent invalidates the height
+        // index, forcing block_locator onto the parent-walk fallback.
+        tree.node_mut(c)?.parent = Some(a);
+
+        let c_hash = tree.node(c)?.hash;
+        let a_hash = tree.node(a)?.hash;
+        assert_eq!(tree.block_locator(c, 3), vec![c_hash, a_hash]);
+        Ok(())
+    }
+
+    #[test]
+    fn block_locator_falls_back_on_same_height_fork_index_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let genesis_hash = BlockHash::from_byte_array(tree.node(genesis_id)?.hash.to_le_bytes());
+
+        let main_child = test_header(genesis_hash, 1);
+        let main_child_id =
+            tree.insert_node(Some(genesis_id), main_child, NodeStatus::HeaderValid)?;
+        let main_child_hash =
+            BlockHash::from_byte_array(tree.node(main_child_id)?.hash.to_le_bytes());
+        let main_tip = test_header(main_child_hash, 2);
+        let main_tip_id =
+            tree.insert_node(Some(main_child_id), main_tip, NodeStatus::HeaderValid)?;
+
+        // Same-height side fork (shares genesis parent with main_child).
+        let fork_child = test_header(genesis_hash, 11);
+        let fork_child_id =
+            tree.insert_node(Some(genesis_id), fork_child, NodeStatus::HeaderValid)?;
+        let fork_hash = tree.node(fork_child_id)?.hash;
+
+        assert_eq!(tree.active_by_height.last().copied(), Some(main_tip_id));
+        assert_eq!(tree.active_by_height.get(1).copied(), Some(main_child_id));
+
+        // Corrupt the height-1 index slot to the same-height fork node while
+        // leaving the tip slot intact so the indexed path is still attempted.
+        tree.active_by_height[1] = fork_child_id;
+
+        let corrupted_locator = tree.block_locator(main_tip_id, 32);
+        tree.active_by_height.clear();
+        let parent_walk_locator = tree.block_locator(main_tip_id, 32);
+
+        assert_eq!(corrupted_locator, parent_walk_locator);
+        assert!(!corrupted_locator.contains(&fork_hash));
+        assert_eq!(
+            corrupted_locator,
+            vec![
+                tree.node(main_tip_id)?.hash,
+                tree.node(main_child_id)?.hash,
+                tree.node(genesis_id)?.hash,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn block_locator_preserves_schedule_at_exponential_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let mut tip_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let mut hashes = vec![hash_from_header(&genesis)];
+
+        for height in 1..=40_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let header = test_header(parent_hash, height);
+            tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+            hashes.push(hash_from_header(&header));
+        }
+
+        let tip_h = 40_u32;
+        let locator = tree.block_locator(tip_id, 32);
+        let expected_heights = [
+            tip_h - 0,
+            tip_h - 1,
+            tip_h - 2,
+            tip_h - 3,
+            tip_h - 4,
+            tip_h - 5,
+            tip_h - 6,
+            tip_h - 7,
+            tip_h - 8,
+            tip_h - 9,
+            tip_h - 10,
+            tip_h - 12,
+            tip_h - 16,
+            tip_h - 24,
+            tip_h - 40,
+        ];
+        let expected: Vec<Hash256> = expected_heights
+            .iter()
+            .map(|&h| hashes[h as usize])
+            .collect();
+        assert_eq!(locator, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn block_locator_indexed_path_matches_parent_walk() -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let mut tip_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let mut mid_node = None;
+
+        for height in 1..=25_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(tip_id)?.hash.to_le_bytes());
+            let header = test_header(parent_hash, height);
+            tip_id = tree.insert_node(Some(tip_id), header, NodeStatus::HeaderValid)?;
+            if height == 10 {
+                mid_node = Some(tip_id);
+            }
+        }
+
+        let indexed = tree.block_locator(tip_id, 32);
+        tree.active_by_height.clear();
+        let walked = tree.block_locator(tip_id, 32);
+        assert_eq!(indexed, walked);
+
+        // A non-active-tip node still yields a non-empty locator via the
+        // parent-walk fallback once the height index is cleared.
+        let side = mid_node.expect("height 10 node was recorded");
+        let side_locator = tree.block_locator(side, 32);
+        assert!(!side_locator.is_empty());
+        assert_eq!(side_locator[0], tree.node(side)?.hash);
         Ok(())
     }
 
