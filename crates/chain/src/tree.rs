@@ -372,6 +372,29 @@ impl BlockTree {
             return Some(0);
         }
 
+        if window == 11 {
+            let mut times = [0_u32; 11];
+            let mut len = 0;
+            let mut cursor = start_id;
+            while len < times.len() {
+                let Ok(node) = self.node(cursor) else {
+                    if len == 0 {
+                        return None;
+                    }
+                    break;
+                };
+                times[len] = node.header.time;
+                len += 1;
+                let Some(parent) = node.parent else {
+                    break;
+                };
+                cursor = parent;
+            }
+
+            times[..len].sort_unstable();
+            return Some(times[len / 2]);
+        }
+
         let mut times = Vec::with_capacity(window);
         let mut cursor = start_id;
         while times.len() < window {
@@ -660,6 +683,73 @@ mod tests {
         };
         assert_eq!(mtp, 1_003_000);
         Ok(())
+    }
+
+    #[test]
+    fn median_time_past_at_parity_across_zero_short_eleven_and_wider_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let mut prev_hash = BlockHash::all_zeros();
+        let mut tip = None;
+        let mut times = Vec::new();
+        let mut ids = Vec::new();
+
+        for i in 0..15_u32 {
+            let header = BlockHeader {
+                version: Version::ONE,
+                prev_blockhash: prev_hash,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_000 + i * 600,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            prev_hash = header.block_hash();
+            times.push(header.time);
+            let id = tree.insert_header(header, NodeStatus::HeaderValid)?;
+            ids.push(id);
+            tip = Some(id);
+        }
+
+        let Some(tip) = tip else {
+            panic!("chain has 15 blocks should yield a tip");
+        };
+
+        assert_eq!(tree.median_time_past_at(tip, 0), Some(0));
+        assert_eq!(
+            tree.median_time_past_at(tip, 5),
+            Some(expected_median_time_past(&times, 5))
+        );
+        assert_eq!(
+            tree.median_time_past_at(tip, 11),
+            Some(expected_median_time_past(&times, 11))
+        );
+        assert_eq!(
+            tree.median_time_past_at(tip, 15),
+            Some(expected_median_time_past(&times, 15))
+        );
+
+        let short_tip = ids[2];
+        assert_eq!(
+            tree.median_time_past_at(short_tip, 11),
+            Some(expected_median_time_past(&times[..=2], 11))
+        );
+
+        assert_eq!(
+            tree.median_time_past_at(crate::node::NodeId::new(u32::MAX), 11),
+            None
+        );
+        assert_eq!(
+            tree.median_time_past_at(crate::node::NodeId::new(u32::MAX), 5),
+            None
+        );
+        Ok(())
+    }
+
+    fn expected_median_time_past(times_oldest_first: &[u32], window: usize) -> u32 {
+        let take = window.min(times_oldest_first.len());
+        let mut sample: Vec<u32> = times_oldest_first[times_oldest_first.len() - take..].to_vec();
+        sample.sort_unstable();
+        sample[sample.len() / 2]
     }
 
     #[test]
