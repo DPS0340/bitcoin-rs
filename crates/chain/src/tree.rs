@@ -410,15 +410,16 @@ impl BlockTree {
     /// `None` instead of hanging.
     #[must_use]
     pub fn node_at_height_from(&self, start_id: NodeId, target_height: u32) -> Option<NodeId> {
-        if self.active_by_height.is_trusted() && self.active_by_height.last() == Some(start_id) {
-            return self.active_by_height.get(target_height);
-        }
-
         let Ok(start_node) = self.node(start_id) else {
             return None;
         };
         if target_height > start_node.height {
             return None;
+        }
+        if self.active_by_height.is_trusted()
+            && self.active_by_height.get(start_node.height) == Some(start_id)
+        {
+            return self.active_by_height.get(target_height);
         }
         if target_height == start_node.height {
             return Some(start_id);
@@ -953,10 +954,55 @@ mod tests {
         assert!(tree.active_by_height.is_tainted_for_test());
 
         assert_eq!(
-            tree.node_at_height_from(main_ids[40], 19),
+            tree.node_at_height_from(main_ids[30], 19),
             Some(main_ids[19])
         );
-        assert_ne!(tree.node_at_height_from(main_ids[40], 19), Some(side_id));
+        assert_ne!(tree.node_at_height_from(main_ids[30], 19), Some(side_id));
+        Ok(())
+    }
+
+    #[test]
+    fn node_at_height_from_indexes_active_prefix_but_walks_side_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let mut main_tip = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let mut main_ids = vec![main_tip];
+
+        for height in 1..=5_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(main_tip)?.hash.to_le_bytes());
+            main_tip = tree.insert_node(
+                Some(main_tip),
+                test_header(parent_hash, height),
+                NodeStatus::HeaderValid,
+            )?;
+            main_ids.push(main_tip);
+        }
+
+        let mut side_tip = main_ids[0];
+        let mut side_ids = vec![side_tip];
+        for nonce in 11..=13_u32 {
+            let parent_hash = BlockHash::from_byte_array(tree.node(side_tip)?.hash.to_le_bytes());
+            side_tip = tree.insert_node(
+                Some(side_tip),
+                test_header(parent_hash, nonce),
+                NodeStatus::HeaderValid,
+            )?;
+            side_ids.push(side_tip);
+        }
+
+        assert_eq!(tree.node_at_height_from(side_ids[3], 1), Some(side_ids[1]));
+
+        let active_prefix = main_ids[4];
+        let active_prefix_index = usize::try_from(active_prefix.get())?;
+        tree.nodes
+            .get_mut(active_prefix_index)
+            .ok_or("missing active prefix")?
+            .parent = None;
+        assert_eq!(
+            tree.node_at_height_from(active_prefix, 1),
+            Some(main_ids[1])
+        );
         Ok(())
     }
 
