@@ -3,8 +3,8 @@
 
 #![allow(clippy::let_unit_value)]
 
-/// Gate G3 manual run instructions: build with `--features kernel`, then run
-/// `cargo test -p bitcoin-rs --features kernel --test g03_kernel_parity -- --ignored --nocapture`
+/// Gate G3 manual run instructions: the default build is the kernel build, so
+/// run `cargo test -p bitcoin-rs --test g03_kernel_parity -- --ignored --nocapture`
 /// over the first 100 000 mainnet blocks through both validators and artifact
 /// any disagreement.
 #[test]
