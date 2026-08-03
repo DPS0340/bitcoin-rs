@@ -153,7 +153,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
             &max_height_key,
             &encode_block_file_max_height(max_height),
         );
-        self.index.write(batch)
+        self.index.write_deferred(batch)
     }
 
     fn load_block_body(
