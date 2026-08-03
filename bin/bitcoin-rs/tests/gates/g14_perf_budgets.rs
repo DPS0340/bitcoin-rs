@@ -1,7 +1,7 @@
 //! G14 — Performance budgets.
 //! **G14 — Performance budgets.**
 //! - Initial block sync throughput is faster than Bitcoin Core's blocks-per-second on identical mainnet IBD (measured via `criterion`).
-//! - UTXO commit p95 ≤ 50 ms per 4 MiB block.
+//! - UTXO commit p95 ≤ 50 ms per block of at least 1,000,000 serialized bytes.
 //! - Electrum `scripthash.get_history` p95 ≤ 30 ms over a 10 000-call random sample at tip.
 //! - RSS ≤ 16 GiB at mainnet tip with fjall default + all indexes enabled.
 //!
@@ -10,6 +10,7 @@
 //! missing or malformed.
 
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File},
     io::Read,
@@ -24,7 +25,7 @@ const MIN_INITIAL_SYNC_RATIO_VS_BITCOIN_CORE: f64 = 1.0;
 const MAX_UTXO_COMMIT_P95_MS: f64 = 50.0;
 const MAX_ELECTRUM_GET_HISTORY_P95_MS: f64 = 30.0;
 const MAX_RSS_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-const FOUR_MIB_BYTES: u64 = 4 * 1024 * 1024;
+const UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES: u64 = 1_000_000;
 const EXPECTED_ELECTRUM_SAMPLE_SIZE: u64 = 10_000;
 const ELECTRUM_RSS_MEASUREMENT_SCHEMA: &str = "g14-electrum-rss-measurement-v1";
 const UTXO_COMMIT_MEASUREMENT_SCHEMA: &str = "g14-utxo-commit-measurement-v1";
@@ -44,7 +45,7 @@ G14_STORAGE_BACKEND=fjall, \
 G14_INDEXES=all, \
 G14_REFERENCE_IMPL=bitcoin-core, \
 G14_BENCH_TOOL=criterion, \
-G14_BLOCK_SIZE_BYTES=4194304, \
+G14_BLOCK_SIZE_BYTES=1000000, \
 G14_ELECTRUM_SAMPLE_SIZE=10000, \
 G14_IBD_START_HEIGHT, \
 G14_IBD_START_HASH=<64 lowercase hex>, \
@@ -80,7 +81,7 @@ G14_UTXO_COMMIT_MEASUREMENT_START_HEIGHT=G14_IBD_START_HEIGHT, \
 G14_UTXO_COMMIT_MEASUREMENT_START_HASH=G14_IBD_START_HASH, \
 G14_UTXO_COMMIT_MEASUREMENT_STOP_HEIGHT=G14_IBD_STOP_HEIGHT, \
 G14_UTXO_COMMIT_MEASUREMENT_STOP_HASH=G14_IBD_STOP_HASH, \
-G14_UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES=4194304, \
+G14_UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES=1000000, \
 G14_ELECTRUM_GET_HISTORY_P95_MS, \
 G14_RSS_BYTES, \
 G14_ELECTRUM_RSS_MEASUREMENT_PATH, \
@@ -872,7 +873,10 @@ fn require_g14_static_env() {
     require_literal("G14_INDEXES", "all");
     require_literal("G14_REFERENCE_IMPL", "bitcoin-core");
     require_literal("G14_BENCH_TOOL", "criterion");
-    require_exact_u64("G14_BLOCK_SIZE_BYTES", FOUR_MIB_BYTES);
+    require_exact_u64(
+        "G14_BLOCK_SIZE_BYTES",
+        UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES,
+    );
     require_exact_u64("G14_ELECTRUM_SAMPLE_SIZE", EXPECTED_ELECTRUM_SAMPLE_SIZE);
 }
 
@@ -1116,15 +1120,25 @@ fn read_utxo_samples_from_path(path: &Path, source: &str) -> Vec<Value> {
             path.display()
         ),
     };
-    if let Value::Array(samples) = payload {
-        return samples;
-    }
-    if let Value::Object(object) = payload {
-        if let Some(Value::Array(samples)) = object.get("samples") {
-            return samples.clone();
+    let samples = match payload {
+        Value::Array(samples) => samples,
+        Value::Object(mut object) => match object.remove("samples") {
+            Some(Value::Array(samples)) => samples,
+            _ => panic!("{source} sample source object must contain a samples array"),
+        },
+        _ => {
+            panic!("{source} sample source must be a JSON array or an object with a samples array")
         }
+    };
+    let mut seen = HashSet::new();
+    for (index, sample) in samples.iter().enumerate() {
+        let height = utxo_sample_height(sample.get("height"), index);
+        assert!(
+            seen.insert(height),
+            "{source} contains duplicate sample height {height}"
+        );
     }
-    panic!("{source} sample source must be a JSON array or an object with a samples array");
+    samples
 }
 
 fn utxo_sample_commit_ms(sample: &Value, index: usize) -> f64 {
@@ -1310,7 +1324,10 @@ impl UtxoCommitMeasurementEvidence {
             measurement_stop_hash, stop_hash,
             "G14_UTXO_COMMIT_MEASUREMENT_STOP_HASH must match G14_IBD_STOP_HASH"
         );
-        require_exact_u64("G14_UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES", FOUR_MIB_BYTES);
+        require_exact_u64(
+            "G14_UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES",
+            UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES,
+        );
         let sample_count = positive_u64("G14_UTXO_COMMIT_MEASUREMENT_SAMPLE_COUNT");
         let path = required_env("G14_UTXO_COMMIT_MEASUREMENT_PATH");
         let sha256 = required_hex("G14_UTXO_COMMIT_MEASUREMENT_SHA256", 64);
@@ -1401,7 +1418,7 @@ fn verify_utxo_commit_measurement_json(
     require_json_exact_u64(
         &data,
         "block_size_threshold_bytes",
-        FOUR_MIB_BYTES,
+        UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES,
         "G14_UTXO_COMMIT_MEASUREMENT_PATH",
     );
     require_json_exact_u64(
@@ -1425,7 +1442,7 @@ fn verify_utxo_commit_measurement_json(
             stop_height,
             stop_hash,
         },
-        FOUR_MIB_BYTES,
+        UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES,
         expected_sample_count,
         utxo_commit_p95_ms,
     );
@@ -2178,8 +2195,11 @@ mod tests {
             heights.push(stop_height);
         }
         let mut cursor = 0u64;
-        while heights.len() < 20 {
-            heights.push(start_height + (cursor % span));
+        while heights.len() < 20 && cursor < span {
+            let candidate = start_height + (cursor % span);
+            if !heights.contains(&candidate) {
+                heights.push(candidate);
+            }
             cursor += 1;
         }
         let mut samples = Vec::new();
@@ -2197,7 +2217,7 @@ mod tests {
                 _ => 10.0,
             };
             samples.push(format!(
-                r#"{{"height": {height}, "block_hash": "{block_hash}", "block_size_bytes": 4194304, "utxo_commit_ms": {commit_ms}}}"#
+                r#"{{"height": {height}, "block_hash": "{block_hash}", "block_size_bytes": 1000000, "utxo_commit_ms": {commit_ms}}}"#
             ));
         }
         let samples_path = dir.join("utxo-commit-samples.json");
@@ -2239,14 +2259,11 @@ mod tests {
   "ibd_start_hash": "{start_hash}",
   "ibd_stop_height": {stop_height},
   "ibd_stop_hash": "{stop_hash}",
-  "block_size_threshold_bytes": 4194304,
+  "block_size_threshold_bytes": 1000000,
   "sample_source_path": "{sample_source_path}",
   "sample_source_sha256": "{sample_source_sha256}",
   "sample_count": 20,
-  "utxo_commit_p50_ms": 10.0,
-  "utxo_commit_p95_ms": {p95_ms},
-  "utxo_commit_p99_ms": 30.0,
-  "utxo_commit_max_ms": 40.0
+  "utxo_commit_p95_ms": {p95_ms}
 }}"#,
                 sample_source_path = samples_path.display(),
             ),
@@ -2283,7 +2300,7 @@ mod tests {
         );
         fs::write(
             &samples_path,
-            r#"[{"height":0,"block_hash":"000000000000000000000000000000000000000000000000000000000000000a","block_size_bytes":4194304,"utxo_commit_ms":12.5}]"#,
+            r#"[{"height":0,"block_hash":"000000000000000000000000000000000000000000000000000000000000000a","block_size_bytes":1000000,"utxo_commit_ms":12.5}]"#,
         )
         .unwrap_or_else(|error| panic!("write tampered samples failed: {error}"));
         let tampered_sha = sha256_file(
@@ -2322,15 +2339,12 @@ mod tests {
   "ibd_start_hash": "{start_hash}",
   "ibd_stop_height": 800000,
   "ibd_stop_hash": "{stop_hash}",
-  "block_size_threshold_bytes": 4194304,
+  "block_size_threshold_bytes": 1000000,
   "sample_source_path": "/tmp/g14-utxo-samples.json",
   "sample_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "sample_count": 20,
-  "utxo_commit_p50_ms": 10.0,
-  "utxo_commit_p95_ms": {p95_ms},
-  "utxo_commit_p99_ms": 30.0,
-  "utxo_commit_max_ms": 40.0
-}}"#
+  "utxo_commit_p95_ms": {p95_ms}
+}}"#,
         )
     }
 

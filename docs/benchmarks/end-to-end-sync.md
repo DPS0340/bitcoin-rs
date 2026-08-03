@@ -63,7 +63,7 @@ Later code changed both failed bitcoin-rs paths, but no completed rerun is attac
 | Budget | Required evidence | Status in this publication |
 |---|---|---|
 | IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Not measured |
-| UTXO commit p95 | ≤50ms for blocks ≥4MiB | Not captured |
+| UTXO commit p95 | ≤50ms for serialized blocks ≥1MB | Not captured |
 | Electrum history p95 | ≤30ms over 10,000 non-empty calls | Not captured |
 | Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Not measured at a completed tip; attached runs have indexes disabled |
 

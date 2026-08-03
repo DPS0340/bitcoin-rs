@@ -62,6 +62,7 @@ fn g14_default_daemon_adapter_command(adapter: &Path) -> String {
 }
 
 const BITCOIN_RS_IBD_ADAPTER: &str = "bitcoin-rs-daemon-mainnet-ibd-v1";
+const UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES: &str = "1000000";
 
 #[derive(Clone, Copy)]
 struct CriterionArtifactBinding<'a> {
@@ -555,10 +556,56 @@ fn utxo_commit_measurement_rejects_sub_threshold_block_size()
     let samples = write_text(
         temp.path(),
         "utxo-samples-small.json",
-        r#"[{"height": 5, "block_hash": "0000000000000000000000000000000000000000000000000000000000000005", "block_size_bytes": 1, "utxo_commit_ms": 12.5}]"#,
+        r#"[
+  {"height": 0, "block_hash": "0000000000000000000000000000000000000000000000000000000000000000", "block_size_bytes": 1, "utxo_commit_ms": 1.0},
+  {"height": 5, "block_hash": "0000000000000000000000000000000000000000000000000000000000000005", "block_size_bytes": 1, "utxo_commit_ms": 12.5},
+  {"height": 10, "block_hash": "000000000000000000000000000000000000000000000000000000000000000a", "block_size_bytes": 1, "utxo_commit_ms": 1.0}
+]"#,
     )?;
     let output = temp.path().join("utxo-measurement.json");
-    let status = Command::new("bash")
+    let result = Command::new("bash")
+        .arg(utxo_commit_script_path())
+        .args([
+            "--output",
+            output.to_str().ok_or("non-UTF-8 output")?,
+            "--samples",
+            samples.to_str().ok_or("non-UTF-8 samples")?,
+            "--ibd-start-height",
+            "0",
+            "--ibd-start-hash",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--ibd-stop-height",
+            "10",
+            "--ibd-stop-hash",
+            "000000000000000000000000000000000000000000000000000000000000000a",
+            utxo_commit_block_size_threshold_args()[0],
+            utxo_commit_block_size_threshold_args()[1],
+        ])
+        .output()?;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("no qualifying UTXO commit samples"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn utxo_commit_measurement_rejects_duplicate_heights() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let samples = write_text(
+        temp.path(),
+        "utxo-samples-duplicate.json",
+        r#"[
+  {"height": 0, "block_hash": "0000000000000000000000000000000000000000000000000000000000000000", "block_size_bytes": 1, "utxo_commit_ms": 1.0},
+  {"height": 5, "block_hash": "0000000000000000000000000000000000000000000000000000000000000005", "block_size_bytes": 1000000, "utxo_commit_ms": 10.0},
+  {"height": 5, "block_hash": "0000000000000000000000000000000000000000000000000000000000000005", "block_size_bytes": 1000000, "utxo_commit_ms": 10.0},
+  {"height": 10, "block_hash": "000000000000000000000000000000000000000000000000000000000000000a", "block_size_bytes": 1, "utxo_commit_ms": 1.0}
+]"#,
+    )?;
+    let output = temp.path().join("utxo-measurement.json");
+    let result = Command::new("bash")
         .arg(utxo_commit_script_path())
         .args([
             "--output",
@@ -574,8 +621,84 @@ fn utxo_commit_measurement_rejects_sub_threshold_block_size()
             "--ibd-stop-hash",
             "000000000000000000000000000000000000000000000000000000000000000a",
         ])
-        .status()?;
-    assert!(!status.success());
+        .output()?;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("duplicate height 5"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn utxo_commit_measurement_rejects_existing_output() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let output = write_text(temp.path(), "utxo-measurement.json", "stale evidence")?;
+    let result = Command::new("bash")
+        .arg(utxo_commit_script_path())
+        .args([
+            "--output",
+            output.to_str().ok_or("non-UTF-8 output")?,
+            "--samples",
+            "/missing/samples.json",
+            "--ibd-start-height",
+            "0",
+            "--ibd-start-hash",
+            "invalid",
+            "--ibd-stop-height",
+            "10",
+            "--ibd-stop-hash",
+            "invalid",
+        ])
+        .output()?;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--output already exists"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read_to_string(output)?, "stale evidence");
+    Ok(())
+}
+
+#[test]
+fn producer_rejects_existing_output_before_input_validation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let output = write_text(temp.path(), "g14-manifest.json", "stale evidence")?;
+    let result = Command::new("bash")
+        .arg(producer_script_path())
+        .args([
+            "--output",
+            output.to_str().ok_or("non-UTF-8 output")?,
+            "--ibd-start-height",
+            "0",
+            "--ibd-stop-height",
+            "10",
+            "--bitcoin-rs-command",
+            "false",
+            "--bitcoin-core-command",
+            "false",
+            "--bitcoin-rs-config",
+            "/missing/bitcoin-rs.toml",
+            "--bitcoin-core-config",
+            "/missing/bitcoin.conf",
+            "--bitcoin-core-version",
+            "v0",
+            "--bitcoin-core-commit",
+            "0000000000000000000000000000000000000000",
+            "--benchmark-artifact",
+            "/missing/criterion.json",
+        ])
+        .output()?;
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--output already exists"),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read_to_string(output)?, "stale evidence");
     Ok(())
 }
 
@@ -1930,7 +2053,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_emits_canonical_criterion_output()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2001,7 +2123,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_produces_utxo_commit_measurement()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2090,7 +2211,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_force_discards_stale_utxo_samples()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2187,7 +2307,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_fails_without_qualifying_utxo_samples()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2266,7 +2385,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_removes_auto_command_output_on_success(
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2343,7 +2461,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_shuts_down_promptly_with_large_startup_
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2409,7 +2526,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_rejects_wrong_stop_hash()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2501,7 +2617,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_rejects_rpc_startup_timeout()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2567,7 +2682,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_translates_localhost_rpc_url()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -2630,7 +2744,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_rejects_dns_rpc_url()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
 
     let output = Command::new("bash")
         .arg(bitcoin_rs_daemon_mainnet_ibd_script_path())
@@ -2675,7 +2788,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_rejects_addnode_option()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
 
     let output = Command::new("bash")
         .arg(bitcoin_rs_daemon_mainnet_ibd_script_path())
@@ -2722,7 +2834,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_rejects_addnode_passthrough()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let bitcoin_rs = fake_failing_command(temp.path(), "bitcoin-rs")?;
 
     let output = Command::new("bash")
@@ -2780,7 +2891,6 @@ fn criterion_runner_accepts_bitcoin_rs_daemon_mainnet_ibd_wrapper()
     )?;
     let bitcoin_core_config = write_text(temp.path(), "bitcoin.conf", "chain=main\ndbcache=450\n")?;
     let datadir = temp.path().join("bitcoin-rs-runner-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -4232,24 +4342,51 @@ fn utxo_commit_script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/measure-g14-utxo-commit-p95.sh")
 }
 
+fn utxo_commit_block_size_threshold_args() -> [&'static str; 2] {
+    [
+        "--block-size-threshold-bytes",
+        UTXO_COMMIT_BLOCK_SIZE_THRESHOLD_BYTES,
+    ]
+}
+
 fn utxo_commit_samples_json(
     dir: &Path,
     start_height: u32,
     stop_height: u32,
     p95_ms: f64,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let span = stop_height - start_height + 1;
+    let start_hash = format!("{start_height:064x}");
+    let stop_hash = format!("{stop_height:064x}");
+    let span = u64::from(stop_height - start_height + 1);
+    let mut heights = Vec::with_capacity(20);
+    heights.push(u64::from(start_height));
+    if stop_height != start_height {
+        heights.push(u64::from(stop_height));
+    }
+    let mut cursor = 0u64;
+    while heights.len() < 20 && cursor < span {
+        let candidate = u64::from(start_height) + (cursor % span);
+        if !heights.contains(&candidate) {
+            heights.push(candidate);
+        }
+        cursor += 1;
+    }
     let mut samples = Vec::new();
-    for index in 0..20 {
-        let height = start_height + (index % span);
-        let block_hash = format!("{height:064x}");
+    for (index, height) in heights.iter().copied().enumerate() {
+        let block_hash = if height == u64::from(start_height) {
+            start_hash.clone()
+        } else if height == u64::from(stop_height) {
+            stop_hash.clone()
+        } else {
+            format!("{height:064x}")
+        };
         let commit_ms = match index {
             18 => p95_ms,
             19 => p95_ms + 7.5,
             _ => 10.0,
         };
         samples.push(format!(
-            r#"{{"height": {height}, "block_hash": "{block_hash}", "block_size_bytes": 4194304, "utxo_commit_ms": {commit_ms}}}"#
+            r#"{{"height": {height}, "block_hash": "{block_hash}", "block_size_bytes": 1000000, "utxo_commit_ms": {commit_ms}}}"#
         ));
     }
     write_text(
@@ -4284,6 +4421,8 @@ fn produce_utxo_commit_measurement(
             &stop_height.to_string(),
             "--ibd-stop-hash",
             &stop_hash,
+            utxo_commit_block_size_threshold_args()[0],
+            utxo_commit_block_size_threshold_args()[1],
         ])
         .status()?;
     if !status.success() {
@@ -4315,14 +4454,11 @@ fn utxo_commit_measurement_json(
   "ibd_start_hash": "{start_hash}",
   "ibd_stop_height": {stop_height},
   "ibd_stop_hash": "{stop_hash}",
-  "block_size_threshold_bytes": 4194304,
+  "block_size_threshold_bytes": 1000000,
   "sample_source_path": "/tmp/g14-utxo-samples.json",
   "sample_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "sample_count": 20,
-  "utxo_commit_p50_ms": 10.0,
-  "utxo_commit_p95_ms": {p95_ms},
-  "utxo_commit_p99_ms": 30.0,
-  "utxo_commit_max_ms": 40.0
+  "utxo_commit_p95_ms": {p95_ms}
 }}"#,
             current_head()?
         ),
@@ -4438,7 +4574,7 @@ fn utxo_measurement_manifest_fragment(
   "utxo_commit_measurement_start_hash": "{start_hash}",
   "utxo_commit_measurement_stop_height": {stop_height},
   "utxo_commit_measurement_stop_hash": "{stop_hash}",
-  "utxo_commit_block_size_threshold_bytes": 4194304,"#
+  "utxo_commit_block_size_threshold_bytes": 1000000,"#
     ))
 }
 
@@ -5212,7 +5348,7 @@ fn utxo_commit_measurement_rejects_mismatched_boundary_sample_hash()
     let samples = write_text(
         temp.path(),
         "utxo-boundary-mismatch-samples.json",
-        r#"[{"height": 0, "block_hash": "000000000000000000000000000000000000000000000000000000000000000a", "block_size_bytes": 4194304, "utxo_commit_ms": 12.5}]"#,
+        r#"[{"height": 0, "block_hash": "000000000000000000000000000000000000000000000000000000000000000a", "block_size_bytes": 1000000, "utxo_commit_ms": 12.5}]"#,
     )?;
     let output = temp.path().join("utxo-boundary-mismatch-measurement.json");
     let status = Command::new("bash")
@@ -5230,6 +5366,8 @@ fn utxo_commit_measurement_rejects_mismatched_boundary_sample_hash()
             "0",
             "--ibd-stop-hash",
             "0000000000000000000000000000000000000000000000000000000000000000",
+            utxo_commit_block_size_threshold_args()[0],
+            utxo_commit_block_size_threshold_args()[1],
         ])
         .status()?;
     assert!(!status.success());
@@ -6009,7 +6147,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_uses_ibd_timeout_after_rpc_startup()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -6088,7 +6225,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_uses_ibd_timeout_after_rpc_drop()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -6167,7 +6303,6 @@ fn bitcoin_rs_daemon_mainnet_ibd_wrapper_uses_ibd_timeout_after_rpc_hang()
         "storage_backend=fjall\nindexes=all\n",
     )?;
     let datadir = temp.path().join("bitcoin-rs-datadir");
-    fs::create_dir(&datadir)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let rpc_port = listener.local_addr()?.port();
     drop(listener);
@@ -6261,7 +6396,7 @@ def write_g14_utxo_samples(path: pathlib.Path) -> None:
     start = int(g14_arg("--g14-utxo-commit-ibd-start-height=") or "0")
     stop = int(g14_arg("--g14-utxo-commit-ibd-stop-height=") or "10")
     samples = []
-    block_size = 1 if os.environ.get("G14_FAKE_SUB_THRESHOLD_UTXO_SAMPLES") == "1" else 4194304
+    block_size = 1 if os.environ.get("G14_FAKE_SUB_THRESHOLD_UTXO_SAMPLES") == "1" else 1000000
     for height in range(start, stop + 1):
         samples.append(
             {

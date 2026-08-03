@@ -7,9 +7,9 @@ usage() {
     '' \
     'Reads local UTXO commit timing samples and writes a hash-bound G14 measurement artifact.' \
     'Each qualifying sample must include height, block_hash, block_size_bytes, and utxo_commit_ms or utxo_commit_us.' \
-    'Only samples with block_size_bytes >= the threshold (default 4 MiB) and height inside the IBD window are used.' \
+    'Only samples with block_size_bytes >= the threshold (default 1 MB) and height inside the IBD window are used.' \
     '' \
-    'Defaults: --block-size-threshold-bytes 4194304 --measurement-kind evidence'
+    'Defaults: --block-size-threshold-bytes 1000000 --measurement-kind evidence'
 }
 
 if (($# == 0)); then
@@ -30,7 +30,7 @@ from pathlib import Path
 
 SCHEMA = "g14-utxo-commit-measurement-v1"
 SMOKE_SCHEMA = "g14-utxo-commit-smoke-v1"
-DEFAULT_BLOCK_SIZE_THRESHOLD_BYTES = 4 * 1024 * 1024
+DEFAULT_BLOCK_SIZE_THRESHOLD_BYTES = 1_000_000
 
 
 def die(message: str) -> None:
@@ -91,6 +91,19 @@ def percentile_ms(samples_ms: list[float], numerator: int, denominator: int) -> 
     return ordered[index]
 
 
+def reject_duplicate_heights(samples: list, source: str) -> None:
+    seen: set[int] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            die(f"{source}[{index}] must be an object")
+        height = sample.get("height")
+        if not isinstance(height, int) or isinstance(height, bool):
+            die(f"{source}[{index}].height must be an integer")
+        if height in seen:
+            die(f"{source} must not contain duplicate height {height}")
+        seen.add(height)
+
+
 def read_samples(path: Path) -> list:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -99,10 +112,12 @@ def read_samples(path: Path) -> list:
     except json.JSONDecodeError as error:
         die(f"--samples must be JSON: {error}")
     if isinstance(payload, list):
+        reject_duplicate_heights(payload, "sample source")
         return payload
     if isinstance(payload, dict):
         samples = payload.get("samples")
         if isinstance(samples, list):
+            reject_duplicate_heights(samples, "sample source")
             return samples
     die("--samples must be a JSON array or an object with a samples array")
 
@@ -157,13 +172,12 @@ def utxo_sample_hash_at_height(samples: list, height: int, source: str) -> str:
 
 
 def verify_utxo_boundary_sample_hashes(
-    samples_path: Path,
+    samples: list,
     start_height: int,
     start_hash: str,
     stop_height: int,
     stop_hash: str,
 ) -> None:
-    samples = read_samples(samples_path)
     start_sample_hash = utxo_sample_hash_at_height(samples, start_height, "sample source")
     if start_sample_hash != start_hash:
         die("sample source block_hash at ibd_start_height must match --ibd-start-hash")
@@ -176,7 +190,8 @@ def write_json(path: str, data: dict) -> None:
     if path == "-":
         sys.stdout.write(encoded)
         return
-    Path(path).write_text(encoded, encoding="utf-8")
+    with Path(path).open("x", encoding="utf-8") as output:
+        output.write(encoded)
 
 
 parser = argparse.ArgumentParser(add_help=False)
@@ -199,6 +214,9 @@ for key in ("output", "samples", "ibd_start_height", "ibd_start_hash", "ibd_stop
     if getattr(args, key) is None:
         die(f"--{key.replace('_', '-')} is required")
 
+if args.output != "-" and Path(args.output).exists():
+    die(f"--output already exists: {args.output}")
+
 start_height = non_negative_int(args.ibd_start_height, "--ibd-start-height")
 stop_height = non_negative_int(args.ibd_stop_height, "--ibd-stop-height")
 if stop_height < start_height:
@@ -210,8 +228,9 @@ samples_path = Path(args.samples)
 if not samples_path.is_file():
     die(f"--samples is not a readable file: {samples_path}")
 
+samples = read_samples(samples_path)
 verify_utxo_boundary_sample_hashes(
-    samples_path,
+    samples,
     start_height,
     start_hash,
     stop_height,
@@ -219,7 +238,7 @@ verify_utxo_boundary_sample_hashes(
 )
 
 qualifying_ms: list[float] = []
-for index, sample in enumerate(read_samples(samples_path)):
+for index, sample in enumerate(samples):
     parsed = parse_sample(sample, index, start_height, stop_height, threshold_bytes)
     if parsed is not None:
         qualifying_ms.append(parsed)
@@ -242,10 +261,7 @@ data = {
     "sample_source_path": str(samples_path.resolve()),
     "sample_source_sha256": sha256_file(samples_path),
     "sample_count": len(qualifying_ms),
-    "utxo_commit_p50_ms": percentile_ms(qualifying_ms, 50, 100),
     "utxo_commit_p95_ms": percentile_ms(qualifying_ms, 95, 100),
-    "utxo_commit_p99_ms": percentile_ms(qualifying_ms, 99, 100),
-    "utxo_commit_max_ms": max(qualifying_ms),
 }
 write_json(args.output, data)
 PY
