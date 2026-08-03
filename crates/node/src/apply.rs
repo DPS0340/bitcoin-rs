@@ -271,7 +271,7 @@ pub struct ApplyHandles {
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
-    /// Block height at or below which interpreter / `bitcoinconsensus` script execution is skipped during block apply.
+    /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
 }
@@ -1077,7 +1077,7 @@ fn verify_block_transactions(
         }
         return Ok(());
     }
-    // Height-only assume-valid: skip interpreter / bitcoinconsensus script execution only.
+    // Height-only assume-valid: skip kernel / portable script execution only.
     let skip_scripts = handles.assume_valid_height > 0 && height <= handles.assume_valid_height;
     if skip_scripts && !tx_plan.needs_local_utxo_overlay {
         let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
@@ -4678,7 +4678,7 @@ mod consensus_rule_tests {
     /// Gated to a real script backend: the acceptance arm asserts `Ok`, which only
     /// holds when scripts actually execute. With no backend the verifier returns a
     /// `Script { .. "backend disabled" }` error, so the helper would be dead code.
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn p2sh_template_bare_spend_block()
     -> Result<(bitcoin::Block, BlockTxPlan, Arc<UtxoSet>), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
@@ -4730,7 +4730,7 @@ mod consensus_rule_tests {
 
     // Asserts acceptance under the BIP16 exception, which needs a real script backend
     // (the backend-less default build returns a "backend disabled" Script error).
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     #[test]
     fn bip16_exception_accepts_bare_p2sh_template_spend_that_normal_p2sh_rejects()
     -> Result<(), Box<dyn std::error::Error>> {

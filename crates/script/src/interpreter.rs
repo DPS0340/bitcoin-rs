@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 
-#[cfg(feature = "bitcoinconsensus")]
-use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{Script, ScriptBuf, Witness};
@@ -95,18 +93,6 @@ impl VerifyFlags {
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
-    }
-
-    /// Returns only the bits accepted by rust-bitcoin's `bitcoinconsensus` backend.
-    #[must_use]
-    pub const fn consensus_bits(self) -> u32 {
-        self.0
-            & (Self::P2SH.0
-                | Self::DERSIG.0
-                | Self::NULLDUMMY.0
-                | Self::CHECKLOCKTIMEVERIFY.0
-                | Self::CHECKSEQUENCEVERIFY.0
-                | Self::WITNESS.0)
     }
 
     /// Returns the full consensus-authority bit set, including taproot for bitcoinkernel.
@@ -215,8 +201,12 @@ pub enum ScriptError {
     },
 }
 
-/// Public script verifier. Legacy and segwit-v0 spends use bitcoinconsensus when
-/// that backend is enabled; taproot key-path spends use the local BIP341 path.
+/// Public script verifier for the portable posture.
+///
+/// Handles taproot key-path spends via the local BIP341 path; non-taproot spends
+/// (legacy, segwit-v0, taproot script-path) require the kernel production path.
+/// Without the kernel the stub accepts only empty `OP_TRUE` spends and rejects
+/// everything else.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Interpreter;
 
@@ -321,32 +311,13 @@ impl Interpreter {
             return verify_taproot_keypath(&spending, input_idx, script, witness, prevouts);
         }
 
-        verify_with_bitcoinconsensus(input_idx, prevout, &spending, script, flags)
+        verify_non_taproot_portable(input_idx, prevout, &spending, script, flags)
     }
 }
 
-#[cfg(feature = "bitcoinconsensus")]
-fn verify_with_bitcoinconsensus(
-    input_idx: usize,
-    prevout: &TxOut,
-    spending: &bitcoin::Transaction,
-    script: &Script,
-    flags: VerifyFlags,
-) -> Result<bool, ScriptError> {
-    let serialized = encode::serialize(spending);
-    script
-        .verify_with_flags(
-            input_idx,
-            prevout.value,
-            serialized.as_slice(),
-            flags.consensus_bits(),
-        )
-        .map(|()| true)
-        .map_err(|error| ScriptError::Verification(error.to_string()))
-}
-
-#[cfg(not(feature = "bitcoinconsensus"))]
-fn verify_with_bitcoinconsensus(
+/// Portable non-taproot stub: accepts only empty `OP_TRUE` spends. All other
+/// non-taproot (and taproot script-path) classes require the kernel production path.
+fn verify_non_taproot_portable(
     input_idx: usize,
     _prevout: &TxOut,
     spending: &bitcoin::Transaction,
@@ -365,7 +336,7 @@ fn verify_with_bitcoinconsensus(
     }
 
     Err(ScriptError::Verification(
-        "bitcoinconsensus backend is disabled".to_owned(),
+        "portable script backend cannot verify this non-taproot spend".to_owned(),
     ))
 }
 
@@ -420,7 +391,7 @@ fn taproot_keypath_signature(witness: &[Vec<u8>]) -> Result<&[u8], ScriptError> 
     }
 }
 
-#[cfg(all(test, not(feature = "bitcoinconsensus")))]
+#[cfg(test)]
 mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin::{
@@ -431,7 +402,6 @@ mod tests {
     use super::{Interpreter, ScriptError, VerifyFlags};
 
     #[test]
-    #[cfg(not(feature = "bitcoinconsensus"))]
     fn no_backend_accepts_only_empty_op_true_spend() {
         let interpreter = Interpreter;
         let tx = unsigned_spend();
@@ -459,7 +429,6 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "bitcoinconsensus"))]
     fn unsigned_spend() -> Transaction {
         Transaction {
             version: transaction::Version::TWO,

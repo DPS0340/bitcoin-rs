@@ -12,8 +12,7 @@ description = "bitcoin-rs :: script"
 workspace = true
 
 [features]
-default = ["bitcoinconsensus"]
-bitcoinconsensus = ["bitcoin/bitcoinconsensus-std"]
+default = []
 rocksdb = []
 fjall = []
 redb = []

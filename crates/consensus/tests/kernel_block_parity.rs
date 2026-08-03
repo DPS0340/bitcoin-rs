@@ -29,13 +29,11 @@
 //!
 //! ## Honest interpreter scoping — no fake parity
 //!
-//! In this binary (`--no-default-features --features kernel`) the
-//! `bitcoinconsensus` backend is excluded (overlapping native Core symbols;
-//! `compile_error!` guard in `src/lib.rs`), so `Interpreter::execute`
-//! (crates/script/src/interpreter.rs) natively executes exactly one class:
-//! **single-input taproot key-path spends** with a one-element witness
-//! (local BIP341 Schnorr verification). Legacy, P2SH, segwit v0, and taproot
-//! script-path spends have no Rust execution path here. Fixtures therefore
+//! The portable `Interpreter` (`crates/script/src/interpreter.rs`, the script
+//! crate's default posture) natively executes exactly one class: **taproot
+//! key-path spends** (local BIP341 Schnorr verification). Legacy, P2SH,
+//! segwit v0, and taproot script-path spends have no Rust execution path —
+//! production routes those through bitcoinkernel. Fixtures therefore
 //! carry an explicit `interpreter_parity` flag: only the taproot key-path
 //! fixture asserts two-engine verdict parity; every other class is verified
 //! against the kernel alone, with the scoping stated rather than faked.
@@ -67,11 +65,10 @@
 //! coverage rests on the portable block rules tests plus the R3 0→150k
 //! stop-hash differential between the kernel and portable builds.
 //!
-//! Run with the isolated kernel feature (needs system `libboost-dev` + `cmake`):
+//! Run (needs system `libboost-dev` + `cmake`):
 //!
 //! ```sh
-//! cargo test -p bitcoin-rs-consensus --no-default-features --features kernel \
-//!     --test kernel_block_parity
+//! cargo test -p bitcoin-rs-consensus --test kernel_block_parity
 //! ```
 
 #![cfg(feature = "kernel")]
