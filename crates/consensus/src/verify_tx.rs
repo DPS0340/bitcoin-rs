@@ -189,10 +189,13 @@ fn verify_transaction_borrowed_with_locktime_cutoff(
             let serialized_tx = Some(encode::serialize(tx));
             #[cfg(not(feature = "bitcoinconsensus"))]
             let serialized_tx: Option<Vec<u8>> = None;
+            let all_prevouts: Vec<&bitcoin::TxOut> =
+                prep.prevouts.iter().map(|(_, prevout)| prevout).collect();
             for (input_index, (_, prevout)) in prep.prevouts.iter().enumerate() {
                 verify_input_script_portable(
                     input_index,
                     prevout,
+                    &all_prevouts,
                     tx,
                     flags,
                     serialized_tx.as_deref(),
@@ -309,6 +312,7 @@ fn finalize_tx_value_and_sigops(
 fn verify_input_script_portable(
     input_index: usize,
     prevout: &bitcoin::TxOut,
+    all_prevouts: &[&bitcoin::TxOut],
     tx: &bitcoin::Transaction,
     flags: VerifyFlags,
     serialized_tx: Option<&[u8]>,
@@ -325,12 +329,12 @@ fn verify_input_script_portable(
     let input = &tx.input[input_index];
     let witness = input.witness.to_vec();
     Interpreter
-        .execute(
+        .execute_with_prevouts(
             prevout.script_pubkey.as_bytes(),
             input.script_sig.as_bytes(),
             &witness,
             flags,
-            prevout,
+            all_prevouts,
             tx,
             input_index,
         )
@@ -573,7 +577,16 @@ fn check_input(
         let serialized_tx = prep.serialized.as_deref();
         #[cfg(not(feature = "bitcoinconsensus"))]
         let serialized_tx = None;
-        verify_input_script_portable(check.input_index, prevout, tx, flags, serialized_tx)
+        let all_prevouts: Vec<&bitcoin::TxOut> =
+            prep.prevouts.iter().map(|(_, spent)| spent).collect();
+        verify_input_script_portable(
+            check.input_index,
+            prevout,
+            &all_prevouts,
+            tx,
+            flags,
+            serialized_tx,
+        )
     }
 }
 
@@ -950,10 +963,81 @@ mod tests {
             result,
             Err(ConsensusError::Script {
                 input_index: 0,
-                reason:
-                    "taproot key-path verification requires all prevouts for multi-input transactions"
-                        .to_owned(),
+                reason: "script verification failed: missing taproot key-path signature".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "bitcoinconsensus", not(feature = "kernel")))]
+    fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
+        use bitcoin::key::TapTweak;
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+        let secp = Secp256k1::new();
+        let seeds = [1u8, 2u8];
+        let mut keypairs = Vec::new();
+        let mut prevouts = Vec::new();
+        let mut outpoints = Vec::new();
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let secret = SecretKey::from_slice(&[seed; 32]).expect("secret key");
+            let keypair = Keypair::from_secret_key(&secp, &secret);
+            let tweaked = TapTweak::tap_tweak(keypair, &secp, None);
+            let (output_key, _) = tweaked.public_parts();
+            let outpoint = OutPoint {
+                txid: Txid::from_byte_array([seed; 32]),
+                vout: u32::try_from(index).expect("vout"),
+            };
+            outpoints.push(outpoint);
+            prevouts.push(TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
+            });
+            keypairs.push(tweaked);
+        }
+
+        let mut tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: absolute::LockTime::ZERO,
+            input: outpoints
+                .iter()
+                .copied()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+
+        for input_idx in 0..tx.input.len() {
+            let mut cache = SighashCache::new(&tx);
+            let sighash = cache
+                .taproot_key_spend_signature_hash(
+                    input_idx,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .expect("taproot sighash");
+            let message = Message::from_digest(*sighash.as_byte_array());
+            let signature = secp.sign_schnorr(&message, keypairs[input_idx].as_keypair());
+            tx.input[input_idx].witness = Witness::from_slice(&[signature.serialize().to_vec()]);
+        }
+
+        let mut utxos = BTreeMap::new();
+        for (outpoint, prevout) in outpoints.into_iter().zip(prevouts) {
+            utxos.insert(outpoint, prevout);
+        }
+
+        assert_eq!(
+            verify_transaction(&Tx(tx), &utxos, 0, VerifyFlags::MANDATORY),
+            Ok(())
         );
     }
 

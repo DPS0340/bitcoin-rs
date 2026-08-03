@@ -231,6 +231,13 @@ impl Interpreter {
     /// which reads them straight off the transaction — `tx` is used as-is with
     /// no clone. Only callers that pass substitute bytes (e.g. vector tests
     /// grafting a foreign witness) pay for a clone to splice them in.
+    ///
+    /// Taproot key-path verification needs every spent output. Callers that only
+    /// have the current input's prevout should prefer
+    /// [`Self::execute_with_prevouts`] when the full ordered set is available;
+    /// this wrapper forwards a one-element slice and therefore still rejects
+    /// multi-input taproot key-path spends with
+    /// [`ScriptError::TaprootPrevoutsUnavailable`].
     pub fn execute(
         &self,
         script_pubkey: &[u8],
@@ -241,12 +248,49 @@ impl Interpreter {
         tx: &bitcoin::Transaction,
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
+        self.execute_with_prevouts(
+            script_pubkey,
+            script_sig,
+            witness,
+            flags,
+            &[prevout],
+            tx,
+            input_idx,
+        )
+    }
+
+    /// Executes a script spend with the complete ordered prevout set.
+    ///
+    /// `prevouts` must be aligned with `tx.input` (same length, input order).
+    /// BIP341 key-path sighsashes commit to every spent output, so multi-input
+    /// taproot spends require the full slice via [`Prevouts::All`].
+    pub fn execute_with_prevouts(
+        &self,
+        script_pubkey: &[u8],
+        script_sig: &[u8],
+        witness: &[Vec<u8>],
+        flags: VerifyFlags,
+        prevouts: &[&TxOut],
+        tx: &bitcoin::Transaction,
+        input_idx: usize,
+    ) -> Result<bool, ScriptError> {
         let inputs = tx.input.len();
         let out_of_range = ScriptError::InputIndexOutOfRange {
             index: input_idx,
             inputs,
         };
         let input = tx.input.get(input_idx).ok_or(out_of_range)?;
+        // `execute` forwards a one-element slice for the current input. Full-set
+        // callers pass `prevouts.len() == tx.input.len()` in input order.
+        let prevout = if prevouts.len() == inputs {
+            *prevouts
+                .get(input_idx)
+                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
+        } else if prevouts.len() == 1 {
+            prevouts[0]
+        } else {
+            return Err(ScriptError::TaprootPrevoutsUnavailable);
+        };
 
         let matches_tx = input.script_sig.as_bytes() == script_sig
             && input.witness.len() == witness.len()
@@ -274,7 +318,7 @@ impl Interpreter {
 
         let script = Script::from_bytes(script_pubkey);
         if script.is_p2tr() && flags.contains(VerifyFlags::TAPROOT) {
-            return verify_taproot_keypath(&spending, input_idx, prevout, script, witness);
+            return verify_taproot_keypath(&spending, input_idx, script, witness, prevouts);
         }
 
         verify_with_bitcoinconsensus(input_idx, prevout, &spending, script, flags)
@@ -328,11 +372,11 @@ fn verify_with_bitcoinconsensus(
 fn verify_taproot_keypath(
     spending: &bitcoin::Transaction,
     input_idx: usize,
-    prevout: &TxOut,
     script: &Script,
     witness: &[Vec<u8>],
+    prevouts: &[&TxOut],
 ) -> Result<bool, ScriptError> {
-    if spending.input.len() != 1 || input_idx != 0 {
+    if prevouts.len() != spending.input.len() {
         return Err(ScriptError::TaprootPrevoutsUnavailable);
     }
     let signature_bytes = taproot_keypath_signature(witness)?;
@@ -353,10 +397,9 @@ fn verify_taproot_keypath(
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let public_key = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&script.as_bytes()[2..34])
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
-    let prevouts = [prevout.clone()];
     let mut cache = SighashCache::new(spending);
     let sighash = cache
-        .taproot_key_spend_signature_hash(input_idx, &Prevouts::All(&prevouts), sighash_type)
+        .taproot_key_spend_signature_hash(input_idx, &Prevouts::All(prevouts), sighash_type)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let message = bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array());
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
