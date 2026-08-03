@@ -76,17 +76,16 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 
 ### Resulting feature flags
 
-- `crates/consensus`: `kernel` feature → enables `bitcoinkernel` dep + the dual-path validator. **Default off.**
-- `crates/storage`: `rocksdb`, `fjall`, `redb`, `mdbx` features. Default: `fjall`.
-- Current CI uses Rust 1.95.0 after the workspace MSRV bump; the 2026-05-19 dependency audit above records the older PLAN.md 1.85.0 snapshot.
-- Workspace CI: `clippy`/`test` jobs build with `--no-default-features --features rocksdb,fjall,redb,mdbx,bitcoinconsensus` under Rust 1.95.0. The `kernel-only` job installs `libboost-dev` and builds `bitcoin-rs-consensus` with `--no-default-features --features kernel -- --include-ignored`, because `bitcoinkernel` and `bitcoinconsensus` cannot be linked into the same Rust test binary.
+- `crates/consensus`: `kernel` feature enables `bitcoinkernel` dep and is the production consensus default (**Default ON** across consensus, node, and binary crates). The obsolete `bitcoinconsensus` feature chain was removed.
+- `crates/storage`: `rocksdb`, `fjall`, `redb`, `mdbx` features (all enabled by default in binary; node defaults `fjall,kernel`).
+- Default builds link `bitcoinkernel` and require system dependencies (`cmake` and `libboost-dev`).
+- Workspace CI: `clippy`/`test` jobs build with `FULL_NODE_FEATURES: "rocksdb,fjall,redb,mdbx,kernel"` under Rust 1.95.0 with `libboost-dev` and `cmake` installed up front. The obsolete `kernel-node` job is replaced by `kernel-parity`, while `portable-check` exercises the `--no-default-features` path without C++ build dependencies.
 
 ### What this means for PLAN.md gates
 
-- **G3 (kernel parity)** has a CI build/smoke gate on the `kernel-only` job; the 100k-block parity loop remains the documented gate target until real mainnet fixture plumbing lands.
-- **G7 (4-backend equivalence)** now runs in the default portable CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
+- **G3 (kernel parity)** is exercised on the default build via `kernel-parity`; default builds validate all script classes through bitcoinkernel.
+- **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
 - All other gates (G1, G2, G4, G5, G6, G8 – G14) are unaffected.
-
 ## 2. Task 3 — script interpreter v1 wraps bitcoin crate
 
 Task 3 Step 2 calls for a hand-rolled per-opcode dispatcher. The v1 script
@@ -120,6 +119,14 @@ Multi-input taproot and tapscript spends require the `kernel` feature
 (libbitcoinkernel). Future work, behind a `hand-rolled` feature in
 `crates/script`, ships the missing BIP341/BIP342 interpreter coverage.
 
+
+### Current State Cutover (Tasks 16–18)
+
+The pre-cutover delegation to `bitcoinconsensus` and its associated Taproot coverage gap were resolved by making `bitcoinkernel` (`libbitcoinkernel`) the default production consensus engine across consensus, node, and binary crates. The `bitcoinconsensus` feature chain and backend were removed.
+
+- **Forcing Event:** Mainnet IBD twice stopped at block 938344 under the pre-cutover default (first due to missing complete prevouts, then due to unsupported Taproot script-path witness validation in the Rust/bitcoinconsensus path).
+- **Landed Posture:** Default builds link `bitcoinkernel` and require system dependencies (`cmake` and `libboost-dev`). `bitcoinkernel` validates all script classes (legacy, segwit, and Taproot key-path and script-path spends).
+- **Portable Posture:** The Rust interpreter is retained under `--no-default-features` as an explicit portable posture for differential testing without C++ dependencies, but cannot validate mainnet Taproot script-path scripts.
 ### v1 legacy sighash + `OP_CODESEPARATOR`
 
 `bitcoin::sighash::SighashCache::legacy_signature_hash` rejects scripts that

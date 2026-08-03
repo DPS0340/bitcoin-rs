@@ -17,6 +17,15 @@ multi-peer block-download mechanism, attacking the live-IBD gap (rs 5,332 s vs C
 gocoin ~277 s on live 0→150k). Kernel first; campaigns are sequenced, not interleaved. Campaign A
 opens with a zero-integration spike (U0) that can kill the campaign before any surgery.
 
+
+> **Current State Status Addendum (Tasks 16–18):**
+> Campaign A is completed. `bitcoinkernel` (`libbitcoinkernel`) is now the default production consensus engine across `bitcoin-rs-consensus`, `bitcoin-rs-node`, and `bitcoin-rs`. The obsolete `bitcoinconsensus` feature chain and `kernel-node` alias were removed. Default builds now require system dependencies (`cmake` and `libboost-dev`).
+>
+> **Forcing Event and Seam Coverage:**
+> Mainnet IBD twice stopped at block 938344 under the pre-cutover default (first due to missing complete prevouts, then due to unsupported Taproot script-path witness validation in the Rust/bitcoinconsensus path). Making `bitcoinkernel` the default production engine resolves Taproot script-path validation across all script classes through the public consensus seam.
+>
+> **Historical Evidence Notice:**
+> Benchmark numbers in this plan (such as the 296.2 s vs 67 s replay figures) were measured under the pre-cutover `bitcoinconsensus` and early kernel spike setups. They serve as historical baseline markers and are non-comparable with kernel-default production builds. Full-tip live mainnet IBD performance must be remeasured under the landed kernel default.
 ---
 
 ## Problem Frame

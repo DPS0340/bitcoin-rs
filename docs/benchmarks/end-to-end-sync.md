@@ -1,9 +1,10 @@
 # End-to-end sync benchmarks
 
-> **Evidence status:** This page publishes completed historical runs and their raw JSON. It is not a current-HEAD full-tip result or a G14 performance-gate pass. No completed run here reaches height 957,600, no paired Bitcoin Core artifact exists, and none measures commit `4cfd3df`. Treat every number as descriptive unless a comparison below states that its range, source, validation posture, and commit match.
+> **Evidence status:** This page publishes completed historical runs and their raw JSON. All numbers and artifacts below reflect historical runs performed prior to the Task 16 cutover, where `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine across `bitcoin-rs-consensus`, `bitcoin-rs-node`, and `bitcoin-rs`.
 >
-> This publication is provisional. A clean paired 0–957,600 G14 campaign remains separate follow-up work.
-> Commit `9ce0727ced19644e551d1eac7895993fe43a7db6` is an unpushed local research revision not resolvable from remote history. The historical `kernel` and `parverify` verification-engine labels are inferred from filenames and run notes, not machine-recorded Cargo feature metadata.
+> The obsolete `bitcoinconsensus` backend was removed in Task 16 after fresh mainnet IBD stopped at block 938344 (exposing missing complete prevouts and unsupported Taproot script-path verification in the portable path). Default builds now require system dependencies (`cmake` and `libboost-dev`).
+>
+> Historical `bitcoinconsensus` and early experimental `kernel` numbers published here serve as historical records and are non-comparable with kernel-default production builds. No full-tip (height 957,600+) live IBD run or G14 performance-gate pass has been completed under the landed kernel default. Final performance claims remain pending fresh measurements.
 
 The machine-readable attachments preserve every recorded field and stage timer. The source artifacts do not record the exact command line, compiler flags, CPU affinity, cache state, host identity, exit code, or replication count. Those missing fields prevent a reproducible controlled claim.
 

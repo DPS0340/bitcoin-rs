@@ -196,6 +196,9 @@ This section tracks the aggressive sync/UTXO performance campaign that has lande
 It is a status addendum to the roadmap below, not a replacement for the all-up shippability gates.
 Do not mark the broad roadmap tasks complete from these slices alone unless the named gate evidence exists.
 
+**Consensus verifier cutover note (Tasks 16–18):**
+The historical entries below record evidence commands from the 2026-06-05 campaign when `bitcoinconsensus` was enabled. In Tasks 16–18, `bitcoinconsensus` was removed and `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine (`FULL_NODE_FEATURES: rocksdb,fjall,redb,mdbx,kernel`). Default builds now link `bitcoinkernel` and require `cmake` and `libboost-dev`. Historical evidence items below using `bitcoinconsensus` are preserved as historical records and are non-comparable with kernel-default runs.
+
 **Merged into `origin/main`:**
 
 - [x] Node sync request scheduling was compressed with bounded peer selection, FIFO staged-block eviction, collapsed received-block scans, fused getdata cache construction, alternate-peer retries for expired blocks, contiguous received-scan candidates, inbound drain batching, inbound wakeups, and retry-metric coalescing.
