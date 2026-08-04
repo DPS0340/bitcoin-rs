@@ -238,6 +238,91 @@ impl ApplyAdmission {
     }
 }
 
+
+/// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
+///
+/// Historical script verification may be skipped only while the active header
+/// chain is verified to contain the pinned anchor block. The gate starts
+/// trusted when no anchor applies (no pin configured) and starts untrusted
+/// when an anchor is pinned; [`AssumeValidGate::evaluate`] re-evaluates trust
+/// against the block tree whenever a new inbound headers batch is accepted.
+#[derive(Debug)]
+pub struct AssumeValidGate {
+    /// Pinned `(height, hash)` anchor, or `None` when no pin applies.
+    anchor: Option<(u32, Hash256)>,
+    /// Whether the active chain is currently verified to contain the anchor.
+    trusted: AtomicBool,
+    /// Whether the diverged-chain warning has already been emitted.
+    warned: AtomicBool,
+}
+
+impl AssumeValidGate {
+    /// Builds the gate for `network` gated on `configured_height`.
+    ///
+    /// The network's pinned anchor applies only when `configured_height` equals
+    /// the anchor height (the production default). Any other value — `0` (full
+    /// verification opt-in) or a custom height-only shortcut — leaves the gate
+    /// unpinned and therefore always trusted.
+    #[must_use]
+    pub fn new(network: Network, configured_height: u32) -> Self {
+        let anchor = network
+            .assume_valid_anchor()
+            .filter(|(height, _)| *height == configured_height);
+        Self {
+            trusted: AtomicBool::new(anchor.is_none()),
+            warned: AtomicBool::new(false),
+            anchor,
+        }
+    }
+
+    /// Builds a gate directly from an optional pinned anchor.
+    #[must_use]
+    pub fn with_anchor(anchor: Option<(u32, Hash256)>) -> Self {
+        Self {
+            trusted: AtomicBool::new(anchor.is_none()),
+            warned: AtomicBool::new(false),
+            anchor,
+        }
+    }
+
+    /// Returns whether historical script verification may currently be skipped.
+    #[must_use]
+    pub fn trusted(&self) -> bool {
+        self.trusted.load(Ordering::Relaxed)
+    }
+
+    /// Re-evaluates trust against `tree`'s active chain.
+    ///
+    /// Trusted only when the active tip is at or above the pinned height and
+    /// the node at the pinned height on the active chain carries the pinned
+    /// hash. Emits a one-time warning when a chain at/past the anchor height
+    /// lacks the anchor block; such a chain is never trusted.
+    pub fn evaluate(&self, tree: &BlockTree) {
+        let Some((pinned_height, pinned_hash)) = self.anchor else {
+            return;
+        };
+        let Some(tip) = tree.tip() else {
+            self.trusted.store(false, Ordering::Relaxed);
+            return;
+        };
+        if tip.height < pinned_height {
+            self.trusted.store(false, Ordering::Relaxed);
+            return;
+        }
+        let trusted = tree
+            .node_at_height_from(tip.tip_id, pinned_height)
+            .is_some_and(|id| tree.lookup(pinned_hash) == Some(id));
+        if !trusted && !self.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                pinned_height,
+                pinned_hash = %pinned_hash,
+                "active chain lacks the assume-valid anchor block; verifying every script",
+            );
+        }
+        self.trusted.store(trusted, Ordering::Relaxed);
+    }
+}
+
 /// Owned shared handle set needed by `apply_block` to perform a block apply.
 #[derive(Clone)]
 pub struct ApplyHandles {
@@ -274,6 +359,8 @@ pub struct ApplyHandles {
     /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
+    /// Hash-pinned assume-valid trust gate; the height shortcut above applies only while this is trusted.
+    pub assume_valid_gate: Arc<AssumeValidGate>,
 }
 
 impl ApplyHandles {
@@ -314,6 +401,7 @@ impl ApplyHandles {
             g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
             assume_valid_height: 0,
+            assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
         }
     }
 
@@ -1077,8 +1165,11 @@ fn verify_block_transactions(
         }
         return Ok(());
     }
-    // Height-only assume-valid: skip kernel / portable script execution only.
-    let skip_scripts = handles.assume_valid_height > 0 && height <= handles.assume_valid_height;
+    // Assume-valid: skip kernel / portable script execution only, and only while the
+    // hash-pinned trust gate holds (always trusted when no pin is configured).
+    let skip_scripts = handles.assume_valid_height > 0
+        && height <= handles.assume_valid_height
+        && handles.assume_valid_gate.trusted();
     if skip_scripts && !tx_plan.needs_local_utxo_overlay {
         let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
         block.txdata.par_iter().try_for_each(|tx| {
@@ -2269,6 +2360,81 @@ mod consensus_rule_tests {
                 bitcoin_rs_consensus::ConsensusError::CoinbaseScriptSigSize { len: 1 }
             )
         ));
+    }
+
+    #[test]
+    fn assume_valid_gate_new_pins_only_the_exact_anchor_height() {
+        let anchor_height = Network::Mainnet
+            .assume_valid_anchor()
+            .map(|(height, _)| height)
+            .unwrap_or(0);
+        assert!(anchor_height > 0);
+
+        let no_pin = AssumeValidGate::new(Network::Mainnet, 0);
+        assert!(no_pin.trusted(), "zero configured height means no pin");
+
+        let pinned = AssumeValidGate::new(Network::Mainnet, anchor_height);
+        assert!(
+            !pinned.trusted(),
+            "exact anchor height starts untrusted until the chain is evaluated"
+        );
+
+        let off_by_one = AssumeValidGate::new(Network::Mainnet, anchor_height + 1);
+        assert!(
+            off_by_one.trusted(),
+            "custom heights keep the height-only shortcut without a pin"
+        );
+
+        let unanchored = AssumeValidGate::with_anchor(None);
+        assert!(unanchored.trusted(), "no anchor means always trusted");
+    }
+
+    #[test]
+    fn assume_valid_gate_evaluate_trusts_only_the_chain_containing_the_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = empty_apply_handles();
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let headers: Vec<_> = (0..=4).map(|height| (bits, height)).collect();
+        seed_pow_chain_with_headers(&handles, &headers)?;
+
+        let anchor_hash = {
+            let tree = handles.block_tree.read();
+            let tip = tree.tip().ok_or_else(|| std::io::Error::other("missing tip"))?;
+            let anchor_id = tree
+                .node_at_height_from(tip.tip_id, 2)
+                .ok_or_else(|| std::io::Error::other("missing anchor node"))?;
+            tree.node(anchor_id)?.hash
+        };
+
+        let pinned = AssumeValidGate::with_anchor(Some((2, anchor_hash)));
+        assert!(!pinned.trusted(), "pinned gate starts untrusted");
+        {
+            let tree = handles.block_tree.read();
+            pinned.evaluate(&tree);
+        }
+        assert!(
+            pinned.trusted(),
+            "active chain contains the anchor block, so the gate must trust it"
+        );
+
+        let diverged = AssumeValidGate::with_anchor(Some((2, Hash256::from_le_bytes(&[0xee; 32]))));
+        {
+            let tree = handles.block_tree.read();
+            diverged.evaluate(&tree);
+        }
+        assert!(
+            !diverged.trusted(),
+            "a chain lacking the pinned hash must never be trusted"
+        );
+        {
+            let tree = handles.block_tree.read();
+            diverged.evaluate(&tree);
+        }
+        assert!(
+            !diverged.trusted(),
+            "re-evaluation on the same diverged chain keeps the gate untrusted"
+        );
+        Ok(())
     }
 
     #[test]

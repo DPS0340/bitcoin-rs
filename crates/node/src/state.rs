@@ -949,6 +949,10 @@ impl NodeState {
             g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
             assume_valid_height: config.assume_valid_height,
+            assume_valid_gate: Arc::new(crate::apply::AssumeValidGate::new(
+                config.network,
+                config.assume_valid_height,
+            )),
         };
         let sync = Arc::new(crate::BlockSync::new(
             apply_handles.clone(),

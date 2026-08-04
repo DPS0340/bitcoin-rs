@@ -345,7 +345,13 @@ assume_valid_height = 10000
         core::iter::empty::<EnvPair>(),
         ["bitcoin-rs-node"],
     )?;
-    assert_eq!(default_config.assume_valid_height, 0);
+    assert_eq!(
+        default_config.assume_valid_height,
+        Network::Mainnet
+            .assume_valid_anchor()
+            .map(|(height, _)| height)
+            .unwrap_or(0)
+    );
     Ok(())
 }
 

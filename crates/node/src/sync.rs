@@ -385,12 +385,13 @@ impl BlockSync {
         while let Ok(InboundHeaders { headers, source }) = receiver.try_recv() {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
-            let acceptance = {
-                let mut tree = self.handles.block_tree.write();
-                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network)
-            };
+            let mut tree = self.handles.block_tree.write();
+            let acceptance =
+                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network);
             match acceptance {
                 Ok(node_ids) => {
+                    self.handles.assume_valid_gate.evaluate(&tree);
+                    drop(tree);
                     if let Some(source) = source {
                         let _window = self.download_window.lock();
                         let outbound = self.peer_outbound.read();
@@ -411,6 +412,7 @@ impl BlockSync {
                     );
                 }
                 Err(error) if is_peer_fault(&error) => {
+                    drop(tree);
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         let mut window = self.download_window.lock();
@@ -447,6 +449,7 @@ impl BlockSync {
                     }
                 }
                 Err(error) => {
+                    drop(tree);
                     tracing::warn!(
                         received = batch_len,
                         %error,

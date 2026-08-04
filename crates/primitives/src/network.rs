@@ -20,6 +20,19 @@ const BIP16_EXCEPTION_TESTNET3: Hash256 = Hash256::from_le_bytes(&[
     0x12, 0xcc, 0x08, 0xd2, 0x95, 0x40, 0x1f, 0x00, 0x7c, 0x45, 0x30, 0xdd, 0x00, 0x00, 0x00, 0x00,
 ]);
 
+/// Mainnet assume-valid anchor height — the production default for skipping
+/// historical script verification, paired with [`MAINNET_ASSUME_VALID_HASH`].
+const MAINNET_ASSUME_VALID_HEIGHT: u32 = 938_343;
+
+/// Mainnet assume-valid anchor block hash — display hash
+/// `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`. Stored
+/// in consensus little-endian (display hex reversed byte-wise), following the
+/// `BIP16_EXCEPTION_*` convention above.
+const MAINNET_ASSUME_VALID_HASH: Hash256 = Hash256::from_le_bytes(&[
+    0xac, 0xa5, 0x1b, 0xd5, 0xfa, 0x4b, 0x09, 0x8e, 0x47, 0x7c, 0x17, 0x1d, 0xdc, 0xdc, 0xd8, 0x94,
+    0x91, 0x4d, 0xd7, 0xd6, 0xeb, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+]);
+
 /// A supported Bitcoin network.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Network {
@@ -177,6 +190,23 @@ impl Network {
             Self::Mainnet => block_hash == BIP16_EXCEPTION_MAINNET,
             Self::Testnet3 => block_hash == BIP16_EXCEPTION_TESTNET3,
             _ => false,
+        }
+    }
+
+
+    /// Returns the network's hash-pinned assume-valid anchor `(height, hash)`, or
+    /// `None` when the network has no production anchor.
+    ///
+    /// Mirrors Bitcoin Core's `-assumevalid` semantics: script verification for
+    /// blocks at or below the anchor height may be skipped only while the active
+    /// header chain is verified to contain the exact anchor block. Only mainnet
+    /// ships a pinned anchor; every other network returns `None` and always
+    /// verifies scripts in full.
+    #[must_use]
+    pub const fn assume_valid_anchor(self) -> Option<(u32, Hash256)> {
+        match self {
+            Self::Mainnet => Some((MAINNET_ASSUME_VALID_HEIGHT, MAINNET_ASSUME_VALID_HASH)),
+            Self::Testnet3 | Self::Testnet4 | Self::Signet | Self::Regtest => None,
         }
     }
 
