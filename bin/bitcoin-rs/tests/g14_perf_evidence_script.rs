@@ -1629,6 +1629,73 @@ fn bitcoin_core_mainnet_ibd_wrapper_emits_canonical_criterion_output()
 }
 
 #[test]
+fn bitcoin_core_mainnet_ibd_wrapper_enables_network_after_start_attestation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = write_text(temp.path(), "bitcoin.conf", "chain=main\n")?;
+    let datadir = temp.path().join("core-datadir");
+    fs::create_dir(&datadir)?;
+    let stop_file = temp.path().join("fake-bitcoind.stop");
+    let bitcoind = fake_bitcoind_command(temp.path(), "bitcoind", &stop_file)?;
+    let bitcoin_cli = fake_measured_bitcoin_core_cli(
+        temp.path(),
+        "bitcoin-cli",
+        FakeBitcoinCliMode::Mainnet,
+        &stop_file,
+    )?;
+    let calls_log = temp.path().join("bitcoin-cli.calls-log");
+
+    let output = Command::new("bash")
+        .arg(bitcoin_core_mainnet_ibd_script_path())
+        .args([
+            "--ibd-start-height",
+            "0",
+            "--ibd-stop-height",
+            "10",
+            "--ibd-start-hash",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--ibd-stop-hash",
+            "000000000000000000000000000000000000000000000000000000000000000a",
+            "--datadir",
+            datadir.to_str().ok_or("non-UTF-8 datadir path")?,
+            "--bitcoin-core-config",
+            config.to_str().ok_or("non-UTF-8 config path")?,
+            "--bitcoind-command",
+            bitcoind.to_str().ok_or("non-UTF-8 bitcoind path")?,
+            "--bitcoin-cli-command",
+            bitcoin_cli.to_str().ok_or("non-UTF-8 bitcoin-cli path")?,
+            "--poll-interval-seconds",
+            "0.01",
+            "--startup-timeout-seconds",
+            "5",
+            "--ibd-timeout-seconds",
+            "0.6",
+        ])
+        .output()?;
+
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("bitcoin-core/mainnet-ibd   time:"), "stdout: {stdout}");
+    assert!(stop_file.exists());
+
+    let calls = fs::read_to_string(&calls_log)?;
+    let order: Vec<&str> = calls.lines().collect();
+    let first_info = order
+        .iter()
+        .position(|call| *call == "getblockchaininfo")
+        .ok_or("expected a getblockchaininfo call")?;
+    let first_activate = order
+        .iter()
+        .position(|call| *call == "setnetworkactive")
+        .ok_or("expected a setnetworkactive call")?;
+    assert!(
+        first_info < first_activate,
+        "start attestation must precede P2P activation, calls: {order:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn bitcoin_core_mainnet_ibd_wrapper_help_shows_ibd_timeout_default()
 -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("bash")
@@ -5473,7 +5540,11 @@ fn fake_bitcoind_command_with_shutdown_delay(
         format!(
             r#"#!/usr/bin/env python3
 import pathlib
+import sys
 import time
+
+if "-networkactive=0" not in sys.argv:
+    raise SystemExit("fake bitcoind requires -networkactive=0 launch gate")
 
 stop_file = pathlib.Path({stop_file:?})
 deadline = time.monotonic() + 10.0
@@ -6721,6 +6792,8 @@ fn fake_measured_bitcoin_core_cli(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path = dir.join(name);
     let state_file = dir.join(format!("{name}.chaininfo-calls"));
+    let network_file = dir.join(format!("{name}.network-active"));
+    let calls_log = dir.join(format!("{name}.calls-log"));
     let hash_expr = mode.hash_expr();
     let chain = mode.chain();
     let (initial_blocks, initial_headers) = mode.measured_initial_blocks_headers();
@@ -6744,25 +6817,38 @@ import pathlib
 import sys
 
 args = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
+STATE_FILE = pathlib.Path({state_file:?})
+NETWORK_FILE = pathlib.Path({network_file:?})
+CALLS_LOG = pathlib.Path({calls_log:?})
+RPC_WARMUP = {rpc_warmup}
 RPC_DROP_AFTER_START = {rpc_drop_after_start}
 
+if args:
+    with CALLS_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(args[0] + "\n")
 
 if len(args) == 1 and args[0] == "stop":
     pathlib.Path({stop_file:?}).write_text("stop\n", encoding="utf-8")
     print("Bitcoin Core stopping")
     raise SystemExit(0)
 
+if len(args) == 2 and args[0] == "setnetworkactive" and args[1] == "true":
+    NETWORK_FILE.write_text("active\n", encoding="utf-8")
+    print("true")
+    raise SystemExit(0)
+
 if len(args) == 1 and args[0] == "getblockchaininfo":
-    state_file = pathlib.Path({state_file:?})
-    call_count = int(state_file.read_text(encoding="utf-8")) if state_file.exists() else 0
-    if {rpc_warmup} and not state_file.exists():
-        state_file.write_text("-1", encoding="utf-8")
+    if RPC_WARMUP and not STATE_FILE.exists():
+        STATE_FILE.write_text("0", encoding="utf-8")
         raise SystemExit("RPC server not ready")
-    if RPC_DROP_AFTER_START and call_count > 0:
+    successes = int(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else 0
+    if RPC_DROP_AFTER_START and successes > 0:
         raise SystemExit("RPC dropped after start")
-    state_file.write_text(str(call_count + 1), encoding="utf-8")
-    blocks = {initial_blocks} if call_count <= 0 else {blocks}
-    headers = {initial_headers} if call_count <= 0 else {headers}
+    STATE_FILE.write_text(str(successes + 1), encoding="utf-8")
+    if NETWORK_FILE.exists():
+        blocks, headers = {blocks}, {headers}
+    else:
+        blocks, headers = {initial_blocks}, {initial_headers}
     print(json.dumps({{"chain": "{chain}", "blocks": blocks, "headers": headers}}))
     raise SystemExit(0)
 
@@ -6774,7 +6860,8 @@ print({hash_expr})
 "#,
             stop_file = stop_file.display().to_string(),
             state_file = state_file.display().to_string(),
-            rpc_drop_after_start = rpc_drop_after_start,
+            network_file = network_file.display().to_string(),
+            calls_log = calls_log.display().to_string(),
         ),
     )?;
     let mut permissions = fs::metadata(&path)?.permissions();
