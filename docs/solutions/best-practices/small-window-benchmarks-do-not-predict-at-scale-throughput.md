@@ -57,10 +57,17 @@ refresh.
    ≪ the effect being measured, fix the harness (here: keep-alive REST block source,
    commit `4700c25`) before recording any number.
 3. **Match validation posture across nodes or the comparison is fiction.** Core defaults
-   (`-assumevalid`) and gocoin defaults (`LastTrustedBlock`) skip historical script checks;
-   bitcoin-rs's default (`assume_valid_height = 0`) checks everything. Pin both sides
-   explicitly (`-assumevalid=0` ↔ `assume_valid_height=0`) and record the posture in the
-   artifact.
+   (`-assumevalid`) and gocoin defaults (`LastTrustedBlock`) skip historical script checks.
+   `bitcoin-rs` mainnet nodes default to assume-valid enabled using the hash-pinned anchor
+   at height 938343 (block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`),
+   skipping historical script checks once the active header chain validates the anchor.
+   Full script verification requires explicit opt-in (`--assume-valid-height 0` or
+   `mainnet_prefix_replay`, which defaults to 0). The node's optimized default posture pairs
+   this mainnet assume-valid anchor with the `fjall` storage backend, multi-peer block
+   download (outbound peer target 8, pending budget 128, 16 in-flight per peer), 450 MiB
+   database cache (`dbcache`), and disabled secondary indexes/pruning. When running head-to-head
+   benchmarks, pin both sides explicitly (for full validation, `-assumevalid=0` ↔
+   `--assume-valid-height 0`) and record the posture in the artifact.
 Single-machine criterion trust (rebuild codegen drift, CLI baseline flags, allocator parity)
 is its own note: [criterion-bench-trust-rebuild-drift-baselines-allocator](criterion-bench-trust-rebuild-drift-baselines-allocator.md).
 Process hygiene for stale blockers is in

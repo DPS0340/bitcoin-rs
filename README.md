@@ -29,6 +29,16 @@ gates G1-G14 in `PLAN.md`.
   signing methods return -32603 "wallet has no private keys".
 - mimalloc global allocator and a crossbeam-channel event loop.
 
+## Default posture
+
+`bitcoin-rs` runs by default with an optimized posture for mainnet Initial Block Download (IBD):
+
+- **Hash-pinned assume-valid**: Mainnet nodes skip historical transaction script verification up to height 938343 (block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`). Script checks are skipped only after the node validates that the active header chain contains this exact anchor block hash. Diverged chains and sub-anchor tips remain untrusted and undergo full script verification. Full script verification is available via `--assume-valid-height 0`. Non-mainnet networks default to height 0.
+- **Storage backend**: `fjall` storage backend by default.
+- **Multi-peer block download**: Enabled by default with an outbound P2P target of 8 peers (fanout threshold), a pending block budget of 128, and up to 16 in-flight blocks per peer.
+- **Database cache**: 450 MiB database cache (`dbcache`), matching Bitcoin Core default allocation parity.
+- **Indexes and features**: Transaction index (`txindex`), block filter index (`blockfilterindex`), pruning, and utreexo stateless validation are disabled by default.
+
 ## Build
 
 Default builds link bitcoinkernel and require system dependencies (`libboost-dev` and `cmake`).

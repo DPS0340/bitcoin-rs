@@ -21,7 +21,13 @@ A peer that holds up the apply frontier by having been assigned a frontier block
 Stalling detection is the mechanism that identifies the staller and, in the reference (Bitcoin Core) design, disconnects it so another peer can supply the blocking block. Without stalling detection, a staller freezes apply progress until a long fixed timeout elapses.
 
 ### assumevalid
-A validation mode that skips script-signature verification for blocks at or below a configured trusted height while still performing every other consensus check, used to accelerate IBD without abandoning validation; blocks above the height are fully verified.
+A validation mode that skips script-signature verification for blocks at or below a configured trusted height while still performing every other consensus check, used to accelerate IBD without abandoning validation; blocks above the height are fully verified. Mainnet nodes in `bitcoin-rs` default to assume-valid enabled at anchor height 938343.
+
+### Hash-pinned assume-valid anchor
+The mainnet consensus checkpoint (height 938343, block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`) used by default on mainnet to gate historical script verification. The node skips script verification for blocks at or below height 938343 only after validating that the active header chain contains this exact anchor hash. Sub-anchor header tips and diverged chains remain untrusted and trigger full script verification. Passing `--assume-valid-height 0` explicitly requests full verification across all blocks. Custom nonzero heights skip script checks up to that height without hash gating. Non-mainnet networks default to height 0. Replay measurement tools like `mainnet_prefix_replay` retain a default of 0 to ensure full-validation benchmark fidelity.
+
+### Optimized default posture
+The standard node operational configuration tuned for mainnet sync: `fjall` storage backend, multi-peer block download active (outbound peer target 8, pending block budget 128, 16 in-flight requests per peer), hash-pinned assume-valid active on mainnet (height 938343), 450 MiB database cache (`dbcache`, matching Bitcoin Core parity), with secondary indexes (`txindex`, `blockfilterindex`), pruning, and `utreexo` stateless validation disabled by default.
 
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture.
