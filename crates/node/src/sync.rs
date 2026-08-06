@@ -371,7 +371,7 @@ impl BlockSync {
             self.record_pending_sync_metrics();
         }
     }
-
+    #[allow(clippy::too_many_lines)]
     fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;

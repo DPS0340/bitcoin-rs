@@ -1148,7 +1148,11 @@ fn resolve_block_prevouts(
             .collect())
     }
 }
-#[allow(clippy::as_conversions)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -1171,7 +1175,23 @@ fn verify_block_transactions(
         && height <= handles.assume_valid_height
         && handles.assume_valid_gate.trusted();
     if skip_scripts && !tx_plan.needs_local_utxo_overlay {
-        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
+        let resolved = resolve_block_prevouts(handles, block, tx_plan, height)?;
+        let mut map = HashMap::with_capacity(
+            block
+                .txdata
+                .iter()
+                .filter(|tx| !tx.is_coinbase())
+                .map(|tx| tx.input.len())
+                .sum(),
+        );
+        for (tx, inputs) in block.txdata.iter().zip(resolved) {
+            for (input, prevout) in tx.input.iter().zip(inputs) {
+                if let Some(prevout) = prevout {
+                    map.insert(input.previous_output, prevout);
+                }
+            }
+        }
+        let view = ResolvedPrevoutView(map);
         block.txdata.par_iter().try_for_each(|tx| {
             if tx.is_coinbase() {
                 bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
@@ -1318,6 +1338,19 @@ impl UtxoView for BlockLocalUtxoView<'_> {
         self.base
             .get_entry(&internal_outpoint(outpoint))
             .map(|entry| entry.txout)
+    }
+}
+
+/// Owned prevout map used during the assume-valid skip path.
+///
+/// The portable validator only needs `TxOut` values, so we pre-resolve them
+/// once from the UTXO set and answer lookups from a flat `HashMap` instead of
+/// repeatedly acquiring per-shard locks on the live `UtxoSet`.
+struct ResolvedPrevoutView(HashMap<bitcoin::OutPoint, bitcoin::TxOut>);
+
+impl UtxoView for ResolvedPrevoutView {
+    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+        self.0.get(outpoint).cloned()
     }
 }
 

@@ -881,7 +881,7 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
     }
 
     fn begin_batch(&mut self) {
-        Self::begin_batch(self)
+        Self::begin_batch(self);
     }
 
     fn end_batch(&mut self) -> Result<(), IndexError> {
