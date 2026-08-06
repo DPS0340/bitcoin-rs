@@ -949,15 +949,19 @@ impl ProductionStateSyncFixture {
     }
 
     fn assert_getdata_batch(&self) {
-        let getdata_count = match self
+        let rx = self
             .outbound_rxs
             .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory.len(),
-            other => panic!("expected production getdata, got {other:?}"),
+            .unwrap_or_else(|| panic!("missing primary outbound receiver"));
+        let getdata_count = loop {
+            match rx
+                .try_recv()
+                .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
+            {
+                NetworkMessage::GetData(inventory) => break inventory.len(),
+                NetworkMessage::GetHeaders(_) => continue,
+                other => panic!("expected production getdata, got {other:?}"),
+            }
         };
         assert_eq!(getdata_count, self.expected_getdata_count);
     }
