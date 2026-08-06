@@ -953,13 +953,22 @@ impl ProductionStateSyncFixture {
             .outbound_rxs
             .first()
             .unwrap_or_else(|| panic!("missing primary outbound receiver"));
+        let mut drained_headers = 0_usize;
         let getdata_count = loop {
             match rx
                 .try_recv()
                 .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
             {
                 NetworkMessage::GetData(inventory) => break inventory.len(),
-                NetworkMessage::GetHeaders(_) => continue,
+                NetworkMessage::GetHeaders(_) => {
+                    drained_headers = drained_headers.saturating_add(1);
+                    if drained_headers > 32 {
+                        panic!(
+                            "expected production getdata after draining {drained_headers} header requests"
+                        );
+                    }
+                    continue;
+                }
                 other => panic!("expected production getdata, got {other:?}"),
             }
         };
