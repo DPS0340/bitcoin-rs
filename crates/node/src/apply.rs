@@ -982,7 +982,19 @@ impl WitnessPresence {
 }
 
 fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
-    let mut txids = Vec::with_capacity(block.txdata.len());
+    let txids: Vec<Txid> = if block.txdata.len() > 32 {
+        block
+            .txdata
+            .par_iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect()
+    } else {
+        block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect()
+    };
     let mut only_coinbase = true;
     let mut needs_local_utxo_overlay = false;
     let mut overlay_capacity = 0usize;
@@ -997,11 +1009,9 @@ fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
     let track_spent_conflicts = block.txdata.len() > 2;
     let mut saw_non_coinbase = false;
 
-    for tx in &block.txdata {
+    for (tx_index, (tx, txid)) in block.txdata.iter().zip(txids.iter().copied()).enumerate() {
         let is_coinbase = tx.is_coinbase();
         let output_count = tx.output.len();
-        let txid = tx.compute_txid();
-        txids.push(txid);
         only_coinbase &= is_coinbase;
         created_output_count = created_output_count.saturating_add(output_count);
         if is_coinbase {
@@ -1011,7 +1021,7 @@ fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
             let input_count = tx.input.len();
             for input in &tx.input {
                 has_witness |= !input.witness.is_empty();
-                let prior_txids = &txids[..txids.len().saturating_sub(1)];
+                let prior_txids = &txids[..tx_index];
                 let spends_created_output = if prior_txids.len() <= LOCAL_OVERLAY_TXID_SET_THRESHOLD
                 {
                     prior_txids.contains(&input.previous_output.txid)
