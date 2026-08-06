@@ -347,7 +347,6 @@ impl BlockSync {
             tracing::trace!(applied_height, "block sync: no peer above current height");
             return;
         }
-        let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
         let mut sent_getdata = false;
         let request_peer_count = sync_peer_selection.request_peers.len();
         for (peer_idx, peer) in sync_peer_selection.request_peers.into_iter().enumerate() {
@@ -368,12 +367,6 @@ impl BlockSync {
             }
         }
         self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
-        if let Some(peer) = sync_peer_selection.header_peer {
-            let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
-            if peer_best_height > header_height {
-                self.send_getheaders(peer.addr, header_height, peer.start_height);
-            }
-        }
         if sent_getdata {
             self.record_pending_sync_metrics();
         }
@@ -460,6 +453,36 @@ impl BlockSync {
         }
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
+        }
+        let applied_tip = self.handles.applied_tip.load_full();
+        let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let chain_tip = self.handles.chain_tip.load_full();
+        let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
+        let header_peer = {
+            let peers = self.peers.read();
+            let mut best: Option<SyncPeer> = None;
+            for peer in peers.iter() {
+                let Ok(height) = u32::try_from(peer.start_height) else {
+                    continue;
+                };
+                if height <= applied_height {
+                    continue;
+                }
+                let candidate = SyncPeer {
+                    addr: peer.addr,
+                    start_height: peer.start_height,
+                };
+                if best.is_none_or(|current| current.start_height < candidate.start_height) {
+                    best = Some(candidate);
+                }
+            }
+            best
+        };
+        if let Some(peer) = header_peer {
+            let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
+            if peer_best_height > header_height {
+                self.send_getheaders(peer.addr, header_height, peer.start_height);
+            }
         }
     }
 
@@ -654,6 +677,9 @@ impl BlockSync {
             return (0, 0);
         };
         let started = Instant::now();
+        if let Some(tx_index) = &self.handles.tx_index {
+            tx_index.lock().begin_batch();
+        }
         let (drained, expected_len) = self
             .drain_cached_expected_blocks(staged_count)
             .unwrap_or_else(|| {
@@ -717,6 +743,12 @@ impl BlockSync {
             self.advance_expected_apply_cache(&applied_hashes, failed_hash.is_some());
             metrics::histogram!("node.sync.apply_buffered_blocks_seconds")
                 .record(started.elapsed().as_secs_f64());
+        }
+        #[allow(clippy::significant_drop_in_scrutinee)]
+        if let Some(tx_index) = &self.handles.tx_index {
+            if let Err(error) = tx_index.lock().end_batch() {
+                tracing::warn!(%error, "block sync: tx_index batch flush failed");
+            }
         }
         (applied, failed)
     }

@@ -995,7 +995,7 @@ fn populate_sync_header_chain(
         tip_id = tree
             .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
             .unwrap_or_else(|error| panic!("synthetic header insert failed: {error}"));
-        if height == 1 || (3..=SYNC_PROXY_BLOCKS.saturating_add(1)).contains(&height) {
+        if height == 1 || (3..=body_blocks).contains(&height) {
             let node = tree
                 .node(tip_id)
                 .unwrap_or_else(|error| panic!("synthetic header lookup failed: {error}"));

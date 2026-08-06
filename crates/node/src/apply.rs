@@ -1135,7 +1135,7 @@ fn resolve_block_prevouts(
         let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
         Ok(block
             .txdata
-            .iter()
+            .par_iter()
             .map(|tx| {
                 if tx.is_coinbase() {
                     return Vec::new();
@@ -1148,6 +1148,7 @@ fn resolve_block_prevouts(
             .collect())
     }
 }
+#[allow(clippy::as_conversions)]
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -1218,8 +1219,9 @@ fn verify_block_transactions(
     // block; the non-overlay case reads the committed shared set directly.
     let resolution_started = quanta::Instant::now();
     let resolution_result = resolve_block_prevouts(handles, block, tx_plan, height);
+    let resolution_dur = resolution_started.elapsed();
     metrics::histogram!("node.apply_block.script_resolution_seconds")
-        .record(resolution_started.elapsed().as_secs_f64());
+        .record(resolution_dur.as_secs_f64());
     let resolved = resolution_result?;
 
     // Consensus has no `metrics` dependency, so it measures its serial
@@ -1240,6 +1242,13 @@ fn verify_block_transactions(
     metrics::histogram!("node.apply_block.script_parallel_seconds")
         .record(script_timings.parallel_seconds);
     script_input_result?;
+    tracing::debug!(
+        height,
+        script_resolution_us = resolution_dur.as_micros(),
+        script_prepare_us = (script_timings.prepare_seconds * 1_000_000.0) as u64,
+        script_parallel_us = (script_timings.parallel_seconds * 1_000_000.0) as u64,
+        "script_verify: profile"
+    );
     Ok(())
 }
 
