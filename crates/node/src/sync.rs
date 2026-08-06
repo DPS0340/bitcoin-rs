@@ -6122,8 +6122,7 @@ mod tests {
     }
 
     fn install_budget(sync: &BlockSync, budget: super::SyncBudget) {
-        *sync.download_window.lock() = super::DownloadWindow::new(budget);
-        *sync.block_stager.lock() = super::BlockStager::new(budget);
+        sync.install_budget(budget);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]
