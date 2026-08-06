@@ -193,7 +193,6 @@ impl Network {
         }
     }
 
-
     /// Returns the network's hash-pinned assume-valid anchor `(height, hash)`, or
     /// `None` when the network has no production anchor.
     ///

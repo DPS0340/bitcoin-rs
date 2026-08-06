@@ -259,7 +259,9 @@ impl Config {
             zmqpubhashtxhwm: None,
             zmqpubrawblockhwm: None,
             zmqpubrawtxhwm: None,
-            assume_valid_height: network.assume_valid_anchor().map_or(0, |(height, _)| height),
+            assume_valid_height: network
+                .assume_valid_anchor()
+                .map_or(0, |(height, _)| height),
             shutdown_signal: None,
         }
     }

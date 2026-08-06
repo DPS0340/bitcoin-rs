@@ -1675,7 +1675,10 @@ fn bitcoin_core_mainnet_ibd_wrapper_enables_network_after_start_attestation()
 
     assert_success(&output);
     let stdout = String::from_utf8(output.stdout)?;
-    assert!(stdout.contains("bitcoin-core/mainnet-ibd   time:"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("bitcoin-core/mainnet-ibd   time:"),
+        "stdout: {stdout}"
+    );
     assert!(stop_file.exists());
 
     let calls = fs::read_to_string(&calls_log)?;

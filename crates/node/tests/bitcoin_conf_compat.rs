@@ -143,8 +143,7 @@ assumevalid=0000000000000000000000000000000000000000000000000000000000000000
         config.assume_valid_height,
         Network::Mainnet
             .assume_valid_anchor()
-            .map(|(height, _)| height)
-            .unwrap_or(0),
+            .map_or(0, |(height, _)| height),
         "Bitcoin Core hash-based assumevalid must not alter the hash-pinned assume_valid_height default"
     );
     Ok(())

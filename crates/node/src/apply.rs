@@ -238,7 +238,6 @@ impl ApplyAdmission {
     }
 }
 
-
 /// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
 ///
 /// Historical script verification may be skipped only while the active header
@@ -2366,8 +2365,7 @@ mod consensus_rule_tests {
     fn assume_valid_gate_new_pins_only_the_exact_anchor_height() {
         let anchor_height = Network::Mainnet
             .assume_valid_anchor()
-            .map(|(height, _)| height)
-            .unwrap_or(0);
+            .map_or(0, |(height, _)| height);
         assert!(anchor_height > 0);
 
         let no_pin = AssumeValidGate::new(Network::Mainnet, 0);
@@ -2399,7 +2397,9 @@ mod consensus_rule_tests {
 
         let anchor_hash = {
             let tree = handles.block_tree.read();
-            let tip = tree.tip().ok_or_else(|| std::io::Error::other("missing tip"))?;
+            let tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing tip"))?;
             let anchor_id = tree
                 .node_at_height_from(tip.tip_id, 2)
                 .ok_or_else(|| std::io::Error::other("missing anchor node"))?;

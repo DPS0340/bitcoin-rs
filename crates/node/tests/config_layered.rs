@@ -349,8 +349,7 @@ assume_valid_height = 10000
         default_config.assume_valid_height,
         Network::Mainnet
             .assume_valid_anchor()
-            .map(|(height, _)| height)
-            .unwrap_or(0)
+            .map_or(0, |(height, _)| height)
     );
     Ok(())
 }
