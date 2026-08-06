@@ -29,7 +29,8 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
-use self::window::{DownloadWindow, SyncBudget};
+use self::window::DownloadWindow;
+pub use self::window::SyncBudget;
 
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
@@ -289,6 +290,14 @@ impl BlockSync {
             pending_getheaders: Arc::new(Mutex::new(None)),
             expected_apply_cache: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Replaces the download window and block stager with ones configured by
+    /// `budget`. Intended for tests and benchmarks that need to exercise
+    /// non-default capacity limits.
+    pub fn install_budget(&self, budget: SyncBudget) {
+        *self.download_window.lock() = DownloadWindow::new(budget);
+        *self.block_stager.lock() = BlockStager::new(budget);
     }
 
     /// Returns the sole production peer-registration operation. It preserves
@@ -1468,7 +1477,8 @@ fn metric_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-const fn default_sync_budget() -> SyncBudget {
+/// Returns the production `SyncBudget` used by `BlockSync::new`.
+pub const fn default_sync_budget() -> SyncBudget {
     SyncBudget {
         max_pending_blocks: PENDING_BUDGET,
         max_pending_bytes: PENDING_BYTE_BUDGET,

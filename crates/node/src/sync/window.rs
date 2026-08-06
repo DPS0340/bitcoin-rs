@@ -7,20 +7,21 @@ use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct SyncBudget {
-    pub(super) max_pending_blocks: usize,
-    pub(super) max_pending_bytes: usize,
-    pub(super) max_received_blocks: usize,
-    pub(super) max_received_bytes: usize,
-    pub(super) max_peer_inflight: usize,
-    pub(super) fanout_peer_inflight: usize,
-    pub(super) min_peers_for_fanout: usize,
-    pub(super) getdata_batch_limit: usize,
-    pub(super) pending_timeout: Duration,
-    pub(super) received_timeout: Duration,
-    pub(super) stall_timeout_initial: Duration,
-    pub(super) stall_timeout_max: Duration,
-    pub(super) staller_cooldown: Duration,
+#[allow(missing_docs)]
+pub struct SyncBudget {
+    pub max_pending_blocks: usize,
+    pub max_pending_bytes: usize,
+    pub max_received_blocks: usize,
+    pub max_received_bytes: usize,
+    pub max_peer_inflight: usize,
+    pub fanout_peer_inflight: usize,
+    pub min_peers_for_fanout: usize,
+    pub getdata_batch_limit: usize,
+    pub pending_timeout: Duration,
+    pub received_timeout: Duration,
+    pub stall_timeout_initial: Duration,
+    pub stall_timeout_max: Duration,
+    pub staller_cooldown: Duration,
 }
 
 #[derive(Clone, Debug)]

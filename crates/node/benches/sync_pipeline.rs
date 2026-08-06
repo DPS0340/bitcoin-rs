@@ -24,7 +24,10 @@ use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
 use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
-    BlockSync, Config, Network, NoOpZmqPublisher, apply::ApplyHandles, state::NodeState,
+    BlockSync, Config, Network, NoOpZmqPublisher,
+    apply::ApplyHandles,
+    state::NodeState,
+    sync::{SyncBudget, default_sync_budget},
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
@@ -568,6 +571,13 @@ impl SyncFixture {
     fn new_reverse_scan_overflow(tx_index_mode: TxIndexMode) -> Self {
         let mut fixture =
             Self::new_with_block_count(tx_index_mode, 0, SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS);
+        // The bench stages 128 received blocks and still needs to request the
+        // full 128-block pending window, so the received-block budget must
+        // cover both the staged blocks and the new requests.
+        fixture.sync.install_budget(SyncBudget {
+            max_received_blocks: 256,
+            ..default_sync_budget()
+        });
         let first_index = SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_START_HEIGHT.saturating_sub(1);
         let last_index = first_index.saturating_add(SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_BLOCKS);
         for block in fixture
