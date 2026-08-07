@@ -348,7 +348,7 @@ fn verify_input_script_portable(
 }
 
 /// Per-transaction state retained across the flat block verify phases.
-struct PreparedTx {
+struct PreparedTx<'b> {
     tx_index: usize,
     prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
     pre_error: Option<ConsensusError>,
@@ -356,7 +356,9 @@ struct PreparedTx {
     checks_start: usize,
     checks_len: usize,
     #[cfg(feature = "kernel")]
-    kernel_state: Option<crate::kernel::PreparedKernelTx>,
+    kernel_state: Option<crate::kernel::PreparedKernelTx<bitcoinkernel::TransactionRef<'b>>>,
+    #[cfg(not(feature = "kernel"))]
+    _block: core::marker::PhantomData<&'b ()>,
 }
 
 /// One deferred per-input script check, indexing back into the prepared txs.
@@ -403,6 +405,7 @@ pub fn verify_block_input_scripts(
     locktime_cutoff: u32,
     flags: VerifyFlags,
     timings: &mut ScriptStageTimings,
+    kernel_block: &crate::kernel::KernelBlock,
 ) -> Result<(), ConsensusError> {
     if txs.len() != resolved.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
@@ -412,8 +415,13 @@ pub fn verify_block_input_scripts(
     }
 
     let prepare_started = Instant::now();
-    let (prepared, checks) =
-        prepare_block_input_checks(txs, resolved.as_mut_slice(), height, locktime_cutoff);
+    let (prepared, checks) = prepare_block_input_checks(
+        txs,
+        resolved.as_mut_slice(),
+        height,
+        locktime_cutoff,
+        kernel_block,
+    );
     timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
 
     let parallel_started = Instant::now();
@@ -452,12 +460,16 @@ pub fn verify_block_input_scripts(
 ///
 /// Preparation stops at the first pre-script failure so no later transaction
 /// can outrank it during the final ordered error scan.
-fn prepare_block_input_checks(
+fn prepare_block_input_checks<'b>(
     txs: &[bitcoin::Transaction],
     resolved: &mut [Vec<Option<bitcoin::TxOut>>],
     height: u32,
     locktime_cutoff: u32,
-) -> (Vec<PreparedTx>, Vec<InputCheck>) {
+    // Unused by the portable backend, which verifies rust-bitcoin transactions
+    // directly; kept in the signature so both backends share one call shape.
+    #[cfg_attr(not(feature = "kernel"), expect(unused_variables, reason = "kernel-only"))]
+    kernel_block: &'b crate::kernel::KernelBlock,
+) -> (Vec<PreparedTx<'b>>, Vec<InputCheck>) {
     let mut prepared = Vec::with_capacity(txs.len());
     let mut checks = Vec::new();
     for (tx_index, tx) in txs.iter().enumerate() {
@@ -476,6 +488,8 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
+                    #[cfg(not(feature = "kernel"))]
+                    _block: core::marker::PhantomData,
                 });
                 continue;
             }
@@ -489,6 +503,8 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
+                    #[cfg(not(feature = "kernel"))]
+                    _block: core::marker::PhantomData,
                 });
                 break;
             }
@@ -497,7 +513,11 @@ fn prepare_block_input_checks(
         // Build retained kernel state before checks so setup failure cannot
         // leave an InputCheck without its PreparedKernelTx.
         #[cfg(feature = "kernel")]
-        let kernel_state = match crate::kernel::prepare_kernel_tx(tx, &prep.prevouts) {
+        let kernel_state = match kernel_block
+            .transaction(tx_index)
+            .and_then(|kernel_tx| {
+                crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
+            }) {
             Ok(state) => state,
             Err(setup_error) => {
                 prepared.push(PreparedTx {
@@ -534,6 +554,8 @@ fn prepare_block_input_checks(
             checks_len,
             #[cfg(feature = "kernel")]
             kernel_state: Some(kernel_state),
+            #[cfg(not(feature = "kernel"))]
+            _block: core::marker::PhantomData,
         });
         // This tx's scripts still outrank its post error; that post error makes
         // every later transaction irrelevant to the ordered verdict.
@@ -549,7 +571,7 @@ fn prepare_block_input_checks(
 /// `&txs` by shared reference only.
 fn check_input(
     txs: &[bitcoin::Transaction],
-    prepared: &[PreparedTx],
+    prepared: &[PreparedTx<'_>],
     check: &InputCheck,
     flags: VerifyFlags,
 ) -> Result<(), ConsensusError> {
@@ -633,6 +655,24 @@ mod tests {
         verify_transaction, verify_transaction_borrowed, verify_transaction_borrowed_with_mtp,
         verify_transaction_with_mtp,
     };
+
+    /// Wraps `txs` in a block and parses it the way production does, so tests
+    /// exercise the real one-shot parse rather than a stand-in.
+    fn kernel_block_for(txs: &[Transaction]) -> crate::kernel::KernelBlock {
+        let block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0x2000_ffff),
+                nonce: 0,
+            },
+            txdata: txs.to_vec(),
+        };
+        crate::kernel::KernelBlock::parse(&bitcoin::consensus::serialize(&block))
+            .unwrap_or_else(|error| panic!("synthetic block must parse: {error}"))
+    }
     use crate::{ConsensusError, rust_path::UtxoView};
 
     #[test]
@@ -1256,7 +1296,8 @@ mod tests {
                 0,
                 0,
                 VerifyFlags::MANDATORY,
-                &mut ScriptStageTimings::default()
+                &mut ScriptStageTimings::default(),
+                &kernel_block_for(&txs)
             ),
             Err(ConsensusError::PrevoutMatrixSize {
                 expected: 1,
@@ -1284,6 +1325,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1308,6 +1350,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1343,6 +1386,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert_eq!(
             result,
@@ -1374,6 +1418,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1407,7 +1452,8 @@ mod tests {
                 0,
                 0,
                 VerifyFlags::MANDATORY,
-                &mut ScriptStageTimings::default()
+                &mut ScriptStageTimings::default(),
+                &kernel_block_for(&txs)
             ),
             Ok(())
         );
@@ -1436,6 +1482,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),

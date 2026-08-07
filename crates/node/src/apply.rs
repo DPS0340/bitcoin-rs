@@ -497,7 +497,29 @@ fn apply_block_inner(
     } else {
         block.header.time
     };
-    let tx_plan = plan_block_transactions(block);
+    // Parse the block once with the kernel and take its txids. Core's
+    // `CTransaction` hashes itself while deserializing with the SHA-256
+    // implementation selected at runtime, so this one parse replaces the
+    // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
+    // that script preparation used to perform.
+    let raw_block: bytes::Bytes = provided_serialized
+        .clone()
+        .unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
+    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+        .map_err(ApplyError::Consensus)?;
+    if kernel_block.transaction_count() != block.txdata.len() {
+        return Err(ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Kernel(
+            format!(
+                "kernel parsed {} transactions, decoder produced {}",
+                kernel_block.transaction_count(),
+                block.txdata.len()
+            ),
+        )));
+    }
+    let tx_plan = plan_block_transactions_with_txids(
+        block,
+        kernel_block.txids().map_err(ApplyError::Consensus)?,
+    );
     let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
@@ -541,6 +563,7 @@ fn apply_block_inner(
         height,
         locktime_cutoff,
         verify_flags,
+        &kernel_block,
     );
     let script_verify_dur = script_verify_started.elapsed();
     metrics::histogram!("node.apply_block.script_verify_seconds")
@@ -995,6 +1018,16 @@ fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
             .map(bitcoin::Transaction::compute_txid)
             .collect()
     };
+    plan_block_transactions_with_txids(block, txids)
+}
+
+/// Plans a block whose txids are already known.
+///
+/// The kernel's one-shot block parse hashes every transaction on the way past,
+/// using the SHA-256 implementation Core picks at runtime, so the apply path
+/// hands those txids straight in rather than re-hashing with a scalar
+/// implementation.
+fn plan_block_transactions_with_txids(block: &bitcoin::Block, txids: Vec<Txid>) -> BlockTxPlan {
     let mut only_coinbase = true;
     let mut needs_local_utxo_overlay = false;
     let mut overlay_capacity = 0usize;
@@ -1243,6 +1276,7 @@ fn verify_block_transactions(
     height: u32,
     locktime_cutoff: u32,
     flags: bitcoin_rs_script::VerifyFlags,
+    kernel_block: &bitcoin_rs_consensus::kernel::KernelBlock,
 ) -> core::result::Result<(), ApplyError> {
     let txids = tx_plan.txids();
     debug_assert_eq!(block.txdata.len(), txids.len());
@@ -1316,6 +1350,7 @@ fn verify_block_transactions(
         locktime_cutoff,
         flags,
         &mut script_timings,
+        kernel_block,
     );
     metrics::histogram!("node.apply_block.script_prepare_seconds")
         .record(script_timings.prepare_seconds);
@@ -1880,6 +1915,15 @@ mod consensus_rule_tests {
     const MAINNET_POW_LIMIT_DIV_4_BITS: u32 = 0x1c3f_ffc0;
     const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
 
+    /// Parses `block` the way production does, so tests exercise the real
+    /// one-shot kernel parse rather than a stand-in.
+    fn kernel_block_of(block: &bitcoin::Block) -> bitcoin_rs_consensus::kernel::KernelBlock {
+        bitcoin_rs_consensus::kernel::KernelBlock::parse(
+            &bitcoin::consensus::encode::serialize(block),
+        )
+        .unwrap_or_else(|error| panic!("test block must parse: {error}"))
+    }
+
     fn tx_plan(block: &bitcoin::Block) -> BlockTxPlan {
         plan_block_transactions(block)
     }
@@ -2034,6 +2078,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
         )?;
         Ok(())
     }
@@ -2224,6 +2269,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail under the kernel build"),
             Err(error) => error,
@@ -2293,6 +2339,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad same-block spend must fail under the kernel build"),
             Err(error) => error,
@@ -2380,6 +2427,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("earlier tx bad script must reject the block"),
             Err(error) => error,
@@ -2430,6 +2478,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("cross-transaction duplicate spend must fail script verification"),
             Err(error) => error,
@@ -2463,6 +2512,7 @@ mod consensus_rule_tests {
             1,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail transaction verification"),
             Err(error) => error,
@@ -2570,6 +2620,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail when assume_valid_height is zero"),
             Err(error) => error,
@@ -2602,6 +2653,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail even under assume_valid_height"),
             Err(error) => error,
@@ -2634,6 +2686,7 @@ mod consensus_rule_tests {
             3,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail above assume_valid_height"),
             Err(error) => error,
@@ -2666,6 +2719,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         )?;
         Ok(())
     }
@@ -2688,6 +2742,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail when assume_valid_height is zero"),
             Err(error) => error,
@@ -2721,6 +2776,7 @@ mod consensus_rule_tests {
             3,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail above assume_valid_height"),
             Err(error) => error,
@@ -2757,6 +2813,7 @@ mod consensus_rule_tests {
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("outputs exceeding inputs must fail even under assume_valid_height"),
             Err(error) => error,
@@ -2794,6 +2851,7 @@ mod consensus_rule_tests {
             1,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail under assume_valid_height"),
             Err(error) => error,
@@ -3090,8 +3148,9 @@ mod consensus_rule_tests {
                 )),
                 1,
                 0,
-                bitcoin_rs_script::VerifyFlags::NONE
-            )
+                bitcoin_rs_script::VerifyFlags::NONE,
+            &kernel_block_of(&block),
+        )
             .is_ok()
         );
         let error = match check_coinbase_maturity_with_tx_plan(
@@ -5189,6 +5248,7 @@ mod consensus_rule_tests {
             170_060,
             0,
             exc_flags,
+            &kernel_block_of(&block),
         )?;
 
         // Normal block at the same height: P2SH enforced -> REJECTED at input 0.
@@ -5206,6 +5266,7 @@ mod consensus_rule_tests {
             170_060,
             0,
             normal_flags,
+            &kernel_block_of(&block2),
         ) {
             Ok(()) => {
                 panic!("normal P2SH enforcement must reject the bare-script redeem spend")
