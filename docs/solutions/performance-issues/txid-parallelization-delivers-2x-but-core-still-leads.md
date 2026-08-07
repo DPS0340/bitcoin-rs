@@ -41,20 +41,29 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 
 Gap to Core: **5.8× → 2.36×** (157.8/67). Total win over the `4700c25` baseline is **2.47×**. Remaining gap is 90.8s.
 
-## Why Core still leads — stage decomposition
+## Where the 157.8s goes — clean stage decomposition
 
-`node.apply_block.total_seconds` dominates wall-clock (87% of elapsed at `f76d43a`: 156.06s total, fetch 15.97s + decode 3.59s overlap via prefetch). At `f76d43a` (178.93s elapsed, no per-block histograms for txid/utxo) **41.5s (26.6% of total) was uninstrumented** — outside all histograms.
+From `/tmp/replay-t32-3.json` (`0e2dda5`, `taskset -c 0-31`, uncontaminated):
 
-Instrumented run `53feecb` (201.84s elapsed, same code + `txid_plan_seconds`/`utxo_resolve_seconds` histograms, but **contaminated** — full-tip IBD `bitcoin-rs-fulltip-postopt-local3` was actively writing `blk00817.dat→blk00867.dat` (50 files) during the run, so absolute times are inflated; relative proportions remain indicative) attributes that gap:
+```
+elapsed              157.8s      fetch 22.4s   decode 3.6s   RSS 212 MB
+  apply total        128.9s
+    script_verify     84.9s      (66% of apply)
+      script_parallel 55.2s
+      script_prepare  19.4s
+      script_resolution 6.1s
+    utxo_commit        7.0s
+    block_rules        5.2s
+    (remainder <5s each)
+  non-script apply    44.0s
+```
 
-* `utxo_resolve_seconds` **25.69s** (ResolvedUtxoView::resolve — UTXO cache lookups per input)
-* `txid_plan_seconds` **21.63s** (`plan_block_transactions` — `compute_txid` per tx, parallel >32)
-* `script_prepare_seconds` **20.43s** (serial `prepare_block_input_checks` + `prepare_kernel_tx` per-tx serialize/PrecomputedTransactionData)
-* `block_body_persist 11.18s`, `utxo_commit 7.78s`, `block_rules 5.25s`, remainder <2s each (see `replay-postopt-150k-53feecb.json:stage_seconds` 113 lines).
+Two things this reframes:
 
-The 41.5s gap is therefore **UTXO resolve (25.69) + txid plan (21.63) ≈ 47s** (slightly above gap due to histogram overhead and contamination), not `prepare` alone. The `prepare` 18–20s is 10% of wall time, but the **dominant uninstrumented cost is UTXO resolve**, so the next lever is UTXO cache/lookup efficiency, not just kernel serialization. `script_verify` itself is 87–99s (55% of total) and already input-level parallel via `SCRIPT_VERIFY_POOL.install || checks.par_iter()` in `verify_block_input_scripts:394-406` (the verdict doc’s “per-block” line referred to pre-`4700c25`).
+1. **~22.4s of the 157.8s is REST fetch**, a harness cost Core's `-reindex-chainstate` never pays — it reads local `blk` files. Apply-only is **128.9s vs Core's 67s = 1.92×**, so the headline 2.36× overstates the engine gap; 1.92× is the defensible lower bound (Core's 67s does include its own block reads).
+2. **`script_verify` at 84.9s already exceeds Core's entire 67s run**, and non-script apply (44.0s) is by itself two-thirds of Core's total. Both halves need work; neither alone closes the gap.
 
-Taskset-pinned 3× median at `e540b91` (code-identical to `f76d43a`, clean, no IBD contention, `taskset -c 0-31`): **173.1s** (166.4, 173.1, 177.8) / 867 blk/s — confirms the 2.25× win (389.7→173.1) is stable within ~6% noise. Parallel-prepare re-applied at `0302a0c` and re-measured clean taskset 3× median **173.5s** (170.6, 173.5, 173.9) vs serial 173.1s — **delta 0.4s within noise, no win**; the earlier 195.89s (`1126cab`) contaminated run was IBD contention (blk00817→867), not rayon pool contention, and was reverted at `6d9c3b8` to keep serial prepare for simplicity. The 201.84s (`53feecb` instrumented) was per-block histogram overhead (~23s) and was also reverted.
+An earlier instrumented run (`53feecb`, 201.84s) attributed the then-uninstrumented remainder to `utxo_resolve` 25.7s and `txid_plan` 21.6s, but that run was contaminated (concurrent full-tip IBD writing `blk00817→867`) **and** inflated ~23s by the per-block histograms themselves. Treat its absolute numbers as indicative only; the clean decomposition above supersedes it.
 
 **Levers tried and rejected on clean `taskset -c 0-31` 3× medians (all against the 173.1s serial baseline):**
 
@@ -71,7 +80,16 @@ The first two cleared the tests but not the 1.05× noise floor; the third never 
 
 1. **Attribute a stage by disabling it, not by reading a profiler.** `perf` was unavailable here (`perf_event_paranoid=4`, no sudo), but the open question — is `script_parallel`'s ~0.93 ms/block genuine secp256k1 work or rayon dispatch overhead? — is binary, so forcing `MIN_PARALLEL_SCRIPT_CHECKS = usize::MAX` answered it in one run: the replay went 173.1s → **313.3s** and the stage 63s → **227.6s**. Genuine crypto. That immediately reframed the number: 227.6s → 63s is only **3.6× from a 16-thread pool**, so the pool width was the binding constraint, and widening it to 32 bought 1.10× (`0e2dda5`). Prefer this disable-the-stage technique whenever a hypothesis is binary; it needs no tooling and cannot be argued with.
 2. **The prepare phase is closed — do not reopen it.** Prepare is ~20s of the run; zeroing it entirely still leaves ~138s against Core's 67s. Four candidates are closed (table above): two by benchmark, one by tests (`btck_script_pubkey_verify` gates on `m_spent_outputs_ready`, so prevout `TxOut`s must be built even when nothing hashes them), one by cost analysis. `ResolvedUtxoView::resolve` is already `into_par_iter` (`apply.rs:1136`) and `plan_block_transactions` already `par_iter` above 32 txs (`apply.rs:985`), so neither is a target either.
-3. **Next: pool width is tuned for this host, not solved.** `MAX_SCRIPT_VERIFY_THREADS = 32` was measured on an 80-CPU box; a different machine needs its own sweep, and the constant is deliberately a cap rather than `available_parallelism` so verification cannot starve the rest of the pipeline. Beyond width, the remaining structural lever is holding kernel objects across the block (`bitcoinkernel::Block::new` once, then `block.transaction(i)`) instead of reconstructing per transaction — a cross-crate change to the consensus public API.
+3. **Pool width has a measured optimum at 32 on this host — do not raise it further.** The sweep is non-monotonic:
+
+   | Pool | CPU set | Median | `script_parallel` |
+   |---|---|---|---|
+   | 16 | 32 physical (`0-31`) | 173.1s | 63-65s |
+   | **32** | 32 physical (`0-31`) | **157.8s** | 55.2s |
+   | 32 | 16 physical + SMT siblings (`0-15,40-55`) | 158.9s | 63.9s |
+   | 64 | 64 logical (`0-63`) | 177.9s | 60.2s |
+
+   64 threads is *worse than 16* — coordination and oversubscription on ~22-input blocks cost more than the extra width buys. A different machine needs its own sweep; the constant stays a cap rather than `available_parallelism` so verification cannot starve the rest of the pipeline. Beyond width, the remaining structural lever is holding kernel objects across the block (`bitcoinkernel::Block::new` once, then `block.transaction(i)`) instead of reconstructing per transaction — a cross-crate change to the consensus public API.
 4. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
 5. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
