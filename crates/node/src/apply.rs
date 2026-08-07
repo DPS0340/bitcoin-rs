@@ -497,14 +497,8 @@ fn apply_block_inner(
     } else {
         block.header.time
     };
-    let tx_plan_started = quanta::Instant::now();
     let tx_plan = plan_block_transactions(block);
-    metrics::histogram!("node.apply_block.txid_plan_seconds")
-        .record(tx_plan_started.elapsed().as_secs_f64());
-    let utxo_resolve_started = quanta::Instant::now();
     let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
-    metrics::histogram!("node.apply_block.utxo_resolve_seconds")
-        .record(utxo_resolve_started.elapsed().as_secs_f64());
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
         bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
