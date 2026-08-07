@@ -1,5 +1,5 @@
 ---
-title: Parallel granularity beat parallel width — 389.7s to 125.4s (3.11x), Core still leads 1.87x
+title: Parallel granularity beat parallel width — 3.1x self-improvement, but a matched pair puts Core 2.2x ahead
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Parallel *granularity* beat parallel *width* — 389.7s → 125.4s (3.11×), Core still leads 1.87×
+# Parallel *granularity* beat parallel *width* — 3.11× self-improvement, and a matched pair puts Core 2.22× ahead
 
 ## Context
 
@@ -92,6 +92,27 @@ An earlier instrumented run (`53feecb`, 201.84s) attributed the then-uninstrumen
 The first two cleared the tests but not the 1.05× noise floor; the third never got that far. `script_prepare` is real work inside `libbitcoinkernel`, not Rust-side overhead. Even eliminating **all** of prepare leaves ~153s against Core's 67s, so prepare is not where the gap lives. `ResolvedUtxoView::resolve` (25.69s) is likewise **already parallel** (`apply.rs:1136` `into_par_iter`), so it is not a batching target either.
 
 The fourth result retires the "FFI boundary is the remaining lever" hypothesis for its allocation half. Per-input `ScriptPubkey::new` is a ~25-byte `malloc` plus copy; at 3.3M inputs that is real allocator traffic, and removing it entirely changed nothing measurable. What the kernel spends inside `btck_script_pubkey_verify` is secp256k1 work, not marshalling. Marshalling-side micro-optimization is now closed as a class: four separate attempts (parallel prepare, serialize buffer, witness-free skip, prevout reuse) all landed at 0.98–1.00×.
+
+## The matched pair — the only ratio worth quoting
+
+Every earlier ratio in this note compared a bitcoin-rs median against Core's **67s** figure captured on 2026-06-09 under unknown load. That reference has now been re-derived, and the honest numbers are worse than the ones this document previously carried.
+
+Core re-run from the same `core-datadir-reindex` that produced the original figure, same command (`-reindex-chainstate -assumevalid=0 -connect=0 -stopatheight=150000`), pinned `taskset -c 0-31`, 150,001 UpdateTip lines each time: **63.5 / 60.0 / 60.1s**. The old 67s was conservative.
+
+Then both nodes interleaved back-to-back on the same idle host, so neither gets a quieter machine:
+
+| Node | Runs | Median | Ratio |
+|---|---|---|---|
+| Core 31.0 | 59.6 / 59.4 / 60.2s | **59.6s** | 1.00× |
+| bitcoin-rs | 132.2 / 134.5 / 131.6s | **132.2s** | **2.22× slower** |
+| bitcoin-rs, apply only | 95.3s median | **95.3s** | **1.60× slower** |
+
+Two corrections fall out of this:
+
+1. **The gap is 2.22×, not the 1.87× computed from a best-case rs run against a stale Core reference.** Comparing your best run to someone else's old run is not a measurement. Interleave, or do not quote a ratio.
+2. **Harness cost is larger than the 22.4s quoted below.** Measured back-to-back, rs spends ~37s outside apply, because the `bitcoind` serving REST competes for the same cores. Core reads local `blk` files and pays nothing equivalent. Apply-only (1.60×) is the fair engine comparison; total (2.22×) is what a user experiences from this harness.
+
+Core reaches this with **15** script threads (`MAX_SCRIPTCHECK_THREADS`) against our 32, which makes the gap a per-unit-work gap rather than a parallelism gap. That is the shape of the remaining problem.
 
 ## What the remaining apply time is
 
