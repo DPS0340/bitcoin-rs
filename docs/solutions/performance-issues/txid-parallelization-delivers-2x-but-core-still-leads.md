@@ -1,5 +1,5 @@
 ---
-title: Parallel granularity beat parallel width — 3.1x self-improvement, but a matched pair puts Core 2.2x ahead
+title: Parse the block once — 3.4x self-improvement, Core still 2.05x ahead on a matched pair
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Parallel *granularity* beat parallel *width* — 3.11× self-improvement, and a matched pair puts Core 2.22× ahead
+# Parse the block once — 3.4× self-improvement, and a matched pair puts Core 2.05× ahead
 
 ## Context
 
@@ -43,9 +43,10 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | serial prevout resolve | **125.4s median** (124.1, 125.4, 128.4) | **1196** | 226 MB | `taskset -c 0-31` 3× paired (`/tmp/rp2-0-*.json`) | + both UTXO resolve stages serial |
 | Core 31.0 | — | ~~67s~~ **superseded** | 2240 | n/a | 2026-06-09 debug.log, unknown load | do not quote; re-derived below |
 | Core 31.0 | — | **59.6s median** (59.6, 59.4, 60.2) | 2517 | n/a | `taskset -c 0-31` 3× interleaved with rs, same idle host | `-reindex-chainstate -assumevalid=0 -connect=0 -stopatheight=150000` |
-| bitcoin-rs | matched pair | **132.2s median** (132.2, 134.5, 131.6) | 1135 | 226 MB | same interleaved series | apply 95.3s; the rest is REST fetch |
+| bitcoin-rs | matched pair | 132.2s median (132.2, 134.5, 131.6) | 1135 | 226 MB | same interleaved series | apply 95.3s; the rest is REST fetch |
+| bitcoin-rs | one-shot kernel block parse | **121.9s median** (121.9, 124.4, 120.6) | **1231** | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
 
-**Quote the matched pair, not a cross-run ratio: 132.2s vs 59.6s = 2.22×** (1.60× comparing our apply alone against Core's whole run). Total self-improvement over the `4700c25` baseline is **3.11×**.
+**Quote the matched pair, not a cross-run ratio.** After the one-shot parse: **121.9s vs Core 59.6s = 2.05×** (apply 82.0s alone is 1.38× Core's whole run). Total self-improvement over the `4700c25` baseline is **3.4×**.
 
 Core's own stage decomposition over the identical window (`-debug=bench`, aggregated from its log lines), recorded so nobody re-derives it:
 
@@ -212,7 +213,17 @@ net                              -11.78s   (~1.10x on a 132s run)
 
 Zero mismatches over 1.7M transactions, so the kernel txids are consensus-identical to rust-bitcoin's.
 
-**This is the largest remaining lever and it is worth its refactor**, because one `Block::new` retires three separate costs at once. The shape: parse the block once in `apply_block_inner`, harvest txids from it instead of calling `plan_block_transactions`' hasher, and pass `&Block` down through `verify_block_transactions` → `verify_block_input_scripts` → `prepare_block_input_checks` so `PreparedKernelTx` can hold a `TransactionRef<'block>` instead of re-serializing. Lifetimes flow as ordinary parameters, so nothing is self-referential.
+**This was the largest remaining lever, and it is now implemented.** One `Block::new` retires three separate costs at once. Measured 3× pinned and interleaved against the previous binary:
+
+| | before | after |
+|---|---|---|
+| elapsed | 137.3s | **121.9s** (1.126×) |
+| apply | 100.8s | **82.0s** (1.23×) |
+| `script_prepare` | 18.55s | **4.29s** (4.3×) |
+
+Every run validated all 150,001 blocks at `assume_valid_height=0`, and the kernel txids were proven byte-identical to `compute_txid` over 1.7M transactions before a line was written.
+
+The shape that landed: `KernelBlock` owns the parse and exposes `txids()` plus borrowed transactions; `apply_block_inner` parses once and feeds those txids into `plan_block_transactions_with_txids`; `PreparedKernelTx<T: TransactionExt>` is generic so the block path holds a `TransactionRef<'block>` while the standalone `verify_tx_scripts` entry keeps an owned `Transaction`. The portable backend gets a `KernelBlock` that decodes with rust-bitcoin, so both backends share one call shape instead of a cfg-split signature.
 
 The lesson generalizes past this case: **price a replacement by everything it subsumes, not by the line item that motivated it.** Costed against parse-and-serialize the change looks like +1.54s; costed against parse, serialize, and hash it is -11.78s.
 
