@@ -114,6 +114,42 @@ Two corrections fall out of this:
 
 Core reaches this with **15** script threads (`MAX_SCRIPTCHECK_THREADS`) against our 32, which makes the gap a per-unit-work gap rather than a parallelism gap. That is the shape of the remaining problem.
 
+## Core's crypto is not faster — ours is surrounded by work Core never does
+
+Core re-run with `-debug=bench` over the identical window, aggregating its own stage lines:
+
+| Core stage | Cost |
+|---|---|
+| `Verify N txins` (2,868,199 inputs) | **36.07s** |
+| Load block from disk | 7.18s |
+| Fork checks | 3.25s |
+| Flush | 2.59s |
+| Connect postprocess | 1.63s |
+| Sanity checks | 1.41s |
+| **Connect block (total)** | **55.80s** |
+
+Our `script_parallel` is **36.42s**. Core's `Verify txins` is **36.07s**. Within a percent of each other, on the same inputs, through the same libsecp256k1. **The crypto is a tie.**
+
+That kills three hypotheses at once, and they should not be re-opened without new evidence:
+
+* **Not the signature cache.** Core's `CachingTransactionSignatureChecker` and CuckooCache sigcache cannot be worth much here, because Core's measured verify time already equals ours. There is no hidden 2× being saved by cache hits.
+* **Not compiler tuning.** The kernel is built `-O2 -g` with no `-march` (generic x86-64), and it still matches Core. `-C target-cpu=native` on the Rust side measured 1.016×. Build flags are not where the gap lives.
+* **Not parallel width.** Core reaches this with 15 script threads against our 32, and still ties on verify.
+
+The gap is the ~40s of apply that is **not** crypto:
+
+| | Core | bitcoin-rs | Delta |
+|---|---|---|---|
+| script verify | 36.07s | 36.42s | ~0 |
+| transaction marshalling (`script_prepare`) | none | 18.6s | **+18.6s** |
+| txid computation | free during deserialization | 10.3s | **+10.3s** |
+| remaining apply | 16.1s | 23.9s | +7.8s |
+| total | 55.8s | 95.3s | +39.5s |
+
+Core never pays the first two. It deserializes each block once into `CTransaction` objects and validates those in place; the txid falls out of deserialization, and `PrecomputedTransactionData` is built over objects it already holds. We decode raw bytes into `bitcoin::Transaction`, then `encode::serialize` every transaction back into bytes so `bitcoinkernel::Transaction::new` can parse it a **third** time.
+
+So the marshalling class closed earlier was closed at the wrong altitude. Four micro-optimizations inside that round-trip each measured 0.98-1.00×, and that remains true: shaving allocations off a redundant round-trip cannot pay. Removing the round-trip is a different change, and it is now quantified at **~29s of the 39.5s gap**. That is the only lever left that is worth its risk.
+
 ## What the remaining apply time is
 
 Two temporary probes (removed after measurement) attributed the last unmeasured slice of apply. They cost nothing detectable — the probed run measured 123.3s and 126.0s against a 124.2s unprobed median — which **retires the earlier claim that per-block histograms cost ~23s**. That figure came from a contaminated run; the apply path already carries 13 per-block histograms, so two more are free at this scale.
