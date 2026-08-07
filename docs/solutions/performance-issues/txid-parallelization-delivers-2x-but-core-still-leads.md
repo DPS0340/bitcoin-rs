@@ -192,7 +192,12 @@ Two temporary probes (removed after measurement) attributed the last unmeasured 
 | `script_resolution` | 1.6s | now serial |
 | genuinely unmeasured | 2.0s | |
 
-Txid is now the largest single item outside script verification. It does not respond to parallelism (threshold swept flat, one SHA256d is order 1 µs), and it does not allocate, so any further win there has to come from the hash itself — batch/SIMD SHA-256 across independent transactions, which this host would need in software: the Xeon Gold 6138 is Skylake-SP and has **no `sha_ni`**, only AVX2 and AVX512F.
+Txid is the largest single item outside script verification, and it splits into two parts that are each already near their floor:
+
+* **Feeding the hasher (~2.7s).** `compute_txid` streams `consensus_encode` into the engine with no intermediate `Vec`. The proposal to hash the raw transaction bytes instead — the `bitcoin_slices` approach already used by `crates/index` — removes exactly this encode step. Its size is bounded directly: `encode::serialize` over the same 687 MB of transactions measured **2.74s**. That is the whole prize, and it is under the 1.05× gate on a 132s run.
+* **The hash itself (~7.6s).** 687 MB hashed twice at roughly 200 MB/s per core is the remainder, and it is identical whichever way the bytes arrive. Only SIMD or hardware SHA changes it, and this host cannot: the Xeon Gold 6138 is Skylake-SP with **no `sha_ni`**, only AVX2/AVX512F. A software AVX2 multi-buffer SHA-256 across independent transactions is the only remaining path, and that is a cryptographic-library project, not a node change.
+
+Txid also does not respond to parallelism — the threshold swept flat — because the bytes are concentrated in later blocks that already exceed the 32-tx parallel threshold.
 
 **`-C target-cpu=native` is real but too small to ship.** The build sets no `target-cpu`, so it is generic x86-64. Rebuilding native and pairing 3× against generic: **132.0s vs 129.9s (1.016×)**, native winning all three rounds, with apply alone 96.8s → 90.8s (~1.066×). The whole-run figure misses the gate because roughly 22s of the run is REST fetch that codegen cannot touch. It is deliberately **not** made the default: the binary would be pinned to this CPU. Use it only as a documented opt-in for a known host.
 
