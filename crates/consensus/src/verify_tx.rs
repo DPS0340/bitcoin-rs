@@ -432,174 +432,88 @@ fn prepare_block_input_checks(
     height: u32,
     locktime_cutoff: u32,
 ) -> (Vec<PreparedTx>, Vec<InputCheck>) {
-    // For small blocks, serial is faster (no rayon overhead).
-    if txs.len() < MIN_PARALLEL_SCRIPT_CHECKS {
-        let mut prepared = Vec::with_capacity(txs.len());
-        let mut checks = Vec::new();
-        for (tx_index, tx) in txs.iter().enumerate() {
-            let resolved_inputs = &mut resolved[tx_index];
-            let prep = match prepare_tx_checks(tx, height, locktime_cutoff, |input_index, _| {
-                resolved_inputs.get_mut(input_index).and_then(Option::take)
-            }) {
-                Ok(Some(prep)) => prep,
-                Ok(None) => {
-                    prepared.push(PreparedTx {
-                        tx_index,
-                        prevouts: Vec::new(),
-                        pre_error: None,
-                        post_error: None,
-                        checks_start: checks.len(),
-                        checks_len: 0,
-                        #[cfg(feature = "kernel")]
-                        kernel_state: None,
-                    });
-                    continue;
-                }
-                Err(pre_error) => {
-                    prepared.push(PreparedTx {
-                        tx_index,
-                        prevouts: Vec::new(),
-                        pre_error: Some(pre_error),
-                        post_error: None,
-                        checks_start: checks.len(),
-                        checks_len: 0,
-                        #[cfg(feature = "kernel")]
-                        kernel_state: None,
-                    });
-                    break;
-                }
-            };
-            #[cfg(feature = "kernel")]
-            let kernel_state = match crate::kernel::prepare_kernel_tx(tx, &prep.prevouts) {
-                Ok(state) => state,
-                Err(setup_error) => {
-                    prepared.push(PreparedTx {
-                        tx_index,
-                        prevouts: prep.prevouts,
-                        pre_error: Some(setup_error),
-                        post_error: None,
-                        checks_start: checks.len(),
-                        checks_len: 0,
-                        kernel_state: None,
-                    });
-                    break;
-                }
-            };
-            let checks_start = checks.len();
-            for input_index in 0..tx.input.len() {
-                checks.push(InputCheck {
-                    prepared_index: prepared.len(),
-                    input_index,
-                });
-            }
-            let checks_len = tx.input.len();
-            let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
-            let stop_after_tx = post_error.is_some();
-            prepared.push(PreparedTx {
-                tx_index,
-                prevouts: prep.prevouts,
-                pre_error: None,
-                post_error,
-                checks_start,
-                checks_len,
-                #[cfg(feature = "kernel")]
-                kernel_state: Some(kernel_state),
-            });
-            if stop_after_tx {
-                break;
-            }
-        }
-        return (prepared, checks);
-    }
-    // Parallel path for larger blocks: each tx's prevout resolution and kernel
-    // setup touches only its own resolved[tx_index] (disjoint), so par_iter_mut
-    // is safe. Prepare all in parallel, then build checks in block order and
-    // truncate at first pre/post error to preserve serial break semantics.
-    let mut prepared: Vec<PreparedTx> = resolved
-        .par_iter_mut()
-        .enumerate()
-        .map(|(tx_index, resolved_inputs)| {
-            let tx = &txs[tx_index];
-            let prep_result = prepare_tx_checks(tx, height, locktime_cutoff, |input_index, _| {
-                resolved_inputs.get_mut(input_index).and_then(Option::take)
-            });
-            match prep_result {
-                Ok(Some(prep)) => {
-                    #[cfg(feature = "kernel")]
-                    let kernel_state = match crate::kernel::prepare_kernel_tx(tx, &prep.prevouts) {
-                        Ok(state) => Some(state),
-                        Err(setup_error) => {
-                            return PreparedTx {
-                                tx_index,
-                                prevouts: prep.prevouts,
-                                pre_error: Some(setup_error),
-                                post_error: None,
-                                checks_start: 0,
-                                checks_len: 0,
-                                kernel_state: None,
-                            };
-                        }
-                    };
-                    let checks_len = tx.input.len();
-                    let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
-                    PreparedTx {
-                        tx_index,
-                        prevouts: prep.prevouts,
-                        pre_error: None,
-                        post_error,
-                        checks_start: 0,
-                        checks_len,
-                        #[cfg(feature = "kernel")]
-                        kernel_state,
-                    }
-                }
-                Ok(None) => PreparedTx {
+    let mut prepared = Vec::with_capacity(txs.len());
+    let mut checks = Vec::new();
+    for (tx_index, tx) in txs.iter().enumerate() {
+        let resolved_inputs = &mut resolved[tx_index];
+        let prep = match prepare_tx_checks(tx, height, locktime_cutoff, |input_index, _| {
+            resolved_inputs.get_mut(input_index).and_then(Option::take)
+        }) {
+            Ok(Some(prep)) => prep,
+            Ok(None) => {
+                prepared.push(PreparedTx {
                     tx_index,
                     prevouts: Vec::new(),
                     pre_error: None,
                     post_error: None,
-                    checks_start: 0,
+                    checks_start: checks.len(),
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
-                },
-                Err(pre_error) => PreparedTx {
+                });
+                continue;
+            }
+            Err(pre_error) => {
+                prepared.push(PreparedTx {
                     tx_index,
                     prevouts: Vec::new(),
                     pre_error: Some(pre_error),
                     post_error: None,
-                    checks_start: 0,
+                    checks_start: checks.len(),
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
-                },
-            }
-        })
-        .collect();
-    // Build checks in block order and fix up checks_start.
-    let mut checks = Vec::new();
-    for (prepared_index, prep) in prepared.iter_mut().enumerate() {
-        prep.checks_start = checks.len();
-        if prep.pre_error.is_none() && prep.checks_len > 0 {
-            for input_index in 0..prep.checks_len {
-                checks.push(InputCheck {
-                    prepared_index,
-                    input_index,
                 });
+                break;
             }
-        }
-    }
-    if let Some(first_error_idx) = prepared
-        .iter()
-        .position(|p| p.pre_error.is_some() || p.post_error.is_some())
-    {
-        let truncate_checks = if prepared[first_error_idx].pre_error.is_some() {
-            prepared[first_error_idx].checks_start
-        } else {
-            prepared[first_error_idx].checks_start + prepared[first_error_idx].checks_len
         };
-        checks.truncate(truncate_checks);
-        prepared.truncate(first_error_idx + 1);
+
+        // Build retained kernel state before checks so setup failure cannot
+        // leave an InputCheck without its PreparedKernelTx.
+        #[cfg(feature = "kernel")]
+        let kernel_state = match crate::kernel::prepare_kernel_tx(tx, &prep.prevouts) {
+            Ok(state) => state,
+            Err(setup_error) => {
+                prepared.push(PreparedTx {
+                    tx_index,
+                    prevouts: prep.prevouts,
+                    pre_error: Some(setup_error),
+                    post_error: None,
+                    checks_start: checks.len(),
+                    checks_len: 0,
+                    kernel_state: None,
+                });
+                break;
+            }
+        };
+
+        let prepared_index = prepared.len();
+        let checks_start = checks.len();
+        for input_index in 0..tx.input.len() {
+            checks.push(InputCheck {
+                prepared_index,
+                input_index,
+            });
+        }
+        let checks_len = tx.input.len();
+
+        let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
+        let stop_after_tx = post_error.is_some();
+        prepared.push(PreparedTx {
+            tx_index,
+            prevouts: prep.prevouts,
+            pre_error: None,
+            post_error,
+            checks_start,
+            checks_len,
+            #[cfg(feature = "kernel")]
+            kernel_state: Some(kernel_state),
+        });
+        // This tx's scripts still outrank its post error; that post error makes
+        // every later transaction irrelevant to the ordered verdict.
+        if stop_after_tx {
+            break;
+        }
     }
     (prepared, checks)
 }
