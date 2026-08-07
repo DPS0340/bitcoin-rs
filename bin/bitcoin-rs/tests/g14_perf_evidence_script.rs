@@ -14,24 +14,9 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 type FakeElectrumServer = (thread::JoinHandle<std::io::Result<()>>, u16);
-type FakeElectrumRecordingServer = (thread::JoinHandle<std::io::Result<Vec<String>>>, u16);
 
-struct FakeBitcoinRsProcess {
-    child: Child,
-}
 
-impl FakeBitcoinRsProcess {
-    fn pid(&self) -> String {
-        self.child.id().to_string()
-    }
-}
 
-impl Drop for FakeBitcoinRsProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 const DIRECT_BITCOIN_RS_COMMAND: &str = "/tmp/g14-fixture/run-g14-bitcoin-rs-daemon-mainnet-ibd.sh";
 const DIRECT_BITCOIN_RS_COMMAND_SHA256: &str =
@@ -4144,7 +4129,7 @@ fn electrum_rss_measurement_emits_g14_fragment() -> Result<(), Box<dyn std::erro
             "--tip-height",
             "10",
             "--tip-hash",
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            FAKE_ELECTRUM_TIP_HASH,
             "--sample-size",
             "3",
             "--seed",
@@ -4184,8 +4169,7 @@ fn electrum_rss_measurement_emits_g14_fragment() -> Result<(), Box<dyn std::erro
 fn electrum_rss_measurement_samples_real_corpus_by_seeded_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
-    let (server, port) = fake_electrum_history_server(3)?;
-    let fake_node = fake_bitcoin_rs_process()?;
+    let node = fake_electrum_node(temp.path(), 3, "history")?;
     let output = temp.path().join("electrum-rss.json");
     let corpus_contents = [
         "1111111111111111111111111111111111111111111111111111111111111111",
@@ -4207,13 +4191,13 @@ fn electrum_rss_measurement_samples_real_corpus_by_seeded_order()
             "--host",
             "127.0.0.1",
             "--port",
-            &port.to_string(),
+            &node.port(),
             "--pid",
-            &fake_node.pid(),
+            &node.pid(),
             "--tip-height",
             "10",
             "--tip-hash",
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            FAKE_ELECTRUM_TIP_HASH,
             "--sample-size",
             "3",
             "--seed",
@@ -4226,11 +4210,8 @@ fn electrum_rss_measurement_samples_real_corpus_by_seeded_order()
         .output()?;
 
     assert_success(&command_output);
-    let requested = server
-        .join()
-        .map_err(|_| "fake Electrum server panicked")??;
     assert_eq!(
-        requested,
+        node.requested(),
         vec![
             String::from("3333333333333333333333333333333333333333333333333333333333333333"),
             String::from("2222222222222222222222222222222222222222222222222222222222222222"),
@@ -4298,7 +4279,7 @@ fn electrum_rss_measurement_requires_real_scripthash_corpus()
             "--tip-height",
             "10",
             "--tip-hash",
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            FAKE_ELECTRUM_TIP_HASH,
             "--sample-size",
             "1",
         ])
@@ -4314,8 +4295,7 @@ fn electrum_rss_measurement_requires_real_scripthash_corpus()
 fn electrum_rss_measurement_rejects_empty_history_for_real_corpus()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
-    let (_server, port) = fake_electrum_server(1)?;
-    let fake_node = fake_bitcoin_rs_process()?;
+    let node = fake_electrum_node(temp.path(), 1, "empty")?;
     let output = temp.path().join("electrum-rss.json");
     let corpus = write_text(
         temp.path(),
@@ -4331,13 +4311,13 @@ fn electrum_rss_measurement_rejects_empty_history_for_real_corpus()
             "--host",
             "127.0.0.1",
             "--port",
-            &port.to_string(),
+            &node.port(),
             "--pid",
-            &fake_node.pid(),
+            &node.pid(),
             "--tip-height",
             "10",
             "--tip-hash",
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            FAKE_ELECTRUM_TIP_HASH,
             "--sample-size",
             "1",
             "--scripthashes",
@@ -4382,7 +4362,7 @@ fn electrum_rss_measurement_rejects_smoke_flag_with_real_corpus()
             "--tip-height",
             "10",
             "--tip-hash",
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            FAKE_ELECTRUM_TIP_HASH,
             "--sample-size",
             "1",
             "--scripthashes",
@@ -6873,6 +6853,116 @@ print({hash_expr})
     Ok(path)
 }
 
+/// Header served by the fake Electrum servers for
+/// `blockchain.headers.subscribe`. The measurement script recomputes the block
+/// hash from these bytes and compares it to `--tip-hash`, so the pair must be
+/// genuinely consistent: this is the mainnet genesis header and its real hash.
+/// A placeholder hash cannot work, because no 80-byte header hashes to one.
+const FAKE_ELECTRUM_TIP_HEADER_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+const FAKE_ELECTRUM_TIP_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+/// Python source for a fake Electrum server that runs as its own process under
+/// argv0 `bitcoin-rs`.
+///
+/// Production evidence requires one process to satisfy both gates the script
+/// enforces: `--pid` must name a bitcoin-rs process, and that same pid must own
+/// the accepted connection. A listener living in the test process cannot do
+/// that, so the server and the "node" have to be the same process.
+const FAKE_ELECTRUM_NODE_PY: &str = r#"
+import json, socket, sys
+
+requests_path, count, mode, header_hex = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+print(server.getsockname()[1], flush=True)
+
+connection, _ = server.accept()
+stream = connection.makefile("rwb")
+if stream.readline():
+    tip = {"id": 0, "result": {"height": 10, "hex": header_hex}}
+    stream.write((json.dumps(tip) + "\n").encode("utf-8"))
+    stream.flush()
+with open(requests_path, "w", encoding="utf-8") as recorder:
+    for request_id in range(1, count + 1):
+        line = stream.readline()
+        if not line:
+            break
+        recorder.write(json.loads(line)["params"][0] + "\n")
+        recorder.flush()
+        history = [] if mode == "empty" else [
+            {"height": 1, "tx_hash": "0000000000000000000000000000000000000000000000000000000000000001"}
+        ]
+        stream.write((json.dumps({"id": request_id, "result": history}) + "\n").encode("utf-8"))
+        stream.flush()
+"#;
+
+struct FakeElectrumNode {
+    child: Child,
+    port: u16,
+    requests_path: PathBuf,
+}
+
+impl FakeElectrumNode {
+    fn pid(&self) -> String {
+        self.child.id().to_string()
+    }
+
+    fn port(&self) -> String {
+        self.port.to_string()
+    }
+
+    /// Scripthashes the script actually asked for, in request order.
+    fn requested(&self) -> Vec<String> {
+        fs::read_to_string(&self.requests_path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Drop for FakeElectrumNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn fake_electrum_node(
+    dir: &Path,
+    response_count: usize,
+    mode: &str,
+) -> Result<FakeElectrumNode, Box<dyn std::error::Error>> {
+    let program = dir.join("fake-electrum-node.py");
+    fs::write(&program, FAKE_ELECTRUM_NODE_PY)?;
+    let requests_path = dir.join("fake-electrum-requests.txt");
+    let command = format!(
+        "exec -a bitcoin-rs python3 {} {} {} {} {}",
+        program.display(),
+        requests_path.display(),
+        response_count,
+        mode,
+        FAKE_ELECTRUM_TIP_HEADER_HEX,
+    );
+    let mut child = Command::new("bash")
+        .args(["-c", &command])
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("fake electrum node has no stdout")?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let port: u16 = line.trim().parse()?;
+    Ok(FakeElectrumNode {
+        child,
+        port,
+        requests_path,
+    })
+}
+
 fn fake_electrum_server(
     response_count: usize,
 ) -> Result<FakeElectrumServer, Box<dyn std::error::Error>> {
@@ -6883,6 +6973,14 @@ fn fake_electrum_server(
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
         let mut line = String::new();
+        line.clear();
+        if reader.read_line(&mut line)? > 0 {
+            writeln!(
+                writer,
+                r#"{{"id":0,"result":{{"height":10,"hex":"{FAKE_ELECTRUM_TIP_HEADER_HEX}"}}}}"#
+            )?;
+            writer.flush()?;
+        }
         for request_id in 1..=response_count {
             line.clear();
             if reader.read_line(&mut line)? == 0 {
@@ -6896,66 +6994,7 @@ fn fake_electrum_server(
     Ok((handle, port))
 }
 
-fn fake_electrum_history_server(
-    response_count: usize,
-) -> Result<FakeElectrumRecordingServer, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    let handle = thread::spawn(move || -> std::io::Result<Vec<String>> {
-        let (stream, _addr) = listener.accept()?;
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = stream;
-        let mut line = String::new();
-        let mut requested = Vec::with_capacity(response_count);
-        for request_id in 1..=response_count {
-            line.clear();
-            if reader.read_line(&mut line)? == 0 {
-                break;
-            }
-            let request: serde_json::Value = serde_json::from_str(line.trim_end())
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            let scripthash = request
-                .get("params")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|params| params.first())
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "request missing scripthash param",
-                    )
-                })?;
-            requested.push(scripthash.to_owned());
-            writeln!(
-                writer,
-                r#"{{"id":{request_id},"result":[{{"height":1,"tx_hash":"0000000000000000000000000000000000000000000000000000000000000001"}}]}}"#
-            )?;
-            writer.flush()?;
-        }
-        Ok(requested)
-    });
-    Ok((handle, port))
-}
 
-fn fake_bitcoin_rs_process() -> Result<FakeBitcoinRsProcess, Box<dyn std::error::Error>> {
-    let child = Command::new("bash")
-        .args(["-c", "exec -a bitcoin-rs sleep 30"])
-        .spawn()?;
-    let cmdline = PathBuf::from(format!("/proc/{}/cmdline", child.id()));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        if fs::read(&cmdline).is_ok_and(|contents| {
-            contents
-                .split(|byte| *byte == 0)
-                .next()
-                .is_some_and(|argv0| argv0 == b"bitcoin-rs")
-        }) {
-            return Ok(FakeBitcoinRsProcess { child });
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    Ok(FakeBitcoinRsProcess { child })
-}
 
 fn assert_success(output: &std::process::Output) {
     assert!(
