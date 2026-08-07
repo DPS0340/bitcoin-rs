@@ -1,5 +1,5 @@
 ---
-title: Parse the block once — 3.4x self-improvement, Core still 2.05x ahead on a matched pair
+title: Parse the block once — Core leads 2.05x on throughput, bitcoin-rs uses 2.8x less memory
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Parse the block once — 3.4× self-improvement, and a matched pair puts Core 2.05× ahead
+# Parse the block once — Core leads 2.05× on throughput, bitcoin-rs uses 2.8× less memory
 
 ## Context
 
@@ -47,6 +47,17 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | one-shot kernel block parse | **121.9s median** (121.9, 124.4, 120.6) | **1231** | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
 
 **Quote the matched pair, not a cross-run ratio.** After the one-shot parse: **121.9s vs Core 59.6s = 2.05×** (apply 82.0s alone is 1.38× Core's whole run). Total self-improvement over the `4700c25` baseline is **3.4×**.
+
+### Memory is the metric bitcoin-rs wins
+
+Peak RSS over the same window, same validation posture, both pinned:
+
+| Node | Peak RSS | Source |
+|---|---|---|
+| bitcoin-rs | **232 MB** (233, 232, 232) | replay `rss_high_water_bytes` |
+| Core 31.0 | **643 MB** | `/usr/bin/time -v` over the reindex run |
+
+**bitcoin-rs holds 2.77× less resident memory.** Any summary of this work that quotes only the throughput ratio is incomplete: the two nodes trade off, Core faster per block and bitcoin-rs far leaner. Core's figure comes from the same `-reindex-chainstate` invocation timed at 60.5s wall, so it is the memory cost of the run being compared, not a different configuration.
 
 Core's own stage decomposition over the identical window (`-debug=bench`, aggregated from its log lines), recorded so nobody re-derives it:
 
