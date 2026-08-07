@@ -41,9 +41,23 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | `0e2dda5` | 157.8s median (163.8, 155.9, 157.8) | 950 | 223 MB | `taskset -c 0-31` 3× (`/tmp/replay-t32-*.json`) | + 32-thread script-verify pool |
 | bitcoin-rs | threshold change | 135.0s median (135.0, 134.0, 140.6) | 1111 | 226 MB | `taskset -c 0-31` 3× (`/tmp/rfin-*.json`) | + parallel threshold 16 → 4 |
 | bitcoin-rs | serial prevout resolve | **125.4s median** (124.1, 125.4, 128.4) | **1196** | 226 MB | `taskset -c 0-31` 3× paired (`/tmp/rp2-0-*.json`) | + both UTXO resolve stages serial |
-| Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log | |
+| Core 31.0 | — | ~~67s~~ **superseded** | 2240 | n/a | 2026-06-09 debug.log, unknown load | do not quote; re-derived below |
+| Core 31.0 | — | **59.6s median** (59.6, 59.4, 60.2) | 2517 | n/a | `taskset -c 0-31` 3× interleaved with rs, same idle host | `-reindex-chainstate -assumevalid=0 -connect=0 -stopatheight=150000` |
+| bitcoin-rs | matched pair | **132.2s median** (132.2, 134.5, 131.6) | 1135 | 226 MB | same interleaved series | apply 95.3s; the rest is REST fetch |
 
-Gap to Core: **5.8× → 1.87×** (125.4/67). Total win over the `4700c25` baseline is **3.11×**. Remaining gap is 58.4s.
+**Quote the matched pair, not a cross-run ratio: 132.2s vs 59.6s = 2.22×** (1.60× comparing our apply alone against Core's whole run). Total self-improvement over the `4700c25` baseline is **3.11×**.
+
+Core's own stage decomposition over the identical window (`-debug=bench`, aggregated from its log lines), recorded so nobody re-derives it:
+
+| Core stage | Cost |
+|---|---|
+| `Verify N txins` (2,868,199 inputs) | 36.07s |
+| Load block from disk | 7.18s |
+| Fork checks | 3.25s |
+| Flush | 2.59s |
+| Connect postprocess | 1.63s |
+| Sanity checks | 1.41s |
+| **Connect block total** | **55.80s** |
 
 **Pool width was only half of it.** Widening the pool 16 → 32 bought 1.10×, but the pool cannot help a block that never reaches it: `MIN_PARALLEL_SCRIPT_CHECKS` sent every block with fewer than 16 input checks down the serial branch, and on mainnet 0→150k that is most of them. Lowering the threshold to 4 bought a further **1.15×** and cut `script_verify` 84.0s → 66.5s. The sweep is steep and monotonic above the optimum (`taskset -c 0-31`, 3× medians for 4/8/16 interleaved round-robin so cache warming hits each equally; single runs above):
 
