@@ -118,7 +118,16 @@ The fourth result retires the "FFI boundary is the remaining lever" hypothesis f
    | `ResolvedUtxoView::resolve` (`into_par_iter`, no threshold) | 143.8s | 134.7s | apply 116.2s → 103.6s |
    | `resolve_block_prevouts` non-overlay branch (`par_iter` per tx) | 139.4s | 125.4s | `script_resolution` 6.9s → 1.63s |
 
-   The second is the clearest evidence: 5.3s of dispatch layered on 1.6s of work. This is the mirror of the threshold finding — there the fix was *more* parallelism for 100 µs script checks, here it is *none* for 500 ns lookups. Same question either way: does per-item work exceed dispatch? Distinct from the marshalling class closed above, which was about removing allocations rather than removing threads. Remaining fan-outs and their verdicts: `verify_block_input_scripts` (keep, ~100 µs per input), `UtxoSet::commit` over shards (keep, a batch write per item), `plan_block_transactions` (keep, swept flat).
+   **A stage-local win can be a global loss — always gate on elapsed, never on the stage.** Parallel prepare (`0302a0c`, reverted `6d9c3b8`) was re-tested at the current balance, because the original rejection was measured at threshold 16 with both resolve stages still parallel. It makes its own stage measurably faster and the run measurably slower:
+
+   | | prepare stage | apply | elapsed |
+   |---|---|---|---|
+   | serial prepare | 17.7-18.5s | 92.3-95.3s | **124.2s** |
+   | parallel prepare | 12.8-14.0s | 98.9-101.6s | 129.0s |
+
+   It buys ~5s in `script_prepare` and gives back ~7s across the rest of apply, because its threads contend with the script-verify pool for the same cores. Reading `script_prepare_seconds` alone would have shipped a 4% regression as a 30% stage win. This re-confirms the original verdict and supplies the mechanism it lacked; prepare stays serial.
+
+   The clearest evidence for the removal class: 5.3s of dispatch layered on 1.6s of work. This is the mirror of the threshold finding — there the fix was *more* parallelism for 100 µs script checks, here it is *none* for 500 ns lookups. Same question either way: does per-item work exceed dispatch? Distinct from the marshalling class closed above, which was about removing allocations rather than removing threads. Remaining fan-outs and their verdicts: `verify_block_input_scripts` (keep, ~100 µs per input), `UtxoSet::commit` over shards (keep, a batch write per item), `plan_block_transactions` (keep, swept flat).
 5. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
 6. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
