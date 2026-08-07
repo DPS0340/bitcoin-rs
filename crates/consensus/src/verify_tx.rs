@@ -16,8 +16,22 @@ const SEQUENCE_FINAL: u32 = 0xffff_ffff;
 const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 
-// SMT siblings make secp256k1 verification slower past this width on large hosts.
-const MAX_SCRIPT_VERIFY_THREADS: usize = 16;
+// Width of the script-verification pool. 16 was chosen on the belief that SMT
+// siblings slow secp256k1 down past that width. A matched-validation replay of
+// mainnet 0..150_000 measures otherwise on this host (3x medians, pinned):
+//
+//   16 threads on 32 physical cores (`taskset -c 0-31`)        173.1s
+//   32 threads on 32 physical cores (`taskset -c 0-31`)        157.8s
+//   32 threads on 16 physical cores + their SMT siblings
+//                                  (`taskset -c 0-15,40-55`)   158.9s
+//
+// The last two agree within run-to-run noise while the third uses half the
+// physical cores, so the gain tracks thread count and SMT pairing costs
+// nothing measurable here. Kept as a cap rather than raised to
+// `available_parallelism` so a many-core host does not oversubscribe
+// verification against the rest of the apply pipeline; widen only against a
+// fresh measurement on the target hardware.
+const MAX_SCRIPT_VERIFY_THREADS: usize = 32;
 const MIN_PARALLEL_SCRIPT_CHECKS: usize = 16;
 static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
