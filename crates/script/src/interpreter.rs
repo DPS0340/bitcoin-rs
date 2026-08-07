@@ -1,7 +1,5 @@
 use std::borrow::Cow;
 
-#[cfg(feature = "bitcoinconsensus")]
-use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{Script, ScriptBuf, Witness};
@@ -95,18 +93,6 @@ impl VerifyFlags {
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
-    }
-
-    /// Returns only the bits accepted by rust-bitcoin's `bitcoinconsensus` backend.
-    #[must_use]
-    pub const fn consensus_bits(self) -> u32 {
-        self.0
-            & (Self::P2SH.0
-                | Self::DERSIG.0
-                | Self::NULLDUMMY.0
-                | Self::CHECKLOCKTIMEVERIFY.0
-                | Self::CHECKSEQUENCEVERIFY.0
-                | Self::WITNESS.0)
     }
 
     /// Returns the full consensus-authority bit set, including taproot for bitcoinkernel.
@@ -215,8 +201,12 @@ pub enum ScriptError {
     },
 }
 
-/// Public script verifier. Legacy and segwit-v0 spends use bitcoinconsensus when
-/// that backend is enabled; taproot key-path spends use the local BIP341 path.
+/// Public script verifier for the portable posture.
+///
+/// Handles taproot key-path spends via the local BIP341 path; non-taproot spends
+/// (legacy, segwit-v0, taproot script-path) require the kernel production path.
+/// Without the kernel the stub accepts only empty `OP_TRUE` spends and rejects
+/// everything else.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Interpreter;
 
@@ -231,6 +221,13 @@ impl Interpreter {
     /// which reads them straight off the transaction — `tx` is used as-is with
     /// no clone. Only callers that pass substitute bytes (e.g. vector tests
     /// grafting a foreign witness) pay for a clone to splice them in.
+    ///
+    /// Taproot key-path verification needs every spent output. Callers that only
+    /// have the current input's prevout should prefer
+    /// [`Self::execute_with_prevouts`] when the full ordered set is available;
+    /// this wrapper forwards a one-element slice and therefore still rejects
+    /// multi-input taproot key-path spends with
+    /// [`ScriptError::TaprootPrevoutsUnavailable`].
     pub fn execute(
         &self,
         script_pubkey: &[u8],
@@ -241,12 +238,49 @@ impl Interpreter {
         tx: &bitcoin::Transaction,
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
+        self.execute_with_prevouts(
+            script_pubkey,
+            script_sig,
+            witness,
+            flags,
+            &[prevout],
+            tx,
+            input_idx,
+        )
+    }
+
+    /// Executes a script spend with the complete ordered prevout set.
+    ///
+    /// `prevouts` must be aligned with `tx.input` (same length, input order).
+    /// BIP341 key-path sighsashes commit to every spent output, so multi-input
+    /// taproot spends require the full slice via [`Prevouts::All`].
+    pub fn execute_with_prevouts(
+        &self,
+        script_pubkey: &[u8],
+        script_sig: &[u8],
+        witness: &[Vec<u8>],
+        flags: VerifyFlags,
+        prevouts: &[&TxOut],
+        tx: &bitcoin::Transaction,
+        input_idx: usize,
+    ) -> Result<bool, ScriptError> {
         let inputs = tx.input.len();
         let out_of_range = ScriptError::InputIndexOutOfRange {
             index: input_idx,
             inputs,
         };
         let input = tx.input.get(input_idx).ok_or(out_of_range)?;
+        // `execute` forwards a one-element slice for the current input. Full-set
+        // callers pass `prevouts.len() == tx.input.len()` in input order.
+        let prevout = if prevouts.len() == inputs {
+            *prevouts
+                .get(input_idx)
+                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
+        } else if prevouts.len() == 1 {
+            prevouts[0]
+        } else {
+            return Err(ScriptError::TaprootPrevoutsUnavailable);
+        };
 
         let matches_tx = input.script_sig.as_bytes() == script_sig
             && input.witness.len() == witness.len()
@@ -274,35 +308,16 @@ impl Interpreter {
 
         let script = Script::from_bytes(script_pubkey);
         if script.is_p2tr() && flags.contains(VerifyFlags::TAPROOT) {
-            return verify_taproot_keypath(&spending, input_idx, prevout, script, witness);
+            return verify_taproot_keypath(&spending, input_idx, script, witness, prevouts);
         }
 
-        verify_with_bitcoinconsensus(input_idx, prevout, &spending, script, flags)
+        verify_non_taproot_portable(input_idx, prevout, &spending, script, flags)
     }
 }
 
-#[cfg(feature = "bitcoinconsensus")]
-fn verify_with_bitcoinconsensus(
-    input_idx: usize,
-    prevout: &TxOut,
-    spending: &bitcoin::Transaction,
-    script: &Script,
-    flags: VerifyFlags,
-) -> Result<bool, ScriptError> {
-    let serialized = encode::serialize(spending);
-    script
-        .verify_with_flags(
-            input_idx,
-            prevout.value,
-            serialized.as_slice(),
-            flags.consensus_bits(),
-        )
-        .map(|()| true)
-        .map_err(|error| ScriptError::Verification(error.to_string()))
-}
-
-#[cfg(not(feature = "bitcoinconsensus"))]
-fn verify_with_bitcoinconsensus(
+/// Portable non-taproot stub: accepts only empty `OP_TRUE` spends. All other
+/// non-taproot (and taproot script-path) classes require the kernel production path.
+fn verify_non_taproot_portable(
     input_idx: usize,
     _prevout: &TxOut,
     spending: &bitcoin::Transaction,
@@ -321,18 +336,18 @@ fn verify_with_bitcoinconsensus(
     }
 
     Err(ScriptError::Verification(
-        "bitcoinconsensus backend is disabled".to_owned(),
+        "portable script backend cannot verify this non-taproot spend".to_owned(),
     ))
 }
 
 fn verify_taproot_keypath(
     spending: &bitcoin::Transaction,
     input_idx: usize,
-    prevout: &TxOut,
     script: &Script,
     witness: &[Vec<u8>],
+    prevouts: &[&TxOut],
 ) -> Result<bool, ScriptError> {
-    if spending.input.len() != 1 || input_idx != 0 {
+    if prevouts.len() != spending.input.len() {
         return Err(ScriptError::TaprootPrevoutsUnavailable);
     }
     let signature_bytes = taproot_keypath_signature(witness)?;
@@ -353,10 +368,9 @@ fn verify_taproot_keypath(
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let public_key = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&script.as_bytes()[2..34])
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
-    let prevouts = [prevout.clone()];
     let mut cache = SighashCache::new(spending);
     let sighash = cache
-        .taproot_key_spend_signature_hash(input_idx, &Prevouts::All(&prevouts), sighash_type)
+        .taproot_key_spend_signature_hash(input_idx, &Prevouts::All(prevouts), sighash_type)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let message = bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array());
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
@@ -377,7 +391,7 @@ fn taproot_keypath_signature(witness: &[Vec<u8>]) -> Result<&[u8], ScriptError> 
     }
 }
 
-#[cfg(all(test, not(feature = "bitcoinconsensus")))]
+#[cfg(test)]
 mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin::{
@@ -388,7 +402,6 @@ mod tests {
     use super::{Interpreter, ScriptError, VerifyFlags};
 
     #[test]
-    #[cfg(not(feature = "bitcoinconsensus"))]
     fn no_backend_accepts_only_empty_op_true_spend() {
         let interpreter = Interpreter;
         let tx = unsigned_spend();
@@ -416,7 +429,6 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "bitcoinconsensus"))]
     fn unsigned_spend() -> Transaction {
         Transaction {
             version: transaction::Version::TWO,

@@ -11,7 +11,7 @@ const STATS_INTERVAL: u64 = 1024;
 
 const MEMPOOL_TICK: Duration = Duration::from_secs(1);
 const METRICS_TICK: Duration = Duration::from_secs(10);
-const SYNC_TICK: Duration = Duration::from_secs(5);
+const SYNC_TICK: Duration = Duration::from_secs(1);
 
 /// Central v1 event loop for process-level tick coordination.
 ///

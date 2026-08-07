@@ -14,7 +14,7 @@ use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
 use bitcoin_rs_rpc::BlockRecord;
 use bitcoin_rs_utxo::{
-    LiveOutputMeta, UtxoSet,
+    LiveOutput, LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
 use hashbrown::{HashMap, HashSet};
@@ -153,7 +153,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
             &max_height_key,
             &encode_block_file_max_height(max_height),
         );
-        self.index.write(batch)
+        self.index.write_deferred(batch)
     }
 
     fn load_block_body(
@@ -238,6 +238,90 @@ impl ApplyAdmission {
     }
 }
 
+/// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
+///
+/// Historical script verification may be skipped only while the active header
+/// chain is verified to contain the pinned anchor block. The gate starts
+/// trusted when no anchor applies (no pin configured) and starts untrusted
+/// when an anchor is pinned; [`AssumeValidGate::evaluate`] re-evaluates trust
+/// against the block tree whenever a new inbound headers batch is accepted.
+#[derive(Debug)]
+pub struct AssumeValidGate {
+    /// Pinned `(height, hash)` anchor, or `None` when no pin applies.
+    anchor: Option<(u32, Hash256)>,
+    /// Whether the active chain is currently verified to contain the anchor.
+    trusted: AtomicBool,
+    /// Whether the diverged-chain warning has already been emitted.
+    warned: AtomicBool,
+}
+
+impl AssumeValidGate {
+    /// Builds the gate for `network` gated on `configured_height`.
+    ///
+    /// The network's pinned anchor applies only when `configured_height` equals
+    /// the anchor height (the production default). Any other value — `0` (full
+    /// verification opt-in) or a custom height-only shortcut — leaves the gate
+    /// unpinned and therefore always trusted.
+    #[must_use]
+    pub fn new(network: Network, configured_height: u32) -> Self {
+        let anchor = network
+            .assume_valid_anchor()
+            .filter(|(height, _)| *height == configured_height);
+        Self {
+            trusted: AtomicBool::new(anchor.is_none()),
+            warned: AtomicBool::new(false),
+            anchor,
+        }
+    }
+
+    /// Builds a gate directly from an optional pinned anchor.
+    #[must_use]
+    pub fn with_anchor(anchor: Option<(u32, Hash256)>) -> Self {
+        Self {
+            trusted: AtomicBool::new(anchor.is_none()),
+            warned: AtomicBool::new(false),
+            anchor,
+        }
+    }
+
+    /// Returns whether historical script verification may currently be skipped.
+    #[must_use]
+    pub fn trusted(&self) -> bool {
+        self.trusted.load(Ordering::Relaxed)
+    }
+
+    /// Re-evaluates trust against `tree`'s active chain.
+    ///
+    /// Trusted only when the active tip is at or above the pinned height and
+    /// the node at the pinned height on the active chain carries the pinned
+    /// hash. Emits a one-time warning when a chain at/past the anchor height
+    /// lacks the anchor block; such a chain is never trusted.
+    pub fn evaluate(&self, tree: &BlockTree) {
+        let Some((pinned_height, pinned_hash)) = self.anchor else {
+            return;
+        };
+        let Some(tip) = tree.tip() else {
+            self.trusted.store(false, Ordering::Relaxed);
+            return;
+        };
+        if tip.height < pinned_height {
+            self.trusted.store(false, Ordering::Relaxed);
+            return;
+        }
+        let trusted = tree
+            .node_at_height_from(tip.tip_id, pinned_height)
+            .is_some_and(|id| tree.lookup(pinned_hash) == Some(id));
+        if !trusted && !self.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                pinned_height,
+                pinned_hash = %pinned_hash,
+                "active chain lacks the assume-valid anchor block; verifying every script",
+            );
+        }
+        self.trusted.store(trusted, Ordering::Relaxed);
+    }
+}
+
 /// Owned shared handle set needed by `apply_block` to perform a block apply.
 #[derive(Clone)]
 pub struct ApplyHandles {
@@ -271,9 +355,11 @@ pub struct ApplyHandles {
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
-    /// Block height at or below which interpreter / `bitcoinconsensus` script execution is skipped during block apply.
+    /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
+    /// Hash-pinned assume-valid trust gate; the height shortcut above applies only while this is trusted.
+    pub assume_valid_gate: Arc<AssumeValidGate>,
 }
 
 impl ApplyHandles {
@@ -314,6 +400,7 @@ impl ApplyHandles {
             g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
             assume_valid_height: 0,
+            assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
         }
     }
 
@@ -411,6 +498,7 @@ fn apply_block_inner(
         block.header.time
     };
     let tx_plan = plan_block_transactions(block);
+    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
         bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
@@ -449,6 +537,7 @@ fn apply_block_inner(
         handles,
         block,
         &tx_plan,
+        Arc::clone(&resolved),
         height,
         locktime_cutoff,
         verify_flags,
@@ -469,8 +558,13 @@ fn apply_block_inner(
     script_verify_result?;
 
     let coinbase_maturity_started = quanta::Instant::now();
-    let coinbase_maturity_result =
-        check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, height);
+    let coinbase_maturity_result = check_coinbase_maturity_with_tx_plan(
+        handles,
+        block,
+        &tx_plan,
+        Arc::clone(&resolved),
+        height,
+    );
     let coinbase_maturity_dur = coinbase_maturity_started.elapsed();
     metrics::histogram!("node.apply_block.coinbase_maturity_seconds")
         .record(coinbase_maturity_dur.as_secs_f64());
@@ -481,6 +575,7 @@ fn apply_block_inner(
         handles,
         block,
         &tx_plan,
+        Arc::clone(&resolved),
         height,
         prev_tip_state.median_time_past,
         softfork_state,
@@ -887,7 +982,19 @@ impl WitnessPresence {
 }
 
 fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
-    let mut txids = Vec::with_capacity(block.txdata.len());
+    let txids: Vec<Txid> = if block.txdata.len() > 32 {
+        block
+            .txdata
+            .par_iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect()
+    } else {
+        block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect()
+    };
     let mut only_coinbase = true;
     let mut needs_local_utxo_overlay = false;
     let mut overlay_capacity = 0usize;
@@ -902,11 +1009,9 @@ fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
     let track_spent_conflicts = block.txdata.len() > 2;
     let mut saw_non_coinbase = false;
 
-    for tx in &block.txdata {
+    for (tx_index, (tx, txid)) in block.txdata.iter().zip(txids.iter().copied()).enumerate() {
         let is_coinbase = tx.is_coinbase();
         let output_count = tx.output.len();
-        let txid = tx.compute_txid();
-        txids.push(txid);
         only_coinbase &= is_coinbase;
         created_output_count = created_output_count.saturating_add(output_count);
         if is_coinbase {
@@ -916,7 +1021,7 @@ fn plan_block_transactions(block: &bitcoin::Block) -> BlockTxPlan {
             let input_count = tx.input.len();
             for input in &tx.input {
                 has_witness |= !input.witness.is_empty();
-                let prior_txids = &txids[..txids.len().saturating_sub(1)];
+                let prior_txids = &txids[..tx_index];
                 let spends_created_output = if prior_txids.len() <= LOCAL_OVERLAY_TXID_SET_THRESHOLD
                 {
                     prior_txids.contains(&input.previous_output.txid)
@@ -1006,6 +1111,62 @@ fn compute_basic_filter(
     };
     Some(filter.content)
 }
+/// All external (already-committed) prevouts for one block, resolved in a single
+/// parallel pass so `script_verify`, `coinbase_maturity`, and `bip68` reuse one
+/// lookup table instead of hitting the `UtxoSet` repeatedly.
+struct ResolvedUtxoView {
+    external: HashMap<bitcoin::OutPoint, LiveOutput>,
+}
+
+impl ResolvedUtxoView {
+    fn resolve(utxo: &UtxoSet, block: &bitcoin::Block, tx_plan: &BlockTxPlan) -> Self {
+        let same_block = tx_plan.same_block_spent.as_ref();
+        let inputs: Vec<bitcoin::OutPoint> = block
+            .txdata
+            .iter()
+            .filter(|tx| !tx.is_coinbase())
+            .flat_map(|tx| &tx.input)
+            .filter(|input| {
+                same_block
+                    .is_none_or(|set| !set.contains(&internal_outpoint(&input.previous_output)))
+            })
+            .map(|input| input.previous_output)
+            .collect();
+        let entries: Vec<(bitcoin::OutPoint, LiveOutput)> = inputs
+            .into_par_iter()
+            .filter_map(|outpoint| {
+                utxo.get_entry(&internal_outpoint(&outpoint))
+                    .map(|entry| (outpoint, entry))
+            })
+            .collect();
+        Self {
+            external: entries.into_iter().collect(),
+        }
+    }
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self {
+            external: HashMap::new(),
+        }
+    }
+
+    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+        self.external.get(outpoint).map(|entry| entry.txout.clone())
+    }
+
+    fn lookup_meta(&self, outpoint: &bitcoin::OutPoint) -> Option<LiveOutputMeta> {
+        self.external.get(outpoint).map(|entry| LiveOutputMeta {
+            coinbase: entry.coinbase,
+            height: entry.height,
+        })
+    }
+}
+
+impl UtxoView for ResolvedUtxoView {
+    fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
+        self.lookup(outpoint)
+    }
+}
 
 /// Resolves every transaction's prevouts serially in block order into an owned
 /// `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec). This is the only
@@ -1014,19 +1175,15 @@ fn compute_basic_filter(
 /// created (or spent) in the same block; the non-overlay case reads the
 /// committed shared set directly.
 fn resolve_block_prevouts(
-    handles: &ApplyHandles,
+    resolved: Arc<ResolvedUtxoView>,
     block: &bitcoin::Block,
     tx_plan: &BlockTxPlan,
     height: u32,
 ) -> core::result::Result<Vec<Vec<Option<bitcoin::TxOut>>>, ApplyError> {
     let txids = tx_plan.txids();
     if tx_plan.needs_local_utxo_overlay {
-        let mut view = BlockLocalUtxoView::new(
-            Arc::clone(&handles.utxo),
-            &block.txdata,
-            height,
-            tx_plan.overlay_capacity,
-        );
+        let mut view =
+            BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
         let mut resolved = Vec::with_capacity(block.txdata.len());
         for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
             if tx.is_coinbase() {
@@ -1045,26 +1202,31 @@ fn resolve_block_prevouts(
         }
         Ok(resolved)
     } else {
-        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
         Ok(block
             .txdata
-            .iter()
+            .par_iter()
             .map(|tx| {
                 if tx.is_coinbase() {
                     return Vec::new();
                 }
                 tx.input
                     .iter()
-                    .map(|input| view.lookup(&input.previous_output))
+                    .map(|input| resolved.lookup(&input.previous_output))
                     .collect()
             })
             .collect())
     }
 }
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     tx_plan: &BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
     height: u32,
     locktime_cutoff: u32,
     flags: bitcoin_rs_script::VerifyFlags,
@@ -1077,10 +1239,12 @@ fn verify_block_transactions(
         }
         return Ok(());
     }
-    // Height-only assume-valid: skip interpreter / bitcoinconsensus script execution only.
-    let skip_scripts = handles.assume_valid_height > 0 && height <= handles.assume_valid_height;
+    // Assume-valid: skip kernel / portable script execution only, and only while the
+    // hash-pinned trust gate holds (always trusted when no pin is configured).
+    let skip_scripts = handles.assume_valid_height > 0
+        && height <= handles.assume_valid_height
+        && handles.assume_valid_gate.trusted();
     if skip_scripts && !tx_plan.needs_local_utxo_overlay {
-        let view = crate::UtxoSetView::new(Arc::clone(&handles.utxo));
         block.txdata.par_iter().try_for_each(|tx| {
             if tx.is_coinbase() {
                 bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
@@ -1088,7 +1252,7 @@ fn verify_block_transactions(
             }
             bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
                 tx,
-                &view,
+                &*resolved,
                 height,
                 locktime_cutoff,
             )
@@ -1096,12 +1260,8 @@ fn verify_block_transactions(
         return Ok(());
     }
     if skip_scripts {
-        let mut view = BlockLocalUtxoView::new(
-            Arc::clone(&handles.utxo),
-            &block.txdata,
-            height,
-            tx_plan.overlay_capacity,
-        );
+        let mut view =
+            BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
         for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
             if tx.is_coinbase() {
                 bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
@@ -1127,12 +1287,11 @@ fn verify_block_transactions(
     // later transaction sees outputs an earlier one created (or spent) in the same
     // block; the non-overlay case reads the committed shared set directly.
     let resolution_started = quanta::Instant::now();
-    let resolution_result = resolve_block_prevouts(handles, block, tx_plan, height);
+    let resolution_result = resolve_block_prevouts(resolved, block, tx_plan, height);
+    let resolution_dur = resolution_started.elapsed();
     metrics::histogram!("node.apply_block.script_resolution_seconds")
-        .record(resolution_started.elapsed().as_secs_f64());
+        .record(resolution_dur.as_secs_f64());
     let resolved = resolution_result?;
-
-    // Consensus has no `metrics` dependency, so it measures its serial
     // preparation and parallel input-check fan-out internally and reports both
     // sub-stage durations back; record them here on the success and error paths
     // before propagating the verdict, mirroring the surrounding `*_result` idiom.
@@ -1150,11 +1309,18 @@ fn verify_block_transactions(
     metrics::histogram!("node.apply_block.script_parallel_seconds")
         .record(script_timings.parallel_seconds);
     script_input_result?;
+    tracing::debug!(
+        height,
+        script_resolution_us = resolution_dur.as_micros(),
+        script_prepare_us = (script_timings.prepare_seconds * 1_000_000.0) as u64,
+        script_parallel_us = (script_timings.parallel_seconds * 1_000_000.0) as u64,
+        "script_verify: profile"
+    );
     Ok(())
 }
 
 struct BlockLocalUtxoView<'b> {
-    base: Arc<UtxoSet>,
+    base: Arc<ResolvedUtxoView>,
     txdata: &'b [bitcoin::Transaction],
     height: u32,
     overlay: HashMap<bitcoin::OutPoint, Option<u32>>,
@@ -1162,13 +1328,13 @@ struct BlockLocalUtxoView<'b> {
 
 impl<'b> BlockLocalUtxoView<'b> {
     fn new(
-        set: Arc<UtxoSet>,
+        base: Arc<ResolvedUtxoView>,
         txdata: &'b [bitcoin::Transaction],
         height: u32,
         overlay_capacity: usize,
     ) -> Self {
         Self {
-            base: set,
+            base,
             txdata,
             height,
             overlay: HashMap::with_capacity(overlay_capacity),
@@ -1185,7 +1351,7 @@ impl<'b> BlockLocalUtxoView<'b> {
                 height: self.height,
             });
         }
-        self.base.get_meta(&internal_outpoint(outpoint))
+        self.base.lookup_meta(outpoint)
     }
 
     fn spend_inputs(&mut self, tx: &bitcoin::Transaction) {
@@ -1216,9 +1382,7 @@ impl UtxoView for BlockLocalUtxoView<'_> {
             let vout = usize::try_from(outpoint.vout).ok()?;
             return self.txdata.get(tx_index)?.output.get(vout).cloned();
         }
-        self.base
-            .get_entry(&internal_outpoint(outpoint))
-            .map(|entry| entry.txout)
+        self.base.lookup(outpoint)
     }
 }
 
@@ -1228,13 +1392,16 @@ pub(crate) fn check_coinbase_maturity(
     block: &bitcoin::Block,
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
-    check_coinbase_maturity_with_tx_plan(handles, block, &plan_block_transactions(block), height)
+    let tx_plan = plan_block_transactions(block);
+    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
+    check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, resolved, height)
 }
 
 fn check_coinbase_maturity_with_tx_plan(
-    handles: &ApplyHandles,
+    _handles: &ApplyHandles,
     block: &bitcoin::Block,
     tx_plan: &BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
     let txids = tx_plan.txids();
@@ -1246,10 +1413,7 @@ fn check_coinbase_maturity_with_tx_plan(
     if !tx_plan.needs_local_utxo_overlay {
         for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
             for input in &tx.input {
-                let Some(entry) = handles
-                    .utxo
-                    .get_meta(&internal_outpoint(&input.previous_output))
-                else {
+                let Some(entry) = resolved.lookup_meta(&input.previous_output) else {
                     continue;
                 };
                 check_coinbase_input_maturity(entry, height)?;
@@ -1258,12 +1422,8 @@ fn check_coinbase_maturity_with_tx_plan(
         return Ok(());
     }
 
-    let mut view = BlockLocalUtxoView::new(
-        Arc::clone(&handles.utxo),
-        &block.txdata,
-        height,
-        tx_plan.overlay_capacity,
-    );
+    let mut view =
+        BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
     for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
         if tx.is_coinbase() {
             view.add_outputs(tx_index, *txid, tx.output.len())?;
@@ -1301,6 +1461,7 @@ fn check_bip68_sequence_locks(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     tx_plan: &BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
     height: u32,
     mtp: u32,
     softfork_state: crate::bip9_context::ContextualSoftforkState,
@@ -1318,12 +1479,8 @@ fn check_bip68_sequence_locks(
 
     let txids = tx_plan.txids();
     debug_assert_eq!(block.txdata.len(), txids.len());
-    let mut view = BlockLocalUtxoView::new(
-        Arc::clone(&handles.utxo),
-        &block.txdata,
-        height,
-        tx_plan.overlay_capacity,
-    );
+    let mut view =
+        BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
     let mut prevout_mtp_by_height = None;
     for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
         if tx.is_coinbase() {
@@ -1856,6 +2013,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
@@ -1876,7 +2038,8 @@ mod consensus_rule_tests {
             op_true_script(),
         );
         let block = block_with_transactions(vec![created, spending]);
-        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+        let mut view =
+            BlockLocalUtxoView::new(Arc::new(ResolvedUtxoView::empty()), &block.txdata, 42, 2);
 
         view.add_outputs(
             0,
@@ -1912,7 +2075,8 @@ mod consensus_rule_tests {
             op_true_script(),
         );
         let block = block_with_transactions(vec![created, first_spend, second_spend]);
-        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 3);
+        let mut view =
+            BlockLocalUtxoView::new(Arc::new(ResolvedUtxoView::empty()), &block.txdata, 42, 3);
 
         view.add_outputs(
             0,
@@ -1939,7 +2103,8 @@ mod consensus_rule_tests {
             op_true_script(),
         );
         let block = block_with_transactions(vec![spending, created]);
-        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+        let mut view =
+            BlockLocalUtxoView::new(Arc::new(ResolvedUtxoView::empty()), &block.txdata, 42, 2);
 
         view.spend_inputs(&block.txdata[0]);
         view.add_outputs(
@@ -1964,7 +2129,8 @@ mod consensus_rule_tests {
             vout: 0,
         };
         let block = block_with_transactions(vec![earlier, later]);
-        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+        let mut view =
+            BlockLocalUtxoView::new(Arc::new(ResolvedUtxoView::empty()), &block.txdata, 42, 2);
 
         view.add_outputs(
             0,
@@ -1996,7 +2162,8 @@ mod consensus_rule_tests {
             vout: 0,
         };
         let block = block_with_transactions(vec![coinbase, transaction]);
-        let mut view = BlockLocalUtxoView::new(Arc::new(UtxoSet::new()), &block.txdata, 42, 2);
+        let mut view =
+            BlockLocalUtxoView::new(Arc::new(ResolvedUtxoView::empty()), &block.txdata, 42, 2);
 
         view.add_outputs(
             0,
@@ -2036,6 +2203,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2100,6 +2272,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2182,6 +2359,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2227,6 +2409,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
@@ -2255,6 +2442,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             1,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2272,6 +2464,82 @@ mod consensus_rule_tests {
     }
 
     #[test]
+    fn assume_valid_gate_new_pins_only_the_exact_anchor_height() {
+        let anchor_height = Network::Mainnet
+            .assume_valid_anchor()
+            .map_or(0, |(height, _)| height);
+        assert!(anchor_height > 0);
+
+        let no_pin = AssumeValidGate::new(Network::Mainnet, 0);
+        assert!(no_pin.trusted(), "zero configured height means no pin");
+
+        let pinned = AssumeValidGate::new(Network::Mainnet, anchor_height);
+        assert!(
+            !pinned.trusted(),
+            "exact anchor height starts untrusted until the chain is evaluated"
+        );
+
+        let off_by_one = AssumeValidGate::new(Network::Mainnet, anchor_height + 1);
+        assert!(
+            off_by_one.trusted(),
+            "custom heights keep the height-only shortcut without a pin"
+        );
+
+        let unanchored = AssumeValidGate::with_anchor(None);
+        assert!(unanchored.trusted(), "no anchor means always trusted");
+    }
+
+    #[test]
+    fn assume_valid_gate_evaluate_trusts_only_the_chain_containing_the_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = empty_apply_handles();
+        let bits = CompactTarget::from_consensus(0x207f_ffff);
+        let headers: Vec<_> = (0..=4).map(|height| (bits, height)).collect();
+        seed_pow_chain_with_headers(&handles, &headers)?;
+
+        let anchor_hash = {
+            let tree = handles.block_tree.read();
+            let tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing tip"))?;
+            let anchor_id = tree
+                .node_at_height_from(tip.tip_id, 2)
+                .ok_or_else(|| std::io::Error::other("missing anchor node"))?;
+            tree.node(anchor_id)?.hash
+        };
+
+        let pinned = AssumeValidGate::with_anchor(Some((2, anchor_hash)));
+        assert!(!pinned.trusted(), "pinned gate starts untrusted");
+        {
+            let tree = handles.block_tree.read();
+            pinned.evaluate(&tree);
+        }
+        assert!(
+            pinned.trusted(),
+            "active chain contains the anchor block, so the gate must trust it"
+        );
+
+        let diverged = AssumeValidGate::with_anchor(Some((2, Hash256::from_le_bytes(&[0xee; 32]))));
+        {
+            let tree = handles.block_tree.read();
+            diverged.evaluate(&tree);
+        }
+        assert!(
+            !diverged.trusted(),
+            "a chain lacking the pinned hash must never be trusted"
+        );
+        {
+            let tree = handles.block_tree.read();
+            diverged.evaluate(&tree);
+        }
+        assert!(
+            !diverged.trusted(),
+            "re-evaluation on the same diverged chain keeps the gate untrusted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn verify_block_transactions_rejects_duplicate_spends_when_assume_valid_height_zero()
     -> Result<(), Box<dyn std::error::Error>> {
         let (block, plan, utxo) = duplicate_spend_block()?;
@@ -2281,6 +2549,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
@@ -2308,6 +2581,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
@@ -2335,6 +2613,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             3,
             0,
             bitcoin_rs_script::VerifyFlags::NONE,
@@ -2362,6 +2645,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2379,6 +2667,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2407,6 +2700,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             3,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2438,6 +2736,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
             2,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2470,6 +2773,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             1,
             0,
             bitcoin_rs_script::VerifyFlags::MANDATORY,
@@ -2724,11 +3032,20 @@ mod consensus_rule_tests {
         let block = block_with_transactions(vec![coinbase, spend]);
         let handles = empty_apply_handles();
 
-        let error =
-            match check_coinbase_maturity_with_tx_plan(&handles, &block, &tx_plan(&block), 1) {
-                Ok(()) => panic!("same-block coinbase spend must fail maturity"),
-                Err(error) => error,
-            };
+        let error = match check_coinbase_maturity_with_tx_plan(
+            &handles,
+            &block,
+            &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
+            1,
+        ) {
+            Ok(()) => panic!("same-block coinbase spend must fail maturity"),
+            Err(error) => error,
+        };
         assert_bip_error(&error, "COINBASE_MATURITY");
     }
 
@@ -2753,17 +3070,31 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 1,
                 0,
                 bitcoin_rs_script::VerifyFlags::NONE
             )
             .is_ok()
         );
-        let error =
-            match check_coinbase_maturity_with_tx_plan(&handles, &block, &tx_plan(&block), 1) {
-                Ok(()) => panic!("same-block coinbase spend must fail maturity"),
-                Err(error) => error,
-            };
+        let error = match check_coinbase_maturity_with_tx_plan(
+            &handles,
+            &block,
+            &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
+            1,
+        ) {
+            Ok(()) => panic!("same-block coinbase spend must fail maturity"),
+            Err(error) => error,
+        };
         assert_bip_error(&error, "COINBASE_MATURITY");
     }
 
@@ -2787,6 +3118,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             101,
             0,
             active,
@@ -2797,8 +3133,21 @@ mod consensus_rule_tests {
         };
         assert_bip_error(&error, "BIP68");
         assert!(
-            check_bip68_sequence_locks(&handles, &block, &tx_plan(&block), 102, 0, active, None)
-                .is_ok()
+            check_bip68_sequence_locks(
+                &handles,
+                &block,
+                &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
+                102,
+                0,
+                active,
+                None
+            )
+            .is_ok()
         );
         Ok(())
     }
@@ -2826,6 +3175,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             0,
             required_mtp - 1,
             active,
@@ -2840,6 +3194,11 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 0,
                 required_mtp,
                 active,
@@ -2871,6 +3230,11 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 prevout_height + 1,
                 200,
                 softfork_state(true),
@@ -2917,6 +3281,11 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 prevout_height + 1,
                 BIP68_TEST_PREVOUT_MTP,
                 softfork_state(true),
@@ -2946,6 +3315,11 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 101,
                 BIP68_TEST_PREVOUT_MTP,
                 softfork_state(true),
@@ -2974,6 +3348,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             101,
             BIP68_TEST_PREVOUT_MTP,
             softfork_state(true),
@@ -3009,6 +3388,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             0,
             BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
             active,
@@ -3043,6 +3427,11 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &tx_plan(&block),
+            )),
             0,
             BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
             active,
@@ -3074,6 +3463,11 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &block,
+                    &tx_plan(&block)
+                )),
                 101,
                 0,
                 softfork_state(false),
@@ -3105,6 +3499,11 @@ mod consensus_rule_tests {
                 &handles,
                 &version_one_block,
                 &tx_plan(&version_one_block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &version_one_block,
+                    &tx_plan(&version_one_block)
+                )),
                 101,
                 0,
                 active,
@@ -3123,6 +3522,11 @@ mod consensus_rule_tests {
                 &handles,
                 &disabled_block,
                 &tx_plan(&disabled_block),
+                Arc::new(ResolvedUtxoView::resolve(
+                    (&handles).utxo.as_ref(),
+                    &disabled_block,
+                    &tx_plan(&disabled_block)
+                )),
                 101,
                 0,
                 active,
@@ -4678,7 +5082,7 @@ mod consensus_rule_tests {
     /// Gated to a real script backend: the acceptance arm asserts `Ok`, which only
     /// holds when scripts actually execute. With no backend the verifier returns a
     /// `Script { .. "backend disabled" }` error, so the helper would be dead code.
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn p2sh_template_bare_spend_block()
     -> Result<(bitcoin::Block, BlockTxPlan, Arc<UtxoSet>), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
@@ -4730,7 +5134,7 @@ mod consensus_rule_tests {
 
     // Asserts acceptance under the BIP16 exception, which needs a real script backend
     // (the backend-less default build returns a "backend disabled" Script error).
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     #[test]
     fn bip16_exception_accepts_bare_p2sh_template_spend_that_normal_p2sh_rejects()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4760,18 +5164,41 @@ mod consensus_rule_tests {
         // Exception block: bare-valid P2SH-template spend is ACCEPTED.
         let (block, plan, utxo) = p2sh_template_bare_spend_block()?;
         let handles = apply_handles_with_assume_valid(utxo, 0); // full verification
-        verify_block_transactions(&handles, &block, &plan, 170_060, 0, exc_flags)?;
+        verify_block_transactions(
+            &handles,
+            &block,
+            &plan,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles).utxo.as_ref(),
+                &block,
+                &plan,
+            )),
+            170_060,
+            0,
+            exc_flags,
+        )?;
 
         // Normal block at the same height: P2SH enforced -> REJECTED at input 0.
         let (block2, plan2, utxo2) = p2sh_template_bare_spend_block()?;
         let handles2 = apply_handles_with_assume_valid(utxo2, 0);
-        let err =
-            match verify_block_transactions(&handles2, &block2, &plan2, 170_060, 0, normal_flags) {
-                Ok(()) => {
-                    panic!("normal P2SH enforcement must reject the bare-script redeem spend")
-                }
-                Err(e) => e,
-            };
+        let err = match verify_block_transactions(
+            &handles2,
+            &block2,
+            &plan2,
+            Arc::new(ResolvedUtxoView::resolve(
+                (&handles2).utxo.as_ref(),
+                &block2,
+                &plan2,
+            )),
+            170_060,
+            0,
+            normal_flags,
+        ) {
+            Ok(()) => {
+                panic!("normal P2SH enforcement must reject the bare-script redeem spend")
+            }
+            Err(e) => e,
+        };
         assert!(matches!(
             err,
             ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {

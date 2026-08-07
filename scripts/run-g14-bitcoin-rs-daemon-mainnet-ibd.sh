@@ -377,6 +377,11 @@ def reap_lingering_process_group(pgid: int, timeout_seconds: float) -> None:
         except ProcessLookupError:
             return
         time.sleep(0.05)
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return
+    die(f"process group {pgid} survived SIGKILL deadline")
 
 
 def shutdown_daemon_process(process: subprocess.Popen, pgid: int) -> None:
@@ -494,6 +499,17 @@ command = (
         *bitcoin_rs_args,
     ]
 )
+
+# Fresh exclusive datadir: refuse any prior path and reserve with non-recursive
+# mkdir only. Never delete or reuse existing state.
+if datadir.exists():
+    die(f"--datadir already exists; refusing to reuse state: {datadir}")
+try:
+    datadir.mkdir()
+except FileExistsError:
+    die(f"--datadir already exists; refusing to reuse state: {datadir}")
+except FileNotFoundError:
+    die(f"--datadir parent directory does not exist: {datadir.parent}")
 
 process: subprocess.Popen | None = None
 pgid: int | None = None

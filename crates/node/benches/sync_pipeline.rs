@@ -24,7 +24,10 @@ use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
 use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
-    BlockSync, Config, Network, NoOpZmqPublisher, apply::ApplyHandles, state::NodeState,
+    BlockSync, Config, Network, NoOpZmqPublisher,
+    apply::ApplyHandles,
+    state::NodeState,
+    sync::{SyncBudget, default_sync_budget},
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
@@ -568,6 +571,13 @@ impl SyncFixture {
     fn new_reverse_scan_overflow(tx_index_mode: TxIndexMode) -> Self {
         let mut fixture =
             Self::new_with_block_count(tx_index_mode, 0, SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS);
+        // The bench stages 128 received blocks and still needs to request the
+        // full 128-block pending window, so the received-block budget must
+        // cover both the staged blocks and the new requests.
+        fixture.sync.install_budget(SyncBudget {
+            max_received_blocks: 256,
+            ..default_sync_budget()
+        });
         let first_index = SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_START_HEIGHT.saturating_sub(1);
         let last_index = first_index.saturating_add(SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_BLOCKS);
         for block in fixture
@@ -939,15 +949,28 @@ impl ProductionStateSyncFixture {
     }
 
     fn assert_getdata_batch(&self) {
-        let getdata_count = match self
+        let rx = self
             .outbound_rxs
             .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory.len(),
-            other => panic!("expected production getdata, got {other:?}"),
+            .unwrap_or_else(|| panic!("missing primary outbound receiver"));
+        let mut drained_headers = 0_usize;
+        let getdata_count = loop {
+            match rx
+                .try_recv()
+                .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
+            {
+                NetworkMessage::GetData(inventory) => break inventory.len(),
+                NetworkMessage::GetHeaders(_) => {
+                    drained_headers = drained_headers.saturating_add(1);
+                    if drained_headers > 32 {
+                        panic!(
+                            "expected production getdata after draining {drained_headers} header requests"
+                        );
+                    }
+                    continue;
+                }
+                other => panic!("expected production getdata, got {other:?}"),
+            }
         };
         assert_eq!(getdata_count, self.expected_getdata_count);
     }
@@ -995,7 +1018,7 @@ fn populate_sync_header_chain(
         tip_id = tree
             .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
             .unwrap_or_else(|error| panic!("synthetic header insert failed: {error}"));
-        if height == 1 || (3..=SYNC_PROXY_BLOCKS.saturating_add(1)).contains(&height) {
+        if height == 1 || (3..=body_blocks).contains(&height) {
             let node = tree
                 .node(tip_id)
                 .unwrap_or_else(|error| panic!("synthetic header lookup failed: {error}"));

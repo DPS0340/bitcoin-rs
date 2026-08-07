@@ -153,9 +153,12 @@ pub struct Config {
     pub zmqpubrawtxhwm: Option<u32>,
     /// Block height at or below which script verification is skipped during block apply.
     ///
-    /// Height-only trust shortcut for faster catch-up. This is **not** equivalent to Bitcoin
-    /// Core's hash-based `-assumevalid`, which pins a trusted block hash. Zero disables script
-    /// skipping and preserves full consensus checks.
+    /// On mainnet the default is the hash-pinned assume-valid anchor
+    /// ([`Network::assume_valid_anchor`]): blocks at or below the anchor height skip script
+    /// execution only while the active header chain is verified to contain the pinned anchor
+    /// block, matching Bitcoin Core's `-assumevalid` posture. Setting `0` opts into full
+    /// script verification of every block. Any other custom height applies the height-only
+    /// trust shortcut without a hash pin.
     pub assume_valid_height: u32,
     #[serde(skip)]
     pub(crate) shutdown_signal: Option<Receiver<()>>,
@@ -256,7 +259,9 @@ impl Config {
             zmqpubhashtxhwm: None,
             zmqpubrawblockhwm: None,
             zmqpubrawtxhwm: None,
-            assume_valid_height: 0,
+            assume_valid_height: network
+                .assume_valid_anchor()
+                .map_or(0, |(height, _)| height),
             shutdown_signal: None,
         }
     }

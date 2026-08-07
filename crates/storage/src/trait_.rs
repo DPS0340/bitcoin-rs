@@ -42,7 +42,15 @@ pub trait KvStore: Send + Sync + 'static {
     /// Atomically applies `batch`.
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError>;
 
-    /// Flushes pending durable state according to backend semantics.
+    /// Atomically applies `batch`, but may defer crash durability until [`Self::flush`].
+    ///
+    /// Completed writes must be visible to later reads in the current process. Backends that do
+    /// not support deferred durability may use the regular [`Self::write`] path.
+    fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write(batch)
+    }
+
+    /// Makes every earlier completed write durable before returning.
     fn flush(&self) -> Result<(), StorageError>;
 
     /// Captures a point-in-time read snapshot.

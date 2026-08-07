@@ -1,5 +1,5 @@
 ---
-title: Non-taproot script verification runs Core's own C engine — optimize non-script paths
+title: "Production script verification runs through bitcoinkernel: optimize measured Rust-side preparation and non-script stages"
 date: 2026-06-09
 category: docs/solutions/architecture-patterns
 module: crates/consensus
@@ -8,7 +8,7 @@ component: tooling
 severity: medium
 applies_when:
   - "Proposing work to make bitcoin-rs faster than Bitcoin Core at block validation"
-  - "Micro-optimizing a data structure inside or adjacent to a bitcoinconsensus call"
+  - "Micro-optimizing a data structure inside or adjacent to a bitcoinkernel consensus call"
   - "Choosing a container for a very-small-N collection on a hot path"
   - "Editing a dependency or swapping a container without a baseline benchmark"
 related_components:
@@ -16,7 +16,7 @@ related_components:
   - script-verification
   - utxo
 tags:
-  - bitcoinconsensus
+  - bitcoinkernel
   - script-verification
   - consensus
   - performance
@@ -26,16 +26,20 @@ tags:
   - measured-regression
 ---
 
-# Non-taproot script verification runs Core's own C engine — optimize non-script paths
+# Production script verification runs through bitcoinkernel: optimize measured Rust-side preparation and non-script stages
+
+> **Current Architecture Status (Tasks 16–18):**
+> In Tasks 16–18, `bitcoinkernel` (`libbitcoinkernel`) became the default production input-script verification engine across all script classes (legacy, segwit, and Taproot script-path and key-path spends). Historical `bitcoinconsensus` has been removed.
+>
+> **Architecture Decision and Tradeoff:**
+> Adopting `bitcoinkernel` as the single native input-script verification engine addresses the unsupported Taproot script-path capability exposed during the block-938344 IBD stall under the portable path; successful live progression through block 938344 and full-tip completion remain pending a fresh rerun. The tradeoff is a hard build requirement on C++ build tools (`cmake` and `libboost-dev`) for default builds. The pure-Rust interpreter remains an explicit `--no-default-features` portable posture for differential testing, but cannot validate Taproot script-path transactions on mainnet.
+>
+> **Performance Evidence Note:**
+> The `BTreeSet` vs `HashSet` benchmark delta below was measured under the historical `bitcoinconsensus` backend. Production script verification now runs entirely through `bitcoinkernel`. The cutover is a correctness and architecture requirement, not a speed optimization; final end-to-end performance must be remeasured under the kernel default.
 
 ## Context
 
-The IBD / block-validation effort set a goal of beating Bitcoin Core (C++) and gocoin (Go) on
-validation speed while staying compact. A natural first instinct was to micro-optimize the consensus
-hot path. The candidate: the duplicate-input detection set in transaction verification, which enforces
-the consensus rule that a transaction may not spend the same outpoint twice.
-
-That set lives at `crates/consensus/src/verify_tx.rs:179`:
+The block-validation performance effort set a goal of matching or exceeding Bitcoin Core validation speed while maintaining a compact footprint. An early optimization attempt targeted the duplicate-input detection set during transaction verification in `crates/consensus/src/verify_tx.rs`, which enforces the consensus rule that a transaction must not spend the same outpoint twice:
 
 ```rust
 let mut seen = BTreeSet::new();
@@ -49,103 +53,52 @@ for (input_index, input) in tx.input.iter().enumerate() {
 }
 ```
 
-The hypothesis was that swapping the ordered `std::collections::BTreeSet` for `hashbrown::HashSet`
-(O(log n) tree ops -> amortized O(1) hashing) would shave time off per-transaction verification. It did
-the opposite.
+The hypothesis was that replacing `std::collections::BTreeSet` with `hashbrown::HashSet` would reduce per-transaction verification overhead by substituting O(1) hashing for tree operations. Instead, the change caused a statistically significant performance regression of +2.7% on the `verify_tx/multi_input_true_scripts` benchmark (p<0.05), leading to an immediate revert.
 
-**What didn't work:** swapping `BTreeSet` -> `hashbrown::HashSet` for the `seen` outpoint set produced
-a *statistically significant regression* of **+2.7%** on the `verify_tx/multi_input_true_scripts`
-criterion benchmark (p<0.05). The change was reverted; HEAD still uses `BTreeSet`. Codex metacognition
-independently flagged the micro-opt as "premature and not goal-aligned" before the bench came back — the
-regression confirmed the flag empirically.
+Under current architecture, default builds route all production input-script verification across all script classes to `bitcoinkernel` (`libbitcoinkernel`), while Rust retains surrounding non-script consensus checks. The `--no-default-features` direct `Interpreter` posture is a separate non-production path retained for differential testing, lacking Taproot script-path validation capabilities.
 
-The root cause is structural, not tuning-fixable. Under the default `bitcoinconsensus` feature, the
-verification loop immediately after the dup-input check routes each **non-taproot** input into
-`bitcoinconsensus` (libbitcoinconsensus — Bitcoin Core's *own* extracted script-verification engine).
-The feature is on by default (`crates/consensus/Cargo.toml:15`, `default = ["bitcoinconsensus"]`) and the
-call site is gated by `#[cfg(feature = "bitcoinconsensus")]` (`verify_tx.rs:202`). The `seen` set holds
-only a handful of outpoints per transaction, so its container choice cannot move a path whose time is
-spent inside an external C verifier call. Worse, at tiny N (a few elements), `HashSet`'s allocation plus
-hashing constant-factor costs *more* than `BTreeSet`'s. Pure downside.
+Because the `seen` set holds only a few outpoints per transaction, swapping containers at tiny N adds allocation and hashing overhead without reducing execution time. The +2.7% container regression remains historical evidence from the `bitcoinconsensus` era and cannot support a direct performance comparison against the current `bitcoinkernel` default. The core operational lesson remains valid: profile first before modifying small-N collections or wrapper logic adjacent to consensus verification.
 
 ## Guidance
 
-**The default non-taproot script-verification path is not where a speed advantage over Core can live,
-because it is literally Bitcoin Core's code.** With the shipping default (`bitcoinconsensus`),
-**non-taproot** per-input script verification is delegated to Core's own extracted C engine (taproot
-inputs run bitcoin-rs's Rust `Interpreter` instead — see Scope above). That C path is byte-identical to
-Core *and* essentially equal-speed to Core — you are calling the same compiled engine. No amount of
-Rust-side container or allocator tuning around that call changes the wall-clock, because the time is
-spent inside the C call, not in the surrounding Rust.
+**Production script verification routes to `bitcoinkernel`; optimize measured Rust-side preparation and non-script stages.** Under default features, production input-script verification delegates all script classes to `bitcoinkernel`, while Rust performs surrounding non-script consensus checks. Direct `Interpreter` calls remain a separate portable posture under `--no-default-features` and cannot validate Taproot script-path transactions on mainnet.
 
-> Scope — non-taproot only: on the default build the per-input routing is **split**. Non-taproot inputs
-> go to the `bitcoinconsensus` C engine (`verify_tx.rs:203`, then `continue`); taproot (P2TR) inputs fall
-> through to bitcoin-rs's own Rust `Interpreter` (`verify_tx.rs:215`) *even on the default build*. The
-> "you cannot beat Core here" claim therefore applies to the **non-taproot** path — which is exactly what
-> the regression evidence exercises (the bench script is OP_1, non-taproot). The taproot path is Rust and
-> carries its own optimization story; see the parallel Rust validation path.
+Because core script evaluation runs inside `bitcoinkernel`, Rust-side micro-optimizations inside verifier loops provide limited leverage. Optimization efforts must focus on measured Rust-side bottlenecks (such as UTXO caching, input preparation, storage commits, and block download scheduling).
 
 Concretely:
 
-- **Do not micro-optimize Rust data structures that sit on either side of the `bitcoinconsensus` call.**
-  The `seen` duplicate-input set, input/output vector container choices, and similar small-N collections
-  in `verify_tx` are not the bottleneck and cannot become one on the default path.
-- **Genuine speed advantage over Core must come from non-script paths:** the UTXO cache (hit rate,
-  eviction, layout), parallelism and commit batching, block download (multi-peer, bandwidth-bound), and
-  the storage engine (the four `KvStore` backends). These are the paths where bitcoin-rs owns the
-  implementation and Core does not get a vote.
-- **Process discipline that would have caught this before the edit:** (a) define the success metric and
-  comparison harness *before* micro-optimizing; (b) profile to learn where time actually goes before
-  picking what to change; (c) benchmark a candidate *before* editing dependencies or containers; (d)
-  treat a measured regression as an immediate **reject** — revert, do not tune.
+- **Do not micro-optimize small-N Rust data structures adjacent to consensus calls without profiling.** Small-N collections like the duplicate-input `seen` set carry constant-factor allocation and hashing overhead that often exceeds ordered tree lookups.
+- **Profile non-script and wrapper paths alongside script execution:** UTXO cache lookup efficiency, transaction iteration, parallelism, storage backend commits, and block download scheduling. Measure actual overhead before attempting Rust-side modifications.
+- **Maintain measurement discipline:** (a) define the baseline harness before optimizing; (b) profile to isolate the rate-limiting stage; (c) benchmark candidates against the `bitcoinkernel` baseline; (d) revert measured regressions immediately.
 
 ## Why This Matters
 
-This is the load-bearing strategic corollary, and it generalizes beyond one benchmark:
+**Delegating production script evaluation to `bitcoinkernel` bounds Rust-side execution headroom on the script path while requiring focus on surrounding stages.** While core script execution runs inside `libbitcoinkernel`, surrounding Rust logic (UTXO retrieval, transaction iteration, container allocation, and storage commits) decides remaining Rust-side performance. Unprofiled micro-optimizations risk adding allocation or hashing overhead, whereas measured wrapper or caching improvements remain effective.
 
-**You cannot out-optimize a competitor on a path where you run the competitor's own code.** Because the
-default non-taproot path *is* Core's extracted engine, that share of script verification is a fixed cost
-shared with the thing you are trying to beat. Effort spent there has a hard ceiling of "tie," and a
-realistic outcome of "regression" once you add Rust-side wrapper overhead. Recognizing this redirects all
-optimization budget to the paths where bitcoin-rs has architectural freedom — UTXO cache, parallel
-commit batching, download, storage — which are the only places a win is even *possible*.
-
-It also reinforces a pattern that already shows up in this codebase: **optimize the actual bottleneck,
-not the convenient one.** The sibling doc
-`multi-peer-block-download-requires-core-stalling-disconnect.md` makes the same shape of argument for the
-download/apply path: real-world IBD is download-bandwidth-bound, not CPU-bound — block *apply* runs at
-~1228 blk/s while single-peer *download* runs at ~5-25 blk/s, so shaving CPU off a path that already
-runs 50-250x faster than the upstream bottleneck buys nothing. Two subsystems, one principle: profile
-first, find the rate-limiting stage, and spend there.
+This aligns with a core system design principle: **optimize the actual bottleneck, not the convenient one.** Real-world IBD wall-clock time is frequently download-bandwidth or storage-bound rather than CPU-script bound. Profiling isolates the true constraint before code changes begin.
 
 ## When to Apply
 
-- Before micro-optimizing any data structure inside `crates/consensus/src/verify_tx.rs` or adjacent to a
-  `bitcoinconsensus` call — stop and confirm the path is not dominated by the external C verifier.
-- When the optimization target is small-N (a handful of elements): question whether a hash-based
-  container beats an ordered or array one at all; constant factors and allocation often lose at tiny N.
-- When proposing "faster than Core" work: verify the path is one where bitcoin-rs actually owns the
-  implementation (UTXO cache, parallelism, download, storage) — not one delegated to `bitcoinconsensus`.
-- Whenever you are tempted to edit a dependency or swap a container without a baseline benchmark and a
-  profile — the prerequisite is the measurement, not the edit.
-- When a candidate change shows a statistically significant regression: revert immediately; do not enter
-  a tuning loop on a path that was the wrong target to begin with.
+- Before micro-optimizing any data structure inside `crates/consensus/src/verify_tx.rs` or adjacent to a `bitcoinkernel` call: verify whether script execution or C++ kernel overhead dominates execution time.
+- When evaluating small-N collections (handful of elements): test whether hash-based containers outperform ordered or array-backed alternatives at tiny scale.
+- When proposing block-validation performance work: benchmark full block input-script verification under the default `bitcoinkernel` feature rather than isolated non-production interpreter paths.
+- Whenever editing containers or dependencies on hot validation paths: establish a baseline benchmark before modifying code.
+- When a candidate change produces a statistically significant regression: revert immediately instead of tuning an ineffective path.
 
 ## Examples
 
-**Before (HEAD — reverted to this):** `crates/consensus/src/verify_tx.rs:179`
+**Baseline (reverted code):** `crates/consensus/src/verify_tx.rs`
 
 ```rust
 use std::collections::BTreeSet;
 
 let mut seen = BTreeSet::new();
-// reject a tx spending the same outpoint twice (consensus rule)
 if !seen.insert(input.previous_output) {
     return Err(ConsensusError::DuplicateInput { input_index });
 }
 ```
 
-**After (the experiment — rejected):**
+**Experiment (rejected code):**
 
 ```rust
 use hashbrown::HashSet;
@@ -156,22 +109,15 @@ if !seen.insert(input.previous_output) {
 }
 ```
 
-**Measured result** — `verify_tx/multi_input_true_scripts`, `crates/consensus/benches/verify_tx.rs`:
+**Historical measured result** — `verify_tx/multi_input_true_scripts`, `crates/consensus/benches/verify_tx.rs` (measured under historical `bitcoinconsensus` engine):
 
 | Variant          | Container             | Time      | Delta vs baseline      | Significance       |
 | ---------------- | --------------------- | --------- | ---------------------- | ------------------ |
-| Baseline (HEAD)  | `BTreeSet`            | 3.6312 ms | —                      | —                  |
+| Baseline         | `BTreeSet`            | 3.6312 ms | —                      | —                  |
 | Experiment       | `hashbrown::HashSet`  | 3.7297 ms | **+2.7% (regression)** | p<0.05 significant |
 
-The `seen` set holds only a few outpoints per tx; per-input time is spent inside the `bitcoinconsensus`
-C call. The container swap added `HashSet` allocation plus hashing constant-factor at tiny N on top of a
-path it cannot influence — pure downside. Outcome: reverted.
+The `seen` set holds only a handful of outpoints per tx; the container swap added `HashSet` allocation plus hashing constant factors at tiny N without delivering a measured win, producing a net +2.7% regression. This result is historical evidence from the `bitcoinconsensus` era; current performance under `bitcoinkernel` requires fresh measurement. Outcome: reverted.
 
 ## Related
 
-- `multi-peer-block-download-requires-core-stalling-disconnect.md` — sibling instance of the same
-  "optimize the actual bottleneck / know which paths have headroom" principle. That doc covers the
-  **download/scheduler** path (the lever that *does* move IBD wall time); this one covers the
-  **default script-verify** path (no Rust headroom — it is Core's own C via the default
-  `bitcoinconsensus` feature). See its guidance point 1, which makes the identical argument for the
-  apply/UTXO/wire path.
+- `multi-peer-block-download-requires-core-stalling-disconnect.md`: Sibling instance of optimizing the actual bottleneck. That doc covers download scheduling; this doc covers production script verification (delegated to `bitcoinkernel`, requiring focus on measured non-script Rust stages).

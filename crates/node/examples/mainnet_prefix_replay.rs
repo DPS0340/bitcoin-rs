@@ -6,6 +6,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
@@ -42,7 +43,13 @@ fn main() -> Result<()> {
             .context("install metrics recorder")?;
 
     let state = NodeState::open(config).context("open node state")?;
-    let apply_handles = state.apply_handles();
+    let mut apply_handles = state.apply_handles();
+    // Offline tool: no header sync loop ever runs, so a hash-pinned gate would
+    // stay untrusted and silently force full verification when the configured
+    // height equals the network anchor. Unpin the gate so `--assume-valid-height`
+    // keeps its height-only shortcut semantics for every height.
+    apply_handles.assume_valid_gate =
+        Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));
     let mut tx_count = 0_usize;
     let mut block_bytes = 0_usize;
     let mut fetch_time = Duration::ZERO;

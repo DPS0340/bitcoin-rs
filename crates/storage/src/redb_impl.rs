@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
+};
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
 
@@ -26,6 +28,30 @@ impl RedbStore {
         }
         write_txn.commit().map_err(StorageError::backend)?;
         Ok(Self { db })
+    }
+
+    fn write_with_durability(
+        &self,
+        batch: RedbWriteBatch,
+        durability: Durability,
+    ) -> Result<(), StorageError> {
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        write_txn
+            .set_durability(durability)
+            .map_err(StorageError::backend)?;
+        let mut ops = batch.ops.into_iter().peekable();
+        while let Some(op) = ops.next() {
+            let cf = op.cf();
+            let mut table = write_txn
+                .open_table(table_for(cf))
+                .map_err(StorageError::backend)?;
+            apply_redb_batch_op(&mut table, op)?;
+            while ops.peek().is_some_and(|next| next.cf() == cf) {
+                let Some(op) = ops.next() else { break };
+                apply_redb_batch_op(&mut table, op)?;
+            }
+        }
+        write_txn.commit().map_err(StorageError::backend)
     }
 }
 
@@ -69,24 +95,19 @@ impl KvStore for RedbStore {
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
-        let write_txn = self.db.begin_write().map_err(StorageError::backend)?;
-        let mut ops = batch.ops.into_iter().peekable();
-        while let Some(op) = ops.next() {
-            let cf = op.cf();
-            let mut table = write_txn
-                .open_table(table_for(cf))
-                .map_err(StorageError::backend)?;
-            apply_redb_batch_op(&mut table, op)?;
-            while ops.peek().is_some_and(|next| next.cf() == cf) {
-                let Some(op) = ops.next() else { break };
-                apply_redb_batch_op(&mut table, op)?;
-            }
-        }
-        write_txn.commit().map_err(StorageError::backend)
+        self.write_with_durability(batch, Durability::Immediate)
+    }
+
+    fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Durability::None)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
-        let write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        // An empty Immediate commit makes all earlier None commits durable.
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(StorageError::backend)?;
         write_txn.commit().map_err(StorageError::backend)
     }
 

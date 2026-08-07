@@ -6,7 +6,7 @@ usage() {
     'usage: run-g14-bitcoin-rs-mainnet-ibd.sh --ibd-start-height <height> --ibd-stop-height <height> --ibd-start-hash <hash> --ibd-stop-hash <hash> [--replay-command <command>] [--replay-output <path>] [--force] -- <mainnet-prefix-replay-arg>...' \
     '' \
     'Runs the repo-native mainnet_prefix_replay command and emits a canonical Criterion-style bitcoin-rs/mainnet-ibd timing section for G14 evidence capture.' \
-    'The default replay command is: cargo run -p bitcoin-rs-node --example mainnet_prefix_replay --no-default-features --features fjall --'
+    'The default replay command is: cargo run -p bitcoin-rs-node --example mainnet_prefix_replay --no-default-features --features "fjall,kernel" --'
 }
 
 if (($# == 0)); then
@@ -28,7 +28,7 @@ BENCHMARK_ID = "bitcoin-rs/mainnet-ibd"
 REPLAY_SCHEMA = "mainnet-prefix-replay-v1"
 DEFAULT_REPLAY_COMMAND = (
     "cargo run -p bitcoin-rs-node --example mainnet_prefix_replay "
-    "--no-default-features --features fjall --"
+    "--no-default-features --features fjall,kernel --"
 )
 
 

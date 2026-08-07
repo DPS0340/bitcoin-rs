@@ -29,7 +29,8 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
-use self::window::{DownloadWindow, SyncBudget};
+use self::window::DownloadWindow;
+pub use self::window::SyncBudget;
 
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
@@ -291,6 +292,14 @@ impl BlockSync {
         }
     }
 
+    /// Replaces the download window and block stager with ones configured by
+    /// `budget`. Intended for tests and benchmarks that need to exercise
+    /// non-default capacity limits.
+    pub fn install_budget(&self, budget: SyncBudget) {
+        *self.download_window.lock() = DownloadWindow::new(budget);
+        *self.block_stager.lock() = BlockStager::new(budget);
+    }
+
     /// Returns the sole production peer-registration operation. It preserves
     /// the window-then-outbound lock order and purges old-address state before
     /// the new sender becomes visible.
@@ -347,7 +356,6 @@ impl BlockSync {
             tracing::trace!(applied_height, "block sync: no peer above current height");
             return;
         }
-        let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
         let mut sent_getdata = false;
         let request_peer_count = sync_peer_selection.request_peers.len();
         for (peer_idx, peer) in sync_peer_selection.request_peers.into_iter().enumerate() {
@@ -368,29 +376,24 @@ impl BlockSync {
             }
         }
         self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
-        if let Some(peer) = sync_peer_selection.header_peer {
-            let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
-            if peer_best_height > header_height {
-                self.send_getheaders(peer.addr, header_height, peer.start_height);
-            }
-        }
         if sent_getdata {
             self.record_pending_sync_metrics();
         }
     }
-
+    #[allow(clippy::too_many_lines)]
     fn drain_inbound_headers(&self) {
         let receiver = self.inbound_headers_rx.lock();
         let mut total_headers = 0_usize;
         while let Ok(InboundHeaders { headers, source }) = receiver.try_recv() {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
-            let acceptance = {
-                let mut tree = self.handles.block_tree.write();
-                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network)
-            };
+            let mut tree = self.handles.block_tree.write();
+            let acceptance =
+                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network);
             match acceptance {
                 Ok(node_ids) => {
+                    self.handles.assume_valid_gate.evaluate(&tree);
+                    drop(tree);
                     if let Some(source) = source {
                         let _window = self.download_window.lock();
                         let outbound = self.peer_outbound.read();
@@ -411,6 +414,7 @@ impl BlockSync {
                     );
                 }
                 Err(error) if is_peer_fault(&error) => {
+                    drop(tree);
                     let mut blamed_peer = None;
                     if let Some(source) = source {
                         let mut window = self.download_window.lock();
@@ -447,6 +451,7 @@ impl BlockSync {
                     }
                 }
                 Err(error) => {
+                    drop(tree);
                     tracing::warn!(
                         received = batch_len,
                         %error,
@@ -457,6 +462,36 @@ impl BlockSync {
         }
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
+        }
+        let applied_tip = self.handles.applied_tip.load_full();
+        let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let chain_tip = self.handles.chain_tip.load_full();
+        let header_height = chain_tip.as_ref().map_or(applied_height, |tip| tip.height);
+        let header_peer = {
+            let peers = self.peers.read();
+            let mut best: Option<SyncPeer> = None;
+            for peer in peers.iter() {
+                let Ok(height) = u32::try_from(peer.start_height) else {
+                    continue;
+                };
+                if height <= applied_height {
+                    continue;
+                }
+                let candidate = SyncPeer {
+                    addr: peer.addr,
+                    start_height: peer.start_height,
+                };
+                if best.is_none_or(|current| current.start_height < candidate.start_height) {
+                    best = Some(candidate);
+                }
+            }
+            best
+        };
+        if let Some(peer) = header_peer {
+            let peer_best_height = u32::try_from(peer.start_height).unwrap_or(0);
+            if peer_best_height > header_height {
+                self.send_getheaders(peer.addr, header_height, peer.start_height);
+            }
         }
     }
 
@@ -651,6 +686,9 @@ impl BlockSync {
             return (0, 0);
         };
         let started = Instant::now();
+        if let Some(tx_index) = &self.handles.tx_index {
+            tx_index.lock().begin_batch();
+        }
         let (drained, expected_len) = self
             .drain_cached_expected_blocks(staged_count)
             .unwrap_or_else(|| {
@@ -714,6 +752,12 @@ impl BlockSync {
             self.advance_expected_apply_cache(&applied_hashes, failed_hash.is_some());
             metrics::histogram!("node.sync.apply_buffered_blocks_seconds")
                 .record(started.elapsed().as_secs_f64());
+        }
+        #[allow(clippy::significant_drop_in_scrutinee)]
+        if let Some(tx_index) = &self.handles.tx_index {
+            if let Err(error) = tx_index.lock().end_batch() {
+                tracing::warn!(%error, "block sync: tx_index batch flush failed");
+            }
         }
         (applied, failed)
     }
@@ -1433,7 +1477,8 @@ fn metric_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-const fn default_sync_budget() -> SyncBudget {
+/// Returns the production `SyncBudget` used by `BlockSync::new`.
+pub const fn default_sync_budget() -> SyncBudget {
     SyncBudget {
         max_pending_blocks: PENDING_BUDGET,
         max_pending_bytes: PENDING_BYTE_BUDGET,
@@ -6077,8 +6122,7 @@ mod tests {
     }
 
     fn install_budget(sync: &BlockSync, budget: super::SyncBudget) {
-        *sync.download_window.lock() = super::DownloadWindow::new(budget);
-        *sync.block_stager.lock() = super::BlockStager::new(budget);
+        sync.install_budget(budget);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq)]

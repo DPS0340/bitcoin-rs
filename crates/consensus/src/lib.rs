@@ -1,20 +1,13 @@
 //! Consensus validation surfaces for bitcoin-rs.
 //!
-//! The `kernel` feature enables a bitcoinkernel-backed authority path. With the
+//! The `kernel` feature is the production default: it routes every script class
+//! through bitcoinkernel (Bitcoin Core's native consensus engine). With the
 //! feature off, the crate builds a portable Rust validation path that delegates
-//! script execution to `bitcoin-rs-script` and keeps consensus-facing rule checks
-//! in small, testable modules.
+//! taproot key-path script execution to `bitcoin-rs-script` and keeps
+//! consensus-facing rule checks in small, testable modules. The portable path
+//! is retained for differential tests and builds without a native backend.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
-
-#[cfg(all(feature = "kernel", feature = "bitcoinconsensus"))]
-compile_error!(
-    "features `kernel` and `bitcoinconsensus` are mutually exclusive: both statically link \
-     Bitcoin Core's native consensus symbols, and the overlapping archives would silently \
-     misroute between the two engines instead of failing cleanly at link time. Enable exactly \
-     one script-verification backend (`bitcoinconsensus` is a default feature — build kernel \
-     profiles with `--no-default-features`)."
-);
 
 /// Maximum consensus script size in bytes.
 pub const MAX_SCRIPT_SIZE: usize = 10_000;

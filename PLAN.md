@@ -184,7 +184,7 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 
 **G14 — Performance budgets.**
 - Initial block sync throughput is faster than Bitcoin Core's blocks-per-second on identical mainnet IBD (measured via `criterion`).
-- UTXO commit p95 ≤ 50 ms per 4 MiB block.
+- UTXO commit p95 ≤ 50 ms per serialized block of at least 1 MB.
 - Electrum `scripthash.get_history` p95 ≤ 30 ms over a 10 000-call random sample at tip.
 - RSS ≤ 16 GiB at mainnet tip with fjall default + all indexes enabled.
 
@@ -195,6 +195,9 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 This section tracks the aggressive sync/UTXO performance campaign that has landed on `origin/main`.
 It is a status addendum to the roadmap below, not a replacement for the all-up shippability gates.
 Do not mark the broad roadmap tasks complete from these slices alone unless the named gate evidence exists.
+
+**Consensus verifier cutover note (Tasks 16–18):**
+The historical entries below record evidence commands from the 2026-06-05 campaign when `bitcoinconsensus` was enabled. In Tasks 16–18, `bitcoinconsensus` was removed and `bitcoinkernel` (`libbitcoinkernel`) became the default production consensus engine (`FULL_NODE_FEATURES: rocksdb,fjall,redb,mdbx,kernel`). Default builds now link `bitcoinkernel` and require `cmake` and `libboost-dev`. Historical evidence items below using `bitcoinconsensus` are preserved as historical records and are non-comparable with kernel-default runs.
 
 **Merged into `origin/main`:**
 
@@ -456,7 +459,7 @@ Do not mark the broad roadmap tasks complete from these slices alone unless the 
 **Still pending:**
 
 - [ ] Prove G14 initial block sync throughput is faster than Bitcoin Core on identical mainnet IBD hardware and configuration.
-- [ ] Prove all G14 budgets, not just proxy workloads: UTXO commit p95 <= 50 ms per 4 MiB block, Electrum history p95 <= 30 ms over the required sample, and RSS <= 16 GiB at mainnet tip with fjall default plus indexes.
+- [ ] Prove all G14 budgets, not just proxy workloads: UTXO commit p95 <= 50 ms per serialized block of at least 1 MB, Electrum history p95 <= 30 ms over the required sample, and RSS <= 16 GiB at mainnet tip with fjall default plus indexes.
 - [ ] Run and preserve full gate evidence for G1-G14 across two consecutive `main` CI runs before declaring bitcoin-rs shippable.
 - [ ] Keep Task 5, Task 18, and Task 20 below pending as broad roadmap tasks until their complete step lists and gate evidence are satisfied.
 

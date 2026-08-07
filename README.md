@@ -6,16 +6,16 @@ than `bitcoind` while remaining consensus-compatible.
 ## Status
 
 **Pre-alpha scaffold.** The workspace has 18 structurally complete crates, but
-the integration layer (`run` loop ↔ chain ↔ utxo ↔ p2p ↔ rpc ↔ electrum) lands
+the integration layer (run loop, chain, utxo, p2p, rpc, electrum) lands
 in following commits. Empirical "faster than Bitcoin Core" validation requires
 live mainnet IBD against reference `bitcoind` and is tracked as verification
 gates G1-G14 in `PLAN.md`.
 
 ## Architecture highlights
 
-- Consensus parity via vendored Bitcoin Core test vectors and an optional
-  `bitcoinkernel` cross-check gate.
-- Four pluggable storage backends: fjall (default), RocksDB, MDBX, redb —
+- Production consensus verification via bitcoinkernel (libbitcoinkernel),
+  ensuring full script-path and key-path consensus parity with Bitcoin Core.
+- Four pluggable storage backends (fjall default, RocksDB, MDBX, redb),
   selected at runtime via `--storage-backend`. The 4-backend equivalence test
   produces an identical aggregate hash on every IBD.
 - 256-shard arena-backed UTXO set (bumpalo + hashbrown) with snapshot format
@@ -29,19 +29,32 @@ gates G1-G14 in `PLAN.md`.
   signing methods return -32603 "wallet has no private keys".
 - mimalloc global allocator and a crossbeam-channel event loop.
 
+## Default posture
+
+`bitcoin-rs` runs by default with an optimized posture for mainnet Initial Block Download (IBD):
+
+- **Hash-pinned assume-valid**: Mainnet nodes skip historical transaction script verification up to height 938343 (block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`). Script checks are skipped only after the node validates that the active header chain contains this exact anchor block hash. Diverged chains and sub-anchor tips remain untrusted and undergo full script verification. Full script verification is available via `--assume-valid-height 0`. Non-mainnet networks default to height 0.
+- **Storage backend**: `fjall` storage backend by default.
+- **Multi-peer block download**: Enabled by default with an outbound P2P target of 8 peers (fanout threshold), a pending block budget of 128, and up to 16 in-flight blocks per peer.
+- **Database cache**: 450 MiB database cache (`dbcache`), matching Bitcoin Core default allocation parity.
+- **Indexes and features**: Transaction index (`txindex`), block filter index (`blockfilterindex`), pruning, and utreexo stateless validation are disabled by default.
+
 ## Build
 
+Default builds link bitcoinkernel and require system dependencies (`libboost-dev` and `cmake`).
+
 ```sh
-cargo build --release --features rocksdb,fjall,redb,mdbx
+cargo build --release -p bitcoin-rs
 ```
 
-Feature flags: `rocksdb` / `fjall` / `redb` / `mdbx` (defaults all on),
-`kernel` (link against `bitcoinkernel`), `utreexo`, `prometheus-http`.
+Default feature flags (`rocksdb`, `fjall`, `redb`, `mdbx`, `kernel`) are enabled automatically.
+The `--no-default-features` flag builds a portable Rust-only posture without C++ build dependencies,
+which cannot validate Taproot script-path transactions on mainnet.
 
 ## Tests
 
 ```sh
-cargo test --no-default-features --features rocksdb,fjall,redb
+cargo test
 ```
 
 Live-infrastructure gates are `#[ignore]`d; invoke them individually with

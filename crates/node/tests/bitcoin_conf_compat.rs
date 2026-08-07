@@ -1,7 +1,7 @@
 //! Integration tests for the bitcoin-rs node.
 
 use anyhow::Result;
-use bitcoin_rs_node::{Auth, Config, bitcoin_conf_compat};
+use bitcoin_rs_node::{Auth, Config, Network, bitcoin_conf_compat};
 use std::fs;
 
 #[test]
@@ -140,8 +140,11 @@ assumevalid=0000000000000000000000000000000000000000000000000000000000000000
     bitcoin_conf_compat::apply_file(&mut config, &conf_path)?;
 
     assert_eq!(
-        config.assume_valid_height, 0,
-        "Bitcoin Core hash-based assumevalid must not populate height-only assume_valid_height"
+        config.assume_valid_height,
+        Network::Mainnet
+            .assume_valid_anchor()
+            .map_or(0, |(height, _)| height),
+        "Bitcoin Core hash-based assumevalid must not alter the hash-pinned assume_valid_height default"
     );
     Ok(())
 }

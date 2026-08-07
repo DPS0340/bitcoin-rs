@@ -30,6 +30,7 @@ RESERVED_BITCOIND_ARGS = (
     "-datadir",
     "-chain",
     "-daemon",
+    "-networkactive",
     "-regtest",
     "-signet",
     "-testnet",
@@ -300,6 +301,7 @@ command = (
         f"-datadir={datadir}",
         f"-conf={config}",
         "-chain=main",
+        "-networkactive=0",
         "-daemon=0",
         *bitcoind_args,
     ]
@@ -327,6 +329,7 @@ try:
             continue
         if not observed_start:
             require_chain_start(info, start_height)
+            run_cli(bitcoin_cli_command, datadir, config, ["setnetworkactive", "true"])
             observed_start = True
             ibd_deadline = time.monotonic() + ibd_timeout
         if require_chain_tip(info, stop_height):
@@ -337,10 +340,10 @@ try:
 
     require_hash(bitcoin_cli_command, datadir, config, start_height, start_hash, "start")
     require_hash(bitcoin_cli_command, datadir, config, stop_height, stop_hash, "stop")
-    elapsed = time.monotonic() - started
     run_cli(bitcoin_cli_command, datadir, config, ["stop"])
     stopped = True
     wait_for_stop(process, SHUTDOWN_TIMEOUT_SECONDS)
+    elapsed = time.monotonic() - started
 finally:
     if not stopped and process.poll() is None:
         cleanup_after_failure(process, bitcoin_cli_command, datadir, config)

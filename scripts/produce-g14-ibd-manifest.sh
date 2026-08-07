@@ -36,7 +36,7 @@ ELECTRUM_HISTORY_METHOD = "blockchain.scripthash.get_history"
 ELECTRUM_SAMPLE_SIZE = 10_000
 UTXO_COMMIT_MEASUREMENT_SCHEMA = "g14-utxo-commit-measurement-v1"
 UTXO_COMMIT_SMOKE_SCHEMA = "g14-utxo-commit-smoke-v1"
-UTXO_BLOCK_SIZE_THRESHOLD_BYTES = 4 * 1024 * 1024
+UTXO_BLOCK_SIZE_THRESHOLD_BYTES = 1_000_000
 BITCOIN_RS_CRITERION_BENCHMARK_ID = "bitcoin-rs/mainnet-ibd"
 BITCOIN_CORE_CRITERION_BENCHMARK_ID = "bitcoin-core/mainnet-ibd"
 BITCOIN_RS_IBD_ADAPTER = "bitcoin-rs-daemon-mainnet-ibd-v1"
@@ -680,6 +680,19 @@ def positive_sample_float(value, name: str) -> float:
     return number
 
 
+def reject_duplicate_heights(samples: list, source: str) -> None:
+    seen: set[int] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            die(f"{source}[{index}] must be an object")
+        height = sample.get("height")
+        if not isinstance(height, int) or isinstance(height, bool):
+            die(f"{source}[{index}].height must be an integer")
+        if height in seen:
+            die(f"{source} must not contain duplicate height {height}")
+        seen.add(height)
+
+
 def read_utxo_samples(path: Path) -> list:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -688,10 +701,12 @@ def read_utxo_samples(path: Path) -> list:
     except json.JSONDecodeError as error:
         die(f"sample source must be JSON: {error}")
     if isinstance(payload, list):
+        reject_duplicate_heights(payload, "sample source")
         return payload
     if isinstance(payload, dict):
         samples = payload.get("samples")
         if isinstance(samples, list):
+            reject_duplicate_heights(samples, "sample source")
             return samples
     die("sample source must be a JSON array or an object with a samples array")
 
@@ -847,7 +862,7 @@ def read_utxo_commit_measurement(
         positive=True,
     )
     if threshold != UTXO_BLOCK_SIZE_THRESHOLD_BYTES:
-        die("--utxo-commit-measurement block_size_threshold_bytes must be 4194304")
+        die(f"--utxo-commit-measurement block_size_threshold_bytes must be {UTXO_BLOCK_SIZE_THRESHOLD_BYTES}")
     verify_utxo_commit_sample_custody(
         data,
         "--utxo-commit-measurement",
@@ -957,8 +972,8 @@ if missing:
     die("missing " + ", ".join(missing))
 
 output = Path(args.output)
-if output.exists() and output.is_dir():
-    die(f"--output must be a file path, got directory: {output}")
+if output.exists():
+    die(f"--output already exists: {output}")
 if output.parent and not output.parent.exists():
     die(f"--output parent does not exist: {output.parent}")
 
@@ -1149,6 +1164,7 @@ if all(criterion_benchmark_ids_supplied):
     manifest["criterion_bitcoin_core_raw_output_sha256"] = raw_output_sha256_by_id[bitcoin_core_benchmark_id]
     manifest["bitcoin_rs_ibd_adapter"] = bitcoin_rs_ibd_adapter
 
-output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+with output.open("x", encoding="utf-8") as manifest_file:
+    manifest_file.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 print(output)
 PY

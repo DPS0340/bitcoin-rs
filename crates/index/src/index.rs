@@ -44,6 +44,8 @@ pub struct IndexRowCounts {
 pub struct Indexer<S: KvStore> {
     store: std::sync::Arc<S>,
     last_counts: IndexRowCounts,
+    pending_rows: PendingRows,
+    batch_depth: u32,
 }
 
 impl<S: KvStore> Indexer<S> {
@@ -52,6 +54,8 @@ impl<S: KvStore> Indexer<S> {
         Self {
             store,
             last_counts: IndexRowCounts::default(),
+            pending_rows: PendingRows::default(),
+            batch_depth: 0,
         }
     }
 
@@ -399,6 +403,8 @@ impl<S: KvStore> Indexer<S> {
         Ok(None)
     }
 
+    const FLUSH_THRESHOLD_ROWS: usize = 500_000;
+
     /// Walks one serialized block once with `bitcoin_slices` and writes electrs-shaped rows.
     pub fn ingest_block(
         &mut self,
@@ -406,7 +412,7 @@ impl<S: KvStore> Indexer<S> {
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
         let (rows, _txid_count) = pending_rows_for_block(block, height, TxidSource::Compute)?;
-        self.write_pending_rows(rows, height)
+        self.ingest_rows(rows)
     }
 
     /// Walks one serialized block and reuses caller-supplied transaction IDs after validation.
@@ -424,7 +430,7 @@ impl<S: KvStore> Indexer<S> {
         if txids.len() != txid_count {
             return self.ingest_block(block, height);
         }
-        self.write_pending_rows(rows, height)
+        self.ingest_rows(rows)
     }
 
     /// Walks one serialized block using caller-verified transaction IDs.
@@ -438,11 +444,12 @@ impl<S: KvStore> Indexer<S> {
         height: u32,
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
+        let (rows, txid_count) =
+            pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
         if txids.len() != txid_count {
             return self.ingest_block(block, height);
         }
-        self.write_pending_rows(rows, height)
+        self.ingest_rows(rows)
     }
 
     /// Walks one decoded block using caller-verified transaction IDs.
@@ -461,42 +468,65 @@ impl<S: KvStore> Indexer<S> {
             return self.ingest_block_with_verified_txids(serialized_block, height, txids);
         }
         let rows = pending_rows_for_decoded_block(block, height, txids)?;
-        self.write_pending_rows(rows, height)
+        self.ingest_rows(rows)
     }
 
-    fn write_pending_rows(
-        &mut self,
-        mut rows: PendingRows,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
-        rows.sort();
-        let counts = rows.counts();
+    fn ingest_rows(&mut self, rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
+        let block_counts = rows.counts();
+        self.pending_rows.append(rows);
+        if self.batch_depth == 0 || self.pending_rows.total() >= Self::FLUSH_THRESHOLD_ROWS {
+            self.flush()?;
+        }
+        Ok(block_counts)
+    }
+
+    fn flush(&mut self) -> Result<IndexRowCounts, IndexError> {
+        self.pending_rows.sort();
+        let counts = self.pending_rows.counts();
+        if counts.txids + counts.funding + counts.spending + counts.headers == 0 {
+            return Ok(counts);
+        }
         let mut batch = self.store.new_batch();
-        for row in &rows.txid_rows {
+        for row in &self.pending_rows.txid_rows {
             batch.put(ColumnFamily::TxConfirmed, row.as_bytes(), &[]);
         }
-        for row in &rows.funding_rows {
+        for row in &self.pending_rows.funding_rows {
             batch.put(ColumnFamily::Funding, row.as_bytes(), &[]);
         }
-        for row in &rows.spending_rows {
+        for row in &self.pending_rows.spending_rows {
             batch.put(ColumnFamily::Spending, row.as_bytes(), &[]);
         }
-        for row in &rows.header_rows {
+        for row in &self.pending_rows.header_rows {
             batch.put(ColumnFamily::BlockHeaders, row, &[]);
         }
         self.store.write(batch)?;
         self.last_counts = counts;
+        self.pending_rows = PendingRows::default();
         debug!(
-            height,
             txids = counts.txids,
             funding = counts.funding,
             spending = counts.spending,
             headers = counts.headers,
-            "indexed block"
+            "indexed batch"
         );
         Ok(counts)
     }
+
+    /// Disables per-block flushing so multiple ingests can be written in one batch.
+    pub fn begin_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_add(1);
+    }
+
+    /// Re-enables per-block flushing and flushes any accumulated rows.
+    pub fn end_batch(&mut self) -> Result<(), IndexError> {
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 {
+            self.flush()?;
+        }
+        Ok(())
+    }
 }
+
 
 fn pending_rows_for_block(
     block: &[u8],
@@ -585,6 +615,19 @@ impl PendingRows {
             spending: self.spending_rows.len(),
             headers: self.header_rows.len(),
         }
+    }
+    fn append(&mut self, other: Self) {
+        self.txid_rows.extend(other.txid_rows);
+        self.funding_rows.extend(other.funding_rows);
+        self.spending_rows.extend(other.spending_rows);
+        self.header_rows.extend(other.header_rows);
+    }
+
+    fn total(&self) -> usize {
+        self.txid_rows.len()
+            + self.funding_rows.len()
+            + self.spending_rows.len()
+            + self.header_rows.len()
     }
 }
 
@@ -759,6 +802,12 @@ pub trait IndexerLike: Send + Sync {
         self.ingest_block_with_verified_txids(serialized_block, height, txids)
     }
 
+    /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
+    fn begin_batch(&mut self) {}
+
+    /// Ends a batch of block ingests, flushing any accumulated rows.
+    fn end_batch(&mut self) -> Result<(), IndexError> { Ok(()) }
+
     /// Resolves a confirmed transaction by txid via `source`.
     ///
     /// Default implementations may return `Ok(None)` when the concrete indexer
@@ -829,6 +878,14 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
+    }
+
+    fn begin_batch(&mut self) {
+        Self::begin_batch(self);
+    }
+
+    fn end_batch(&mut self) -> Result<(), IndexError> {
+        Self::end_batch(self)
     }
 
     fn resolve_transaction(

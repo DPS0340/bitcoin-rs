@@ -2,8 +2,6 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-#[cfg(feature = "bitcoinconsensus")]
-use bitcoin::{Script, consensus::encode};
 use bitcoin_rs_primitives::Tx;
 #[cfg(not(feature = "kernel"))]
 use bitcoin_rs_script::Interpreter;
@@ -18,9 +16,35 @@ const SEQUENCE_FINAL: u32 = 0xffff_ffff;
 const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 
-// SMT siblings make secp256k1 verification slower past this width on large hosts.
-const MAX_SCRIPT_VERIFY_THREADS: usize = 16;
-const MIN_PARALLEL_SCRIPT_CHECKS: usize = 16;
+// Width of the script-verification pool. 16 was chosen on the belief that SMT
+// siblings slow secp256k1 down past that width. A matched-validation replay of
+// mainnet 0..150_000 measures otherwise on this host (3x medians, pinned):
+//
+//   16 threads on 32 physical cores (`taskset -c 0-31`)        173.1s
+//   32 threads on 32 physical cores (`taskset -c 0-31`)        157.8s
+//   32 threads on 16 physical cores + their SMT siblings
+//                                  (`taskset -c 0-15,40-55`)   158.9s
+//
+// The last two agree within run-to-run noise while the third uses half the
+// physical cores, so the gain tracks thread count and SMT pairing costs
+// nothing measurable here. Kept as a cap rather than raised to
+// `available_parallelism` so a many-core host does not oversubscribe
+// verification against the rest of the apply pipeline; widen only against a
+// fresh measurement on the target hardware.
+const MAX_SCRIPT_VERIFY_THREADS: usize = 32;
+// Blocks with fewer checks than this verify serially. A matched-validation
+// replay of mainnet 0..150_000 (3x medians, pinned `taskset -c 0-31`, the three
+// variants interleaved round-robin so page-cache warming hits them equally)
+// puts the optimum at 4, and the ordering held in every round:
+//
+//   threshold 16   155.8s      threshold 128   234.6s
+//   threshold  8   145.1s      threshold 512   297.3s
+//   threshold  4   139.4s      threshold  48   185.0s
+//
+// The curve is monotonic and steep above 16, so a higher threshold is never
+// right here: even a handful of inputs is worth the fan-out. Below 4 it turns
+// back up (threshold 2 measured 143.8s single-run), which sets the floor.
+const MIN_PARALLEL_SCRIPT_CHECKS: usize = 4;
 static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     rayon::ThreadPoolBuilder::new()
@@ -143,8 +167,8 @@ pub fn verify_transaction_borrowed_with_mtp(
 /// timestamp cutoff.
 ///
 /// Checks finality, empty inputs/outputs, coinbase scriptSig size, duplicate inputs, null
-/// prevouts, missing prevouts, input/output value balance, and sigop limits. Skips interpreter
-/// and `bitcoinconsensus` script execution.
+/// prevouts, missing prevouts, input/output value balance, and sigop limits. Skips
+/// kernel/script script execution.
 pub fn verify_transaction_borrowed_non_script_with_mtp(
     tx: &bitcoin::Transaction,
     prevouts: &impl UtxoView,
@@ -180,23 +204,15 @@ fn verify_transaction_borrowed_with_locktime_cutoff(
     if !skip_scripts {
         // KTD5: under the kernel feature every script class routes through Core's
         // engine — one transaction parse plus one sighash precompute shared across
-        // inputs. The portable arm keeps the interpreter/bitcoinconsensus dispatch.
+        // inputs. The portable arm keeps the interpreter dispatch.
         #[cfg(feature = "kernel")]
         crate::kernel::verify_tx_scripts(tx, &prep.prevouts, flags)?;
         #[cfg(not(feature = "kernel"))]
         {
-            #[cfg(feature = "bitcoinconsensus")]
-            let serialized_tx = Some(encode::serialize(tx));
-            #[cfg(not(feature = "bitcoinconsensus"))]
-            let serialized_tx: Option<Vec<u8>> = None;
+            let all_prevouts: Vec<&bitcoin::TxOut> =
+                prep.prevouts.iter().map(|(_, prevout)| prevout).collect();
             for (input_index, (_, prevout)) in prep.prevouts.iter().enumerate() {
-                verify_input_script_portable(
-                    input_index,
-                    prevout,
-                    tx,
-                    flags,
-                    serialized_tx.as_deref(),
-                )?;
+                verify_input_script_portable(input_index, prevout, &all_prevouts, tx, flags)?;
             }
         }
     }
@@ -302,35 +318,25 @@ fn finalize_tx_value_and_sigops(
     Ok(())
 }
 
-/// Portable per-input script verdict: bitcoinconsensus for non-taproot, else the
-/// Rust interpreter. `serialized_tx` borrows one serialization shared by every
-/// input of the transaction.
+/// Portable per-input script verdict: the Rust interpreter handles taproot
+/// key-path; non-taproot spends require the kernel production path.
 #[cfg(not(feature = "kernel"))]
 fn verify_input_script_portable(
     input_index: usize,
     prevout: &bitcoin::TxOut,
+    all_prevouts: &[&bitcoin::TxOut],
     tx: &bitcoin::Transaction,
     flags: VerifyFlags,
-    serialized_tx: Option<&[u8]>,
 ) -> Result<(), ConsensusError> {
-    #[cfg(feature = "bitcoinconsensus")]
-    if let Some(serialized_tx) = serialized_tx
-        && verify_non_taproot_with_bitcoinconsensus(input_index, prevout, serialized_tx, flags)?
-    {
-        return Ok(());
-    }
-    #[cfg(not(feature = "bitcoinconsensus"))]
-    let _ = serialized_tx;
-
     let input = &tx.input[input_index];
     let witness = input.witness.to_vec();
     Interpreter
-        .execute(
+        .execute_with_prevouts(
             prevout.script_pubkey.as_bytes(),
             input.script_sig.as_bytes(),
             &witness,
             flags,
-            prevout,
+            all_prevouts,
             tx,
             input_index,
         )
@@ -351,8 +357,6 @@ struct PreparedTx {
     checks_len: usize,
     #[cfg(feature = "kernel")]
     kernel_state: Option<crate::kernel::PreparedKernelTx>,
-    #[cfg(all(not(feature = "kernel"), feature = "bitcoinconsensus"))]
-    serialized: Option<Vec<u8>>,
 }
 
 /// One deferred per-input script check, indexing back into the prepared txs.
@@ -472,8 +476,6 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
-                    #[cfg(all(not(feature = "kernel"), feature = "bitcoinconsensus"))]
-                    serialized: None,
                 });
                 continue;
             }
@@ -487,8 +489,6 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
-                    #[cfg(all(not(feature = "kernel"), feature = "bitcoinconsensus"))]
-                    serialized: None,
                 });
                 break;
             }
@@ -522,8 +522,7 @@ fn prepare_block_input_checks(
             });
         }
         let checks_len = tx.input.len();
-        #[cfg(all(not(feature = "kernel"), feature = "bitcoinconsensus"))]
-        let serialized = Some(encode::serialize(tx));
+
         let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
         let stop_after_tx = post_error.is_some();
         prepared.push(PreparedTx {
@@ -535,8 +534,6 @@ fn prepare_block_input_checks(
             checks_len,
             #[cfg(feature = "kernel")]
             kernel_state: Some(kernel_state),
-            #[cfg(all(not(feature = "kernel"), feature = "bitcoinconsensus"))]
-            serialized,
         });
         // This tx's scripts still outrank its post error; that post error makes
         // every later transaction irrelevant to the ordered verdict.
@@ -569,11 +566,9 @@ fn check_input(
     }
     #[cfg(not(feature = "kernel"))]
     {
-        #[cfg(feature = "bitcoinconsensus")]
-        let serialized_tx = prep.serialized.as_deref();
-        #[cfg(not(feature = "bitcoinconsensus"))]
-        let serialized_tx = None;
-        verify_input_script_portable(check.input_index, prevout, tx, flags, serialized_tx)
+        let all_prevouts: Vec<&bitcoin::TxOut> =
+            prep.prevouts.iter().map(|(_, spent)| spent).collect();
+        verify_input_script_portable(check.input_index, prevout, &all_prevouts, tx, flags)
     }
 }
 
@@ -605,32 +600,6 @@ fn cached_prevout_lookup(
     Some(txout.clone())
 }
 
-#[cfg(feature = "bitcoinconsensus")]
-fn verify_non_taproot_with_bitcoinconsensus(
-    input_index: usize,
-    prevout: &bitcoin::TxOut,
-    serialized_tx: &[u8],
-    flags: VerifyFlags,
-) -> Result<bool, ConsensusError> {
-    let script = Script::from_bytes(prevout.script_pubkey.as_bytes());
-    if script.is_p2tr() && flags.contains(VerifyFlags::TAPROOT) {
-        return Ok(false);
-    }
-
-    script
-        .verify_with_flags(
-            input_index,
-            prevout.value,
-            serialized_tx,
-            flags.consensus_bits(),
-        )
-        .map_err(|error| ConsensusError::Script {
-            input_index,
-            reason: format!("script verification failed: {error}"),
-        })?;
-    Ok(true)
-}
-
 fn total_output_value_borrowed(tx: &bitcoin::Transaction) -> Result<u64, ConsensusError> {
     tx.output.iter().try_fold(0u64, |sum, output| {
         let next = sum
@@ -649,7 +618,7 @@ mod tests {
     use std::{cell::Cell, collections::BTreeMap};
 
     use bitcoin::hashes::Hash as _;
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     use bitcoin::opcodes::all::OP_EQUAL;
     use bitcoin::script::Builder;
     use bitcoin::{
@@ -832,84 +801,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "bitcoinconsensus")]
-    fn verify_transaction_accepts_non_taproot_spend_with_script_sig_data() {
-        let outpoint = OutPoint {
-            txid: Txid::from_byte_array([3; 32]),
-            vout: 0,
-        };
-        let tx = Tx(Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: outpoint,
-                script_sig: Builder::new().push_int(7).push_int(7).into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        });
-        let mut utxos = BTreeMap::new();
-        utxos.insert(
-            outpoint,
-            TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
-            },
-        );
-
-        assert_eq!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
-            Ok(())
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "bitcoinconsensus")]
-    fn verify_transaction_rejects_non_taproot_spend_with_script_sig_mismatch() {
-        let outpoint = OutPoint {
-            txid: Txid::from_byte_array([4; 32]),
-            vout: 0,
-        };
-        let tx = Tx(Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: outpoint,
-                script_sig: Builder::new().push_int(7).push_int(8).into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        });
-        let mut utxos = BTreeMap::new();
-        utxos.insert(
-            outpoint,
-            TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
-            },
-        );
-
-        let result = verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY);
-
-        assert!(matches!(
-            result,
-            Err(ConsensusError::Script {
-                input_index: 0,
-                reason
-            }) if reason.starts_with("script verification failed:")
-        ));
-    }
-
-    #[test]
-    #[cfg(feature = "bitcoinconsensus")]
+    #[cfg(not(feature = "kernel"))]
     fn verify_transaction_routes_taproot_spends_to_interpreter() {
         let first = OutPoint {
             txid: Txid::from_byte_array([5; 32]),
@@ -950,10 +842,82 @@ mod tests {
             result,
             Err(ConsensusError::Script {
                 input_index: 0,
-                reason:
-                    "taproot key-path verification requires all prevouts for multi-input transactions"
-                        .to_owned(),
+                reason: "script verification failed: missing taproot key-path signature".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "kernel"))]
+    fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
+        use bitcoin::key::TapTweak;
+        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
+        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+
+        let secp = Secp256k1::new();
+        let seeds = [1u8, 2u8];
+        let mut keypairs = Vec::new();
+        let mut prevouts = Vec::new();
+        let mut outpoints = Vec::new();
+        for (index, seed) in seeds.into_iter().enumerate() {
+            let secret =
+                SecretKey::from_slice(&[seed; 32]).unwrap_or_else(|_| panic!("secret key"));
+            let keypair = Keypair::from_secret_key(&secp, &secret);
+            let tweaked = TapTweak::tap_tweak(keypair, &secp, None);
+            let (output_key, _) = tweaked.public_parts();
+            let outpoint = OutPoint {
+                txid: Txid::from_byte_array([seed; 32]),
+                vout: u32::try_from(index).unwrap_or_else(|_| panic!("vout")),
+            };
+            outpoints.push(outpoint);
+            prevouts.push(TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
+            });
+            keypairs.push(tweaked);
+        }
+
+        let mut tx = Transaction {
+            version: transaction::Version(2),
+            lock_time: absolute::LockTime::ZERO,
+            input: outpoints
+                .iter()
+                .copied()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+
+        for (input_idx, keypair) in keypairs.iter().enumerate() {
+            let mut cache = SighashCache::new(&tx);
+            let sighash = cache
+                .taproot_key_spend_signature_hash(
+                    input_idx,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .unwrap_or_else(|_| panic!("taproot sighash"));
+            let message = Message::from_digest(*sighash.as_byte_array());
+            let signature = secp.sign_schnorr(&message, keypair.as_keypair());
+            tx.input[input_idx].witness = Witness::from_slice(&[signature.serialize().to_vec()]);
+        }
+
+        let mut utxos = BTreeMap::new();
+        for (outpoint, prevout) in outpoints.into_iter().zip(prevouts) {
+            utxos.insert(outpoint, prevout);
+        }
+
+        assert_eq!(
+            verify_transaction(&Tx(tx), &utxos, 0, VerifyFlags::MANDATORY),
+            Ok(())
         );
     }
 
@@ -1207,7 +1171,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "bitcoinconsensus")]
+    #[cfg(not(feature = "kernel"))]
     fn p2tr_script_pubkey() -> ScriptBuf {
         let mut bytes = Vec::with_capacity(34);
         bytes.push(0x51);
@@ -1233,7 +1197,7 @@ mod tests {
         })
     }
 
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn op1_txout(value: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(value),
@@ -1241,7 +1205,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn op_equal_txout(value: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(value),
@@ -1250,8 +1214,8 @@ mod tests {
     }
 
     /// Input spending an `OP_EQUAL` prevout with a mismatched `7 8` scriptSig:
-    /// rejected by both bitcoinconsensus and the kernel.
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    /// rejected by the kernel.
+    #[cfg(feature = "kernel")]
     fn mismatch_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
@@ -1261,7 +1225,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn spend_tx(inputs: Vec<TxIn>, output_value: u64) -> Transaction {
         Transaction {
             version: transaction::Version(1),
@@ -1274,7 +1238,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn outpoint(seed: u8) -> OutPoint {
         OutPoint {
             txid: Txid::from_byte_array([seed; 32]),
@@ -1305,7 +1269,7 @@ mod tests {
     /// must outrank a later transaction's missing prevout, because prep emits the
     /// earlier tx's input checks before it breaks on the missing-prevout pre-error.
     #[test]
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn earlier_tx_script_error_beats_later_tx_missing_prevout() {
         let txs = vec![
             coinbase_transaction_with_script_sig_len(2).0,
@@ -1330,7 +1294,7 @@ mod tests {
     /// The deferred post-error (value balance) must not outrank the same tx's
     /// script failure: script is phase 1, post is phase 2 in the intra-tx order.
     #[test]
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn intra_tx_script_error_beats_value_and_sigop() {
         let txs = vec![
             coinbase_transaction_with_script_sig_len(2).0,
@@ -1354,7 +1318,7 @@ mod tests {
     /// A later transaction's pre-error must not outrank an earlier transaction's
     /// deferred post-error: the scan walks in block order and returns tx1 first.
     #[test]
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn later_pre_error_does_not_outrank_earlier_post_error() {
         let txs = vec![
             coinbase_transaction_with_script_sig_len(2).0,
@@ -1391,7 +1355,7 @@ mod tests {
 
     /// Parallel script checks still report the earliest block-ordered failure.
     #[test]
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn parallel_script_checks_report_first_error() {
         let mut txs = vec![
             coinbase_transaction_with_script_sig_len(2).0,
@@ -1421,7 +1385,7 @@ mod tests {
     /// resolves it into `resolved`; a bad script in the producing tx surfaces that
     /// earlier transaction's Script error.
     #[test]
-    #[cfg(any(feature = "bitcoinconsensus", feature = "kernel"))]
+    #[cfg(feature = "kernel")]
     fn same_block_spend_resolves_and_verifies() {
         let tx1 = spend_tx(vec![true_spending_input(outpoint(1))], 100);
         let tx1_out = OutPoint {
@@ -1476,6 +1440,130 @@ mod tests {
         assert!(
             matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),
             "expected producing tx Script error, got {bad:?}"
+        );
+    }
+
+    // ---- Taproot script-path public-seam regression ---------------------------
+    //
+    // The committed `taproot_scriptpath_spend.json` fixture is a real mainnet
+    // BIP342 script-path spend. The kernel production path accepts it; the
+    // portable interpreter only implements Taproot key-path, so it rejects the
+    // multi-element witness with `TaprootUnsupportedWitness`. These two tests
+    // pin `verify_transaction`'s public seam for both builds against this
+    // fixture without pulling in a BIP342 VM or new dependencies.
+
+    struct TaprootScriptPathFixture {
+        tx: Transaction,
+        prevouts: Vec<TxOut>,
+        flags: VerifyFlags,
+        height: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TaprootScriptPathFile {
+        tx_hex: String,
+        prevouts: Vec<TaprootScriptPathPrevout>,
+        flags: String,
+        height: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TaprootScriptPathPrevout {
+        script_hex: String,
+        amount_sat: u64,
+    }
+
+    /// Decodes a hex string to bytes; panics on malformed input. The fixture is
+    /// committed and validated, so a malformed hex is a corpus regression, not
+    /// a runtime condition.
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert!(hex.len().is_multiple_of(2), "hex string has odd length");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digits = std::str::from_utf8(pair).unwrap_or_else(|_| panic!("hex ascii"));
+                u8::from_str_radix(digits, 16).unwrap_or_else(|_| panic!("hex digit"))
+            })
+            .collect()
+    }
+
+    /// Loads and decodes the committed mainnet Taproot script-path fixture.
+    fn load_taproot_scriptpath_fixture() -> TaprootScriptPathFixture {
+        let json = include_str!("../tests/vectors/scripts/taproot_scriptpath_spend.json");
+        let file: TaprootScriptPathFile = serde_json::from_str(json)
+            .unwrap_or_else(|error| panic!("taproot scriptpath fixture parses: {error}"));
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&decode_hex(&file.tx_hex))
+            .unwrap_or_else(|error| panic!("taproot scriptpath tx hex decodes: {error}"));
+        assert_eq!(
+            file.prevouts.len(),
+            tx.input.len(),
+            "taproot scriptpath fixture: prevout count must match input count"
+        );
+        let prevouts = file
+            .prevouts
+            .iter()
+            .map(|prevout| TxOut {
+                value: Amount::from_sat(prevout.amount_sat),
+                script_pubkey: ScriptBuf::from_bytes(decode_hex(&prevout.script_hex)),
+            })
+            .collect::<Vec<_>>();
+        let flags = VerifyFlags::from_core_names(&file.flags)
+            .unwrap_or_else(|error| panic!("taproot scriptpath flags parse: {error}"));
+        TaprootScriptPathFixture {
+            tx,
+            prevouts,
+            flags,
+            height: file.height,
+        }
+    }
+
+    /// Public-seam regression: under `feature = "kernel"`, `verify_transaction`
+    /// routes the real mainnet Taproot script-path spend to the kernel, which
+    /// accepts it.
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn verify_transaction_accepts_mainnet_taproot_scriptpath_spend() {
+        let fixture = load_taproot_scriptpath_fixture();
+        let mut utxos = BTreeMap::new();
+        for (index, prevout) in fixture.prevouts.iter().enumerate() {
+            utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
+        }
+        assert_eq!(
+            verify_transaction(
+                &Tx(fixture.tx.clone()),
+                &utxos,
+                fixture.height,
+                fixture.flags
+            ),
+            Ok(())
+        );
+    }
+
+    /// Public-seam regression: without the kernel, `verify_transaction` routes
+    /// the Taproot script-path spend to the portable interpreter, which only
+    /// implements key-path and rejects the multi-element witness with
+    /// `TaprootUnsupportedWitness` ("unsupported annex or script-path").
+    #[test]
+    #[cfg(not(feature = "kernel"))]
+    fn verify_transaction_rejects_mainnet_taproot_scriptpath_under_portable() {
+        let fixture = load_taproot_scriptpath_fixture();
+        let mut utxos = BTreeMap::new();
+        for (index, prevout) in fixture.prevouts.iter().enumerate() {
+            utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
+        }
+        let result = verify_transaction(
+            &Tx(fixture.tx.clone()),
+            &utxos,
+            fixture.height,
+            fixture.flags,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ConsensusError::Script { input_index: 0, ref reason })
+                    if reason.contains("unsupported annex or script-path")
+            ),
+            "expected portable TaprootUnsupportedWitness rejection, got {result:?}"
         );
     }
 }

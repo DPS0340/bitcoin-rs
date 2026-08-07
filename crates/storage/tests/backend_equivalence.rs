@@ -18,6 +18,7 @@ fn run_equivalence_suite<S: KvStore>(store: S) -> Result<[u8; 32], StorageError>
     verify_prefix_iteration(&store)?;
     verify_mixed_column_family_batch_ordering(&store)?;
     verify_mixed_owned_value_batch_ordering(&store)?;
+    verify_deferred_batch_visibility(&store)?;
     overwrite_one_row_with_direct_put(&store)?;
     verify_direct_put_overwrite(&store)?;
     delete_first_rows(&store)?;
@@ -59,6 +60,22 @@ fn verify_mixed_owned_value_batch_ordering(store: &impl KvStore) -> Result<(), S
         store.get(ColumnFamily::TxConfirmed, key)?,
         Some(b"second-confirmed-owned".to_vec())
     );
+    Ok(())
+}
+
+fn verify_deferred_batch_visibility(store: &impl KvStore) -> Result<(), StorageError> {
+    let key = b"deferred-batch";
+    let mut batch = store.new_batch();
+    batch.put(ColumnFamily::BlockBodies, key, b"body");
+    batch.put(ColumnFamily::BlockHeaders, key, b"header");
+    batch.delete(ColumnFamily::BlockHeaders, key);
+    store.write_deferred(batch)?;
+
+    assert_eq!(
+        store.get(ColumnFamily::BlockBodies, key)?,
+        Some(b"body".to_vec())
+    );
+    assert_eq!(store.get(ColumnFamily::BlockHeaders, key)?, None);
     Ok(())
 }
 
@@ -263,6 +280,34 @@ fn mdbx_equivalence_hash() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
     let hash = run_equivalence_suite(bitcoin_rs_storage::MdbxStore::open(temp.path())?)?;
     eprintln!("mdbx aggregate hash: {}", hash_hex(&hash));
+    Ok(())
+}
+
+#[cfg(feature = "redb")]
+#[test]
+fn redb_flush_persists_deferred_write_after_reopen() -> TestResult<()> {
+    let temp = tempfile::TempDir::new()?;
+    {
+        let store = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+        let mut batch = store.new_batch();
+        batch.put(
+            ColumnFamily::BlockBodies,
+            b"deferred-key",
+            b"deferred-value",
+        );
+        store.write_deferred(batch)?;
+        assert_eq!(
+            store.get(ColumnFamily::BlockBodies, b"deferred-key")?,
+            Some(b"deferred-value".to_vec())
+        );
+        store.flush()?;
+    }
+
+    let reopened = bitcoin_rs_storage::RedbStore::open(temp.path())?;
+    assert_eq!(
+        reopened.get(ColumnFamily::BlockBodies, b"deferred-key")?,
+        Some(b"deferred-value".to_vec())
+    );
     Ok(())
 }
 

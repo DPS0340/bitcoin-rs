@@ -131,7 +131,7 @@ ELECTRUM_RSS_MEASUREMENT_SCHEMA = "g14-electrum-rss-measurement-v1"
 ELECTRUM_HISTORY_METHOD = "blockchain.scripthash.get_history"
 ELECTRUM_SAMPLE_SIZE = 10_000
 UTXO_COMMIT_MEASUREMENT_SCHEMA = "g14-utxo-commit-measurement-v1"
-UTXO_BLOCK_SIZE_THRESHOLD_BYTES = 4 * 1024 * 1024
+UTXO_BLOCK_SIZE_THRESHOLD_BYTES = 1_000_000
 BITCOIN_RS_CRITERION_BENCHMARK_ID = "bitcoin-rs/mainnet-ibd"
 BITCOIN_CORE_CRITERION_BENCHMARK_ID = "bitcoin-core/mainnet-ibd"
 BITCOIN_RS_IBD_ADAPTER = "bitcoin-rs-daemon-mainnet-ibd-v1"
@@ -776,6 +776,19 @@ def positive_sample_float(value, name: str) -> float:
     return number
 
 
+def reject_duplicate_heights(samples: list, source: str) -> None:
+    seen: set[int] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            die(f"{source}[{index}] must be an object")
+        height = sample.get("height")
+        if not isinstance(height, int) or isinstance(height, bool):
+            die(f"{source}[{index}].height must be an integer")
+        if height in seen:
+            die(f"{source} must not contain duplicate height {height}")
+        seen.add(height)
+
+
 def read_utxo_samples(path: Path) -> list:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -784,10 +797,12 @@ def read_utxo_samples(path: Path) -> list:
     except json.JSONDecodeError as error:
         die(f"sample source must be JSON: {error}")
     if isinstance(payload, list):
+        reject_duplicate_heights(payload, "sample source")
         return payload
     if isinstance(payload, dict):
         samples = payload.get("samples")
         if isinstance(samples, list):
+            reject_duplicate_heights(samples, "sample source")
             return samples
     die("sample source must be a JSON array or an object with a samples array")
 
@@ -1196,7 +1211,7 @@ env = {
     "G14_INDEXES": indexes,
     "G14_REFERENCE_IMPL": "bitcoin-core",
     "G14_BENCH_TOOL": bench_tool,
-    "G14_BLOCK_SIZE_BYTES": "4194304",
+    "G14_BLOCK_SIZE_BYTES": "1000000",
     "G14_ELECTRUM_SAMPLE_SIZE": "10000",
     "G14_IBD_START_HEIGHT": str(start_height),
     "G14_IBD_START_HASH": start_hash,

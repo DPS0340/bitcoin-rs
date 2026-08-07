@@ -17,12 +17,13 @@ workspace = true
 # `match self` arms are non-exhaustive and the crate fails to compile.  fjall
 # is the performance-oriented default backend so per-crate `cargo publish` / `cargo check`
 # works out of the box.  CI and local dev build via `bin/bitcoin-rs` with
-# `--package bitcoin-rs --no-default-features --features "rocksdb,fjall,redb,mdbx,bitcoinconsensus"`,
-# which propagates all four backends through `bin/bitcoin-rs`'s feature table.
+# `--package bitcoin-rs --no-default-features --features "rocksdb,fjall,redb,mdbx,kernel"`,
+# which propagates all four backends and the bitcoinkernel verifier through
+# `bin/bitcoin-rs`'s feature table.
 # Note: `--workspace --features "..."` in a virtual workspace (no root [package])
 # does NOT forward CLI features to library crates; always use -p when features
 # must reach a specific crate.
-default = ["fjall"]
+default = ["fjall", "kernel"]
 rocksdb = [
     "bitcoin-rs-chain/rocksdb",
     "bitcoin-rs-coinstats/rocksdb",
@@ -81,10 +82,6 @@ mdbx = [
     "bitcoin-rs-filters/mdbx",
     "bitcoin-rs-index/mdbx",
     "bitcoin-rs-storage/mdbx",
-]
-bitcoinconsensus = [
-    "bitcoin-rs-consensus/bitcoinconsensus",
-    "bitcoin-rs-script/bitcoinconsensus",
 ]
 kernel = ["bitcoin-rs-consensus/kernel"]
 utreexo = ["dep:bitcoin-rs-utreexo"]

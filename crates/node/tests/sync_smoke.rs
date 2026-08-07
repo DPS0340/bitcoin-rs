@@ -880,18 +880,11 @@ fn apply_buffers_g14_utxo_commit_samples_until_stop_height()
 }
 
 #[test]
-fn tick_advances_tip_when_g14_utxo_commit_sample_write_fails()
--> Result<(), Box<dyn std::error::Error>> {
+fn node_open_rejects_existing_g14_utxo_commit_samples() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let samples_path = temp.path().join("g14-utxo.samples.json");
+    std::fs::write(&samples_path, b"stale evidence")?;
     let genesis_hash = Network::Regtest.genesis_block_hash().to_string_be();
-    let stale_sample = serde_json::json!([{
-        "height": 0,
-        "block_hash": genesis_hash,
-        "block_size_bytes": 1,
-        "utxo_commit_us": 1,
-    }]);
-    std::fs::write(&samples_path, serde_json::to_vec_pretty(&stale_sample)?)?;
     let mut config = Config::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "fjall".to_owned();
@@ -901,28 +894,13 @@ fn tick_advances_tip_when_g14_utxo_commit_sample_write_fails()
     config.g14_utxo_commit_ibd_stop_height = Some(0);
     config.g14_utxo_commit_ibd_start_hash = Some(genesis_hash.clone());
     config.g14_utxo_commit_ibd_stop_hash = Some(genesis_hash);
-    let state = NodeState::open(config)?;
 
-    state.sync().tick();
-
-    let applied = state
-        .applied_tip()
-        .load_full()
-        .ok_or("expected applied tip after genesis tick")?;
-    assert_eq!(applied.height, 0);
-    assert_eq!(applied.hash, Network::Regtest.genesis_block_hash());
-    let on_disk: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&samples_path)?)?;
-    let first = on_disk
-        .as_array()
-        .and_then(|samples| samples.first())
-        .and_then(serde_json::Value::as_object)
-        .ok_or("expected stale G14 sample object")?;
-    assert_eq!(
-        first
-            .get("utxo_commit_us")
-            .and_then(serde_json::Value::as_u64),
-        Some(1)
-    );
+    let result = NodeState::open(config);
+    let Err(error) = result else {
+        panic!("expected existing G14 evidence path to fail");
+    };
+    let error = format!("{error:?}");
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(std::fs::read(&samples_path)?, b"stale evidence");
     Ok(())
 }
