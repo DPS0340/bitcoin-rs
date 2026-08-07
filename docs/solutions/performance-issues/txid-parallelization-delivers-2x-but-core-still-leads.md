@@ -29,34 +29,37 @@ Commit `f76d43a` (`perf(apply): parallelize txid computation for blocks with man
 
 ## Measurement
 
-Same machine (128 cores), serial runs, local REST blocks:
+Same machine (128 cores), serial runs, local REST blocks (fjall, full verification):
 
-| Node | Commit | Elapsed 0→150k | blk/s | RSS high-water | Source |
-|---|---|---|---|---|---|
-| bitcoin-rs | `4700c25` | 389.7s | 385 | 2.36 GB | `processing-bound-150k-verdict.md` |
-| bitcoin-rs | `f76d43a` | **178.93s** | **838** | **223 MB** | `~/bench-g14/results/replay-postopt-150k-f76d43a.json` (150001 blocks, 687 MB, `blocks_per_second 838.32`, `git_head f76d43a`) |
-| Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log |
+| Node | Commit | Elapsed 0→150k | blk/s | RSS high-water | Source | Notes |
+|---|---|---|---|---|---|---|
+| bitcoin-rs | `4700c25` | 389.7s | 385 | 2.36 GB | `processing-bound-150k-verdict.md` | baseline |
+| bitcoin-rs | `f76d43a` | 178.93s | 838 | 223 MB | `~/bench-g14/results/replay-postopt-150k-f76d43a.json` (150001 blocks, 687 MB, `git_head f76d43a`) | single clean run, txid parallel |
+| bitcoin-rs | `e540b91` (code-identical to `f76d43a`) | **173.1s median** (166.4, 173.1, 177.8) | **867** | 223 MB | `taskset -c 0-31` 3×, no IBD contention (`/tmp/replay-taskset-*.json`) | most reliable post-opt |
+| Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log | |
 
-Gap to Core halved: **5.8× → 2.67×**. Next gap is still 111.9s.
+Gap to Core halved: **5.8× → 2.58×** (173.1/67). Next gap is still 106.1s.
 
-## Why Core still leads — stage decomposition of the 178.93s run
+## Why Core still leads — stage decomposition
 
-`node.apply_block.total_seconds` 156.06s dominates wall-clock (87% of elapsed; fetch 15.97s + decode 3.59s overlap partially via prefetch).
+`node.apply_block.total_seconds` dominates wall-clock (87% of elapsed at `f76d43a`: 156.06s total, fetch 15.97s + decode 3.59s overlap via prefetch). At `f76d43a` (178.93s elapsed, no per-block histograms for txid/utxo) **41.5s (26.6% of total) was uninstrumented** — outside all histograms.
 
-Accounted stages sum to 114.56s; **41.5s (26.6% of total) is uninstrumented** — outside all histograms (likely `plan_block_transactions` txid work + `ResolvedUtxoView::resolve` UTXO lookups, added as histograms after this measurement).
+Instrumented run `53feecb` (201.84s elapsed, same code + `txid_plan_seconds`/`utxo_resolve_seconds` histograms, but **contaminated** — full-tip IBD `bitcoin-rs-fulltip-postopt-local3` was actively writing `blk00817.dat→blk00867.dat` (50 files) during the run, so absolute times are inflated; relative proportions remain indicative) attributes that gap:
 
-Instrumented breakdown (from `replay-postopt-150k-f76d43a.json:stage_seconds`):
+* `utxo_resolve_seconds` **25.69s** (ResolvedUtxoView::resolve — UTXO cache lookups per input)
+* `txid_plan_seconds` **21.63s** (`plan_block_transactions` — `compute_txid` per tx, parallel >32)
+* `script_prepare_seconds` **20.43s** (serial `prepare_block_input_checks` + `prepare_kernel_tx` per-tx serialize/PrecomputedTransactionData)
+* `block_body_persist 11.18s`, `utxo_commit 7.78s`, `block_rules 5.25s`, remainder <2s each (see `replay-postopt-150k-53feecb.json:stage_seconds` 113 lines).
 
-* `script_verify 87.03s` (55.8% of total) — of which `prepare 18.09s` (serial per-transaction kernel setup in `verify_tx.rs:389` `prepare_block_input_checks`, no overlap with parallel phase) + `resolution 10.09s`
-* `block_body_persist 11.23s`, `utxo_commit 6.91s`, `block_rules 4.53s`, `bip30_bip34 1.14s`, `block_tree_insert 1.10s`, remainder <1s each.
+The 41.5s gap is therefore **UTXO resolve (25.69) + txid plan (21.63) ≈ 47s** (slightly above gap due to histogram overhead and contamination), not `prepare` alone. The `prepare` 18–20s is 10% of wall time, but the **dominant uninstrumented cost is UTXO resolve**, so the next lever is UTXO cache/lookup efficiency, not just kernel serialization. `script_verify` itself is 87–99s (55% of total) and already input-level parallel via `SCRIPT_VERIFY_POOL.install || checks.par_iter()` in `verify_block_input_scripts:394-406` (the verdict doc’s “per-block” line referred to pre-`4700c25`).
 
-The 18s `prepare` is the actionable Rust-side target named in `script-verification-delegated-to-core-c-no-rust-headroom.md:66` (“UTXO caching, input preparation, storage commits”) — it runs serially before the `par_iter` fan-out in `verify_block_input_scripts:394-406`, which already implements the per-input CCheckQueue pattern (checks `par_iter`, not per-block). The verdict doc’s line 28 describing “rs parallelizes per-block via rayon” referred to pre-refactor `4700c25`, not the current `checks.par_iter()`.
+Taskset-pinned 3× median at `e540b91` (code-identical to `f76d43a`, clean, no IBD contention, `taskset -c 0-31`): **173.1s** (166.4, 173.1, 177.8) / 867 blk/s — confirms the 2.25× win (389.7→173.1) is stable within ~6% noise; the 195.89s (`1126cab` parallel-prepare) and 201.84s (`53feecb` instrumented) numbers above were **observed under contaminated conditions (background rustc + active full-tip IBD) — root cause of those specific regressions (dual rayon pools, quanta overhead) is unconfirmed and not reproduced in isolation**.
 
 ## Guidance
 
-1. **Profile the 41.5s uninstrumented gap before declaring blocked.** The 178.93s replay had 41.5s outside all histograms (likely `plan_block_transactions` txid work + `ResolvedUtxoView::resolve`). Histograms `node.apply_block.txid_plan_seconds` and `node.apply_block.utxo_resolve_seconds` are added in the follow-up change to this doc (crates/node/src/apply.rs:502,506); the next replay will be instrumented to attribute the gap before the next optimization.
-2. **Next lever is not CCheckQueue — it is already input-level parallel.** `verify_block_input_scripts` flattens all inputs into `checks` and fans out per-input via `SCRIPT_VERIFY_POOL.install || par_iter` (verify_tx.rs:394-406). Further script-verification headroom must come from overlapping or parallelizing the `prepare` phase with the check phase, and from `script_resolution` / `block_rules` / `block_body_persist` batching.
-3. **Do not re-use full-tip IBD wall-time to validate this CPU change.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the 2.18× CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 306k/961k) only for the complementary bandwidth regime.
+1. **Next lever is UTXO resolve, not prepare alone.** The 41.5s gap is dominated by `ResolvedUtxoView::resolve` (25.69s) and `txid_plan` (21.63s) — both larger than `prepare` (18–20s). Prioritize UTXO cache/lookup batching and `compute_txid` amortization; `prepare` (kernel serialize+PrecomputedTransactionData) is secondary. Histograms `txid_plan_seconds`/`utxo_resolve_seconds` added at `68bbb2f` then reverted at `e540b91` due to ~23s per-block overhead (150k × quanta+metrics); future profiling should use sampled or off-line instrumentation, not per-block histograms.
+2. **CCheckQueue is already input-level parallel.** `verify_block_input_scripts` flattens inputs into `checks` and fans out per-input via `SCRIPT_VERIFY_POOL` (verify_tx.rs:394-406). Further script headroom must come from UTXO resolve batching, `compute_txid` amortization, and `script_resolution`/`block_rules`/`block_body_persist` — not another CCheckQueue.
+3. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the 2.25× CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
 ## Related
 
