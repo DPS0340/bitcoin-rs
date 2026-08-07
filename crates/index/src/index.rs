@@ -471,7 +471,11 @@ impl<S: KvStore> Indexer<S> {
         self.ingest_rows(rows)
     }
 
-    fn ingest_rows(&mut self, rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
+    fn ingest_rows(&mut self, mut rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
+        // Dedup before counting: a block can generate the same funding or
+        // spending row twice, and only one copy is ever written. Counting the
+        // raw rows would report more rows than the store receives.
+        rows.sort();
         let block_counts = rows.counts();
         self.pending_rows.append(rows);
         if self.batch_depth == 0 || self.pending_rows.total() >= Self::FLUSH_THRESHOLD_ROWS {
