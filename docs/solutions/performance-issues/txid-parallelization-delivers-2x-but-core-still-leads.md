@@ -252,6 +252,34 @@ Txid also does not respond to parallelism — the threshold swept flat — becau
 
 **`-C target-cpu=native` is real but too small to ship.** The build sets no `target-cpu`, so it is generic x86-64. Rebuilding native and pairing 3× against generic: **132.0s vs 129.9s (1.016×)**, native winning all three rounds, with apply alone 96.8s → 90.8s (~1.066×). The whole-run figure misses the gate because roughly 22s of the run is REST fetch that codegen cannot touch. It is deliberately **not** made the default: the binary would be pinned to this CPU. Use it only as a documented opt-in for a known host.
 
+## Where the 80.7s apply stands against Core, stage by stage
+
+Post-refactor decomposition beside Core's `-debug=bench` figures for the identical window:
+
+| Stage | bitcoin-rs | Core | Note |
+|---|---|---|---|
+| script verification | 36.47s | 36.07s | **tie** — same libsecp256k1, nothing to win |
+| block parsing | ~14.0s (`Block::new` ~10.9s + rust-bitcoin decode 3.1s) | 7.18s (`Load block from disk`) | **we parse every block twice** |
+| consensus rules / merkle | 4.79s (`block_rules`) | 1.41s (`Sanity checks`) | merkle root over scalar SHA-256 vs Core's AVX2 |
+| UTXO commit | 6.10s | 2.59s (`Flush`) | |
+| block body persist | 4.18s | none | see the fairness note below |
+| script prepare + resolve | 5.80s | folded into Connect | |
+| remainder | ~9.4s | ~7.5s (`Fork checks` + postprocess) | |
+| **total** | **80.7s** | **55.80s** | |
+
+**Fairness note.** Core's `-reindex-chainstate` already holds its `blk` files and writes no block bodies; our replay persists them, so 4.18s of our apply is storage work Core does not do *in this benchmark*. It is not dead weight — a real node must store blocks, and Core pays it during IBD — but a strict engine-to-engine ratio should exclude it: **116.4s vs 59.6s = 1.95×**, or apply-only 76.5s vs 55.80s = 1.37×.
+
+### The one lever left, and why it is a separate change
+
+**We parse every block twice**: once with rust-bitcoin into `bitcoin::Block`, once with the kernel. Core parses once. At ~14.0s against Core's 7.18s that is the largest remaining structural difference, and unlike everything else measured here it is not a constant to tune — it means removing `bitcoin::Transaction` from the hot path entirely and carrying kernel types through apply, block rules, and the UTXO layer.
+
+That is a multi-crate change to consensus-critical code and belongs in its own PR with its own review, not appended to this one. Two smaller targets sit behind it, both bounded:
+
+* `block_rules` 4.79s vs Core's 1.41s — the merkle root is SHA-256d over txids with a scalar implementation while Core uses its runtime-selected AVX2 one. The kernel does not expose a merkle helper, so this needs either an exposed hash primitive or a parallel merkle tree.
+* `utxo_commit` 6.10s vs Core's 2.59s flush.
+
+Do not re-open script verification: it is a measured tie, and four marshalling micro-optimizations plus a pool-width and threshold sweep are already closed above.
+
 ## Guidance
 
 1. **Attribute a stage by disabling it, not by reading a profiler.** `perf` was unavailable here (`perf_event_paranoid=4`, no sudo), but the open question — is `script_parallel`'s ~0.93 ms/block genuine secp256k1 work or rayon dispatch overhead? — is binary, so forcing `MIN_PARALLEL_SCRIPT_CHECKS = usize::MAX` answered it in one run: the replay went 173.1s → **313.3s** and the stage 63s → **227.6s**. Genuine crypto. That immediately reframed the number: 227.6s → 63s is only **3.6× from a 16-thread pool**, so the pool width was the binding constraint, and widening it to 32 bought 1.10× (`0e2dda5`). Prefer this disable-the-stage technique whenever a hypothesis is binary; it needs no tooling and cannot be argued with.
