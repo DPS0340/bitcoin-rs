@@ -19,7 +19,7 @@ tags:
   - replay
 ---
 
-# Script-verify pool width was the binding constraint — 389.7s → 157.8s (2.47×), Core still leads 2.36×
+# Script-verify parallel *granularity* was the binding constraint — 389.7s → 135.0s (2.89×), Core still leads 2.01×
 
 ## Context
 
@@ -36,10 +36,19 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | `4700c25` | 389.7s | 385 | 2.36 GB | `processing-bound-150k-verdict.md` | baseline |
 | bitcoin-rs | `f76d43a` | 178.93s | 838 | 223 MB | `~/bench-g14/results/replay-postopt-150k-f76d43a.json` (150001 blocks, 687 MB, `git_head f76d43a`) | single clean run, txid parallel |
 | bitcoin-rs | `e540b91` (code-identical to `f76d43a`) | 173.1s median (166.4, 173.1, 177.8) | 867 | 223 MB | `taskset -c 0-31` 3×, no IBD contention (`/tmp/replay-taskset-*.json`) | txid parallel, 16-thread pool |
-| bitcoin-rs | `0e2dda5` | **157.8s median** (163.8, 155.9, 157.8) | **950** | 223 MB | `taskset -c 0-31` 3× (`/tmp/replay-t32-*.json`) | + 32-thread script-verify pool |
+| bitcoin-rs | `0e2dda5` | 157.8s median (163.8, 155.9, 157.8) | 950 | 223 MB | `taskset -c 0-31` 3× (`/tmp/replay-t32-*.json`) | + 32-thread script-verify pool |
+| bitcoin-rs | this change | **135.0s median** (135.0, 134.0, 140.6) | **1111** | 226 MB | `taskset -c 0-31` 3× (`/tmp/rfin-*.json`) | + parallel threshold 16 → 4 |
 | Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log | |
 
-Gap to Core: **5.8× → 2.36×** (157.8/67). Total win over the `4700c25` baseline is **2.47×**. Remaining gap is 90.8s.
+Gap to Core: **5.8× → 2.01×** (135.0/67). Total win over the `4700c25` baseline is **2.89×**. Remaining gap is 68.0s.
+
+**Pool width was only half of it.** Widening the pool 16 → 32 bought 1.10×, but the pool cannot help a block that never reaches it: `MIN_PARALLEL_SCRIPT_CHECKS` sent every block with fewer than 16 input checks down the serial branch, and on mainnet 0→150k that is most of them. Lowering the threshold to 4 bought a further **1.15×** and cut `script_verify` 84.0s → 66.5s. The sweep is steep and monotonic above the optimum (`taskset -c 0-31`, 3× medians for 4/8/16 interleaved round-robin so cache warming hits each equally; single runs above):
+
+| Threshold | 4 | 8 | 16 | 48 | 128 | 512 |
+|---|---|---|---|---|---|---|
+| Elapsed | **139.4s** | 145.1s | 155.8s | 185.0s | 234.6s | 297.3s |
+
+Threshold 2 measured 143.8s, so the optimum is a genuine interior minimum at 4, not "as low as possible". The ordering 4 < 8 < 16 held in all three interleaved rounds.
 
 ## Where the 157.8s goes — clean stage decomposition
 

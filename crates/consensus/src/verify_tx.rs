@@ -32,7 +32,19 @@ const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 // verification against the rest of the apply pipeline; widen only against a
 // fresh measurement on the target hardware.
 const MAX_SCRIPT_VERIFY_THREADS: usize = 32;
-const MIN_PARALLEL_SCRIPT_CHECKS: usize = 16;
+// Blocks with fewer checks than this verify serially. A matched-validation
+// replay of mainnet 0..150_000 (3x medians, pinned `taskset -c 0-31`, the three
+// variants interleaved round-robin so page-cache warming hits them equally)
+// puts the optimum at 4, and the ordering held in every round:
+//
+//   threshold 16   155.8s      threshold 128   234.6s
+//   threshold  8   145.1s      threshold 512   297.3s
+//   threshold  4   139.4s      threshold  48   185.0s
+//
+// The curve is monotonic and steep above 16, so a higher threshold is never
+// right here: even a handful of inputs is worth the fan-out. Below 4 it turns
+// back up (threshold 2 measured 143.8s single-run), which sets the floor.
+const MIN_PARALLEL_SCRIPT_CHECKS: usize = 4;
 static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     rayon::ThreadPoolBuilder::new()
