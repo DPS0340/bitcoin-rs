@@ -1,5 +1,5 @@
 ---
-title: Txid parallelization delivers 2.18× processing-bound win but Core still leads 2.67× at 150k
+title: Script-verify pool width was the binding constraint — 389.7s to 157.8s (2.47x), Core still leads 2.36x
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -19,7 +19,7 @@ tags:
   - replay
 ---
 
-# Txid parallelization delivers 2.18× processing-bound win but Core still leads 2.67× at 150k
+# Script-verify pool width was the binding constraint — 389.7s → 157.8s (2.47×), Core still leads 2.36×
 
 ## Context
 
@@ -35,10 +35,11 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 |---|---|---|---|---|---|---|
 | bitcoin-rs | `4700c25` | 389.7s | 385 | 2.36 GB | `processing-bound-150k-verdict.md` | baseline |
 | bitcoin-rs | `f76d43a` | 178.93s | 838 | 223 MB | `~/bench-g14/results/replay-postopt-150k-f76d43a.json` (150001 blocks, 687 MB, `git_head f76d43a`) | single clean run, txid parallel |
-| bitcoin-rs | `e540b91` (code-identical to `f76d43a`) | **173.1s median** (166.4, 173.1, 177.8) | **867** | 223 MB | `taskset -c 0-31` 3×, no IBD contention (`/tmp/replay-taskset-*.json`) | most reliable post-opt |
+| bitcoin-rs | `e540b91` (code-identical to `f76d43a`) | 173.1s median (166.4, 173.1, 177.8) | 867 | 223 MB | `taskset -c 0-31` 3×, no IBD contention (`/tmp/replay-taskset-*.json`) | txid parallel, 16-thread pool |
+| bitcoin-rs | `0e2dda5` | **157.8s median** (163.8, 155.9, 157.8) | **950** | 223 MB | `taskset -c 0-31` 3× (`/tmp/replay-t32-*.json`) | + 32-thread script-verify pool |
 | Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log | |
 
-Gap to Core halved: **5.8× → 2.58×** (173.1/67). Next gap is still 106.1s.
+Gap to Core: **5.8× → 2.36×** (157.8/67). Total win over the `4700c25` baseline is **2.47×**. Remaining gap is 90.8s.
 
 ## Why Core still leads — stage decomposition
 
@@ -68,9 +69,11 @@ The first two cleared the tests but not the 1.05× noise floor; the third never 
 
 ## Guidance
 
-1. **The gap is not in any prepare-phase lever — stop optimizing `prepare`.** Prepare is 20.4s of a 173.1s run; zeroing it entirely still leaves ~153s against Core's 67s. Four prepare-phase candidates are now closed (table above), two by benchmark, one by tests, one by cost analysis. Every Rust-side stage is already parallel: `ResolvedUtxoView::resolve` is `into_par_iter` (`apply.rs:1136`), `verify_block_input_scripts` is per-input via `SCRIPT_VERIFY_POOL` (`verify_tx.rs:394-406`), `plan_block_transactions` is `par_iter` above 32 txs (`apply.rs:985`). The cost that actually decides the comparison is `script_verify` at 87–103s — larger than Core's entire run — of which `script_parallel` is 63–65s summed over only 67,891 blocks (~0.93 ms per block). **That per-block figure, not prepare, is the next thing to attribute**: it is either genuine secp256k1 work or per-block rayon dispatch overhead, and the two call for opposite fixes (nothing vs. batching blocks into one fan-out). Attribution needs a sampling profiler; `perf` was unavailable here (`perf_event_paranoid=4`, no sudo). The only structural lever below that is holding kernel objects across the block (`bitcoinkernel::Block::new` once, then `block.transaction(i)`) instead of reconstructing per transaction — a cross-crate change to the consensus public API.
-2. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
-3. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the 2.25× CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
+1. **Attribute a stage by disabling it, not by reading a profiler.** `perf` was unavailable here (`perf_event_paranoid=4`, no sudo), but the open question — is `script_parallel`'s ~0.93 ms/block genuine secp256k1 work or rayon dispatch overhead? — is binary, so forcing `MIN_PARALLEL_SCRIPT_CHECKS = usize::MAX` answered it in one run: the replay went 173.1s → **313.3s** and the stage 63s → **227.6s**. Genuine crypto. That immediately reframed the number: 227.6s → 63s is only **3.6× from a 16-thread pool**, so the pool width was the binding constraint, and widening it to 32 bought 1.10× (`0e2dda5`). Prefer this disable-the-stage technique whenever a hypothesis is binary; it needs no tooling and cannot be argued with.
+2. **The prepare phase is closed — do not reopen it.** Prepare is ~20s of the run; zeroing it entirely still leaves ~138s against Core's 67s. Four candidates are closed (table above): two by benchmark, one by tests (`btck_script_pubkey_verify` gates on `m_spent_outputs_ready`, so prevout `TxOut`s must be built even when nothing hashes them), one by cost analysis. `ResolvedUtxoView::resolve` is already `into_par_iter` (`apply.rs:1136`) and `plan_block_transactions` already `par_iter` above 32 txs (`apply.rs:985`), so neither is a target either.
+3. **Next: pool width is tuned for this host, not solved.** `MAX_SCRIPT_VERIFY_THREADS = 32` was measured on an 80-CPU box; a different machine needs its own sweep, and the constant is deliberately a cap rather than `available_parallelism` so verification cannot starve the rest of the pipeline. Beyond width, the remaining structural lever is holding kernel objects across the block (`bitcoinkernel::Block::new` once, then `block.transaction(i)`) instead of reconstructing per transaction — a cross-crate change to the consensus public API.
+4. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
+5. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
 ## Related
 
