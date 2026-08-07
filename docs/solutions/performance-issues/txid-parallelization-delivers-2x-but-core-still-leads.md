@@ -150,7 +150,7 @@ Core never pays the first two. It deserializes each block once into `CTransactio
 
 So the marshalling class closed earlier was closed at the wrong altitude. Four micro-optimizations inside that round-trip each measured 0.98-1.00×, and that remains true: shaving allocations off a redundant round-trip cannot pay. Removing the round-trip is a different change, and it is now quantified at **~29s of the 39.5s gap**. That is the only lever left that is worth its risk.
 
-## The marshalling refactor is closed by measurement, not by argument
+## The marshalling refactor: first closed wrongly, then reopened by a better measurement
 
 The obvious conclusion from the table above is "stop round-tripping transactions through Rust structs: parse the block once with `bitcoinkernel::Block::new` and validate `block.transaction(i)` in place." The API supports it — `TransactionRef<'a>` is `Send + Sync` and implements `TransactionExt` — at the cost of threading a block lifetime through `PreparedTx`, `prepare_block_input_checks`, `verify_block_input_scripts`, and `PreparedKernelTx` across three crates.
 
@@ -172,9 +172,35 @@ whole-block Block::new     10.88s   (added, 150k calls)
 net                        +1.54s   (1.1% of a 138s run)
 ```
 
-**`Block::new` is more expensive per byte than the 1.7M individual `Transaction::new` calls it would replace.** Batching the parse does not amortize anything, because the kernel re-parses the same bytes either way and its block parser carries its own per-block structure cost. The redundant `encode::serialize` really is only 2.74s, exactly consistent with the four earlier micro-optimizations that each landed at 0.98-1.00×.
+`Block::new` is more expensive per byte than the 1.7M individual `Transaction::new` calls it would replace, so on those two line items alone the refactor loses.
 
-So the marshalling gap against Core is real (Core never pays it) but it is **not recoverable through this API**. Recovering it would mean not holding `bitcoin::Transaction` at all — decoding straight from bytes into kernel objects for the whole apply path — which is a different node, not a refactor.
+**That accounting was wrong, and the correction reverses the verdict.** It priced only the parse and the serialize, and ignored that `Block::new` *also* produces every txid as a side effect: Core's `CTransaction` hashes itself during deserialization, so `TransactionExt::txid()` is a getter over an already-computed hash. And it computes it with the implementation Core selects at runtime, which this host logs as:
+
+```
+Using the 'sse4(1way);sse41(4way);avx2(8way)' SHA256 implementation
+```
+
+That is a software **AVX2 8-way multi-buffer** SHA-256, already linked into this binary through `libbitcoinkernel`. Our `compute_txid` uses `bitcoin_hashes`' scalar SHA-256. The earlier note here that beating it would need "a cryptographic-library project" was wrong — the library is already a dependency.
+
+Timing `Block::new` plus harvesting every txid from it, and checking each against the `tx_plan` txids:
+
+```
+Block::new + harvest all txids   10.93s   (150k blocks, 1.7M txids, 0 mismatches)
+
+replaces:
+  compute_txid (scalar SHA-256)  10.30s
+  encode::serialize               2.74s
+  Transaction::new                9.67s
+                                --------
+                                 22.71s
+net                              -11.78s   (~1.10x on a 132s run)
+```
+
+Zero mismatches over 1.7M transactions, so the kernel txids are consensus-identical to rust-bitcoin's.
+
+**This is the largest remaining lever and it is worth its refactor**, because one `Block::new` retires three separate costs at once. The shape: parse the block once in `apply_block_inner`, harvest txids from it instead of calling `plan_block_transactions`' hasher, and pass `&Block` down through `verify_block_transactions` → `verify_block_input_scripts` → `prepare_block_input_checks` so `PreparedKernelTx` can hold a `TransactionRef<'block>` instead of re-serializing. Lifetimes flow as ordinary parameters, so nothing is self-referential.
+
+The lesson generalizes past this case: **price a replacement by everything it subsumes, not by the line item that motivated it.** Costed against parse-and-serialize the change looks like +1.54s; costed against parse, serialize, and hash it is -11.78s.
 
 Probe methodology, for anyone repeating this: the probes were `AtomicU64` nanosecond accumulators exported from `crates/consensus/src/kernel.rs` and printed by the replay example, all reverted afterwards. They are cheap enough to leave in during a measurement run (138.2s probed against a ~132s unprobed median, most of that ordinary drift).
 
