@@ -93,6 +93,24 @@ The first two cleared the tests but not the 1.05× noise floor; the third never 
 
 The fourth result retires the "FFI boundary is the remaining lever" hypothesis for its allocation half. Per-input `ScriptPubkey::new` is a ~25-byte `malloc` plus copy; at 3.3M inputs that is real allocator traffic, and removing it entirely changed nothing measurable. What the kernel spends inside `btck_script_pubkey_verify` is secp256k1 work, not marshalling. Marshalling-side micro-optimization is now closed as a class: four separate attempts (parallel prepare, serialize buffer, witness-free skip, prevout reuse) all landed at 0.98–1.00×.
 
+## What the remaining apply time is
+
+Two temporary probes (removed after measurement) attributed the last unmeasured slice of apply. They cost nothing detectable — the probed run measured 123.3s and 126.0s against a 124.2s unprobed median — which **retires the earlier claim that per-block histograms cost ~23s**. That figure came from a contaminated run; the apply path already carries 13 per-block histograms, so two more are free at this scale.
+
+| Component | Cost | Note |
+|---|---|---|
+| `script_parallel` | 36.4s | secp256k1, already input-parallel at threshold 4 |
+| `script_prepare` | 18.6s | kernel serialize + `PrecomputedTransactionData`, serial on purpose |
+| `plan_block_transactions` (txid) | 10.3s | `compute_txid` streams into the hash engine, no intermediate `Vec` |
+| named non-script apply | 19.5s | `utxo_commit` 6.1s, `block_rules` 5.3s, `block_body_persist` 4.1s |
+| `ResolvedUtxoView::resolve` | 2.8s | now serial |
+| `script_resolution` | 1.6s | now serial |
+| genuinely unmeasured | 2.0s | |
+
+Txid is now the largest single item outside script verification. It does not respond to parallelism (threshold swept flat, one SHA256d is order 1 µs), and it does not allocate, so any further win there has to come from the hash itself — batch/SIMD SHA-256 across independent transactions, which this host would need in software: the Xeon Gold 6138 is Skylake-SP and has **no `sha_ni`**, only AVX2 and AVX512F.
+
+**`-C target-cpu=native` is real but too small to ship.** The build sets no `target-cpu`, so it is generic x86-64. Rebuilding native and pairing 3× against generic: **132.0s vs 129.9s (1.016×)**, native winning all three rounds, with apply alone 96.8s → 90.8s (~1.066×). The whole-run figure misses the gate because roughly 22s of the run is REST fetch that codegen cannot touch. It is deliberately **not** made the default: the binary would be pinned to this CPU. Use it only as a documented opt-in for a known host.
+
 ## Guidance
 
 1. **Attribute a stage by disabling it, not by reading a profiler.** `perf` was unavailable here (`perf_event_paranoid=4`, no sudo), but the open question — is `script_parallel`'s ~0.93 ms/block genuine secp256k1 work or rayon dispatch overhead? — is binary, so forcing `MIN_PARALLEL_SCRIPT_CHECKS = usize::MAX` answered it in one run: the replay went 173.1s → **313.3s** and the stage 63s → **227.6s**. Genuine crypto. That immediately reframed the number: 227.6s → 63s is only **3.6× from a 16-thread pool**, so the pool width was the binding constraint, and widening it to 32 bought 1.10× (`0e2dda5`). Prefer this disable-the-stage technique whenever a hypothesis is binary; it needs no tooling and cannot be argued with.
@@ -128,7 +146,7 @@ The fourth result retires the "FFI boundary is the remaining lever" hypothesis f
    It buys ~5s in `script_prepare` and gives back ~7s across the rest of apply, because its threads contend with the script-verify pool for the same cores. Reading `script_prepare_seconds` alone would have shipped a 4% regression as a 30% stage win. This re-confirms the original verdict and supplies the mechanism it lacked; prepare stays serial.
 
    The clearest evidence for the removal class: 5.3s of dispatch layered on 1.6s of work. This is the mirror of the threshold finding — there the fix was *more* parallelism for 100 µs script checks, here it is *none* for 500 ns lookups. Same question either way: does per-item work exceed dispatch? Distinct from the marshalling class closed above, which was about removing allocations rather than removing threads. Remaining fan-outs and their verdicts: `verify_block_input_scripts` (keep, ~100 µs per input), `UtxoSet::commit` over shards (keep, a batch write per item), `plan_block_transactions` (keep, swept flat).
-5. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
+5. **Per-block histograms are cheap here — the earlier warning was wrong.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) were blamed for ~23s, but that run was contaminated by a concurrent full-tip IBD. Re-probing the same two stages on a quiet host cost nothing measurable (123.3s and 126.0s against a 124.2s unprobed median). The apply path already records 13 per-block histograms; two more do not move the number. Probe freely, but re-measure unprobed before quoting a figure.
 6. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
 ## Related
