@@ -1209,9 +1209,15 @@ fn resolve_block_prevouts(
         }
         Ok(resolved)
     } else {
+        // Serial on purpose, for the same reason as `ResolvedUtxoView::resolve`:
+        // each item is a hashmap hit plus a `TxOut` clone, which is cheaper than
+        // handing the work to another thread. Pinned 3x medians on mainnet
+        // 0..150_000, parallel and serial interleaved, serial winning every
+        // round: 139.4s vs 125.4s overall, and this stage 6.9s vs 1.63s. The
+        // fan-out was adding 5.3s of dispatch on top of 1.6s of work.
         Ok(block
             .txdata
-            .par_iter()
+            .iter()
             .map(|tx| {
                 if tx.is_coinbase() {
                     return Vec::new();

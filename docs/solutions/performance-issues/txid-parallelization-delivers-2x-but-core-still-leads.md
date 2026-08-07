@@ -1,5 +1,5 @@
 ---
-title: Script-verify pool width was the binding constraint — 389.7s to 157.8s (2.47x), Core still leads 2.36x
+title: Parallel granularity beat parallel width — 389.7s to 125.4s (3.11x), Core still leads 1.87x
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -9,17 +9,19 @@ severity: medium
 applies_when:
   - "Measuring processing-bound 0→150k replay with full verification (assume_valid_height=0)"
   - "Optimizing txid computation or script verification preparation"
+  - "Adding, removing, or tuning a rayon fan-out on the block apply path"
 related_components:
   - consensus
   - utxo
 tags:
   - txid
   - parallelization
+  - rayon-granularity
   - processing-bound
   - replay
 ---
 
-# Script-verify parallel *granularity* was the binding constraint — 389.7s → 135.0s (2.89×), Core still leads 2.01×
+# Parallel *granularity* beat parallel *width* — 389.7s → 125.4s (3.11×), Core still leads 1.87×
 
 ## Context
 
@@ -37,10 +39,11 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | `f76d43a` | 178.93s | 838 | 223 MB | `~/bench-g14/results/replay-postopt-150k-f76d43a.json` (150001 blocks, 687 MB, `git_head f76d43a`) | single clean run, txid parallel |
 | bitcoin-rs | `e540b91` (code-identical to `f76d43a`) | 173.1s median (166.4, 173.1, 177.8) | 867 | 223 MB | `taskset -c 0-31` 3×, no IBD contention (`/tmp/replay-taskset-*.json`) | txid parallel, 16-thread pool |
 | bitcoin-rs | `0e2dda5` | 157.8s median (163.8, 155.9, 157.8) | 950 | 223 MB | `taskset -c 0-31` 3× (`/tmp/replay-t32-*.json`) | + 32-thread script-verify pool |
-| bitcoin-rs | this change | **135.0s median** (135.0, 134.0, 140.6) | **1111** | 226 MB | `taskset -c 0-31` 3× (`/tmp/rfin-*.json`) | + parallel threshold 16 → 4 |
+| bitcoin-rs | threshold change | 135.0s median (135.0, 134.0, 140.6) | 1111 | 226 MB | `taskset -c 0-31` 3× (`/tmp/rfin-*.json`) | + parallel threshold 16 → 4 |
+| bitcoin-rs | serial prevout resolve | **125.4s median** (124.1, 125.4, 128.4) | **1196** | 226 MB | `taskset -c 0-31` 3× paired (`/tmp/rp2-0-*.json`) | + both UTXO resolve stages serial |
 | Core 31.0 | — | 67s | 2240 | n/a | `-reindex-chainstate -assumevalid=0 -connect=0` debug.log | |
 
-Gap to Core: **5.8× → 2.01×** (135.0/67). Total win over the `4700c25` baseline is **2.89×**. Remaining gap is 68.0s.
+Gap to Core: **5.8× → 1.87×** (125.4/67). Total win over the `4700c25` baseline is **3.11×**. Remaining gap is 58.4s.
 
 **Pool width was only half of it.** Widening the pool 16 → 32 bought 1.10×, but the pool cannot help a block that never reaches it: `MIN_PARALLEL_SCRIPT_CHECKS` sent every block with fewer than 16 input checks down the serial branch, and on mainnet 0→150k that is most of them. Lowering the threshold to 4 bought a further **1.15×** and cut `script_verify` 84.0s → 66.5s. The sweep is steep and monotonic above the optimum (`taskset -c 0-31`, 3× medians for 4/8/16 interleaved round-robin so cache warming hits each equally; single runs above):
 
@@ -108,8 +111,16 @@ The fourth result retires the "FFI boundary is the remaining lever" hypothesis f
    **Width was re-swept after the threshold moved to 4 and did not move.** The two constants interact — a lower threshold sends far more blocks to the pool — so the width result was re-derived rather than assumed. On `taskset -c 0-31`: width 16 → 152.7s, width 32 → 139.6s. Values above 32 are unmeasurable under that pin, because `available_parallelism()` reports 32 and `available.min(cap)` clamps them; runs at 48/64/80 returned 141.0/147.2/144.0s, which are replicates of 32 and put single-run noise at roughly ±5%. Given a genuinely wider CPU set (`taskset -c 0-63`), width 32 and width 64 tie (159.8/162.2s vs 159.7/158.0s) and *both* lose ~15% to the 0-31 pin from host contention. So 32 is the optimum at either threshold, and the way to test a wider pool is a wider `taskset`, not a larger constant.
 
    **The threshold lesson does not generalize to `plan_block_transactions`.** The obvious follow-up — `apply.rs:985` parallelizes txid computation only above 32 txs, the same too-high-threshold shape — was swept and rejected: 1 → 139.8s, 4 → 138.1s, 16 → 141.9s, 32 → 136.4s, every value inside the ±5% single-run noise with the incumbent 32 nominally best. A txid is one SHA256d (order 1 µs) while a script check is order 100 µs, so per-item work decides whether a fan-out pays. Check the item cost before assuming a low threshold wins.
-4. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
-5. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
+4. **Unnecessary parallelism is its own cost class — audit fan-outs by per-item work.** Two rayon fan-outs over UTXO lookups were pure loss, because a sharded hashmap hit is order 500 ns while a rayon dispatch is more. Removing them, each measured as pinned 3× medians with parallel and serial interleaved and serial winning every round:
+
+   | Fan-out | Parallel | Serial | Stage effect |
+   |---|---|---|---|
+   | `ResolvedUtxoView::resolve` (`into_par_iter`, no threshold) | 143.8s | 134.7s | apply 116.2s → 103.6s |
+   | `resolve_block_prevouts` non-overlay branch (`par_iter` per tx) | 139.4s | 125.4s | `script_resolution` 6.9s → 1.63s |
+
+   The second is the clearest evidence: 5.3s of dispatch layered on 1.6s of work. This is the mirror of the threshold finding — there the fix was *more* parallelism for 100 µs script checks, here it is *none* for 500 ns lookups. Same question either way: does per-item work exceed dispatch? Distinct from the marshalling class closed above, which was about removing allocations rather than removing threads. Remaining fan-outs and their verdicts: `verify_block_input_scripts` (keep, ~100 µs per input), `UtxoSet::commit` over shards (keep, a batch write per item), `plan_block_transactions` (keep, swept flat).
+5. **Do not re-profile with per-block histograms.** `txid_plan_seconds`/`utxo_resolve_seconds` (added `68bbb2f`, reverted `e540b91`) cost ~23s over 150k blocks — 13% of the measurement they were meant to explain. Use sampled or off-line profiling.
+6. **Do not re-use full-tip IBD wall-time to validate CPU changes.** IBD is download-bandwidth-bound (`multi-peer-block-download-requires-core-stalling-disconnect.md:41` apply 50–250× faster than single-peer download); the CPU win is invisible in IBD. Use the processing-bound replay (full verification) for CPU work, and the local-fixture full-tip IBD (`full-tip-rs-assumevalid.toml` 938343, `bitcoin-rs-fulltip-postopt-local3` at 463k/961k when stopped) only for the complementary bandwidth regime.
 
 ## Related
 
