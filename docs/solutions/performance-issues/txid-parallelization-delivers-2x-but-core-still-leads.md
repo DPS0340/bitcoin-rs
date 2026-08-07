@@ -150,6 +150,34 @@ Core never pays the first two. It deserializes each block once into `CTransactio
 
 So the marshalling class closed earlier was closed at the wrong altitude. Four micro-optimizations inside that round-trip each measured 0.98-1.00×, and that remains true: shaving allocations off a redundant round-trip cannot pay. Removing the round-trip is a different change, and it is now quantified at **~29s of the 39.5s gap**. That is the only lever left that is worth its risk.
 
+## The marshalling refactor is closed by measurement, not by argument
+
+The obvious conclusion from the table above is "stop round-tripping transactions through Rust structs: parse the block once with `bitcoinkernel::Block::new` and validate `block.transaction(i)` in place." The API supports it — `TransactionRef<'a>` is `Send + Sync` and implements `TransactionExt` — at the cost of threading a block lifetime through `PreparedTx`, `prepare_block_input_checks`, `verify_block_input_scripts`, and `PreparedKernelTx` across three crates.
+
+It is not worth doing. Sub-stage probes inside `prepare_kernel_tx` split the 19.2s prepare stage:
+
+| Sub-stage | Cost | Fate under the refactor |
+|---|---|---|
+| `encode::serialize` (per tx) | **2.74s** | removed |
+| `bitcoinkernel::Transaction::new` (1.7M calls) | **9.67s** | replaced |
+| `PrecomputedTransactionData::new` | 2.61s | stays |
+| other | 2.84s | stays |
+
+The replacement is not free, and that is the whole point. Timing one `bitcoinkernel::Block::new` per block over the same bytes:
+
+```
+per-tx serialize + parse   12.42s   (removed)
+whole-block Block::new     10.88s   (added, 150k calls)
+                         --------
+net                        +1.54s   (1.1% of a 138s run)
+```
+
+**`Block::new` is more expensive per byte than the 1.7M individual `Transaction::new` calls it would replace.** Batching the parse does not amortize anything, because the kernel re-parses the same bytes either way and its block parser carries its own per-block structure cost. The redundant `encode::serialize` really is only 2.74s, exactly consistent with the four earlier micro-optimizations that each landed at 0.98-1.00×.
+
+So the marshalling gap against Core is real (Core never pays it) but it is **not recoverable through this API**. Recovering it would mean not holding `bitcoin::Transaction` at all — decoding straight from bytes into kernel objects for the whole apply path — which is a different node, not a refactor.
+
+Probe methodology, for anyone repeating this: the probes were `AtomicU64` nanosecond accumulators exported from `crates/consensus/src/kernel.rs` and printed by the replay example, all reverted afterwards. They are cheap enough to leave in during a measurement run (138.2s probed against a ~132s unprobed median, most of that ordinary drift).
+
 ## What the remaining apply time is
 
 Two temporary probes (removed after measurement) attributed the last unmeasured slice of apply. They cost nothing detectable — the probed run measured 123.3s and 126.0s against a 124.2s unprobed median — which **retires the earlier claim that per-block histograms cost ~23s**. That figure came from a contaminated run; the apply path already carries 13 per-block histograms, so two more are free at this scale.
