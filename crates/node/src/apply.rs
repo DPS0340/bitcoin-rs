@@ -816,6 +816,57 @@ pub fn apply_block_with_serialized(
     apply_block_inner(handles, block, Some(serialized))
 }
 
+/// Everything a block's application needs that depends only on the block and
+/// the outputs it spends, not on the chain state the commit will mutate.
+///
+/// Split out because a window of consecutive blocks can produce all of these
+/// at once, against one ordered overlay, and share a single script dispatch.
+/// The measured duplication that made an earlier batching attempt a wash was
+/// exactly the kernel parse and the prevout resolution below being done twice.
+struct PreparedApply {
+    kernel_block: bitcoin_rs_consensus::kernel::KernelBlock,
+    tx_plan: BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
+}
+
+/// Parses a block and resolves the outputs it spends.
+///
+/// `source` is where prevouts come from. Today that is always the committed
+/// UTXO set; a window passes an overlay so a block can see outputs an earlier
+/// block in the same window created.
+///
+/// Runs no consensus rule and mutates nothing, which is what lets a window
+/// prepare several blocks before committing any of them.
+fn prepare_apply(
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    source: &UtxoSet,
+) -> core::result::Result<PreparedApply, ApplyError> {
+    let raw_block: bytes::Bytes =
+        provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
+    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+        .map_err(ApplyError::Consensus)?;
+    if kernel_block.transaction_count() != block.txdata.len() {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                "kernel parsed {} transactions, decoder produced {}",
+                kernel_block.transaction_count(),
+                block.txdata.len()
+            )),
+        ));
+    }
+    let tx_plan = plan_block_transactions_with_txids(
+        block,
+        kernel_block.txids().map_err(ApplyError::Consensus)?,
+    );
+    let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &tx_plan));
+    Ok(PreparedApply {
+        kernel_block,
+        tx_plan,
+        resolved,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply_block_inner(
     handles: &ApplyHandles,
@@ -885,25 +936,12 @@ fn apply_block_inner(
     // implementation selected at runtime, so this one parse replaces the
     // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
     // that script preparation used to perform.
-    let raw_block: bytes::Bytes = provided_serialized
-        .clone()
-        .unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
-    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
-        .map_err(ApplyError::Consensus)?;
-    if kernel_block.transaction_count() != block.txdata.len() {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                "kernel parsed {} transactions, decoder produced {}",
-                kernel_block.transaction_count(),
-                block.txdata.len()
-            )),
-        ));
-    }
-    let tx_plan = plan_block_transactions_with_txids(
-        block,
-        kernel_block.txids().map_err(ApplyError::Consensus)?,
-    );
-    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
+    let prepared = prepare_apply(block, provided_serialized.clone(), &handles.utxo)?;
+    let PreparedApply {
+        kernel_block,
+        tx_plan,
+        resolved,
+    } = prepared;
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
         bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
