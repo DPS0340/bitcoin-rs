@@ -219,7 +219,14 @@ impl<S: KvStore> KvUndoStore<S> {
 }
 
 impl<S: KvStore> UndoStore for KvUndoStore<S> {
-    /// Writes without `flush`, matching the rest of the apply path.
+    /// Deferred, matching the rest of the apply path.
+    ///
+    /// `put` is what this used to call, and on redb `put` commits an
+    /// immediately durable transaction, so every connected block paid an fsync
+    /// on that backend — the same per-block durability cost the deferred
+    /// block-body write path exists to avoid. `write_deferred` leaves the row
+    /// visible to later reads in this process and lets the checkpoint flush
+    /// make it durable, which is what `disconnect_block` needs and all it needs.
     ///
     /// This is not crash-safe, and neither is the UTXO commit beside it: no
     /// part of block connection fsyncs. An fsync on this write alone would cost
@@ -235,11 +242,15 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
         hash: bitcoin_rs_primitives::Hash256,
         record: &[u8],
     ) -> Result<(), StorageError> {
-        self.store.put(
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.put(
             bitcoin_rs_storage::ColumnFamily::UndoData,
             &bitcoin_rs_pruning::block_undo_key(height, hash),
             record,
-        )
+        );
+        self.store.write_deferred(batch)
     }
 
     fn load_undo(
@@ -5509,6 +5520,34 @@ mod consensus_rule_tests {
             decoded.removes(),
             batch.removes(),
             "outputs to remove must round-trip"
+        );
+        Ok(())
+    }
+
+    /// Deferred durability must not become deferred visibility.
+    ///
+    /// `disconnect_block` reads back the undo record the connect wrote, in the
+    /// same process and before any checkpoint flush. redb is the backend that
+    /// makes this worth pinning: its `put` commits immediately, so moving the
+    /// write to `write_deferred` is exactly the change that could have made the
+    /// row unreadable until a flush.
+    #[cfg(feature = "redb")]
+    #[test]
+    fn a_deferred_undo_record_is_readable_before_any_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(bitcoin_rs_storage::RedbStore::open(dir.path())?);
+        let undo_store = KvUndoStore::new(Arc::clone(&store));
+        let hash = Hash256::from_le_bytes(&[0x4d; 32]);
+
+        undo_store.persist_undo(4_242, hash, b"undo-record")?;
+
+        let loaded = undo_store
+            .load_undo(4_242, hash)?
+            .ok_or("undo record must be readable in-process before any flush")?;
+        assert_eq!(
+            loaded, b"undo-record",
+            "the deferred write must return exactly what was written"
         );
         Ok(())
     }

@@ -38,9 +38,21 @@ fn apply_window(
         bitcoin_rs_chain::header_sync::accept_headers(&mut tree, &headers, handles.network)
             .context("accept window headers")?;
     }
-    bitcoin_rs_node::apply::apply_window(handles, blocks, raw)
-        .map_err(|error| error.source)
-        .context("apply window")?;
+    bitcoin_rs_node::apply::apply_window(handles, blocks, raw).map_err(|error| {
+        // Name the block that failed. Most `ApplyError`s carry no height or
+        // hash, so a bare "apply window" leaves a 64-block range to search and
+        // nothing to resume from. `applied` is the count that committed, so the
+        // block at that index is the one that stopped it.
+        let blame = blocks.get(error.applied).map_or_else(
+            || "unknown block".to_owned(),
+            |block| format!("block {}", block.block_hash()),
+        );
+        anyhow::Error::new(error.source).context(format!(
+            "apply window: {blame} failed after {} of {} blocks committed",
+            error.applied,
+            blocks.len()
+        ))
+    })?;
     blocks.clear();
     raw.clear();
     Ok(())
@@ -129,6 +141,11 @@ fn main() -> Result<()> {
         "txindex": args.txindex,
         "blockfilterindex": args.blockfilterindex,
         "assume_valid_height": args.assume_valid_height,
+        // The effective value, not the raw flag: `--window 0` normalises to 1.
+        // Without this two artifacts from `--window 1` and `--window 64` are
+        // indistinguishable by configuration, and those are exactly the two runs
+        // the validation gate compares.
+        "window": window,
         "start_height": args.start_height,
         "start_hash": start_hash,
         "stop_height": args.stop_height,
