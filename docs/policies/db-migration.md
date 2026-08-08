@@ -1,0 +1,116 @@
+# Database Migration Policy
+
+This document defines the storage versioning, schema compatibility, and migration policy for `bitcoin-rs`.
+
+## 1. Scope and Authority
+
+This policy applies to all persistent storage surfaces in `bitcoin-rs`:
+- Key-Value database backends (`crates/storage/src/trait_.rs`, `crates/storage/src/column_families.rs`).
+- Append-only flat block files (`crates/storage/src/block_file.rs`).
+- Binary UTXO snapshot artifacts (`crates/utxo/src/snapshot.rs`).
+- Chainstate checkpoint directories and metadata (`crates/node/src/checkpoint.rs`).
+
+## 2. Current On-Disk Storage Architecture
+
+`bitcoin-rs` splits persistent data across four distinct storage mechanisms:
+
+| Storage Surface | Implementation File | On-Disk Location | Version Indicator |
+| :--- | :--- | :--- | :--- |
+| Key-Value Storage | `crates/storage/src/column_families.rs` | Datadir root (`fjall`, `rocksdb`, `mdbx`, `redb`) | **None** (See Gap) |
+| Flat Block Files | `crates/storage/src/block_file.rs` | `blocks/blkNNNNN.dat` | Magic `BRSB` (`0x42525342`), no version field |
+| UTXO Snapshot | `crates/utxo/src/snapshot.rs` | `utxo-v4.dat` inside checkpoint directory | Magic `0x5554584F`, header version `4` |
+| Chainstate Checkpoint | `crates/node/src/checkpoint.rs` | `chainstate-checkpoints/CURRENT` & `gen-N/` | Manifest `1`, Headers `1`, UTXO `4`, CoinStats `1` |
+
+### 2.1 Key-Value Store Column Families
+`KvStore` (`crates/storage/src/trait_.rs`) abstracts backend storage over eleven fixed column families defined in `ColumnFamily` (`crates/storage/src/column_families.rs`):
+- `TxConfirmed` (`0`)
+- `TxMempool` (`1`)
+- `BlockHeaders` (`2`)
+- `Funding` (`3`)
+- `Spending` (`4`)
+- `Filters` (`5`)
+- `FilterHeaders` (`6`)
+- `Coinstats` (`7`)
+- `BlockTree` (`8`)
+- `UtxoMeta` (`9`)
+- `BlockBodies` (`10`)
+
+Storage backends (`FjallStore` in `fjall_impl.rs`, `RocksDbStore` in `rocksdb_impl.rs`, `MdbxStore` in `mdbx_impl.rs`, and `RedbStore` in `redb_impl.rs`) create or open these eleven tables on startup using `ColumnFamily::ALL`.
+
+> **IDENTIFIED GAP:**
+> The `KvStore` interface and database backends store **no schema version metadata** in database headers or dedicated version rows. Database engines open existing keyspaces or tables by string name (`ColumnFamily::name()`) without checking schema compatibility.
+
+### 2.2 Flat Block Files
+`FlatFileBlockStore` (`crates/storage/src/block_file.rs`) writes raw block bodies to `blocks/blkNNNNN.dat`. Each record begins with a 4-byte magic (`BLOCK_FILE_MAGIC` = `*b"BRSB"`), followed by record length and metadata. Individual files cap at 128 MiB (`BLOCK_FILE_MAX_BYTES`).
+
+> **IDENTIFIED GAP:**
+> Flat block files carry a record magic header, but lack a format version field.
+
+### 2.3 Binary UTXO Snapshots
+`crates/utxo/src/snapshot.rs` serializes and deserializes the UTXO set.
+- `SnapshotHeader` stores `magic` (`0x55_54_58_4f`), `version` (`4`), `tip_hash` (32 bytes), `height` (`u32`), and `record_count` (`u64`).
+- Writer function `write_snapshot` emits version `4` (`SNAPSHOT_WRITE_VERSION`).
+- Reader function `read_snapshot` decodes legacy versions `2`, `3`, and `4`.
+- Reader function `read_snapshot_strict_v4` decodes version `4` exclusively, enforcing strict end-of-file validation and requiring a 384-byte `MuHash3072` trailer (`MUHASH_TRAILER_LEN`).
+
+### 2.4 Chainstate Checkpoint Directory
+`crates/node/src/checkpoint.rs` persists full chainstate checkpoints under `chainstate-checkpoints/`.
+- `CURRENT` file contains `CurrentV1` JSON referencing an active generation directory (e.g. `gen-0000000000000001/`).
+- `manifest-v1.json` (`CheckpointManifestV1`) records component versions and codec identifier strings:
+  - `headers`: version `1`, codec `"bitcoin-rs-canonical-headers"`.
+  - `utxo`: version `4`, codec `"bitcoin-rs-utxo-spendable-v1"`.
+  - `coinstats`: version `1`, codec `"bitcoin-rs-coinstats"`.
+
+## 3. Schema Breaking Changes
+
+A database or artifact change is breaking when an existing binary cannot parse data written by a different version.
+
+### 3.1 Column Family Breaking Changes
+The following modifications break key-value store compatibility:
+- Adding, removing, or reordering variants in `ColumnFamily`.
+- Changing the string name returned by `ColumnFamily::name()`.
+- Altering the binary serialization layout of keys or values within any column family.
+- Changing key prefixes or integer endianness.
+
+### 3.2 Snapshot Format Breaking Changes
+The following modifications break UTXO snapshot compatibility:
+- Changing fields or layout in `SnapshotHeader`, `SnapshotRecordHeaderV4`, or `SnapshotVoutHeader`.
+- Changing the varint encoding or output serialization order.
+- Modifying `MUHASH_TRAILER_LEN` (384 bytes) or trailer calculation rules.
+
+## 4. Snapshot Version Bump Procedure
+
+When changing the binary layout of the UTXO snapshot:
+1. Increment `SNAPSHOT_WRITE_VERSION` in `crates/utxo/src/snapshot.rs`.
+2. Increment `UTXO_VERSION` in `crates/node/src/checkpoint.rs`.
+3. Update `UTXO_CODEC` in `crates/node/src/checkpoint.rs` to reflect the new layout.
+4. Define a new record header struct in `crates/utxo/src/snapshot.rs` (e.g., `SnapshotRecordHeaderV5`).
+5. Add a reading function for the new version in `read_snapshot_with_policy_observed`.
+6. Retain older read decoders in `read_snapshot` only if backward read support is explicitly required by project maintainers; otherwise, remove legacy decoders to enforce a clean cutover.
+
+## 5. Datadir Compatibility and Startup Behavior
+
+`load_checkpoint_from_dir` in `crates/node/src/checkpoint.rs` inspects on-disk checkpoint metadata during node startup. Startup outcomes follow strict precedence:
+
+| Condition | Internal Function Return | Node Action |
+| :--- | :--- | :--- |
+| Mismatched or unsupported `headers` or `CoinStats` version | `Err(IncompatibleCheckpoint::UnsupportedVersion)` | **Fatal Abort.** Node stops immediately with an explicit error. |
+| Mismatched `utxo.version` or unexpected `utxo`/`coinstats` codec | `Ok(CheckpointLoad::HeadersOnly)` | **Fallback Resync.** Node retains validated `BlockTree` headers, drops UTXO payload, and resynchronizes chainstate. |
+| Missing `CURRENT` file, invalid JSON, or missing generation directory | `Ok(CheckpointLoad::Cold)` | **Cold Start.** Node starts initial block download from genesis (height 0). |
+| Valid manifest, headers, UTXO snapshot, and CoinStats | `Ok(CheckpointLoad::Complete)` | **Normal Startup.** Node loads full chainstate and resumes operation. |
+
+For raw Key-Value database stores (`fjall`, `rocksdb`, `mdbx`, `redb`):
+- Because KV stores lack on-disk schema headers, opening a datadir with incompatible KV key/value layouts causes runtime read failures or database panics.
+
+## 6. Migration and Resync Policy
+
+### 6.1 In-Place Migrations
+**`bitcoin-rs` does not support in-place database migrations.**
+The codebase contains zero schema transformation scripts, database version tables, or in-place record converters.
+
+### 6.2 Recommended Rule for Schema Modifications
+When a pull request alters key-value column family key/value formats, column family enum definitions, or storage engine layouts:
+1. Do not write in-place conversion code or compatibility adapters.
+2. Update the component version or codec string in `crates/node/src/checkpoint.rs`.
+3. Require users to wipe the local datadir and resync from genesis or load a fresh UTXO snapshot.
+4. Allow the node's native `HeadersOnly` or `Cold` fallback mechanisms to rebuild incompatible state cleanly.
