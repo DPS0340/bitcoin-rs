@@ -64,6 +64,20 @@ GoCoin's own log line is the source (`Sync to 150000 took 3m15.76s`); it landed 
 
 **These are deliberately the socket-fetch numbers, not the local-block-file ones.** GoCoin pulls blocks over P2P from the fixture node, so the comparable bitcoin-rs figures are the REST runs (84.0s assume-valid, 121.9s full-verify) where both nodes pay a socket round-trip. Quoting the 84.6s local-file result against GoCoin would reintroduce exactly the harness mismatch corrected above for Core.
 
+### P2P sync over the loopback fixture — Core leads here too
+
+The processing-bound replay is not the only throughput metric the goal names, so all three nodes were also run as a P2P sync to 150k against the same local fixture peer, each at its own default posture (all three skip historical script checks by default at this height, so the postures match):
+
+| Node | Runs | Median | |
+|---|---|---|---|
+| Core 31.0 | 43.1 / 42.9s | **43.0s** | 1.00× |
+| bitcoin-rs | 75.7 / 76.4s | **76.0s** | 1.77× slower |
+| GoCoin | 195.8s | 195.8s | bitcoin-rs 2.58× faster |
+
+**This is not the download-bound regime, despite being a P2P sync.** A loopback fixture imposes no bandwidth limit, so what this measures is validation plus P2P protocol overhead — closer to processing-bound than to real IBD. The genuine download-bound regime needs a bandwidth-constrained or real-network path, and the older full-tip figures (bitcoin-rs 27081s vs Core 42907s at 961k) were taken there and are **not** contradicted by this table. They are also months old and unverified this session; do not quote them without re-deriving.
+
+What this does settle: Core leads on *both* throughput measurements available on this host (1.42× processing-bound, 1.77× over loopback P2P), and bitcoin-rs beats GoCoin on both. The two bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating 76.0s as precise.
+
 ### Memory is the metric bitcoin-rs wins
 
 Peak RSS over the same window, same validation posture, both pinned:
