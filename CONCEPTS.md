@@ -70,7 +70,7 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The single mutation that decides a multi-store operation happened; everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first is what tells you which steps need atomicity, and the answer differs per store: the index is on disk, but its rollback is one write batch, so a failure leaves it un-started; the UTXO set is RAM-resident with checkpoint durability, so a crash discards its partial mutation entirely. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo is not all-or-nothing: it walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Separately, a checkpoint can retain a UTXO commit whose undo record was lost with the journal. Retry is ruled out as the answer, because the commit fires the set's change listener and coinstats is one, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). Fatal is a classification, not yet a mechanism: the poison is a return value, so a restart clears it while an index rollback that reached disk survives. A durable marker, a startup that refuses or recovers, and gating beyond the apply path are open, and belong with the recovery protocol. See `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first is what tells you which steps need atomicity, and the answer differs per store: the index is on disk, but its rollback is one write batch, so a failure leaves it un-started; the UTXO set is RAM-resident with checkpoint durability, so a crash discards its partial mutation entirely. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo is not all-or-nothing: it walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Separately, a checkpoint can retain a UTXO commit whose undo record was lost with the journal. Retry is ruled out as the answer, because the commit fires the set's change listener and coinstats is one, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). Fatal is a classification, not yet a mechanism: the poison is a return value, so a restart clears it while an index rollback that reached disk survives. A durable marker, a startup that refuses or recovers, and gating beyond the apply path are open, and belong with the recovery protocol. See `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
 ### Refusing default (trait participation)
 A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
@@ -86,13 +86,20 @@ normal.
 
 ### Owed derived state
 
-State that connection writes and disconnection must undo. Naming the whole set
-is what turns "disconnect works" into a checkable claim, and the answers were
-not uniform: `coin_stats` needed only its block-level fields, because the
-per-coin ones ride the UTXO change listener and the undo already reverses them;
-the filter index needed nothing, because its rows are hash-addressed like block
-bodies, so only its last-tip cache is repointed; the `blocks` RPC cache needed
-an opportunistic pop; and `transactions` needed nothing at all, because
-connection never populates it. What remains owed is not derived state but
-recovery: a durable poison marker and the startup handling around it, which is
-why `disconnect_block` still has no production caller.
+State that connection writes and disconnection must account for. Naming the
+whole set is what turns "disconnect works" into a checkable claim, and the
+answers are not uniform, which is why the list is kept rather than summarised.
+
+Handled, in three different ways. `coin_stats` needed an explicit inverse for
+its block-level fields only, because the per-coin ones ride the UTXO change
+listener and the undo already reverses them. The filter index needed no
+rollback, because its rows are hash-addressed like block bodies and stay valid
+for a block that left the chain; only its last-tip cache is repointed, and that
+cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
+inverses. `transactions` needed nothing, because connection never populates it.
+
+Still open: returning a disconnected block's transactions to the mempool,
+publishing a disconnect notification, backfilling the filter index after a gap,
+routing a block that extends a known side branch, and the durable poison marker
+with the startup handling around it. Together they are why `disconnect_block`
+has no production caller.
