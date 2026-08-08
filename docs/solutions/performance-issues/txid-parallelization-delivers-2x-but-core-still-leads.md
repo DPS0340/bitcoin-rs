@@ -44,9 +44,10 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | Core 31.0 | — | ~~67s~~ **superseded** | 2240 | n/a | 2026-06-09 debug.log, unknown load | do not quote; re-derived below |
 | Core 31.0 | — | **59.6s median** (59.6, 59.4, 60.2) | 2517 | n/a | `taskset -c 0-31` 3× interleaved with rs, same idle host | `-reindex-chainstate -assumevalid=0 -connect=0 -stopatheight=150000` |
 | bitcoin-rs | matched pair | 132.2s median (132.2, 134.5, 131.6) | 1135 | 226 MB | same interleaved series | apply 95.3s; the rest is REST fetch |
-| bitcoin-rs | one-shot kernel block parse | **121.9s median** (121.9, 124.4, 120.6) | **1231** | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
+| bitcoin-rs | one-shot kernel block parse, REST source | 121.9s median (121.9, 124.4, 120.6) | 1231 | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
+| bitcoin-rs | **local block file source** | **84.6s median** (84.2, 84.6, 86.5) | **1774** | **224 MB** | `taskset -c 0-31` 3× | apply 76.7s; block source matched to Core |
 
-**Quote the matched pair, not a cross-run ratio.** After the one-shot parse: **121.9s vs Core 59.6s = 2.05×** (apply 82.0s alone is 1.38× Core's whole run). Total self-improvement over the `4700c25` baseline is **3.4×**.
+**Quote 84.6s vs 59.6s = 1.42×.** Every row above it fetched blocks over REST while Core read local `blk*.dat` files, so those ratios measure the harness as much as the engine — see the harness section below. Total self-improvement over the `4700c25` baseline is **4.6×**.
 
 ### GoCoin: bitcoin-rs wins, and by more than the raw numbers show
 
@@ -333,6 +334,28 @@ Why ours is ~1.5× slower on the same code is unexplained and worth knowing, but
 * `utxo_commit` 6.10s vs Core's 2.59s flush.
 
 Do not re-open script verification: it is a measured tie, and four marshalling micro-optimizations plus a pool-width and threshold sweep are already closed above.
+
+## The gap is now fully accounted for, and it is a program of small items
+
+With the harness matched, the arithmetic closes for the first time. Apply is 76.7s against Core's 55.80s, a **20.9s** gap, and the identified per-stage deltas sum to **20.6s** — there is no longer a large unexplained remainder hiding in the measurement.
+
+| Stage | bitcoin-rs | Core | delta | alone |
+|---|---|---|---|---|
+| script verification | 36.47s | 36.07s | ~0 | tie |
+| `script_prepare` + `script_resolution` | 5.80s | folded into Connect | 5.80s | 1.074× |
+| `block_body_persist` | 4.18s | none in reindex | 4.18s | 1.052× |
+| block parse | 10.88s | 7.18s | 3.70s | 1.046× |
+| `utxo_commit` | 6.10s | 2.59s | 3.51s | 1.043× |
+| `block_rules` / merkle | 4.79s | 1.41s | 3.38s | 1.042× |
+| **all together** | | | **20.6s** | **1.32×** |
+
+Closing all of them lands at **64.0s against Core's 59.6s = 1.07×**, which is parity within a rounding of the noise band.
+
+**This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
+
+1. Treat these as **one program, not five candidates**. Gate the program on the cumulative number, and use paired interleaved runs with more than three repetitions to resolve each step.
+2. Start with `block_rules` (merkle root over scalar SHA-256 against Core's AVX2) — it is a pure function, immediately falsified by any error since every block checks it, and therefore the lowest-risk of the five.
+3. Decide `block_body_persist` on policy, not performance: Core's reindex writes no blocks, so it is either excluded from the ratio or matched by having Core do it. Do not simply delete it to win a benchmark; a real node must store blocks.
 
 ## Guidance
 
