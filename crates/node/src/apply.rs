@@ -1630,7 +1630,14 @@ fn apply_block_admitted(
     };
 
     let utxo_changes_started = quanta::Instant::now();
-    let (changes, undo) = build_utxo_changes(block, height, &scratch, &resolved)?;
+    let (changes, undo) = build_utxo_changes(
+        block,
+        height,
+        &scratch,
+        &resolved,
+        bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
+            .then(|| handles.utxo.as_ref()),
+    )?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_changes_seconds")
         .record(utxo_changes_dur.as_secs_f64());
@@ -2761,7 +2768,9 @@ fn check_bip30_and_bip34(
             }
         }
     }
-    bitcoin_rs_consensus::bip30::check_bip30(height, has_duplicate)?;
+    let block_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    bitcoin_rs_consensus::bip30::check_bip30(height, block_hash, has_duplicate)?;
 
     // BIP34: when active for this network at `height`, the coinbase
     // scriptSig must start with the minimally-encoded height.
@@ -2872,6 +2881,7 @@ fn build_utxo_changes<'a>(
     height: u32,
     scratch: &ApplyScratch,
     resolved: &ResolvedUtxoView,
+    overwritten: Option<&UtxoSet>,
 ) -> core::result::Result<(BorrowedBlockChanges<'a>, bitcoin_rs_utxo::UndoBatch), ApplyError> {
     use bitcoin::hashes::Hash as _;
 
@@ -2902,9 +2912,27 @@ fn build_utxo_changes<'a>(
             if net_same_block_spends && scratch.contains_same_block_spent(&outpoint) {
                 continue;
             }
+            // At a BIP30 exception height the coinbase reuses an earlier txid
+            // whose outputs are still live, so this add OVERWRITES a coin
+            // rather than creating one. `overwritten` is `Some` only at those
+            // two mainnet heights, so every other block pays no lookup.
+            let replaced = overwritten.and_then(|set| set.get_entry(&outpoint));
             changes.add(BorrowedUtxoAdd::new(outpoint, txout, coinbase, height));
-            // Disconnecting the block deletes what it created.
-            undo.remove(outpoint);
+            match replaced {
+                // The inverse of overwriting is writing the old coin back, not
+                // deleting the outpoint. Emitting a remove as well would depend
+                // on `undo_block` applying restores after removes, and it does
+                // the opposite, so the older coin would be lost and the rewound
+                // UTXO set, MuHash, and coinstats would not match the parent.
+                Some(previous) => undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
+                    outpoint,
+                    previous.txout,
+                    previous.coinbase,
+                    previous.height,
+                )),
+                // Disconnecting the block deletes what it created.
+                None => undo.remove(outpoint),
+            }
         }
 
         if !coinbase {
@@ -3993,7 +4021,8 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
@@ -4023,7 +4052,8 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
@@ -4077,7 +4107,7 @@ mod consensus_rule_tests {
         // resolved view that spend came from. An empty view would now be
         // rejected, which is the point of UndoPrevoutMissing.
         let resolved = ResolvedUtxoView::resolve(utxo.as_ref(), &block, &tx_plan(&block));
-        let (changes, undo) = build_utxo_changes(&block, 2, &scratch, &resolved)?;
+        let (changes, undo) = build_utxo_changes(&block, 2, &scratch, &resolved, None)?;
         assert_eq!(
             undo.restores().len(),
             1,
@@ -4126,7 +4156,8 @@ mod consensus_rule_tests {
         let block = block_with_transaction(coinbase_transaction(0x70));
 
         let scratch = ApplyScratch::new(&block, 1, false, true)?;
-        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
 
         assert!(
             !scratch.contains_same_block_spent(&internal_outpoint(&bitcoin::OutPoint {
@@ -5429,6 +5460,62 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// At a BIP30 exception height the coinbase reuses a txid whose outputs are
+    /// still live, so the add overwrites a coin rather than creating one. The
+    /// undo must put the overwritten coin back; removing the new output instead
+    /// loses the old one for good and the rewound set no longer matches the
+    /// parent.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn bip30_exception_undo_restores_the_coin_it_overwrote()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let block = block_with_transactions(vec![coinbase_transaction(7)]);
+        let coinbase = block.txdata.first().ok_or("block has no coinbase")?;
+        let reused = internal_outpoint(&bitcoin::OutPoint {
+            txid: coinbase.compute_txid(),
+            vout: 0,
+        });
+
+        // The older coin at the very same outpoint, with values the new one does
+        // not share, so a restore that invents a coin cannot pass.
+        let older = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(4_242),
+            script_pubkey: op_true_script(),
+        };
+        let mut seed = bitcoin_rs_utxo::BlockChanges::default();
+        seed.add(bitcoin_rs_utxo::UtxoAdd::new(
+            reused,
+            older.clone(),
+            true,
+            91_722,
+        ));
+        utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x30; 32]))?;
+
+        let scratch = ApplyScratch::new(&block, 91_842, false, false)?;
+        let (_changes, undo) = build_utxo_changes(
+            &block,
+            91_842,
+            &scratch,
+            &ResolvedUtxoView::empty(),
+            Some(utxo.as_ref()),
+        )?;
+
+        assert!(
+            undo.removes().is_empty(),
+            "an overwrite is undone by writing the old coin back, not by deleting the outpoint"
+        );
+        let restored = undo
+            .restores()
+            .iter()
+            .find(|entry| entry.outpoint == reused)
+            .ok_or("undo does not restore the overwritten coin")?;
+        assert_eq!(restored.txout, older, "the ORIGINAL output must come back");
+        assert_eq!(restored.height, 91_722, "at its original height");
+        assert!(restored.coinbase, "and with its original coinbase flag");
+        Ok(())
     }
 
     /// Two connects racing for the same height must produce one winner and one
