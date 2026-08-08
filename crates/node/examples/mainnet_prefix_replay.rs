@@ -22,6 +22,84 @@ use serde_json::json;
 ///
 /// Headers go in first because the batch reads median-time-past and softfork
 /// state from the block tree, and a header-first peer would have put them there
+/// Returns true once the accumulated window should be applied.
+///
+/// Applies the same byte cap production does, so a replay measures the window
+/// production would actually form rather than a larger one. The byte total is
+/// accumulated by the caller rather than re-summed here: the window holds up to
+/// a thousand blocks and this runs once per block.
+/// Totals the replay reports, gathered while it walks the prefix.
+struct ReplayTotals {
+    start_hash: Option<String>,
+    stop_hash: Option<String>,
+    tx_count: usize,
+    block_bytes: usize,
+    fetch_time: Duration,
+    decode_time: Duration,
+    elapsed: Duration,
+}
+
+/// Walks `start_height..=stop_height`, applying each window as it fills.
+fn replay_prefix(
+    args: &Args,
+    apply_handles: &bitcoin_rs_node::apply::ApplyHandles,
+) -> Result<ReplayTotals> {
+    let mut tx_count = 0_usize;
+    let mut block_bytes = 0_usize;
+    let mut fetch_time = Duration::ZERO;
+    let mut decode_time = Duration::ZERO;
+    let started = Instant::now();
+    let mut start_hash = None;
+    let mut stop_hash = None;
+
+    let window = args.window.max(1);
+    let mut source = open_block_source(args)?;
+    let mut window_blocks: Vec<Block> = Vec::with_capacity(window);
+    let mut window_bytes: Vec<bytes::Bytes> = Vec::with_capacity(window);
+    let mut window_bytes_held = 0_usize;
+    for height in args.start_height..=args.stop_height {
+        let fetch_started = Instant::now();
+        let (hash, bytes) = source.fetch(height)?;
+        fetch_time += fetch_started.elapsed();
+        if height == args.start_height {
+            start_hash = Some(hash.clone());
+        }
+        if height == args.stop_height {
+            stop_hash = Some(hash.clone());
+        }
+        let decode_started = Instant::now();
+        let mut cursor = std::io::Cursor::new(bytes.as_slice());
+        let block = Block::consensus_decode(&mut cursor)
+            .with_context(|| format!("decode block bytes at height {height}"))?;
+        decode_time += decode_started.elapsed();
+        tx_count = tx_count.saturating_add(block.txdata.len());
+        block_bytes = block_bytes.saturating_add(bytes.len());
+        window_blocks.push(block);
+        window_bytes_held = window_bytes_held.saturating_add(bytes.len());
+        window_bytes.push(bytes::Bytes::from(bytes));
+        if window_is_full(window_blocks.len(), window_bytes_held, window)
+            || height == args.stop_height
+        {
+            apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
+            window_bytes_held = 0;
+        }
+    }
+    apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
+    Ok(ReplayTotals {
+        start_hash,
+        stop_hash,
+        tx_count,
+        block_bytes,
+        fetch_time,
+        decode_time,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn window_is_full(blocks: usize, bytes_held: usize, max_blocks: usize) -> bool {
+    blocks >= max_blocks || bytes_held >= bitcoin_rs_node::apply::SCRIPT_BATCH_MAX_BYTES
+}
+
 /// long before the bodies arrived. Without that the window can never prove and
 /// the driver silently measures the unbatched path.
 fn apply_window(
@@ -90,44 +168,17 @@ fn main() -> Result<()> {
     // keeps its height-only shortcut semantics for every height.
     apply_handles.assume_valid_gate =
         Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));
-    let mut tx_count = 0_usize;
-    let mut block_bytes = 0_usize;
-    let mut fetch_time = Duration::ZERO;
-    let mut decode_time = Duration::ZERO;
-    let started = Instant::now();
-    let mut start_hash = None;
-    let mut stop_hash = None;
-
+    let ReplayTotals {
+        start_hash,
+        stop_hash,
+        tx_count,
+        block_bytes,
+        fetch_time,
+        decode_time,
+        elapsed,
+    } = replay_prefix(&args, &apply_handles)?;
     let window = args.window.max(1);
-    let mut source = open_block_source(&args)?;
-    let mut window_blocks: Vec<Block> = Vec::with_capacity(window);
-    let mut window_bytes: Vec<bytes::Bytes> = Vec::with_capacity(window);
-    for height in args.start_height..=args.stop_height {
-        let fetch_started = Instant::now();
-        let (hash, bytes) = source.fetch(height)?;
-        fetch_time += fetch_started.elapsed();
-        if height == args.start_height {
-            start_hash = Some(hash.clone());
-        }
-        if height == args.stop_height {
-            stop_hash = Some(hash.clone());
-        }
-        let decode_started = Instant::now();
-        let mut cursor = std::io::Cursor::new(bytes.as_slice());
-        let block = Block::consensus_decode(&mut cursor)
-            .with_context(|| format!("decode block bytes at height {height}"))?;
-        decode_time += decode_started.elapsed();
-        tx_count = tx_count.saturating_add(block.txdata.len());
-        block_bytes = block_bytes.saturating_add(bytes.len());
-        window_blocks.push(block);
-        window_bytes.push(bytes::Bytes::from(bytes));
-        if window_blocks.len() >= window || height == args.stop_height {
-            apply_window(&apply_handles, &mut window_blocks, &mut window_bytes)?;
-        }
-    }
-    apply_window(&apply_handles, &mut window_blocks, &mut window_bytes)?;
 
-    let elapsed = started.elapsed();
     let block_count = args
         .stop_height
         .saturating_sub(args.start_height)

@@ -737,9 +737,13 @@ impl BlockSync {
         let drained: Vec<_> = drained.into_iter().collect();
         let mut chunk_start = 0_usize;
         while chunk_start < drained.len() {
-            let chunk_end = drained
-                .len()
-                .min(chunk_start.saturating_add(crate::apply::SCRIPT_BATCH_WINDOW));
+            // Bounded by block count AND by bytes, so a window of tip-sized
+            // blocks does not hold gigabytes just because the count allows it.
+            let chunk_end = chunk_start.saturating_add(crate::apply::window_len(
+                drained[chunk_start..]
+                    .iter()
+                    .map(|drained| drained.serialized.len()),
+            ));
             let chunk = &drained[chunk_start..chunk_end];
             let blocks: Vec<bitcoin::Block> =
                 chunk.iter().map(|drained| drained.block.clone()).collect();

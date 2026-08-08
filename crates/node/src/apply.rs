@@ -1034,8 +1034,56 @@ pub fn apply_block_with_serialized(
 /// blocks turns roughly 21,000 dispatches into 330.
 ///
 /// Bounded by memory: the window holds every block's parsed kernel block and
-/// resolved prevouts at once.
-pub const SCRIPT_BATCH_WINDOW: usize = 64;
+/// resolved prevouts at once, which costs far more than the block bytes.
+/// Measured over `0..150_000`, pinned to 32 cores, medians of interleaved runs:
+///
+///   window     wall     CPU     peak RSS
+///       64    66.2s   596.3s      397 MB
+///      128    75.8s   525.6s      409 MB
+///      256    69.8s   471.5s      436 MB
+///     1024    51.8s   388.7s      572 MB
+///     4096    47.2s   377.1s     1205 MB
+///
+/// CPU falls by a third from 64 to 1024 because the cost being removed is rayon
+/// dispatch and spin, not verification. RSS is what stops it: 4096 doubles the
+/// resident set for a few more seconds.
+///
+/// This is a COUNT cap, and count alone is the wrong bound. Early-chain blocks
+/// average about 4.6 KB, so 1024 of them is 5 MB of block data; at the tip they
+/// are 2 MB, so the same 1024 would hold 2 GB. [`SCRIPT_BATCH_MAX_BYTES`] is the
+/// other half, and the window is whichever bound hits first.
+pub const SCRIPT_BATCH_WINDOW: usize = 1024;
+
+/// How many bytes of block data one window may hold.
+///
+/// The count cap above is sized for small early-chain blocks. This is what
+/// keeps the same constant safe at the tip, where a block is roughly 2 MB and
+/// the count would otherwise let a window hold gigabytes. Whichever cap binds
+/// first ends the window, so the batch is large exactly where blocks are small
+/// and dispatch dominates, and small where blocks are large and it does not.
+pub const SCRIPT_BATCH_MAX_BYTES: usize = 64 << 20;
+
+/// Returns how many of `sizes` fit in one window.
+///
+/// At least one block always fits, even one larger than the byte cap on its
+/// own: refusing it would stall the chain on an oversized block rather than
+/// verify it.
+pub fn window_len(sizes: impl IntoIterator<Item = usize>) -> usize {
+    let mut count = 0_usize;
+    let mut bytes = 0_usize;
+    for size in sizes {
+        if count == SCRIPT_BATCH_WINDOW {
+            break;
+        }
+        let next = bytes.saturating_add(size);
+        if count > 0 && next > SCRIPT_BATCH_MAX_BYTES {
+            break;
+        }
+        bytes = next;
+        count = count.saturating_add(1);
+    }
+    count
+}
 
 /// Applies consecutive blocks, verifying all their input scripts in one
 /// dispatch when the window can be proven.
@@ -5598,6 +5646,44 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// The window's two caps, and which one binds.
+    ///
+    /// Count alone is wrong at the tip and bytes alone is wrong at genesis, so
+    /// the rule is whichever binds first. The oversized-block case is the one
+    /// worth pinning: a block bigger than the whole byte cap must still go
+    /// through, or the chain stalls on it.
+    #[test]
+    fn a_window_stops_at_whichever_cap_binds_first() {
+        // Tiny blocks: the count cap binds.
+        assert_eq!(
+            window_len(std::iter::repeat_n(256, SCRIPT_BATCH_WINDOW * 2)),
+            SCRIPT_BATCH_WINDOW,
+            "small blocks must fill the window to its count cap"
+        );
+
+        // Tip-sized blocks: the byte cap binds long before the count does.
+        let tip_block = 2 << 20;
+        let expected = SCRIPT_BATCH_MAX_BYTES / tip_block;
+        assert_eq!(
+            window_len(std::iter::repeat_n(tip_block, SCRIPT_BATCH_WINDOW)),
+            expected,
+            "tip-sized blocks must be cut off by the byte cap"
+        );
+        assert!(
+            expected < SCRIPT_BATCH_WINDOW,
+            "this assertion is vacuous unless the byte cap binds first here"
+        );
+
+        // A single block larger than the entire byte cap still goes through.
+        assert_eq!(
+            window_len([SCRIPT_BATCH_MAX_BYTES * 2, 256]),
+            1,
+            "an oversized block must be applied alone, not refused"
+        );
+
+        assert_eq!(window_len([]), 0, "an empty window is empty");
     }
 
     /// The window must make the same assume-valid decision the single-block path
