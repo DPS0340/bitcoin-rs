@@ -76,14 +76,21 @@ The processing-bound replay is not the only throughput metric the goal names, so
 
 **This is not the download-bound regime, despite being a P2P sync.** A loopback fixture imposes no bandwidth limit, so what this measures is validation plus P2P protocol overhead — closer to processing-bound than to real IBD. The genuine download-bound regime needs a bandwidth-constrained or real-network path, and the older full-tip figures (bitcoin-rs 27081s vs Core 42907s at 961k) were taken there and are **not** contradicted by this table. They are also months old and unverified this session; do not quote them without re-deriving.
 
-**The two postures together confirm the gap is entirely non-crypto.** The replay verifies every script on both sides; the P2P run skips historical scripts on both sides. Removing that shared work makes bitcoin-rs's position *worse*, not better:
+**These two results are independent, not a decomposition — do not divide them.** An earlier revision of this note put them side by side:
 
-| Posture | bitcoin-rs | Core | ratio |
+| Measurement | bitcoin-rs | Core | ratio |
 |---|---|---|---|
-| full verification | 84.6s | 59.6s | 1.42× |
-| both skip historical scripts | 76.0s | 43.0s | **1.77×** |
+| replay, full verification | 84.6s | 59.6s | 1.42× |
+| P2P sync, both skip historical scripts | 76.0s | 43.0s | 1.77× |
 
-That is exactly the signature of a non-crypto gap. The ~36s of secp256k1 work is a measured tie, so including it drags both ratios toward 1.0; strip it out and the underlying difference in everything else shows through undiluted. Any future work aimed at closing the distance to Core should therefore ignore script verification entirely — it is already at parity — and target the surrounding apply path, where the itemised deltas live.
+and inferred that because the second ratio is worse, stripping the tied crypto reveals "the non-crypto gap undiluted". **That inference was wrong.** The two runs do not share a common baseline: the P2P sync additionally executes header sync, net message processing, block-download scheduling, block staging, mempool bookkeeping, and an RPC server, none of which the replay runs at all. The difference between 1.42× and 1.77× therefore mixes script posture with entire subsystems, and attributing it to the apply path is unsupported.
+
+Each result stands on its own, and each is internally matched:
+
+* **1.42×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files.
+* **1.77×** is a clean whole-node comparison — same window, both at their own defaults, both pulling from the same fixture peer.
+
+The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack; that needs its own decomposition, and `node.sync.*` histograms exist for it.
 
 What this does settle: Core leads on *both* throughput measurements available on this host (1.42× processing-bound, 1.77× over loopback P2P), and bitcoin-rs beats GoCoin on both. The two bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating 76.0s as precise.
 
