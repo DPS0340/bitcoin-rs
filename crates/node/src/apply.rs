@@ -995,33 +995,31 @@ fn prove_window(
         // window builds them all at once. The overlay walk above already fixed
         // every prevout, which is what makes this independent per block.
         let checks_started = quanta::Instant::now();
-        let built: Vec<Option<_>> = blocks
-            .par_iter()
-            .zip(prepared.par_iter())
-            .zip(contexts.par_iter())
-            .map(|((block, unit), context)| {
-                let resolved = resolve_block_prevouts(
-                    Arc::clone(&unit.resolved),
-                    block,
-                    &unit.tx_plan,
-                    context.height,
-                )
-                .ok()?;
-                bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
-                    &block.txdata,
-                    resolved,
-                    context.height,
-                    context.locktime_cutoff,
-                    &unit.kernel_block,
-                )
-                .ok()
-            })
-            .collect();
+        // Serial on purpose. Fanning this out measured worse on both axes:
+        // 58.7s wall / 585.2s CPU with it serial against 64.2s / 613.1s
+        // parallel, on the 0..150_000 replay. Each block's preparation is short
+        // enough that the dispatch costs more than it distributes, which is the
+        // same reason the script checks are batched across blocks rather than
+        // split within one.
         let mut units = Vec::with_capacity(prepared.len());
-        for checks in built {
-            match checks {
-                Some(checks) => units.push(checks),
-                None => return Vec::new(),
+        for ((block, unit), context) in blocks.iter().zip(&prepared).zip(&contexts) {
+            let Ok(resolved) = resolve_block_prevouts(
+                Arc::clone(&unit.resolved),
+                block,
+                &unit.tx_plan,
+                context.height,
+            ) else {
+                return Vec::new();
+            };
+            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+                &block.txdata,
+                resolved,
+                context.height,
+                context.locktime_cutoff,
+                &unit.kernel_block,
+            ) {
+                Ok(checks) => units.push(checks),
+                Err(_) => return Vec::new(),
             }
         }
         metrics::histogram!("node.window.checks_seconds")
