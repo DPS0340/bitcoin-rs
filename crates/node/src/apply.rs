@@ -697,7 +697,7 @@ fn plan_disconnect(
 pub fn disconnect_block(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
-) -> core::result::Result<TipSnapshot, ApplyError> {
+) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
     use bitcoin::hashes::Hash as _;
 
     let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
@@ -706,19 +706,34 @@ pub fn disconnect_block(
         undo,
         height,
         tx_count_delta,
-    } = plan_disconnect(handles, block, block_hash)?;
+    } = plan_disconnect(handles, block, block_hash)
+        .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
 
+    // Still a free refusal. Index rollback flushes buffered rows and then
+    // issues every delete in one write batch, so a failure at either step
+    // leaves the rollback un-started and the chain exactly as it was.
     if let Some(tx_index) = &handles.tx_index {
         tx_index
             .lock()
             .rollback_block(block, height)
-            .map_err(|error| ApplyError::IndexRollback(error.to_string()))?;
+            .map_err(|error| {
+                crate::DisconnectError::Refused(Box::new(ApplyError::IndexRollback(
+                    error.to_string(),
+                )))
+            })?;
     }
 
+    // Past this line every failure is `Fatal`. The UTXO commit walks shards and
+    // can stop part-way, so from here some state is rolled back and some is
+    // not.
     handles
         .utxo
         .undo_block(&undo)
-        .map_err(ApplyError::UtxoCommit)?;
+        .map_err(|error| crate::DisconnectError::Fatal {
+            hash: block_hash,
+            height,
+            source: Box::new(ApplyError::UtxoCommit(error)),
+        })?;
 
     // RPC serves blocks from this vector, so the disconnected block's record
     // must go or `getblock` keeps answering for it.
@@ -763,7 +778,11 @@ pub fn disconnect_block(
     handles
         .coin_stats
         .rewind_block(height, parent_tip.height, tx_count_delta)
-        .map_err(ApplyError::CoinStatsRewind)?;
+        .map_err(|error| crate::DisconnectError::Fatal {
+            hash: block_hash,
+            height,
+            source: Box::new(ApplyError::CoinStatsRewind(error)),
+        })?;
 
     handles
         .applied_tip
@@ -4913,7 +4932,11 @@ mod consensus_rule_tests {
         let outcome = disconnect_block(&handles, &forged);
 
         assert!(
-            matches!(outcome, Err(ApplyError::DisconnectBodyMismatch { .. })),
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::DisconnectBodyMismatch { .. })
+            ),
             "a body that contradicts its header must be refused, got {outcome:?}"
         );
         assert_eq!(
@@ -5073,7 +5096,11 @@ mod consensus_rule_tests {
         let outcome = disconnect_block(&handles, &block);
 
         assert!(
-            matches!(outcome, Err(ApplyError::IndexRollback(_))),
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::IndexRollback(_))
+            ),
             "an indexer without rollback must refuse the disconnect, got {outcome:?}"
         );
         assert_eq!(
@@ -5123,7 +5150,11 @@ mod consensus_rule_tests {
         let outcome = disconnect_block(&handles, &block_1);
 
         assert!(
-            matches!(outcome, Err(ApplyError::DisconnectNotTip { .. })),
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::DisconnectNotTip { .. })
+            ),
             "disconnecting a non-tip block must be refused, got {outcome:?}"
         );
         assert_eq!(
@@ -5170,7 +5201,11 @@ mod consensus_rule_tests {
         let outcome = disconnect_block(&handles, &block);
 
         assert!(
-            matches!(outcome, Err(ApplyError::UndoRecordMissing { .. })),
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::UndoRecordMissing { .. })
+            ),
             "a missing undo record must refuse the disconnect, got {outcome:?}"
         );
         assert_eq!(

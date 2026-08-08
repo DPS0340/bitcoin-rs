@@ -207,6 +207,42 @@ pub enum ApplyError {
     IndexRollback(String),
 }
 
+/// The outcome of a refused or failed block disconnect.
+///
+/// Two variants because the caller must act differently, and a single error
+/// type let that distinction live in prose where it can be missed. Every
+/// disconnect failure is one or the other; there is no third case.
+#[derive(Debug, thiserror::Error)]
+pub enum DisconnectError {
+    /// Refused before anything was touched. The chain is exactly as it was.
+    ///
+    /// Safe to report and carry on: no rollback started, so no state is half
+    /// applied. Every check that can produce this runs in the planning step
+    /// precisely so that refusing stays free.
+    #[error("disconnect refused: {0}")]
+    Refused(#[source] Box<ApplyError>),
+    /// Failed after the rollback began. Some state is rolled back and some is
+    /// not, and which is which depends on where it stopped.
+    ///
+    /// Fatal. Do not retry: the UTXO commit fires the set's change listener and
+    /// coinstats is registered as one, so a second pass double-counts even
+    /// where the set itself converges. Stop applying blocks and report the
+    /// block named here, which is why the hash and height are carried rather
+    /// than left for the caller to reconstruct.
+    #[error(
+        "disconnect of block {hash} at height {height} failed after mutation began, chain state is partial: {source}"
+    )]
+    Fatal {
+        /// Block whose disconnect wedged.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height it was applied at.
+        height: u32,
+        /// What failed.
+        #[source]
+        source: Box<ApplyError>,
+    },
+}
+
 enum NodeStorage {
     #[cfg(feature = "rocksdb")]
     RocksDb(Arc<bitcoin_rs_storage::RocksDbStore>),

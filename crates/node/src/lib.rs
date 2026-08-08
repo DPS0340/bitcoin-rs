@@ -57,7 +57,7 @@ pub use block_source::NodeBlockSource;
 pub use config::{Auth, Config};
 pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;
-pub use state::ApplyError;
+pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
 pub use utxo_view::UtxoSetView;
 pub use zmq_publisher::{NoOpZmqPublisher, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher};

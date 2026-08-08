@@ -153,7 +153,7 @@ Open, and prerequisites for giving `disconnect_block` a caller:
 | `coin_stats` inverse feed | cumulative, so it drifts on every disconnect |
 | `filter_index` rollback | BIP157 headers chain, so a stale link corrupts the chain; `filter_header_cache` must be reset with it |
 | RPC caches | `blocks` and `transactions` would keep serving the disconnected block |
-| ~~Rollback idempotence~~ | **Settled: retry is ruled out.** `undo_block` is fallible, runs after the index rolls back, and is not all-or-nothing: `commit_adds_and_removes` walks shards and both its serial and parallel paths can fail after other shards committed. Each UTXO operation is idempotent on the set, but the commit fires `UtxoSet`'s listener and `coin_stats` is one, so a second pass double-counts where the set converges. A failed disconnect is fatal: poison the apply path, the same mechanism a failed compensating rollback needs |
+| Partial-transition handling | **Retry is ruled out**, and that half is settled: each UTXO operation is idempotent on the set, but the commit fires `UtxoSet`'s listener and `coin_stats` is one, so a second pass double-counts where the set converges. `DisconnectError` now splits `Refused` (nothing touched, free) from `Fatal` (partly rolled back, carries the block hash and height). **The recovery half is not built**: the poison is a return value, so a restart clears it while the index rollback that already reached disk survives. Needs a durable marker written before mutation, a startup that refuses or recovers until it clears, and gating for RPC, P2P and Electrum rather than the apply path alone |
 
 Open, layer 4:
 
