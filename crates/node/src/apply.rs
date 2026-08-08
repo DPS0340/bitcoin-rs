@@ -1058,7 +1058,7 @@ pub fn apply_block_with_serialized(
 /// 596s at 64 — a real gain, and not the 389s the replay driver reaches.
 /// Raising the staging cap is not a constant change: the staller-arming
 /// invariant in `sync.rs` ties the staged byte budget to the staged count at
-/// MAX_SERIALIZED_BLOCK_SIZE, so a 1024-block stage would demand a 2 GB bound.
+/// `MAX_SERIALIZED_BLOCK_SIZE`, so a 1024-block stage would demand a 2 GB bound.
 /// That invariant has to be reworked against typical block size first.
 pub const SCRIPT_BATCH_WINDOW: usize = 1024;
 
