@@ -373,7 +373,8 @@ impl BlockSource<'_> {
                 reader
                     .read_exact(&mut len_bytes)
                     .with_context(|| format!("read block length at height {height}"))?;
-                let len = u32::from_le_bytes(len_bytes) as usize;
+                let len = usize::try_from(u32::from_le_bytes(len_bytes))
+                    .with_context(|| format!("block length at height {height} exceeds usize"))?;
                 let mut bytes = vec![0_u8; len];
                 reader
                     .read_exact(&mut bytes)
