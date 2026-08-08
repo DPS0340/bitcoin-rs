@@ -539,7 +539,7 @@ impl ApplyHandles {
 /// | Handle | Status |
 /// |---|---|
 /// | `utxo`, `tx_index`, `applied_tip` | restored here |
-/// | `coin_stats` | **owed** — cumulative, so it drifts on every disconnect |
+/// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
 /// | `filter_index`, `filter_header_cache` | **owed** — BIP157 headers chain, so a stale link corrupts the chain |
 /// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
 /// | `transactions` | nothing owed: connection never populates it |
@@ -648,6 +648,30 @@ pub fn disconnect_block(
         }
     })?;
 
+    // Validate the coinstats rewind before anything is touched. The rewind
+    // itself has to run after `undo_block`, because the per-coin fields ride
+    // the UTXO change listener, so this is the only place the check is free.
+    let tx_count_delta = tx_count_delta_for(block);
+    {
+        let stats = handles.coin_stats.snapshot();
+        if stats.height != height {
+            return Err(ApplyError::CoinStatsRewind(
+                bitcoin_rs_coinstats::CoinStatsRewindError::HeightMismatch {
+                    expected: height,
+                    found: stats.height,
+                },
+            ));
+        }
+        if stats.tx_count < tx_count_delta {
+            return Err(ApplyError::CoinStatsRewind(
+                bitcoin_rs_coinstats::CoinStatsRewindError::TxCountUnderflow {
+                    tx_count: stats.tx_count,
+                    tx_delta: tx_count_delta,
+                },
+            ));
+        }
+    }
+
     if let Some(tx_index) = &handles.tx_index {
         tx_index
             .lock()
@@ -682,10 +706,28 @@ pub fn disconnect_block(
         }
     }
 
+    // The per-coin coinstats fields need nothing here: `coin_stats` is the
+    // `UtxoSet` change listener, so `undo_block` already drove them in reverse.
+    // The block-level fields are not part of that, because `finish_block` sets
+    // them directly on connect.
+    handles
+        .coin_stats
+        .rewind_block(height, parent_tip.height, tx_count_delta)
+        .map_err(ApplyError::CoinStatsRewind)?;
+
     handles
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
     Ok(parent_tip)
+}
+
+/// The `tx_count` delta one block contributes to coinstats.
+///
+/// One function, used by connect and by disconnect. Two copies of this
+/// expression would be two chances for the rewind to subtract something the
+/// apply never added.
+fn tx_count_delta_for(block: &bitcoin::Block) -> u64 {
+    u64::try_from(block.txdata.len()).unwrap_or(u64::MAX)
 }
 
 /// Synthetically applies `block` as the next tip after consensus checks.
@@ -1068,7 +1110,7 @@ fn apply_block_inner(
     let mempool_evict_dur = mempool_evict_started.elapsed();
     metrics::histogram!("node.apply_block.mempool_evict_seconds")
         .record(mempool_evict_dur.as_secs_f64());
-    let tx_count_delta = u64::try_from(block.txdata.len()).unwrap_or(u64::MAX);
+    let tx_count_delta = tx_count_delta_for(block);
     let coin_stats_started = quanta::Instant::now();
     handles.coin_stats.finish_block(height, tx_count_delta);
     let coin_stats_dur = coin_stats_started.elapsed();
@@ -4765,6 +4807,70 @@ mod consensus_rule_tests {
             handles.blocks.read().len(),
             records_before,
             "exactly the one record must go"
+        );
+        Ok(())
+    }
+
+    /// `coin_stats` needs no inverse feed of its own, and this proves it rather
+    /// than assuming it. It is registered as the `UtxoSet` change listener, so
+    /// `undo_block` already delivers the inverse as ordinary inserts and
+    /// removals: restores arrive as inserts, removes as removals. Adding a
+    /// second feed on the disconnect path would double-count.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_returns_coin_stats_to_their_prior_value() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut utxo = UtxoSet::new();
+        let listener = bitcoin_rs_coinstats::CoinStatsListener::new(
+            bitcoin_rs_coinstats::CoinStats::default(),
+        );
+        utxo.set_listener(Box::new(listener.clone()));
+        let utxo = Arc::new(utxo);
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        handles.coin_stats = Arc::new(listener);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let before = handles.coin_stats.snapshot();
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let connected = handles.coin_stats.snapshot();
+        assert_ne!(
+            connected, before,
+            "connection must move the stats, or the test proves nothing"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        // Every field, not a chosen one. Comparing only the per-coin fields
+        // would pass while `height` and `tx_count` stayed on the child, which
+        // is the gap that made the block-level rewind necessary.
+        //
+        // MuHash is compared by digest rather than by struct. It is a ratio of
+        // a numerator and a denominator, so inserting a coin and removing it
+        // leaves the two equal but not back at the limbs they started from. The
+        // digest is the observable value and it does return.
+        let after = handles.coin_stats.snapshot();
+        assert_eq!(
+            after.muhash.finalize_hash(),
+            before.muhash.finalize_hash(),
+            "the MuHash digest must return to its prior value"
+        );
+        assert_eq!(after.height, before.height, "height must return");
+        assert_eq!(
+            after.total_amount, before.total_amount,
+            "total amount must return"
+        );
+        assert_eq!(after.bogo_size, before.bogo_size, "bogo size must return");
+        assert_eq!(after.tx_count, before.tx_count, "tx count must return");
+        assert_eq!(
+            after.utxo_count, before.utxo_count,
+            "utxo count must return"
         );
         Ok(())
     }

@@ -188,6 +188,14 @@ pub enum ApplyError {
         /// Block whose body was rejected.
         hash: bitcoin_rs_primitives::Hash256,
     },
+    /// Rewinding the block-level coinstats failed.
+    ///
+    /// The per-coin fields ride the UTXO change listener and are already
+    /// reversed by the undo; only height and transaction count are set
+    /// directly, and a refusal here means they do not describe the block being
+    /// disconnected.
+    #[error("coinstats rewind: {0}")]
+    CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
     /// Rolling the transaction index back failed.
     #[error("index rollback: {0}")]
     IndexRollback(String),

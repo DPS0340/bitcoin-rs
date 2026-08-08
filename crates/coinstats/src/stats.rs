@@ -35,6 +35,27 @@ const PARALLEL_MUHASH_MAX_LANES: usize = 16;
 /// Exact byte length of the stable `CoinStats` encoding.
 pub const COIN_STATS_ENCODED_LEN: usize = 804;
 
+/// Why a [`CoinStats::rewind_block`] was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CoinStatsRewindError {
+    /// The stats are not at the block being disconnected.
+    #[error("coinstats are at height {found}, not the disconnected height {expected}")]
+    HeightMismatch {
+        /// Height the caller is disconnecting.
+        expected: u32,
+        /// Height the stats currently record.
+        found: u32,
+    },
+    /// The rewind would take `tx_count` below zero.
+    #[error("rewind of {tx_delta} transactions exceeds the recorded count {tx_count}")]
+    TxCountUnderflow {
+        /// Transactions currently recorded.
+        tx_count: u64,
+        /// Transactions the rewind would remove.
+        tx_delta: u64,
+    },
+}
+
 /// Incremental UTXO set statistics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoinStats {
@@ -96,6 +117,45 @@ impl CoinStats {
     pub const fn finish_block(&mut self, height: u32, tx_delta: u64) {
         self.height = height;
         self.tx_count = self.tx_count.saturating_add(tx_delta);
+    }
+
+    /// Reverses one [`Self::finish_block`], for a disconnected block.
+    ///
+    /// Only the block-level fields. The per-coin fields (`muhash`,
+    /// `total_amount`, `bogo_size`, `utxo_count`) are maintained by the
+    /// `UtxoChangeListener` callbacks, which a UTXO undo already drives in
+    /// reverse; touching them here would double-count.
+    ///
+    /// Both invariants are checked before either field moves, so a rejected
+    /// rewind leaves the stats exactly as they were. Saturating arithmetic was
+    /// the first version and is wrong here: it turns a second rewind of the
+    /// same block into a silent clamp, which is the failure this guards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stats are not at `disconnected_height`, or
+    /// when `tx_delta` exceeds the recorded `tx_count`.
+    pub const fn rewind_block(
+        &mut self,
+        disconnected_height: u32,
+        parent_height: u32,
+        tx_delta: u64,
+    ) -> Result<(), CoinStatsRewindError> {
+        if self.height != disconnected_height {
+            return Err(CoinStatsRewindError::HeightMismatch {
+                expected: disconnected_height,
+                found: self.height,
+            });
+        }
+        let Some(tx_count) = self.tx_count.checked_sub(tx_delta) else {
+            return Err(CoinStatsRewindError::TxCountUnderflow {
+                tx_count: self.tx_count,
+                tx_delta,
+            });
+        };
+        self.height = parent_height;
+        self.tx_count = tx_count;
+        Ok(())
     }
 
     /// Serializes stats in a stable byte layout.
@@ -637,6 +697,23 @@ impl CoinStatsListener {
     pub fn finish_block(&self, height: u32, tx_delta: u64) {
         self.state.lock().stats.finish_block(height, tx_delta);
     }
+
+    /// Reverses one [`Self::finish_block`], for a disconnected block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`CoinStats::rewind_block`]'s invariant failures.
+    pub fn rewind_block(
+        &self,
+        disconnected_height: u32,
+        parent_height: u32,
+        tx_delta: u64,
+    ) -> Result<(), CoinStatsRewindError> {
+        self.state
+            .lock()
+            .stats
+            .rewind_block(disconnected_height, parent_height, tx_delta)
+    }
 }
 
 impl UtxoChangeListener for CoinStatsListener {
@@ -895,7 +972,81 @@ mod tests {
     use bitcoin_rs_utxo::{SnapshotCoin, SnapshotCoinObserver};
     use proptest::prelude::*;
 
-    use super::{TxOut, encode_txout_into};
+    use super::{CoinStats, CoinStatsRewindError, TxOut, encode_txout_into};
+
+    /// A rewind that would take the count below zero is a double rewind of the
+    /// same block, or a delta from a different one. Saturating here would clamp
+    /// it to zero and carry on with a count that describes no chain.
+    #[test]
+    fn rewind_refuses_to_take_the_transaction_count_below_zero() {
+        let mut stats = CoinStats::default();
+        stats.finish_block(7, 3);
+        let before = stats.clone();
+
+        let outcome = stats.rewind_block(7, 6, 4);
+
+        assert_eq!(
+            outcome,
+            Err(CoinStatsRewindError::TxCountUnderflow {
+                tx_count: 3,
+                tx_delta: 4,
+            })
+        );
+        assert_eq!(stats, before, "a refused rewind must change nothing");
+    }
+
+    /// Rewinding a block the stats are not on would silently move them to a
+    /// height whose transaction count was never subtracted.
+    #[test]
+    fn rewind_refuses_a_height_the_stats_are_not_on() {
+        let mut stats = CoinStats::default();
+        stats.finish_block(7, 3);
+        let before = stats.clone();
+
+        let outcome = stats.rewind_block(9, 8, 1);
+
+        assert_eq!(
+            outcome,
+            Err(CoinStatsRewindError::HeightMismatch {
+                expected: 9,
+                found: 7,
+            })
+        );
+        assert_eq!(stats, before, "a refused rewind must change nothing");
+    }
+
+    /// The same block cannot be rewound twice: the second attempt no longer
+    /// matches the height, which is what the guard is for.
+    #[test]
+    fn rewinding_the_same_block_twice_is_refused() {
+        let mut stats = CoinStats::default();
+        stats.finish_block(7, 3);
+
+        assert_eq!(stats.rewind_block(7, 6, 3), Ok(()));
+        let after_first = stats.clone();
+        assert_eq!(stats.tx_count, 0, "the first rewind must subtract");
+
+        let outcome = stats.rewind_block(7, 6, 3);
+
+        assert!(
+            matches!(outcome, Err(CoinStatsRewindError::HeightMismatch { .. })),
+            "a second rewind must be refused, got {outcome:?}"
+        );
+        assert_eq!(stats, after_first, "a refused rewind must change nothing");
+    }
+
+    /// A rewind must invert exactly what `finish_block` recorded.
+    #[test]
+    fn rewind_inverts_finish_block() {
+        let mut stats = CoinStats::default();
+        let before = stats.clone();
+        stats.finish_block(12, 5);
+        assert_ne!(stats, before, "the setup must move the stats");
+
+        assert_eq!(stats.rewind_block(12, before.height, 5), Ok(()));
+
+        assert_eq!(stats, before, "the block-level fields must return exactly");
+    }
 
     #[test]
     fn manual_txout_encoding_matches_consensus_boundaries() {
