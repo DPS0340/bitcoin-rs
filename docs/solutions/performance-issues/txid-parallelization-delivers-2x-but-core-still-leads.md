@@ -1,5 +1,5 @@
 ---
-title: Beats GoCoin 2.3x and uses 2.8x less memory than Core, but Core still leads 2.05x on throughput
+title: Beats GoCoin 2.3x, uses 2.9x less memory than Core, and Core leads 1.42x on throughput once the harness is matched
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Beats GoCoin 2.3×, uses 2.8× less memory than Core, and Core still leads 2.05× on throughput
+# Beats GoCoin 2.3×, uses 2.9× less memory than Core, and Core leads 1.42× once the harness is matched
 
 ## Context
 
@@ -131,6 +131,27 @@ An earlier instrumented run (`53feecb`, 201.84s) attributed the then-uninstrumen
 The first two cleared the tests but not the 1.05× noise floor; the third never got that far. `script_prepare` is real work inside `libbitcoinkernel`, not Rust-side overhead. Even eliminating **all** of prepare leaves ~153s against Core's 67s, so prepare is not where the gap lives. `ResolvedUtxoView::resolve` (25.69s) is likewise **already parallel** (`apply.rs:1136` `into_par_iter`), so it is not a batching target either.
 
 The fourth result retires the "FFI boundary is the remaining lever" hypothesis for its allocation half. Per-input `ScriptPubkey::new` is a ~25-byte `malloc` plus copy; at 3.3M inputs that is real allocator traffic, and removing it entirely changed nothing measurable. What the kernel spends inside `btck_script_pubkey_verify` is secp256k1 work, not marshalling. Marshalling-side micro-optimization is now closed as a class: four separate attempts (parallel prepare, serialize buffer, witness-free skip, prevout reuse) all landed at 0.98–1.00×.
+
+## Matching the harness moved the ratio from 2.05× to 1.42×
+
+Every earlier number here fetched blocks over REST from a live `bitcoind`. Core's `-reindex-chainstate` reads its own `blk*.dat` files. That is not a like-for-like harness: the replay paid HTTP round-trips *and* competed for CPU with the process serving them, neither of which Core pays.
+
+`mainnet_prefix_replay --blocks-file` now reads a length-prefixed local file, mirroring what Core does. Same window, same validation posture, pinned 3× medians:
+
+| Source | elapsed | apply | outside apply |
+|---|---|---|---|
+| REST from live `bitcoind` | 121.9s | 82.0s | ~40s |
+| **local block file** | **84.6s** (84.2, 84.6, 86.5) | **76.7s** | 8.0s |
+
+Note that *apply itself* improved, 82.0s → 76.7s, purely from removing the serving node's CPU contention. The harness was distorting the engine measurement, not merely adding a constant.
+
+| Metric | Core 31.0 | bitcoin-rs | |
+|---|---|---|---|
+| elapsed | 59.6s | **84.6s** | **1.42× slower** |
+| apply | 55.80s | 76.7s | 1.37× slower |
+| peak RSS | 643 MB | **224 MB** | **2.87× leaner** |
+
+**Quote 1.42×.** The 2.05× and 2.22× figures earlier in this note measured the harness as much as the engine and are superseded. The lesson is the same one that produced the matched-pair section below: a ratio is only as good as the least-matched thing in it, and here the block source was the least-matched thing for the whole session.
 
 ## The matched pair — the only ratio worth quoting
 
