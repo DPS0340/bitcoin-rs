@@ -17,17 +17,24 @@ const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 
 // Width of the script-verification pool. 16 was chosen on the belief that SMT
-// siblings slow secp256k1 down past that width. A matched-validation replay of
-// mainnet 0..150_000 measures otherwise on this host (3x medians, pinned):
+// siblings slow secp256k1 down past that width. A full-verification replay of
+// mainnet 0..150_000 reading local block files measures otherwise on this host
+// (2x medians, `taskset -c 0-31`, wall and CPU together):
 //
-//   16 threads on 32 physical cores (`taskset -c 0-31`)        173.1s
-//   32 threads on 32 physical cores (`taskset -c 0-31`)        157.8s
-//   32 threads on 16 physical cores + their SMT siblings
-//                                  (`taskset -c 0-15,40-55`)   158.9s
+//    8 threads   130.6s wall   474.2s CPU
+//   16 threads    97.7s wall   521.3s CPU
+//   24 threads    83.7s wall   590.9s CPU
+//   32 threads    78.4s wall   652.3s CPU
 //
-// The last two agree within run-to-run noise while the third uses half the
-// physical cores, so the gain tracks thread count and SMT pairing costs
-// nothing measurable here. Kept as a cap rather than raised to
+// Wall falls monotonically with width while CPU rises sublinearly, so unlike
+// the threshold below this genuinely trades: 32 buys 1.67x the wall of 8 for
+// 1.38x the CPU, and wall is what a syncing node is waiting on. 32 equals the
+// core count here, and an earlier sweep found no gain from exceeding it.
+//
+// Re-measured after the block source was matched to Core's; the numbers this
+// rationale first carried (157.8s at 32, 173.1s at 16) came from the contended
+// REST harness. Same conclusion, sounder evidence — see
+// `docs/solutions/performance-issues/`. Kept as a cap rather than raised to
 // `available_parallelism` so a many-core host does not oversubscribe
 // verification against the rest of the apply pipeline; widen only against a
 // fresh measurement on the target hardware.
