@@ -173,11 +173,17 @@ hash and height where it wedged.
 ## Guidance
 
 1. **Name the commit point before writing any of it.** Which single mutation
-   decides that the disconnect happened? Everything before it must be safe to
-   re-enter; everything after is cleanup.
-2. **Do not add a mechanism whose failure mode cannot occur.** The phase marker
-   here was that mistake — it protects boundaries in a store whose partial
-   states never persist.
+   decides that the disconnect happened? Everything after it is cleanup.
+   Everything before it must be atomic, compensatable, or recoverable, and you
+   must say which for each store. "Safe to re-enter" was the earlier wording and
+   it was wishful: it assumed each step either happens or does not, which the
+   shard-walking UTXO commit does not honour.
+2. **Do not add a mechanism whose failure mode cannot occur, and do not assume a
+   failure mode cannot occur because one store is in RAM.** The phase marker was
+   called a mistake on that reasoning. It is not settled: a checkpoint can
+   retain a UTXO commit whose undo record was lost with the journal, and a
+   durable boundary is one way to detect that. Decide it with the recovery
+   protocol.
 3. **A trait default that returns success is a silent-corruption path.** When a
    consumer must participate in rollback, make the default refuse. See
    `IndexError::UnsupportedRollback`.
