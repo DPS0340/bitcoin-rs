@@ -92,7 +92,30 @@ Each result stands on its own, and each is internally matched:
 
 The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack.
 
-**Splitting the P2P gap is the obvious next measurement, and it needs one small piece of plumbing first.** The `node.sync.*` histograms already exist (`apply_buffered_blocks_seconds`, `stall_seconds`, `received_bytes`, `getdata_batch_size`, and others), and `MetricsHandle::snapshot()` renders them — but `install_metrics` deliberately ships without the Prometheus listener, so a running daemon has no external scrape path. Getting the numbers therefore means adding one, or dumping the snapshot at shutdown. Worth doing before anyone attributes the 1.77× whole-node gap to any particular subsystem; not worth guessing at in the meantime.
+**The P2P gap is not stall — it is 4.9× the CPU.** The plumbing was never needed. Sampling `utime+stime` from `/proc/<pid>/stat` while polling `getblockcount` answers the first question directly, and both nodes were run through the same probe pinned to `taskset -c 0-31`:
+
+| Node | wall | CPU | mean cores |
+|---|---|---|---|
+| Core 31.0 | 42.5s | **65.0s** | 1.53 |
+| bitcoin-rs | 76.3s | **318.4s** | 4.17 |
+
+A stalling node burns comparable CPU over more wall time. This is the opposite: bitcoin-rs spends **4.9× the CPU** to sync the same 150k blocks and hides most of it behind parallelism. Two consequences. Wall-clock tuning on a 128-core idle host is measuring the wrong thing, because it can spend cores freely; and on a 4- or 8-core machine, which is what most nodes run on, 318 CPU-seconds becomes wall time and the 1.77× gap widens sharply.
+
+**Per-thread attribution says the waste is broad, not one hot spot.** Summing `/proc/<pid>/task/*/stat` by thread name over 60s of sync: threads named `bitcoin-rs` 128.8s (52%), the `script-verify-*` pool ~105s, `bitcoin-rs-p2p-` 11.1s. The pool burning 105s during an *assume-valid* sync that skips historical scripts looked like rayon workers spinning before sleeping, which would have been a one-constant fix.
+
+**That hypothesis is refuted; do not go looking for the knob.** Sweeping `SCRIPT_VERIFY_POOL` width against both axes at once:
+
+| width | wall | CPU |
+|---|---|---|
+| 32 (current) | 75.9s | 318.9s |
+| 8 | 77.0s | 250.2s |
+| 4 | 79.2s | 243.6s |
+| 2 | 82.6s | 239.0s |
+| 1 | 89.2s | 230.1s |
+
+Collapsing the pool to a single thread removes only 88s of the 318s and costs 13s of wall. Even fully serial, bitcoin-rs burns **3.5×** Core's CPU. Pool spin is a minority of the excess, so no width setting converges and the remaining cost is spread across the whole apply and sync path — the same conclusion the stage decomposition below reaches from the other direction, now confirmed on an independent axis.
+
+**Measure CPU alongside wall from now on.** Every sweep in this note before this one optimised wall time only, on an idle 128-core host. `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 is the clearest case: it won 1.15× of wall by pushing far more blocks through the pool, which is exactly the change that raises CPU. It was not re-checked against CPU and should be, on hardware with a realistic core count, before it is treated as settled.
 
 What this does settle: Core leads on *both* throughput measurements available on this host (1.42× processing-bound, 1.77× over loopback P2P), and bitcoin-rs beats GoCoin on both. The two bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating 76.0s as precise.
 
