@@ -1188,7 +1188,7 @@ impl NodeState {
         // A checkpoint may name this tip only after body files then index rows sync.
         self.block_body_store.sync()?;
         let applied_tip = self.applied_tip.load_full();
-        crate::checkpoint::write_checkpoint_from_dir(
+        let written = crate::checkpoint::write_checkpoint_from_dir(
             &self.checkpoint_data_dir,
             crate::checkpoint::HeaderCheckpointConfig {
                 network: self.config.network,
@@ -1199,7 +1199,18 @@ impl NodeState {
             &self.coin_stats,
             applied_tip.as_deref(),
             self.config.g2_muhash_samples.is_some(),
-        )
+        )?;
+        // The disconnect marker comes off here, not when the disconnect
+        // finished. A disconnect leaves the index rollback durable while the
+        // rolled-back UTXO set and tip are still only in memory, so until a
+        // checkpoint captures them a crash restores a chainstate that still
+        // contains the disconnected block with its index rows already deleted.
+        // This is the first point at which the rollback is whole on disk.
+        self.apply_handles
+            .undo_store
+            .disarm_disconnect()
+            .map_err(crate::checkpoint::CheckpointError::from)?;
+        Ok(written)
     }
 
     /// Returns the configured storage backend that was opened.

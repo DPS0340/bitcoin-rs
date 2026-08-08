@@ -93,6 +93,27 @@ pub(crate) trait UndoStore: Send + Sync {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<(), StorageError>;
 
+    /// Clears a marker armed for a disconnect that then touched nothing.
+    ///
+    /// Separate from [`Self::disarm_disconnect`] because the two callers know
+    /// different things. This one runs before any mutation, so it may clear
+    /// unconditionally. The checkpoint's clear may not: it cannot tell a
+    /// completed rollback from a half-finished one except by the phase.
+    fn cancel_disconnect(&self) -> Result<(), StorageError>;
+
+    /// Records that the rollback finished, in memory, and is owed a checkpoint.
+    ///
+    /// Distinct from clearing. Both phases refuse a startup, because both mean
+    /// the durable state is torn. What the phase decides is whether a
+    /// checkpoint may clear the marker: only a rollback that ran to completion
+    /// may, and a checkpoint taken over a half-finished or failed one would be
+    /// a checkpoint of the damage.
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError>;
+
     /// Clears the marker once a disconnect has finished cleanly.
     ///
     /// What this pair does NOT close: the UTXO set and the tip are in memory
@@ -121,6 +142,24 @@ pub struct DisconnectMarker {
     pub hash: bitcoin_rs_primitives::Hash256,
     /// Height it was applied at.
     pub height: u32,
+    /// How far the disconnect got.
+    pub phase: DisconnectPhase,
+}
+
+/// How far a disconnect got before the marker was last written.
+///
+/// Both phases refuse a startup. The phase decides only whether a checkpoint
+/// may clear the marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectPhase {
+    /// Mutation started and was never reported finished: the rollback is
+    /// half-done, or the process died inside it. A checkpoint must NOT clear
+    /// this, because a checkpoint over a half-finished rollback captures the
+    /// damage instead of repairing it.
+    InFlight,
+    /// The rollback completed in memory and is waiting for a checkpoint to make
+    /// it durable. Only this phase may be cleared, and only by that checkpoint.
+    RolledBack,
 }
 
 /// Key for the in-flight disconnect marker.
@@ -131,30 +170,44 @@ pub struct DisconnectMarker {
 const DISCONNECT_MARKER_KEY: &[u8] = b"node:disconnect-in-flight";
 
 impl DisconnectMarker {
-    fn encode(&self) -> [u8; 36] {
-        let mut encoded = [0_u8; 36];
+    fn encode(&self) -> [u8; 37] {
+        let mut encoded = [0_u8; 37];
         encoded[..32].copy_from_slice(&self.hash.to_le_bytes());
-        encoded[32..].copy_from_slice(&self.height.to_be_bytes());
+        encoded[32..36].copy_from_slice(&self.height.to_be_bytes());
+        encoded[36] = match self.phase {
+            DisconnectPhase::InFlight => 0,
+            DisconnectPhase::RolledBack => 1,
+        };
         encoded
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let Ok(fixed): Result<[u8; 36], _> = bytes.try_into() else {
+        let Ok(fixed): Result<[u8; 37], _> = bytes.try_into() else {
             // A marker that will not decode is still a marker. Treating a short
             // read as "no disconnect was in flight" would let corruption clear
             // the interlock, which is the one thing it must never do.
             return Err(StorageError::Backend(format!(
-                "disconnect marker is {} bytes, expected 36",
+                "disconnect marker is {} bytes, expected 37",
                 bytes.len()
             )));
         };
         let mut hash = [0_u8; 32];
         hash.copy_from_slice(&fixed[..32]);
         let mut height = [0_u8; 4];
-        height.copy_from_slice(&fixed[32..]);
+        height.copy_from_slice(&fixed[32..36]);
+        let phase = match fixed[36] {
+            0 => DisconnectPhase::InFlight,
+            1 => DisconnectPhase::RolledBack,
+            other => {
+                return Err(StorageError::Backend(format!(
+                    "disconnect marker has unknown phase {other}"
+                )));
+            }
+        };
         Ok(Self {
             hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
             height: u32::from_be_bytes(height),
+            phase,
         })
     }
 }
@@ -193,12 +246,41 @@ impl UndoStore for InMemoryUndoStore {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<(), StorageError> {
-        *self.marker.write() = Some(DisconnectMarker { hash, height });
+        *self.marker.write() = Some(DisconnectMarker {
+            hash,
+            height,
+            phase: DisconnectPhase::InFlight,
+        });
+        Ok(())
+    }
+
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        *self.marker.write() = None;
+        Ok(())
+    }
+
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        *self.marker.write() = Some(DisconnectMarker {
+            hash,
+            height,
+            phase: DisconnectPhase::RolledBack,
+        });
         Ok(())
     }
 
     fn disarm_disconnect(&self) -> Result<(), StorageError> {
-        *self.marker.write() = None;
+        let mut marker = self.marker.write();
+        if marker
+            .as_ref()
+            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
+        {
+            return Ok(());
+        }
+        *marker = None;
         Ok(())
     }
 
@@ -279,14 +361,59 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
         self.store.put(
             bitcoin_rs_storage::ColumnFamily::UtxoMeta,
             DISCONNECT_MARKER_KEY,
-            &DisconnectMarker { hash, height }.encode(),
+            &DisconnectMarker {
+                hash,
+                height,
+                phase: DisconnectPhase::InFlight,
+            }
+            .encode(),
         )?;
         self.store.flush()
     }
 
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.delete(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+        );
+        self.store.write(batch)?;
+        self.store.flush()
+    }
+
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        self.store.put(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+            &DisconnectMarker {
+                hash,
+                height,
+                phase: DisconnectPhase::RolledBack,
+            }
+            .encode(),
+        )?;
+        self.store.flush()
+    }
+
+    /// Refuses to clear a marker that is still `InFlight`.
+    ///
+    /// The caller is a checkpoint, and a checkpoint taken while a rollback is
+    /// half-done captures the damage. Only a completed rollback may be cleared.
     fn disarm_disconnect(&self) -> Result<(), StorageError> {
         use bitcoin_rs_storage::WriteBatch as _;
 
+        if self
+            .load_disconnect_marker()?
+            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
+        {
+            return Ok(());
+        }
         let mut batch = self.store.new_batch();
         batch.delete(
             bitcoin_rs_storage::ColumnFamily::UtxoMeta,
@@ -908,7 +1035,7 @@ pub fn disconnect_block(
         let rollback = tx_index.lock().rollback_block(block, height);
         if let Err(error) = rollback {
             let refusal = ApplyError::IndexRollback(error);
-            return Err(match handles.undo_store.disarm_disconnect() {
+            return Err(match handles.undo_store.cancel_disconnect() {
                 Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
                 Err(disarm) => crate::DisconnectError::MarkerStuck {
                     hash: block_hash,
@@ -984,17 +1111,28 @@ pub fn disconnect_block(
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
 
-    // Every mutation landed, so the marker has nothing left to guard. A failure
-    // to clear it is reported rather than swallowed: the chain is consistent,
-    // but the node will refuse to start until the marker goes, and a caller
-    // told "success" would have no way to know that.
-    handles.undo_store.disarm_disconnect().map_err(|error| {
-        crate::DisconnectError::MarkerStuck {
+    // The rollback finished in memory, so the marker moves to `RolledBack`.
+    // It stays set: a checkpoint has not captured this yet.
+    handles
+        .undo_store
+        .complete_disconnect(height, block_hash)
+        .map_err(|error| crate::DisconnectError::MarkerStuck {
             hash: block_hash,
             height,
             source: Box::new(ApplyError::UndoPersistence(error)),
-        }
-    })?;
+        })?;
+
+    // The marker deliberately stays set here.
+    //
+    // Every mutation landed, but only some of them are durable. The index
+    // rollback committed; the UTXO set and the tip are in memory behind
+    // periodic checkpoints. A crash now restores a checkpoint that still
+    // contains this block while its index rows are already gone, which is the
+    // same torn state the marker exists to catch. Clearing it on the strength
+    // of an in-memory rollback would hide exactly that case.
+    //
+    // [`NodeState::write_clean_checkpoint`] clears it, because that is where
+    // the rolled-back set and tip become durable.
     Ok(parent_tip)
 }
 
@@ -5652,16 +5790,32 @@ mod consensus_rule_tests {
             .ok_or("armed marker did not survive the reopen")?;
         assert_eq!(marker.hash, block_hash, "hash must round-trip");
         assert_eq!(marker.height, 140_003, "height must round-trip");
+        assert_eq!(
+            marker.phase,
+            DisconnectPhase::InFlight,
+            "arming records an unfinished rollback"
+        );
 
-        // And it must come back off, or a node that disconnected cleanly could
-        // never start again.
+        // A checkpoint must NOT clear an unfinished rollback. Checkpointing
+        // half-rolled-back state captures the damage instead of repairing it.
+        KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect()?;
+        assert!(
+            KvUndoStore::new(Arc::clone(&reopened))
+                .load_disconnect_marker()?
+                .is_some(),
+            "a checkpoint must not clear an in-flight marker"
+        );
+
+        // Once the rollback completes, the same call clears it, or a node that
+        // disconnected cleanly could never start again.
+        KvUndoStore::new(Arc::clone(&reopened)).complete_disconnect(140_003, block_hash)?;
         KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect()?;
         drop(reopened);
         let after = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
         assert_eq!(
             KvUndoStore::new(after).load_disconnect_marker()?,
             None,
-            "a disarmed marker must not come back after a reopen"
+            "a completed rollback must clear and stay cleared across a reopen"
         );
         Ok(())
     }
@@ -5674,7 +5828,7 @@ mod consensus_rule_tests {
             panic!("a 20-byte marker must not decode as absent");
         };
         assert!(
-            error.to_string().contains("expected 36"),
+            error.to_string().contains("expected 37"),
             "error must say what it expected, got: {error}"
         );
     }
@@ -6064,6 +6218,20 @@ mod consensus_rule_tests {
             self.inner.arm_disconnect(height, hash)
         }
 
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("cancel");
+            self.inner.cancel_disconnect()
+        }
+
+        fn complete_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("complete");
+            self.inner.complete_disconnect(height, hash)
+        }
+
         fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
             self.events.lock().push("disarm");
             self.inner.disarm_disconnect()
@@ -6117,8 +6285,9 @@ mod consensus_rule_tests {
         );
         assert_eq!(
             store.events.lock().as_slice(),
-            ["arm", "disarm"],
-            "the marker must be armed before the rollback runs and cleared when it refuses"
+            ["arm", "cancel"],
+            "the marker must be armed before the rollback runs, and a refusal that \
+             touched nothing must cancel it rather than leave a false poison"
         );
         assert_eq!(
             store.load_disconnect_marker()?,
@@ -6160,6 +6329,22 @@ mod consensus_rule_tests {
         ) -> Result<(), bitcoin_rs_storage::StorageError> {
             Err(bitcoin_rs_storage::StorageError::Backend(
                 "injected marker write failure".to_owned(),
+            ))
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker cancel failure".to_owned(),
+            ))
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker completion failure".to_owned(),
             ))
         }
 
@@ -6457,10 +6642,17 @@ mod consensus_rule_tests {
 
         disconnect_block(&handles, &block)?;
 
+        // Deliberately still set. The rollback is complete in memory, but the
+        // index rollback is durable while the UTXO set and tip are not, so the
+        // marker is owed a checkpoint before it may go.
+        let marker = handles
+            .undo_store
+            .load_disconnect_marker()?
+            .ok_or("a completed disconnect must leave a marker for the checkpoint")?;
         assert_eq!(
-            handles.undo_store.load_disconnect_marker()?,
-            None,
-            "a disconnect that completed must clear the marker it armed"
+            marker.phase,
+            DisconnectPhase::RolledBack,
+            "a completed rollback must be recorded as such, not left in flight"
         );
         Ok(())
     }
