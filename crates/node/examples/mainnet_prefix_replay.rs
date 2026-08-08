@@ -58,18 +58,7 @@ fn main() -> Result<()> {
     let mut start_hash = None;
     let mut stop_hash = None;
 
-    let mut source = match &args.rest_url {
-        Some(host) => BlockSource::Rest(spawn_prefetch(host, args.start_height, args.stop_height)?),
-        None => BlockSource::Cli(&args),
-    };
-    let mut source = match args.blocks_file.as_ref() {
-        Some(path) => BlockSource::File(std::io::BufReader::with_capacity(
-            1 << 20,
-            std::fs::File::open(path)
-                .with_context(|| format!("open blocks file {}", path.display()))?,
-        )),
-        None => source,
-    };
+    let mut source = open_block_source(&args)?;
     for height in args.start_height..=args.stop_height {
         let fetch_started = Instant::now();
         let (hash, bytes) = source.fetch(height)?;
@@ -338,6 +327,29 @@ type FetchedBlock = (String, Vec<u8>);
 
 /// Where replay blocks come from: per-call `bitcoin-cli` spawns or a prefetch
 /// thread reading ahead over a persistent REST socket.
+/// Picks the block source, preferring a local file over REST.
+///
+/// The file source must win outright: building the REST source spawns a
+/// prefetch thread, so choosing it first and discarding it would start an
+/// HTTP pipeline the run never reads.
+fn open_block_source(args: &Args) -> Result<BlockSource<'_>> {
+    if let Some(path) = args.blocks_file.as_ref() {
+        return Ok(BlockSource::File(std::io::BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(path)
+                .with_context(|| format!("open blocks file {}", path.display()))?,
+        )));
+    }
+    match &args.rest_url {
+        Some(host) => Ok(BlockSource::Rest(spawn_prefetch(
+            host,
+            args.start_height,
+            args.stop_height,
+        )?)),
+        None => Ok(BlockSource::Cli(args)),
+    }
+}
+
 enum BlockSource<'a> {
     Cli(&'a Args),
     Rest(crossbeam_channel::Receiver<Result<FetchedBlock>>),
