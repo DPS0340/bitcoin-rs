@@ -283,7 +283,7 @@ Post-refactor decomposition beside Core's `-debug=bench` figures for the identic
 | Stage | bitcoin-rs | Core | Note |
 |---|---|---|---|
 | script verification | 36.47s | 36.07s | **tie** — same libsecp256k1, nothing to win |
-| block parsing | ~14.0s (`Block::new` ~10.9s + rust-bitcoin decode 3.1s) | 7.18s (`Load block from disk`) | **we parse every block twice** |
+| block parsing | ~14.0s (`Block::new` + txid harvest ~10.9s, rust-bitcoin decode 3.1s) | 7.18s (`Load block from disk`) | only the 3.1s is removable — see below |
 | consensus rules / merkle | 4.79s (`block_rules`) | 1.41s (`Sanity checks`) | merkle root over scalar SHA-256 vs Core's AVX2 |
 | UTXO commit | 6.10s | 2.59s (`Flush`) | |
 | block body persist | 4.18s | none | see the fairness note below |
@@ -295,9 +295,14 @@ Post-refactor decomposition beside Core's `-debug=bench` figures for the identic
 
 ### The one lever left, and why it is a separate change
 
-**We parse every block twice**: once with rust-bitcoin into `bitcoin::Block`, once with the kernel. Core parses once. At ~14.0s against Core's 7.18s that is the largest remaining structural difference, and unlike everything else measured here it is not a constant to tune — it means removing `bitcoin::Transaction` from the hot path entirely and carrying kernel types through apply, block rules, and the UTXO layer.
+**Do not start the "remove the double parse" refactor expecting a large win — it is worth about 3.1s.** The framing is tempting: we parse every block twice, once with rust-bitcoin into `bitcoin::Block` and once with the kernel, where Core parses once. But the two halves are not equally removable:
 
-That is a multi-crate change to consensus-critical code and belongs in its own PR with its own review, not appended to this one. Two smaller targets sit behind it, both bounded:
+* The kernel parse (~10.9s) is **load-bearing and cannot go**. It produces the txids and the transaction objects that verification borrows; it is what replaced a 10.3s scalar-SHA `compute_txid` pass plus a 12.4s serialize-and-reparse round-trip. That figure also includes harvesting 1.7M txids across the FFI, not parsing alone.
+* The rust-bitcoin decode (**3.1s**) is the only genuinely removable half, and removing it means carrying kernel types through apply, block rules, and the UTXO layer — a multi-crate change to consensus-critical code for **2.5% of a 121.9s run**, below the 1.05× noise gate.
+
+An earlier revision of this note called the double parse "the largest remaining structural lever" at ~14.0s against Core's 7.18s. That was wrong in the same way the `Block::new` accounting was wrong earlier: it priced a replacement against a total that includes work which does not disappear. Corrected here so nobody spends a refactor on it.
+
+One genuine open question remains rather than a lever: our in-memory kernel parse plus txid harvest costs 10.9s while Core's `Load block from disk` — which *includes* disk I/O and uses the same C++ deserializer — costs 7.18s. Worth attributing before anyone assumes the parse is already optimal. Two smaller targets sit behind it, both bounded:
 
 * `block_rules` 4.79s vs Core's 1.41s — the merkle root is SHA-256d over txids with a scalar implementation while Core uses its runtime-selected AVX2 one. The kernel does not expose a merkle helper, so this needs either an exposed hash primitive or a parallel merkle tree.
 * `utxo_commit` 6.10s vs Core's 2.59s flush.
