@@ -5,7 +5,6 @@
 //! to the mempool or relayed by default.
 
 use bitcoin::blockdata::script::Instruction;
-use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16};
 use bitcoin::{Script, Transaction, TxOut};
 use thiserror::Error;
 
@@ -23,11 +22,12 @@ const TX_VERSION_MIN: i32 = 1;
 
 /// Maximum transaction version considered standard.
 ///
-/// Bitcoin Core accepts versions 1 and 2 as standard. Version 3 is also
-/// relayed under post-TRUC policy, but the base `IsStandardTx` check
-/// historically rejects versions outside `1..=2`. We follow the base
-/// policy: versions 1 and 2 are standard.
-const TX_VERSION_MAX: i32 = 2;
+/// Current Bitcoin Core accepts version 3 at the `IsStandardTx` gate and
+/// enforces TRUC's extra restrictions at the transaction and package policy
+/// layers. Rejecting v3 here classifies otherwise standard transactions as
+/// non-standard before any of those checks can run. Those restrictions belong
+/// to that other layer and are deliberately not implemented here.
+const TX_VERSION_MAX: i32 = 3;
 
 /// Standardness policy rejection reason for a single transaction.
 ///
@@ -53,6 +53,9 @@ pub enum StandardnessError {
     /// Transaction contains more than one `OP_RETURN` output.
     #[error("transaction has multiple OP_RETURN outputs")]
     MultipleOpReturn,
+    /// Non-witness serialization is below the relay minimum.
+    #[error("transaction non-witness size is below the relay minimum")]
+    TransactionTooSmall,
     /// An `OP_RETURN` output payload exceeds 83 bytes.
     #[error("OP_RETURN payload exceeds maximum relay size")]
     OpReturnPayloadTooLarge,
@@ -74,6 +77,25 @@ pub fn is_standard_tx(tx: &Transaction) -> Result<(), StandardnessError> {
     check_weight(tx)?;
     check_script_sigs(tx)?;
     check_outputs(tx)?;
+    // Last, matching Core: `IsStandardTx` runs first and `PreChecks` applies
+    // `tx-size-small` after it, so a transaction that is both undersized and
+    // carries a non-standard output reports the output.
+    check_min_size(tx)?;
+    Ok(())
+}
+
+/// Minimum non-witness serialization Core relays, `tx-size-small`.
+///
+/// The bound is on the stripped size. A one-input `SegWit` spend with an empty
+/// scriptSig and a minimal `OP_RETURN` output serializes to 61 bytes without
+/// its witness while carrying its authorization inside one, so a weight check
+/// alone lets it through.
+const MIN_NON_WITNESS_TX_SIZE: usize = 65;
+
+fn check_min_size(tx: &Transaction) -> Result<(), StandardnessError> {
+    if tx.base_size() < MIN_NON_WITNESS_TX_SIZE {
+        return Err(StandardnessError::TransactionTooSmall);
+    }
     Ok(())
 }
 
@@ -116,7 +138,14 @@ fn check_outputs(tx: &Transaction) -> Result<(), StandardnessError> {
             if op_return_count > 1 {
                 return Err(StandardnessError::MultipleOpReturn);
             }
-            if op_return_payload_len(script) > MAX_OP_RETURN_RELAY {
+            if !is_standard_nulldata(script) {
+                return Err(StandardnessError::NonStandardOutput);
+            }
+            // The limit is on the SERIALIZED script, not the payload it
+            // carries. An 81-byte push encoded with OP_PUSHDATA1 makes an
+            // 84-byte script, which Core rejects and a payload-only measure
+            // accepted at 81.
+            if script.len() > MAX_OP_RETURN_RELAY {
                 return Err(StandardnessError::OpReturnPayloadTooLarge);
             }
         } else {
@@ -142,7 +171,19 @@ fn is_standard_output_script(script: &Script) -> bool {
         || script.is_p2wpkh()
         || script.is_p2wsh()
         || script.is_p2tr()
+        || is_p2a(script)
         || is_standard_multisig(script)
+}
+
+/// Returns `true` for the pay-to-anchor output template.
+///
+/// `OP_1` followed by a two-byte push of `0x4e73`. Core treats this distinct
+/// short witness program as standard under TRUC and ephemeral-anchor policy,
+/// and none of the predicates above match it: `is_p2tr` wants a 32-byte
+/// version-1 program. Its dust and package restrictions live at the policy
+/// layer that owns them, not here.
+fn is_p2a(script: &Script) -> bool {
+    script.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
 }
 
 /// Returns `true` if `script` is a bare multisig with at most 3 pubkeys.
@@ -155,37 +196,32 @@ fn is_standard_multisig(script: &Script) -> bool {
     multisig_key_count(script).is_some_and(|n| n <= 3)
 }
 
-/// Counts the number of pubkeys in a bare multisig script, or `None` if
-/// the script is not a valid multisig.
+/// Counts the pubkeys in a bare multisig script, or `None` if any push in it
+/// is not a serialized pubkey.
+///
+/// Deliberately narrow. `Script::is_multisig` was measured against this exact
+/// surface and it already rejects a declared count that disagrees with the keys
+/// present, an `m` greater than `n`, and a script with no keys at all. The one
+/// thing it does not check is the length of each push, so
+/// `OP_1 <4 bytes> OP_1 OP_CHECKMULTISIG` passes it. That is the gap, and this
+/// closes exactly that; duplicating the rest would be checks that can never
+/// fire.
 fn multisig_key_count(script: &Script) -> Option<u8> {
-    let mut instructions = script.instructions();
-    // Required-sigs pushnum (OP_1..OP_16).
-    instructions.next()?.ok()?;
     let mut count: u8 = 0;
-    for inst in instructions.by_ref() {
+    for inst in script.instructions() {
         match inst {
-            Ok(Instruction::PushBytes(_)) => {
+            // 33 bytes compressed, 65 uncompressed. Anything else is not a key.
+            Ok(Instruction::PushBytes(bytes)) => {
+                if bytes.len() != 33 && bytes.len() != 65 {
+                    return None;
+                }
                 count = count.checked_add(1)?;
             }
-            Ok(Instruction::Op(op)) => {
-                // The pubkey-count pushnum — stop here.
-                if is_pushnum(op) {
-                    break;
-                }
-                return None;
-            }
+            Ok(Instruction::Op(_)) => {}
             Err(_) => return None,
         }
     }
     Some(count)
-}
-
-/// Returns `true` if `op` is one of `OP_1` through `OP_16`.
-///
-/// `Opcode::decode_pushnum` is `pub(crate)` in the `bitcoin` crate, so the
-/// range is checked directly against the opcode byte.
-fn is_pushnum(op: bitcoin::opcodes::Opcode) -> bool {
-    (OP_PUSHNUM_1.to_u8()..=OP_PUSHNUM_16.to_u8()).contains(&op.to_u8())
 }
 
 /// Returns `true` if a non-`OP_RETURN` output is dust.
@@ -198,20 +234,20 @@ fn is_dust(output: &TxOut) -> bool {
 /// An `OP_RETURN` script is `OP_RETURN` followed by zero or more push
 /// operations. The payload length is the total number of bytes pushed.
 /// Returns `None` if the script is not `OP_RETURN`.
-fn op_return_payload_len(script: &Script) -> usize {
-    let mut total: usize = 0;
-    for inst in script.instructions() {
-        match inst {
-            Ok(Instruction::PushBytes(bytes)) => {
-                total += bytes.len();
-            }
-            // Opcodes, including the leading `OP_RETURN`, contribute no
-            // payload bytes.
-            Ok(Instruction::Op(_)) => {}
-            Err(_) => return total,
-        }
+/// Returns `true` if everything after the leading `OP_RETURN` is a data push.
+///
+/// Standard nulldata is `OP_RETURN` followed by pushes and nothing else. A
+/// script that merely starts with `OP_RETURN` and then carries an opcode, or
+/// that fails to parse partway, is not standard — and the old code accepted
+/// both, because it ignored opcodes and treated a parse error as the end of
+/// the payload.
+fn is_standard_nulldata(script: &Script) -> bool {
+    let mut instructions = script.instructions();
+    // The leading OP_RETURN itself, already established by `is_op_return`.
+    if instructions.next().is_none() {
+        return false;
     }
-    total
+    instructions.all(|inst| matches!(inst, Ok(Instruction::PushBytes(_))))
 }
 
 #[cfg(test)]
@@ -220,6 +256,7 @@ mod tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash as _;
     use bitcoin::opcodes::all::OP_RETURN;
+    use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1};
     use bitcoin::script::{Builder, PushBytesBuf};
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, PubkeyHash, ScriptBuf, Sequence, TxIn, TxOut, Witness};
@@ -259,10 +296,132 @@ mod tests {
         assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
     }
 
+    /// Current Core relays v3 (TRUC); its extra restrictions are enforced at
+    /// the package-policy layer, not by this gate.
     #[test]
-    fn rejects_version_three() {
+    fn accepts_version_three() {
         let tx = empty_tx(Version(3));
+        assert_eq!(is_standard_tx(&tx), Ok(()));
+    }
+
+    #[test]
+    fn rejects_version_four() {
+        let tx = empty_tx(Version(4));
         assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
+    }
+
+    /// An 81-byte push needs `OP_PUSHDATA1`, making an 84-byte script. The limit
+    /// is on the script, so this must be rejected even though the payload is
+    /// under it.
+    #[test]
+    fn rejects_op_return_whose_script_exceeds_the_limit() {
+        let mut tx = empty_tx(Version::ONE);
+        let payload = [0x2b_u8; 81];
+        let Ok(pushable) = <&bitcoin::script::PushBytes>::try_from(payload.as_slice()) else {
+            panic!("81 bytes must be pushable");
+        };
+        tx.output[0].value = Amount::ZERO;
+        tx.output[0].script_pubkey = ScriptBuf::new_op_return(pushable);
+        assert!(
+            tx.output[0].script_pubkey.len() > MAX_OP_RETURN_RELAY,
+            "the script must exceed the limit or this test proves nothing"
+        );
+        assert_eq!(
+            is_standard_tx(&tx),
+            Err(StandardnessError::OpReturnPayloadTooLarge)
+        );
+    }
+
+    /// `OP_RETURN` followed by a non-push opcode is not standard nulldata.
+    #[test]
+    fn rejects_op_return_followed_by_an_opcode() {
+        let mut tx = empty_tx(Version::ONE);
+        tx.output[0].value = Amount::ZERO;
+        tx.output[0].script_pubkey = Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .push_opcode(bitcoin::opcodes::all::OP_DUP)
+            .into_script();
+        assert_eq!(
+            is_standard_tx(&tx),
+            Err(StandardnessError::NonStandardOutput)
+        );
+    }
+
+    /// A push that is not a pubkey length still passes `Script::is_multisig`.
+    ///
+    /// That predicate was measured against this surface: it already rejects a
+    /// declared count that disagrees with the keys present, an `m` greater than
+    /// `n`, and a keyless script. Push length is the one thing it does not
+    /// check, so it is the only thing worth checking here.
+    #[test]
+    fn rejects_bare_multisig_whose_key_is_not_a_pubkey() {
+        let script = Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice([0_u8; 4])
+            .push_opcode(OP_PUSHNUM_1)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert!(
+            script.is_multisig(),
+            "the shape check must accept this, or the length check is never reached"
+        );
+
+        let mut tx = empty_tx(Version::ONE);
+        tx.output[0].script_pubkey = script;
+        assert_eq!(
+            is_standard_tx(&tx),
+            Err(StandardnessError::NonStandardOutput)
+        );
+    }
+
+    /// The same shape, honestly declared, stays standard.
+    #[test]
+    fn accepts_a_well_formed_bare_multisig() {
+        let key = [0x02_u8; 33];
+        let Ok(pushable) = <&bitcoin::script::PushBytes>::try_from(key.as_slice()) else {
+            panic!("33 bytes must be pushable");
+        };
+        let mut tx = empty_tx(Version::ONE);
+        tx.output[0].script_pubkey = Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice(pushable)
+            .push_opcode(OP_PUSHNUM_1)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(is_standard_tx(&tx), Ok(()));
+    }
+
+    /// The pay-to-anchor template, `OP_1` plus a two-byte push of 0x4e73.
+    ///
+    /// Carries a second, ordinary output: a lone 4-byte anchor script makes the
+    /// transaction smaller than the relay minimum, and this test is about the
+    /// script being recognised, not about that.
+    #[test]
+    fn accepts_a_pay_to_anchor_output() {
+        let mut tx = empty_tx(Version::ONE);
+        tx.output.push(TxOut {
+            value: Amount::from_sat(240),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
+        });
+        assert_eq!(is_standard_tx(&tx), Ok(()));
+    }
+
+    /// A `SegWit` spend can be consensus-valid and still below the relay
+    /// minimum once its witness is stripped, which a weight check alone
+    /// cannot see.
+    #[test]
+    fn rejects_a_transaction_below_the_non_witness_minimum() {
+        let mut tx = empty_tx(Version::ONE);
+        tx.output[0].value = Amount::ZERO;
+        tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+        assert!(
+            tx.base_size() < MIN_NON_WITNESS_TX_SIZE,
+            "the fixture must be undersized or this test proves nothing"
+        );
+        assert_eq!(
+            is_standard_tx(&tx),
+            Err(StandardnessError::TransactionTooSmall)
+        );
     }
 
     #[test]
