@@ -1247,7 +1247,7 @@ pub fn window_len(sizes: impl IntoIterator<Item = usize>) -> usize {
 /// what applying them one at a time would also do.
 pub fn apply_window(
     handles: &ApplyHandles,
-    blocks: &[bitcoin::Block],
+    blocks: &[&bitcoin::Block],
     serialized: &[bytes::Bytes],
 ) -> core::result::Result<(), WindowApplyError> {
     if blocks.len() != serialized.len() {
@@ -1332,7 +1332,7 @@ impl std::error::Error for WindowApplyError {
 #[allow(clippy::too_many_lines)]
 fn prove_window(
     handles: &ApplyHandles,
-    blocks: &[bitcoin::Block],
+    blocks: &[&bitcoin::Block],
     serialized: &[bytes::Bytes],
 ) -> Vec<ProvenApply> {
     use bitcoin::hashes::Hash as _;
@@ -5950,7 +5950,7 @@ mod consensus_rule_tests {
         applied_header_tip(&handles, block_hash, &block, 1)?;
         let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
         assert_eq!(
-            prove_window(&handles, std::slice::from_ref(&block), &[raw]).len(),
+            prove_window(&handles, &[&block], &[raw]).len(),
             1,
             "the honest block must prove, or this test proves nothing"
         );
@@ -5964,7 +5964,7 @@ mod consensus_rule_tests {
         );
         let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&tampered));
         assert!(
-            prove_window(&handles, std::slice::from_ref(&tampered), &[raw]).is_empty(),
+            prove_window(&handles, &[&tampered], &[raw]).is_empty(),
             "a body that fails the merkle check must not reach the script batch"
         );
         Ok(())
@@ -6073,7 +6073,7 @@ mod consensus_rule_tests {
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
         let (handles, block, raw) = build(100)?;
-        let proven = prove_window(&handles, std::slice::from_ref(&block), &[raw]);
+        let proven = prove_window(&handles, &[&block], &[raw]);
         assert_eq!(
             proven.len(),
             1,
@@ -6091,7 +6091,7 @@ mod consensus_rule_tests {
 
         // Full verification must be completely unaffected.
         let (handles, block, raw) = build(0)?;
-        let proven = prove_window(&handles, std::slice::from_ref(&block), &[raw]);
+        let proven = prove_window(&handles, &[&block], &[raw]);
         assert!(
             proven.is_empty(),
             "with assume_valid_height 0 the bad script must still fail the window"

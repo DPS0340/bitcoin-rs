@@ -24,11 +24,16 @@ const TX_VERSION_MIN: i32 = 1;
 /// Maximum transaction version considered standard.
 ///
 /// Current Bitcoin Core accepts version 3 at the `IsStandardTx` gate and
-/// enforces TRUC's extra restrictions at the transaction and package policy
-/// layers. Rejecting v3 here classifies otherwise standard transactions as
-/// non-standard before any of those checks can run. Those restrictions belong
-/// to that other layer and are deliberately not implemented here.
-const TX_VERSION_MAX: i32 = 3;
+/// enforces TRUC's extra restrictions — the ancestor and descendant limits,
+/// the sibling rules, the size cap — at the transaction and package policy
+/// layers.
+///
+/// This node has no such layer. Accepting v3 here would copy the permissive
+/// half of Core's design without the half that constrains it, so whoever wires
+/// this gate to mempool admission would be relaying v3 transactions Core
+/// rejects. Raise this to 3 in the same change that adds TRUC policy, not
+/// before.
+const TX_VERSION_MAX: i32 = 2;
 
 /// Standardness policy rejection reason for a single transaction.
 ///
@@ -308,12 +313,13 @@ mod tests {
         assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
     }
 
-    /// Current Core relays v3 (TRUC); its extra restrictions are enforced at
-    /// the package-policy layer, not by this gate.
+    /// Rejected until a TRUC policy layer exists to carry its restrictions.
+    /// Core accepts v3 here and constrains it elsewhere; this node has only
+    /// the "here".
     #[test]
-    fn accepts_version_three() {
+    fn rejects_version_three_while_truc_policy_is_absent() {
         let tx = empty_tx(Version(3));
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
     }
 
     #[test]

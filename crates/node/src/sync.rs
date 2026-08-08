@@ -749,8 +749,10 @@ impl BlockSync {
                     .map(|drained| drained.serialized.len()),
             ));
             let chunk = &drained[chunk_start..chunk_end];
-            let blocks: Vec<bitcoin::Block> =
-                chunk.iter().map(|drained| drained.block.clone()).collect();
+            // Borrowed, not cloned. `DrainedBlock` owns a whole block, so
+            // cloning one deep-copies every transaction and witness; doing that
+            // per block per window would spend the dispatch win on memcpy.
+            let blocks: Vec<&bitcoin::Block> = chunk.iter().map(|drained| &drained.block).collect();
             let bodies: Vec<bytes::Bytes> = chunk
                 .iter()
                 .map(|drained| drained.serialized.clone())

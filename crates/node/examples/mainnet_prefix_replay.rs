@@ -127,19 +127,20 @@ fn apply_window(
         )
         .context("accept window headers")?;
     }
-    bitcoin_rs_node::apply::apply_window(handles, blocks, raw).map_err(|error| {
+    let borrowed: Vec<&Block> = blocks.iter().collect();
+    bitcoin_rs_node::apply::apply_window(handles, &borrowed, raw).map_err(|error| {
         // Name the block that failed. Most `ApplyError`s carry no height or
         // hash, so a bare "apply window" leaves a 64-block range to search and
         // nothing to resume from. `applied` is the count that committed, so the
         // block at that index is the one that stopped it.
-        let blame = blocks.get(error.applied).map_or_else(
+        let blame = borrowed.get(error.applied).map_or_else(
             || "unknown block".to_owned(),
             |block| format!("block {}", block.block_hash()),
         );
         anyhow::Error::new(error.source).context(format!(
             "apply window: {blame} failed after {} of {} blocks committed",
             error.applied,
-            blocks.len()
+            borrowed.len()
         ))
     })?;
     blocks.clear();
