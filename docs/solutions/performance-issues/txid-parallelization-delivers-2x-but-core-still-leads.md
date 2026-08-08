@@ -338,6 +338,15 @@ With the harness matched, the arithmetic closes for the first time. Apply is 76.
 
 Closing all of them lands at **64.0s against Core's 59.6s = 1.07×**, which is parity within a rounding of the noise band.
 
+**One item is already tested and closed: `utxo_commit` is real work, not fan-out overhead.** `UtxoSet::commit` fans out over active shards above `PARALLEL_LISTENER_SHARD_THRESHOLD = 8`, which looked like a third instance of the unpaid-parallelism pattern. It is not. Paired 3× medians with the threshold at 8 versus effectively infinite:
+
+| | elapsed | `utxo_commit` |
+|---|---|---|
+| parallel shards (threshold 8) | 84.2s | 5.5s |
+| serial shards | 84.7s | 5.5s |
+
+Identical. On blocks this small the active shard count rarely reaches 8, so the serial path is already what runs — there is no dispatch to remove. Closing the 3.51s against Core's flush needs a change to what the commit *does*, not to how it is scheduled. That drops the program to four items worth ~17s.
+
 **This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
 
 1. Treat these as **one program, not five candidates**. Gate the program on the cumulative number, and use paired interleaved runs with more than three repetitions to resolve each step.
