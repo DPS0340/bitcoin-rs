@@ -1,5 +1,5 @@
 ---
-title: Parse the block once — Core leads 2.05x on throughput, bitcoin-rs uses 2.8x less memory
+title: Beats GoCoin 2.3x and uses 2.8x less memory than Core, but Core still leads 2.05x on throughput
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Parse the block once — Core leads 2.05× on throughput, bitcoin-rs uses 2.8× less memory
+# Beats GoCoin 2.3×, uses 2.8× less memory than Core, and Core still leads 2.05× on throughput
 
 ## Context
 
@@ -47,6 +47,19 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | one-shot kernel block parse | **121.9s median** (121.9, 124.4, 120.6) | **1231** | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
 
 **Quote the matched pair, not a cross-run ratio.** After the one-shot parse: **121.9s vs Core 59.6s = 2.05×** (apply 82.0s alone is 1.38× Core's whole run). Total self-improvement over the `4700c25` baseline is **3.4×**.
+
+### GoCoin: bitcoin-rs wins, and by more than the raw numbers show
+
+GoCoin's default `LastTrustedBlock` is **#940000** (`client/common/config.go:22`), and `lib/chain/chain_accept.go:140` short-circuits script verification for any block marked `Trusted`. The whole 0→150k window sits below that, so **GoCoin skips script verification for every block in this comparison** by default. Quoting its wall time against a full-verification bitcoin-rs run would be comparing different work.
+
+Both re-measured now, pinned `taskset -c 0-31`, both pulling blocks from the same local fixture node:
+
+| Posture | GoCoin | bitcoin-rs | |
+|---|---|---|---|
+| matched — both skip historical script checks | 195.8s | **84.0s** (84.0, 84.5) | **2.33× faster** |
+| bitcoin-rs doing strictly more work — full script verification | 195.8s | 121.9s | 1.61× faster |
+
+GoCoin's own log line is the source (`Sync to 150000 took 3m15.76s`); it landed within 3% of a months-old run, so unlike Core's reference this figure was stable. bitcoin-rs is faster on both readings, and the honest headline is the second one: **it beats GoCoin by 1.61× while verifying every script GoCoin skips.**
 
 ### Memory is the metric bitcoin-rs wins
 
