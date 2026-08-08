@@ -114,7 +114,7 @@ elapsed              157.8s      fetch 22.4s   decode 3.6s   RSS 212 MB
 
 Two things this reframes:
 
-1. **~22.4s of the 157.8s is REST fetch**, a harness cost Core's `-reindex-chainstate` never pays — it reads local `blk` files. Apply-only is **128.9s vs Core's 67s = 1.92×**, so the headline 2.36× overstates the engine gap; 1.92× is the defensible lower bound (Core's 67s does include its own block reads).
+1. **~22.4s of the 157.8s is REST fetch**, a harness cost Core's `-reindex-chainstate` never pays — it reads local `blk` files. *(Historical: this was the first sighting of the harness asymmetry. Both sides of the ratio quoted here are superseded — Core's 67s by the re-derived 59.6s, and the REST fetch itself by the local-block-file source. The correct figure is 1.42×; see the harness section.)*
 2. **`script_verify` at 84.9s already exceeds Core's entire 67s run**, and non-script apply (44.0s) is by itself two-thirds of Core's total. Both halves need work; neither alone closes the gap.
 
 **Pinning is load control, not a core handicap.** The same `0e2dda5` build run *unpinned* on all 80 CPUs measures **190.7s** (188.0, 190.7, 191.5) — 21% *slower* than the pinned 157.8s — because this box is shared and carried load average 7.7–18.5 during the run. Giving the replay every CPU means contending for them; pinning 32 gives it 32 it mostly keeps. So `taskset -c 0-31` is the reproducible measurement, not an artificial handicap, and any cross-node ratio quoted from an unpinned run on a busy host is contention noise. The corollary matters for the Core comparison: **Core's 67s reference was captured at another time under unknown load**, so the 2.36×/1.92× figures carry that uncertainty on both sides and should be re-derived from a back-to-back idle-host pair before anyone treats them as final.
@@ -315,7 +315,7 @@ Post-refactor decomposition beside Core's `-debug=bench` figures for the identic
 | remainder | ~9.4s | ~7.5s (`Fork checks` + postprocess) | |
 | **total** | **80.7s** | **55.80s** | |
 
-**Fairness note.** Core's `-reindex-chainstate` already holds its `blk` files and writes no block bodies; our replay persists them, so 4.18s of our apply is storage work Core does not do *in this benchmark*. It is not dead weight — a real node must store blocks, and Core pays it during IBD — but a strict engine-to-engine ratio should exclude it: **116.4s vs 59.6s = 1.95×**, or apply-only 76.5s vs 55.80s = 1.37×.
+**Fairness note.** Core's `-reindex-chainstate` already holds its `blk` files and writes no block bodies; our replay persists them, so 4.18s of our apply is storage work Core does not do *in this benchmark*. It is not dead weight — a real node must store blocks, and Core pays it during IBD — but a strict engine-to-engine ratio should exclude it. On the current local-block-file measurement that is **80.4s vs 59.6s = 1.35×**, against the headline 1.42×.
 
 ### The one lever left, and why it is a separate change
 
