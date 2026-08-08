@@ -508,13 +508,13 @@ fn apply_block_inner(
     let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
         .map_err(ApplyError::Consensus)?;
     if kernel_block.transaction_count() != block.txdata.len() {
-        return Err(ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Kernel(
-            format!(
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
                 "kernel parsed {} transactions, decoder produced {}",
                 kernel_block.transaction_count(),
                 block.txdata.len()
-            ),
-        )));
+            )),
+        ));
     }
     let tx_plan = plan_block_transactions_with_txids(
         block,
@@ -1918,9 +1918,9 @@ mod consensus_rule_tests {
     /// Parses `block` the way production does, so tests exercise the real
     /// one-shot kernel parse rather than a stand-in.
     fn kernel_block_of(block: &bitcoin::Block) -> bitcoin_rs_consensus::kernel::KernelBlock {
-        bitcoin_rs_consensus::kernel::KernelBlock::parse(
-            &bitcoin::consensus::encode::serialize(block),
-        )
+        bitcoin_rs_consensus::kernel::KernelBlock::parse(&bitcoin::consensus::encode::serialize(
+            block,
+        ))
         .unwrap_or_else(|error| panic!("test block must parse: {error}"))
     }
 
@@ -3149,8 +3149,8 @@ mod consensus_rule_tests {
                 1,
                 0,
                 bitcoin_rs_script::VerifyFlags::NONE,
-            &kernel_block_of(&block),
-        )
+                &kernel_block_of(&block),
+            )
             .is_ok()
         );
         let error = match check_coinbase_maturity_with_tx_plan(

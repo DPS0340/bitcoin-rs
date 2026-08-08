@@ -467,7 +467,10 @@ fn prepare_block_input_checks<'b>(
     locktime_cutoff: u32,
     // Unused by the portable backend, which verifies rust-bitcoin transactions
     // directly; kept in the signature so both backends share one call shape.
-    #[cfg_attr(not(feature = "kernel"), expect(unused_variables, reason = "kernel-only"))]
+    #[cfg_attr(
+        not(feature = "kernel"),
+        expect(unused_variables, reason = "kernel-only")
+    )]
     kernel_block: &'b crate::kernel::KernelBlock,
 ) -> (Vec<PreparedTx<'b>>, Vec<InputCheck>) {
     let mut prepared = Vec::with_capacity(txs.len());
@@ -513,11 +516,9 @@ fn prepare_block_input_checks<'b>(
         // Build retained kernel state before checks so setup failure cannot
         // leave an InputCheck without its PreparedKernelTx.
         #[cfg(feature = "kernel")]
-        let kernel_state = match kernel_block
-            .transaction(tx_index)
-            .and_then(|kernel_tx| {
-                crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
-            }) {
+        let kernel_state = match kernel_block.transaction(tx_index).and_then(|kernel_tx| {
+            crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
+        }) {
             Ok(state) => state,
             Err(setup_error) => {
                 prepared.push(PreparedTx {
