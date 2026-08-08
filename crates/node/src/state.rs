@@ -188,6 +188,12 @@ pub enum ApplyError {
         /// Block whose body was rejected.
         hash: bitcoin_rs_primitives::Hash256,
     },
+    /// Reading a BIP157 filter header failed.
+    ///
+    /// A broken backend, not a missing row: an absent header is answered by
+    /// skipping the filter write, which keeps the chain moving.
+    #[error("filter header lookup: {0}")]
+    FilterHeaderLookup(#[source] bitcoin_rs_filters::FilterIndexError),
     /// Rewinding the block-level coinstats failed.
     ///
     /// The per-coin fields ride the UTXO change listener and are already

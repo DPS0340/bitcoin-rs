@@ -529,6 +529,112 @@ impl ApplyHandles {
     }
 }
 
+/// Everything a disconnect can refuse, decided before anything is mutated.
+///
+/// Split out because the ordering matters more than the code: if a check can
+/// live here it must, since a refusal from this function costs nothing while a
+/// refusal after the first write leaves a partly disconnected chain. Anything
+/// added to `disconnect_block` that can fail belongs here unless it physically
+/// cannot run this early.
+struct DisconnectPlan {
+    parent_tip: TipSnapshot,
+    undo: bitcoin_rs_utxo::UndoBatch,
+    height: u32,
+    tx_count_delta: u64,
+}
+
+fn plan_disconnect(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    block_hash: Hash256,
+) -> core::result::Result<DisconnectPlan, ApplyError> {
+    let applied = handles
+        .applied_tip
+        .load_full()
+        .ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: block_hash,
+        })?;
+    // The height is read from the snapshot, never from the caller. A caller
+    // that could pass one would be able to disagree with the tip, and the undo
+    // key and the index rollback are both keyed by it.
+    let height = applied.height;
+    if applied.hash != block_hash {
+        return Err(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        });
+    }
+
+    // The header hash proves the caller named the right block; it does not
+    // prove they handed over that block's transactions. Index rollback walks
+    // the body, so an altered body under a matching header would delete rows
+    // belonging to transactions the block never contained.
+    if !block.check_merkle_root() {
+        return Err(ApplyError::DisconnectBodyMismatch { hash: block_hash });
+    }
+
+    let parent_tip = {
+        let tree = handles.block_tree.read();
+        let node = tree.node(applied.tip_id)?;
+        let parent_id = node.parent.ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        })?;
+        let parent = tree.node(parent_id)?;
+        TipSnapshot {
+            tip_id: parent_id,
+            height: parent.height,
+            chainwork: parent.chainwork,
+            hash: parent.hash,
+        }
+    };
+
+    let encoded = handles
+        .undo_store
+        .load_undo(height, block_hash)
+        .map_err(ApplyError::UndoRead)?
+        .ok_or(ApplyError::UndoRecordMissing {
+            hash: block_hash,
+            height,
+        })?;
+    let undo = bitcoin_rs_utxo::undo_codec::decode(&encoded, block_hash).map_err(|error| {
+        ApplyError::UndoRecordUnreadable {
+            hash: block_hash,
+            reason: error.to_string(),
+        }
+    })?;
+
+    // The coinstats rewind itself has to run after `undo_block`, because the
+    // per-coin fields ride the UTXO change listener. This is the only place its
+    // preconditions can be checked while a refusal is still free.
+    let tx_count_delta = tx_count_delta_for(block);
+    let stats = handles.coin_stats.snapshot();
+    if stats.height != height {
+        return Err(ApplyError::CoinStatsRewind(
+            bitcoin_rs_coinstats::CoinStatsRewindError::HeightMismatch {
+                expected: height,
+                found: stats.height,
+            },
+        ));
+    }
+    if stats.tx_count < tx_count_delta {
+        return Err(ApplyError::CoinStatsRewind(
+            bitcoin_rs_coinstats::CoinStatsRewindError::TxCountUnderflow {
+                tx_count: stats.tx_count,
+                tx_delta: tx_count_delta,
+            },
+        ));
+    }
+
+    Ok(DisconnectPlan {
+        parent_tip,
+        undo,
+        height,
+        tx_count_delta,
+    })
+}
+
 /// Disconnects the applied tip, restoring the consensus state the block
 /// replaced.
 ///
@@ -591,86 +697,12 @@ pub fn disconnect_block(
     use bitcoin::hashes::Hash as _;
 
     let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-    let applied = handles
-        .applied_tip
-        .load_full()
-        .ok_or(ApplyError::DisconnectNotTip {
-            hash: block_hash,
-            tip: block_hash,
-        })?;
-    // The height is read from the snapshot, never from the caller. A caller
-    // that could pass one would be able to disagree with the tip, and the
-    // undo key and index rollback are both keyed by it.
-    let height = applied.height;
-    if applied.hash != block_hash {
-        return Err(ApplyError::DisconnectNotTip {
-            hash: block_hash,
-            tip: applied.hash,
-        });
-    }
-
-    // The header hash proves the caller named the right block; it does not
-    // prove they handed over that block's transactions. Index rollback walks
-    // the body, so an altered body under a matching header would delete rows
-    // belonging to transactions the block never contained.
-    if !block.check_merkle_root() {
-        return Err(ApplyError::DisconnectBodyMismatch { hash: block_hash });
-    }
-
-    let parent_tip = {
-        let tree = handles.block_tree.read();
-        let node = tree.node(applied.tip_id)?;
-        let parent_id = node.parent.ok_or(ApplyError::DisconnectNotTip {
-            hash: block_hash,
-            tip: applied.hash,
-        })?;
-        let parent = tree.node(parent_id)?;
-        TipSnapshot {
-            tip_id: parent_id,
-            height: parent.height,
-            chainwork: parent.chainwork,
-            hash: parent.hash,
-        }
-    };
-
-    let encoded = handles
-        .undo_store
-        .load_undo(height, block_hash)
-        .map_err(ApplyError::UndoRead)?
-        .ok_or(ApplyError::UndoRecordMissing {
-            hash: block_hash,
-            height,
-        })?;
-    let undo = bitcoin_rs_utxo::undo_codec::decode(&encoded, block_hash).map_err(|error| {
-        ApplyError::UndoRecordUnreadable {
-            hash: block_hash,
-            reason: error.to_string(),
-        }
-    })?;
-
-    // Validate the coinstats rewind before anything is touched. The rewind
-    // itself has to run after `undo_block`, because the per-coin fields ride
-    // the UTXO change listener, so this is the only place the check is free.
-    let tx_count_delta = tx_count_delta_for(block);
-    {
-        let stats = handles.coin_stats.snapshot();
-        if stats.height != height {
-            return Err(ApplyError::CoinStatsRewind(
-                bitcoin_rs_coinstats::CoinStatsRewindError::HeightMismatch {
-                    expected: height,
-                    found: stats.height,
-                },
-            ));
-        }
-        if stats.tx_count < tx_count_delta {
-            return Err(ApplyError::CoinStatsRewind(
-                bitcoin_rs_coinstats::CoinStatsRewindError::TxCountUnderflow {
-                    tx_count: stats.tx_count,
-                    tx_delta: tx_count_delta,
-                },
-            ));
-        }
-    }
+    let DisconnectPlan {
+        parent_tip,
+        undo,
+        height,
+        tx_count_delta,
+    } = plan_disconnect(handles, block, block_hash)?;
 
     if let Some(tx_index) = &handles.tx_index {
         tx_index
@@ -704,6 +736,20 @@ pub fn disconnect_block(
         {
             blocks.pop();
         }
+    }
+
+    // The cache maps one block to its filter header. Leaving the disconnected
+    // block there is not a correctness bug, because lookups are keyed by the
+    // tip's hash and would simply miss, but it is a lie about what the node
+    // last indexed. Replace it with the parent's header when the index has one,
+    // and clear it otherwise so the next connect asks storage.
+    {
+        let parent_header = handles
+            .filter_index
+            .filter_header(parent_tip.hash)
+            .ok()
+            .flatten();
+        *handles.filter_header_cache.lock() = parent_header.map(|header| (parent_tip.hash, header));
     }
 
     // The per-coin coinstats fields need nothing here: `coin_stats` is the
@@ -1118,23 +1164,35 @@ fn apply_block_inner(
         .record(coin_stats_dur.as_secs_f64());
     let filter_started = quanta::Instant::now();
     if let Some(filter_bytes) = filter_bytes {
-        let prev_filter_header = previous_filter_header(handles, prior.as_deref());
-        match handles
-            .filter_index
-            .put_filter(block_hash, prev_filter_header, &filter_bytes)
-        {
-            Ok(filter_header) => {
-                *handles.filter_header_cache.lock() = Some((block_hash, filter_header));
-                tracing::debug!(
-                    height,
-                    %filter_header,
-                    bytes = filter_bytes.len(),
-                    "filter_index stored block filter"
-                );
+        if let Some(prev_filter_header) = previous_filter_header(handles, prior.as_deref()) {
+            match handles
+                .filter_index
+                .put_filter(block_hash, prev_filter_header, &filter_bytes)
+            {
+                Ok(filter_header) => {
+                    *handles.filter_header_cache.lock() = Some((block_hash, filter_header));
+                    tracing::debug!(
+                        height,
+                        %filter_header,
+                        bytes = filter_bytes.len(),
+                        "filter_index stored block filter"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(height, %error, "filter_index failed to store block filter");
+                }
             }
-            Err(error) => {
-                tracing::warn!(height, %error, "filter_index failed to store block filter");
-            }
+        } else {
+            // Skip the write rather than chain from zero. A BIP157 header is a
+            // hash over its predecessor, so a chain that restarts mid-way is
+            // invalid, not short, and verifies wrongly with no way to tell.
+            // Writing nothing leaves the index unavailable from here, which a
+            // backfill can repair.
+            tracing::warn!(
+                height,
+                %block_hash,
+                "no BIP157 filter header for the previous block; skipping this block's filter"
+            );
         }
     }
     let filter_dur = filter_started.elapsed();
@@ -1226,21 +1284,44 @@ fn applied_predecessor(
     Ok((prior, height))
 }
 
-fn previous_filter_header(handles: &ApplyHandles, prior: Option<&TipSnapshot>) -> Hash256 {
+/// The BIP157 filter header the next filter chains from, when one exists.
+///
+/// Zero is valid for exactly one caller: the genesis block, whose parent
+/// header is defined as zero. Everywhere else zero is a wrong answer that
+/// looks like a right one, because BIP157 defines each header as a hash over
+/// the previous one. A chain that restarts mid-way is not a shorter valid
+/// chain; it is an invalid one, and a light client verifying against it gets
+/// wrong answers with no way to tell.
+///
+/// Never returns an error, and never fails a block. Filters are optional
+/// derived state written after the block has already applied, so neither an
+/// absent row nor a broken backend may turn an applied block into a failure.
+/// Both answer `None`, the caller skips the write, and the index stays
+/// unavailable from that point until a backfill repairs it.
+///
+/// `None` is not the old bug wearing a new hat. The old code returned zero and
+/// wrote a header, producing an index that verifies wrongly. This writes
+/// nothing, which is honest and repairable.
+fn previous_filter_header(handles: &ApplyHandles, prior: Option<&TipSnapshot>) -> Option<Hash256> {
     let Some(tip) = prior else {
-        return Hash256::default();
+        return Some(Hash256::default());
     };
     if let Some((cached_hash, cached_header)) = handles.filter_header_cache.lock().as_ref()
         && *cached_hash == tip.hash
     {
-        return *cached_header;
+        return Some(*cached_header);
     }
-    handles
-        .filter_index
-        .filter_header(tip.hash)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    match handles.filter_index.filter_header(tip.hash) {
+        Ok(header) => header,
+        Err(error) => {
+            tracing::warn!(
+                prior_hash = %tip.hash,
+                %error,
+                "filter header lookup failed; skipping this block's filter"
+            );
+            None
+        }
+    }
 }
 
 fn applied_header_tip(
@@ -4432,7 +4513,89 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// With no filter header for the parent, the block's filter must be skipped
+    /// rather than written chained from zero.
+    ///
+    /// A BIP157 header is a hash over its predecessor, so a chain that restarts
+    /// mid-way is invalid rather than short, and a light client verifying
+    /// against it gets wrong answers with nothing to detect. Writing nothing
+    /// leaves the index unavailable from that point, which a backfill repairs.
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_block_whose_parent_has_no_filter_header_writes_no_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let handles = apply_handles_with_filter_index(
+            Network::Regtest,
+            Arc::new(UtxoSet::new()),
+            &filter_index,
+        );
+        // Genesis deliberately NOT seeded: this is the mid-chain enable case,
+        // where earlier blocks were applied without a filter index.
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+
+        assert!(
+            filter_index.headers.lock().get(&block_hash).is_none(),
+            "no filter header may be written when the parent has none"
+        );
+        assert!(
+            filter_index.prev_headers.lock().is_empty(),
+            "put_filter must not be called at all, not called with zero"
+        );
+        assert!(
+            handles.filter_header_cache.lock().is_none(),
+            "the cache must not advertise a header that was never written"
+        );
+        Ok(())
+    }
+
+    /// Records genesis's BIP158 filter, as a real node does when it applies
+    /// genesis through `apply_block`.
+    ///
+    /// Fixtures that install genesis with `applied_header_tip` get the header
+    /// but not the filter, so the block after it finds no predecessor header
+    /// and its own filter is skipped. That skip is correct behaviour and wrong
+    /// setup, so the setup is what changes.
+    ///
+    /// The filter is computed, not stubbed. Genesis's coinbase spends nothing,
+    /// so it needs no prevout lookup, and an arbitrary byte string here would
+    /// seed a header that no real node would ever produce.
+    fn seed_genesis_filter(
+        filter_index: &RecordingFilterIndex,
+        genesis: &bitcoin::Block,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::hashes::Hash as _;
+
+        let filter = bitcoin::bip158::BlockFilter::new_script_filter(
+            genesis,
+            |outpoint| -> Result<ScriptBuf, bitcoin::bip158::Error> {
+                Err(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+            },
+        )?;
+        filter_index.put_filter(
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            Hash256::default(),
+            &filter.content,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn apply_block_persists_non_empty_filter_for_valid_same_block_spend()
     -> Result<(), Box<dyn std::error::Error>> {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -4447,6 +4610,7 @@ mod consensus_rule_tests {
             utxo_with_output(external_prevout, 1)?,
             &filter_index,
         );
+        seed_genesis_filter(&filter_index, &genesis)?;
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -5077,6 +5241,7 @@ mod consensus_rule_tests {
             Arc::new(UtxoSet::new()),
             &filter_index,
         );
+        seed_genesis_filter(&filter_index, &genesis)?;
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -5103,10 +5268,30 @@ mod consensus_rule_tests {
             .lock()
             .get(&block_1_hash)
             .ok_or_else(|| std::io::Error::other("first filter header missing"))?;
+        let genesis_filter_header = *filter_index
+            .headers
+            .lock()
+            .get(&Hash256::from_le_bytes(
+                genesis.block_hash().as_byte_array(),
+            ))
+            .ok_or_else(|| std::io::Error::other("genesis filter header missing"))?;
         let prev_headers = filter_index.prev_headers.lock();
-        assert_eq!(prev_headers.len(), 2);
-        assert_eq!(prev_headers[0], Hash256::default());
-        assert_eq!(prev_headers[1], first_filter_header);
+        // Three writes: the seeded genesis row, then blocks 1 and 2. Each links
+        // to the one before it, which is the whole BIP157 chain property.
+        assert_eq!(prev_headers.len(), 3);
+        assert_eq!(
+            prev_headers[0],
+            Hash256::default(),
+            "genesis chains from zero, the one place zero is right"
+        );
+        assert_eq!(
+            prev_headers[1], genesis_filter_header,
+            "block 1 must chain from genesis, not restart at zero"
+        );
+        assert_eq!(
+            prev_headers[2], first_filter_header,
+            "block 2 must chain from block 1"
+        );
         assert_eq!(
             *filter_index.header_lookup_count.lock(),
             1,
