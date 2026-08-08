@@ -61,6 +61,8 @@ Both re-measured now, pinned `taskset -c 0-31`, both pulling blocks from the sam
 
 GoCoin's own log line is the source (`Sync to 150000 took 3m15.76s`); it landed within 3% of a months-old run, so unlike Core's reference this figure was stable. bitcoin-rs is faster on both readings, and the honest headline is the second one: **it beats GoCoin by 1.61× while verifying every script GoCoin skips.**
 
+**These are deliberately the socket-fetch numbers, not the local-block-file ones.** GoCoin pulls blocks over P2P from the fixture node, so the comparable bitcoin-rs figures are the REST runs (84.0s assume-valid, 121.9s full-verify) where both nodes pay a socket round-trip. Quoting the 84.6s local-file result against GoCoin would reintroduce exactly the harness mismatch corrected above for Core.
+
 ### Memory is the metric bitcoin-rs wins
 
 Peak RSS over the same window, same validation posture, both pinned:
