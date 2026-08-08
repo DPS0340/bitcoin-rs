@@ -17,34 +17,49 @@ const MIN_COINBASE_SCRIPT_SIG_SIZE: usize = 2;
 const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 
 // Width of the script-verification pool. 16 was chosen on the belief that SMT
-// siblings slow secp256k1 down past that width. A matched-validation replay of
-// mainnet 0..150_000 measures otherwise on this host (3x medians, pinned):
+// siblings slow secp256k1 down past that width. A full-verification replay of
+// mainnet 0..150_000 reading local block files measures otherwise on this host
+// (2x medians, `taskset -c 0-31`, wall and CPU together):
 //
-//   16 threads on 32 physical cores (`taskset -c 0-31`)        173.1s
-//   32 threads on 32 physical cores (`taskset -c 0-31`)        157.8s
-//   32 threads on 16 physical cores + their SMT siblings
-//                                  (`taskset -c 0-15,40-55`)   158.9s
+//    8 threads   130.6s wall   474.2s CPU
+//   16 threads    97.7s wall   521.3s CPU
+//   24 threads    83.7s wall   590.9s CPU
+//   32 threads    78.4s wall   652.3s CPU
 //
-// The last two agree within run-to-run noise while the third uses half the
-// physical cores, so the gain tracks thread count and SMT pairing costs
-// nothing measurable here. Kept as a cap rather than raised to
+// Wall falls monotonically with width while CPU rises sublinearly, so unlike
+// the threshold below this genuinely trades: 32 buys 1.67x the wall of 8 for
+// 1.38x the CPU, and wall is what a syncing node is waiting on. 32 equals the
+// core count here, and an earlier sweep found no gain from exceeding it.
+//
+// Re-measured after the block source was matched to Core's; the numbers this
+// rationale first carried (157.8s at 32, 173.1s at 16) came from the contended
+// REST harness. Same conclusion, sounder evidence — see
+// `docs/solutions/performance-issues/`. Kept as a cap rather than raised to
 // `available_parallelism` so a many-core host does not oversubscribe
 // verification against the rest of the apply pipeline; widen only against a
 // fresh measurement on the target hardware.
 const MAX_SCRIPT_VERIFY_THREADS: usize = 32;
-// Blocks with fewer checks than this verify serially. A matched-validation
-// replay of mainnet 0..150_000 (3x medians, pinned `taskset -c 0-31`, the three
-// variants interleaved round-robin so page-cache warming hits them equally)
-// puts the optimum at 4, and the ordering held in every round:
+// Blocks with fewer checks than this verify serially. Measured on a
+// full-verification replay of mainnet 0..150_000 reading local block files,
+// `taskset -c 0-31`, three interleaved rounds, wall and CPU together:
 //
-//   threshold 16   155.8s      threshold 128   234.6s
-//   threshold  8   145.1s      threshold 512   297.3s
-//   threshold  4   139.4s      threshold  48   185.0s
+//   threshold    4    84.4s wall   946.6s CPU
+//   threshold   16    80.1s wall   773.2s CPU
+//   threshold   32    75.5s wall   649.6s CPU   <- both optima
+//   threshold   64    78.4s wall   533.6s CPU
+//   threshold  128    94.0s wall   390.7s CPU
 //
-// The curve is monotonic and steep above 16, so a higher threshold is never
-// right here: even a handful of inputs is worth the fan-out. Below 4 it turns
-// back up (threshold 2 measured 143.8s single-run), which sets the floor.
-const MIN_PARALLEL_SCRIPT_CHECKS: usize = 4;
+// 32 is the wall minimum and also beats every smaller value on CPU, so it
+// dominates rather than trades. CPU keeps falling above it, but wall turns
+// sharply at 128, and a node that finishes later has not saved anything.
+//
+// This replaced a value of 4, which an earlier sweep picked while the harness
+// fetched every block over REST from a second bitcoind competing for the same
+// cores. That contention inflated the serial path and made ever-finer fan-out
+// look free. Re-measured against local block files the ordering inverts, and 4
+// is now the worst point tested on both axes. Do not tune this against a
+// harness that shares CPU with the node, and do not tune it on wall alone.
+const MIN_PARALLEL_SCRIPT_CHECKS: usize = 32;
 static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     rayon::ThreadPoolBuilder::new()
@@ -348,7 +363,7 @@ fn verify_input_script_portable(
 }
 
 /// Per-transaction state retained across the flat block verify phases.
-struct PreparedTx {
+struct PreparedTx<'b> {
     tx_index: usize,
     prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
     pre_error: Option<ConsensusError>,
@@ -356,7 +371,9 @@ struct PreparedTx {
     checks_start: usize,
     checks_len: usize,
     #[cfg(feature = "kernel")]
-    kernel_state: Option<crate::kernel::PreparedKernelTx>,
+    kernel_state: Option<crate::kernel::PreparedKernelTx<bitcoinkernel::TransactionRef<'b>>>,
+    #[cfg(not(feature = "kernel"))]
+    _block: core::marker::PhantomData<&'b ()>,
 }
 
 /// One deferred per-input script check, indexing back into the prepared txs.
@@ -403,6 +420,7 @@ pub fn verify_block_input_scripts(
     locktime_cutoff: u32,
     flags: VerifyFlags,
     timings: &mut ScriptStageTimings,
+    kernel_block: &crate::kernel::KernelBlock,
 ) -> Result<(), ConsensusError> {
     if txs.len() != resolved.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
@@ -412,8 +430,13 @@ pub fn verify_block_input_scripts(
     }
 
     let prepare_started = Instant::now();
-    let (prepared, checks) =
-        prepare_block_input_checks(txs, resolved.as_mut_slice(), height, locktime_cutoff);
+    let (prepared, checks) = prepare_block_input_checks(
+        txs,
+        resolved.as_mut_slice(),
+        height,
+        locktime_cutoff,
+        kernel_block,
+    );
     timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
 
     let parallel_started = Instant::now();
@@ -452,12 +475,19 @@ pub fn verify_block_input_scripts(
 ///
 /// Preparation stops at the first pre-script failure so no later transaction
 /// can outrank it during the final ordered error scan.
-fn prepare_block_input_checks(
+fn prepare_block_input_checks<'b>(
     txs: &[bitcoin::Transaction],
     resolved: &mut [Vec<Option<bitcoin::TxOut>>],
     height: u32,
     locktime_cutoff: u32,
-) -> (Vec<PreparedTx>, Vec<InputCheck>) {
+    // Unused by the portable backend, which verifies rust-bitcoin transactions
+    // directly; kept in the signature so both backends share one call shape.
+    #[cfg_attr(
+        not(feature = "kernel"),
+        expect(unused_variables, reason = "kernel-only")
+    )]
+    kernel_block: &'b crate::kernel::KernelBlock,
+) -> (Vec<PreparedTx<'b>>, Vec<InputCheck>) {
     let mut prepared = Vec::with_capacity(txs.len());
     let mut checks = Vec::new();
     for (tx_index, tx) in txs.iter().enumerate() {
@@ -476,6 +506,8 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
+                    #[cfg(not(feature = "kernel"))]
+                    _block: core::marker::PhantomData,
                 });
                 continue;
             }
@@ -489,6 +521,8 @@ fn prepare_block_input_checks(
                     checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
+                    #[cfg(not(feature = "kernel"))]
+                    _block: core::marker::PhantomData,
                 });
                 break;
             }
@@ -497,7 +531,9 @@ fn prepare_block_input_checks(
         // Build retained kernel state before checks so setup failure cannot
         // leave an InputCheck without its PreparedKernelTx.
         #[cfg(feature = "kernel")]
-        let kernel_state = match crate::kernel::prepare_kernel_tx(tx, &prep.prevouts) {
+        let kernel_state = match kernel_block.transaction(tx_index).and_then(|kernel_tx| {
+            crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
+        }) {
             Ok(state) => state,
             Err(setup_error) => {
                 prepared.push(PreparedTx {
@@ -534,6 +570,8 @@ fn prepare_block_input_checks(
             checks_len,
             #[cfg(feature = "kernel")]
             kernel_state: Some(kernel_state),
+            #[cfg(not(feature = "kernel"))]
+            _block: core::marker::PhantomData,
         });
         // This tx's scripts still outrank its post error; that post error makes
         // every later transaction irrelevant to the ordered verdict.
@@ -549,7 +587,7 @@ fn prepare_block_input_checks(
 /// `&txs` by shared reference only.
 fn check_input(
     txs: &[bitcoin::Transaction],
-    prepared: &[PreparedTx],
+    prepared: &[PreparedTx<'_>],
     check: &InputCheck,
     flags: VerifyFlags,
 ) -> Result<(), ConsensusError> {
@@ -633,6 +671,24 @@ mod tests {
         verify_transaction, verify_transaction_borrowed, verify_transaction_borrowed_with_mtp,
         verify_transaction_with_mtp,
     };
+
+    /// Wraps `txs` in a block and parses it the way production does, so tests
+    /// exercise the real one-shot parse rather than a stand-in.
+    fn kernel_block_for(txs: &[Transaction]) -> crate::kernel::KernelBlock {
+        let block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::ONE,
+                prev_blockhash: bitcoin::BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 0,
+                bits: bitcoin::CompactTarget::from_consensus(0x2000_ffff),
+                nonce: 0,
+            },
+            txdata: txs.to_vec(),
+        };
+        crate::kernel::KernelBlock::parse(&bitcoin::consensus::serialize(&block))
+            .unwrap_or_else(|error| panic!("synthetic block must parse: {error}"))
+    }
     use crate::{ConsensusError, rust_path::UtxoView};
 
     #[test]
@@ -1256,7 +1312,8 @@ mod tests {
                 0,
                 0,
                 VerifyFlags::MANDATORY,
-                &mut ScriptStageTimings::default()
+                &mut ScriptStageTimings::default(),
+                &kernel_block_for(&txs)
             ),
             Err(ConsensusError::PrevoutMatrixSize {
                 expected: 1,
@@ -1284,6 +1341,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1308,6 +1366,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1343,6 +1402,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert_eq!(
             result,
@@ -1374,6 +1434,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
@@ -1407,7 +1468,8 @@ mod tests {
                 0,
                 0,
                 VerifyFlags::MANDATORY,
-                &mut ScriptStageTimings::default()
+                &mut ScriptStageTimings::default(),
+                &kernel_block_for(&txs)
             ),
             Ok(())
         );
@@ -1436,6 +1498,7 @@ mod tests {
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
+            &kernel_block_for(&txs),
         );
         assert!(
             matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),

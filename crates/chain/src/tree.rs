@@ -893,8 +893,8 @@ mod tests {
         assert_eq!(tree.tip_id(), Some(main_ids[40]));
         assert!(tree.active_by_height.is_trusted());
 
-        for (offset, side_id) in side_ids.iter().enumerate() {
-            let height = 19 + offset as u32;
+        for (offset, side_id) in (0_u32..).zip(side_ids.iter()) {
+            let height = 19 + offset;
             assert!(
                 tree.active_by_height
                     .replace_slot_for_test(height, *side_id)
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(tree.node(i25)?.parent, Some(i24));
 
         for (offset, &side_id) in side_ids.iter().enumerate() {
-            let height = 19 + offset as u32;
+            let height = 19 + u32::try_from(offset).expect("side chain offset fits u32");
             assert_eq!(tree.node(side_id)?.height, height);
             if height == 19 {
                 assert_eq!(tree.node(side_id)?.parent, Some(main_ids[18]));
@@ -1042,7 +1042,7 @@ mod tests {
         ];
         let expected: Vec<Hash256> = expected_heights
             .iter()
-            .map(|&h| hashes[h as usize])
+            .map(|&h| hashes[usize::try_from(h).expect("locator height fits usize")])
             .collect();
         assert_eq!(locator, expected);
         Ok(())

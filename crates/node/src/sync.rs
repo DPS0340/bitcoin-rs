@@ -376,6 +376,7 @@ impl BlockSync {
             }
         }
         self.send_prefix_probes(&sync_peer_selection.probe_peers, now);
+        self.request_headers_from_best_peer();
         if sent_getdata {
             self.record_pending_sync_metrics();
         }
@@ -463,6 +464,18 @@ impl BlockSync {
         if total_headers > 0 {
             tracing::debug!(total_headers, "block sync: drained inbound headers");
         }
+    }
+
+    /// Requests the next header batch from the highest peer above the applied
+    /// tip, using a locator taken after `drain_inbound_headers` so it reflects
+    /// headers accepted this tick.
+    ///
+    /// Called at the end of `tick`, after the getdata fan-out. Position is
+    /// deliberate: peers observe getdata before getheaders within a tick, which
+    /// several sync tests assert. Ordering carries no protocol meaning, but
+    /// both messages leave in the same tick either way, so there is no
+    /// throughput reason to prefer the other order.
+    fn request_headers_from_best_peer(&self) {
         let applied_tip = self.handles.applied_tip.load_full();
         let applied_height = applied_tip.as_ref().map_or(0, |tip| tip.height);
         let chain_tip = self.handles.chain_tip.load_full();

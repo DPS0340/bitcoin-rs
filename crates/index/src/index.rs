@@ -444,8 +444,7 @@ impl<S: KvStore> Indexer<S> {
         height: u32,
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, txid_count) =
-            pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
+        let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
         if txids.len() != txid_count {
             return self.ingest_block(block, height);
         }
@@ -471,7 +470,11 @@ impl<S: KvStore> Indexer<S> {
         self.ingest_rows(rows)
     }
 
-    fn ingest_rows(&mut self, rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
+    fn ingest_rows(&mut self, mut rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
+        // Dedup before counting: a block can generate the same funding or
+        // spending row twice, and only one copy is ever written. Counting the
+        // raw rows would report more rows than the store receives.
+        rows.sort();
         let block_counts = rows.counts();
         self.pending_rows.append(rows);
         if self.batch_depth == 0 || self.pending_rows.total() >= Self::FLUSH_THRESHOLD_ROWS {
@@ -526,7 +529,6 @@ impl<S: KvStore> Indexer<S> {
         Ok(())
     }
 }
-
 
 fn pending_rows_for_block(
     block: &[u8],
@@ -806,7 +808,9 @@ pub trait IndexerLike: Send + Sync {
     fn begin_batch(&mut self) {}
 
     /// Ends a batch of block ingests, flushing any accumulated rows.
-    fn end_batch(&mut self) -> Result<(), IndexError> { Ok(()) }
+    fn end_batch(&mut self) -> Result<(), IndexError> {
+        Ok(())
+    }
 
     /// Resolves a confirmed transaction by txid via `source`.
     ///
