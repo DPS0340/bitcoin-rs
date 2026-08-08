@@ -65,8 +65,14 @@ Or reproduce directly without `cargo-fuzz` by building the target and feeding
 the crash file on stdin (the `libfuzzer_sys` harness reads one file argument):
 
 ```sh
-cargo +nightly run --bin p2p_message -- fuzz/artifacts/p2p_message/crash-<hash>
+cargo +nightly run --manifest-path fuzz/Cargo.toml --bin p2p_message \
+  -- fuzz/artifacts/p2p_message/crash-<hash>
 ```
+
+`--manifest-path` is required. `fuzz/` declares its own workspace, so run from
+the repository root without it Cargo selects the root workspace, whose metadata
+exposes only the `bitcoin-rs` binary, and the command fails with `no bin target
+named p2p_message` before it reads the artifact.
 
 To get a full backtrace, set `RUST_BACKTRACE=1`:
 
