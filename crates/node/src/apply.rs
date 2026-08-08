@@ -1021,6 +1021,16 @@ pub fn disconnect_block(
     // consistent chain at a lower tip, which is recoverable by connecting
     // forward. Holding the marker across a whole switch would refuse startup for
     // that case and force a needless reindex.
+    // Read before arming. A branch switch disconnects several blocks in a row,
+    // and arming overwrites the marker, so an earlier disconnect's `RolledBack`
+    // debt — still owed a checkpoint — would be destroyed by the next arm and
+    // then cleared by a refusal. `prior` is what a refusal restores.
+    let prior = handles
+        .undo_store
+        .load_disconnect_marker()
+        .map_err(|error| {
+            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(error)))
+        })?;
     handles
         .undo_store
         .arm_disconnect(height, block_hash)
@@ -1036,7 +1046,19 @@ pub fn disconnect_block(
         let rollback = tx_index.lock().rollback_block(block, height);
         if let Err(error) = rollback {
             let refusal = ApplyError::IndexRollback(error);
-            return Err(match handles.undo_store.cancel_disconnect() {
+            // This disconnect touched nothing, so its own marker goes. Any debt
+            // that predated it is restored rather than dropped: a clean clear
+            // here would tell a restart the chain is whole when an earlier
+            // rollback in this same switch is still waiting for a checkpoint.
+            let restored = match prior {
+                Some(DisconnectMarker {
+                    hash,
+                    height,
+                    phase: DisconnectPhase::RolledBack,
+                }) => handles.undo_store.complete_disconnect(height, hash),
+                _ => handles.undo_store.cancel_disconnect(),
+            };
+            return Err(match restored {
                 Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
                 Err(disarm) => crate::DisconnectError::MarkerStuck {
                     hash: block_hash,
@@ -8272,6 +8294,194 @@ mod consensus_rule_tests {
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
+    }
+
+    /// In-memory bodies, so a branch switch can reload the blocks it needs.
+    #[derive(Default)]
+    struct MapBodyStore {
+        bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+    }
+
+    impl crate::apply::PruneBodyStore for MapBodyStore {
+        fn load_block_body(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            Ok(self.bodies.read().get(&(height, hash)).cloned())
+        }
+
+        fn persist_block_body(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+            body: &[u8],
+        ) -> Result<(), StorageError> {
+            self.bodies.write().insert((height, hash), body.to_vec());
+            Ok(())
+        }
+
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    /// Applies a chain of blocks and records every body, returning the tip hash.
+    fn apply_and_store(
+        handles: &ApplyHandles,
+        bodies: &MapBodyStore,
+        blocks: &[bitcoin::Block],
+    ) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
+        let mut last = None;
+        for block in blocks {
+            let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(block));
+            let tip = apply_block_with_serialized(handles, block, raw.clone())?;
+            bodies
+                .bodies
+                .write()
+                .insert((tip.height, tip.hash), raw.to_vec());
+            last = Some(tip.hash);
+        }
+        last.ok_or_else(|| anyhow::anyhow!("no blocks applied"))
+    }
+
+    /// The property that separates a full node from a chain follower: when a
+    /// competing branch outweighs the applied one, the node moves to it and the
+    /// coins move with it.
+    #[test]
+    fn a_competing_branch_replaces_the_applied_chain() -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        handles.chain_tip.store(handles.applied_tip.load_full());
+
+        // One block on the branch that will lose.
+        let losing = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let losing_hash = apply_and_store(&handles, &bodies, core::slice::from_ref(&losing))?;
+
+        // Two blocks on the branch that will win. Their bodies must exist
+        // before the switch, so they are recorded without being applied.
+        let win_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let win_two = mined_block_with_prev_hash_and_transactions(
+            win_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let mut winning_tip = None;
+        {
+            let mut tree = handles.block_tree.write();
+            for (height, block) in [(1_u32, &win_one), (2_u32, &win_two)] {
+                let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+                let id = tree.insert_header(
+                    block.header,
+                    bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+                )?;
+                bodies
+                    .bodies
+                    .write()
+                    .insert((height, hash), bitcoin::consensus::encode::serialize(block));
+                winning_tip = Some((id, hash));
+            }
+        }
+        let (target, winning_hash) =
+            winning_tip.ok_or_else(|| anyhow::anyhow!("no winning branch built"))?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(losing_hash),
+            "the node starts on the branch that loses"
+        );
+
+        crate::reorg::switch_to_branch(&handles, target)?;
+
+        let applied = handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| anyhow::anyhow!("no applied tip after the switch"))?;
+        assert_eq!(
+            applied.hash, winning_hash,
+            "the applied tip must be the heavier branch"
+        );
+        assert_eq!(applied.height, 2, "the heavier branch is two blocks long");
+        assert!(
+            !utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                losing.txdata[0].compute_txid().as_byte_array()
+            )),
+            "the losing branch's coinbase output must be gone from the set"
+        );
+        Ok(())
+    }
+
+    /// A branch switch disconnects several blocks in a row. Arming overwrites
+    /// the marker, so a refusal on the second disconnect must restore the debt
+    /// left by the first rather than clearing it — otherwise a restart is told
+    /// the chain is whole while a rollback still owes a checkpoint.
+    #[test]
+    fn a_refused_disconnect_preserves_an_earlier_rollbacks_debt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let store = Arc::new(InMemoryUndoStore::default());
+        let undo_arc = Arc::clone(&store);
+        let undo_handle: Arc<dyn UndoStore> = undo_arc;
+        handles.undo_store = undo_handle;
+
+        // Stand in for a disconnect that already completed and is waiting on a
+        // checkpoint: exactly the state the first block of a switch leaves.
+        let owed_hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        store.complete_disconnect(41, owed_hash)?;
+        assert!(
+            matches!(
+                store.load_disconnect_marker()?,
+                Some(DisconnectMarker {
+                    phase: DisconnectPhase::RolledBack,
+                    ..
+                })
+            ),
+            "the fixture must start with a rollback owing a checkpoint"
+        );
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+
+        // Force the refusal: an index that will not roll back.
+        handles.tx_index = Some(noop_tx_index());
+        let refusal = disconnect_block(&handles, &block);
+        assert!(
+            matches!(refusal, Err(crate::DisconnectError::Refused(_))),
+            "the disconnect must refuse without touching state, got {refusal:?}"
+        );
+
+        assert_eq!(
+            store.load_disconnect_marker()?,
+            Some(DisconnectMarker {
+                hash: owed_hash,
+                height: 41,
+                phase: DisconnectPhase::RolledBack,
+            }),
+            "a refusal must restore the earlier rollback's debt, not clear it"
+        );
+        Ok(())
     }
 
     fn apply_handles_for_network(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {

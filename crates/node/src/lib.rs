@@ -36,6 +36,9 @@ pub mod logging;
 pub mod metrics;
 /// Node-side active-chain view for server-side P2P responders.
 pub mod p2p_chain;
+
+/// Switching the applied chain from one branch to another.
+pub mod reorg;
 /// Top-level node runner.
 pub mod run;
 /// Graceful shutdown.
