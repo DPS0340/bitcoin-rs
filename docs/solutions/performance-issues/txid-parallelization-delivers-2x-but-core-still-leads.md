@@ -90,7 +90,9 @@ Each result stands on its own, and each is internally matched:
 * **1.42×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files.
 * **1.77×** is a clean whole-node comparison — same window, both at their own defaults, both pulling from the same fixture peer.
 
-The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack; that needs its own decomposition, and `node.sync.*` histograms exist for it.
+The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack.
+
+**Splitting the P2P gap is the obvious next measurement, and it needs one small piece of plumbing first.** The `node.sync.*` histograms already exist (`apply_buffered_blocks_seconds`, `stall_seconds`, `received_bytes`, `getdata_batch_size`, and others), and `MetricsHandle::snapshot()` renders them — but `install_metrics` deliberately ships without the Prometheus listener, so a running daemon has no external scrape path. Getting the numbers therefore means adding one, or dumping the snapshot at shutdown. Worth doing before anyone attributes the 1.77× whole-node gap to any particular subsystem; not worth guessing at in the meantime.
 
 What this does settle: Core leads on *both* throughput measurements available on this host (1.42× processing-bound, 1.77× over loopback P2P), and bitcoin-rs beats GoCoin on both. The two bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating 76.0s as precise.
 
