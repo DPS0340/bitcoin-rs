@@ -1,5 +1,5 @@
 ---
-title: Beats GoCoin 2.3x, uses 2.9x less memory than Core, and Core leads 1.26x on throughput once both pools are capped
+title: Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5x and took Core's lead to 1.28x
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Beats GoCoin 2.3×, uses 2.9× less memory than Core, and Core leads 1.26× once both pools are capped
+# Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5× and took Core's lead to 1.28×
 
 ## Context
 
@@ -47,7 +47,7 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | one-shot kernel block parse, REST source | 121.9s median (121.9, 124.4, 120.6) | 1231 | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
 | bitcoin-rs | **local block file source** | **84.6s median** (84.2, 84.6, 86.5) | **1774** | **224 MB** | `taskset -c 0-31` 3× | apply 76.7s; block source matched to Core |
 
-**Quote 75.2s vs 59.6s = 1.26×.** (84.6s stood until the two thread-pool fixes below; the row above predates them.) Every row above it fetched blocks over REST while Core read local `blk*.dat` files, so those ratios measure the harness as much as the engine — see the harness section below. Total self-improvement over the `4700c25` baseline is **4.6×**.
+**Quote the interleaved matched pairs at the top of the pool sections: replay 77.9s vs 60.7s = 1.28×, P2P 62.8s vs 45.9s = 1.37×.** Every row in this table predates the two thread-pool fixes. Every row above it fetched blocks over REST while Core read local `blk*.dat` files, so those ratios measure the harness as much as the engine — see the harness section below. Total self-improvement over the `4700c25` baseline is **4.6×**.
 
 ### GoCoin: bitcoin-rs wins, and by more than the raw numbers show
 
@@ -74,7 +74,7 @@ The processing-bound replay is not the only throughput metric the goal names, so
 | bitcoin-rs | 75.7 / 76.4s | **76.0s** | 1.77× slower |
 | GoCoin | 195.8s | 195.8s | bitcoin-rs 2.58× faster |
 
-The bitcoin-rs row is **superseded by the global-pool cap below**: it now syncs the same window in **64.6s**, so Core leads **1.52×** and bitcoin-rs is **3.03×** faster than GoCoin. The row is kept because the rest of this section reasons from it.
+The bitcoin-rs row is **superseded by both thread-pool fixes below**: it now syncs the same window in **62.8s**, so Core leads **1.37×** and bitcoin-rs is **3.12×** faster than GoCoin. The row is kept because the rest of this section reasons from it.
 
 **This is not the download-bound regime, despite being a P2P sync.** A loopback fixture imposes no bandwidth limit, so what this measures is validation plus P2P protocol overhead — closer to processing-bound than to real IBD. The genuine download-bound regime needs a bandwidth-constrained or real-network path, and the older full-tip figures (bitcoin-rs 27081s vs Core 42907s at 961k) were taken there and are **not** contradicted by this table. They are also months old and unverified this session; do not quote them without re-deriving.
 
@@ -82,14 +82,14 @@ The bitcoin-rs row is **superseded by the global-pool cap below**: it now syncs 
 
 | Measurement | bitcoin-rs | Core | ratio |
 |---|---|---|---|
-| replay, full verification | **75.2s** | 59.6s | **1.26×** |
+| replay, full verification | **77.9s** | 60.7s | **1.28×** |
 | P2P sync, both skip historical scripts | 76.0s | 43.0s | 1.77× |
 
 and inferred that because the second ratio is worse, stripping the tied crypto reveals "the non-crypto gap undiluted". **That inference was wrong.** The two runs do not share a common baseline: the P2P sync additionally executes header sync, net message processing, block-download scheduling, block staging, mempool bookkeeping, and an RPC server, none of which the replay runs at all. The difference between 1.42× and 1.77× therefore mixes script posture with entire subsystems, and attributing it to the apply path is unsupported.
 
 Each result stands on its own, and each is internally matched:
 
-* **1.26×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files. (This read 1.42× before the two thread-pool fixes.)
+* **1.28×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files, interleaved. (This read 1.42× before the two thread-pool fixes.)
 * **1.77×** is a clean whole-node comparison — same window, both at their own defaults, both pulling from the same fixture peer.
 
 The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack.
@@ -130,7 +130,7 @@ This is why the CPU axis was worth adding: the global pool was invisible to ever
 
 **Measure CPU alongside wall from now on.** Every sweep in this note before this one optimised wall time only, on an idle 128-core host. `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 is the clearest untested case: it won 1.15× of wall by pushing far more blocks through the pool, which is exactly the change that raises CPU. It has not been re-checked against CPU and should be, on hardware with a realistic core count, before it is treated as settled.
 
-What this settles: Core still leads both throughput measurements (**1.26×** processing-bound after the threshold fix, down from 1.42×; **1.52×** over loopback P2P after the pool cap, down from 1.77×) and leads CPU efficiency **2.46×** (160.0s vs 65.0s, down from 4.84×); bitcoin-rs beats GoCoin on both throughput figures. Earlier bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating any of these as precise.
+What this settles: Core still leads every figure, but by far less than this section first recorded. The final interleaved pairs are below; after the threshold fix landed on top of this cap, P2P settles at **1.37×** wall and **1.33×** CPU, not the 1.52×/2.46× measured with the cap alone. bitcoin-rs beats GoCoin on both throughput figures. Earlier bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating any of these as precise.
 
 ### The parallel threshold was tuned against a contended harness
 
@@ -154,6 +154,30 @@ Two rules come out of this, and they cost this note two wrong constants between 
 
 1. **Never tune a parallelism constant against a harness that shares CPU with the node.** The contended REST harness did not just add a constant; it changed the *shape* of the curve and reversed its optimum.
 2. **Never tune one on wall alone.** Both bad constants were wall-optimal on an idle many-core host and both were far off once CPU was measured.
+
+### Final matched pairs, both fixes in
+
+Interleaved on an idle host, `taskset -c 0-31`, three rounds each, wall and CPU captured together. These supersede every ratio earlier in this note.
+
+| Benchmark | | Core 31.0 | bitcoin-rs | Core leads |
+|---|---|---|---|---|
+| replay, full verification | wall | 60.7s | 77.9s | 1.28× |
+| | CPU | 463.6s | 652.5s | 1.41× |
+| P2P sync, both assume-valid | wall | 45.9s | 62.8s | 1.37× |
+| | CPU | 67.8s | 90.1s | 1.33× |
+
+What the two constants were worth, measured end to end:
+
+| | before | after | |
+|---|---|---|---|
+| P2P wall | 76.0s | 62.8s | 1.21× faster |
+| **P2P CPU** | **318.4s** | **90.1s** | **3.53× less** |
+| replay wall | 84.6s | 77.9s | 1.09× faster |
+| replay CPU | 946.6s | 652.5s | 1.45× less |
+
+The CPU gap against Core on the P2P sync went from **4.9× to 1.33×**. Neither fix added an optimisation: both removed parallelism that a contended harness had made look free. Against GoCoin's 195.8s the P2P margin is now **3.12×**.
+
+Core still leads every throughput and CPU figure here, so the parity goal is not met. But the remaining gaps are 1.28-1.41×, not the 2-5× this note opened with, and nothing left is a constant — see the stage decomposition below.
 
 ### Memory is the metric bitcoin-rs wins
 
