@@ -1,5 +1,5 @@
 ---
-title: Beats GoCoin 2.3x, uses 2.9x less memory than Core, and Core leads 1.42x on throughput once the harness is matched
+title: Beats GoCoin 2.3x, uses 2.9x less memory than Core, and Core leads 1.26x on throughput once both pools are capped
 date: 2026-08-07
 category: docs/solutions/performance-issues
 module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
@@ -21,7 +21,7 @@ tags:
   - replay
 ---
 
-# Beats GoCoin 2.3×, uses 2.9× less memory than Core, and Core leads 1.42× once the harness is matched
+# Beats GoCoin 2.3×, uses 2.9× less memory than Core, and Core leads 1.26× once both pools are capped
 
 ## Context
 
@@ -47,7 +47,7 @@ Same machine (128 cores), serial runs, local REST blocks (fjall, full verificati
 | bitcoin-rs | one-shot kernel block parse, REST source | 121.9s median (121.9, 124.4, 120.6) | 1231 | 226 MB | `taskset -c 0-31` 3× paired against the prior binary | apply 82.0s, `script_prepare` 4.29s |
 | bitcoin-rs | **local block file source** | **84.6s median** (84.2, 84.6, 86.5) | **1774** | **224 MB** | `taskset -c 0-31` 3× | apply 76.7s; block source matched to Core |
 
-**Quote 84.6s vs 59.6s = 1.42×.** Every row above it fetched blocks over REST while Core read local `blk*.dat` files, so those ratios measure the harness as much as the engine — see the harness section below. Total self-improvement over the `4700c25` baseline is **4.6×**.
+**Quote 75.2s vs 59.6s = 1.26×.** (84.6s stood until the two thread-pool fixes below; the row above predates them.) Every row above it fetched blocks over REST while Core read local `blk*.dat` files, so those ratios measure the harness as much as the engine — see the harness section below. Total self-improvement over the `4700c25` baseline is **4.6×**.
 
 ### GoCoin: bitcoin-rs wins, and by more than the raw numbers show
 
@@ -82,14 +82,14 @@ The bitcoin-rs row is **superseded by the global-pool cap below**: it now syncs 
 
 | Measurement | bitcoin-rs | Core | ratio |
 |---|---|---|---|
-| replay, full verification | 84.6s | 59.6s | 1.42× |
+| replay, full verification | **75.2s** | 59.6s | **1.26×** |
 | P2P sync, both skip historical scripts | 76.0s | 43.0s | 1.77× |
 
 and inferred that because the second ratio is worse, stripping the tied crypto reveals "the non-crypto gap undiluted". **That inference was wrong.** The two runs do not share a common baseline: the P2P sync additionally executes header sync, net message processing, block-download scheduling, block staging, mempool bookkeeping, and an RPC server, none of which the replay runs at all. The difference between 1.42× and 1.77× therefore mixes script posture with entire subsystems, and attributing it to the apply path is unsupported.
 
 Each result stands on its own, and each is internally matched:
 
-* **1.42×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files.
+* **1.26×** is a clean apply-path comparison — same window, same full-verification posture, both reading local files. (This read 1.42× before the two thread-pool fixes.)
 * **1.77×** is a clean whole-node comparison — same window, both at their own defaults, both pulling from the same fixture peer.
 
 The apply-path decomposition below rests on the replay alone, which is why it is trustworthy. Nothing here licenses a claim about how much of the P2P gap is apply versus sync stack.
@@ -130,7 +130,30 @@ This is why the CPU axis was worth adding: the global pool was invisible to ever
 
 **Measure CPU alongside wall from now on.** Every sweep in this note before this one optimised wall time only, on an idle 128-core host. `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 is the clearest untested case: it won 1.15× of wall by pushing far more blocks through the pool, which is exactly the change that raises CPU. It has not been re-checked against CPU and should be, on hardware with a realistic core count, before it is treated as settled.
 
-What this settles: Core still leads both throughput measurements (1.42× processing-bound, **1.52×** over loopback P2P after the cap, down from 1.77×) and leads CPU efficiency **2.46×** (160.0s vs 65.0s, down from 4.84×); bitcoin-rs beats GoCoin on both throughput figures. Earlier bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating any of these as precise.
+What this settles: Core still leads both throughput measurements (**1.26×** processing-bound after the threshold fix, down from 1.42×; **1.52×** over loopback P2P after the pool cap, down from 1.77×) and leads CPU efficiency **2.46×** (160.0s vs 65.0s, down from 4.84×); bitcoin-rs beats GoCoin on both throughput figures. Earlier bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating any of these as precise.
+
+### The parallel threshold was tuned against a contended harness
+
+Capping the global pool exposed a second, older instance of the same mistake. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to **4** by a sweep run while the harness fetched every block over REST from a second `bitcoind` competing for the same cores. That contention inflated the serial path, so finer and finer fan-out kept looking free and the sweep ran to its floor.
+
+Re-measured against local block files, three interleaved rounds, `taskset -c 0-31`, both axes:
+
+| threshold | wall | CPU |
+|---|---|---|
+| 4 (previous) | 84.4s | 946.6s |
+| 16 | 80.1s | 773.2s |
+| **32** | **75.5s** | **649.6s** |
+| 64 | 78.4s | 533.6s |
+| 128 | 94.0s | 390.7s |
+
+The ordering **inverts** once the harness stops stealing CPU: 4 is now the worst point tested on both axes, and the old sweep's monotonic "lower is always better" curve was an artefact of the contention. 32 is the wall minimum and also beats every smaller value on CPU, so it dominates rather than trades. CPU keeps falling above 32, but wall turns sharply at 128 and a node that finishes later has saved nothing.
+
+Compiled binary, no env var, three runs: **75.2s wall, 643.8s CPU**, all 150001 blocks validated at `assume_valid_height=0` to the correct tip hash. Against the previous 84.6s that is **1.12× faster and 1.47× less CPU**, and it moves the standing gap against Core from 1.42× to **1.26×**.
+
+Two rules come out of this, and they cost this note two wrong constants between them:
+
+1. **Never tune a parallelism constant against a harness that shares CPU with the node.** The contended REST harness did not just add a constant; it changed the *shape* of the curve and reversed its optimum.
+2. **Never tune one on wall alone.** Both bad constants were wall-optimal on an idle many-core host and both were far off once CPU was measured.
 
 ### Memory is the metric bitcoin-rs wins
 
@@ -203,7 +226,7 @@ The first two cleared the tests but not the 1.05× noise floor; the third never 
 
 The fourth result retires the "FFI boundary is the remaining lever" hypothesis for its allocation half. Per-input `ScriptPubkey::new` is a ~25-byte `malloc` plus copy; at 3.3M inputs that is real allocator traffic, and removing it entirely changed nothing measurable. What the kernel spends inside `btck_script_pubkey_verify` is secp256k1 work, not marshalling. Marshalling-side micro-optimization is now closed as a class: four separate attempts (parallel prepare, serialize buffer, witness-free skip, prevout reuse) all landed at 0.98–1.00×.
 
-## Matching the harness moved the ratio from 2.05× to 1.42×
+## Matching the harness moved the ratio from 2.05× to 1.42×, and the pool fixes took it to 1.26×
 
 Every earlier number here fetched blocks over REST from a live `bitcoind`. Core's `-reindex-chainstate` reads its own `blk*.dat` files. That is not a like-for-like harness: the replay paid HTTP round-trips *and* competed for CPU with the process serving them, neither of which Core pays.
 
@@ -222,7 +245,7 @@ Note that *apply itself* improved, 82.0s → 76.7s, purely from removing the ser
 | apply | 55.80s | 76.7s | 1.37× slower |
 | peak RSS | 643 MB | **224 MB** | **2.87× leaner** |
 
-**Quote 1.42×.** The 2.05× and 2.22× figures earlier in this note measured the harness as much as the engine and are superseded. The lesson is the same one that produced the matched-pair section below: a ratio is only as good as the least-matched thing in it, and here the block source was the least-matched thing for the whole session.
+**Quote 1.26×.** This section's 1.42× was correct when written and is superseded by the two thread-pool fixes above, not by a harness change. The 2.05× and 2.22× figures earlier in this note measured the harness as much as the engine and are superseded. The lesson is the same one that produced the matched-pair section below: a ratio is only as good as the least-matched thing in it, and here the block source was the least-matched thing for the whole session.
 
 ## The matched pair — the only ratio worth quoting
 
@@ -463,7 +486,7 @@ That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**
 
 Only the last row approaches parity, and it requires undoing three things that are measured as irreducible: merkle is at its hashing floor, `utxo_commit` is real work, and `block_body_persist` has 0.66s of removable overhead in 3.28s. So parity is not one refactor away. Core is modestly faster across nearly every non-crypto stage at once — 3-4s here, 3-4s there — which is what a mature C++ implementation with tuned allocation and batching looks like, not a defect with a fix.
 
-What is genuinely true and worth carrying forward: script verification is a **tie**, memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.42×** and itemised. Anyone resuming should decide whether 1.42× on throughput is worth a broad re-engineering of the non-crypto apply path, rather than starting a multi-crate refactor expecting parity from it.
+What is genuinely true and worth carrying forward: script verification is a **tie**, memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.26×** and itemised. Anyone resuming should decide whether 1.26× on throughput is worth a broad re-engineering of the non-crypto apply path, rather than starting a multi-crate refactor expecting parity from it.
 
 ## Guidance
 
