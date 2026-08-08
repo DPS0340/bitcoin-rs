@@ -899,6 +899,7 @@ fn prove_window(
     // headers into the shared tree and would move median-time-past and softfork
     // state under the later blocks. Each apply re-derives all of it and
     // compares, so a captured value that turns out wrong costs the batch only.
+    let context_started = quanta::Instant::now();
     let mut contexts = Vec::with_capacity(blocks.len());
     {
         let tree = handles.block_tree.read();
@@ -944,6 +945,10 @@ fn prove_window(
         }
     }
 
+    metrics::histogram!("node.window.context_seconds")
+        .record(context_started.elapsed().as_secs_f64());
+
+    let prepare_started = quanta::Instant::now();
     let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, raw), context) in blocks.iter().zip(serialized).zip(&contexts) {
@@ -964,9 +969,13 @@ fn prove_window(
         prepared.push(unit);
     }
 
+    metrics::histogram!("node.window.prepare_seconds")
+        .record(prepare_started.elapsed().as_secs_f64());
+
     // One dispatch for the whole window. The check units borrow their kernel
     // blocks, so they live and die inside this scope, before anything commits.
     {
+        let checks_started = quanta::Instant::now();
         let mut units = Vec::with_capacity(prepared.len());
         for ((block, unit), context) in blocks.iter().zip(&prepared).zip(&contexts) {
             let Ok(resolved) = resolve_block_prevouts(
@@ -988,9 +997,15 @@ fn prove_window(
                 Err(_) => return Vec::new(),
             }
         }
+        metrics::histogram!("node.window.checks_seconds")
+            .record(checks_started.elapsed().as_secs_f64());
+        let verify_started = quanta::Instant::now();
         let flags: Vec<bitcoin_rs_script::VerifyFlags> =
             contexts.iter().map(|context| context.flags).collect();
-        if bitcoin_rs_consensus::verify_tx::verify_prepared_units(&units, &flags).is_err() {
+        let verdict = bitcoin_rs_consensus::verify_tx::verify_prepared_units(&units, &flags);
+        metrics::histogram!("node.window.verify_seconds")
+            .record(verify_started.elapsed().as_secs_f64());
+        if verdict.is_err() {
             return Vec::new();
         }
     }
