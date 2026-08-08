@@ -108,8 +108,8 @@ has no production caller.
 
 A stage that is parallel in shape but serial in effect because each dispatch is
 too small to amortise waking the workers. Script verification on mainnet
-0..150_000 is the case: 2,868,199 input checks at 69.4 us each, which is the
-libsecp256k1 floor, yield only 4.4x on 32 threads. A block there carries about
+0..150_000 is the case: 2,868,199 input checks at a mean 69.4 us each yield only
+4.4x on 32 threads. A block there carries about
 19 checks, so 14.6% of checks fall below `MIN_PARALLEL_SCRIPT_CHECKS` and run
 serially while the rest pay roughly 11s of dispatch across 21,474 fan-outs. The
 diagnosis is a scaling sweep, not a profiler: measure the stage at 1, 4 and 32

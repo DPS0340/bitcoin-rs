@@ -24,11 +24,40 @@ Script verification is 49.26s of the 77.5s wall (63.6%). Inside it:
 |---|---|
 | input checks | 2,868,199 |
 | single-threaded cost of those checks | 199.1s |
-| cost per check | **69.4 us** |
+| mean cost per check | **69.4 us** |
+| raw `secp256k1` ECDSA verify on this host | **38.25 us** |
 
-69.4 us is the libsecp256k1 ECDSA floor on this host. **There is no per-input
-overhead to remove.** The entire gap is parallel efficiency: 199.1s of work
-becomes 45.66s on 32 threads, a 4.4x speedup.
+An earlier version of this note claimed 69.4 us *is* the crypto floor and that
+no per-input overhead exists. That was wrong twice over, and both errors are
+worth naming because they are the same mistake in different clothes.
+
+First, the floor was asserted from recalled typical timings rather than
+measured. Measured here, a single `secp256k1` ECDSA verification takes
+**38.25 us** (20,000 rounds, release build, same host).
+
+Second, and more importantly, **the two numbers cannot simply be subtracted.**
+One input check is not one signature verification: an input may perform none
+(anyone-can-spend), one (P2PKH, P2PK), or several (bare multisig), and it also
+pays script parsing, interpretation, and a legacy sighash that re-serializes
+the spending transaction. Dividing one by the other, or subtracting them to
+get a per-input overhead, assumes a signature count nobody has counted.
+
+So the honest position is narrower than the original claim and narrower than
+its first correction: **the per-check cost and the per-verification cost are
+both measured, and the relationship between them is not yet established.**
+
+## The open question this leaves
+
+Count the actual `CHECKSIG` / `CHECKMULTISIG` operations executed across the
+window, then compare like with like: run the same captured input corpus through
+the verifier and through a bare signature loop. Only that answers whether the
+per-check cost is near its floor or well above it. Until it does, no conclusion
+about per-input overhead is supportable in either direction.
+
+What IS established by direct measurement, independent of any of the above:
+199.1s of check work becomes 45.66s on 32 threads, a **4.4x speedup**, and
+enlarging the dispatch 64-fold cuts that stage 3.5x. Those are the numbers the
+rest of this note rests on.
 
 That 4.4x decomposes:
 
@@ -48,7 +77,7 @@ Do not retry these.
 |---|---|
 | rayon `with_min_len(N)` to coarsen jobs | N=4 105.3s, N=8 132.1s, N=16 184.1s vs N=1 77.6s. Throttles the big blocks that were scaling fine. |
 | Bounded split for small blocks only (2/4/8 tasks below the threshold) | 120.4s / 102.0s / 98.2s vs 79.1s serial. Dispatching tiny blocks costs more than the serial work it saves. |
-| Per-input FFI overhead in the kernel path | 69.4 us/check is the crypto floor. Nothing to remove. |
+| Per-input FFI overhead in the kernel path | Not refuted, and not established either. See the open question above: the per-check cost is measured, the per-verification cost is measured, and the signature count that would relate them is not. |
 | Script pool width | 1 thread 334.8s, 4 threads 185.4s, 32 threads 81.1s. 32 is the measured optimum; 8, 16 and 64 were worse in an earlier sweep. |
 
 The shape of these results is consistent: rayon's default splitting is already
