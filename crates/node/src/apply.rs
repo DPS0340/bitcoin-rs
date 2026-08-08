@@ -237,7 +237,7 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
     ) -> Result<(), StorageError> {
         self.store.put(
             bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_pruning::block_body_key(height, hash),
+            &bitcoin_rs_pruning::block_undo_key(height, hash),
             record,
         )
     }
@@ -249,7 +249,7 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
     ) -> Result<Option<Vec<u8>>, StorageError> {
         self.store.get(
             bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_pruning::block_body_key(height, hash),
+            &bitcoin_rs_pruning::block_undo_key(height, hash),
         )
     }
 

@@ -424,24 +424,6 @@ impl NodeStorage {
     }
 
     #[cfg(test)]
-    fn seed_prune_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        undo: &[u8],
-    ) -> Result<()> {
-        match self {
-            #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => seed_prune_undo(&**store, height, hash, undo),
-            #[cfg(feature = "fjall")]
-            Self::Fjall(store) => seed_prune_undo(&**store, height, hash, undo),
-            #[cfg(feature = "redb")]
-            Self::Redb(store) => seed_prune_undo(&**store, height, hash, undo),
-            #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => seed_prune_undo(&**store, height, hash, undo),
-        }
-    }
-
     #[cfg(test)]
     fn stored_prune_body(
         &self,
@@ -470,13 +452,13 @@ impl NodeStorage {
         let key = bitcoin_rs_pruning::block_undo_key(height, hash);
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::RocksDb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Fjall(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Redb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Mdbx(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
         }
     }
 }
@@ -664,21 +646,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             pruneheight: *self.pruneheight.lock(),
         }
     }
-}
-
-#[cfg(test)]
-fn seed_prune_undo<S: KvStore>(
-    store: &S,
-    height: u32,
-    hash: bitcoin_rs_primitives::Hash256,
-    undo: &[u8],
-) -> Result<()> {
-    store.put(
-        ColumnFamily::BlockTree,
-        &bitcoin_rs_pruning::block_undo_key(height, hash),
-        undo,
-    )?;
-    Ok(())
 }
 
 /// Concrete txindex store handles retained per backend.
@@ -2034,7 +2001,13 @@ mod tests {
             state
                 .block_body_store
                 .persist_block_body(height, hash, b"block-body")?;
-            state.storage.seed_prune_undo(height, hash, b"undo-body")?;
+            // Written through the production undo store, not a test helper.
+            // A helper writing where the pruner happened to look is how the
+            // pruner came to target a column family nothing produced.
+            state
+                .apply_handles()
+                .undo_store
+                .persist_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
@@ -2194,8 +2167,9 @@ mod tests {
             .block_body_store
             .persist_block_body(10, pruned_hash, &serialize(&pruned_block))?;
         state
-            .storage
-            .seed_prune_undo(10, pruned_hash, b"undo-body")?;
+            .apply_handles()
+            .undo_store
+            .persist_undo(10, pruned_hash, b"undo-body")?;
         state
             .blocks
             .write()
