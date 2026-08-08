@@ -509,6 +509,42 @@ impl<S: KvStore> Indexer<S> {
         let mut rows = pending_rows_for_decoded_block(block, height, &txids)?;
         rows.sort();
         let counts = rows.counts();
+
+        // Only delete if this block's header row is still there.
+        //
+        // Funding, spending, and txid keys are an 8-byte prefix plus the
+        // height, carrying no block identity, so a replacement block at the
+        // same height that shares any data — the same output script is enough —
+        // derives the same keys. Rolling this block back a second time, after
+        // the replacement was indexed, would delete the replacement's rows and
+        // leave Electrum missing active-chain history.
+        //
+        // The header row is the identity: its key is the 80-byte serialized
+        // header, and the block hash is the double-SHA256 of exactly those
+        // bytes, so no two blocks share one. Its absence means this block is
+        // already rolled back and the keys now belong to whatever replaced it.
+        // Rekeying the other three families would carry block identity
+        // directly, but it would break the electrs-compatible layout and force
+        // a reindex, which is a far larger change than the bug warrants.
+        // A read failure is propagated, not treated as absence: silently
+        // reporting a clean rollback because storage was unreachable would
+        // leave the caller believing the block is gone.
+        let identity_present = match rows.header_rows.first() {
+            Some(header) => self
+                .store
+                .get(ColumnFamily::BlockHeaders, header)?
+                .is_some(),
+            None => false,
+        };
+        if !identity_present {
+            self.last_counts = counts;
+            debug!(
+                height,
+                "rollback skipped: block header row absent, rows belong to another block"
+            );
+            return Ok(counts);
+        }
+
         let mut batch = self.store.new_batch();
         for row in &rows.txid_rows {
             batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
@@ -1707,6 +1743,62 @@ mod tests {
             super::IndexerLike::rollback_block(&mut indexer, &candidate, HEIGHT),
             Err(super::IndexError::UnsupportedRollback)
         ));
+    }
+
+    /// A repeated rollback must not delete a replacement block's rows.
+    ///
+    /// Funding, spending, and txid keys are an 8-byte prefix plus the height
+    /// and carry no block identity, so a replacement at the same height that
+    /// shares an output script derives the same keys. Without the header-row
+    /// identity check, rolling the old block back twice deleted the
+    /// replacement's history.
+    #[test]
+    fn a_repeated_rollback_leaves_a_replacement_blocks_rows_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let shared_script = ScriptBuf::from_bytes(vec![0x51]);
+
+        // Two different blocks at the same height that both pay the same
+        // script, so their funding rows collide.
+        // The shared `block` fixture pins a zero merkle root, so the nonce is
+        // what distinguishes these two headers.
+        let mut old_block = block(vec![tx(
+            OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0),
+            shared_script.clone(),
+        )]);
+        old_block.header.nonce = 1;
+        let mut replacement = block(vec![tx(
+            OutPoint::new(Txid::from_byte_array([0xb2; 32]), 0),
+            shared_script,
+        )]);
+        replacement.header.nonce = 2;
+        assert_ne!(
+            old_block.header.block_hash(),
+            replacement.header.block_hash(),
+            "the two blocks must differ, or there is nothing to confuse"
+        );
+
+        indexer.ingest_block(&serialize(&old_block), HEIGHT)?;
+        indexer.rollback_block(&old_block, HEIGHT)?;
+        indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        indexer.flush()?;
+        let after_replacement = stored_rows(&indexer)?;
+        assert!(
+            !after_replacement.is_empty(),
+            "the replacement must have written rows"
+        );
+
+        // Roll the OLD block back again. It is already gone; its keys now
+        // belong to the replacement.
+        indexer.rollback_block(&old_block, HEIGHT)?;
+        indexer.flush()?;
+
+        assert_eq!(
+            stored_rows(&indexer)?,
+            after_replacement,
+            "a repeated rollback must not touch the replacement's rows"
+        );
+        Ok(())
     }
 
     fn indexer() -> Result<(tempfile::TempDir, Indexer<RocksDbStore>), Box<dyn std::error::Error>> {
