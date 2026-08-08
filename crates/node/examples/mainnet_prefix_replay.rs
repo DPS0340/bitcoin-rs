@@ -74,12 +74,22 @@ fn replay_prefix(
         decode_time += decode_started.elapsed();
         tx_count = tx_count.saturating_add(block.txdata.len());
         block_bytes = block_bytes.saturating_add(bytes.len());
+        // Flushed BEFORE appending when this block would cross the byte cap,
+        // which is what `window_len` does: it leaves the crossing block for the
+        // next window. Appending first and checking after let a replay window
+        // exceed the cap by a whole block, so its batch boundaries were not
+        // production's and the timings near the cap were not comparable.
+        if !window_blocks.is_empty()
+            && window_bytes_held.saturating_add(bytes.len())
+                > bitcoin_rs_node::apply::SCRIPT_BATCH_MAX_BYTES
+        {
+            apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
+            window_bytes_held = 0;
+        }
         window_blocks.push(block);
         window_bytes_held = window_bytes_held.saturating_add(bytes.len());
         window_bytes.push(bytes::Bytes::from(bytes));
-        if window_is_full(window_blocks.len(), window_bytes_held, window)
-            || height == args.stop_height
-        {
+        if window_blocks.len() >= window || height == args.stop_height {
             apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
             window_bytes_held = 0;
         }
@@ -94,10 +104,6 @@ fn replay_prefix(
         decode_time,
         elapsed: started.elapsed(),
     })
-}
-
-fn window_is_full(blocks: usize, bytes_held: usize, max_blocks: usize) -> bool {
-    blocks >= max_blocks || bytes_held >= bitcoin_rs_node::apply::SCRIPT_BATCH_MAX_BYTES
 }
 
 /// long before the bodies arrived. Without that the window can never prove and

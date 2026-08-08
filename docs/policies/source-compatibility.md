@@ -43,7 +43,7 @@ Language and toolchain settings are locked centrally in `rust-toolchain.toml` an
 
 ## 4. Workspace Versioning and Semver Commitment
 
-All crates in `bitcoin-rs` share a single workspace version managed by `[workspace.package] version` (currently `0.3.1`).
+All crates in `bitcoin-rs` share a single workspace version managed by `[workspace.package] version` (currently `0.4.0`).
 
 | Workspace Crate | Path | Description |
 | :--- | :--- | :--- |
@@ -68,8 +68,8 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs` | `bin/bitcoin-rs` | Command-line node binary |
 
 ### 4.1 Semver Rules
-- During `0.x.y` releases, public API breaking changes require a minor version bump (e.g., `0.3.1` to `0.4.0`).
-- Patch updates (e.g., `0.3.1` to `0.3.2`) must contain only non-breaking bug fixes, performance optimizations, or internal refactoring.
+- During `0.x.y` releases, public API breaking changes require a minor version bump (e.g., `0.4.0` to `0.4.0`).
+- Patch updates (e.g., `0.4.0` to `0.3.2`) must contain only non-breaking bug fixes, performance optimizations, or internal refactoring.
 
 ## 5. Anti-Shim Principle and Deprecation Policy
 

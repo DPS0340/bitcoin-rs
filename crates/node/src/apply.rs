@@ -934,7 +934,8 @@ fn plan_disconnect(
 /// |---|---|
 /// | `utxo`, `tx_index`, `applied_tip` | restored here |
 /// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
-/// | `filter_index`, `filter_header_cache` | **owed** — BIP157 headers chain, so a stale link corrupts the chain |
+/// | `filter_header_cache` | repointed here at the parent, or cleared when the index has no header for it |
+/// | `filter_index` | retained deliberately — its rows are hash-addressed, like block bodies, so a disconnected block's filter stays valid and simply stops being reachable. What is owed is BACKFILL after a gap, not rollback |
 /// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
 /// | `transactions` | nothing owed: connection never populates it |
 /// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
@@ -1823,6 +1824,12 @@ fn apply_block_admitted(
         tx_plan,
         resolved,
     } = prepared;
+    // Before any mutation. A header the tree has never seen skips header sync's
+    // timestamp rules entirely, and `applied_header_tip` — where the insert
+    // happens — runs after the UTXO commit, so checking there would reject the
+    // block with its outputs already installed.
+    check_unseen_header_timestamp(handles, block, block_hash)?;
+
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
         bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
@@ -2289,6 +2296,31 @@ fn previous_filter_header(handles: &ApplyHandles, prior: Option<&TipSnapshot>) -
     }
 }
 
+/// Applies header-sync's timestamp rules to a header the tree has not seen.
+///
+/// A header already in the tree went through `accept_headers` and was checked
+/// there. One that is not is about to be inserted by `applied_header_tip`, and
+/// without this a caller handing `apply_block` a block directly could make one
+/// with an invalid median-time-past or an absurd future timestamp the applied
+/// consensus tip.
+fn check_unseen_header_timestamp(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    block_hash: bitcoin_rs_primitives::Hash256,
+) -> core::result::Result<(), ApplyError> {
+    let tree = handles.block_tree.read();
+    if tree.lookup(block_hash).is_some() {
+        return Ok(());
+    }
+    bitcoin_rs_chain::validate_header_timestamp(
+        &tree,
+        &block.header,
+        block_hash,
+        bitcoin_rs_chain::current_unix_seconds(),
+    )?;
+    Ok(())
+}
+
 fn applied_header_tip(
     handles: &ApplyHandles,
     block_hash: bitcoin_rs_primitives::Hash256,
@@ -2296,21 +2328,12 @@ fn applied_header_tip(
     height: u32,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let mut tree = handles.block_tree.write();
-    let node_id = if let Some(node_id) = tree.lookup(block_hash) {
-        node_id
-    } else {
-        // A header the tree has never seen goes in here, and header sync's
-        // timestamp rules never ran on it. Without this check a caller handing
-        // `apply_block` a block directly could make one with an invalid
-        // median-time-past or an absurd future timestamp the applied consensus
-        // tip.
-        bitcoin_rs_chain::validate_header_timestamp(
-            &tree,
-            &block.header,
-            block_hash,
-            bitcoin_rs_chain::current_unix_seconds(),
-        )?;
-        tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?
+    // No timestamp check here: this runs after the UTXO commit, so rejecting a
+    // block at this point would leave its outputs and index rows installed.
+    // `check_unseen_header_timestamp` does it before any mutation.
+    let node_id = match tree.lookup(block_hash) {
+        Some(node_id) => node_id,
+        None => tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?,
     };
     let node = tree.node(node_id)?;
     if node.height != height {
@@ -5879,6 +5902,25 @@ mod consensus_rule_tests {
                 ))
             ),
             "a block at or below its parent's median-time-past must be refused, got {outcome:?}"
+        );
+
+        // And it must be refused before anything is written. The check first
+        // lived in `applied_header_tip`, which runs AFTER the UTXO commit, so
+        // the rejection left the block's outputs installed and later validation
+        // could spend coins from a block outside the applied chain.
+        assert_eq!(
+            utxo.len(),
+            0,
+            "a refused block must leave no outputs in the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(u32::MAX, |tip| tip.height),
+            0,
+            "and must not move the tip"
         );
         Ok(())
     }

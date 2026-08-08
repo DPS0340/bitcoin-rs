@@ -112,6 +112,9 @@ struct PendingEntry {
 /// confirmation target.
 pub struct FeeEstimator {
     buckets: Vec<Bucket>,
+    /// Height whose decay has already been applied, so a repeated
+    /// notification for it does not age the history a second time.
+    last_decayed_height: Option<u32>,
     pending: HashMap<Txid, PendingEntry>,
 }
 
@@ -122,6 +125,7 @@ impl FeeEstimator {
         Self {
             buckets: build_buckets(),
             pending: HashMap::new(),
+            last_decayed_height: None,
         }
     }
 
@@ -184,7 +188,14 @@ impl FeeEstimator {
             }
         }
         self.expire_targets(block_height);
-        self.apply_decay();
+        // Once per height, not once per call. Decay models blocks elapsing, and
+        // the same height arriving twice is not two blocks; decaying again
+        // would age every observation for no elapsed time and could push a
+        // bucket below `MIN_OBSERVATIONS` on duplicate notifications alone.
+        if self.last_decayed_height != Some(block_height) {
+            self.last_decayed_height = Some(block_height);
+            self.apply_decay();
+        }
     }
 
     /// Samples a failure for every target that expired on this block.
@@ -411,6 +422,35 @@ mod tests {
         assert!(
             est.pending.contains_key(&fresh),
             "a departure must free the slot it occupied"
+        );
+    }
+
+    /// Decay models elapsed blocks, so one height decays once.
+    #[test]
+    fn a_repeated_height_notification_decays_the_history_once() {
+        let mut once = FeeEstimator::new();
+        let mut twice = FeeEstimator::new();
+        for est in [&mut once, &mut twice] {
+            for n in 0..10_u8 {
+                est.tx_entered(test_txid(n), 10_000, 100);
+            }
+            let confirmed: Vec<Txid> = (0..10_u8).map(test_txid).collect();
+            est.block_connected(&confirmed, 101);
+        }
+        // The same height announced four more times.
+        for _ in 0..4 {
+            twice.block_connected(&[], 101);
+        }
+
+        let bucket_index = once.bucket_index_for_rate(10_000);
+        assert!(
+            (twice.buckets[bucket_index].confirmed_within[0]
+                - once.buckets[bucket_index].confirmed_within[0])
+                .abs()
+                < 1e-9,
+            "repeating a height must not age the history: {} against {}",
+            twice.buckets[bucket_index].confirmed_within[0],
+            once.buckets[bucket_index].confirmed_within[0]
         );
     }
 

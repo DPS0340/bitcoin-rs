@@ -5,6 +5,7 @@
 //! to the mempool or relayed by default.
 
 use bitcoin::blockdata::script::Instruction;
+use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_PUSHNUM_NEG1};
 use bitcoin::{Script, Transaction, TxOut};
 use thiserror::Error;
 
@@ -247,7 +248,18 @@ fn is_standard_nulldata(script: &Script) -> bool {
     if instructions.next().is_none() {
         return false;
     }
-    instructions.all(|inst| matches!(inst, Ok(Instruction::PushBytes(_))))
+    instructions.all(|inst| match inst {
+        Ok(Instruction::PushBytes(_)) => true,
+        // `OP_1` through `OP_16` and `OP_1NEGATE` are pushes too, and
+        // rust-bitcoin reports them as `Op` rather than `PushBytes`. Core's
+        // push-only nulldata rule accepts every push opcode, so rejecting
+        // `OP_RETURN OP_1` would call a standard output non-standard.
+        Ok(Instruction::Op(op)) => {
+            op == OP_PUSHNUM_NEG1
+                || (OP_PUSHNUM_1.to_u8()..=OP_PUSHNUM_16.to_u8()).contains(&op.to_u8())
+        }
+        Err(_) => false,
+    })
 }
 
 #[cfg(test)]
@@ -330,6 +342,27 @@ mod tests {
             is_standard_tx(&tx),
             Err(StandardnessError::OpReturnPayloadTooLarge)
         );
+    }
+
+    /// Numeric push opcodes are pushes, and standard nulldata accepts them.
+    ///
+    /// rust-bitcoin reports `OP_1` through `OP_16` as `Op` rather than
+    /// `PushBytes`, so a naive push-only check calls `OP_RETURN OP_1`
+    /// non-standard when Core relays it.
+    #[test]
+    fn accepts_op_return_followed_by_a_numeric_push() {
+        let mut tx = empty_tx(Version::ONE);
+        tx.output[0].value = Amount::ZERO;
+        tx.output[0].script_pubkey = Builder::new()
+            .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+            .push_opcode(OP_PUSHNUM_1)
+            .into_script();
+        // Padded to clear the relay minimum, which is a different rule.
+        tx.output.push(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([9_u8; 20])),
+        });
+        assert_eq!(is_standard_tx(&tx), Ok(()));
     }
 
     /// `OP_RETURN` followed by a non-push opcode is not standard nulldata.
