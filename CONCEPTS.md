@@ -103,3 +103,29 @@ publishing a disconnect notification, backfilling the filter index after a gap,
 routing a block that extends a known side branch, and the durable poison marker
 with the startup handling around it. Together they are why `disconnect_block`
 has no production caller.
+
+### Dispatch-bound parallelism
+
+A stage that is parallel in shape but serial in effect because each dispatch is
+too small to amortise waking the workers. Script verification on mainnet
+0..150_000 is the case: 2,868,199 input checks at 69.4 us each, which is the
+libsecp256k1 floor, yield only 4.4x on 32 threads. A block there carries about
+19 checks, so 14.6% of checks fall below `MIN_PARALLEL_SCRIPT_CHECKS` and run
+serially while the rest pay roughly 11s of dispatch across 21,474 fan-outs. The
+diagnosis is a scaling sweep, not a profiler: measure the stage at 1, 4 and 32
+threads and compare the speedup against the thread count. Coarsening each
+dispatch does not fix it and makes it worse, because it throttles the blocks
+that were scaling; only issuing fewer, larger dispatches does. See
+`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
+
+### Front-half duplication
+
+The failure mode where a batched fast path recomputes the sequential path's
+preparation instead of replacing it, so a real saving is paid straight back.
+Cross-block script batching cut crypto dispatch from 44.08s to 12.53s and moved
+wall time not at all, because the batch resolved every prevout and parsed every
+block that `apply_block` then resolved and parsed again for coinbase maturity,
+BIP68, and the UTXO change set. The tell is that the accelerated stage shrinks
+by roughly what the new stage costs. The fix is never a cheaper second pass; it
+is splitting the sequential path into a prepare half and a commit half so the
+preparation happens once.
