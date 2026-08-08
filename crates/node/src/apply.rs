@@ -75,14 +75,6 @@ pub(crate) trait UndoStore: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// Reads the undo record for one block, if present.
-    ///
-    /// Written now and read by the disconnect path in the next layer; the tests
-    /// below already depend on it, so a write-only store would be the odd shape
-    /// here, not this.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the block-disconnect path")
-    )]
     fn load_undo(
         &self,
         height: u32,
@@ -535,6 +527,132 @@ impl ApplyHandles {
         self.zmq_publisher = publisher;
         self
     }
+}
+
+/// Disconnects the applied tip, restoring the consensus state the block
+/// replaced.
+///
+/// Restores the UTXO set, the transaction index, and `applied_tip`. It does
+/// NOT yet restore the other state connection touches, so it has no production
+/// caller and must not get one until they are handled:
+///
+/// | Handle | Status |
+/// |---|---|
+/// | `utxo`, `tx_index`, `applied_tip` | restored here |
+/// | `coin_stats` | **owed** — cumulative, so it drifts on every disconnect |
+/// | `filter_index`, `filter_header_cache` | **owed** — BIP157 headers chain, so a stale link corrupts the chain |
+/// | `blocks`, `transactions` | **owed** — RPC would keep serving the disconnected block |
+/// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
+/// | `block_tree` | retained deliberately — the header stays valid and known |
+/// | `block_body_store` | retained deliberately — the body is still a real block |
+/// | `zmq_publisher` | a notification, not state; a disconnect event belongs here later |
+///
+/// The ordering below is the design: every fallible step that touches nothing
+/// runs first, so the common failures cost nothing.
+///
+/// One partial-failure window remains and is not yet closed. If `undo_block`
+/// fails after the index has rolled back, the index no longer describes the
+/// block while the UTXO set and the tip still do. Retrying is safe only if
+/// index rollback is idempotent, which is not yet proven, so the window is
+/// listed with the owed work above rather than claimed away here.
+///
+/// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
+///    so a missing or corrupt record costs nothing.
+/// 2. Roll the transaction index back. It is derived state, and its rows still
+///    point at an intact UTXO set at this point.
+/// 3. Restore the UTXO set.
+/// 4. Move `applied_tip` to the parent, last. While it still names this block a
+///    concurrent reader sees a consistent older state; moving it first would
+///    advertise a tip whose outputs are still spent.
+///
+/// Refuses any block that is not the applied tip, because disconnecting from
+/// the middle of a chain restores outputs its descendants have already spent,
+/// and any block whose body does not match its own header.
+///
+/// Takes no height. The applied tip already knows it, and a second source for
+/// the same fact is a second source of disagreement: the undo key and the index
+/// rollback are both keyed by height, so a caller passing a stale one could
+/// delete the wrong rows. There is no parameter to get wrong.
+pub fn disconnect_block(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+) -> core::result::Result<TipSnapshot, ApplyError> {
+    use bitcoin::hashes::Hash as _;
+
+    let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    let applied = handles
+        .applied_tip
+        .load_full()
+        .ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: block_hash,
+        })?;
+    // The height is read from the snapshot, never from the caller. A caller
+    // that could pass one would be able to disagree with the tip, and the
+    // undo key and index rollback are both keyed by it.
+    let height = applied.height;
+    if applied.hash != block_hash {
+        return Err(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        });
+    }
+
+    // The header hash proves the caller named the right block; it does not
+    // prove they handed over that block's transactions. Index rollback walks
+    // the body, so an altered body under a matching header would delete rows
+    // belonging to transactions the block never contained.
+    if !block.check_merkle_root() {
+        return Err(ApplyError::DisconnectBodyMismatch { hash: block_hash });
+    }
+
+    let parent_tip = {
+        let tree = handles.block_tree.read();
+        let node = tree.node(applied.tip_id)?;
+        let parent_id = node.parent.ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        })?;
+        let parent = tree.node(parent_id)?;
+        TipSnapshot {
+            tip_id: parent_id,
+            height: parent.height,
+            chainwork: parent.chainwork,
+            hash: parent.hash,
+        }
+    };
+
+    let encoded = handles
+        .undo_store
+        .load_undo(height, block_hash)
+        .map_err(ApplyError::UndoRead)?
+        .ok_or(ApplyError::UndoRecordMissing {
+            hash: block_hash,
+            height,
+        })?;
+    let undo = bitcoin_rs_utxo::undo_codec::decode(&encoded, block_hash).map_err(|error| {
+        ApplyError::UndoRecordUnreadable {
+            hash: block_hash,
+            reason: error.to_string(),
+        }
+    })?;
+
+    if let Some(tx_index) = &handles.tx_index {
+        tx_index
+            .lock()
+            .rollback_block(block, height)
+            .map_err(|error| ApplyError::IndexRollback(error.to_string()))?;
+    }
+
+    handles
+        .utxo
+        .undo_block(&undo)
+        .map_err(ApplyError::UtxoCommit)?;
+
+    handles
+        .applied_tip
+        .store(Some(Arc::new(parent_tip.clone())));
+    Ok(parent_tip)
 }
 
 /// Synthetically applies `block` as the next tip after consensus checks.
@@ -4416,6 +4534,305 @@ mod consensus_rule_tests {
         assert!(
             filter_index.headers.lock().is_empty(),
             "no derived filter row may be written for a block that did not apply"
+        );
+        Ok(())
+    }
+
+    /// The round trip that makes the node a full node: connect a block, then
+    /// disconnect it and land on exactly the state that preceded it. A spend is
+    /// included deliberately, because a coinbase-only block would exercise only
+    /// the removes half and leave the restores half unproven.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnecting_the_tip_restores_the_exact_prior_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        // No indexer: the index half has its own rollback tests in
+        // `crates/index`, one of them mutation-verified, and an indexer that
+        // refuses rollback is pinned separately below. This isolates the UTXO
+        // and tip halves.
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // A mature output for the block to spend, so the undo record carries a
+        // restore as well as a remove.
+        let funding_txid = bitcoin::Txid::from_byte_array([0x8b; 32]);
+        let funded = bitcoin::OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        };
+        let funded_value = bitcoin::Amount::from_sat(50_000);
+        let mut seed = bitcoin_rs_utxo::UndoBatch::default();
+        seed.restore(bitcoin_rs_utxo::UtxoAdd::new(
+            internal_outpoint(&funded),
+            bitcoin::TxOut {
+                value: funded_value,
+                script_pubkey: op_true_script(),
+            },
+            false,
+            0,
+        ));
+        utxo.undo_block(&seed)?;
+        let outputs_before = utxo.len();
+        let funded_before = utxo
+            .get(&internal_outpoint(&funded))
+            .ok_or("seeded output missing before apply")?;
+
+        let spend = spending_transaction_to_script(funded, 0xFFFF_FFFF, op_true_script());
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1), spend.clone()],
+        )?;
+        let applied = apply_block(&handles, &block)?;
+        assert_eq!(applied.height, 1, "the block must connect first");
+        assert!(
+            utxo.get(&internal_outpoint(&funded)).is_none(),
+            "the spend must consume the funded output"
+        );
+
+        let restored_tip = disconnect_block(&handles, &block)?;
+
+        assert_eq!(
+            restored_tip.hash, genesis_hash,
+            "tip must return to genesis"
+        );
+        assert_eq!(restored_tip.height, 0, "height must return to genesis");
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map(|tip| tip.hash)
+                .ok_or("applied tip cleared by disconnect")?,
+            genesis_hash,
+            "the published applied tip must match the returned one"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "the UTXO set must return to its exact prior size"
+        );
+        let funded_after = utxo
+            .get(&internal_outpoint(&funded))
+            .ok_or("spent output was not restored")?;
+        assert_eq!(
+            funded_after, funded_before,
+            "the restored output must be byte-identical to the one spent"
+        );
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint {
+                txid: spend.compute_txid(),
+                vout: 0,
+            }))
+            .is_none(),
+            "outputs the block created must be gone"
+        );
+        Ok(())
+    }
+
+    /// The header hash names the block; it does not vouch for the transactions
+    /// handed over with it. A body swapped under a matching header would send
+    /// index rollback over rows the block never wrote, so it must be rejected
+    /// before anything is touched.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_a_body_that_does_not_match_its_header()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        // Same header, therefore the same hash and the same tip check, but a
+        // different transaction list.
+        let mut forged = block.clone();
+        forged.txdata.push(coinbase_transaction(2));
+        assert_eq!(
+            forged.block_hash(),
+            block.block_hash(),
+            "the forgery must keep the header, or it tests nothing"
+        );
+
+        let outcome = disconnect_block(&handles, &forged);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::DisconnectBodyMismatch { .. })),
+            "a body that contradicts its header must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "a refused disconnect must leave the tip where it was"
+        );
+        Ok(())
+    }
+
+    /// An indexer that cannot roll back must stop the disconnect, not be
+    /// skipped. Finishing would leave index rows describing a block the chain
+    /// no longer contains, and queries would answer from them.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_when_the_indexer_cannot_roll_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer for this test to mean anything"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        let outcome = disconnect_block(&handles, &block);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::IndexRollback(_))),
+            "an indexer without rollback must refuse the disconnect, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "the UTXO set must be untouched when the index refuses"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "the tip must not move when the index refuses"
+        );
+        Ok(())
+    }
+
+    /// Disconnecting anything but the tip would restore outputs that later
+    /// blocks already spent, so it must be refused rather than attempted.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_a_block_that_is_not_the_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block_1 = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block_1)?;
+        let block_2 = mined_block_with_prev_hash_and_transactions(
+            block_1.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        apply_block(&handles, &block_2)?;
+        let outputs_before = utxo.len();
+
+        let outcome = disconnect_block(&handles, &block_1);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::DisconnectNotTip { .. })),
+            "disconnecting a non-tip block must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            2,
+            "a refused disconnect must leave the tip where it was"
+        );
+        Ok(())
+    }
+
+    /// Without the record the prior UTXO state is unknowable. Proceeding would
+    /// silently corrupt the set, so the disconnect must fail and change nothing.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_when_the_undo_record_is_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        // Swap in an empty store, standing in for a record lost to pruning.
+        handles.undo_store = Arc::new(InMemoryUndoStore::default());
+        let outcome = disconnect_block(&handles, &block);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::UndoRecordMissing { .. })),
+            "a missing undo record must refuse the disconnect, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "a refused disconnect must leave the tip where it was"
         );
         Ok(())
     }

@@ -145,6 +145,52 @@ pub enum ApplyError {
         /// Output index of the unresolvable spend.
         vout: u32,
     },
+    /// The undo record for a block being disconnected is absent.
+    ///
+    /// Fatal: without it the UTXO set cannot be restored, and guessing would
+    /// silently corrupt the chainstate.
+    #[error("no undo record for block {hash} at height {height}")]
+    UndoRecordMissing {
+        /// Block whose record is absent.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height the block was applied at.
+        height: u32,
+    },
+    /// A stored undo record could not be decoded.
+    #[error("undo record for block {hash} is unreadable: {reason}")]
+    UndoRecordUnreadable {
+        /// Block whose record is unreadable.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Why the codec rejected it.
+        reason: String,
+    },
+    /// Reading a stored undo record failed.
+    #[error("undo record read: {0}")]
+    UndoRead(#[source] bitcoin_rs_storage::StorageError),
+    /// The block asked to be disconnected is not the applied tip.
+    ///
+    /// Blocks must be disconnected tip-first. Taking one from the middle would
+    /// restore outputs that its descendants have already spent.
+    #[error("block {hash} is not the applied tip {tip}")]
+    DisconnectNotTip {
+        /// Block the caller asked to disconnect.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Block that is actually applied.
+        tip: bitcoin_rs_primitives::Hash256,
+    },
+    /// The supplied block body does not match its own header.
+    ///
+    /// The header hash commits to the merkle root, not to the transactions the
+    /// caller handed over. A body swapped under a matching header would roll
+    /// the index back over the wrong rows.
+    #[error("block {hash} body does not match its header merkle root")]
+    DisconnectBodyMismatch {
+        /// Block whose body was rejected.
+        hash: bitcoin_rs_primitives::Hash256,
+    },
+    /// Rolling the transaction index back failed.
+    #[error("index rollback: {0}")]
+    IndexRollback(String),
 }
 
 enum NodeStorage {
