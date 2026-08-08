@@ -846,26 +846,62 @@ pub fn apply_window(
     handles: &ApplyHandles,
     blocks: &[bitcoin::Block],
     serialized: &[bytes::Bytes],
-) -> core::result::Result<(), ApplyError> {
+) -> core::result::Result<(), WindowApplyError> {
     if blocks.len() != serialized.len() {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+        return Err(WindowApplyError {
+            applied: 0,
+            source: ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Kernel(format!(
                 "window has {} blocks but {} serialized bodies",
                 blocks.len(),
                 serialized.len()
-            )),
-        ));
+            ))),
+        });
     }
     // One permit for the whole window. Preparation reads the applied tip and the
     // UTXO set and the commits mutate both; taken per block instead, another
     // applier could move the chain between preparation and the commit relying on
     // it, and matching the tip hash would not detect a same-tip partial change.
-    let _admission = handles.admission.enter()?;
+    let _admission = handles
+        .admission
+        .enter()
+        .map_err(|source| WindowApplyError { applied: 0, source })?;
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
+    let mut applied = 0_usize;
     for (block, raw) in blocks.iter().zip(serialized) {
-        apply_block_admitted(handles, block, Some(raw.clone()), proven.next())?;
+        apply_block_admitted(handles, block, Some(raw.clone()), proven.next())
+            .map_err(|source| WindowApplyError { applied, source })?;
+        applied = applied.saturating_add(1);
     }
     Ok(())
+}
+
+/// A window that failed partway, and how many of its blocks committed first.
+///
+/// The count is what a caller needs to recover: it must record the hashes that
+/// landed, retry only the one that failed, and put the rest back. A bare
+/// `ApplyError` cannot say where the window stopped.
+#[derive(Debug)]
+pub struct WindowApplyError {
+    /// Blocks that committed before the failure.
+    pub applied: usize,
+    /// What stopped the block at index `applied`.
+    pub source: ApplyError,
+}
+
+impl core::fmt::Display for WindowApplyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "window failed after applying {} block(s): {}",
+            self.applied, self.source
+        )
+    }
+}
+
+impl std::error::Error for WindowApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Prepares consecutive blocks against one overlay and verifies all their input

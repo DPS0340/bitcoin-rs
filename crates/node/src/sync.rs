@@ -730,34 +730,61 @@ impl BlockSync {
             });
         let mut applied_hashes = ExpectedBlockHashes::with_capacity(expected_len);
         let mut failed_hash = None;
-        let mut drained = drained.into_iter();
-        while let Some(drained_block) = drained.next() {
-            match crate::apply::apply_block_with_serialized(
-                &self.handles,
-                &drained_block.block,
-                drained_block.serialized.clone(),
-            ) {
-                Ok(tip) => {
-                    applied = applied.saturating_add(1);
-                    tracing::debug!(
-                        height = tip.height,
-                        %tip.hash,
-                        "block sync: applied buffered block"
-                    );
-                    applied_hashes.push(tip.hash);
-                }
+        // Applied in windows, not one at a time: the window verifies every
+        // block's input scripts in a single dispatch, which is where the
+        // measured apply win comes from. Blocks still commit one by one and in
+        // order inside the window, so nothing about the applied chain changes.
+        let drained: Vec<_> = drained.into_iter().collect();
+        let mut chunk_start = 0_usize;
+        while chunk_start < drained.len() {
+            let chunk_end = drained
+                .len()
+                .min(chunk_start.saturating_add(crate::apply::SCRIPT_BATCH_WINDOW));
+            let chunk = &drained[chunk_start..chunk_end];
+            let blocks: Vec<bitcoin::Block> =
+                chunk.iter().map(|drained| drained.block.clone()).collect();
+            let bodies: Vec<bytes::Bytes> = chunk
+                .iter()
+                .map(|drained| drained.serialized.clone())
+                .collect();
+            // The window reports how far it got rather than just failing,
+            // because only the committed prefix may be marked applied; the rest
+            // has to go back on the stager untouched.
+            let committed = match crate::apply::apply_window(&self.handles, &blocks, &bodies) {
+                Ok(()) => chunk.len(),
                 Err(error) => {
+                    let stopped = error.applied.min(chunk.len());
                     failed = failed.saturating_add(1);
-                    failed_hash = Some(drained_block.hash);
-                    tracing::warn!(
-                        %drained_block.hash,
-                        %error,
-                        "block sync: failed to apply buffered block"
-                    );
-                    self.block_stager.lock().restore_many(drained);
+                    if let Some(blocker) = chunk.get(stopped) {
+                        failed_hash = Some(blocker.hash);
+                        tracing::warn!(
+                            hash = %blocker.hash,
+                            error = %error.source,
+                            "block sync: failed to apply buffered block"
+                        );
+                    }
+                    for drained in chunk.iter().take(stopped) {
+                        applied_hashes.push(drained.hash);
+                    }
+                    applied = applied.saturating_add(stopped);
+                    // Everything after the block that failed, in the order it
+                    // was drained: the rest of this chunk past the failure, then
+                    // every chunk not yet attempted.
+                    let restore_from = chunk_start
+                        .saturating_add(stopped)
+                        .saturating_add(1)
+                        .min(drained.len());
+                    self.block_stager
+                        .lock()
+                        .restore_many(drained[restore_from..].iter().cloned());
                     break;
                 }
+            };
+            for drained in chunk.iter().take(committed) {
+                applied_hashes.push(drained.hash);
             }
+            applied = applied.saturating_add(committed);
+            chunk_start = chunk_end;
         }
         if !applied_hashes.is_empty() || failed_hash.is_some() {
             {
@@ -5845,6 +5872,55 @@ mod tests {
         assert_ne!(
             after.chain_tip_hash, original_chain_tip_hash,
             "repopulated cache must be keyed to the moved tip"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn window_failure_applies_prefix_and_restores_suffix() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Blocks now apply in windows, so a mid-window failure has to split the
+        // chunk three ways: the prefix committed, the one block that failed, and
+        // an untouched suffix that must go back on the stager. Getting that
+        // split wrong is invisible to the (applied, failed) counts alone, so
+        // this asserts the stager contents too.
+        let fixture = apply_cache_fixture(4, 0)?;
+
+        // Corrupt the second body without touching its header: the stager keys
+        // on the header hash, so this still drains as the expected block, and
+        // apply rejects it on the merkle root. A body that changed its own hash
+        // would never be drained and the window would never see it.
+        let mut corrupted = fixture.blocks[1].clone();
+        corrupted.txdata.push(coinbase_transaction(99));
+        assert_eq!(
+            corrupted.block_hash(),
+            fixture.blocks[1].block_hash(),
+            "corruption must not move the header hash or the drain never sees it"
+        );
+
+        stage_body(&fixture.sync, &fixture.blocks[0]);
+        stage_body(&fixture.sync, &corrupted);
+        stage_body(&fixture.sync, &fixture.blocks[2]);
+        stage_body(&fixture.sync, &fixture.blocks[3]);
+
+        let (applied, failed) = fixture.sync.apply_buffered_blocks(None);
+        assert_eq!(
+            (applied, failed),
+            (1, 1),
+            "only the block before the corrupt one commits"
+        );
+        assert_eq!(
+            fixture.applied_tip.load_full().map(|tip| tip.height),
+            Some(1),
+            "the chain stops at the last good block"
+        );
+
+        // The two blocks after the failure were never attempted, so they must be
+        // back on the stager rather than silently dropped.
+        let restored = fixture.sync.block_stager.lock().received_len();
+        assert_eq!(
+            restored, 2,
+            "suffix after the failure returns to the stager"
         );
         Ok(())
     }

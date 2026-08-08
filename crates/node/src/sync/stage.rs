@@ -31,7 +31,7 @@ struct ReceivedBlock {
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct DrainedBlock {
     pub(super) hash: Hash256,
     pub(super) block: bitcoin::Block,

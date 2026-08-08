@@ -38,7 +38,9 @@ fn apply_window(
         bitcoin_rs_chain::header_sync::accept_headers(&mut tree, &headers, handles.network)
             .context("accept window headers")?;
     }
-    bitcoin_rs_node::apply::apply_window(handles, blocks, raw).context("apply window")?;
+    bitcoin_rs_node::apply::apply_window(handles, blocks, raw)
+        .map_err(|error| error.source)
+        .context("apply window")?;
     blocks.clear();
     raw.clear();
     Ok(())
