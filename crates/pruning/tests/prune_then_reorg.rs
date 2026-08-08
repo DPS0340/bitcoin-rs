@@ -76,7 +76,7 @@ fn staged_flat_file_pruning_removes_all_selected_indexes_before_reclaim()
 
     let mut prune_batch = store.new_batch();
     let (block_outcome, undo_outcome, file_numbers) =
-        stage_block_and_undo_prune(&store, &mut prune_batch, &block_files, 1_000, policy)?;
+        stage_block_and_undo_prune(&store, &mut prune_batch, &block_files, 1_000, 1_000, policy)?;
     assert_eq!(block_outcome.blocks_removed, 2);
     assert_eq!(block_outcome.bytes_freed, 32);
     assert!(undo_outcome.is_empty());
@@ -147,6 +147,7 @@ fn target_pruning_deletes_old_indexes_in_the_current_flat_file()
         &store,
         &mut prune_batch,
         &block_files,
+        1_000,
         1_000,
         PrunePolicy::utreexo_only(),
     )?;

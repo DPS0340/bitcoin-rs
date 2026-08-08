@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -335,6 +336,7 @@ impl NodeStorage {
         block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -344,6 +346,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
@@ -352,6 +355,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
@@ -360,6 +364,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
@@ -368,6 +373,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
         }
     }
@@ -523,6 +529,11 @@ pub struct NodePruneService<S: KvStore> {
     blocks: Arc<RwLock<Vec<BlockRecord>>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     pruneheight: Mutex<Option<u32>>,
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    ///
+    /// Undo pruning is bounded by this, not by the in-memory applied tip, which
+    /// can run far ahead of it.
+    durable_tip_height: Arc<AtomicU32>,
 }
 
 impl<S: KvStore> NodePruneService<S> {
@@ -533,6 +544,7 @@ impl<S: KvStore> NodePruneService<S> {
         block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
@@ -542,6 +554,7 @@ impl<S: KvStore> NodePruneService<S> {
             blocks,
             transactions,
             pruneheight: Mutex::new(pruneheight),
+            durable_tip_height,
         })
     }
 }
@@ -601,6 +614,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             &mut batch,
             &self.block_files,
             pruner_tip,
+            self.durable_tip_height.load(Ordering::Acquire),
             policy,
         )
         .map_err(|err| PruneServiceError::failed(err.to_string()))?;
@@ -848,6 +862,11 @@ fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
 
 /// Aggregate handle to a running node.
 pub struct NodeState {
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    ///
+    /// Published by `write_clean_checkpoint` and read by the pruner, which must
+    /// not delete an undo record a crash-restore would still need.
+    durable_tip_height: Arc<AtomicU32>,
     config: Config,
     data_dir: PathBuf,
     checkpoint_data_dir: cap_std::fs::Dir,
@@ -1110,12 +1129,18 @@ impl NodeState {
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
         ));
+        // A restored checkpoint is durable at its own height by definition, so
+        // start there rather than at zero, which would refuse all undo pruning.
+        let durable_tip_height = Arc::new(AtomicU32::new(
+            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
+        ));
         let prune_service = if config.prune_target_mb > 0 {
             Some(storage.prune_service(
                 &block_files,
                 &block_body_store,
                 Arc::clone(&blocks),
                 Arc::clone(&transactions),
+                &durable_tip_height,
             )?)
         } else {
             None
@@ -1127,6 +1152,7 @@ impl NodeState {
         );
         let data_dir = config.data_dir.clone();
         Ok(Self {
+            durable_tip_height,
             config,
             data_dir,
             checkpoint_data_dir,
@@ -1210,6 +1236,12 @@ impl NodeState {
             .undo_store
             .disarm_disconnect()
             .map_err(crate::checkpoint::CheckpointError::from)?;
+        // Everything up to this tip is now recoverable, so undo records below it
+        // may be pruned. Published after the write, never before.
+        self.durable_tip_height.store(
+            applied_tip.as_ref().map_or(0, |tip| tip.height),
+            Ordering::Release,
+        );
         Ok(written)
     }
 
@@ -1992,6 +2024,72 @@ mod tests {
         Ok(())
     }
 
+    /// Undo pruning must respect the durable tip, not the in-memory one.
+    ///
+    /// The applied tip can run far ahead of the last clean checkpoint. Pruning
+    /// undo to the in-memory tip deletes the record for the block the
+    /// checkpoint names, and a crash then restores a chainstate that cannot
+    /// disconnect its own tip.
+    #[test]
+    fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()> {
+        fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
+            let byte = u8::try_from(height)
+                .map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
+            Ok(bitcoin_rs_primitives::Hash256::from_le_bytes(&[byte; 32]))
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config)?;
+
+        for height in 10_u32..=12 {
+            let hash = hash(height)?;
+            state
+                .block_body_store
+                .persist_block_body(height, hash, b"block-body")?;
+            state
+                .apply_handles()
+                .undo_store
+                .persist_undo(height, hash, b"undo-body")?;
+            state.blocks.write().push(BlockRecord {
+                hash,
+                height,
+                block_hex: "00".to_owned(),
+                body_size: 1,
+                header_hex: String::new(),
+                tx_count: 0,
+                time: 0,
+            });
+        }
+
+        // No checkpoint has been written, so nothing is durable above genesis.
+        assert_eq!(
+            state.durable_tip_height.load(Ordering::Acquire),
+            0,
+            "the fixture must have no durable checkpoint, or this proves nothing"
+        );
+
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        let result = service
+            .prune_to_height(11)
+            .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
+
+        assert_eq!(
+            result.undo_rows_removed, 0,
+            "no undo record may go while a crash would restore below all of them"
+        );
+        assert!(
+            state.storage.stored_prune_undo(10, hash(10)?)?.is_some(),
+            "the record a restore would need must survive"
+        );
+        Ok(())
+    }
+
     #[test]
     fn prune_service_deletes_seeded_storage_rows_and_clears_cached_bodies() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
@@ -2029,6 +2127,15 @@ mod tests {
                 time: 0,
             });
         }
+
+        // A node pruning old history has a durable tip far above it. Undo
+        // records within the reorg-safety margin of that tip are kept, so the
+        // durable tip has to clear height 11 by more than the margin for this
+        // prune to touch anything. Without that the prune is correctly refused,
+        // which the sibling test asserts.
+        state
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
