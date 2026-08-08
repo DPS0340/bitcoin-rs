@@ -25,14 +25,29 @@ tags:
 
 ## Status
 
-**Not implemented.** `crates/node/src/apply.rs` advances `applied_tip` forward
-only, UTXO undo data is never persisted, and `bitcoin_rs_chain::plan_reorg` has
-no production caller. `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs` is
-`#[ignore]`d and says so.
+**Layers 1-2 implemented. Layer 3 is a primitive with no caller. Layer 4 not
+started.**
 
-The **index half is done**: `IndexerLike::rollback_block` exists, is tested, and
-refuses by default rather than reporting a false success. The node half is not
-written. This note records the design so the next attempt starts from it.
+Done, all in `crates/node/src/apply.rs` unless noted:
+
+* `ColumnFamily::UndoData` across all four backends, and a versioned undo codec
+  bound to the block hash (`crates/utxo/src/undo_codec.rs`).
+* Undo generation in the same pass as the forward UTXO changes, so the two
+  cannot drift. `UndoStore` is a mandatory handle, not an `Option`, and the
+  record is written before the block body, the index, and the UTXO commit.
+* `disconnect_block`, which restores the UTXO set, the transaction index, and
+  `applied_tip`. Its four ordering claims are mutation-verified.
+* The index half: `IndexerLike::rollback_block` exists, is tested, and refuses
+  by default rather than reporting a false success.
+
+Not done: `bitcoin_rs_chain::plan_reorg` still has no production caller, and
+`bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs` is still `#[ignore]`d.
+
+`disconnect_block` also has no production caller, deliberately. Connection
+touches `coin_stats`, `filter_index`, `filter_header_cache`, and the `blocks`
+and `transactions` RPC caches, and disconnect does not yet undo any of them.
+Those are prerequisites for wiring it, listed under Work remaining. The
+function's own doc comment carries the same table.
 
 ## Why it matters
 
@@ -56,10 +71,26 @@ Consequences:
 
 1. **Undo records serve live reorgs, not crash recovery.** A crash cannot leave
    a half-applied UTXO undo, because the in-memory set does not survive the
-   crash at all. Recovery is checkpoint-plus-replay.
+   crash at all.
+
+   An earlier version of this note said recovery is checkpoint-plus-replay.
+   Only the checkpoint half exists. `run.rs` does call `recover_if_needed`, but
+   nothing in production ever writes the metadata it reads: the only writer is
+   `NodeState::record_synthetic_block_for_recovery`, whose own doc calls it a
+   test helper. So on a normal boot `read_meta` finds no sidecar and the
+   fresh-node path is taken. Nothing in block connection fsyncs either.
+
+   Note what this does NOT mean. The two halves do not fail together, for the
+   reason this whole section exists: the undo record is a journaled KV write
+   and the UTXO set is RAM behind periodic checkpoints. A crash can leave a
+   durable undo record for a UTXO commit that vanished, or a checkpointed UTXO
+   commit whose undo record was still in the journal. Rolling either forward
+   needs the replay that is not wired. Tracked below.
 2. **A durable phase marker is not needed for the UTXO step.** An earlier draft
-   of this design specified one; it solves a failure mode that cannot occur
-   here.
+   specified one; it solves a failure mode that cannot occur here, since the
+   in-memory set discards all uncommitted mutation on a crash. This holds on
+   its own. It does not imply the node recovers: reaching the tip again from a
+   reloaded checkpoint still needs replay, which is missing.
 3. **Index rollback must be one atomic write batch.** A partial index rollback
    does survive a crash, and no marker helps because the crash lands inside the
    phase. This is already implemented that way.
@@ -101,15 +132,33 @@ with no recoverable undo record is an unrecoverable chainstate.
 
 ## Work remaining
 
+Done:
+
 | Piece | Notes |
 |---|---|
-| `ColumnFamily::UndoData` | touches the enum, its `ALL` list, and all four backends |
-| Versioned undo codec | first byte a format version; key by height **and** block hash |
-| Undo generation in apply | `ResolvedUtxoView.external` already holds every spent prevout as `LiveOutput { txout, coinbase, height }`, which is exactly `UtxoAdd`'s shape. Build the batch where `build_utxo_changes` builds `BorrowedBlockChanges` |
-| Persistence | same batch as the UTXO commit |
-| `crates/node/src/reorg.rs` | disconnect one tip; switch branches via `plan_reorg` |
+| `ColumnFamily::UndoData` | enum, its `ALL` list, and all four backends |
+| Versioned undo codec | first byte a format version; keyed by height **and** block hash, with 10 rejection tests |
+| Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
+| Persistence | before the block body, the index, and the UTXO commit; ordering mutation-verified |
+| `disconnect_block` | restores UTXO, index, and tip, in that order, all four orderings mutation-verified |
+
+Open, and prerequisites for giving `disconnect_block` a caller:
+
+| Piece | Notes |
+|---|---|
+| `coin_stats` inverse feed | cumulative, so it drifts on every disconnect |
+| `filter_index` rollback | BIP157 headers chain, so a stale link corrupts the chain; `filter_header_cache` must be reset with it |
+| RPC caches | `blocks` and `transactions` would keep serving the disconnected block |
+| Index rollback idempotence | `undo_block` is fallible and runs after the index rolls back, so the window between them is retryable only if rollback is idempotent. Prove it or add compensation |
+
+Open, layer 4:
+
+| Piece | Notes |
+|---|---|
+| `crates/node/src/reorg.rs` | switch branches via `plan_reorg` |
 | Apply-path routing | keep rejecting a non-extending block, but with a distinguishable error naming the known-side-branch case so the caller can route to reorg. Deleting the rejection outright corrupts the UTXO set |
 | Failure handling | attempt a compensating rollback; if that also fails, poison the apply path and refuse further blocks rather than serving a chain the node cannot describe. Refuse cleanly, never panic mid-write |
+| Real crash replay | `crash_recovery` has no production writer today, so its watermark records nothing and regenerates nothing |
 | Un-ignore `g10_reorg_deep` | prove against `bitcoind` regtest |
 
 Absolute "a failed reorg leaves the original tip" is not achievable, because the

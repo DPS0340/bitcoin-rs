@@ -73,3 +73,19 @@ The single mutation that decides a multi-store operation happened; everything be
 
 ### Refusing default (trait participation)
 A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
+
+### Undo record
+
+The per-block inverse of a UTXO commit: the outputs the block spent, with
+enough metadata to recreate them, plus the outputs it created. Written during
+connection, keyed by height **and** block hash so a record from an abandoned
+branch can never be replayed against a different block at the same height.
+Retained after a disconnect, because flip-flop between competing branches is
+normal.
+
+### Owed derived state
+
+State that connection writes and disconnection does not yet undo: `coin_stats`,
+the filter index and its header cache, and the `blocks` and `transactions` RPC
+caches. Named as owed rather than silently skipped, and the reason
+`disconnect_block` has no production caller.
