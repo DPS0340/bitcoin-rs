@@ -32,19 +32,27 @@ const MAX_COINBASE_SCRIPT_SIG_SIZE: usize = 100;
 // verification against the rest of the apply pipeline; widen only against a
 // fresh measurement on the target hardware.
 const MAX_SCRIPT_VERIFY_THREADS: usize = 32;
-// Blocks with fewer checks than this verify serially. A matched-validation
-// replay of mainnet 0..150_000 (3x medians, pinned `taskset -c 0-31`, the three
-// variants interleaved round-robin so page-cache warming hits them equally)
-// puts the optimum at 4, and the ordering held in every round:
+// Blocks with fewer checks than this verify serially. Measured on a
+// full-verification replay of mainnet 0..150_000 reading local block files,
+// `taskset -c 0-31`, three interleaved rounds, wall and CPU together:
 //
-//   threshold 16   155.8s      threshold 128   234.6s
-//   threshold  8   145.1s      threshold 512   297.3s
-//   threshold  4   139.4s      threshold  48   185.0s
+//   threshold    4    84.4s wall   946.6s CPU
+//   threshold   16    80.1s wall   773.2s CPU
+//   threshold   32    75.5s wall   649.6s CPU   <- both optima
+//   threshold   64    78.4s wall   533.6s CPU
+//   threshold  128    94.0s wall   390.7s CPU
 //
-// The curve is monotonic and steep above 16, so a higher threshold is never
-// right here: even a handful of inputs is worth the fan-out. Below 4 it turns
-// back up (threshold 2 measured 143.8s single-run), which sets the floor.
-const MIN_PARALLEL_SCRIPT_CHECKS: usize = 4;
+// 32 is the wall minimum and also beats every smaller value on CPU, so it
+// dominates rather than trades. CPU keeps falling above it, but wall turns
+// sharply at 128, and a node that finishes later has not saved anything.
+//
+// This replaced a value of 4, which an earlier sweep picked while the harness
+// fetched every block over REST from a second bitcoind competing for the same
+// cores. That contention inflated the serial path and made ever-finer fan-out
+// look free. Re-measured against local block files the ordering inverts, and 4
+// is now the worst point tested on both axes. Do not tune this against a
+// harness that shares CPU with the node, and do not tune it on wall alone.
+const MIN_PARALLEL_SCRIPT_CHECKS: usize = 32;
 static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     rayon::ThreadPoolBuilder::new()
