@@ -1052,6 +1052,14 @@ pub fn apply_block_with_serialized(
 /// average about 4.6 KB, so 1024 of them is 5 MB of block data; at the tip they
 /// are 2 MB, so the same 1024 would hold 2 GB. [`SCRIPT_BATCH_MAX_BYTES`] is the
 /// other half, and the window is whichever bound hits first.
+///
+/// Peer sync does not reach 1024 today. `RECEIVED_BLOCK_BUDGET` caps staging at
+/// 128 blocks, so the windows it forms are at most that, worth 525s CPU against
+/// 596s at 64 — a real gain, and not the 389s the replay driver reaches.
+/// Raising the staging cap is not a constant change: the staller-arming
+/// invariant in `sync.rs` ties the staged byte budget to the staged count at
+/// MAX_SERIALIZED_BLOCK_SIZE, so a 1024-block stage would demand a 2 GB bound.
+/// That invariant has to be reworked against typical block size first.
 pub const SCRIPT_BATCH_WINDOW: usize = 1024;
 
 /// How many bytes of block data one window may hold.

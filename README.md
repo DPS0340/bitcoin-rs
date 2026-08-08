@@ -13,8 +13,7 @@ Bitcoin Core uses.
 Script verification runs through libbitcoinkernel, the same library Bitcoin
 Core uses, so the hardest part of consensus is not reimplemented here. The
 block-level rules around it (BIP30, BIP34, weight and coinbase checks, and the
-rest) are this project's own code, and are covered by its own tests. The
-resident set is 224 MB against Bitcoin Core's 643 MB on the benchmark below.
+rest) are this project's own code, and are covered by its own tests.
 
 Four storage backends are selectable at runtime: fjall, RocksDB, MDBX, and
 redb. An equivalence test replays the same chain through all four and requires
@@ -46,18 +45,23 @@ physical cores with `taskset -c 0-31`. Three interleaved runs per contender,
 medians reported. Bitcoin Core 31.0 was run with `-reindex-chainstate
 -assumevalid=0 -connect=0 -dbcache=450`.
 
-| contender | wall | CPU |
-|---|---|---|
-| bitcoin-rs | 60.3s | 580.5s |
-| Bitcoin Core 31.0 | 61.1s | 470.7s |
+| contender | wall | CPU | peak RSS |
+|---|---|---|---|
+| bitcoin-rs | 50.3s | 392.9s | 562 MB |
+| Bitcoin Core 31.0 | 62.5s | 475.5s | 658 MB |
 
-Measured at commit `92a324d`. Correctness fixes have landed on the apply path
-since, and are not re-baselined here.
+Measured at commit `2ab0fd5`: 1.24x faster on wall-clock, 1.21x less CPU, and a
+1.17x smaller resident set. Both nodes reach the same tip hash.
 
-Read this per metric. On wall-clock the two are at parity. On CPU-seconds
-bitcoin-rs uses about 1.23x what Core does, because it buys wall-clock time
-with wider script-verification fan-out. Closing that gap is open work, not a
-footnote.
+This is the replay driver, which reads blocks from local files. Peer sync does
+not reach the same figure yet: it stages at most 128 blocks, so it forms
+smaller script-verification windows and lands between the two. Widening that is
+open work, and it is a change to the download pipeline rather than a constant.
+
+Read the conditions before reusing these numbers. This box runs other tenants,
+and the same binary has measured anywhere from 50s to 73s across sessions
+depending on load. Only runs interleaved with Core inside one session are
+comparable; an absolute number quoted from a different session is not.
 
 Against [GoCoin](https://github.com/piotrnar/gocoin) on the same harness:
 2.6x faster on replay and 3.03x on peer-to-peer sync.
