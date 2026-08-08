@@ -167,15 +167,17 @@ Then both nodes interleaved back-to-back on the same idle host, so neither gets 
 | Node | Runs | Median | Ratio |
 |---|---|---|---|
 | Core 31.0 | 59.6 / 59.4 / 60.2s | **59.6s** | 1.00× |
-| bitcoin-rs | 132.2 / 134.5 / 131.6s | **132.2s** | **2.22× slower** |
-| bitcoin-rs, apply only | 95.3s median | **95.3s** | **1.60× slower** |
+| bitcoin-rs *(REST source — superseded)* | 132.2 / 134.5 / 131.6s | 132.2s | 2.22× slower |
+| bitcoin-rs, apply only *(superseded)* | 95.3s median | 95.3s | 1.60× slower |
 
-Two corrections fall out of this:
+> **The two bitcoin-rs rows here are superseded.** They still fetched blocks over REST while Core read local `blk*.dat`. Matching the block source drops them to **84.6s / 1.42×** — see *"Matching the harness moved the ratio"* above. The Core row (59.6s) stands; it is the same measurement used throughout.
 
-1. **The gap is 2.22×, not the 1.87× computed from a best-case rs run against a stale Core reference.** Comparing your best run to someone else's old run is not a measurement. Interleave, or do not quote a ratio.
-2. **Harness cost is larger than the 22.4s quoted below.** Measured back-to-back, rs spends ~37s outside apply, because the `bitcoind` serving REST competes for the same cores. Core reads local `blk` files and pays nothing equivalent. Apply-only (1.60×) is the fair engine comparison; total (2.22×) is what a user experiences from this harness.
+The correction this section *does* establish, and which still holds:
 
-Core reaches this with **15** script threads (`MAX_SCRIPTCHECK_THREADS`) against our 32, which makes the gap a per-unit-work gap rather than a parallelism gap. That is the shape of the remaining problem.
+1. **Never compare your best run against someone else's old run.** The 1.87× previously quoted came from a best-case bitcoin-rs median against Core's stale 67s reference. Interleave both nodes back-to-back, or do not quote a ratio at all. This is what exposed the harness problem in the first place.
+2. **Harness cost was larger than the 22.4s this note originally claimed** — ~37s once measured back-to-back, because the `bitcoind` serving REST competes for the same cores. That observation is what led to the local-block-file source and the current 1.42×.
+
+Core reaches its number with **15** script threads (`MAX_SCRIPTCHECK_THREADS`) against our 32, which makes the remaining gap a per-unit-work gap rather than a parallelism gap. That still describes the shape of the problem.
 
 ## Core's crypto is not faster — ours is surrounded by work Core never does
 
