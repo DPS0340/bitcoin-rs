@@ -1349,10 +1349,74 @@ struct PreparedApply {
 ///
 /// Runs no consensus rule and mutates nothing, which is what lets a window
 /// prepare several blocks before committing any of them.
+/// A sink that compares what is written to it against `expected`.
+///
+/// Used to check preserved bytes against a block without serialising the block
+/// into a second buffer: nothing is allocated and the first differing byte ends
+/// the walk.
+struct ByteEquality<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    equal: bool,
+}
+
+impl bitcoin::io::Write for ByteEquality<'_> {
+    fn write(&mut self, buf: &[u8]) -> bitcoin::io::Result<usize> {
+        if self.equal {
+            match self
+                .expected
+                .get(self.offset..self.offset.saturating_add(buf.len()))
+            {
+                Some(window) if window == buf => {}
+                _ => self.equal = false,
+            }
+        }
+        self.offset = self.offset.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> bitcoin::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Returns true iff `raw` is exactly the consensus serialization of `block`.
+fn bytes_are_block(raw: &[u8], block: &bitcoin::Block) -> bool {
+    use bitcoin::consensus::Encodable as _;
+
+    let mut sink = ByteEquality {
+        expected: raw,
+        offset: 0,
+        equal: true,
+    };
+    // Encoding to a sink cannot fail; a write error here would be a bug in the
+    // sink above, and treating it as inequality is the safe reading either way.
+    let Ok(written) = block.consensus_encode(&mut sink) else {
+        return false;
+    };
+    sink.equal && written == raw.len()
+}
+
 fn parse_block_for_apply(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, BlockTxPlan), ApplyError> {
+    // Preserved bytes must BE this block, not merely agree with it on
+    // transaction count. In kernel builds the txids and the transactions that
+    // script verification runs come from these bytes, while the witness
+    // commitment check and the UTXO mutation use the decoded block. Changing a
+    // witness does not change a txid, so a count check lets a caller pair a
+    // block carrying an invalid witness with bytes carrying a valid one: the
+    // scripts verify against the bytes and the invalid block gets applied.
+    if let Some(raw) = provided_serialized.as_deref()
+        && !bytes_are_block(raw, block)
+    {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(
+                "preserved bytes are not the serialization of the block they accompany".to_owned(),
+            ),
+        ));
+    }
     let raw_block: bytes::Bytes =
         provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
     let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
@@ -5460,6 +5524,60 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// Preserved bytes must be the block, not a block with the same shape.
+    ///
+    /// The witness is the hole a count check leaves open: changing it does not
+    /// change any txid, so the decoded block and the bytes can disagree on
+    /// exactly the data script verification reads while every count and every
+    /// txid still matches.
+    #[test]
+    fn preserved_bytes_carrying_a_different_witness_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+
+        let honest = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        assert!(
+            bytes_are_block(&honest, &block),
+            "the block's own serialization must be accepted"
+        );
+
+        // Swap only the witness. Every txid, the transaction count, and the
+        // header are untouched.
+        let before = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let Some(input) = block.txdata.first_mut().and_then(|tx| tx.input.first_mut()) else {
+            panic!("coinbase has no input");
+        };
+        input.witness.push([0xab_u8; 32]);
+        let after = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before, after,
+            "the witness swap must not move a txid, or this proves nothing"
+        );
+
+        assert!(
+            !bytes_are_block(&honest, &block),
+            "bytes whose witness differs from the block must be rejected"
+        );
+        let outcome = parse_block_for_apply(&block, Some(honest));
+        assert!(
+            outcome.is_err(),
+            "apply must refuse a block whose preserved bytes are not its serialization"
+        );
+        Ok(())
     }
 
     /// At a BIP30 exception height the coinbase reuses a txid whose outputs are
