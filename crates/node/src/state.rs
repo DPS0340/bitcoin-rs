@@ -130,6 +130,21 @@ pub enum ApplyError {
     /// Persisting the canonical prunable block body failed.
     #[error("block body persistence: {0}")]
     BlockBodyPersistence(#[from] bitcoin_rs_storage::StorageError),
+    /// Persisting the UTXO undo record failed.
+    ///
+    /// Fatal for the block: without a recoverable undo record the node could
+    /// not disconnect it, so the block must not be applied.
+    #[error("undo persistence: {0}")]
+    UndoPersistence(#[source] bitcoin_rs_storage::StorageError),
+    /// A spent output had no resolved prevout, so the undo record would be
+    /// unable to restore it.
+    #[error("undo record cannot restore spent output {txid}:{vout}")]
+    UndoPrevoutMissing {
+        /// Transaction id of the unresolvable spend.
+        txid: bitcoin_rs_primitives::Hash256,
+        /// Output index of the unresolvable spend.
+        vout: u32,
+    },
 }
 
 enum NodeStorage {
@@ -272,6 +287,24 @@ impl NodeStorage {
                 files,
                 data_dir,
             )?)),
+        }
+    }
+
+    /// Builds the undo store for the configured backend.
+    ///
+    /// Mandatory rather than optional: without undo records the node cannot
+    /// disconnect a block, so it could advance its tip into a chain it is
+    /// unable to leave.
+    fn undo_store(&self) -> Arc<dyn crate::apply::UndoStore> {
+        match self {
+            #[cfg(feature = "rocksdb")]
+            Self::RocksDb(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
+            #[cfg(feature = "fjall")]
+            Self::Fjall(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
+            #[cfg(feature = "redb")]
+            Self::Redb(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
+            #[cfg(feature = "mdbx")]
+            Self::Mdbx(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
         }
     }
 
@@ -945,6 +978,7 @@ impl NodeState {
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: false,
             block_body_store: Some(Arc::clone(&block_body_store)),
+            undo_store: storage.undo_store(),
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),

@@ -48,6 +48,111 @@ fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
     usize::try_from(count).ok()
 }
 
+/// Durable storage for per-block UTXO undo records.
+///
+/// Undo records are consensus state, not an optional index: without the record
+/// for a block the node cannot disconnect it, so it can advance `applied_tip`
+/// into a chain it is unable to leave. The handle is therefore mandatory rather
+/// than `Option`, and every construction path must supply a real
+/// implementation. [`InMemoryUndoStore`] is a real one — it round-trips — and
+/// is the correct choice for tests that need no durability. A no-op
+/// implementation would recreate exactly the silent failure this type exists to
+/// prevent, so do not add one.
+///
+/// Records are keyed by height AND block hash. Keying by height alone would let
+/// a stale record from an abandoned branch be replayed against a different
+/// block at the same height.
+pub(crate) trait UndoStore: Send + Sync {
+    /// Writes the undo record for one block.
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Reads the undo record for one block, if present.
+    ///
+    /// Written now and read by the disconnect path in the next layer; the tests
+    /// below already depend on it, so a write-only store would be the odd shape
+    /// here, not this.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the block-disconnect path")
+    )]
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError>;
+}
+
+/// Process-local undo storage.
+///
+/// A real implementation: what is written can be read back. Suitable wherever
+/// durability across a restart is not required, such as tests.
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryUndoStore {
+    records: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+}
+
+impl UndoStore for InMemoryUndoStore {
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError> {
+        self.records.write().insert((height, hash), record.to_vec());
+        Ok(())
+    }
+
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.records.read().get(&(height, hash)).cloned())
+    }
+}
+
+/// Undo storage backed by a [`KvStore`] column family.
+pub(crate) struct KvUndoStore<S: KvStore> {
+    store: Arc<S>,
+}
+
+impl<S: KvStore> KvUndoStore<S> {
+    pub(crate) const fn new(store: Arc<S>) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: KvStore> UndoStore for KvUndoStore<S> {
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError> {
+        self.store.put(
+            bitcoin_rs_storage::ColumnFamily::UndoData,
+            &bitcoin_rs_pruning::block_body_key(height, hash),
+            record,
+        )
+    }
+
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.store.get(
+            bitcoin_rs_storage::ColumnFamily::UndoData,
+            &bitcoin_rs_pruning::block_body_key(height, hash),
+        )
+    }
+}
+
 pub(crate) trait PruneBodyStore: Send + Sync {
     fn persist_block_body(
         &self,
@@ -352,6 +457,8 @@ pub struct ApplyHandles {
     pub(crate) filter_header_cache: Arc<Mutex<Option<(Hash256, Hash256)>>>,
     pub(crate) cache_block_bodies_in_memory: bool,
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
+    /// Undo storage. Mandatory: see [`UndoStore`].
+    pub(crate) undo_store: Arc<dyn UndoStore>,
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
@@ -396,6 +503,7 @@ impl ApplyHandles {
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: true,
             block_body_store: None,
+            undo_store: Arc::new(InMemoryUndoStore::default()),
             g2_muhash_sampler: None,
             g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
@@ -639,10 +747,24 @@ fn apply_block_inner(
     };
 
     let utxo_changes_started = quanta::Instant::now();
-    let changes = build_utxo_changes(block, height, &scratch)?;
+    let (changes, undo) = build_utxo_changes(block, height, &scratch, &resolved)?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_changes_seconds")
         .record(utxo_changes_dur.as_secs_f64());
+
+    // Persist undo before the block body, the index, and the UTXO commit. All
+    // three are derived state for a block that is about to apply; if the undo
+    // record cannot be written the block must not apply at all, and leaving
+    // body bytes or index rows behind for it would be worse than not starting.
+    let undo_persist_started = quanta::Instant::now();
+    let undo_record = bitcoin_rs_utxo::encode_undo(&undo, block_hash);
+    let undo_persist_result = handles
+        .undo_store
+        .persist_undo(height, block_hash, &undo_record)
+        .map_err(ApplyError::UndoPersistence);
+    metrics::histogram!("node.apply_block.undo_persist_seconds")
+        .record(undo_persist_started.elapsed().as_secs_f64());
+    undo_persist_result?;
     // Serialize the block lazily: only when a consumer actually needs the
     // full bytes. During IBD with pruning+txindex disabled this avoids a
     // full-block serialize on every apply.
@@ -1190,6 +1312,11 @@ impl ResolvedUtxoView {
 
     fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
         self.external.get(outpoint).map(|entry| entry.txout.clone())
+    }
+
+    /// Full resolved entry for a spent outpoint, including creation metadata.
+    fn entry(&self, outpoint: &bitcoin::OutPoint) -> Option<&LiveOutput> {
+        self.external.get(outpoint)
     }
 
     fn lookup_meta(&self, outpoint: &bitcoin::OutPoint) -> Option<LiveOutputMeta> {
@@ -1773,17 +1900,22 @@ fn build_utxo_changes<'a>(
     block: &'a bitcoin::Block,
     height: u32,
     scratch: &ApplyScratch,
-) -> core::result::Result<BorrowedBlockChanges<'a>, ApplyError> {
+    resolved: &ResolvedUtxoView,
+) -> core::result::Result<(BorrowedBlockChanges<'a>, bitcoin_rs_utxo::UndoBatch), ApplyError> {
     use bitcoin::hashes::Hash as _;
 
     // Bitcoin Core indexes genesis but does not connect its transactions into
     // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
     if height == 0 {
-        return Ok(BorrowedBlockChanges::default());
+        return Ok((
+            BorrowedBlockChanges::default(),
+            bitcoin_rs_utxo::UndoBatch::default(),
+        ));
     }
 
     let (add_capacity, remove_capacity) = scratch.utxo_change_capacity();
     let mut changes = BorrowedBlockChanges::with_capacity(add_capacity, remove_capacity);
+    let mut undo = bitcoin_rs_utxo::UndoBatch::default();
     let net_same_block_spends = scratch.has_same_block_spends();
     for (tx, txid) in block.txdata.iter().zip(scratch.txids()) {
         let txid = bitcoin_rs_primitives::Hash256::from_le_bytes(txid.as_byte_array());
@@ -1800,6 +1932,8 @@ fn build_utxo_changes<'a>(
                 continue;
             }
             changes.add(BorrowedUtxoAdd::new(outpoint, txout, coinbase, height));
+            // Disconnecting the block deletes what it created.
+            undo.remove(outpoint);
         }
 
         if !coinbase {
@@ -1809,10 +1943,25 @@ fn build_utxo_changes<'a>(
                     continue;
                 }
                 changes.remove(previous_output);
+                // ...and restores what it spent. A spend with no resolved
+                // prevout would make the record unable to restore that output,
+                // so refuse rather than persist an undo that silently loses it.
+                let spent = resolved.entry(&tx_input.previous_output).ok_or(
+                    ApplyError::UndoPrevoutMissing {
+                        txid: previous_output.txid,
+                        vout: previous_output.vout,
+                    },
+                )?;
+                undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
+                    previous_output,
+                    spent.txout.clone(),
+                    spent.coinbase,
+                    spent.height,
+                ));
             }
         }
     }
-    Ok(changes)
+    Ok((changes, undo))
 }
 
 fn internal_outpoint(outpoint: &bitcoin::OutPoint) -> OutPoint {
@@ -2873,7 +3022,7 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
@@ -2903,7 +3052,7 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
@@ -2953,7 +3102,16 @@ mod consensus_rule_tests {
         let block = block_with_transactions(vec![funding_tx, same_block_spend]);
 
         let scratch = ApplyScratch::new(&block, 2, false, false)?;
-        let changes = build_utxo_changes(&block, 2, &scratch)?;
+        // The block spends an external prevout, so the undo half needs the
+        // resolved view that spend came from. An empty view would now be
+        // rejected, which is the point of UndoPrevoutMissing.
+        let resolved = ResolvedUtxoView::resolve(&utxo, &block, &tx_plan(&block));
+        let (changes, undo) = build_utxo_changes(&block, 2, &scratch, &resolved)?;
+        assert_eq!(
+            undo.restores().len(),
+            1,
+            "only the external spend is restorable; the same-block spend never entered the set"
+        );
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x63; 32]))?;
 
         assert!(utxo.get(&internal_outpoint(&base_prevout)).is_none());
@@ -2997,7 +3155,7 @@ mod consensus_rule_tests {
         let block = block_with_transaction(coinbase_transaction(0x70));
 
         let scratch = ApplyScratch::new(&block, 1, false, true)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) = build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty())?;
 
         assert!(
             !scratch.contains_same_block_spent(&internal_outpoint(&bitcoin::OutPoint {
@@ -4117,6 +4275,128 @@ mod consensus_rule_tests {
             .filter(block_hash)?
             .ok_or_else(|| std::io::Error::other("filter row missing"))?;
         assert!(!stored_filter.is_empty());
+        Ok(())
+    }
+
+    /// A store that refuses every write, to prove the undo persistence is a
+    /// real gate rather than a best-effort side effect.
+    #[derive(Debug, Default)]
+    struct RejectingUndoStore;
+
+    impl UndoStore for RejectingUndoStore {
+        fn persist_undo(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+            _record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected undo write failure".to_owned(),
+            ))
+        }
+
+        fn load_undo(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            Ok(None)
+        }
+    }
+
+    /// The ordering contract: undo is written before the UTXO commit and before
+    /// every derived write, so a failure to record it must leave the node
+    /// exactly as it was. Applying the block anyway would produce a chainstate
+    /// the node cannot disconnect.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_failed_undo_write_applies_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        handles.undo_store = Arc::new(RejectingUndoStore);
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let outcome = apply_block(&handles, &block);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::UndoPersistence(_))),
+            "a failed undo write must fail the apply, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            0,
+            "no UTXO mutation may survive a refused undo write"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(u32::MAX, |tip| tip.height),
+            0,
+            "the applied tip must not advance"
+        );
+        assert!(
+            filter_index.headers.lock().is_empty(),
+            "no derived filter row may be written for a block that did not apply"
+        );
+        Ok(())
+    }
+
+    /// Layer-2 acceptance: connecting a block leaves a decodable undo record
+    /// bound to that block, which is the prerequisite for ever disconnecting it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn apply_block_persists_a_decodable_undo_record() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let handles = apply_handles_with_filter_index(
+            Network::Regtest,
+            Arc::new(UtxoSet::new()),
+            &filter_index,
+        );
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+
+        let record = handles
+            .undo_store
+            .load_undo(1, block_hash)?
+            .ok_or_else(|| std::io::Error::other("undo record missing after apply"))?;
+        let undo = bitcoin_rs_utxo::decode_undo(&record, block_hash)?;
+
+        // A coinbase-only block creates one output and spends nothing, so its
+        // inverse removes that output and restores nothing.
+        assert_eq!(undo.removes().len(), 1);
+        assert!(undo.restores().is_empty());
+
+        // The record is bound to its block: it must refuse another hash.
+        let other = Hash256::from_le_bytes(&[0xAB; 32]);
+        assert!(bitcoin_rs_utxo::decode_undo(&record, other).is_err());
         Ok(())
     }
 
