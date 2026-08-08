@@ -302,7 +302,9 @@ Post-refactor decomposition beside Core's `-debug=bench` figures for the identic
 
 An earlier revision of this note called the double parse "the largest remaining structural lever" at ~14.0s against Core's 7.18s. That was wrong in the same way the `Block::new` accounting was wrong earlier: it priced a replacement against a total that includes work which does not disappear. Corrected here so nobody spends a refactor on it.
 
-One genuine open question remains rather than a lever: our in-memory kernel parse plus txid harvest costs 10.9s while Core's `Load block from disk` — which *includes* disk I/O and uses the same C++ deserializer — costs 7.18s. Worth attributing before anyone assumes the parse is already optimal. Two smaller targets sit behind it, both bounded:
+That parse gap is real but also sub-gate, and the two probes already separate it. `Block::new` with the result discarded measured **10.88s**; `Block::new` plus harvesting all 1.7M txids measured **10.93s**. Harvesting is therefore **0.05s** — `TransactionExt::txid()` really is a getter over a hash the parse already computed, so there is nothing to reclaim there. The 10.88s is the deserialize itself, against Core's 7.18s for the same C++ deserializer *including real disk I/O*.
+
+Why ours is ~1.5× slower on the same code is unexplained and worth knowing, but it is not a lever: **matching Core exactly would save 3.70s, or 3.0% of a 121.9s run (1.031×)** — under the noise gate. Attribute it for understanding, not for throughput. Two smaller targets sit behind it, both similarly bounded:
 
 * `block_rules` 4.79s vs Core's 1.41s — the merkle root is SHA-256d over txids with a scalar implementation while Core uses its runtime-selected AVX2 one. The kernel does not expose a merkle helper, so this needs either an exposed hash primitive or a parallel merkle tree.
 * `utxo_commit` 6.10s vs Core's 2.59s flush.
