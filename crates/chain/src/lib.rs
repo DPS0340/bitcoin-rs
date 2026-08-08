@@ -114,4 +114,27 @@ pub enum ChainError {
         /// New tip node id.
         new_tip: NodeId,
     },
+    /// A header's timestamp is not strictly greater than the median-time-past
+    /// of its previous 11 blocks.
+    #[error("header {hash} timestamp {timestamp} is not greater than median-time-past {median}")]
+    TimestampTooEarly {
+        /// Header hash.
+        hash: Hash256,
+        /// Header timestamp (seconds since UNIX epoch).
+        timestamp: u32,
+        /// Median timestamp of the previous 11 blocks.
+        median: u32,
+    },
+    /// A header's timestamp is too far ahead of the current network-adjusted time.
+    #[error(
+        "header {hash} timestamp {timestamp} exceeds maximum allowed future time {max_allowed}"
+    )]
+    TimestampTooFarAhead {
+        /// Header hash.
+        hash: Hash256,
+        /// Header timestamp (seconds since UNIX epoch).
+        timestamp: u32,
+        /// Maximum allowed timestamp (`now + 7200`).
+        max_allowed: u32,
+    },
 }

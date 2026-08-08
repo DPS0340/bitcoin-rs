@@ -1024,7 +1024,7 @@ mod tests {
         let tip_h = 40_u32;
         let locator = tree.block_locator(tip_id, 32);
         let expected_heights = [
-            tip_h - 0,
+            tip_h,
             tip_h - 1,
             tip_h - 2,
             tip_h - 3,

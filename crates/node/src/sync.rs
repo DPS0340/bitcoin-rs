@@ -260,8 +260,15 @@ fn is_peer_fault(error: &ChainError) -> bool {
         | ChainError::ZeroTarget { .. }
         | ChainError::NonContinuousHeader { .. }
         | ChainError::ChainworkOverflow { .. }
-        | ChainError::HeightOverflow { .. } => true,
-        ChainError::DuplicateHeader { .. }
+        | ChainError::HeightOverflow { .. }
+        // A median-time-past violation is decided entirely by the chain the peer
+        // itself sent, so it is unambiguously the peer's fault.
+        | ChainError::TimestampTooEarly { .. } => true,
+        // Future drift is judged against OUR clock, so a wrong local clock
+        // would otherwise let us ban every honest peer and partition
+        // ourselves. The header is rejected without blaming the sender.
+        ChainError::TimestampTooFarAhead { .. }
+        | ChainError::DuplicateHeader { .. }
         | ChainError::MissingParent { .. }
         | ChainError::NodeIdOverflow { .. }
         | ChainError::UnknownNode { .. }
