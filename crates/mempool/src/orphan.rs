@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use bitcoin::{Transaction, Txid};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 use thiserror::Error;
@@ -37,6 +37,9 @@ pub enum OrphanError {
     /// The transaction id is already present in the orphan pool.
     #[error("transaction already exists in orphan pool")]
     DuplicateOrphan,
+    /// The pool is configured to hold no orphans at all.
+    #[error("orphan pool is disabled: maximum count is zero")]
+    PoolDisabled,
     /// The transaction's weight alone exceeds the pool's weight limit, so it
     /// can never be admitted regardless of eviction.
     #[error("transaction weight {weight} exceeds orphan pool max {max}")]
@@ -150,6 +153,13 @@ impl OrphanPool {
         peer: SocketAddr,
         now: Instant,
     ) -> Result<Txid, OrphanError> {
+        // Zero means zero. The eviction loop below runs against an empty pool,
+        // finds no oldest entry, breaks, and the insert then happens anyway, so
+        // a pool configured to hold nothing held one.
+        if self.max_count == 0 {
+            return Err(OrphanError::PoolDisabled);
+        }
+
         let txid = tx.compute_txid();
         if self.orphans.contains_key(&txid) {
             return Err(OrphanError::DuplicateOrphan);
@@ -164,9 +174,15 @@ impl OrphanPool {
         }
 
         // Deduplicate missing parents while preserving order.
+        //
+        // Through a set, not `Vec::contains`. A transaction under the pool's
+        // weight limit can still name thousands of distinct parents, and the
+        // scan made admission quadratic in that count, so repeated large
+        // orphans burned CPU before the eviction logic ever ran.
+        let mut seen: HashSet<Txid> = HashSet::with_capacity(missing_parents.len());
         let mut deduped: Vec<Txid> = Vec::with_capacity(missing_parents.len());
         for parent in missing_parents {
-            if !deduped.contains(&parent) {
+            if seen.insert(parent) {
                 deduped.push(parent);
             }
         }
@@ -348,6 +364,49 @@ mod tests {
 
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// A pool configured to hold nothing must hold nothing.
+    ///
+    /// The eviction loop runs against an empty pool, finds no oldest entry, and
+    /// breaks; without an explicit guard the insert then happened anyway and
+    /// the pool kept one orphan, defeating a zero used to disable retention.
+    #[test]
+    fn a_zero_count_limit_admits_no_orphans() {
+        let mut pool = OrphanPool::with_limits(0, 10_000_000, Duration::from_secs(60));
+        let tx = orphan_tx(1, vec![OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0)]);
+        let outcome = pool.add(tx, Vec::new(), peer(1), Instant::now());
+
+        assert!(
+            matches!(outcome, Err(OrphanError::PoolDisabled)),
+            "a zero-count pool must refuse, got {outcome:?}"
+        );
+        assert_eq!(pool.len(), 0, "and must hold nothing afterwards");
+    }
+
+    /// Deduplication must keep first-seen order.
+    ///
+    /// The set is there for the cost, but order is the contract: parents are
+    /// requested in the order given, and a set alone would scramble them.
+    #[test]
+    fn duplicate_parents_collapse_and_keep_their_order() {
+        let mut pool = OrphanPool::with_limits(8, 10_000_000, Duration::from_secs(60));
+        let a = Txid::from_byte_array([0xa1; 32]);
+        let b = Txid::from_byte_array([0xb2; 32]);
+        let c = Txid::from_byte_array([0xc3; 32]);
+        let tx = orphan_tx(2, vec![OutPoint::new(a, 0)]);
+
+        let Ok(txid) = pool.add(tx, vec![c, a, b, a, c, b], peer(2), Instant::now()) else {
+            panic!("the orphan must be admitted");
+        };
+        let Some(entry) = pool.orphans.get(&txid) else {
+            panic!("the admitted orphan must be retrievable");
+        };
+        assert_eq!(
+            entry.missing_parents,
+            vec![c, a, b],
+            "duplicates collapse to the first occurrence, in first-seen order"
+        );
     }
 
     /// Builds a transaction with the given label and prevout outpoints.
