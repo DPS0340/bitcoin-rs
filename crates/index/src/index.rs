@@ -1589,6 +1589,126 @@ mod tests {
         Ok(())
     }
 
+    /// Delegates every operation to a real store but fails `write`, so the
+    /// all-or-nothing claim on `rollback_block` can be exercised rather than
+    /// merely asserted in a doc comment.
+    struct FailingWriteStore(RocksDbStore);
+
+    impl bitcoin_rs_storage::KvStore for FailingWriteStore {
+        type WriteBatch = <RocksDbStore as KvStore>::WriteBatch;
+
+        fn get(
+            &self,
+            cf: ColumnFamily,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.0.get(cf, key)
+        }
+
+        fn iter_prefix<'a>(
+            &'a self,
+            cf: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<bitcoin_rs_storage::KvIter<'a>, bitcoin_rs_storage::StorageError> {
+            self.0.iter_prefix(cf, prefix)
+        }
+
+        fn new_batch(&self) -> Self::WriteBatch {
+            self.0.new_batch()
+        }
+
+        fn write(&self, _batch: Self::WriteBatch) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected write failure".to_owned(),
+            ))
+        }
+
+        fn flush(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.0.flush()
+        }
+
+        fn snapshot(
+            &self,
+        ) -> Result<Box<dyn bitcoin_rs_storage::KvSnapshot + '_>, bitcoin_rs_storage::StorageError>
+        {
+            self.0.snapshot()
+        }
+    }
+
+    #[test]
+    fn rollback_deletes_nothing_when_the_write_fails() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let candidate = rollback_fixture_block();
+
+        // Populate through a normal indexer, then reopen behind the failing
+        // store so the rows exist but no write can land.
+        {
+            let store = Arc::new(RocksDbStore::open(dir.path())?);
+            let mut indexer = Indexer::new(store);
+            indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        }
+        let store = Arc::new(RocksDbStore::open(dir.path())?);
+        let before = stored_rows(&Indexer::new(Arc::clone(&store)))?;
+        assert!(!before.is_empty(), "fixture must have rows to preserve");
+        drop(store);
+
+        let failing = Arc::new(FailingWriteStore(RocksDbStore::open(dir.path())?));
+        let mut indexer = Indexer::new(Arc::clone(&failing));
+        let outcome = indexer.rollback_block(&candidate, HEIGHT);
+        assert!(outcome.is_err(), "a failing write must surface as an error");
+        drop(indexer);
+        drop(failing);
+
+        let reopened = Indexer::new(Arc::new(RocksDbStore::open(dir.path())?));
+        assert_eq!(
+            stored_rows(&reopened)?,
+            before,
+            "a failed rollback must leave every row in place"
+        );
+        Ok(())
+    }
+
+    /// An indexer that persists nothing and does not override the rollback
+    /// default. It must refuse rather than report a successful no-op, or the
+    /// node would advance its tip believing a stale index is consistent.
+    struct RollbackUnawareIndexer;
+
+    impl super::IndexerLike for RollbackUnawareIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<super::IndexRowCounts, super::IndexError> {
+            Ok(super::IndexRowCounts::default())
+        }
+
+        fn resolve_transaction(
+            &self,
+            _txid: Txid,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<Transaction>, super::IndexError> {
+            Ok(None)
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, super::IndexError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn the_rollback_default_refuses_rather_than_silently_succeeding() {
+        let mut indexer = RollbackUnawareIndexer;
+        let candidate = rollback_fixture_block();
+        assert!(matches!(
+            super::IndexerLike::rollback_block(&mut indexer, &candidate, HEIGHT),
+            Err(super::IndexError::UnsupportedRollback)
+        ));
+    }
+
     fn indexer() -> Result<(tempfile::TempDir, Indexer<RocksDbStore>), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(RocksDbStore::open(dir.path())?);
