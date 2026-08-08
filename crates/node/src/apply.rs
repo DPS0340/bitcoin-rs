@@ -1231,6 +1231,9 @@ fn prove_window(
     metrics::histogram!("node.window.prepare_seconds")
         .record(prepare_started.elapsed().as_secs_f64());
 
+    // One slot per input block, so a skipped unit leaves a hole rather than
+    // shifting every later block onto the wrong prepared state.
+    let mut skipped = vec![false; prepared.len()];
     // One dispatch for the whole window. The check units borrow their kernel
     // blocks, so they live and die inside this scope, before anything commits.
     {
@@ -1245,7 +1248,22 @@ fn prove_window(
         // same reason the script checks are batched across blocks rather than
         // split within one.
         let mut units = Vec::with_capacity(prepared.len());
-        for ((block, unit), context) in blocks.iter().zip(&prepared).zip(&contexts) {
+        let mut flags: Vec<bitcoin_rs_script::VerifyFlags> = Vec::with_capacity(prepared.len());
+        for (index, ((block, unit), context)) in
+            blocks.iter().zip(&prepared).zip(&contexts).enumerate()
+        {
+            // The same predicate the single-block path applies, per block rather
+            // than per window, because the anchor height can fall inside a
+            // window. Without it the batch prepared and executed every unit
+            // before the per-block decision was ever reached, so assume-valid
+            // did nothing at all on the windowed path.
+            if handles.assume_valid_height > 0
+                && context.height <= handles.assume_valid_height
+                && handles.assume_valid_gate.trusted()
+            {
+                skipped[index] = true;
+                continue;
+            }
             let Ok(resolved) = resolve_block_prevouts(
                 Arc::clone(&unit.resolved),
                 block,
@@ -1261,15 +1279,19 @@ fn prove_window(
                 context.locktime_cutoff,
                 &unit.kernel_block,
             ) {
-                Ok(checks) => units.push(checks),
+                Ok(checks) => {
+                    units.push(checks);
+                    // Pushed together with the unit so the two stay aligned:
+                    // collecting flags from every context would misalign them
+                    // against a units list that skipped some.
+                    flags.push(context.flags);
+                }
                 Err(_) => return Vec::new(),
             }
         }
         metrics::histogram!("node.window.checks_seconds")
             .record(checks_started.elapsed().as_secs_f64());
         let verify_started = quanta::Instant::now();
-        let flags: Vec<bitcoin_rs_script::VerifyFlags> =
-            contexts.iter().map(|context| context.flags).collect();
         let verdict = bitcoin_rs_consensus::verify_tx::verify_prepared_units(&units, &flags);
         metrics::histogram!("node.window.verify_seconds")
             .record(verify_started.elapsed().as_secs_f64());
@@ -1281,7 +1303,18 @@ fn prove_window(
     prepared
         .into_iter()
         .zip(contexts)
-        .map(|(prepared, proof)| ProvenApply { prepared, proof })
+        .zip(skipped)
+        .map(|((prepared, proof), skipped)| ProvenApply {
+            prepared,
+            // No proof for a block whose scripts this window skipped. A
+            // `ScriptProof` asserts the scripts ran, and handing one back for a
+            // skipped block would do more than lie: the commit would take the
+            // proof branch instead of re-reading the trust gate, so a gate that
+            // flipped to untrusted between here and the commit would let the
+            // block through unverified. `None` sends it down the per-block path,
+            // which makes that decision against the gate as it stands then.
+            proof: (!skipped).then_some(proof),
+        })
         .collect()
 }
 
@@ -1325,7 +1358,9 @@ impl ScriptProof {
 /// construction makes that unrepresentable.
 struct ProvenApply {
     prepared: PreparedApply,
-    proof: ScriptProof,
+    /// `None` when the window skipped this block's scripts under assume-valid.
+    /// The preparation is still reused; only the script evidence is absent.
+    proof: Option<ScriptProof>,
 }
 
 /// Everything a block's application needs that depends only on the block and
@@ -1549,7 +1584,7 @@ fn apply_block_admitted(
     // A window prepares several blocks against one overlay and hands the result
     // back, so the kernel parse and the prevout resolution happen once.
     let (prepared, proof) = match proven {
-        Some(ProvenApply { prepared, proof }) => (prepared, Some(proof)),
+        Some(ProvenApply { prepared, proof }) => (prepared, proof),
         None => (
             prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
             None,
@@ -5524,6 +5559,97 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// The window must make the same assume-valid decision the single-block path
+    /// makes, and must not hand back script evidence for a block it skipped.
+    ///
+    /// It used to do neither: every unit was prepared and executed before the
+    /// per-block decision was reached, so `--assume-valid-height N` did nothing
+    /// on the windowed path at all.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::opcodes::all::OP_EQUAL;
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x71; 32]),
+            vout: 0,
+        };
+
+        // A spend that cannot pass: the prevout pays to a bare OP_EQUAL, so the
+        // script fails whenever it actually runs. Whether the window ran it is
+        // therefore observable in the result.
+        let build = |assume_valid_height: u32| -> Result<_, Box<dyn std::error::Error>> {
+            let utxo = Arc::new(UtxoSet::new());
+            let mut changes = BlockChanges::default();
+            changes.add(UtxoAdd::new(
+                OutPoint::new(
+                    Hash256::from_le_bytes(prevout.txid.as_byte_array()),
+                    prevout.vout,
+                ),
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: bitcoin::script::Builder::new()
+                        .push_opcode(OP_EQUAL)
+                        .into_script(),
+                },
+                false,
+                0,
+            ));
+            utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0x71; 32]))?;
+
+            let mut handles = apply_handles_for_network(Network::Regtest, utxo);
+            handles.assume_valid_height = assume_valid_height;
+            let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+            let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+            handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+            let spend = spending_transaction_to_script(
+                prevout,
+                Sequence::MAX.to_consensus_u32(),
+                op_true_script(),
+            );
+            let block = mined_block_with_prev_hash_and_transactions(
+                genesis.block_hash(),
+                vec![coinbase_transaction(1), spend],
+            )?;
+            // The window refuses a block whose header the tree has not seen.
+            // This test is about the assume-valid decision, not admission.
+            let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            applied_header_tip(&handles, block_hash, &block, 1)?;
+            let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+            Ok((handles, block, raw))
+        };
+
+        // Height 1 is covered, and with no anchor pinned the gate is trusted.
+        let (handles, block, raw) = build(100)?;
+        let proven = prove_window(&handles, std::slice::from_ref(&block), &[raw]);
+        assert_eq!(
+            proven.len(),
+            1,
+            "a trusted block must not be failed by a script the window should never have run"
+        );
+        let Some(entry) = proven.first() else {
+            panic!("window returned no entry for the only block");
+        };
+        assert!(
+            entry.proof.is_none(),
+            "a skipped block must carry no script proof: the proof branch bypasses the \
+             trust-gate re-read at commit, so a gate that flips in between would let an \
+             unverified block through"
+        );
+
+        // Full verification must be completely unaffected.
+        let (handles, block, raw) = build(0)?;
+        let proven = prove_window(&handles, std::slice::from_ref(&block), &[raw]);
+        assert!(
+            proven.is_empty(),
+            "with assume_valid_height 0 the bad script must still fail the window"
+        );
+        Ok(())
     }
 
     /// Preserved bytes must be the block, not a block with the same shape.
