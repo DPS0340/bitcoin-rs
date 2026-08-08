@@ -19,6 +19,9 @@ pub enum IndexError {
     /// `bitcoin_slices` rejected the serialized block.
     #[error("invalid serialized block: {0:?}")]
     BlockParse(bitcoin_slices::Error),
+    /// This indexer cannot undo a block, so a reorg cannot be made consistent.
+    #[error("this indexer does not support block disconnect")]
+    UnsupportedRollback,
     /// A block header did not have the consensus 80-byte length.
     #[error("invalid block header length {len}")]
     InvalidHeaderLength {
@@ -470,6 +473,57 @@ impl<S: KvStore> Indexer<S> {
         self.ingest_rows(rows)
     }
 
+    /// Deletes every index row that ingesting `block` at `height` would have written.
+    ///
+    /// Derives the same txid, funding, spending, and header row keys as
+    /// [`Self::ingest_decoded_block_with_verified_txids`] by reusing the shared
+    /// row-construction code, then issues all deletions in a single atomic
+    /// [`KvStore::write`] batch. Either the entire block's rows are removed or
+    /// the method returns `Err` having deleted nothing observable.
+    ///
+    /// Deleting a row that is already absent is not an error: the indexer may
+    /// have been enabled after `block` was applied, so its rows may never have
+    /// existed. The returned [`IndexRowCounts`] reflects the rows targeted for
+    /// deletion (the same counts a matching ingest would have written), which
+    /// may be zero on a repeat call or when the block was never indexed.
+    pub fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let txids: Vec<bitcoin::Txid> = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect();
+        let mut rows = pending_rows_for_decoded_block(block, height, &txids)?;
+        rows.sort();
+        let counts = rows.counts();
+        let mut batch = self.store.new_batch();
+        for row in &rows.txid_rows {
+            batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
+        }
+        for row in &rows.funding_rows {
+            batch.delete(ColumnFamily::Funding, row.as_bytes());
+        }
+        for row in &rows.spending_rows {
+            batch.delete(ColumnFamily::Spending, row.as_bytes());
+        }
+        for row in &rows.header_rows {
+            batch.delete(ColumnFamily::BlockHeaders, row);
+        }
+        self.store.write(batch)?;
+        self.last_counts = counts;
+        debug!(
+            txids = counts.txids,
+            funding = counts.funding,
+            spending = counts.spending,
+            headers = counts.headers,
+            "rolled back block"
+        );
+        Ok(counts)
+    }
+
     fn ingest_rows(&mut self, mut rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
         // Dedup before counting: a block can generate the same funding or
         // spending row twice, and only one copy is ever written. Counting the
@@ -804,6 +858,24 @@ pub trait IndexerLike: Send + Sync {
         self.ingest_block_with_verified_txids(serialized_block, height, txids)
     }
 
+    /// Deletes every index row that ingesting `block` at `height` would have written.
+    ///
+    /// The inverse of the ingest methods above. The default returns
+    /// [`IndexError::UnsupportedRollback`] rather than succeeding: an
+    /// implementation that silently reports a successful rollback while
+    /// deleting nothing would let the node advance its tip believing the index
+    /// is consistent, and the Electrum server would then serve transactions
+    /// that are no longer in the chain. Failing loudly is the only safe
+    /// default. Concrete indexers that persist rows override this.
+    fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = (block, height);
+        Err(IndexError::UnsupportedRollback)
+    }
+
     /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
     fn begin_batch(&mut self) {}
 
@@ -882,6 +954,14 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
+    }
+
+    fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block(self, block, height)
     }
 
     fn begin_batch(&mut self) {
