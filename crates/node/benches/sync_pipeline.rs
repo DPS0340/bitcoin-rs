@@ -962,11 +962,10 @@ impl ProductionStateSyncFixture {
                 NetworkMessage::GetData(inventory) => break inventory.len(),
                 NetworkMessage::GetHeaders(_) => {
                     drained_headers = drained_headers.saturating_add(1);
-                    if drained_headers > 32 {
-                        panic!(
-                            "expected production getdata after draining {drained_headers} header requests"
-                        );
-                    }
+                    assert!(
+                        drained_headers <= 32,
+                        "expected production getdata after draining {drained_headers} header requests"
+                    );
                     continue;
                 }
                 other => panic!("expected production getdata, got {other:?}"),

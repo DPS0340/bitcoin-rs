@@ -2014,7 +2014,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -2204,7 +2204,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2273,7 +2273,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2360,7 +2360,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2410,7 +2410,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -2443,7 +2443,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -2550,7 +2550,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2582,7 +2582,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2614,7 +2614,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2646,7 +2646,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2668,7 +2668,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2701,7 +2701,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2737,7 +2737,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -2774,7 +2774,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3037,7 +3037,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3071,7 +3071,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3086,7 +3086,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3119,7 +3119,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3138,7 +3138,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3176,7 +3176,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3195,7 +3195,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3231,7 +3231,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3282,7 +3282,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3316,7 +3316,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3349,7 +3349,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3389,7 +3389,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3428,7 +3428,7 @@ mod consensus_rule_tests {
             &block,
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &tx_plan(&block),
             )),
@@ -3464,7 +3464,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &block,
                     &tx_plan(&block)
                 )),
@@ -3500,7 +3500,7 @@ mod consensus_rule_tests {
                 &version_one_block,
                 &tx_plan(&version_one_block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &version_one_block,
                     &tx_plan(&version_one_block)
                 )),
@@ -3523,7 +3523,7 @@ mod consensus_rule_tests {
                 &disabled_block,
                 &tx_plan(&disabled_block),
                 Arc::new(ResolvedUtxoView::resolve(
-                    (&handles).utxo.as_ref(),
+                    handles.utxo.as_ref(),
                     &disabled_block,
                     &tx_plan(&disabled_block)
                 )),
@@ -5169,7 +5169,7 @@ mod consensus_rule_tests {
             &block,
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles).utxo.as_ref(),
+                handles.utxo.as_ref(),
                 &block,
                 &plan,
             )),
@@ -5186,7 +5186,7 @@ mod consensus_rule_tests {
             &block2,
             &plan2,
             Arc::new(ResolvedUtxoView::resolve(
-                (&handles2).utxo.as_ref(),
+                handles2.utxo.as_ref(),
                 &block2,
                 &plan2,
             )),
