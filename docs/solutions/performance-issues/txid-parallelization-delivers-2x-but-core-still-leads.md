@@ -74,6 +74,8 @@ The processing-bound replay is not the only throughput metric the goal names, so
 | bitcoin-rs | 75.7 / 76.4s | **76.0s** | 1.77× slower |
 | GoCoin | 195.8s | 195.8s | bitcoin-rs 2.58× faster |
 
+The bitcoin-rs row is **superseded by the global-pool cap below**: it now syncs the same window in **64.6s**, so Core leads **1.52×** and bitcoin-rs is **3.03×** faster than GoCoin. The row is kept because the rest of this section reasons from it.
+
 **This is not the download-bound regime, despite being a P2P sync.** A loopback fixture imposes no bandwidth limit, so what this measures is validation plus P2P protocol overhead — closer to processing-bound than to real IBD. The genuine download-bound regime needs a bandwidth-constrained or real-network path, and the older full-tip figures (bitcoin-rs 27081s vs Core 42907s at 961k) were taken there and are **not** contradicted by this table. They are also months old and unverified this session; do not quote them without re-deriving.
 
 **These two results are independent, not a decomposition — do not divide them.** An earlier revision of this note put them side by side:
@@ -113,11 +115,22 @@ A stalling node burns comparable CPU over more wall time. This is the opposite: 
 | 2 | 82.6s | 239.0s |
 | 1 | 89.2s | 230.1s |
 
-Collapsing the pool to a single thread removes only 88s of the 318s and costs 13s of wall. Even fully serial, bitcoin-rs burns **3.5×** Core's CPU. Pool spin is a minority of the excess, so no width setting converges and the remaining cost is spread across the whole apply and sync path — the same conclusion the stage decomposition below reaches from the other direction, now confirmed on an independent axis.
+Collapsing the pool to a single thread removes only 88s of the 318s and costs 13s of wall. Even fully serial, bitcoin-rs burns **3.5×** Core's CPU. Pool spin in *this* pool is a minority of the excess.
 
-**Measure CPU alongside wall from now on.** Every sweep in this note before this one optimised wall time only, on an idle 128-core host. `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 is the clearest case: it won 1.15× of wall by pushing far more blocks through the pool, which is exactly the change that raises CPU. It was not re-checked against CPU and should be, on hardware with a realistic core count, before it is treated as settled.
+**The wrong pool was under suspicion.** The larger bucket in the thread attribution was the 128.8s under the process name, and rayon leaves its **global** pool's workers unnamed, so they inherit it. Unlike `SCRIPT_VERIFY_POOL` that pool was never capped: it sized itself at one worker per core, on top of a 32-thread script pool and the node's own I/O threads. `RAYON_NUM_THREADS` tests it with no code change, and three interleaved pairs settle it:
 
-What this does settle: Core leads on *both* throughput measurements available on this host (1.42× processing-bound, 1.77× over loopback P2P), and bitcoin-rs beats GoCoin on both. The two bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating 76.0s as precise.
+| global pool | wall | CPU |
+|---|---|---|
+| one per core (32) | 75.6s | 314.4s |
+| **4** | **64.4s** | **162.4s** |
+
+**1.17× faster and 1.94× less CPU at once** — not a trade. Landed as `GLOBAL_RAYON_THREADS` in `cap_global_thread_pool`; the compiled binary reproduces it without the env var (64.6s wall, 160.0s CPU, three runs). The width sweep is flat from 2 to 8 (63.5–64.7s) and climbs above, so 4 sits mid-plateau. The full-verification replay is insensitive at every width (84–88s wall, 960–990s CPU) because script verification dominates there and runs in its own pool, so the cap costs that path nothing.
+
+This is why the CPU axis was worth adding: the global pool was invisible to every wall-only sweep in this note, because on an idle 128-core host spinning workers cost almost no wall time. It only became obvious once CPU was measured, and then it turned out to cost wall time too.
+
+**Measure CPU alongside wall from now on.** Every sweep in this note before this one optimised wall time only, on an idle 128-core host. `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 is the clearest untested case: it won 1.15× of wall by pushing far more blocks through the pool, which is exactly the change that raises CPU. It has not been re-checked against CPU and should be, on hardware with a realistic core count, before it is treated as settled.
+
+What this settles: Core still leads both throughput measurements (1.42× processing-bound, **1.52×** over loopback P2P after the cap, down from 1.77×) and leads CPU efficiency **2.46×** (160.0s vs 65.0s, down from 4.84×); bitcoin-rs beats GoCoin on both throughput figures. Earlier bitcoin-rs runs each logged two `Disk quota exceeded` errors from checkpoint publication at shutdown, after the target height was reached; timings were consistent across runs, but re-measure on a host with headroom before treating any of these as precise.
 
 ### Memory is the metric bitcoin-rs wins
 
