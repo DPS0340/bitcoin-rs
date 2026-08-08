@@ -948,25 +948,41 @@ fn prove_window(
     metrics::histogram!("node.window.context_seconds")
         .record(context_started.elapsed().as_secs_f64());
 
+    // Parsing a block and planning its transactions depends on nothing but that
+    // block, so the window does all of it at once. Only the overlay walk below
+    // is order-dependent, and it is the cheaper half.
+    let parse_started = quanta::Instant::now();
+    let parsed: Vec<core::result::Result<_, ApplyError>> = blocks
+        .par_iter()
+        .zip(serialized.par_iter())
+        .map(|(block, raw)| parse_block_for_apply(block, Some(raw.clone())))
+        .collect();
+    metrics::histogram!("node.window.parse_seconds").record(parse_started.elapsed().as_secs_f64());
+
     let prepare_started = quanta::Instant::now();
     let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
     let mut prepared = Vec::with_capacity(blocks.len());
-    for ((block, raw), context) in blocks.iter().zip(serialized).zip(&contexts) {
-        let Ok(unit) = prepare_apply(block, Some(raw.clone()), &overlay) else {
+    for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
+        let Ok((kernel_block, tx_plan)) = parsed else {
             return Vec::new();
         };
+        let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
         if overlay
             .advance(
                 block,
-                unit.tx_plan.txids(),
+                tx_plan.txids(),
                 context.height,
-                unit.tx_plan.same_block_spent_set(),
+                tx_plan.same_block_spent_set(),
             )
             .is_err()
         {
             return Vec::new();
         }
-        prepared.push(unit);
+        prepared.push(PreparedApply {
+            kernel_block,
+            tx_plan,
+            resolved,
+        });
     }
 
     metrics::histogram!("node.window.prepare_seconds")
@@ -975,26 +991,37 @@ fn prove_window(
     // One dispatch for the whole window. The check units borrow their kernel
     // blocks, so they live and die inside this scope, before anything commits.
     {
+        // Each block's checks are built from its own prepared state, so the
+        // window builds them all at once. The overlay walk above already fixed
+        // every prevout, which is what makes this independent per block.
         let checks_started = quanta::Instant::now();
+        let built: Vec<Option<_>> = blocks
+            .par_iter()
+            .zip(prepared.par_iter())
+            .zip(contexts.par_iter())
+            .map(|((block, unit), context)| {
+                let resolved = resolve_block_prevouts(
+                    Arc::clone(&unit.resolved),
+                    block,
+                    &unit.tx_plan,
+                    context.height,
+                )
+                .ok()?;
+                bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+                    &block.txdata,
+                    resolved,
+                    context.height,
+                    context.locktime_cutoff,
+                    &unit.kernel_block,
+                )
+                .ok()
+            })
+            .collect();
         let mut units = Vec::with_capacity(prepared.len());
-        for ((block, unit), context) in blocks.iter().zip(&prepared).zip(&contexts) {
-            let Ok(resolved) = resolve_block_prevouts(
-                Arc::clone(&unit.resolved),
-                block,
-                &unit.tx_plan,
-                context.height,
-            ) else {
-                return Vec::new();
-            };
-            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
-                &block.txdata,
-                resolved,
-                context.height,
-                context.locktime_cutoff,
-                &unit.kernel_block,
-            ) {
-                Ok(checks) => units.push(checks),
-                Err(_) => return Vec::new(),
+        for checks in built {
+            match checks {
+                Some(checks) => units.push(checks),
+                None => return Vec::new(),
             }
         }
         metrics::histogram!("node.window.checks_seconds")
@@ -1081,11 +1108,10 @@ struct PreparedApply {
 ///
 /// Runs no consensus rule and mutates nothing, which is what lets a window
 /// prepare several blocks before committing any of them.
-fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
+fn parse_block_for_apply(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
-    source: &S,
-) -> core::result::Result<PreparedApply, ApplyError> {
+) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, BlockTxPlan), ApplyError> {
     let raw_block: bytes::Bytes =
         provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
     let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
@@ -1103,6 +1129,20 @@ fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
         block,
         kernel_block.txids().map_err(ApplyError::Consensus)?,
     );
+    Ok((kernel_block, tx_plan))
+}
+
+/// Parses a block and resolves the outputs it spends.
+///
+/// `source` is where prevouts come from. Every caller outside a window passes
+/// the committed UTXO set; a window passes an overlay so a block can see
+/// outputs an earlier block in the same window created.
+fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    source: &S,
+) -> core::result::Result<PreparedApply, ApplyError> {
+    let (kernel_block, tx_plan) = parse_block_for_apply(block, provided_serialized)?;
     let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &tx_plan));
     Ok(PreparedApply {
         kernel_block,
