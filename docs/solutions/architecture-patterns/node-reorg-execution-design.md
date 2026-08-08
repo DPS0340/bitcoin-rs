@@ -153,7 +153,7 @@ Open, and prerequisites for giving `disconnect_block` a caller:
 | `coin_stats` inverse feed | cumulative, so it drifts on every disconnect |
 | `filter_index` rollback | BIP157 headers chain, so a stale link corrupts the chain; `filter_header_cache` must be reset with it |
 | RPC caches | `blocks` and `transactions` would keep serving the disconnected block |
-| Rollback idempotence, both stores | `undo_block` is fallible and runs after the index rolls back. Worse, it is not all-or-nothing: `commit_adds_and_removes` walks shards and both its serial and parallel paths can fail after other shards committed, so the UTXO set can be left partly undone. Retry converges only if both rollbacks are idempotent. Prove it, make the UTXO commit atomic, or add compensation |
+| Rollback idempotence, both stores | `undo_block` is fallible and runs after the index rolls back. Worse, it is not all-or-nothing: `commit_adds_and_removes` walks shards and both its serial and parallel paths can fail after other shards committed, so the UTXO set can be left partly undone. Retry is not obviously a fix: each UTXO operation looks idempotent on the set, but `commit_adds_and_removes` fires `UtxoSet`'s listener, and `coin_stats` is one, so a second pass can re-emit callbacks for operations that changed nothing and a cumulative listener double-counts. Prove listener-level idempotence, make the UTXO commit atomic, or add compensation |
 
 Open, layer 4:
 

@@ -541,7 +541,8 @@ impl ApplyHandles {
 /// | `utxo`, `tx_index`, `applied_tip` | restored here |
 /// | `coin_stats` | **owed** — cumulative, so it drifts on every disconnect |
 /// | `filter_index`, `filter_header_cache` | **owed** — BIP157 headers chain, so a stale link corrupts the chain |
-/// | `blocks`, `transactions` | **owed** — RPC would keep serving the disconnected block |
+/// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
+/// | `transactions` | nothing owed: connection never populates it |
 /// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
 /// | `block_tree` | retained deliberately — the header stays valid and known |
 /// | `block_body_store` | retained deliberately — the body is still a real block |
@@ -557,10 +558,14 @@ impl ApplyHandles {
 /// path can return an error after other shards already committed, so the set
 /// can be left partly undone.
 ///
-/// Retrying converges only if both rollbacks are idempotent. Each individual
-/// UTXO operation is (restoring a live output and removing an absent one are
-/// both no-ops), but neither that nor index rollback idempotence is proven, so
-/// the window is listed with the owed work above rather than claimed away.
+/// Retrying does not obviously converge. Each individual UTXO operation looks
+/// idempotent, since restoring a live output and removing an absent one are
+/// both no-ops on the set. The set is not the whole contract: `undo_block`
+/// runs through `commit_adds_and_removes`, which fires `UtxoSet`'s listener,
+/// and `coin_stats` is one. A second pass can re-emit callbacks for operations
+/// that changed nothing, so a cumulative listener double-counts even though the
+/// set converged. Retry is therefore not a recovery strategy until listener
+/// behaviour is settled, and the window stays with the owed work above.
 ///
 /// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
 ///    so a missing or corrupt record costs nothing.
@@ -654,6 +659,28 @@ pub fn disconnect_block(
         .utxo
         .undo_block(&undo)
         .map_err(ApplyError::UtxoCommit)?;
+
+    // RPC serves blocks from this vector, so the disconnected block's record
+    // must go or `getblock` keeps answering for it.
+    //
+    // Absence is legitimate and must never be an error. This is a best-effort
+    // in-process cache, not authoritative state: it starts empty on every boot
+    // while `applied_tip` resumes from a checkpoint at height N, and pruning
+    // removes records from it. Failing a consensus rollback because an optional
+    // cache is empty would refuse the first disconnect after any restart.
+    //
+    // The hash check is what stops the pop from truncating a record that is not
+    // ours. The tail can only be ours or gone, because disconnect runs on the
+    // applied tip and connection pushed that tip's record last.
+    {
+        let mut blocks = handles.blocks.write();
+        if blocks
+            .last()
+            .is_some_and(|record| record.hash == block_hash)
+        {
+            blocks.pop();
+        }
+    }
 
     handles
         .applied_tip
@@ -4692,6 +4719,52 @@ mod consensus_rule_tests {
                 .map_or(0, |tip| tip.height),
             1,
             "a refused disconnect must leave the tip where it was"
+        );
+        Ok(())
+    }
+
+    /// RPC reads blocks from `handles.blocks`. Leaving the entry there would let
+    /// `getblock` keep answering for a block the chain no longer contains.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_drops_the_rpc_block_record() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let records_before = handles.blocks.read().len();
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+        assert!(
+            handles
+                .blocks
+                .read()
+                .iter()
+                .any(|record| record.hash == block_hash),
+            "connection must publish the record this test then removes"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        assert!(
+            !handles
+                .blocks
+                .read()
+                .iter()
+                .any(|record| record.hash == block_hash),
+            "RPC must not keep serving a disconnected block"
+        );
+        assert_eq!(
+            handles.blocks.read().len(),
+            records_before,
+            "exactly the one record must go"
         );
         Ok(())
     }
