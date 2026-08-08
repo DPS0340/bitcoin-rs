@@ -347,6 +347,18 @@ Closing all of them lands at **64.0s against Core's 59.6s = 1.07×**, which is p
 
 Identical. On blocks this small the active shard count rarely reaches 8, so the serial path is already what runs — there is no dispatch to remove. Closing the 3.51s against Core's flush needs a change to what the commit *does*, not to how it is scheduled. That drops the program to four items worth ~17s.
 
+**A second item is closed: `block_rules` is merkle, and merkle is at its floor.** Probes split the 4.59s stage into merkle **4.34s**, `block.weight()` 0.18s, everything else 0.07s — so the stage *is* the merkle root. Three attempts, all rejected:
+
+| Attempt | Result |
+|---|---|
+| hash via `sha2` (already a dependency, optimized x86_64 backends) instead of `bitcoin_hashes` + `Encodable` | 4.36s — **identical** |
+| parallel fold, threshold 512 | 4.11s — 0.26s, inside run noise |
+| parallel fold, threshold 32 | **6.52s** — worse; dispatch on small levels |
+
+A calibration worth recording, because it corrected my own reasoning: raw double-SHA256 of 64 bytes on this host measures **873 ns** (`sha2`) and **907 ns** (`bitcoin_hashes`), not the ~400 ns I had assumed from theory. The fold runs at ~2586 ns/node, so the real overhead ratio is 2.9×, not the 6.4× an earlier draft claimed. The two libraries are equivalent; there is no faster-SHA lever hiding here.
+
+Where the remaining 2.9× goes is per-node overhead in *small* levels — most blocks in this window have a handful of transactions, so each `next_merkle_level` call folds one or two nodes and amortizes its own call, bounds, and truncate over almost nothing. Parallelism cannot touch that (there is nothing to spread), and neither can a faster hash (hashing is only 1.46s of the 4.3s). Core reaches 1.41s for the whole of `Sanity checks` because its blocks come pre-parsed with the tree work batched differently, not because its SHA is faster.
+
 **This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
 
 1. Treat these as **one program, not five candidates**. Gate the program on the cumulative number, and use paired interleaved runs with more than three repetitions to resolve each step.
