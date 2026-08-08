@@ -57,7 +57,7 @@ mod enabled {
 
         /// Txids in block order, taken from the hashes the parse already
         /// computed. Verified byte-identical to `compute_txid` over mainnet
-        /// 0..150_000 (1.7M transactions, zero mismatches).
+        /// `0..150_000` (1.7M transactions, zero mismatches).
         pub fn txids(&self) -> Result<Vec<bitcoin::Txid>, ConsensusError> {
             use bitcoin::hashes::Hash as _;
             use bitcoinkernel::prelude::*;
