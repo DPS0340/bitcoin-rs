@@ -18,6 +18,32 @@ use bitcoin_rs_node::config::Config;
 use bitcoin_rs_node::state::NodeState;
 use serde_json::json;
 
+/// Proves a window's scripts in one dispatch, then applies its blocks in order.
+///
+/// Headers go in first because the batch reads median-time-past and softfork
+/// state from the block tree, and a header-first peer would have put them there
+/// long before the bodies arrived. Without that the window can never prove and
+/// the driver silently measures the unbatched path.
+fn apply_window(
+    handles: &bitcoin_rs_node::apply::ApplyHandles,
+    blocks: &mut Vec<Block>,
+    raw: &mut Vec<bytes::Bytes>,
+) -> Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let headers: Vec<bitcoin::block::Header> = blocks.iter().map(|block| block.header).collect();
+    {
+        let mut tree = handles.block_tree.write();
+        bitcoin_rs_chain::header_sync::accept_headers(&mut tree, &headers, handles.network)
+            .context("accept window headers")?;
+    }
+    bitcoin_rs_node::apply::apply_window(handles, blocks, raw).context("apply window")?;
+    blocks.clear();
+    raw.clear();
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if args.stop_height < args.start_height {
@@ -58,7 +84,10 @@ fn main() -> Result<()> {
     let mut start_hash = None;
     let mut stop_hash = None;
 
+    let window = args.window.max(1);
     let mut source = open_block_source(&args)?;
+    let mut window_blocks: Vec<Block> = Vec::with_capacity(window);
+    let mut window_bytes: Vec<bytes::Bytes> = Vec::with_capacity(window);
     for height in args.start_height..=args.stop_height {
         let fetch_started = Instant::now();
         let (hash, bytes) = source.fetch(height)?;
@@ -76,9 +105,13 @@ fn main() -> Result<()> {
         decode_time += decode_started.elapsed();
         tx_count = tx_count.saturating_add(block.txdata.len());
         block_bytes = block_bytes.saturating_add(bytes.len());
-        bitcoin_rs_node::apply::apply_block_with_serialized(&apply_handles, &block, bytes.into())
-            .with_context(|| format!("apply block at height {height}"))?;
+        window_blocks.push(block);
+        window_bytes.push(bytes::Bytes::from(bytes));
+        if window_blocks.len() >= window || height == args.stop_height {
+            apply_window(&apply_handles, &mut window_blocks, &mut window_bytes)?;
+        }
     }
+    apply_window(&apply_handles, &mut window_blocks, &mut window_bytes)?;
 
     let elapsed = started.elapsed();
     let block_count = args
@@ -132,6 +165,7 @@ struct Args {
     assume_valid_height: u32,
     data_dir: PathBuf,
     output: Option<PathBuf>,
+    window: usize,
     start_height: u32,
     stop_height: u32,
     storage_backend: String,
@@ -149,6 +183,7 @@ impl Args {
             assume_valid_height: 0,
             data_dir: PathBuf::from(".bitcoin-rs-mainnet-prefix-replay"),
             output: None,
+            window: bitcoin_rs_node::apply::SCRIPT_BATCH_WINDOW,
             start_height: 0,
             stop_height: 0,
             storage_backend: "fjall".to_owned(),
@@ -181,6 +216,7 @@ impl Args {
                 }
                 "--data-dir" => parsed.data_dir = PathBuf::from(next_arg(&mut args, "--data-dir")?),
                 "--output" => parsed.output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
+                "--window" => parsed.window = next_arg(&mut args, "--window")?.parse()?,
                 "--start-height" => {
                     parsed.start_height = parse_height(&next_arg(&mut args, "--start-height")?)?;
                 }

@@ -48,6 +48,8 @@ pub mod state;
 pub mod sync;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
+/// Prevout lookups across a window of consecutive blocks.
+mod window_overlay;
 /// ZMQ publisher trait + implementations for the notification subsystem.
 pub mod zmq_publisher;
 

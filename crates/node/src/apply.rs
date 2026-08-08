@@ -816,6 +816,235 @@ pub fn apply_block_with_serialized(
     apply_block_inner(handles, block, Some(serialized))
 }
 
+/// How many consecutive blocks share one script-verification dispatch.
+///
+/// The window amortises dispatch, it does not add parallelism. A mainnet block
+/// early in the chain carries about 19 input checks, so fanning those across 32
+/// workers costs more in wakeups than the work itself: measured over blocks
+/// `0..150_000`, per-block dispatch left 29s of checks running serially in blocks
+/// below the parallel threshold and wasted a further 11s above it. Sixty-four
+/// blocks turns roughly 21,000 dispatches into 330.
+///
+/// Bounded by memory: the window holds every block's parsed kernel block and
+/// resolved prevouts at once.
+pub const SCRIPT_BATCH_WINDOW: usize = 64;
+
+/// Applies consecutive blocks, verifying all their input scripts in one
+/// dispatch when the window can be proven.
+///
+/// Blocks commit one at a time and in order, exactly as they would
+/// individually, so every rule that depends on committed state still sees the
+/// real chain: BIP30, coinbase maturity, and the relative locks all run after
+/// their predecessor has committed. Only work that depends on nothing but the
+/// block and the outputs it spends moves earlier.
+///
+/// # Errors
+///
+/// Propagates the first failing apply, leaving earlier blocks applied, which is
+/// what applying them one at a time would also do.
+pub fn apply_window(
+    handles: &ApplyHandles,
+    blocks: &[bitcoin::Block],
+    serialized: &[bytes::Bytes],
+) -> core::result::Result<(), ApplyError> {
+    if blocks.len() != serialized.len() {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                "window has {} blocks but {} serialized bodies",
+                blocks.len(),
+                serialized.len()
+            )),
+        ));
+    }
+    // One permit for the whole window. Preparation reads the applied tip and the
+    // UTXO set and the commits mutate both; taken per block instead, another
+    // applier could move the chain between preparation and the commit relying on
+    // it, and matching the tip hash would not detect a same-tip partial change.
+    let _admission = handles.admission.enter()?;
+    let mut proven = prove_window(handles, blocks, serialized).into_iter();
+    for (block, raw) in blocks.iter().zip(serialized) {
+        apply_block_admitted(handles, block, Some(raw.clone()), proven.next())?;
+    }
+    Ok(())
+}
+
+/// Prepares consecutive blocks against one overlay and verifies all their input
+/// scripts in a single dispatch.
+///
+/// Returns one proof per block, or nothing at all. There is no partial result
+/// by design: a block must never be applied with its scripts skipped on the
+/// strength of a neighbour.
+///
+/// Every reason to give up is silent and cheap, because the per-block path
+/// behind this is complete and produces the real verdict in its documented
+/// order. A header not yet in the tree, a block that does not extend its
+/// predecessor, a prevout that does not resolve, or any failing check all
+/// return nothing.
+#[allow(clippy::too_many_lines)]
+fn prove_window(
+    handles: &ApplyHandles,
+    blocks: &[bitcoin::Block],
+    serialized: &[bytes::Bytes],
+) -> Vec<ProvenApply> {
+    use bitcoin::hashes::Hash as _;
+
+    if blocks.is_empty() || blocks.len() != serialized.len() {
+        return Vec::new();
+    }
+    let Some(applied) = handles.applied_tip.load_full() else {
+        return Vec::new();
+    };
+
+    // Context is captured before any block applies, because applying inserts
+    // headers into the shared tree and would move median-time-past and softfork
+    // state under the later blocks. Each apply re-derives all of it and
+    // compares, so a captured value that turns out wrong costs the batch only.
+    let mut contexts = Vec::with_capacity(blocks.len());
+    {
+        let tree = handles.block_tree.read();
+        let mut parent_id = applied.tip_id;
+        let mut parent_hash = applied.hash;
+        for (index, block) in blocks.iter().enumerate() {
+            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            if Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()) != parent_hash {
+                return Vec::new();
+            }
+            let Some(height) = u32::try_from(index)
+                .ok()
+                .and_then(|offset| applied.height.checked_add(offset))
+                .and_then(|height| height.checked_add(1))
+            else {
+                return Vec::new();
+            };
+            let softfork = crate::bip9_context::contextual_softfork_state(
+                &tree,
+                handles.network,
+                Some(parent_id),
+                height,
+            );
+            let cutoff = if softfork.csv_active {
+                tree.median_time_past_at(parent_id, 11).unwrap_or(0)
+            } else {
+                block.header.time
+            };
+            // The next block's context needs this one in the tree. Header-first
+            // sync put it there; without it there is no window.
+            let Some(node_id) = tree.lookup(hash) else {
+                return Vec::new();
+            };
+            contexts.push(ScriptProof {
+                hash,
+                parent: parent_hash,
+                height,
+                flags: compute_verify_flags(handles.network, height, hash, softfork),
+                locktime_cutoff: cutoff,
+            });
+            parent_id = node_id;
+            parent_hash = hash;
+        }
+    }
+
+    let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
+    let mut prepared = Vec::with_capacity(blocks.len());
+    for ((block, raw), context) in blocks.iter().zip(serialized).zip(&contexts) {
+        let Ok(unit) = prepare_apply(block, Some(raw.clone()), &overlay) else {
+            return Vec::new();
+        };
+        if overlay
+            .advance(
+                block,
+                unit.tx_plan.txids(),
+                context.height,
+                unit.tx_plan.same_block_spent_set(),
+            )
+            .is_err()
+        {
+            return Vec::new();
+        }
+        prepared.push(unit);
+    }
+
+    // One dispatch for the whole window. The check units borrow their kernel
+    // blocks, so they live and die inside this scope, before anything commits.
+    {
+        let mut units = Vec::with_capacity(prepared.len());
+        for ((block, unit), context) in blocks.iter().zip(&prepared).zip(&contexts) {
+            let Ok(resolved) = resolve_block_prevouts(
+                Arc::clone(&unit.resolved),
+                block,
+                &unit.tx_plan,
+                context.height,
+            ) else {
+                return Vec::new();
+            };
+            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+                &block.txdata,
+                resolved,
+                context.height,
+                context.locktime_cutoff,
+                &unit.kernel_block,
+            ) {
+                Ok(checks) => units.push(checks),
+                Err(_) => return Vec::new(),
+            }
+        }
+        let flags: Vec<bitcoin_rs_script::VerifyFlags> =
+            contexts.iter().map(|context| context.flags).collect();
+        if bitcoin_rs_consensus::verify_tx::verify_prepared_units(&units, &flags).is_err() {
+            return Vec::new();
+        }
+    }
+
+    prepared
+        .into_iter()
+        .zip(contexts)
+        .map(|(prepared, proof)| ProvenApply { prepared, proof })
+        .collect()
+}
+
+/// Evidence that a block's input scripts were executed and passed as part of a
+/// batch spanning several consecutive blocks.
+///
+/// Bound to more than the block hash on purpose. The verdict also depends on
+/// the height, the rule flags, the median-time-past cutoff, and the block this
+/// one extends, and a reorg can change all four while the hash stays the same.
+struct ScriptProof {
+    hash: Hash256,
+    parent: Hash256,
+    height: u32,
+    flags: bitcoin_rs_script::VerifyFlags,
+    locktime_cutoff: u32,
+}
+
+impl ScriptProof {
+    fn matches(
+        &self,
+        hash: Hash256,
+        parent: Hash256,
+        height: u32,
+        flags: bitcoin_rs_script::VerifyFlags,
+        locktime_cutoff: u32,
+    ) -> bool {
+        self.hash == hash
+            && self.parent == parent
+            && self.height == height
+            && self.flags == flags
+            && self.locktime_cutoff == locktime_cutoff
+    }
+}
+
+/// One block's prepared state together with the proof covering it.
+///
+/// Deliberately one value rather than two parameters. Passed separately, a
+/// caller could hand over block A's proof beside block B's prepared prevouts:
+/// the proof would still match the block being applied, and the scripts skipped
+/// would be the ones verified against different data. Pairing them at
+/// construction makes that unrepresentable.
+struct ProvenApply {
+    prepared: PreparedApply,
+    proof: ScriptProof,
+}
+
 /// Everything a block's application needs that depends only on the block and
 /// the outputs it spends, not on the chain state the commit will mutate.
 ///
@@ -837,10 +1066,10 @@ struct PreparedApply {
 ///
 /// Runs no consensus rule and mutates nothing, which is what lets a window
 /// prepare several blocks before committing any of them.
-fn prepare_apply(
+fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
-    source: &UtxoSet,
+    source: &S,
 ) -> core::result::Result<PreparedApply, ApplyError> {
     let raw_block: bytes::Bytes =
         provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
@@ -867,14 +1096,30 @@ fn prepare_apply(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn apply_block_inner(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
-    use bitcoin::hashes::Hash as _;
     let _admission = handles.admission.enter()?;
+    apply_block_admitted(handles, block, provided_serialized, None)
+}
+
+/// The apply itself, with the single-writer permit already held.
+///
+/// Split from [`apply_block_inner`] so a window can take one permit across its
+/// preparation and all of its ordered commits. Re-entering per block would be
+/// two read guards on the same lock, which deadlocks against a shutdown waiting
+/// on the write side, and would leave gaps in which another applier could move
+/// the chain out from under prepared state.
+#[allow(clippy::too_many_lines)]
+fn apply_block_admitted(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    proven: Option<ProvenApply>,
+) -> core::result::Result<TipSnapshot, ApplyError> {
+    use bitcoin::hashes::Hash as _;
 
     let total_started = quanta::Instant::now();
     let block_hash =
@@ -936,7 +1181,15 @@ fn apply_block_inner(
     // implementation selected at runtime, so this one parse replaces the
     // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
     // that script preparation used to perform.
-    let prepared = prepare_apply(block, provided_serialized.clone(), &handles.utxo)?;
+    // A window prepares several blocks against one overlay and hands the result
+    // back, so the kernel parse and the prevout resolution happen once.
+    let (prepared, proof) = match proven {
+        Some(ProvenApply { prepared, proof }) => (prepared, Some(proof)),
+        None => (
+            prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
+            None,
+        ),
+    };
     let PreparedApply {
         kernel_block,
         tx_plan,
@@ -976,16 +1229,32 @@ fn apply_block_inner(
 
     let script_verify_started = quanta::Instant::now();
     let verify_flags = compute_verify_flags(handles.network, height, block_hash, softfork_state);
-    let script_verify_result = verify_block_transactions(
-        handles,
-        block,
-        &tx_plan,
-        Arc::clone(&resolved),
-        height,
-        locktime_cutoff,
-        verify_flags,
-        &kernel_block,
-    );
+    // A batch already executed these scripts under exactly the context derived
+    // here. Every bound field is compared, so a proof reached under different
+    // rules simply does not apply and the block verifies in full.
+    let script_verify_result = if proof.is_some_and(|proof| {
+        proof.matches(block_hash, prev_hash, height, verify_flags, locktime_cutoff)
+    }) {
+        run_non_script_checks_only(
+            block,
+            &tx_plan,
+            Arc::clone(&resolved),
+            tx_plan.txids(),
+            height,
+            locktime_cutoff,
+        )
+    } else {
+        verify_block_transactions(
+            handles,
+            block,
+            &tx_plan,
+            Arc::clone(&resolved),
+            height,
+            locktime_cutoff,
+            verify_flags,
+            &kernel_block,
+        )
+    };
     let script_verify_dur = script_verify_started.elapsed();
     metrics::histogram!("node.apply_block.script_verify_seconds")
         .record(script_verify_dur.as_secs_f64());
@@ -1430,6 +1699,17 @@ struct BlockTxPlan {
 }
 
 impl BlockTxPlan {
+    /// Outpoints this block both creates and spends, empty when it has none.
+    ///
+    /// The overlay nets these out exactly as `build_utxo_changes` does: such an
+    /// output never reaches the committed set, so a view carrying it would
+    /// resolve a later spend the real set would refuse.
+    fn same_block_spent_set(&self) -> &SameBlockSpentSet {
+        static NONE: std::sync::LazyLock<SameBlockSpentSet> =
+            std::sync::LazyLock::new(SameBlockSpentSet::new);
+        self.same_block_spent.as_ref().unwrap_or(&NONE)
+    }
+
     fn txids(&self) -> &[Txid] {
         &self.txids
     }
@@ -1623,7 +1903,16 @@ struct ResolvedUtxoView {
 }
 
 impl ResolvedUtxoView {
-    fn resolve(utxo: &UtxoSet, block: &bitcoin::Block, tx_plan: &BlockTxPlan) -> Self {
+    /// Resolves a block's external prevouts from any source of live outputs.
+    ///
+    /// Generic so a window can substitute an overlay carrying the outputs its
+    /// earlier blocks created. Every caller outside a window passes the
+    /// committed set.
+    fn resolve<S: crate::window_overlay::OutputSource + ?Sized>(
+        utxo: &S,
+        block: &bitcoin::Block,
+        tx_plan: &BlockTxPlan,
+    ) -> Self {
         let same_block = tx_plan.same_block_spent.as_ref();
         let candidates = block
             .txdata
@@ -1741,6 +2030,60 @@ fn resolve_block_prevouts(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
+/// Runs every non-script transaction check for a block whose scripts do not
+/// need executing here.
+///
+/// Two callers reach this: assume-valid, which trusts the scripts, and a batch
+/// proof, which already ran them. One implementation for both, because a second
+/// copy is how a trusted path and a proven path drift apart.
+fn run_non_script_checks_only(
+    block: &bitcoin::Block,
+    tx_plan: &BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
+    txids: &[Txid],
+    height: u32,
+    locktime_cutoff: u32,
+) -> core::result::Result<(), ApplyError> {
+    if !tx_plan.needs_local_utxo_overlay {
+        block.txdata.par_iter().try_for_each(|tx| {
+            if tx.is_coinbase() {
+                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
+                return Ok(());
+            }
+            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+                tx,
+                &*resolved,
+                height,
+                locktime_cutoff,
+            )
+        })?;
+        return Ok(());
+    }
+    let mut view =
+        BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
+    for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
+        if tx.is_coinbase() {
+            bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
+            continue;
+        }
+        bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+            tx,
+            &view,
+            height,
+            locktime_cutoff,
+        )?;
+        view.spend_inputs(tx);
+        view.add_outputs(tx_index, *txid, tx.output.len())?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -1764,40 +2107,15 @@ fn verify_block_transactions(
     let skip_scripts = handles.assume_valid_height > 0
         && height <= handles.assume_valid_height
         && handles.assume_valid_gate.trusted();
-    if skip_scripts && !tx_plan.needs_local_utxo_overlay {
-        block.txdata.par_iter().try_for_each(|tx| {
-            if tx.is_coinbase() {
-                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                return Ok(());
-            }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
-                tx,
-                &*resolved,
-                height,
-                locktime_cutoff,
-            )
-        })?;
-        return Ok(());
-    }
     if skip_scripts {
-        let mut view =
-            BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
-        for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
-            if tx.is_coinbase() {
-                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                view.add_outputs(tx_index, *txid, tx.output.len())?;
-                continue;
-            }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
-                tx,
-                &view,
-                height,
-                locktime_cutoff,
-            )?;
-            view.spend_inputs(tx);
-            view.add_outputs(tx_index, *txid, tx.output.len())?;
-        }
-        return Ok(());
+        return run_non_script_checks_only(
+            block,
+            tx_plan,
+            resolved,
+            txids,
+            height,
+            locktime_cutoff,
+        );
     }
     // Full-verify: resolve every transaction's prevouts serially in block order
     // into an owned `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec), then
@@ -1914,7 +2232,11 @@ pub(crate) fn check_coinbase_maturity(
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
     let tx_plan = plan_block_transactions(block);
-    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
+    let resolved = Arc::new(ResolvedUtxoView::resolve(
+        handles.utxo.as_ref(),
+        block,
+        &tx_plan,
+    ));
     check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, resolved, height)
 }
 
@@ -3453,7 +3775,7 @@ mod consensus_rule_tests {
         // The block spends an external prevout, so the undo half needs the
         // resolved view that spend came from. An empty view would now be
         // rejected, which is the point of UndoPrevoutMissing.
-        let resolved = ResolvedUtxoView::resolve(&utxo, &block, &tx_plan(&block));
+        let resolved = ResolvedUtxoView::resolve(utxo.as_ref(), &block, &tx_plan(&block));
         let (changes, undo) = build_utxo_changes(&block, 2, &scratch, &resolved)?;
         assert_eq!(
             undo.restores().len(),
