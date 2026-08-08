@@ -179,6 +179,23 @@ The CPU gap against Core on the P2P sync went from **4.9× to 1.33×**. Neither 
 
 Core still leads every throughput and CPU figure here, so the parity goal is not met. But the remaining gaps are 1.28-1.41×, not the 2-5× this note opened with, and nothing left is a constant — see the stage decomposition below.
 
+### The constant class is exhausted
+
+Every parallelism constant in the hot path has now been re-measured against the matched harness with CPU alongside wall. The class is closed:
+
+| Constant | Verdict |
+|---|---|
+| `MIN_PARALLEL_SCRIPT_CHECKS` 4 | **wrong** — 4 was the worst point on both axes; now 32 |
+| global rayon pool, uncapped | **wrong** — 3.53× the CPU on the P2P path; now capped at 4 |
+| `MAX_SCRIPT_VERIFY_THREADS` 32 | **survives** — wall falls monotonically to 32, a real trade that wall wins |
+| global pool cap on the replay | **null** — 77.6s / 654.8s uncapped vs 79.4s / 658.3s at 4, inside noise |
+
+The last row is why `cap_global_thread_pool` lives in `node::run` and not in the consensus crate: it pays on the P2P path, where the pool contends with the sync stack, and does nothing on a replay whose cost is script verification inside a separate pool.
+
+Two of four were wrong, and both were wrong for the same two reasons — tuned against a harness sharing CPU with the node, and tuned on wall alone. Neither mistake is visible without measuring CPU on an idle many-core host. **No constant remains to tune**; what is left is per-unit work, itemised in the stage decomposition below.
+
+A useful framing of that remainder: at 8 script threads bitcoin-rs spends 474.2s CPU, near Core's 463.6s, but takes 130.6s against Core's 60.7s. Core extracts roughly 2.1× more parallelism per CPU-second. We reach a comparable wall only by spending more threads and more total CPU, which is the signature of a per-unit-work gap rather than a scheduling one.
+
 ### Memory is the metric bitcoin-rs wins
 
 Peak RSS over the same window, same validation posture, both pinned:
