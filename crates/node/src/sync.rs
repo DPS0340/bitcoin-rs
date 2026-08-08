@@ -729,6 +729,18 @@ impl BlockSync {
             Err(crate::reorg::ReorgError::MissingBody { height, .. }) => {
                 tracing::trace!(height, "block sync: heavier branch still downloading");
             }
+            Err(error @ crate::reorg::ReorgError::Fatal(_)) => {
+                // The chainstate is torn. The durable marker makes a restart
+                // refuse, but this process is still running and the next tick
+                // would apply blocks on top of the tear. Closing admission
+                // gives the live node the same answer the restart gets:
+                // every further apply and disconnect fails.
+                self.handles.admission.close_permanently();
+                tracing::error!(
+                    %error,
+                    "block sync: chainstate torn by a failed disconnect, apply path closed"
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "block sync: branch switch failed");
             }

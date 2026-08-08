@@ -622,6 +622,16 @@ impl ApplyAdmission {
         self.closed.store(true, Ordering::Release);
         self.barrier.write()
     }
+
+    /// Closes admission without taking the barrier.
+    ///
+    /// [`Self::close`] hands back the write guard because shutdown holds it
+    /// while it drains. A torn chainstate has nothing to drain and no owner to
+    /// hold a guard: it needs the flag set and every later `enter` refused,
+    /// including the one that would otherwise apply the next block.
+    pub(crate) fn close_permanently(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 /// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
@@ -8549,6 +8559,149 @@ mod consensus_rule_tests {
                 applied_block.txdata[0].compute_txid().as_byte_array()
             )),
             "the applied branch's coins must survive an aborted switch"
+        );
+        Ok(())
+    }
+
+    /// A torn chainstate must stop the running process, not just the next
+    /// restart. The durable marker handles restarts; this handles the node that
+    /// is still up. Every path that mutates chainstate takes an admission
+    /// permit, so closing it is what makes "no further mutation" true — and all
+    /// three paths are checked, because a gap in any one of them is a node
+    /// quietly building on a tear.
+    #[test]
+    fn a_closed_admission_refuses_every_chainstate_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        apply_block(&handles, &block)?;
+
+        handles.admission.close_permanently();
+
+        let child = mined_block_with_prev_hash_and_transactions(
+            block.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        assert!(
+            matches!(apply_block(&handles, &child), Err(ApplyError::Shutdown)),
+            "connect must refuse after a tear"
+        );
+        assert!(
+            matches!(
+                apply_window(&handles, &[&child], core::slice::from_ref(&raw)),
+                Err(WindowApplyError {
+                    source: ApplyError::Shutdown,
+                    ..
+                })
+            ),
+            "the window path must refuse after a tear"
+        );
+        let disconnected = disconnect_block(&handles, &block);
+        assert!(
+            matches!(
+                disconnected,
+                Err(crate::DisconnectError::Refused(ref boxed))
+                    if matches!(**boxed, ApplyError::Shutdown)
+            ),
+            "disconnect must refuse after a tear, got {disconnected:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(1),
+            "the applied tip must not have moved while admission was closed"
+        );
+        Ok(())
+    }
+
+    /// `Fatal` is what keeps a torn chainstate from being retried, and the
+    /// reason it stays unreachable is that `plan_disconnect` checks the
+    /// coinstats height before anything mutates. Drop that check and the same
+    /// desync lands mid-rollback instead: the UTXO undo commits, the coinstats
+    /// rewind rejects the height, and the node is torn.
+    ///
+    /// So this pins the precheck, not the tear. A desync must refuse with
+    /// nothing touched — same applied tip, same coins.
+    #[test]
+    fn a_coinstats_desync_refuses_before_it_can_tear_anything()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let losing = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&losing));
+        let applied = apply_block_with_serialized(&handles, &losing, raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), raw.to_vec());
+
+        let win_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let win_two = mined_block_with_prev_hash_and_transactions(
+            win_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut last = None;
+            for (height, block) in [(1_u32, &win_one), (2_u32, &win_two)] {
+                let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+                last = Some(tree.insert_header(
+                    block.header,
+                    bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+                )?);
+                bodies
+                    .bodies
+                    .write()
+                    .insert((height, hash), bitcoin::consensus::encode::serialize(block));
+            }
+            last.ok_or_else(|| anyhow::anyhow!("no winning branch built"))?
+        };
+
+        // Desynchronise the coinstats height. The disconnect's UTXO undo lands
+        // first and the coinstats rewind then rejects the height, which is a
+        // real tear: some state reverted, some did not.
+        handles.coin_stats.finish_block(999, 0);
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target);
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::Refused { .. })),
+            "the precheck must refuse rather than tear, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied.hash),
+            "a refused disconnect must leave the applied tip alone"
+        );
+        assert!(
+            utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                losing.txdata[0].compute_txid().as_byte_array()
+            )),
+            "a refused disconnect must not have undone any coins"
         );
         Ok(())
     }
