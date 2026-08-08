@@ -62,6 +62,14 @@ fn main() -> Result<()> {
         Some(host) => BlockSource::Rest(spawn_prefetch(host, args.start_height, args.stop_height)?),
         None => BlockSource::Cli(&args),
     };
+    let mut source = match args.blocks_file.as_ref() {
+        Some(path) => BlockSource::File(std::io::BufReader::with_capacity(
+            1 << 20,
+            std::fs::File::open(path)
+                .with_context(|| format!("open blocks file {}", path.display()))?,
+        )),
+        None => source,
+    };
     for height in args.start_height..=args.stop_height {
         let fetch_started = Instant::now();
         let (hash, bytes) = source.fetch(height)?;
@@ -131,6 +139,7 @@ struct Args {
     bitcoin_cli: String,
     bitcoin_cli_args: Vec<String>,
     rest_url: Option<String>,
+    blocks_file: Option<PathBuf>,
     assume_valid_height: u32,
     data_dir: PathBuf,
     output: Option<PathBuf>,
@@ -147,6 +156,7 @@ impl Args {
             bitcoin_cli: "bitcoin-cli".to_owned(),
             bitcoin_cli_args: Vec::new(),
             rest_url: None,
+            blocks_file: None,
             assume_valid_height: 0,
             data_dir: PathBuf::from(".bitcoin-rs-mainnet-prefix-replay"),
             output: None,
@@ -168,6 +178,9 @@ impl Args {
                 }
                 "--bitcoin-cli" => parsed.bitcoin_cli = next_arg(&mut args, "--bitcoin-cli")?,
                 "--rest-url" => parsed.rest_url = Some(next_arg(&mut args, "--rest-url")?),
+                "--blocks-file" => {
+                    parsed.blocks_file = Some(PathBuf::from(next_arg(&mut args, "--blocks-file")?));
+                }
                 "--assume-valid-height" => {
                     parsed.assume_valid_height =
                         parse_height(&next_arg(&mut args, "--assume-valid-height")?)?;
@@ -328,6 +341,13 @@ type FetchedBlock = (String, Vec<u8>);
 enum BlockSource<'a> {
     Cli(&'a Args),
     Rest(crossbeam_channel::Receiver<Result<FetchedBlock>>),
+    /// Blocks read sequentially from a local length-prefixed file.
+    ///
+    /// Core's `-reindex-chainstate` reads its own `blk*.dat` files, so a REST
+    /// fetch loads the replay with HTTP and a second process's CPU that Core
+    /// never pays. This source removes that asymmetry for engine-to-engine
+    /// comparisons.
+    File(std::io::BufReader<std::fs::File>),
 }
 
 impl BlockSource<'_> {
@@ -347,6 +367,33 @@ impl BlockSource<'_> {
             Self::Rest(receiver) => receiver
                 .recv()
                 .with_context(|| format!("prefetch thread gone before height {height}"))?,
+            Self::File(reader) => {
+                use std::io::Read as _;
+                let mut len_bytes = [0_u8; 4];
+                reader
+                    .read_exact(&mut len_bytes)
+                    .with_context(|| format!("read block length at height {height}"))?;
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                let mut bytes = vec![0_u8; len];
+                reader
+                    .read_exact(&mut bytes)
+                    .with_context(|| format!("read {len} block bytes at height {height}"))?;
+                // Hash the 80-byte header directly. Deserializing the whole
+                // block here would duplicate the decode the apply loop already
+                // performs and would inflate this source against the REST one,
+                // which gets the hash from the API for free.
+                let header = bytes
+                    .get(..80)
+                    .with_context(|| format!("block at height {height} shorter than a header"))?;
+                let hash = {
+                    use bitcoin::hashes::Hash as _;
+                    bitcoin::BlockHash::from_byte_array(
+                        bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array(),
+                    )
+                    .to_string()
+                };
+                Ok((hash, bytes))
+            }
         }
     }
 }
