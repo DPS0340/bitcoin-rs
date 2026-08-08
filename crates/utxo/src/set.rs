@@ -652,8 +652,13 @@ impl UndoBatch {
     }
 
     /// Rebuilds a batch from its decoded parts.
+    ///
+    /// Crate-visible on purpose. `undo_codec::decode` rejects a record where one
+    /// outpoint appears in both halves, and this constructor performs no check
+    /// at all, so a public one is a way to build exactly the batch the codec
+    /// refuses. The decoder is the only caller and it has already done the work.
     #[must_use]
-    pub const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
+    pub(crate) const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
         Self { restores, removes }
     }
 }

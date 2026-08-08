@@ -5,9 +5,12 @@ use std::io::Cursor;
 use bitcoin::hashes::{Hash as _, sha256d};
 use libfuzzer_sys::fuzz_target;
 
-/// Commands `decode_payload` dispatches on, so a mutation reaches a decoder
-/// rather than the unknown-command arm.
-const COMMANDS: [&str; 21] = [
+/// Every command `decode_payload` dispatches on.
+///
+/// This list is the ONLY source of command names the harness produces, so a
+/// command missing here is a payload decoder no fuzz input can reach. Keep it
+/// in step with the match in `crates/p2p/src/wire.rs`.
+const COMMANDS: [&str; 36] = [
     "version",
     "verack",
     "addr",
@@ -24,11 +27,26 @@ const COMMANDS: [&str; 21] = [
     "getaddr",
     "ping",
     "pong",
-    "feefilter",
-    "sendcmpct",
+    "merkleblock",
     "filterload",
     "filteradd",
     "filterclear",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "sendcmpct",
+    "cmpctblock",
+    "getblocktxn",
+    "blocktxn",
+    "reject",
+    "alert",
+    "feefilter",
+    "wtxidrelay",
+    "addrv2",
+    "sendaddrv2",
 ];
 
 /// Fuzz the Bitcoin P2P command decoders.

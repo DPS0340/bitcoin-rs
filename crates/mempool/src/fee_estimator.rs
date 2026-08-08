@@ -271,10 +271,31 @@ impl FeeEstimator {
     fn record_confirmation(&mut self, entry: &PendingEntry, blocks_waited: u32) {
         let bucket_index = entry.bucket_index;
         let waited = usize::try_from(blocks_waited).unwrap_or(0);
-        if waited == 0 || waited > MAX_CONF_TARGET {
+        if waited == 0 {
             return;
         }
         let bucket = &mut self.buckets[bucket_index];
+        if waited > MAX_CONF_TARGET {
+            // Confirmed past the longest target, so it missed every one of
+            // them. Reachable only when heights were skipped, because
+            // `expire_targets` drops a transaction once it outlives the last
+            // target. Dropping the evidence outright would let a slow
+            // confirmation cost the estimator nothing.
+            for target in entry.resolved_through..MAX_CONF_TARGET {
+                bucket.resolved_within[target] += 1.0;
+            }
+            return;
+        }
+        // Targets shorter than `waited` were missed. `expire_targets` samples
+        // those as they pass, but it never sees this transaction again once the
+        // confirmation removes it, so any target that expired since the last
+        // call — every one of them if heights were skipped — has to be sampled
+        // here. Without this a transaction entering at 100 and confirming in a
+        // call for 105 contributes successes to targets 5 and up and no
+        // failures to 1 through 4, biasing the short targets upward.
+        for target in entry.resolved_through.saturating_add(1)..waited {
+            bucket.resolved_within[target - 1] += 1.0;
+        }
         // Confirming at `waited` blocks satisfies every target from `waited`
         // up, and resolves each of them at the same moment, so numerator and
         // denominator decay together from here.
@@ -422,6 +443,40 @@ mod tests {
         assert!(
             est.pending.contains_key(&fresh),
             "a departure must free the slot it occupied"
+        );
+    }
+
+    /// A confirmation after skipped heights must still record its misses.
+    ///
+    /// `expire_targets` samples a miss as each target passes, but it never sees
+    /// the transaction again once the confirmation removes it. If heights were
+    /// skipped, every target that expired in the gap has to be sampled by the
+    /// confirmation itself.
+    #[test]
+    fn a_confirmation_after_skipped_heights_records_the_targets_it_missed() {
+        let mut est = FeeEstimator::new();
+        let txid = test_txid(5);
+        est.tx_entered(txid, 10_000, 100);
+        // Five blocks elapse but only one notification arrives, carrying the
+        // confirmation. Targets 1 through 4 were missed.
+        est.block_connected(&[txid], 105);
+
+        let bucket_index = est.bucket_index_for_rate(10_000);
+        for target_idx in 0..4 {
+            assert!(
+                est.buckets[bucket_index].resolved_within[target_idx] > 0.5,
+                "target {} was missed and must be sampled as resolved",
+                target_idx + 1
+            );
+            assert!(
+                est.buckets[bucket_index].confirmed_within[target_idx] < 1e-9,
+                "target {} must not count as a success",
+                target_idx + 1
+            );
+        }
+        assert!(
+            est.buckets[bucket_index].confirmed_within[4] > 0.5,
+            "the five-block target is the first this confirmation satisfies"
         );
     }
 
