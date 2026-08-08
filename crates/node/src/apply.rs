@@ -907,7 +907,7 @@ pub fn disconnect_block(
     if let Some(tx_index) = &handles.tx_index {
         let rollback = tx_index.lock().rollback_block(block, height);
         if let Err(error) = rollback {
-            let refusal = ApplyError::IndexRollback(error.to_string());
+            let refusal = ApplyError::IndexRollback(error);
             return Err(match handles.undo_store.disarm_disconnect() {
                 Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
                 Err(disarm) => crate::DisconnectError::MarkerStuck {
@@ -1297,6 +1297,29 @@ fn prove_window(
 
     metrics::histogram!("node.window.prepare_seconds")
         .record(prepare_started.elapsed().as_secs_f64());
+
+    // Cheap structural checks before any script runs.
+    //
+    // Batching changed the cost of a bad body. The per-block path rejects a
+    // broken merkle root or witness commitment before it verifies a single
+    // script, but the window used to dispatch the whole batch first — so a peer
+    // could send a body with the expected header and one altered witness
+    // reserved value, keeping every txid intact, and force a full window of
+    // script verification for a block that is rejected immediately either way.
+    // Both checks below depend on nothing but the block, so running them here
+    // costs a hash per block and removes the amplification.
+    for (block, context) in blocks.iter().zip(&contexts) {
+        if !block.check_merkle_root() {
+            return Vec::new();
+        }
+        if context
+            .flags
+            .contains(bitcoin_rs_script::VerifyFlags::WITNESS)
+            && !block.check_witness_commitment()
+        {
+            return Vec::new();
+        }
+    }
 
     // One slot per input block, so a skipped unit leaves a hole rather than
     // shifting every later block onto the wrong prepared state.
@@ -5654,6 +5677,51 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// A body that fails a cheap structural check must never reach the batch.
+    ///
+    /// Batching made this a cost question, not just a correctness one: a peer
+    /// can keep the expected header and every txid while breaking the witness
+    /// commitment, and before the preflight that bought a full window of script
+    /// verification for a block rejected either way.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_window_refuses_a_block_whose_merkle_root_does_not_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_for_network(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        applied_header_tip(&handles, block_hash, &block, 1)?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        assert_eq!(
+            prove_window(&handles, std::slice::from_ref(&block), &[raw]).len(),
+            1,
+            "the honest block must prove, or this test proves nothing"
+        );
+
+        // Same header, different body: the merkle root no longer matches.
+        let mut tampered = block.clone();
+        tampered.txdata.push(coinbase_transaction(2));
+        assert_eq!(
+            tampered.header, block.header,
+            "the header must be untouched for this to be the attack described"
+        );
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&tampered));
+        assert!(
+            prove_window(&handles, std::slice::from_ref(&tampered), &[raw]).is_empty(),
+            "a body that fails the merkle check must not reach the script batch"
+        );
+        Ok(())
     }
 
     /// The window's two caps, and which one binds.

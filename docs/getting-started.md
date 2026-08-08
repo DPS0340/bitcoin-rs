@@ -3,6 +3,11 @@
 From a clone to a syncing node. Each step says what you should see, so you can
 tell it worked before moving on.
 
+Before you start: this node cannot reorganise off a losing branch yet. It
+disconnects blocks and keeps undo records, but no production path drives a
+branch switch, so it follows the chain forward only. Do not make it the node
+you depend on. See [README.md](README.md) for the rest of the gaps.
+
 ## Prerequisites
 
 A Rust toolchain for edition 2024, plus `cmake` and `libboost-dev`. The last

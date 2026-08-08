@@ -204,7 +204,7 @@ pub enum ApplyError {
     CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
     /// Rolling the transaction index back failed.
     #[error("index rollback: {0}")]
-    IndexRollback(String),
+    IndexRollback(#[source] bitcoin_rs_index::IndexError),
 }
 
 /// The outcome of a refused or failed block disconnect.

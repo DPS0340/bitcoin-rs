@@ -137,6 +137,14 @@ cargo test
 Gates that need live infrastructure are `#[ignore]`d. Run them individually
 with `-- --ignored` once the documented environment is in place.
 
+## Status
+
+The node syncs, verifies, and serves. What it cannot do yet is reorganise:
+undo records are persisted and `disconnect_block` works, but no production
+path drives a branch switch, so the node follows the chain forward only. Until
+that lands, do not rely on it as your only node. `docs/README.md` lists the
+rest of the gaps.
+
 ## Documentation
 
 - [docs/getting-started.md](docs/getting-started.md) — clone to synced node
