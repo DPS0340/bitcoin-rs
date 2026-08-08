@@ -308,11 +308,15 @@ fn genesis_header() -> BlockHeader {
     bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header
 }
 
+/// Regtest genesis timestamp. Headers must advance past it, because the
+/// median-time-past rule compares against the ancestors actually in the tree.
+const GENESIS_TIME: u32 = 1_296_688_602;
+
 fn mine_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
     mine_header_with(
         prev_blockhash,
         height,
-        height,
+        GENESIS_TIME.saturating_add(height),
         CompactTarget::from_consensus(0x207f_ffff),
     )
 }

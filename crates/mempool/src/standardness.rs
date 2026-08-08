@@ -219,6 +219,7 @@ mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash as _;
+    use bitcoin::opcodes::all::OP_RETURN;
     use bitcoin::script::{Builder, PushBytesBuf};
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, PubkeyHash, ScriptBuf, Sequence, TxIn, TxOut, Witness};

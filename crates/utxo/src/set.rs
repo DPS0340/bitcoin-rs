@@ -638,6 +638,24 @@ impl UndoBatch {
     pub const fn is_empty(&self) -> bool {
         self.restores.is_empty() && self.removes.is_empty()
     }
+
+    /// Outputs this batch restores, i.e. those the disconnected block spent.
+    #[must_use]
+    pub fn restores(&self) -> &[UtxoAdd] {
+        &self.restores
+    }
+
+    /// Outputs this batch removes, i.e. those the disconnected block created.
+    #[must_use]
+    pub fn removes(&self) -> &[OutPoint] {
+        &self.removes
+    }
+
+    /// Rebuilds a batch from its decoded parts.
+    #[must_use]
+    pub const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
+        Self { restores, removes }
+    }
 }
 
 #[derive(Copy, Clone)]

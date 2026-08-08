@@ -6447,17 +6447,29 @@ mod tests {
         Arc::new(filter_index)
     }
 
+    /// Regtest genesis timestamp. Fixture headers must advance past it or the
+    /// median-time-past rule rejects them, since the median is taken over the
+    /// ancestors actually present in the tree.
+    const GENESIS_TIME: u32 = 1_296_688_602;
+
     fn test_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
         let mut merkle = [0_u8; 32];
         merkle[..4].copy_from_slice(&height.to_le_bytes());
-        BlockHeader {
+        let mut header = BlockHeader {
             version: Version::ONE,
             prev_blockhash,
             merkle_root: TxMerkleNode::from_byte_array(merkle),
-            time: height,
+            time: GENESIS_TIME.saturating_add(height),
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: height,
+        };
+        // Mine rather than hope: the fixture previously relied on nonce=height
+        // happening to satisfy regtest's easy target, so any change to another
+        // header field silently broke proof-of-work validation.
+        while !header.target().is_met_by(header.block_hash()) {
+            header.nonce = header.nonce.wrapping_add(1);
         }
+        header
     }
 
     fn nbits_mismatch_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
@@ -6572,7 +6584,7 @@ mod tests {
                 version: Version::ONE,
                 prev_blockhash,
                 merkle_root: TxMerkleNode::all_zeros(),
-                time: height,
+                time: GENESIS_TIME.saturating_add(height),
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },

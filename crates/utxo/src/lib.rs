@@ -17,6 +17,8 @@ pub mod set;
 pub mod shard;
 /// Native bitcoin-rs UTXO snapshot format.
 pub mod snapshot;
+/// Versioned on-disk encoding for undo records.
+pub mod undo_codec;
 
 pub use key::{UtxoBuildHasher, UtxoKey};
 pub use record::{OneUtxoOut, UtxoRecord};
@@ -28,4 +30,7 @@ pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,
     read_snapshot, read_snapshot_strict_v4_observed, write_snapshot, write_snapshot_observed,
+};
+pub use undo_codec::{
+    UNDO_FORMAT_VERSION, UndoCodecError, decode as decode_undo, encode as encode_undo,
 };
