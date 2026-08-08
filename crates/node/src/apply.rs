@@ -552,9 +552,15 @@ impl ApplyHandles {
 ///
 /// One partial-failure window remains and is not yet closed. If `undo_block`
 /// fails after the index has rolled back, the index no longer describes the
-/// block while the UTXO set and the tip still do. Retrying is safe only if
-/// index rollback is idempotent, which is not yet proven, so the window is
-/// listed with the owed work above rather than claimed away here.
+/// block while the tip still does. The UTXO set is worse than untouched:
+/// `commit_adds_and_removes` walks shards, and both its serial and its parallel
+/// path can return an error after other shards already committed, so the set
+/// can be left partly undone.
+///
+/// Retrying converges only if both rollbacks are idempotent. Each individual
+/// UTXO operation is (restoring a live output and removing an absent one are
+/// both no-ops), but neither that nor index rollback idempotence is proven, so
+/// the window is listed with the owed work above rather than claimed away.
 ///
 /// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
 ///    so a missing or corrupt record costs nothing.

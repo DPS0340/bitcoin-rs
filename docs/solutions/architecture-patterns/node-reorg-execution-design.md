@@ -75,10 +75,12 @@ Consequences:
 
    An earlier version of this note said recovery is checkpoint-plus-replay.
    Only the checkpoint half exists. `run.rs` does call `recover_if_needed`, but
-   nothing in production ever writes the metadata it reads: the only writer is
-   `NodeState::record_synthetic_block_for_recovery`, whose own doc calls it a
-   test helper. So on a normal boot `read_meta` finds no sidecar and the
-   fresh-node path is taken. Nothing in block connection fsyncs either.
+   nothing in production ever writes the metadata it reads. Two functions can
+   write it, `crash_recovery::set_last_committed_height` and
+   `NodeState::record_synthetic_block_for_recovery`, and neither has a
+   production caller; the second's own doc calls it a test helper. So on a
+   normal boot `read_meta` finds no sidecar and the fresh-node path is taken.
+   Nothing in block connection fsyncs either.
 
    Note what this does NOT mean. The two halves do not fail together, for the
    reason this whole section exists: the undo record is a journaled KV write
@@ -86,11 +88,13 @@ Consequences:
    durable undo record for a UTXO commit that vanished, or a checkpointed UTXO
    commit whose undo record was still in the journal. Rolling either forward
    needs the replay that is not wired. Tracked below.
-2. **A durable phase marker is not needed for the UTXO step.** An earlier draft
-   specified one; it solves a failure mode that cannot occur here, since the
-   in-memory set discards all uncommitted mutation on a crash. This holds on
-   its own. It does not imply the node recovers: reaching the tip again from a
-   reloaded checkpoint still needs replay, which is missing.
+2. **Whether a durable phase marker is needed is undecided.** An earlier draft
+   specified one and a later draft called it unnecessary, reasoning that the
+   in-memory set discards uncommitted mutation on a crash so the two halves
+   cannot disagree. The paragraph above refutes that: a checkpoint can retain a
+   UTXO commit whose undo record was lost with the journal, which is exactly
+   the mismatch a durable boundary would detect. Neither draft settled it.
+   Decide it with the recovery protocol, not before.
 3. **Index rollback must be one atomic write batch.** A partial index rollback
    does survive a crash, and no marker helps because the crash lands inside the
    phase. This is already implemented that way.
@@ -149,7 +153,7 @@ Open, and prerequisites for giving `disconnect_block` a caller:
 | `coin_stats` inverse feed | cumulative, so it drifts on every disconnect |
 | `filter_index` rollback | BIP157 headers chain, so a stale link corrupts the chain; `filter_header_cache` must be reset with it |
 | RPC caches | `blocks` and `transactions` would keep serving the disconnected block |
-| Index rollback idempotence | `undo_block` is fallible and runs after the index rolls back, so the window between them is retryable only if rollback is idempotent. Prove it or add compensation |
+| Rollback idempotence, both stores | `undo_block` is fallible and runs after the index rolls back. Worse, it is not all-or-nothing: `commit_adds_and_removes` walks shards and both its serial and parallel paths can fail after other shards committed, so the UTXO set can be left partly undone. Retry converges only if both rollbacks are idempotent. Prove it, make the UTXO commit atomic, or add compensation |
 
 Open, layer 4:
 
