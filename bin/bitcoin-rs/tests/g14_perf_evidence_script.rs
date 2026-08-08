@@ -4289,6 +4289,59 @@ fn electrum_rss_measurement_requires_real_scripthash_corpus()
 
 #[test]
 #[cfg(target_os = "linux")]
+fn electrum_rss_measurement_waits_for_a_connection_still_in_the_listen_backlog()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The kernel completes the three-way handshake before the server calls
+    // accept(), so the connection is ESTABLISHED with inode 0 until accept()
+    // gives it an owning file. Treating that transient row as malformed made
+    // the ownership proof fail whenever the server was slow to accept, which is
+    // what happens on a loaded CI runner. Delaying accept() past a poll
+    // interval reproduces it deterministically.
+    let temp = tempfile::tempdir()?;
+    let node = fake_electrum_node_with_accept_delay(temp.path(), 1, "history", 1.5)?;
+    let output = temp.path().join("electrum-rss.json");
+    let corpus = write_text(
+        temp.path(),
+        "scripthashes.txt",
+        "1111111111111111111111111111111111111111111111111111111111111111\n",
+    )?;
+
+    let command_output = Command::new("bash")
+        .arg(electrum_rss_script_path())
+        .args([
+            "--output",
+            output.to_str().ok_or("non-UTF-8 output path")?,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &node.port(),
+            "--pid",
+            &node.pid(),
+            "--tip-height",
+            "10",
+            "--tip-hash",
+            FAKE_ELECTRUM_TIP_HASH,
+            "--sample-size",
+            "1",
+            "--scripthashes",
+            corpus.to_str().ok_or("non-UTF-8 corpus path")?,
+            "--timeout-seconds",
+            "20",
+        ])
+        .output()?;
+
+    assert_success(&command_output);
+    assert_eq!(
+        node.requested(),
+        vec![String::from(
+            "1111111111111111111111111111111111111111111111111111111111111111"
+        )],
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
 fn electrum_rss_measurement_rejects_empty_history_for_real_corpus()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -6867,9 +6920,10 @@ const FAKE_ELECTRUM_TIP_HASH: &str =
 /// the accepted connection. A listener living in the test process cannot do
 /// that, so the server and the "node" have to be the same process.
 const FAKE_ELECTRUM_NODE_PY: &str = r#"
-import json, socket, sys
+import json, socket, sys, time
 
 requests_path, count, mode, header_hex = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+accept_delay = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -6877,6 +6931,9 @@ server.bind(("127.0.0.1", 0))
 server.listen(1)
 print(server.getsockname()[1], flush=True)
 
+# The handshake completes in the kernel before accept() runs, so this delay
+# holds the connection ESTABLISHED in the listen backlog with inode 0.
+time.sleep(accept_delay)
 connection, _ = server.accept()
 stream = connection.makefile("rwb")
 if stream.readline():
@@ -6934,16 +6991,26 @@ fn fake_electrum_node(
     response_count: usize,
     mode: &str,
 ) -> Result<FakeElectrumNode, Box<dyn std::error::Error>> {
+    fake_electrum_node_with_accept_delay(dir, response_count, mode, 0.0)
+}
+
+fn fake_electrum_node_with_accept_delay(
+    dir: &Path,
+    response_count: usize,
+    mode: &str,
+    accept_delay_seconds: f64,
+) -> Result<FakeElectrumNode, Box<dyn std::error::Error>> {
     let program = dir.join("fake-electrum-node.py");
     fs::write(&program, FAKE_ELECTRUM_NODE_PY)?;
     let requests_path = dir.join("fake-electrum-requests.txt");
     let command = format!(
-        "exec -a bitcoin-rs python3 {} {} {} {} {}",
+        "exec -a bitcoin-rs python3 {} {} {} {} {} {}",
         program.display(),
         requests_path.display(),
         response_count,
         mode,
         FAKE_ELECTRUM_TIP_HEADER_HEX,
+        accept_delay_seconds,
     );
     let mut child = Command::new("bash")
         .args(["-c", &command])

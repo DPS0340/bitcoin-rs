@@ -297,7 +297,7 @@ def established_socket_inodes_for_connection(
     client_local_port: int,
     client_peer_ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
     client_peer_port: int,
-) -> set[int]:
+) -> tuple[set[int], int]:
     """Find ESTABLISHED inodes whose endpoints match the client's connection.
 
     Server-side local endpoint must equal the client's peer endpoint, and
@@ -307,6 +307,7 @@ def established_socket_inodes_for_connection(
     """
     inodes: set[int] = set()
     tables_seen = 0
+    unaccepted = 0
     for table, ipv6 in (("tcp", False), ("tcp6", True)):
         path = Path(f"/proc/{pid}/net/{table}")
         try:
@@ -350,14 +351,19 @@ def established_socket_inodes_for_connection(
             if not ip_addresses_equivalent(rem_ip, client_local_ip):
                 continue
             if inode <= 0:
-                die(
-                    f"{path} ESTABLISHED entry matching {client_peer_ip}:{client_peer_port} "
-                    f"<- {client_local_ip}:{client_local_port} has malformed inode"
-                )
+                # The three-way handshake completes before accept(), so the
+                # kernel reports the connection ESTABLISHED with inode 0 while
+                # it waits in the listen backlog. That is a transient state, not
+                # a malformed row, and it cannot weaken the ownership proof: an
+                # inode of 0 is in no process fd table, so it could never
+                # intersect process_socket_inodes(pid). Report it so the caller
+                # keeps polling.
+                unaccepted += 1
+                continue
             inodes.add(inode)
     if tables_seen == 0:
         die(f"--pid {pid} does not expose /proc/{pid}/net/tcp or /proc/{pid}/net/tcp6")
-    return inodes
+    return inodes, unaccepted
 
 
 def require_pid_owns_accepted_connection(
@@ -366,9 +372,10 @@ def require_pid_owns_accepted_connection(
     local_ip, local_port, peer_ip, peer_port = connected_client_endpoints(sock)
     match_inodes: set[int] = set()
     owned: set[int] = set()
+    unaccepted = 0
     deadline = time.monotonic() + timeout_seconds
     while True:
-        match_inodes = established_socket_inodes_for_connection(
+        match_inodes, unaccepted = established_socket_inodes_for_connection(
             pid, local_ip, local_port, peer_ip, peer_port
         )
         if match_inodes:
@@ -384,6 +391,12 @@ def require_pid_owns_accepted_connection(
         f"{normalize_ipaddress(peer_ip)}:{peer_port}"
     )
     if not match_inodes:
+        if unaccepted:
+            die(
+                f"--pid {pid} never accepted the connection ({endpoint}): the kernel "
+                f"still reports it ESTABLISHED in the listen backlog with no owning "
+                f"file after {timeout_seconds:g}s"
+            )
         die(
             f"--pid {pid} has no ESTABLISHED TCP socket matching accepted connection "
             f"({endpoint}) in /proc/{pid}/net/tcp or /proc/{pid}/net/tcp6"
