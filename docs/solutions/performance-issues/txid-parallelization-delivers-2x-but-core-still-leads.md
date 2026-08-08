@@ -383,7 +383,17 @@ The two removable reads are **0.66s together, 0.8% of the run**. The remainder i
 
 That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**, both inside the FFI boundary where four separate marshalling attempts already measured 0.98–1.00×. Closing both perfectly would reach ~75s against Core's 59.6s — **1.26×, still not parity**.
 
-The honest conclusion: the 20.6s arithmetic closed, but the reachable portion of it did not. Parity needs the architectural change (no `bitcoin::Transaction` on the hot path, kernel types throughout), not this program.
+**No identified change reaches parity, including the architectural one.** An earlier draft of this section said parity "needs the architectural change". That was wrong and contradicted this note's own costing of that change at 3.1s. The arithmetic, from 84.6s against Core's 59.6s:
+
+| Do this | Lands at | Ratio |
+|---|---|---|
+| the architectural change alone (remove the rust-bitcoin decode, 3.1s) | 81.5s | 1.37× |
+| every still-open item (decode + block parse + prepare/resolve, 12.6s) | 72.0s | 1.21× |
+| literally every item including the three proven unreachable | 61.8s | 1.04× |
+
+Only the last row approaches parity, and it requires undoing three things that are measured as irreducible: merkle is at its hashing floor, `utxo_commit` is real work, and `block_body_persist` has 0.66s of removable overhead in 3.28s. So parity is not one refactor away. Core is modestly faster across nearly every non-crypto stage at once — 3-4s here, 3-4s there — which is what a mature C++ implementation with tuned allocation and batching looks like, not a defect with a fix.
+
+What is genuinely true and worth carrying forward: script verification is a **tie**, memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.42×** and itemised. Anyone resuming should decide whether 1.42× on throughput is worth a broad re-engineering of the non-crypto apply path, rather than starting a multi-crate refactor expecting parity from it.
 
 ## Guidance
 
