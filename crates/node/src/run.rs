@@ -558,6 +558,7 @@ fn spawn_fixed_peer_bootstrap(
 #[allow(clippy::too_many_lines)]
 pub fn run(mut config: Config) -> Result<()> {
     logging::install_tracing(&config.log_level)?;
+    cap_global_thread_pool();
 
     let injected_shutdown = config.shutdown_signal.take();
     let state = NodeState::open(config)?;
@@ -738,6 +739,45 @@ pub fn run(mut config: Config) -> Result<()> {
     clean_checkpoint?;
     tracing::info!("bitcoin-rs node exited cleanly");
     Ok(())
+}
+/// Threads for the process-wide rayon pool.
+///
+/// rayon defaults the global pool to one worker per core. That pool only runs
+/// the short coarse jobs in apply — block txid hashing and shard commits —
+/// while script verification holds its own pool of up to
+/// `MAX_SCRIPT_VERIFY_THREADS` and the node holds its own I/O threads besides.
+/// On a many-core host the process therefore oversubscribes by a wide margin
+/// and the global workers spend their time spinning for work that is not there.
+///
+/// Measured on a loopback P2P sync to height `150_000`, `taskset -c 0-31`, three
+/// interleaved pairs:
+///
+/// | global pool | wall | CPU |
+/// |---|---|---|
+/// | one per core (32) | 75.6s | 314.4s |
+/// | 4 | 64.4s | 162.4s |
+///
+/// Both axes improve together, so this is not a wall-for-CPU trade. The sweep
+/// is flat from 2 to 8 and climbs above it. A full-verification replay of the
+/// same window is insensitive at every width (84-88s) because script
+/// verification dominates there and runs in its own pool, so this cap costs
+/// that path nothing.
+const GLOBAL_RAYON_THREADS: usize = 4;
+
+/// Caps the global rayon pool before any parallel iterator runs.
+///
+/// Idempotent by necessity: `build_global` fails if a pool already exists, and
+/// that is not an error worth aborting a node boot over — it means something
+/// else already sized the pool, and the default is merely slower, not wrong.
+fn cap_global_thread_pool() {
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let threads = available.min(GLOBAL_RAYON_THREADS);
+    if let Err(error) = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+    {
+        tracing::debug!(%error, "global rayon pool already configured, keeping it");
+    }
 }
 
 #[cfg(test)]
