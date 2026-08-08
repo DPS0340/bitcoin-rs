@@ -241,6 +241,25 @@ pub enum DisconnectError {
         #[source]
         source: Box<ApplyError>,
     },
+    /// Rolled back cleanly, but the in-flight marker could not be cleared.
+    ///
+    /// The chain is consistent and no data is lost. What is broken is the
+    /// interlock: the marker still says a disconnect was in flight, so the next
+    /// start refuses until it is cleared. Reported rather than folded into
+    /// success because a caller that heard "done" would restart into a refusal
+    /// it had no warning of.
+    #[error(
+        "disconnect of block {hash} at height {height} completed but the in-flight marker remains set: {source}"
+    )]
+    MarkerStuck {
+        /// Block that was disconnected.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height it was applied at.
+        height: u32,
+        /// Why the marker could not be cleared.
+        #[source]
+        source: Box<ApplyError>,
+    },
 }
 
 enum NodeStorage {
@@ -954,6 +973,37 @@ impl NodeState {
             }
         };
         let storage = NodeStorage::open(&config)?;
+        let undo_store = storage.undo_store();
+        // Before anything reads the chainstate, let alone serves or syncs it.
+        // A node that starts on a torn chainstate builds on it, and every block
+        // it adds makes the damage harder to find.
+        if let Some(marker) = undo_store
+            .load_disconnect_marker()
+            .map_err(anyhow::Error::new)?
+        {
+            // Names directories rather than a `-reindex` option, because this
+            // node has no reindex. An instruction the operator cannot follow is
+            // worse than none.
+            //
+            // All three stores, not just the chainstate: a torn disconnect can
+            // have rolled the transaction index back while the UTXO set and tip
+            // still name the block, so resetting the chainstate alone would
+            // start a node whose index disagrees with it. The marker lives in
+            // the chainstate store, so removing these clears it too; there is no
+            // separate clear step to forget.
+            bail!(
+                "refusing to start: a disconnect of block {hash} at height {height} never \
+                 completed, so the UTXO set, the transaction index, and the chain tip may \
+                 disagree. The node cannot repair this in place, because it cannot tell \
+                 which of those commits landed before the disconnect stopped. Remove \
+                 {chainstate}, {txindex}, and {filters}, then resync.",
+                hash = marker.hash,
+                height = marker.height,
+                chainstate = config.data_dir.join("chainstate").display(),
+                txindex = config.data_dir.join("txindex").display(),
+                filters = config.data_dir.join("filters").display(),
+            );
+        }
         let block_files =
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
         let block_body_store =
@@ -1074,7 +1124,7 @@ impl NodeState {
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: false,
             block_body_store: Some(Arc::clone(&block_body_store)),
-            undo_store: storage.undo_store(),
+            undo_store,
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),

@@ -80,6 +80,83 @@ pub(crate) trait UndoStore: Send + Sync {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Records that a disconnect is about to mutate state, durably.
+    ///
+    /// Armed BEFORE the first mutation, not after a failure. A marker written
+    /// on the error path cannot exist for the case that needs it most: the
+    /// process dying mid-rollback writes nothing at all. Armed first, both a
+    /// crash and a returned `Fatal` leave the same evidence behind.
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError>;
+
+    /// Clears the marker once a disconnect has finished cleanly.
+    ///
+    /// What this pair does NOT close: the UTXO set and the tip are in memory
+    /// behind periodic checkpoints while the transaction index persists
+    /// immediately, so a crash after a clean disconnect but before the next
+    /// checkpoint still restores a tip that names a block whose index rows are
+    /// gone. That skew is the same one block connection has, and closing it
+    /// needs a replay path from the last durable state, which this node does not
+    /// have. The marker guards the window where a single disconnect tears state
+    /// mid-rollback. Do not cite it as crash safety for the whole operation.
+    fn disarm_disconnect(&self) -> Result<(), StorageError>;
+
+    /// Reads the marker left by a disconnect that never finished.
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError>;
+}
+
+/// A disconnect that started and never reported finishing.
+///
+/// Its presence at startup means one of two things, and the node cannot tell
+/// them apart: the disconnect returned `Fatal`, or the process died between the
+/// first mutation and the last. Both leave a chainstate where some of the UTXO
+/// set, the index, and the tip are rolled back and some are not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisconnectMarker {
+    /// Block being disconnected.
+    pub hash: bitcoin_rs_primitives::Hash256,
+    /// Height it was applied at.
+    pub height: u32,
+}
+
+/// Key for the in-flight disconnect marker.
+///
+/// One key, not one per block: only one disconnect runs at a time, and a
+/// per-block key would leave the reader scanning to find out whether any are
+/// set.
+const DISCONNECT_MARKER_KEY: &[u8] = b"node:disconnect-in-flight";
+
+impl DisconnectMarker {
+    fn encode(&self) -> [u8; 36] {
+        let mut encoded = [0_u8; 36];
+        encoded[..32].copy_from_slice(&self.hash.to_le_bytes());
+        encoded[32..].copy_from_slice(&self.height.to_be_bytes());
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        let Ok(fixed): Result<[u8; 36], _> = bytes.try_into() else {
+            // A marker that will not decode is still a marker. Treating a short
+            // read as "no disconnect was in flight" would let corruption clear
+            // the interlock, which is the one thing it must never do.
+            return Err(StorageError::Backend(format!(
+                "disconnect marker is {} bytes, expected 36",
+                bytes.len()
+            )));
+        };
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&fixed[..32]);
+        let mut height = [0_u8; 4];
+        height.copy_from_slice(&fixed[32..]);
+        Ok(Self {
+            hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
+            height: u32::from_be_bytes(height),
+        })
+    }
 }
 
 /// Process-local undo storage.
@@ -89,6 +166,7 @@ pub(crate) trait UndoStore: Send + Sync {
 #[derive(Debug, Default)]
 pub(crate) struct InMemoryUndoStore {
     records: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+    marker: parking_lot::RwLock<Option<DisconnectMarker>>,
 }
 
 impl UndoStore for InMemoryUndoStore {
@@ -108,6 +186,24 @@ impl UndoStore for InMemoryUndoStore {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.records.read().get(&(height, hash)).cloned())
+    }
+
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        *self.marker.write() = Some(DisconnectMarker { hash, height });
+        Ok(())
+    }
+
+    fn disarm_disconnect(&self) -> Result<(), StorageError> {
+        *self.marker.write() = None;
+        Ok(())
+    }
+
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
+        Ok(self.marker.read().clone())
     }
 }
 
@@ -155,6 +251,48 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
             bitcoin_rs_storage::ColumnFamily::UndoData,
             &bitcoin_rs_pruning::block_body_key(height, hash),
         )
+    }
+
+    /// Flushed, unlike every other write on this path.
+    ///
+    /// The rest of block apply does not fsync because a crash there is
+    /// recoverable by re-applying blocks. This one is different: it is the only
+    /// record that a rollback started, and it is worthless if the crash that it
+    /// exists to survive can lose it. One fsync per disconnect, and disconnects
+    /// are rare.
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        self.store.put(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+            &DisconnectMarker { hash, height }.encode(),
+        )?;
+        self.store.flush()
+    }
+
+    fn disarm_disconnect(&self) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.delete(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+        );
+        self.store.write(batch)?;
+        self.store.flush()
+    }
+
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
+        self.store
+            .get(
+                bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+                DISCONNECT_MARKER_KEY,
+            )?
+            .map(|bytes| DisconnectMarker::decode(&bytes))
+            .transpose()
     }
 }
 
@@ -709,18 +847,44 @@ pub fn disconnect_block(
     } = plan_disconnect(handles, block, block_hash)
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
 
-    // Still a free refusal. Index rollback flushes buffered rows and then
-    // issues every delete in one write batch, so a failure at either step
-    // leaves the rollback un-started and the chain exactly as it was.
+    // Armed before the first mutation and cleared after the last, so the window
+    // it covers is exactly the window in which state can be torn. Errors are not
+    // what this guards against; a crash is. A crash writes no error anywhere,
+    // and the marker is the only thing that survives it.
+    //
+    // Above the index rollback, not below it: that rollback commits a delete
+    // batch, so a crash between it and the arming would leave the index rolled
+    // back while the UTXO set and the tip still name the block.
+    //
+    // Deliberately per-disconnect rather than per-reorg: each disconnect commits
+    // fully, so a branch switch interrupted BETWEEN disconnects leaves a
+    // consistent chain at a lower tip, which is recoverable by connecting
+    // forward. Holding the marker across a whole switch would refuse startup for
+    // that case and force a needless reindex.
+    handles
+        .undo_store
+        .arm_disconnect(height, block_hash)
+        .map_err(|error| {
+            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(error)))
+        })?;
+
+    // Index rollback flushes buffered rows and then issues every delete in one
+    // write batch, so an ERROR at either step leaves the rollback un-started and
+    // the chain exactly as it was. That is still a refusal, so the marker armed
+    // above has nothing to guard and comes back off.
     if let Some(tx_index) = &handles.tx_index {
-        tx_index
-            .lock()
-            .rollback_block(block, height)
-            .map_err(|error| {
-                crate::DisconnectError::Refused(Box::new(ApplyError::IndexRollback(
-                    error.to_string(),
-                )))
-            })?;
+        let rollback = tx_index.lock().rollback_block(block, height);
+        if let Err(error) = rollback {
+            let refusal = ApplyError::IndexRollback(error.to_string());
+            return Err(match handles.undo_store.disarm_disconnect() {
+                Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
+                Err(disarm) => crate::DisconnectError::MarkerStuck {
+                    hash: block_hash,
+                    height,
+                    source: Box::new(ApplyError::UndoPersistence(disarm)),
+                },
+            });
+        }
     }
 
     // Past this line every failure is `Fatal`. The UTXO commit walks shards and
@@ -787,6 +951,18 @@ pub fn disconnect_block(
     handles
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
+
+    // Every mutation landed, so the marker has nothing left to guard. A failure
+    // to clear it is reported rather than swallowed: the chain is consistent,
+    // but the node will refuse to start until the marker goes, and a caller
+    // told "success" would have no way to know that.
+    handles.undo_store.disarm_disconnect().map_err(|error| {
+        crate::DisconnectError::MarkerStuck {
+            hash: block_hash,
+            height,
+            source: Box::new(ApplyError::UndoPersistence(error)),
+        }
+    })?;
     Ok(parent_tip)
 }
 
@@ -5171,6 +5347,156 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// The marker exists to survive a crash, so an in-memory round trip proves
+    /// nothing. This closes the backend and reopens it, which is the only shape
+    /// of test that can fail if the write is not durable.
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn an_armed_disconnect_marker_survives_closing_and_reopening_the_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let block_hash = Hash256::from_le_bytes(&[0xa7; 32]);
+
+        {
+            let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+            KvUndoStore::new(store).arm_disconnect(140_003, block_hash)?;
+        }
+
+        let reopened = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+        let marker = KvUndoStore::new(Arc::clone(&reopened))
+            .load_disconnect_marker()?
+            .ok_or("armed marker did not survive the reopen")?;
+        assert_eq!(marker.hash, block_hash, "hash must round-trip");
+        assert_eq!(marker.height, 140_003, "height must round-trip");
+
+        // And it must come back off, or a node that disconnected cleanly could
+        // never start again.
+        KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect()?;
+        drop(reopened);
+        let after = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+        assert_eq!(
+            KvUndoStore::new(after).load_disconnect_marker()?,
+            None,
+            "a disarmed marker must not come back after a reopen"
+        );
+        Ok(())
+    }
+
+    /// A truncated marker must not read as "no disconnect was in flight".
+    /// Corruption clearing the interlock is the one failure it cannot have.
+    #[test]
+    fn a_truncated_disconnect_marker_is_an_error_not_an_absence() {
+        let Err(error) = DisconnectMarker::decode(&[0_u8; 20]) else {
+            panic!("a 20-byte marker must not decode as absent");
+        };
+        assert!(
+            error.to_string().contains("expected 36"),
+            "error must say what it expected, got: {error}"
+        );
+    }
+
+    /// Records the marker calls in order, delegating the rest.
+    ///
+    /// Ordering is the whole property: a marker armed after the index rollback
+    /// would leave a crash between them invisible, and no assertion on the final
+    /// state can tell the two orders apart.
+    #[derive(Debug, Default)]
+    struct MarkerSequenceStore {
+        inner: InMemoryUndoStore,
+        events: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl UndoStore for MarkerSequenceStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("arm");
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("disarm");
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    /// The index rollback commits a delete batch, so it is a mutation and the
+    /// marker must already be armed when it runs. This uses the refusing indexer
+    /// because that path proves both halves at once: the marker was armed before
+    /// the rollback was attempted, and the refusal took it back off.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn the_marker_is_armed_before_the_index_rollback_and_cleared_on_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let store = Arc::new(MarkerSequenceStore::default());
+        handles.undo_store = Arc::<MarkerSequenceStore>::clone(&store);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer that refuses, or this proves nothing"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert!(
+            store.events.lock().is_empty(),
+            "connecting a block must touch the marker not at all"
+        );
+
+        let outcome = disconnect_block(&handles, &block);
+        assert!(
+            matches!(&outcome, Err(crate::DisconnectError::Refused(boxed))
+                if matches!(**boxed, ApplyError::IndexRollback(_))),
+            "the refusing indexer must still refuse, got {outcome:?}"
+        );
+        assert_eq!(
+            store.events.lock().as_slice(),
+            ["arm", "disarm"],
+            "the marker must be armed before the rollback runs and cleared when it refuses"
+        );
+        assert_eq!(
+            store.load_disconnect_marker()?,
+            None,
+            "a refusal changed nothing, so it must leave no marker behind"
+        );
+        Ok(())
+    }
+
     /// A store that refuses every write, to prove the undo persistence is a
     /// real gate rather than a best-effort side effect.
     #[derive(Debug, Default)]
@@ -5193,6 +5519,28 @@ mod consensus_rule_tests {
             _height: u32,
             _hash: Hash256,
         ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            Ok(None)
+        }
+
+        fn arm_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker write failure".to_owned(),
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker clear failure".to_owned(),
+            ))
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
             Ok(None)
         }
     }
@@ -5447,6 +5795,41 @@ mod consensus_rule_tests {
             handles.blocks.read().len(),
             records_before,
             "exactly the one record must go"
+        );
+        Ok(())
+    }
+
+    /// The marker's two ends, on the real disconnect path. Arming without
+    /// disarming would refuse every later start; disarming without arming would
+    /// leave the crash window unguarded. Only running the real disconnect can
+    /// show both ends are wired, so this does not call the store directly.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_clean_disconnect_leaves_no_in_flight_marker() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            None,
+            "connecting a block must not arm the disconnect marker"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            None,
+            "a disconnect that completed must clear the marker it armed"
         );
         Ok(())
     }
