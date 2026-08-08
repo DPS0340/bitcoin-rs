@@ -605,6 +605,17 @@ pub struct ApplyHandles {
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
+    /// Serializes whole chain transitions against each other.
+    ///
+    /// Distinct from `admission`, which is a shutdown barrier: `enter` takes a
+    /// READ guard, so any number of applies hold it at once and it excludes
+    /// nothing but a checkpoint close. A transition reads the applied tip,
+    /// decides what follows it, mutates the UTXO set, and publishes a new tip;
+    /// two of those interleaved can both pass the predecessor check against the
+    /// same tip and then race to publish, so one silently discards the other's
+    /// block. This lock spans the whole read-decide-mutate-publish sequence for
+    /// connects, windows, and disconnects alike.
+    pub(crate) chain_transition: Arc<parking_lot::Mutex<()>>,
     /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
@@ -650,6 +661,7 @@ impl ApplyHandles {
             g2_muhash_sampler: None,
             g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
+            chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
         }
@@ -839,6 +851,15 @@ pub fn disconnect_block(
     use bitcoin::hashes::Hash as _;
 
     let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    // Held across planning as well as rollback. Planning snapshots the applied
+    // tip and validates against it; taken only around the mutation, a connect
+    // could commit a child in between and this would then roll back the old tip
+    // and publish its parent, discarding the child.
+    let _admission = handles
+        .admission
+        .enter()
+        .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
+    let _transition = handles.chain_transition.lock();
     let DisconnectPlan {
         parent_tip,
         undo,
@@ -1033,14 +1054,24 @@ pub fn apply_window(
             ))),
         });
     }
-    // One permit for the whole window. Preparation reads the applied tip and the
-    // UTXO set and the commits mutate both; taken per block instead, another
-    // applier could move the chain between preparation and the commit relying on
-    // it, and matching the tip hash would not detect a same-tip partial change.
+    // One admission permit and one transition lock for the whole window.
+    //
+    // The permit alone would not do it: `enter` takes a read guard, so two
+    // windows, or a window and a single connect, hold it at the same time. The
+    // transition lock is what actually excludes them. Preparation reads the
+    // applied tip and the UTXO set and the commits mutate both, so a concurrent
+    // applier moving the chain in between would invalidate the proof this window
+    // is about to rely on, and matching the tip hash would not detect a same-tip
+    // partial change.
+    //
+    // Both taken once for the window rather than per block: re-entering the
+    // permit is two read guards that deadlock against a shutdown waiting on the
+    // write side, and re-locking the transition would leave gaps between commits.
     let _admission = handles
         .admission
         .enter()
         .map_err(|source| WindowApplyError { applied: 0, source })?;
+    let _transition = handles.chain_transition.lock();
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
     let mut applied = 0_usize;
     for (block, raw) in blocks.iter().zip(serialized) {
@@ -1367,12 +1398,17 @@ fn apply_block_inner(
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let _admission = handles.admission.enter()?;
+    let _transition = handles.chain_transition.lock();
     apply_block_admitted(handles, block, provided_serialized, None)
 }
 
-/// The apply itself, with the single-writer permit already held.
+/// The apply itself, with the admission permit and the transition lock held.
 ///
-/// Split from [`apply_block_inner`] so a window can take one permit across its
+/// Callers MUST hold both. `handles.chain_transition` is what serializes this
+/// against another connect or a disconnect; the admission permit only keeps a
+/// checkpoint close from cutting across it.
+///
+/// Split from [`apply_block_inner`] so a window can take both once across its
 /// preparation and all of its ordered commits. Re-entering per block would be
 /// two read guards on the same lock, which deadlocks against a shutdown waiting
 /// on the write side, and would leave gaps in which another applier could move
@@ -5393,6 +5429,69 @@ mod consensus_rule_tests {
             error.to_string().contains("expected 36"),
             "error must say what it expected, got: {error}"
         );
+    }
+
+    /// Two connects racing for the same height must produce one winner and one
+    /// rejection, never two blocks that both believe they extended the tip.
+    ///
+    /// Before the transition lock this could pass both: `ApplyAdmission::enter`
+    /// hands out read guards, so both threads cleared the predecessor check
+    /// against the same tip and then raced to publish, and whichever published
+    /// second silently discarded the other's block.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn two_concurrent_connects_at_one_height_produce_one_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // Two distinct children of the same parent: both are valid extensions of
+        // the current tip, and exactly one may become it.
+        let left = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let right = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        assert_ne!(
+            left.block_hash(),
+            right.block_hash(),
+            "the two candidates must differ or this races nothing"
+        );
+
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| apply_block(&handles, &left));
+            let b = scope.spawn(|| apply_block(&handles, &right));
+            (a.join(), b.join())
+        });
+        let (Ok(left_outcome), Ok(right_outcome)) = outcomes else {
+            panic!("an applier thread panicked");
+        };
+
+        let winners = usize::from(left_outcome.is_ok()) + usize::from(right_outcome.is_ok());
+        assert_eq!(
+            winners, 1,
+            "exactly one connect may win the height, got left={left_outcome:?} right={right_outcome:?}"
+        );
+
+        let tip = handles
+            .applied_tip
+            .load_full()
+            .ok_or("no applied tip after the race")?;
+        assert_eq!(tip.height, 1, "the tip must advance exactly one block");
+        let winner = if left_outcome.is_ok() { &left } else { &right };
+        assert_eq!(
+            tip.hash,
+            Hash256::from_le_bytes(winner.block_hash().as_byte_array()),
+            "the published tip must be the block that actually won"
+        );
+        Ok(())
     }
 
     /// Records the marker calls in order, delegating the rest.
