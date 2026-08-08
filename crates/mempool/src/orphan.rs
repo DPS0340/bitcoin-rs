@@ -373,7 +373,7 @@ mod tests {
     /// the pool kept one orphan, defeating a zero used to disable retention.
     #[test]
     fn a_zero_count_limit_admits_no_orphans() {
-        let mut pool = OrphanPool::with_limits(0, 10_000_000, Duration::from_secs(60));
+        let mut pool = OrphanPool::with_limits(0, 10_000_000, Duration::from_mins(1));
         let tx = orphan_tx(1, vec![OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0)]);
         let outcome = pool.add(tx, Vec::new(), peer(1), Instant::now());
 
@@ -390,7 +390,7 @@ mod tests {
     /// requested in the order given, and a set alone would scramble them.
     #[test]
     fn duplicate_parents_collapse_and_keep_their_order() {
-        let mut pool = OrphanPool::with_limits(8, 10_000_000, Duration::from_secs(60));
+        let mut pool = OrphanPool::with_limits(8, 10_000_000, Duration::from_mins(1));
         let a = Txid::from_byte_array([0xa1; 32]);
         let b = Txid::from_byte_array([0xb2; 32]);
         let c = Txid::from_byte_array([0xc3; 32]);
