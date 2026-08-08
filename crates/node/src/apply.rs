@@ -8484,6 +8484,75 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// Download lag must not roll the node back. A candidate branch whose
+    /// bodies have not arrived yet is a wait, not a disconnect: the applied
+    /// chain has to sit exactly where it was, or every tick during a normal
+    /// download gap would strand the node on the ancestor.
+    #[test]
+    fn a_branch_with_unavailable_bodies_moves_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let applied_block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&applied_block));
+        let applied = apply_block_with_serialized(&handles, &applied_block, raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), raw.to_vec());
+
+        // A competing branch whose headers are known and whose bodies are not.
+        let rival_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let rival_two = mined_block_with_prev_hash_and_transactions(
+            rival_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut last = None;
+            for block in [&rival_one, &rival_two] {
+                last = Some(tree.insert_header(
+                    block.header,
+                    bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+                )?);
+            }
+            last.ok_or_else(|| anyhow::anyhow!("no rival branch built"))?
+        };
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target);
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::MissingBody { .. })),
+            "an unavailable branch must report a missing body, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied.hash),
+            "the applied tip must not move when the candidate branch is incomplete"
+        );
+        assert!(
+            utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                applied_block.txdata[0].compute_txid().as_byte_array()
+            )),
+            "the applied branch's coins must survive an aborted switch"
+        );
+        Ok(())
+    }
+
     fn apply_handles_for_network(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {
         apply_handles_with_tx_index(network, utxo, noop_tx_index())
     }

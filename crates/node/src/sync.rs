@@ -567,6 +567,7 @@ impl BlockSync {
             }
         }
 
+        self.switch_branch_if_outweighed();
         let (applied, failed) = self.apply_buffered_blocks(apply_head_check);
         if received > 0 || applied > 0 || failed > 0 {
             tracing::debug!(
@@ -697,6 +698,56 @@ impl BlockSync {
             metrics::counter!("node.sync.retry_count").increment(retry_count);
         }
         staged_count
+    }
+
+    /// Moves the applied chain onto the header tip's branch when it has been
+    /// outweighed.
+    ///
+    /// `chain_tip` tracks the heaviest headers and `applied_tip` the validated
+    /// chain; the two diverge exactly when a competing branch wins. Forward
+    /// application cannot close that gap, because the blocks it wants to apply
+    /// do not build on the applied tip.
+    ///
+    /// Availability is left to [`crate::reorg::switch_to_branch`], which loads
+    /// every body before disconnecting anything and touches nothing if one is
+    /// absent. A branch still downloading therefore reports `MissingBody` and
+    /// is retried next tick, rather than being pre-checked here — two copies of
+    /// that condition would be two chances to disagree.
+    fn switch_branch_if_outweighed(&self) {
+        let Some(target) = self.outweighed_branch_target() else {
+            return;
+        };
+        match crate::reorg::switch_to_branch(&self.handles, target) {
+            Ok(()) => {
+                let height = self
+                    .handles
+                    .applied_tip
+                    .load_full()
+                    .map_or(0, |tip| tip.height);
+                tracing::info!(height, "block sync: switched to the heavier branch");
+            }
+            Err(crate::reorg::ReorgError::MissingBody { height, .. }) => {
+                tracing::trace!(height, "block sync: heavier branch still downloading");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "block sync: branch switch failed");
+            }
+        }
+    }
+
+    /// Returns the header tip when the applied chain is not on its branch.
+    ///
+    /// The applied tip is on the branch exactly when the header tip's ancestor
+    /// at the applied height is the applied block itself.
+    fn outweighed_branch_target(&self) -> Option<bitcoin_rs_chain::NodeId> {
+        let chain_tip = self.handles.chain_tip.load_full()?;
+        let applied = self.handles.applied_tip.load_full()?;
+        if chain_tip.hash == applied.hash {
+            return None;
+        }
+        let tree = self.handles.block_tree.read();
+        let ancestor = tree.node_at_height_from(chain_tip.tip_id, applied.height)?;
+        (tree.node(ancestor).ok()?.hash != applied.hash).then_some(chain_tip.tip_id)
     }
 
     fn apply_buffered_blocks(&self, next_expected_hash: Option<Hash256>) -> (usize, usize) {

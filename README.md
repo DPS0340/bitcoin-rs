@@ -144,11 +144,13 @@ with `-- --ignored` once the documented environment is in place.
 
 ## Status
 
-The node syncs, verifies, and serves. What it cannot do yet is reorganise:
-undo records are persisted and `disconnect_block` works, but no production
-path drives a branch switch, so the node follows the chain forward only. Until
-that lands, do not rely on it as your only node. `docs/README.md` lists the
-rest of the gaps.
+The node syncs, verifies, serves, and reorganises. The sync loop compares the
+header tip against the applied tip each tick and switches branches when the
+applied chain is outweighed.
+
+It is still not the node to depend on. A disconnected block's transactions do
+not return to the mempool, no disconnect notification is published, and the
+filter index is not backfilled across a gap. `docs/README.md` lists the rest.
 
 ## Documentation
 

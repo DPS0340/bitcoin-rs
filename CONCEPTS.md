@@ -98,11 +98,13 @@ for a block that left the chain; only its last-tip cache is repointed, and that
 cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
 inverses. `transactions` needed nothing, because connection never populates it.
 
-Still open: returning a disconnected block's transactions to the mempool,
-publishing a disconnect notification, backfilling the filter index after a gap,
-routing a block that extends a known side branch, and the durable poison marker
-with the startup handling around it. Together they are why `disconnect_block`
-has no production caller.
+`disconnect_block` has a production caller: `switch_to_branch`
+(`crates/node/src/reorg.rs`), driven each sync tick when the header tip and the
+applied tip sit on different branches.
+
+Still open around it: returning a disconnected block's transactions to the
+mempool, publishing a disconnect notification, backfilling the filter index
+after a gap, and routing a block that extends a known side branch.
 
 ### Dispatch-bound parallelism
 
