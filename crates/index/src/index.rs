@@ -486,11 +486,21 @@ impl<S: KvStore> Indexer<S> {
     /// existed. The returned [`IndexRowCounts`] reflects the rows targeted for
     /// deletion (the same counts a matching ingest would have written), which
     /// may be zero on a repeat call or when the block was never indexed.
+    ///
+    /// Any buffered rows are flushed first. Deletion writes straight to the
+    /// store, so unflushed rows for the block being disconnected would survive
+    /// in `pending_rows` and a later [`Self::end_batch`] would resurrect the
+    /// very block just rolled back. Flushing first also keeps the all-or-
+    /// nothing property: a failing flush returns `Err` before anything is
+    /// deleted.
     pub fn rollback_block(
         &mut self,
         block: &bitcoin::Block,
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
+        // Buffered rows must reach the store before the deletes, or a later
+        // end_batch would write back the block being disconnected.
+        self.flush()?;
         let txids: Vec<bitcoin::Txid> = block
             .txdata
             .iter()
@@ -1473,6 +1483,110 @@ mod tests {
             }
             None
         }
+    }
+
+    /// A block whose rows populate all four column families: a coinbase plus a
+    /// spend, so funding and spending rows both exist alongside txid and header
+    /// rows.
+    fn rollback_fixture_block() -> Block {
+        let funded = tx(
+            OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+            ScriptBuf::from_bytes(vec![0x51]),
+        );
+        let spender = tx(
+            OutPoint::new(funded.compute_txid(), 0),
+            ScriptBuf::from_bytes(vec![0x52]),
+        );
+        block(vec![funded, spender])
+    }
+
+    #[test]
+    fn rollback_removes_every_row_a_matching_ingest_wrote() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+        let before = stored_rows(&indexer)?;
+
+        let written = indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        let after_ingest = stored_rows(&indexer)?;
+        assert!(
+            after_ingest.len() > before.len(),
+            "fixture must write rows to be a meaningful rollback test"
+        );
+        // All four column families must be exercised, or the test proves little.
+        for cf in [
+            ColumnFamily::TxConfirmed,
+            ColumnFamily::Funding,
+            ColumnFamily::Spending,
+            ColumnFamily::BlockHeaders,
+        ] {
+            assert!(
+                after_ingest.iter().any(|(family, _)| *family == cf),
+                "fixture wrote no rows to {cf:?}"
+            );
+        }
+
+        let removed = indexer.rollback_block(&candidate, HEIGHT)?;
+        assert_eq!(removed.txids, written.txids);
+        assert_eq!(removed.funding, written.funding);
+        assert_eq!(removed.spending, written.spending);
+        assert_eq!(removed.headers, written.headers);
+        assert_eq!(
+            stored_rows(&indexer)?,
+            before,
+            "rollback must restore the pre-ingest row set exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_of_a_never_indexed_block_is_not_an_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+
+        // An indexer enabled after the block was applied never wrote its rows.
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        assert!(stored_rows(&indexer)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_rollback_is_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        let after_first = stored_rows(&indexer)?;
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        assert_eq!(
+            stored_rows(&indexer)?,
+            after_first,
+            "a second rollback must be observationally inert"
+        );
+        Ok(())
+    }
+
+    /// Regression: rollback writes deletions straight to the store, so rows
+    /// still buffered in `pending_rows` used to survive it and a later
+    /// `end_batch` resurrected the disconnected block.
+    #[test]
+    fn rollback_inside_an_open_batch_is_not_undone_by_end_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+
+        indexer.begin_batch();
+        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        indexer.end_batch()?;
+
+        assert!(
+            stored_rows(&indexer)?.is_empty(),
+            "end_batch must not write back rows for a rolled-back block"
+        );
+        Ok(())
     }
 
     fn indexer() -> Result<(tempfile::TempDir, Indexer<RocksDbStore>), Box<dyn std::error::Error>> {
