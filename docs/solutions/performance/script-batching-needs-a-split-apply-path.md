@@ -1,8 +1,24 @@
-# Cross-block script batching cuts crypto dispatch 3.5x, and pays it all back
+# Cross-block script batching: reverted once, then shipped
 
-Status: measured, implemented, reverted. The mechanism works. The integration
-does not, and this note says exactly why so the next attempt starts from the
-right shape.
+Status: **shipped.** The first attempt was a wash and was reverted; the second,
+built on a split apply path so preparation happens once, holds up.
+
+| blocks 0..150,000, full verification | wall | CPU |
+|---|---|---|
+| Bitcoin Core 31.0 | 60.7s | 466.5s |
+| bitcoin-rs before | 78.4s | 643.4s |
+| bitcoin-rs after | **69.6s** | **558.4s** |
+
+Three interleaved pairs, medians, pinned to `taskset -c 0-31`. Both axes
+improve, so this is not a wall-for-CPU trade. Core still leads: 1.15x on wall
+and 1.20x on CPU, down from 1.28x and 1.37x.
+
+Script verification inside apply fell from 49.26s to 6.91s, and the dispatch it
+replaced from 44.08s across 21,474 fan-outs to 12.55s across 2,343.
+
+The rest of this note is why the first attempt failed and what the second had to
+do differently. It is kept because the failure is more instructive than the
+success.
 
 ## The gap
 
@@ -143,7 +159,21 @@ There is no cheaper variant. Block `w+1`'s front half needs `w`'s committed
 state, which is precisely what the overlay substitutes for, so the front half
 cannot be hoisted without the overlay and cannot be shared without the split.
 
-## What was kept
+## Where the time goes now
+
+| stage | seconds |
+|---|---|
+| apply (all blocks, everything but scripts) | 26.51 |
+| script dispatch | 12.55 |
+| window preparation (kernel parse, tx plan, resolution) | 11.28 |
+| check preparation | 5.09 |
+| decode | 3.2 |
+
+The dispatch is no longer the largest term, which is the point. Closing the
+remaining ~9s means broad work across apply's own stages, not one more
+structural change.
+
+## What was kept from the first attempt
 
 Nothing. The building blocks were correct and mutation-verified, but without a
 caller they are scaffolding, and a wired version that costs what it saves is

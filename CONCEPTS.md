@@ -118,6 +118,21 @@ dispatch does not fix it and makes it worse, because it throttles the blocks
 that were scaling; only issuing fewer, larger dispatches does. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
+### Window script batching
+
+Verifying the input scripts of several consecutive blocks in one parallel
+dispatch, so the fan-out is amortised over a run of blocks rather than paid per
+block. The window prepares each block against an ordered overlay, dispatches
+once, and issues a per-block proof; the blocks then commit one at a time and in
+order, so every rule needing committed state still sees the real chain. On
+mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
+558.4s, with the dispatch itself falling from 44.08s to 12.55s. The proof binds
+the block hash, its predecessor, the height, the flags, and the locktime cutoff,
+travels bundled with the prepared state it covers, and is re-checked against
+what the apply derives; a window that cannot be proven yields nothing and every
+block verifies normally. See
+`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
+
 ### Front-half duplication
 
 The failure mode where a batched fast path recomputes the sequential path's
