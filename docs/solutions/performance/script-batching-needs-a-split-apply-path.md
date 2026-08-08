@@ -161,6 +161,84 @@ lands, and both survived adversarial review:
   ordering test passes for the wrong reason. This was found by mutation, not by
   reading.
 
+## The reviewed design for the next attempt
+
+A planner and an adversarial reviewer both examined the prepare/commit split.
+Verdict: feasible, and **ship-with-mitigations** — with the invariants below
+enforced, the reviewer could not construct a consensus divergence.
+
+### The rule that collapses the error-ordering risk
+
+Treat the captured per-block context (height, median-time-past, softfork state,
+locktime cutoff, verify flags, predecessor) as a **hypothesis**. `commit_apply`
+re-derives it from committed state and compares. Any mismatch, any batch
+failure, an assume-valid block, or a coinbase-only block degrades to
+`ScriptOutcome::Unverified`, under which commit runs today's
+`verify_block_transactions` unchanged.
+
+One rule, and the entire "did the batch change which error surfaces" class
+disappears: on any doubt the block takes the path it takes today.
+
+### The cut line
+
+Only four stages move to prepare, and they are exactly the measured
+duplication: `KernelBlock::parse` (6.12s), `plan_block_transactions_with_txids`,
+`ResolvedUtxoView::resolve` (12.35s, the only step whose *source* changes), and
+per-transaction script-check preparation. Everything else stays in commit in
+today's order, so error identity is preserved by construction rather than by
+argument.
+
+Two placements are load-bearing rather than incidental:
+
+- **The admission guard is taken once per window.** `ApplyAdmission::enter`
+  returns a `parking_lot` read guard; nesting two while `close()` waits on the
+  write side can deadlock. `commit_apply` must not re-enter.
+- **`applied_predecessor` stays in commit.** It is the guard that catches an
+  interloping applier: any foreign apply moves `applied_tip` and produces a
+  predecessor mismatch before a stale overlay can be acted on.
+
+### Three defects the plan found in the proposal
+
+1. `PreparedApply` **cannot** own the `KernelBlock` and the `PreparedTx<'b>`
+   values borrowed from it in one struct — that is self-referential. The
+   borrows must live in a sibling collection dropped before commit.
+2. The overlay must reproduce `build_utxo_changes`'s skip rules — OP_RETURN,
+   scripts over `MAX_SCRIPT_SIZE`, same-block-spent, genesis — or it is not
+   equivalent for the undo record, BIP68, or coinbase maturity.
+3. Every window block's header must already be in the `BlockTree`. Production
+   sync satisfies this by construction; the replay driver does not and must
+   insert them first, exactly as header-first sync does.
+
+### The six invariants the reviewer requires
+
+1. **Point-in-time per-block resolved maps.** Emit each block's map at the
+   moment its inputs resolve — resolve, then spend, then create, per
+   transaction. Never derive a per-block map from the overlay's final state, or
+   an output created by A and spent by B is absent when B's undo record needs
+   it.
+2. **True per-block predecessor for BIP68.** Time-based relative locks need the
+   median-time-past at `creation_height - 1`, walked from the block's actual
+   predecessor. During a window that predecessor may itself be unapplied, so
+   capture its node identity from the window's header chain, not from
+   `applied_tip`.
+3. **BIP30 stays in commit**, ordered, querying the real UTXO set. An earlier
+   window block may spend the last live output of a reused txid, which makes a
+   later reuse legal; a stale snapshot gets that backwards in both directions.
+4. **Single-use proofs, revalidated against the current applied tip** before any
+   mutation. Non-cloneable, consumed once, never cached or requeued.
+5. **Undo persisted immediately before its own block's commit**, preserving the
+   existing undo-before-mutation ordering.
+6. **Any failure destroys the failed block and the entire prepared suffix.**
+   Commit progress is the only progress. No `PreparedApply` survives a sync
+   tick, a retry, a peer redelivery, or a reorg.
+
+### Sequencing
+
+Seven commits, each independently verifiable and green, with production sync
+untouched until step 6 and a go/no-go measurement gate at step 5 requiring an
+identical tip hash, an identical UTXO digest, and an identical coinstats MuHash
+between `--window 1` and `--window 64`.
+
 ## Also corrected
 
 The BIP30 duplicate-coinbase blocks are **91,842 and 91,880**. 91,722 and
