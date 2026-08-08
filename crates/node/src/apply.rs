@@ -2296,9 +2296,21 @@ fn applied_header_tip(
     height: u32,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let mut tree = handles.block_tree.write();
-    let node_id = match tree.lookup(block_hash) {
-        Some(node_id) => node_id,
-        None => tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?,
+    let node_id = if let Some(node_id) = tree.lookup(block_hash) {
+        node_id
+    } else {
+        // A header the tree has never seen goes in here, and header sync's
+        // timestamp rules never ran on it. Without this check a caller handing
+        // `apply_block` a block directly could make one with an invalid
+        // median-time-past or an absurd future timestamp the applied consensus
+        // tip.
+        bitcoin_rs_chain::validate_header_timestamp(
+            &tree,
+            &block.header,
+            block_hash,
+            bitcoin_rs_chain::current_unix_seconds(),
+        )?;
+        tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?
     };
     let node = tree.node(node_id)?;
     if node.height != height {
@@ -5833,6 +5845,44 @@ mod consensus_rule_tests {
         );
     }
 
+    /// Timestamp rules must hold on the apply path, not only in header sync.
+    ///
+    /// `applied_header_tip` inserts a header the tree has never seen, so before
+    /// this a caller handing `apply_block` a block directly could make one with
+    /// a timestamp at or below its parent's median-time-past the applied
+    /// consensus tip.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn apply_rejects_a_block_whose_timestamp_precedes_its_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let mut block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        // Exactly the parent's timestamp: the rule is strictly greater than the
+        // median, and with one ancestor the median IS the parent's time.
+        block.header.time = genesis.header.time;
+        let outcome = apply_block(&handles, &block);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(ApplyError::Chain(
+                    bitcoin_rs_chain::ChainError::TimestampTooEarly { .. }
+                ))
+            ),
+            "a block at or below its parent's median-time-past must be refused, got {outcome:?}"
+        );
+        Ok(())
+    }
+
     /// A body that fails a cheap structural check must never reach the batch.
     ///
     /// Batching made this a cost question, not just a correctness one: a peer
@@ -7543,7 +7593,7 @@ mod consensus_rule_tests {
                 version: bitcoin::block::Version::ONE,
                 prev_blockhash,
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-                time: 1,
+                time: next_fixture_time(),
                 bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
@@ -7553,6 +7603,22 @@ mod consensus_rule_tests {
             .compute_merkle_root()
             .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
         block
+    }
+
+    /// A timestamp strictly after every fixture block built before it.
+    ///
+    /// The fixtures used to hard-code `1`, which is before the regtest genesis
+    /// timestamp and therefore below its median-time-past. That went unnoticed
+    /// while only header sync checked timestamps; now that the apply path does
+    /// too, a fixture block has to carry a timestamp a real one could have.
+    /// Strictly increasing also keeps deep chains valid, where a constant would
+    /// fall to the median once enough blocks shared it.
+    fn next_fixture_time() -> u32 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        // Just past the regtest genesis timestamp.
+        static NEXT: AtomicU32 = AtomicU32::new(1_296_688_603);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     fn mined_block_with_prev_hash_and_transactions(

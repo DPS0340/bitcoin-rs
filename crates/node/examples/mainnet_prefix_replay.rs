@@ -113,8 +113,13 @@ fn apply_window(
     let headers: Vec<bitcoin::block::Header> = blocks.iter().map(|block| block.header).collect();
     {
         let mut tree = handles.block_tree.write();
-        bitcoin_rs_chain::header_sync::accept_headers(&mut tree, &headers, handles.network)
-            .context("accept window headers")?;
+        bitcoin_rs_chain::header_sync::accept_headers(
+            &mut tree,
+            &headers,
+            handles.network,
+            bitcoin_rs_chain::current_unix_seconds(),
+        )
+        .context("accept window headers")?;
     }
     bitcoin_rs_node::apply::apply_window(handles, blocks, raw).map_err(|error| {
         // Name the block that failed. Most `ApplyError`s carry no height or

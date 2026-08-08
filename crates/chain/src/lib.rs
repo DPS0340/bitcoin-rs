@@ -19,7 +19,7 @@ use thiserror::Error;
 
 pub use bip9_cache::{Bip9Cache, CachedState};
 pub use bitcoin_rs_primitives::Network;
-pub use header_sync::accept_headers;
+pub use header_sync::{accept_headers, current_unix_seconds, validate_header_timestamp};
 pub use node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus};
 pub use reorg::{ReorgPlan, plan_reorg};
 pub use tip::TipSnapshot;

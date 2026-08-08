@@ -260,7 +260,12 @@ pub(crate) fn read_headers<R: Read + Seek>(
         reader.read_exact(&mut encoded)?;
         let header: Header = deserialize(&encoded)
             .map_err(|error| HeaderCheckpointError::Codec(error.to_string()))?;
-        let ids = accept_headers(&mut tree, core::slice::from_ref(&header), config.network)?;
+        let ids = accept_headers(
+            &mut tree,
+            core::slice::from_ref(&header),
+            config.network,
+            bitcoin_rs_chain::current_unix_seconds(),
+        )?;
         let id = ids[0];
         let node = tree.node(id)?;
         if node.height != height || tree.len() != index + 1 {
@@ -1929,7 +1934,12 @@ mod tests {
             u32::from(NETWORK.genesis_block_hash().to_le_bytes()[0]) + 1,
         );
         mine_header_to_declared_target(&mut fork)?;
-        let fork_id = accept_headers(&mut tree, core::slice::from_ref(&fork), NETWORK)?[0];
+        let fork_id = accept_headers(
+            &mut tree,
+            core::slice::from_ref(&fork),
+            NETWORK,
+            bitcoin_rs_chain::current_unix_seconds(),
+        )?[0];
         let fork = tree.node(fork_id)?;
         let applied = HeaderCheckpointPoint {
             height: fork.height,
@@ -2689,12 +2699,22 @@ mod tests {
         let genesis =
             bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header;
         let mut tree = BlockTree::new();
-        let mut current = accept_headers(&mut tree, core::slice::from_ref(&genesis), NETWORK)?[0];
+        let mut current = accept_headers(
+            &mut tree,
+            core::slice::from_ref(&genesis),
+            NETWORK,
+            bitcoin_rs_chain::current_unix_seconds(),
+        )?[0];
         for height in 1..=best_height {
             let prev = BlockHash::from_byte_array(tree.node(current)?.hash.to_le_bytes());
             let mut header = next_header(prev, height);
             mine_header_to_declared_target(&mut header)?;
-            current = accept_headers(&mut tree, core::slice::from_ref(&header), NETWORK)?[0];
+            current = accept_headers(
+                &mut tree,
+                core::slice::from_ref(&header),
+                NETWORK,
+                bitcoin_rs_chain::current_unix_seconds(),
+            )?[0];
         }
         let applied_id = tree
             .node_at_height_from(current, applied_height)

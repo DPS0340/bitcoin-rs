@@ -396,8 +396,12 @@ impl BlockSync {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
             let mut tree = self.handles.block_tree.write();
-            let acceptance =
-                bitcoin_rs_chain::accept_headers(&mut tree, &headers, self.handles.network);
+            let acceptance = bitcoin_rs_chain::accept_headers(
+                &mut tree,
+                &headers,
+                self.handles.network,
+                bitcoin_rs_chain::current_unix_seconds(),
+            );
             match acceptance {
                 Ok(node_ids) => {
                     self.handles.assume_valid_gate.evaluate(&tree);

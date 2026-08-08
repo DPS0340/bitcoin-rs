@@ -24,13 +24,23 @@ const MEDIAN_TIME_SPAN: usize = 11;
 /// Genesis on a non-empty tree) without relaxing validation or error
 /// propagation for unknown headers, which continue through proof-of-work and
 /// contextual nBits validation before insertion.
+/// `now_secs` is the reference time for the future-drift bound, supplied by
+/// the caller rather than read here.
+///
+/// `TimestampTooFarAhead` documents a network-adjusted limit, and a host clock
+/// running an hour slow would reject a header ninety minutes ahead of network
+/// time even though it is well inside the two-hour window — across every peer,
+/// stalling the sync. This node tracks no peer time offset yet, so every caller
+/// passes [`current_unix_seconds`] today; the parameter is what lets one
+/// callsite change when it does, and what makes the bound testable without
+/// moving the system clock.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
     network: Network,
+    now_secs: u32,
 ) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
-    let now_secs = current_unix_seconds();
     for header in headers {
         let hash = hash_from_header(header);
         if let Some(existing_id) = tree.lookup(hash) {
@@ -51,7 +61,7 @@ pub fn accept_headers(
 ///
 /// A clock before the epoch yields 0, which only makes the future-drift bound
 /// stricter and can never wrongly accept a header.
-fn current_unix_seconds() -> u32 {
+pub fn current_unix_seconds() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -68,7 +78,13 @@ fn current_unix_seconds() -> u32 {
 ///
 /// `now_secs` is passed in rather than read here so the drift bound is a pure
 /// function of its inputs and testable at its boundaries.
-fn validate_header_timestamp(
+/// Checks a header's timestamp against median-time-past and the future bound.
+///
+/// Public because header sync is not the only path that admits a header: the
+/// apply path inserts one directly when a block arrives whose header was never
+/// seen, and without this it could make a block with an invalid timestamp the
+/// applied consensus tip.
+pub fn validate_header_timestamp(
     tree: &BlockTree,
     header: &BlockHeader,
     hash: bitcoin_rs_primitives::Hash256,
@@ -325,6 +341,44 @@ mod timestamp_tests {
             header.nonce = header.nonce.wrapping_add(1);
         }
         header
+    }
+
+    /// The future bound must follow the supplied time, not the host clock.
+    ///
+    /// A host running slow used to reject headers that were well inside the
+    /// two-hour window relative to network time, and it would do that against
+    /// every peer at once.
+    #[test]
+    fn the_future_bound_follows_the_supplied_time_not_the_host_clock() {
+        let (tree, tip) = chain_with_median_five();
+        // Far past any plausible host clock, so a raw-clock bound rejects it.
+        let network_now = 2_000_000_000_u32;
+        let header = mine(tip.block_hash(), 11, network_now + MAX_FUTURE_TIME_SECONDS);
+        let hash = hash_from_header(&header);
+
+        assert!(
+            super::current_unix_seconds() + MAX_FUTURE_TIME_SECONDS < header.time,
+            "the host clock must reject this header, or the test proves nothing"
+        );
+        assert!(
+            validate_header_timestamp(&tree, &header, hash, network_now).is_ok(),
+            "a header exactly at the bound relative to the supplied time is valid"
+        );
+
+        // One second past it is not.
+        let beyond = mine(
+            tip.block_hash(),
+            12,
+            network_now + MAX_FUTURE_TIME_SECONDS + 1,
+        );
+        let beyond_hash = hash_from_header(&beyond);
+        assert!(
+            matches!(
+                validate_header_timestamp(&tree, &beyond, beyond_hash, network_now),
+                Err(ChainError::TimestampTooFarAhead { .. })
+            ),
+            "one second past the bound must still be rejected"
+        );
     }
 
     /// Builds a chain of 11 headers with times 0..=10, so the median-time-past
