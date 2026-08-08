@@ -359,11 +359,31 @@ A calibration worth recording, because it corrected my own reasoning: raw double
 
 Where the remaining 2.9× goes is per-node overhead in *small* levels — most blocks in this window have a handful of transactions, so each `next_merkle_level` call folds one or two nodes and amortizes its own call, bounds, and truncate over almost nothing. Parallelism cannot touch that (there is nothing to spread), and neither can a faster hash (hashing is only 1.46s of the 4.3s). Core reaches 1.41s for the whole of `Sanity checks` because its blocks come pre-parsed with the tree work batched differently, not because its SHA is faster.
 
+**A third item is closed: `block_body_persist` is genuinely storage work, not overhead.** It looked suspicious — 687 MB in 4.18s is 164 MB/s on a tmpfs-backed data dir, an order of magnitude under what the device does. Probing the path found two KV reads wrapping the append (an idempotency lookup that is always `None` during linear replay, and a read-modify-write of a per-file max height that is monotonic and therefore cacheable). Both are real inefficiencies. Neither is worth fixing:
+
+| Sub-stage | Cost |
+|---|---|
+| idempotency `index.get` | 0.36s |
+| flat-file append (687 MB) | 1.44s |
+| max-height `index.get` | 0.30s |
+| batch write + other | 1.18s |
+| total | 3.28s |
+
+The two removable reads are **0.66s together, 0.8% of the run**. The remainder is the write itself plus the index batch. So this item is a *policy* call — include it in the ratio or exclude it as work Core's reindex does not do — and not an optimization target. Do not delete block-body persistence to improve a benchmark; a real node must store blocks.
+
 **This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
 
-1. Treat these as **one program, not five candidates**. Gate the program on the cumulative number, and use paired interleaved runs with more than three repetitions to resolve each step.
-2. Start with `block_rules` (merkle root over scalar SHA-256 against Core's AVX2) — it is a pure function, immediately falsified by any error since every block checks it, and therefore the lowest-risk of the five.
-3. Decide `block_body_persist` on policy, not performance: Core's reindex writes no blocks, so it is either excluded from the ratio or matched by having Core do it. Do not simply delete it to win a benchmark; a real node must store blocks.
+**Three of the five are now closed, all negative**, which retires most of the 20.6s on paper:
+
+| Item | Verdict |
+|---|---|
+| `utxo_commit` 3.51s | real work; the shard fan-out is not even taken at this block size |
+| `block_rules` 3.38s | merkle is at its floor; sha2 identical, parallelism neutral-to-worse |
+| `block_body_persist` 4.18s | policy call; only 0.66s is removable overhead |
+
+That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**, both inside the FFI boundary where four separate marshalling attempts already measured 0.98–1.00×. Closing both perfectly would reach ~75s against Core's 59.6s — **1.26×, still not parity**.
+
+The honest conclusion: the 20.6s arithmetic closed, but the reachable portion of it did not. Parity needs the architectural change (no `bitcoin::Transaction` on the hot path, kernel types throughout), not this program.
 
 ## Guidance
 
