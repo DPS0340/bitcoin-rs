@@ -81,6 +81,15 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 
 When a feature, algorithm, interface, or data layout changes, maintainers must remove the old code path completely in the same change-set.
 
+**One exception, and it is not a shim.** A reader that still accepts an older
+on-disk format is permitted where refusing it would destroy data the node
+cannot rebuild. `read_snapshot` accepts UTXO snapshot versions 2, 3 and 4 for
+that reason. The distinction is direction: reading an old format to recover
+state is recovery, while writing one, or translating in place to keep an old
+consumer working, is a shim and is prohibited. A retained reader must be
+write-only-forward — the node writes the current version and never the old one
+— and `docs/policies/db-migration.md` governs when one may be retained at all.
+
 ### 5.2 RPC Deprecation Policy
 - `bitcoin-rs-rpc` does not provide deprecation windows or compatibility shims for RPC endpoints.
 - RPC methods match current Bitcoin Core JSON-RPC schemas directly (`crates/rpc/tests/core_compat.rs`).
@@ -89,4 +98,4 @@ When a feature, algorithm, interface, or data layout changes, maintainers must r
 ### 5.3 On-Disk Format Deprecation Policy
 - On-disk storage schemas do not maintain backward-compatibility translation shims.
 - When key-value column families, block file encodings, or checkpoint formats change, the system does not convert old databases in place.
-- Incompatible checkpoint formats trigger automatic fallback to `HeadersOnly` or `Cold` start resync (`crates/node/src/checkpoint.rs`), requiring the node to rebuild state cleanly.
+- Incompatible CHECKPOINT formats trigger automatic fallback to `HeadersOnly` or `Cold` start resync (`crates/node/src/checkpoint.rs`), requiring the node to rebuild state cleanly. Key-value column families and flat block files carry no version metadata, so nothing detects an incompatible one and no fallback fires; changing either requires the operator to wipe the datadir, which is why `docs/policies/db-migration.md` makes that step the safeguard rather than the version bump.

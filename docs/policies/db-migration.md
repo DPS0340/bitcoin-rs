@@ -111,9 +111,33 @@ For raw Key-Value database stores (`fjall`, `rocksdb`, `mdbx`, `redb`):
 **`bitcoin-rs` does not support in-place database migrations.**
 The codebase contains zero schema transformation scripts, database version tables, or in-place record converters.
 
+### 6.1.1 Undo Record Encoding
+Undo records in `UndoData` carry their own format version as the first byte
+(`crates/utxo/src/undo_codec.rs`), and each record is bound to the height AND
+block hash of the block it undoes, so a record from an abandoned branch cannot
+be replayed against a different block at the same height.
+
+The codec has no reader for a version other than the current one, by design:
+a record it cannot decode is a record the node refuses to disconnect against,
+which is the safe direction. So a change to the encoding is a breaking schema
+change under section 6.2 and needs the same treatment as a column-family
+change. It is not covered by the UTXO snapshot version rules, which govern a
+different format.
+
+Undo records are also the one persistent structure a resync cannot rebuild
+lazily: they exist to disconnect blocks already applied. Discarding them costs
+the ability to reorganise below the discard point until those blocks are
+re-applied.
+
 ### 6.2 Recommended Rule for Schema Modifications
 When a pull request alters key-value column family key/value formats, column family enum definitions, or storage engine layouts:
 1. Do not write in-place conversion code or compatibility adapters.
-2. Update the component version or codec string in `crates/node/src/checkpoint.rs`.
+2. Update the component version or codec string in `crates/node/src/checkpoint.rs`
+   **where the manifest covers the component**. It covers headers, the UTXO
+   snapshot, and CoinStats. It does NOT cover the key-value column families,
+   the flat block files, or the undo codec, and there is no schema metadata in
+   the KV stores either (see the gap noted in section 2.1). For those, a bump
+   records intent but detects nothing: the node will open the old keyspace by
+   name and read it as if current. Step 3 is the actual safeguard, not step 2.
 3. Require users to wipe the local datadir and resync from genesis or load a fresh UTXO snapshot.
 4. Allow the node's native `HeadersOnly` or `Cold` fallback mechanisms to rebuild incompatible state cleanly.
