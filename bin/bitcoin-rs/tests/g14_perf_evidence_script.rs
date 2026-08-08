@@ -15,9 +15,6 @@ use sha2::{Digest as _, Sha256};
 
 type FakeElectrumServer = (thread::JoinHandle<std::io::Result<()>>, u16);
 
-
-
-
 const DIRECT_BITCOIN_RS_COMMAND: &str = "/tmp/g14-fixture/run-g14-bitcoin-rs-daemon-mainnet-ibd.sh";
 const DIRECT_BITCOIN_RS_COMMAND_SHA256: &str =
     "b8ffdcf8b40352fb7aec7780c4fd8369c9895bbe88e665aea59f4c383ab865e1";
@@ -6859,7 +6856,8 @@ print({hash_expr})
 /// genuinely consistent: this is the mainnet genesis header and its real hash.
 /// A placeholder hash cannot work, because no 80-byte header hashes to one.
 const FAKE_ELECTRUM_TIP_HEADER_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
-const FAKE_ELECTRUM_TIP_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+const FAKE_ELECTRUM_TIP_HASH: &str =
+    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 
 /// Python source for a fake Electrum server that runs as its own process under
 /// argv0 `bitcoin-rs`.
@@ -6951,7 +6949,10 @@ fn fake_electrum_node(
         .args(["-c", &command])
         .stdout(std::process::Stdio::piped())
         .spawn()?;
-    let stdout = child.stdout.take().ok_or("fake electrum node has no stdout")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("fake electrum node has no stdout")?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -6993,8 +6994,6 @@ fn fake_electrum_server(
     });
     Ok((handle, port))
 }
-
-
 
 fn assert_success(output: &std::process::Output) {
     assert!(

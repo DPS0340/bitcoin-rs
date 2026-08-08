@@ -444,8 +444,7 @@ impl<S: KvStore> Indexer<S> {
         height: u32,
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
-        let (rows, txid_count) =
-            pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
+        let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
         if txids.len() != txid_count {
             return self.ingest_block(block, height);
         }
@@ -530,7 +529,6 @@ impl<S: KvStore> Indexer<S> {
         Ok(())
     }
 }
-
 
 fn pending_rows_for_block(
     block: &[u8],
@@ -810,7 +808,9 @@ pub trait IndexerLike: Send + Sync {
     fn begin_batch(&mut self) {}
 
     /// Ends a batch of block ingests, flushing any accumulated rows.
-    fn end_batch(&mut self) -> Result<(), IndexError> { Ok(()) }
+    fn end_batch(&mut self) -> Result<(), IndexError> {
+        Ok(())
+    }
 
     /// Resolves a confirmed transaction by txid via `source`.
     ///
