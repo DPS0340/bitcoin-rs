@@ -43,11 +43,17 @@ Done, all in `crates/node/src/apply.rs` unless noted:
 Not done: `bitcoin_rs_chain::plan_reorg` still has no production caller, and
 `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs` is still `#[ignore]`d.
 
-`disconnect_block` also has no production caller, deliberately. Connection
-touches `coin_stats`, `filter_index`, `filter_header_cache`, and the `blocks`
-and `transactions` RPC caches, and disconnect does not yet undo any of them.
-Those are prerequisites for wiring it, listed under Work remaining. The
-function's own doc comment carries the same table.
+`disconnect_block` also has no production caller, deliberately. The derived
+state connection touches is now accounted for and the answers were not uniform:
+`coin_stats` needed an explicit inverse for its block-level fields only, the
+filter index needed no rollback because its rows are hash-addressed, the
+`blocks` RPC cache needed an opportunistic pop, and `transactions` needed
+nothing because connection never populates it. What still blocks wiring is
+recovery and routing, not derived state: the durable poison marker, returning a
+disconnected block's transactions to the mempool, publishing a disconnect
+notification, backfilling the filter index after a gap, and routing a block that
+extends a known side branch. The function's own doc comment carries the same
+table.
 
 ## Why it matters
 
@@ -145,14 +151,19 @@ Done:
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
 | Persistence | before the block body, the index, and the UTXO commit; ordering mutation-verified |
 | `disconnect_block` | restores UTXO, index, and tip, in that order, all four orderings mutation-verified |
+| `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
+| Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
+| `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
+| `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height) |
 
 Open, and prerequisites for giving `disconnect_block` a caller:
 
 | Piece | Notes |
 |---|---|
-| `coin_stats` inverse feed | cumulative, so it drifts on every disconnect |
-| `filter_index` rollback | BIP157 headers chain, so a stale link corrupts the chain; `filter_header_cache` must be reset with it |
-| RPC caches | `blocks` and `transactions` would keep serving the disconnected block |
+| Mempool reconsideration | a disconnected block's transactions belong back in the mempool |
+| Disconnect notification | ZMQ publishes connects; disconnects are silent |
+| Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
+| Side-branch routing | a block extending a known side branch is rejected with no distinguishable error, so no caller can route it to a reorg |
 | Partial-transition handling | **Retry is ruled out**, and that half is settled: each UTXO operation is idempotent on the set, but the commit fires `UtxoSet`'s listener and `coin_stats` is one, so a second pass double-counts where the set converges. `DisconnectError` now splits `Refused` (nothing touched, free) from `Fatal` (partly rolled back, carries the block hash and height). **The recovery half is not built**: the poison is a return value, so a restart clears it while the index rollback that already reached disk survives. Needs a durable marker written before mutation, a startup that refuses or recovers until it clears, and gating for RPC, P2P and Electrum rather than the apply path alone |
 
 Open, layer 4:
