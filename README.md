@@ -47,16 +47,16 @@ medians reported. Bitcoin Core 31.0 was run with `-reindex-chainstate
 
 | contender | wall | CPU | peak RSS |
 |---|---|---|---|
-| bitcoin-rs | 60.5s | 399.5s | 564 MB |
-| Bitcoin Core 31.0 | 62.8s | 478.1s | 660 MB |
+| bitcoin-rs | 55.3s | 389.1s | 558 MB |
+| Bitcoin Core 31.0 | 61.1s | 469.9s | 659 MB |
 
-Measured at commit `4801a77`: less CPU, a smaller resident set, and no slower
-on wall-clock. Both nodes reach the same tip hash.
+Measured at commit `686379a` with the host near idle: 1.10x faster on
+wall-clock, 1.21x less CPU, and a 1.18x smaller resident set. Both nodes reach
+the same tip hash.
 
-CPU and memory are the solid margins, at 1.20x and 1.17x. Wall-clock is the
-noisy one: the same pair has measured anywhere from 1.04x to 1.24x apart
-depending on what else the host is doing. Treat wall as parity-or-better rather
-than as a fixed number.
+CPU and memory are the stable margins. Wall-clock moves with host load — the
+same pair has measured between 1.04x and 1.24x apart across sessions — so treat
+it as parity-or-better rather than as a fixed number.
 
 This is the replay driver, which reads blocks from local files. Peer sync does
 not reach the same figure yet: it stages at most 128 blocks, so it forms
