@@ -664,14 +664,18 @@ fn plan_disconnect(
 /// path can return an error after other shards already committed, so the set
 /// can be left partly undone.
 ///
-/// Retrying does not obviously converge. Each individual UTXO operation looks
-/// idempotent, since restoring a live output and removing an absent one are
-/// both no-ops on the set. The set is not the whole contract: `undo_block`
-/// runs through `commit_adds_and_removes`, which fires `UtxoSet`'s listener,
-/// and `coin_stats` is one. A second pass can re-emit callbacks for operations
-/// that changed nothing, so a cumulative listener double-counts even though the
-/// set converged. Retry is therefore not a recovery strategy until listener
-/// behaviour is settled, and the window stays with the owed work above.
+/// Retry is not the recovery strategy, and this is settled rather than open.
+/// Each individual UTXO operation is idempotent on the set, since restoring a
+/// live output and removing an absent one are both no-ops. The set is not the
+/// whole contract: `undo_block` runs through `commit_adds_and_removes`, which
+/// fires `UtxoSet`'s listener, and `coin_stats` is one. A second pass re-emits
+/// callbacks for operations that changed nothing, so a cumulative listener
+/// double-counts even where the set converges.
+///
+/// The caller must therefore treat a failed disconnect as fatal: stop applying
+/// blocks and report the block hash and height where it wedged, rather than
+/// trying again. That is the same poison path the branch-switch layer needs for
+/// a failed compensating rollback, so it is one mechanism, not two.
 ///
 /// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
 ///    so a missing or corrupt record costs nothing.
