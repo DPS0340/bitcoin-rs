@@ -154,7 +154,9 @@ Done:
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
-| `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height) |
+| `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
+| Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first mutation and above the index rollback; startup refuses while it is set. See *Disconnect marker phase* in `CONCEPTS.md` |
+| Chain-transition serialization | an exclusive lock spanning read-decide-mutate-publish for connects, windows, and disconnects, held across `plan_disconnect`. `ApplyAdmission::enter` is a shutdown barrier taking a READ guard and serialized nothing |
 
 Open, and prerequisites for giving `disconnect_block` a caller:
 
@@ -164,7 +166,7 @@ Open, and prerequisites for giving `disconnect_block` a caller:
 | Disconnect notification | ZMQ publishes connects; disconnects are silent |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
 | Side-branch routing | a block extending a known side branch is rejected with no distinguishable error, so no caller can route it to a reorg |
-| Partial-transition handling | **Retry is ruled out**, and that half is settled: each UTXO operation is idempotent on the set, but the commit fires `UtxoSet`'s listener and `coin_stats` is one, so a second pass double-counts where the set converges. `DisconnectError` now splits `Refused` (nothing touched, free) from `Fatal` (partly rolled back, carries the block hash and height). **The recovery half is not built**: the poison is a return value, so a restart clears it while the index rollback that already reached disk survives. Needs a durable marker written before mutation, a startup that refuses or recovers until it clears, and gating for RPC, P2P and Electrum rather than the apply path alone |
+| Partial-transition gating | **Retry is ruled out** and the durable half is now built: a phased marker is armed before mutation and startup refuses while it is set, so a restart no longer clears the poison. What remains is reach — the refusal is at node startup, so RPC, P2P and Electrum are gated only by the node failing to start, not by an in-process check. A running node that hits `Fatal` keeps serving until it is restarted |
 
 Open, layer 4:
 
@@ -173,7 +175,7 @@ Open, layer 4:
 | `crates/node/src/reorg.rs` | switch branches via `plan_reorg` |
 | Apply-path routing | keep rejecting a non-extending block, but with a distinguishable error naming the known-side-branch case so the caller can route to reorg. Deleting the rejection outright corrupts the UTXO set |
 | Failure handling | attempt a compensating rollback; if that also fails, poison the apply path and refuse further blocks rather than serving a chain the node cannot describe. Refuse cleanly, never panic mid-write |
-| Real crash replay | `crash_recovery` has no production writer today, so its watermark records nothing and regenerates nothing |
+| Real crash replay | `crash_recovery` has no production writer today, so its watermark records nothing and regenerates nothing. This is also what leaves the checkpoint skew open: a disconnect makes the index rollback durable immediately while the UTXO set and tip wait for a checkpoint, so the marker is held until that checkpoint rather than cleared when the disconnect returns |
 | Un-ignore `g10_reorg_deep` | prove against `bitcoind` regtest |
 
 Absolute "a failed reorg leaves the original tip" is not achievable, because the

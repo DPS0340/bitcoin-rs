@@ -22,7 +22,7 @@ This policy applies to all persistent storage surfaces in `bitcoin-rs`:
 | Chainstate Checkpoint | `crates/node/src/checkpoint.rs` | `chainstate-checkpoints/CURRENT` & `gen-N/` | Manifest `1`, Headers `1`, UTXO `4`, CoinStats `1` |
 
 ### 2.1 Key-Value Store Column Families
-`KvStore` (`crates/storage/src/trait_.rs`) abstracts backend storage over eleven fixed column families defined in `ColumnFamily` (`crates/storage/src/column_families.rs`):
+`KvStore` (`crates/storage/src/trait_.rs`) abstracts backend storage over twelve fixed column families defined in `ColumnFamily` (`crates/storage/src/column_families.rs`):
 - `TxConfirmed` (`0`)
 - `TxMempool` (`1`)
 - `BlockHeaders` (`2`)
@@ -34,8 +34,11 @@ This policy applies to all persistent storage surfaces in `bitcoin-rs`:
 - `BlockTree` (`8`)
 - `UtxoMeta` (`9`)
 - `BlockBodies` (`10`)
+- `UndoData` (`11`)
 
-Storage backends (`FjallStore` in `fjall_impl.rs`, `RocksDbStore` in `rocksdb_impl.rs`, `MdbxStore` in `mdbx_impl.rs`, and `RedbStore` in `redb_impl.rs`) create or open these eleven tables on startup using `ColumnFamily::ALL`.
+Storage backends (`FjallStore` in `fjall_impl.rs`, `RocksDbStore` in `rocksdb_impl.rs`, `MdbxStore` in `mdbx_impl.rs`, and `RedbStore` in `redb_impl.rs`) create or open these twelve tables on startup using `ColumnFamily::ALL`.
+
+`UndoData` holds the per-block records a reorg needs to disconnect a block, keyed by `bitcoin_rs_pruning::block_undo_key` (height and block hash). It is canonical persistent state, not a cache: without a block's undo record the node cannot disconnect that block, so any schema or resync decision that discards it costs the ability to reorganise below the point it was discarded.
 
 > **IDENTIFIED GAP:**
 > The `KvStore` interface and database backends store **no schema version metadata** in database headers or dedicated version rows. Database engines open existing keyspaces or tables by string name (`ColumnFamily::name()`) without checking schema compatibility.
