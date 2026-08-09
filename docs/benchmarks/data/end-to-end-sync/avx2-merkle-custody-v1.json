@@ -404,6 +404,10 @@
     "parents_64_speedup": 4.564475858916201,
     "parents_1024_speedup": 5.5749675465166595
   },
+  "criterion_notes": {
+    "ratio_scope": "The reported criterion ratios include identical scratch-buffer refill overhead in both the candidate and scalar arms, so they are conservative end-to-end Merkle-reducer ratios rather than pure-kernel SHA256d ratios.",
+    "conservative": "Because the scalar arm benefits from the same buffer-reuse strategy as the candidate, any AVX2 kernel advantage is partially absorbed by shared setup cost, making these speedup figures lower bounds on the raw kernel speedup."
+  },
   "final_source_smoke": {
     "command": "taskset -c 0-31 target/release/examples/mainnet_prefix_replay --stop-height 150000 --blocks-file $CORPUS --assume-valid-height 0 --storage-backend fjall --data-dir $DATA_DIR --output $OUTPUT",
     "label": "candidate-final-source",
@@ -415,11 +419,11 @@
     "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
   },
   "optional_local_archive": {
-    "fjall": "/home/alpha/bench-g14/results/avx2-merkle-paired/packet.json",
-    "rocksdb": "/home/alpha/bench-g14/results/avx2-merkle-rocksdb-paired/packet.json",
-    "redb": "/home/alpha/bench-g14/results/avx2-merkle-redb-paired/packet.json",
-    "core": "/home/alpha/bench-g14/results/avx2-merkle-core-final/packet.json",
-    "validation": "/home/alpha/bench-g14/results/avx2-merkle-validation/packet.json",
-    "smoke": "/home/alpha/bench-g14/results/avx2-merkle-final-smoke/packet.json"
+    "fjall": "$BENCH_RESULTS/avx2-merkle-paired/packet.json",
+    "rocksdb": "$BENCH_RESULTS/avx2-merkle-rocksdb-paired/packet.json",
+    "redb": "$BENCH_RESULTS/avx2-merkle-redb-paired/packet.json",
+    "core": "$BENCH_RESULTS/avx2-merkle-core-final/packet.json",
+    "validation": "$BENCH_RESULTS/avx2-merkle-validation/packet.json",
+    "smoke": "$BENCH_RESULTS/avx2-merkle-final-smoke/packet.json"
   }
 }

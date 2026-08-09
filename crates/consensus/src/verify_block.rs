@@ -155,6 +155,11 @@ pub fn verify_merkle_root_with_txids(
 /// Computes the merkle root from caller-supplied transaction IDs and compares
 /// it to the block header. Mutation is intentionally ignored here; the later
 /// consensus path owns the mutation check and its error precedence.
+///
+/// On a nonempty successful reduction the mutable `txids` scratch buffer is
+/// consumed and reduced in place to a single element (the root). Returns
+/// `false` for empty input, encoding failure, or a root that does not match
+/// the block header's merkle root.
 #[doc(hidden)]
 pub fn block_merkle_root_matches_txids(block: &bitcoin::Block, txids: &mut Vec<Txid>) -> bool {
     match merkle_root_and_mutation(txids) {
@@ -278,6 +283,7 @@ mod tests {
     };
     use crate::ConsensusError;
     use crate::rust_path::TipState;
+    use crate::sha256d64::detect_avx2;
 
     #[test]
     fn valid_single_coinbase_block_passes() {
@@ -557,8 +563,23 @@ mod tests {
         }
     }
 
+    /// Reports whether `candidate_merkle` dispatches to the AVX2 or scalar
+    /// `SHA256d` backend. Does not assert AVX2 availability — scalar-only hosts
+    /// and generic runners remain supported.
+    fn candidate_reducer_backend() -> &'static str {
+        if detect_avx2().is_some() {
+            "avx2"
+        } else {
+            "scalar"
+        }
+    }
+
     #[test]
     fn avx2_matches_scalar_for_all_leaf_counts_0_to_129() {
+        eprintln!(
+            "avx2_matches_scalar_for_all_leaf_counts_0_to_129: candidate reducer backend = {}",
+            candidate_reducer_backend()
+        );
         for leaf_count in 0..=129 {
             let txids = txids(leaf_count);
             let mut avx = txids.clone();
@@ -571,6 +592,10 @@ mod tests {
 
     #[test]
     fn lane_boundary_pairs_seven_and_eight() {
+        eprintln!(
+            "lane_boundary_pairs_seven_and_eight: candidate reducer backend = {}",
+            candidate_reducer_backend()
+        );
         for leaf_count in [14, 15, 16, 17, 31, 32, 33] {
             let txids = txids(leaf_count);
             let mut avx = txids.clone();
@@ -585,6 +610,10 @@ mod tests {
 
     #[test]
     fn nonadjacent_duplicates_are_not_mutated() {
+        eprintln!(
+            "nonadjacent_duplicates_are_not_mutated: candidate reducer backend = {}",
+            candidate_reducer_backend()
+        );
         let a = txid(1);
         let b = txid(2);
 
@@ -602,6 +631,10 @@ mod tests {
 
     #[test]
     fn synthetic_odd_duplicate_distinguishes_padding_from_mutation() {
+        eprintln!(
+            "synthetic_odd_duplicate_distinguishes_padding_from_mutation: candidate reducer backend = {}",
+            candidate_reducer_backend()
+        );
         let a = txid(1);
         let b = txid(2);
 
@@ -626,6 +659,10 @@ mod tests {
 
     #[test]
     fn core_ambiguous_six_leaf_tree_vs_duplicated_tail() {
+        eprintln!(
+            "core_ambiguous_six_leaf_tree_vs_duplicated_tail: candidate reducer backend = {}",
+            candidate_reducer_backend()
+        );
         // Core test vector: [1..6] and [1..6, 5, 6] share a root but only the
         // duplicated version is mutated.
         let one_to_six: Vec<Txid> = (1u8..=6).map(txid).collect();

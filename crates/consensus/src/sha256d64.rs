@@ -358,8 +358,12 @@ mod tests {
     #[test]
     fn avx2_matches_independent_sha256d_vectors() {
         let Some(avx2) = detect_avx2() else {
+            eprintln!(
+                "test avx2_matches_independent_sha256d_vectors: AVX2 unavailable — skipping AVX2 vector test"
+            );
             return;
         };
+        eprintln!("test avx2_matches_independent_sha256d_vectors: running with AVX2 backend");
         let mut input = [[0_u8; 64]; 8];
         for (lane, message) in input.iter_mut().enumerate() {
             let lane = match u8::try_from(lane) {
@@ -387,8 +391,12 @@ mod tests {
     #[test]
     fn avx2_matches_literal_zero_message_digest() {
         let Some(avx2) = detect_avx2() else {
+            eprintln!(
+                "test avx2_matches_literal_zero_message_digest: AVX2 unavailable — skipping AVX2 zero-message test"
+            );
             return;
         };
+        eprintln!("test avx2_matches_literal_zero_message_digest: running with AVX2 backend");
         let input = [[0_u8; 64]; 8];
         let mut output = [[0_u8; 32]; 8];
         avx2.transform_8way(&input, &mut output);
