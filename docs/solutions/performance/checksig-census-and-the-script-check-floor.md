@@ -50,77 +50,13 @@ Across 2,868,199 input checks, the 22 u64 counters yielded:
 - **Instrumentation Isolation (INV-15)**: All 22 counters stayed at 0 during direct native timing runs.
 - **Rust Diagnostic**: Rust `secp256k1` 0.31.1 rejected 2 lax-DER records pre-verification due to strict DER parser differences; Core native parity is authoritative.
 
-## Reproducible experiment commands
+## Reproduce the experiment
 
-The experiment harness lives in `.outline/experiments/checksig-census/`:
-
-```bash
-EXP=.outline/experiments/checksig-census
-
-# 1. Build harnesses from repo root with explicit target directories
-cargo build --release --manifest-path $EXP/capture/Cargo.toml --target-dir $EXP/capture/target
-cargo build --release --manifest-path $EXP/bare-secp/Cargo.toml --target-dir $EXP/bare-secp/target
-cargo build --release -p bitcoin-rs-node --example mainnet_prefix_replay \
-  --config 'patch.crates-io.libbitcoinkernel-sys.path=".outline/experiments/checksig-census/libbitcoinkernel-sys-0.3.0"' \
-  --target-dir $EXP/target-instrumented
-cargo build --release -p bitcoin-rs-consensus --example kernel_verify_spike --target-dir target
-
-# 2. Run A — full census (0..150k) using direct instrumented replay binary
-mkdir -p $EXP/out
-BRS_CENSUS_COUNTERS=$EXP/out/census-0-150k.counters.json \
-BRS_CENSUS_JOURNAL=$EXP/out/census-0-150k.journal.bin \
-BRS_CENSUS_LABEL=census-0-150k \
-taskset -c 0-31 \
-./$EXP/target-instrumented/release/examples/mainnet_prefix_replay \
-  --stop-height 150000 --rest-url 127.0.0.1:18443 --assume-valid-height 0 \
-  --data-dir $EXP/out/census-datadir --output json
-
-# 3. Run B — KSPIKE1 capture (run 2x for INV-13 count-repeat check)
-CORPUS=/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin
-CAPTURE=./$EXP/capture/target/release/checksig-census-capture
-
-BRS_CENSUS_COUNTERS=$EXP/out/kspike1.counters.json BRS_CENSUS_JOURNAL=$EXP/out/kspike1.journal.bin \
-BRS_CENSUS_RECORDS=$EXP/out/kspike1.records.bin BRS_CENSUS_LABEL=kspike1 \
-$CAPTURE --corpus $CORPUS --output $EXP/out/kspike1.summary.json
-
-BRS_CENSUS_COUNTERS=$EXP/out/kspike1-repeat.counters.json BRS_CENSUS_JOURNAL=$EXP/out/kspike1-repeat.journal.bin \
-BRS_CENSUS_RECORDS=$EXP/out/kspike1-repeat.records.bin BRS_CENSUS_LABEL=kspike1 \
-$CAPTURE --corpus $CORPUS --output $EXP/out/kspike1-repeat.summary.json
-
-# 4. Validate capture & sort records
-python3 $EXP/analyze.py validate-capture \
-  --counters $EXP/out/kspike1.counters.json --records $EXP/out/kspike1.records.bin --journal $EXP/out/kspike1.journal.bin \
-  --repeat-counters $EXP/out/kspike1-repeat.counters.json --repeat-records $EXP/out/kspike1-repeat.records.bin --repeat-journal $EXP/out/kspike1-repeat.journal.bin \
-  --output $EXP/out/validate-capture.json --sorted-records-output $EXP/out/kspike1.records.sorted.bin
-
-# 5. Run C — bare-secp timing (Core 0.7.2 mode 0, 3 runs pinned to taskset -c 0-31)
-BARE=./$EXP/bare-secp/target/release/checksig-bare-secp
-for i in 1 2 3; do
-  taskset -c 0-31 $BARE \
-    --records $EXP/out/kspike1.records.sorted.bin \
-    --output $EXP/out/bare-secp-$i.json
-done
-
-# 6. Run D — uninstrumented kernel_verify_spike (3 pinned runs)
-SPIKE=./target/release/examples/kernel_verify_spike
-for i in 1 2 3; do
-  taskset -c 0-31 $SPIKE \
-    --corpus /home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin \
-    --output $EXP/out/spike-control-$i.json
-done
-
-# 7. Validate census, integrity & compute final verdict
-python3 $EXP/analyze.py validate-census \
-  --counters $EXP/out/census-0-150k.counters.json --journal $EXP/out/census-0-150k.journal.bin \
-  --capture-journal $EXP/out/kspike1.journal.bin --output $EXP/out/validate-census.json
-
-python3 $EXP/analyze.py verdict \
-  --capture-counters $EXP/out/kspike1.counters.json \
-  --bare-runs $EXP/out/bare-secp-1.json $EXP/out/bare-secp-2.json $EXP/out/bare-secp-3.json \
-  --spike-runs $EXP/out/spike-control-1.json $EXP/out/spike-control-2.json $EXP/out/spike-control-3.json \
-  --current-wall-seconds 69.6 --current-script-wall-seconds 12.55 \
-  --integrity $EXP/out/integrity.json --output $EXP/out/verdict.json
-```
+Use the complete tracked workflow in
+[`tools/checksig-census/README.md`](../../../tools/checksig-census/README.md). It
+reconstructs the patched native source, isolates build outputs, records source
+integrity, captures the corpus twice, runs the three timing panels, and applies
+the analyzer gates.
 
 ## Three-run timing and decision arithmetic
 

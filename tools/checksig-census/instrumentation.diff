@@ -1,0 +1,983 @@
+diff --git a/pristine/bitcoin/src/kernel/bitcoinkernel.cpp b/patched/bitcoin/src/kernel/bitcoinkernel.cpp
+index f21ea04..f8706c5 100644
+--- a/pristine/bitcoin/src/kernel/bitcoinkernel.cpp
++++ b/patched/bitcoin/src/kernel/bitcoinkernel.cpp
+@@ -1,48 +1,51 @@
+ // Copyright (c) 2022-present The Bitcoin Core developers
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #define BITCOINKERNEL_BUILD
+ 
+ #include <kernel/bitcoinkernel.h>
++#include <kernel/census.h>
+ 
+ #include <chain.h>
+ #include <coins.h>
+ #include <consensus/validation.h>
+ #include <dbwrapper.h>
+ #include <kernel/caches.h>
+ #include <kernel/chainparams.h>
+ #include <kernel/checks.h>
+ #include <kernel/context.h>
+ #include <kernel/notifications_interface.h>
+ #include <kernel/warning.h>
+ #include <logging.h>
+ #include <node/blockstorage.h>
+ #include <node/chainstate.h>
+ #include <primitives/block.h>
+ #include <primitives/transaction.h>
++#include <pubkey.h>
+ #include <script/interpreter.h>
+ #include <script/script.h>
+ #include <serialize.h>
+ #include <streams.h>
+ #include <sync.h>
+ #include <uint256.h>
+ #include <undo.h>
+ #include <util/check.h>
+ #include <util/fs.h>
+ #include <util/result.h>
+ #include <util/signalinterrupt.h>
+ #include <util/task_runner.h>
+ #include <util/translation.h>
+ #include <validation.h>
+ #include <validationinterface.h>
++#include <chrono>
+ 
+ #include <cstddef>
+ #include <cstring>
+ #include <exception>
+ #include <functional>
+ #include <list>
+ #include <memory>
+ #include <span>
+ #include <stdexcept>
+ #include <string>
+@@ -676,26 +679,44 @@ int btck_script_pubkey_verify(const btck_ScriptPubkey* script_pubkey,
+ 
+     const PrecomputedTransactionData& txdata{precomputed_txdata ? btck_PrecomputedTransactionData::get(precomputed_txdata) : PrecomputedTransactionData(tx)};
+ 
+     if (flags & btck_ScriptVerificationFlags_TAPROOT && txdata.m_spent_outputs.empty()) {
+         if (status) *status = btck_ScriptVerifyStatus_ERROR_SPENT_OUTPUTS_REQUIRED;
+         return 0;
+     }
+ 
+     if (status) *status = btck_ScriptVerifyStatus_OK;
+ 
++    // I1: census entry - reset thread-local state, copy txid, set input_index.
++    // Placed immediately before VerifyScript, after all flag and spent-output
++    // preconditions. Invalid flags or missing taproot spent outputs return
++    // above without incrementing ffi_verify_entries; they are not census rows.
++    census_resolve_sinks();
++    tl_census = CensusThreadState{};
++    tl_census.active = true;
++    const auto txid = tx.GetHash();
++    std::memcpy(tl_census.spend_txid, txid.begin(), 32);
++    tl_census.input_index = input_index;
++    census_inc(C_FFI_VERIFY_ENTRIES);
++
+     bool result = VerifyScript(tx.vin[input_index].scriptSig,
+                                btck_ScriptPubkey::get(script_pubkey),
+                                &tx.vin[input_index].scriptWitness,
+                                script_verify_flags::from_int(flags),
+                                TransactionSignatureChecker(&tx, input_index, amount, txdata, MissingDataBehavior::FAIL),
+                                nullptr);
++
++    // I2: census exit - emit journal, count true
++    if (result) census_inc(C_FFI_VERIFY_TRUE);
++    census_emit_journal(result);
++    tl_census.active = false;
++
+     return result ? 1 : 0;
+ }
+ 
+ btck_TransactionInput* btck_transaction_input_copy(const btck_TransactionInput* input)
+ {
+     return btck_TransactionInput::copy(input);
+ }
+ 
+ const btck_TransactionOutPoint* btck_transaction_input_get_out_point(const btck_TransactionInput* input)
+ {
+@@ -1437,10 +1458,99 @@ int btck_block_header_to_bytes(const btck_BlockHeader* header, unsigned char out
+         return 0;
+     } catch (...) {
+         return -1;
+     }
+ }
+ 
+ void btck_block_header_destroy(btck_BlockHeader* header)
+ {
+     delete header;
+ }
++
++
++// === Census C ABI exports ===
++
++void btck_census_reset(void)
++{
++    census_reset();
++}
++
++size_t btck_census_counter_count(void)
++{
++    return CENSUS_COUNTER_COUNT;
++}
++
++void btck_census_snapshot(uint64_t* out_counters, size_t counter_count)
++{
++    census_snapshot(out_counters, counter_count);
++}
++
++int btck_census_flush(void)
++{
++    return census_flush();
++}
++
++// btck_bare_verify_bench: mode 0 = CPubKey::Verify (parse pubkey + lax DER + normalize + verify)
++int btck_bare_verify_bench(const btck_bare_input* inputs, uint64_t count,
++                            uint32_t warmup_rounds, uint32_t timed_rounds,
++                            uint32_t mode, btck_bare_result* result)
++{
++    if (mode != 0 || inputs == nullptr || result == nullptr || count == 0) return -1;
++    if (timed_rounds == 0 || timed_rounds > 64) return -1;
++
++    // Prebuild CPubKey, DER vectors, and uint256 outside timing
++    std::vector<CPubKey> pubkeys;
++    std::vector<std::vector<unsigned char>> sigs;
++    std::vector<uint256> hashes;
++    pubkeys.reserve(count);
++    sigs.reserve(count);
++    hashes.reserve(count);
++
++    for (uint64_t i = 0; i < count; i++) {
++        const auto& inp = inputs[i];
++        pubkeys.emplace_back(inp.pubkey, inp.pubkey + inp.pubkey_len);
++        sigs.emplace_back(inp.der_sig, inp.der_sig + inp.der_len);
++        uint256 h;
++        std::memcpy(h.begin(), inp.sighash, 32);
++        hashes.push_back(h);
++    }
++
++    // Mandatory untimed correctness pass
++    uint64_t ok_count = 0;
++    uint64_t mismatches = 0;
++    uint64_t first_mismatch = UINT64_MAX;
++    for (uint64_t i = 0; i < count; i++) {
++        bool ok = pubkeys[i].Verify(hashes[i], sigs[i]);
++        if (ok) ok_count++;
++        bool expected_ok = (inputs[i].expected != 0);
++        if (ok != expected_ok) {
++            if (mismatches == 0) first_mismatch = i;
++            mismatches++;
++        }
++    }
++
++    // Warmup rounds (untimed)
++    for (uint32_t r = 0; r < warmup_rounds; r++) {
++        for (uint64_t i = 0; i < count; i++) {
++            pubkeys[i].Verify(hashes[i], sigs[i]);
++        }
++    }
++
++    // Timed rounds - no I/O, no counters, no locks
++    uint64_t attempts = count * timed_rounds;
++    for (uint32_t r = 0; r < timed_rounds; r++) {
++        auto start = std::chrono::high_resolution_clock::now();
++        for (uint64_t i = 0; i < count; i++) {
++            pubkeys[i].Verify(hashes[i], sigs[i]);
++        }
++        auto end = std::chrono::high_resolution_clock::now();
++        result->round_ns[r] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
++    }
++
++    result->attempts = attempts;
++    result->rounds = timed_rounds;
++    result->mismatches = mismatches;
++    result->first_mismatch = first_mismatch;
++    result->ok_count = ok_count;
++
++    return 0;
++}
+\ No newline at end of file
+diff --git a/pristine/bitcoin/src/kernel/bitcoinkernel.h b/patched/bitcoin/src/kernel/bitcoinkernel.h
+index d302872..6aa4190 100644
+--- a/pristine/bitcoin/src/kernel/bitcoinkernel.h
++++ b/patched/bitcoin/src/kernel/bitcoinkernel.h
+@@ -1862,17 +1862,60 @@ BITCOINKERNEL_API uint32_t BITCOINKERNEL_WARN_UNUSED_RESULT btck_block_header_ge
+  * @return              0 on success.
+  */
+ BITCOINKERNEL_API int BITCOINKERNEL_WARN_UNUSED_RESULT btck_block_header_to_bytes(
+     const btck_BlockHeader* header, unsigned char output[80]) BITCOINKERNEL_ARG_NONNULL(1, 2);
+ 
+ /**
+  * Destroy the btck_BlockHeader.
+  */
+ BITCOINKERNEL_API void btck_block_header_destroy(btck_BlockHeader* header);
+ 
++
++/// === Census API ===
++///@{
++
++/** Reset all census counters to zero and clear journal/records. */
++BITCOINKERNEL_API void btck_census_reset(void);
++
++/** Get the fixed number of census counters (22). */
++BITCOINKERNEL_API size_t btck_census_counter_count(void);
++
++/** Snapshot all counters into the provided array. */
++BITCOINKERNEL_API void btck_census_snapshot(uint64_t* out_counters, size_t counter_count);
++
++/** Flush census counters, journal, and records to env-configured paths. Idempotent. Returns 0 on success. */
++BITCOINKERNEL_API int btck_census_flush(void);
++
++/** Bare verify benchmark input: 176 bytes. */
++typedef struct btck_bare_input {
++    unsigned char sighash[32];
++    unsigned char der_sig[72];
++    unsigned char pubkey[65];
++    unsigned char der_len;
++    unsigned char pubkey_len;
++    unsigned char expected;
++    unsigned char pad[4];
++} btck_bare_input;
++
++/** Bare verify benchmark result: 552 bytes. */
++typedef struct btck_bare_result {
++    uint64_t attempts;
++    uint64_t rounds;
++    uint64_t mismatches;
++    uint64_t first_mismatch;
++    uint64_t ok_count;
++    uint64_t round_ns[64];
++} btck_bare_result;
++
++/** Bare verify benchmark. mode 0 = CPubKey::Verify (parse pubkey + lax DER + normalize + verify). */
++BITCOINKERNEL_API int btck_bare_verify_bench(
++    const btck_bare_input* inputs, uint64_t count,
++    uint32_t warmup_rounds, uint32_t timed_rounds,
++    uint32_t mode, btck_bare_result* result);
++
+ ///@}
+ 
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif // __cplusplus
+ 
+ #endif // BITCOIN_KERNEL_BITCOINKERNEL_H
+diff --git a/patched/bitcoin/src/kernel/census.h b/patched/bitcoin/src/kernel/census.h
+new file mode 100644
+index 0000000..4f153ae
+--- /dev/null
++++ b/patched/bitcoin/src/kernel/census.h
+@@ -0,0 +1,344 @@
++#ifndef BITCOIN_KERNEL_CENSUS_H
++#define BITCOIN_KERNEL_CENSUS_H
++
++// CHECKSIG census instrumentation for the bitcoin-rs experiment.
++// This header is included only by interpreter.cpp and bitcoinkernel.cpp,
++// both of which compile directly into the bitcoinkernel target.
++// No other TU references these symbols, so no CMake change is needed.
++
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// --- 22 atomic counters in fixed order ---
++enum CensusCounter : int {
++    C_VERIFY_SCRIPT_CALLS = 0,
++    C_FFI_VERIFY_ENTRIES,
++    C_FFI_VERIFY_TRUE,
++    C_EVAL_SCRIPT_ENTRIES,
++    C_OP_CHECKSIG,
++    C_OP_CHECKSIGVERIFY,
++    C_OP_CHECKMULTISIG,
++    C_OP_CHECKMULTISIGVERIFY,
++    C_OP_CHECKSIGADD,
++    C_CHECKECDSA_ENTRIES,
++    C_CHECKECDSA_REJECT_PUBKEY,
++    C_CHECKECDSA_REJECT_EMPTY_SIG,
++    C_CHECKECDSA_REJECT_MISSING_DATA,
++    C_ECDSA_VERIFY_CALLS,
++    C_ECDSA_VERIFY_OK,
++    C_ECDSA_VERIFY_FAIL,
++    C_ECDSA_FROM_CHECKSIG,
++    C_ECDSA_FROM_CHECKMULTISIG,
++    C_SIGHASH_COMPUTED,
++    C_SIGHASH_MIDSTATE_HIT,
++    C_CHECKSCHNORR_ENTRIES,
++    C_SCHNORR_VERIFY_CALLS,
++    C_CENSUS_COUNT // = 22
++};
++
++static constexpr size_t CENSUS_COUNTER_COUNT = 22;
++
++static constexpr const char* CENSUS_COUNTER_NAMES[CENSUS_COUNTER_COUNT] = {
++    "verify_script_calls",
++    "ffi_verify_entries",
++    "ffi_verify_true",
++    "eval_script_entries",
++    "op_checksig",
++    "op_checksigverify",
++    "op_checkmultisig",
++    "op_checkmultisigverify",
++    "op_checksigadd",
++    "checkecdsa_entries",
++    "checkecdsa_reject_pubkey",
++    "checkecdsa_reject_empty_sig",
++    "checkecdsa_reject_missing_data",
++    "ecdsa_verify_calls",
++    "ecdsa_verify_ok",
++    "ecdsa_verify_fail",
++    "ecdsa_from_checksig",
++    "ecdsa_from_checkmultisig",
++    "sighash_computed",
++    "sighash_midstate_hit",
++    "checkschnorr_entries",
++    "schnorr_verify_calls",
++};
++
++// --- Binary format constants ---
++static constexpr char RECORD_MAGIC[8] = {'B','R','S','R','E','C','1','\0'};
++static constexpr char JOURNAL_MAGIC[8] = {'B','R','S','J','R','N','1','\0'};
++
++// Record: 224 bytes packed
++struct CensusRecord {
++    uint8_t  spend_txid[32];  // 0
++    uint32_t input_index;     // 32
++    uint32_t op_seq;          // 36
++    uint8_t  op_kind;         // 40 (1=CHECKSIG,2=CHECKSIGVERIFY,3=CHECKMULTISIG,4=CHECKMULTISIGVERIFY,5=CHECKSIGADD)
++    uint8_t  sig_version;     // 41 (0=BASE,1=WITNESS_V0,2=TAPSCRIPT,3=TAPROOT)
++    uint8_t  outcome;         // 42 (0=false,1=true,2=pre-secp reject)
++    uint8_t  der_len;         // 43
++    uint8_t  pubkey_len;      // 44
++    uint8_t  sighash_type;    // 45
++    uint8_t  reject_reason;   // 46 (0=none,1=bad pubkey,2=empty sig,3=missing data)
++    uint8_t  _pad0;           // 47
++    uint8_t  sighash[32];     // 48
++    uint8_t  der_sig[72];     // 80  zero-padded
++    uint8_t  pubkey[65];      // 152 zero-padded
++    uint8_t  _pad1[7];        // 217
++};
++static_assert(sizeof(CensusRecord) == 224, "CensusRecord must be 224 bytes");
++
++// Journal: 56 bytes packed
++struct CensusJournal {
++    uint8_t  spend_txid[32];  // 0
++    uint32_t input_index;     // 32
++    uint32_t checksig_ops;    // 36
++    uint32_t checkmultisig_ops;// 40
++    uint32_t ecdsa_verify_calls;// 44
++    uint32_t ecdsa_verify_ok; // 48
++    uint8_t  verdict;         // 52
++    uint8_t  _pad[3];         // 53
++};
++static_assert(sizeof(CensusJournal) == 56, "CensusJournal must be 56 bytes");
++
++// --- Global counter array ---
++inline std::atomic<uint64_t>& census_counter(int idx) {
++    static std::atomic<uint64_t> counters[CENSUS_COUNTER_COUNT] = {};
++    return counters[idx];
++}
++
++inline void census_inc(int idx) {
++    census_counter(idx).fetch_add(1, std::memory_order_relaxed);
++}
++
++// --- Thread-local per-input state ---
++struct CensusThreadState {
++    uint8_t  spend_txid[32] = {};
++    uint32_t input_index = 0;
++    uint32_t op_seq = 0;
++    uint8_t  cur_op = 0; // 0=none,1=CHECKSIG,2=CHECKSIGVERIFY,3=CHECKMULTISIG,4=CHECKMULTISIGVERIFY,5=CHECKSIGADD
++    uint32_t checksig_ops = 0;
++    uint32_t checkmultisig_ops = 0;
++    uint32_t ecdsa_calls = 0;
++    uint32_t ecdsa_ok = 0;
++    bool active = false; // true between btck_script_pubkey_verify entry and exit
++};
++
++inline thread_local CensusThreadState tl_census;
++
++// --- Sink management ---
++// CensusSinks is heap-allocated only when at least one of
++// BRS_CENSUS_COUNTERS / JOURNAL / RECORDS is configured.  When all three
++// are unset (the timing fast path) no sink object, mutex, vector, or string
++// is ever constructed, and no atexit handler is registered.  BRS_CENSUS_LABEL
++// alone does not enable sinks.
++struct CensusSinks {
++    std::mutex mtx;
++    std::vector<CensusRecord> records;
++    std::vector<CensusJournal> journal;
++    std::string counters_path;
++    std::string journal_path;
++    std::string records_path;
++    std::string label;
++    bool has_records = false;
++    bool has_journal = false;
++    bool flushed = false;   // protected by mtx; set by flush, cleared by reset
++    int flush_result = 0;    // protected by mtx; nonzero after any sink failure
++};
++
++// Forward declaration — referenced by the atexit lambda in census_resolve_sinks.
++inline int census_flush();
++
++// Resolve env vars exactly once.  Returns a pointer to the heap-allocated
++// CensusSinks, or nullptr when no output path is configured.
++//
++// The first call may invoke getenv and call_once.  It does NOT construct a
++// mutex, vector, string-owning CensusSinks, allocate, register atexit, lock,
++// or write unless at least one of COUNTERS/JOURNAL/RECORDS is set.
++inline CensusSinks* census_resolve_sinks() {
++    static std::once_flag flag;
++    static CensusSinks* sinks = nullptr;
++    std::call_once(flag, []() {
++        const char* counters = std::getenv("BRS_CENSUS_COUNTERS");
++        const char* journal  = std::getenv("BRS_CENSUS_JOURNAL");
++        const char* records  = std::getenv("BRS_CENSUS_RECORDS");
++        const char* label    = std::getenv("BRS_CENSUS_LABEL");
++
++        // Label alone does not enable sinks.
++        if (!counters && !journal && !records) return;
++
++        CensusSinks* s = new CensusSinks();
++        if (counters) s->counters_path = counters;
++        if (journal)  { s->journal_path = journal;  s->has_journal = true; }
++        if (records)  { s->records_path = records;  s->has_records = true; }
++        if (label)    s->label = label;
++
++        sinks = s;
++        std::atexit([]() {
++            if (census_flush() != 0) std::_Exit(EXIT_FAILURE);
++        });
++    });
++    return sinks;
++}
++
++// --- Flush: zero-argument, idempotent, race-free ---
++// Writes counters JSON, journal binary, and records binary to the configured
++// paths. Flush is a shutdown-only operation. Holding the sink mutex through
++// I/O makes concurrent flush/reset/emit calls observe one final result.
++inline int census_flush() {
++    CensusSinks* sp = census_resolve_sinks();
++    if (!sp) return 0;
++
++    std::lock_guard<std::mutex> lock(sp->mtx);
++    if (sp->flushed) return sp->flush_result;
++    sp->flushed = true;
++    sp->flush_result = 1;
++
++    bool failed = false;
++    auto close_file = [&failed](FILE* f) {
++        const bool stream_error = std::ferror(f) != 0;
++        const bool close_error = std::fclose(f) != 0;
++        if (stream_error || close_error) failed = true;
++    };
++    auto write_items = [&failed](FILE* f, const void* data, size_t size, size_t count) {
++        if (count != 0 && std::fwrite(data, size, count, f) != count) failed = true;
++    };
++
++    if (!sp->counters_path.empty()) {
++        FILE* f = std::fopen(sp->counters_path.c_str(), "wb");
++        if (!f) {
++            failed = true;
++        } else {
++            if (std::fprintf(f, "{\"schema\":1,\"label\":\"%s\"", sp->label.c_str()) < 0) {
++                failed = true;
++            }
++            for (size_t i = 0; i < CENSUS_COUNTER_COUNT; i++) {
++                if (std::fprintf(f, ",\"%s\":%llu",
++                        CENSUS_COUNTER_NAMES[i],
++                        (unsigned long long)census_counter((int)i).load(std::memory_order_relaxed)) < 0) {
++                    failed = true;
++                }
++            }
++            if (std::fprintf(f, ",\"record_count\":%llu,\"journal_count\":%llu}\n",
++                    (unsigned long long)sp->records.size(),
++                    (unsigned long long)sp->journal.size()) < 0) {
++                failed = true;
++            }
++            close_file(f);
++        }
++    }
++
++    if (sp->has_journal && !sp->journal_path.empty()) {
++        FILE* f = std::fopen(sp->journal_path.c_str(), "wb");
++        if (!f) {
++            failed = true;
++        } else {
++            const uint64_t count = sp->journal.size();
++            write_items(f, JOURNAL_MAGIC, 1, sizeof(JOURNAL_MAGIC));
++            write_items(f, &count, sizeof(count), 1);
++            write_items(f, sp->journal.data(), sizeof(CensusJournal), sp->journal.size());
++            close_file(f);
++        }
++    }
++
++    if (sp->has_records && !sp->records_path.empty()) {
++        FILE* f = std::fopen(sp->records_path.c_str(), "wb");
++        if (!f) {
++            failed = true;
++        } else {
++            const uint64_t count = sp->records.size();
++            write_items(f, RECORD_MAGIC, 1, sizeof(RECORD_MAGIC));
++            write_items(f, &count, sizeof(count), 1);
++            write_items(f, sp->records.data(), sizeof(CensusRecord), sp->records.size());
++            close_file(f);
++        }
++    }
++
++    sp->flush_result = failed ? 1 : 0;
++    return sp->flush_result;
++}
++
++// --- Helper functions called from bitcoinkernel.cpp ---
++
++// Quiescent-only: reset all counters and clear sink vectors.
++inline void census_reset() {
++    for (size_t i = 0; i < CENSUS_COUNTER_COUNT; i++) {
++        census_counter((int)i).store(0, std::memory_order_relaxed);
++    }
++    CensusSinks* sp = census_resolve_sinks();
++    if (!sp) return;
++    std::lock_guard<std::mutex> lock(sp->mtx);
++    sp->records.clear();
++    sp->journal.clear();
++    sp->flushed = false;   // allow a subsequent flush after reset
++    sp->flush_result = 0;
++}
++
++// Returns the fixed counter count (22).  Counter values are obtained
++// exclusively through census_snapshot.
++inline size_t census_counter_count() {
++    return CENSUS_COUNTER_COUNT;
++}
++
++inline void census_snapshot(uint64_t* out_counters, size_t counter_count) {
++    size_t n = counter_count < CENSUS_COUNTER_COUNT ? counter_count : CENSUS_COUNTER_COUNT;
++    for (size_t i = 0; i < n; i++) {
++        out_counters[i] = census_counter((int)i).load(std::memory_order_relaxed);
++    }
++}
++
++// --- Record emission helpers (called from interpreter.cpp) ---
++inline void census_emit_record(uint8_t op_kind, uint8_t sig_version, uint8_t outcome,
++                                uint8_t der_len, uint8_t pubkey_len, uint8_t sighash_type,
++                                uint8_t reject_reason,
++                                const uint8_t* sighash, // 32 bytes or null
++                                const uint8_t* der_sig,  // der_len bytes or null
++                                const uint8_t* pubkey)   // pubkey_len bytes or null
++{
++    CensusSinks* sp = census_resolve_sinks();
++    if (!sp || !sp->has_records) return;
++
++    CensusRecord rec{};
++    std::memcpy(rec.spend_txid, tl_census.spend_txid, 32);
++    rec.input_index = tl_census.input_index;
++    rec.op_seq = tl_census.op_seq++;
++    rec.op_kind = op_kind;
++    rec.sig_version = sig_version;
++    rec.outcome = outcome;
++    rec.der_len = der_len;
++    rec.pubkey_len = pubkey_len;
++    rec.sighash_type = sighash_type;
++    rec.reject_reason = reject_reason;
++    if (sighash && outcome != 2) std::memcpy(rec.sighash, sighash, 32);
++    if (der_sig && der_len > 0) std::memcpy(rec.der_sig, der_sig, der_len > 72 ? 72 : der_len);
++    if (pubkey && pubkey_len > 0) std::memcpy(rec.pubkey, pubkey, pubkey_len > 65 ? 65 : pubkey_len);
++
++    std::lock_guard<std::mutex> lock(sp->mtx);
++    if (sp->flushed) return;   // skip after flush — no post-snapshot record lost
++    sp->records.push_back(rec);
++}
++
++inline void census_emit_journal(bool verdict) {
++    CensusSinks* sp = census_resolve_sinks();
++    if (!sp || !sp->has_journal) return;
++
++    CensusJournal j{};
++    std::memcpy(j.spend_txid, tl_census.spend_txid, 32);
++    j.input_index = tl_census.input_index;
++    j.checksig_ops = tl_census.checksig_ops;
++    j.checkmultisig_ops = tl_census.checkmultisig_ops;
++    j.ecdsa_verify_calls = tl_census.ecdsa_calls;
++    j.ecdsa_verify_ok = tl_census.ecdsa_ok;
++    j.verdict = verdict ? 1 : 0;
++
++    std::lock_guard<std::mutex> lock(sp->mtx);
++    if (sp->flushed) return;   // skip after flush — no post-snapshot record lost
++    sp->journal.push_back(j);
++}
++
++#endif // BITCOIN_KERNEL_CENSUS_H
+diff --git a/pristine/bitcoin/src/script/interpreter.cpp b/patched/bitcoin/src/script/interpreter.cpp
+index 443714c..a185230 100644
+--- a/pristine/bitcoin/src/script/interpreter.cpp
++++ b/patched/bitcoin/src/script/interpreter.cpp
+@@ -1,16 +1,17 @@
+ // Copyright (c) 2009-2010 Satoshi Nakamoto
+ // Copyright (c) 2009-present The Bitcoin Core developers
+ // Distributed under the MIT software license, see the accompanying
+ // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+ 
+ #include <script/interpreter.h>
++#include <kernel/census.h>
+ 
+ #include <crypto/ripemd160.h>
+ #include <crypto/sha1.h>
+ #include <crypto/sha256.h>
+ #include <pubkey.h>
+ #include <script/script.h>
+ #include <tinyformat.h>
+ #include <uint256.h>
+ 
+ typedef std::vector<unsigned char> valtype;
+@@ -399,20 +400,21 @@ static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::con
+         return EvalChecksigTapscript(sig, pubkey, execdata, flags, checker, sigversion, serror, success);
+     case SigVersion::TAPROOT:
+         // Key path spending in Taproot has no script, so this is unreachable.
+         break;
+     }
+     assert(false);
+ }
+ 
+ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror)
+ {
++    census_inc(C_EVAL_SCRIPT_ENTRIES);
+     static const CScriptNum bnZero(0);
+     static const CScriptNum bnOne(1);
+     // static const CScriptNum bnFalse(0);
+     // static const CScriptNum bnTrue(1);
+     static const valtype vchFalse(0);
+     // static const valtype vchZero(0);
+     static const valtype vchTrue(1, 1);
+ 
+     // sigversion cannot be TAPROOT here, as it admits no script execution.
+     assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPSCRIPT);
+@@ -1052,66 +1054,79 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&
+ 
+                     // Hash starts after the code separator
+                     pbegincodehash = pc;
+                     execdata.m_codeseparator_pos = opcode_pos;
+                 }
+                 break;
+ 
+                 case OP_CHECKSIG:
+                 case OP_CHECKSIGVERIFY:
+                 {
++                    // I5: census CHECKSIG/CHECKSIGVERIFY
++                    tl_census.cur_op = (opcode == OP_CHECKSIG) ? 1 : 2;
++                    ++tl_census.checksig_ops;
++                    census_inc(opcode == OP_CHECKSIG ? C_OP_CHECKSIG : C_OP_CHECKSIGVERIFY);
+                     // (sig pubkey -- bool)
+                     if (stack.size() < 2)
+                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+ 
+                     valtype& vchSig    = stacktop(-2);
+                     valtype& vchPubKey = stacktop(-1);
+ 
+                     bool fSuccess = true;
+                     if (!EvalChecksig(vchSig, vchPubKey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, fSuccess)) return false;
++                    tl_census.cur_op = 0;
+                     popstack(stack);
+                     popstack(stack);
+                     stack.push_back(fSuccess ? vchTrue : vchFalse);
+                     if (opcode == OP_CHECKSIGVERIFY)
+                     {
+                         if (fSuccess)
+                             popstack(stack);
+                         else
+                             return set_error(serror, SCRIPT_ERR_CHECKSIGVERIFY);
+                     }
+                 }
+                 break;
+ 
+                 case OP_CHECKSIGADD:
+                 {
++                    // I7: census CHECKSIGADD
++                    tl_census.cur_op = 5;
++                    census_inc(C_OP_CHECKSIGADD);
+                     // OP_CHECKSIGADD is only available in Tapscript
+                     if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+ 
+                     // (sig num pubkey -- num)
+                     if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+ 
+                     const valtype& sig = stacktop(-3);
+                     const CScriptNum num(stacktop(-2), fRequireMinimal);
+                     const valtype& pubkey = stacktop(-1);
+ 
+                     bool success = true;
+                     if (!EvalChecksig(sig, pubkey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, success)) return false;
++                    tl_census.cur_op = 0;
+                     popstack(stack);
+                     popstack(stack);
+                     popstack(stack);
+                     stack.push_back((num + (success ? 1 : 0)).getvch());
+                 }
+                 break;
+ 
+                 case OP_CHECKMULTISIG:
+                 case OP_CHECKMULTISIGVERIFY:
+                 {
++                    // I6: census CHECKMULTISIG/CHECKMULTISIGVERIFY
++                    tl_census.cur_op = (opcode == OP_CHECKMULTISIG) ? 3 : 4;
++                    ++tl_census.checkmultisig_ops;
++                    census_inc(opcode == OP_CHECKMULTISIG ? C_OP_CHECKMULTISIG : C_OP_CHECKMULTISIGVERIFY);
+                     if (sigversion == SigVersion::TAPSCRIPT) return set_error(serror, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
+ 
+                     // ([sig ...] num_of_signatures [pubkey ...] num_of_pubkeys -- bool)
+ 
+                     int i = 1;
+                     if ((int)stack.size() < i)
+                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+ 
+                     int nKeysCount = CScriptNum(stacktop(-i), fRequireMinimal).getint();
+                     if (nKeysCount < 0 || nKeysCount > MAX_PUBKEYS_PER_MULTISIG)
+@@ -1172,20 +1187,22 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript&
+                         }
+                         ikey++;
+                         nKeysCount--;
+ 
+                         // If there are more signatures left than keys left,
+                         // then too many signatures have failed. Exit early,
+                         // without checking any further signatures.
+                         if (nSigsCount > nKeysCount)
+                             fSuccess = false;
+                     }
++                    tl_census.cur_op = 0;
++
+ 
+                     // Clean up stack of actual arguments
+                     while (i-- > 1) {
+                         // If the operation failed, we require that all signatures must be empty vector
+                         if (!fSuccess && (flags & SCRIPT_VERIFY_NULLFAIL) && !ikey2 && stacktop(-1).size())
+                             return set_error(serror, SCRIPT_ERR_SIG_NULLFAIL);
+                         if (ikey2 > 0)
+                             ikey2--;
+                         popstack(stack);
+                     }
+@@ -1577,20 +1594,21 @@ int SigHashCache::CacheIndex(int32_t hash_type) const noexcept
+            2 * ((hash_type & 0x1f) == SIGHASH_SINGLE) +
+            1 * ((hash_type & 0x1f) == SIGHASH_NONE);
+ }
+ 
+ bool SigHashCache::Load(int32_t hash_type, const CScript& script_code, HashWriter& writer) const noexcept
+ {
+     auto& entry = m_cache_entries[CacheIndex(hash_type)];
+     if (entry.has_value()) {
+         if (script_code == entry->first) {
+             writer = HashWriter(entry->second);
++            census_inc(C_SIGHASH_MIDSTATE_HIT);
+             return true;
+         }
+     }
+     return false;
+ }
+ 
+ void SigHashCache::Store(int32_t hash_type, const CScript& script_code, const HashWriter& writer) noexcept
+ {
+     auto& entry = m_cache_entries[CacheIndex(hash_type)];
+     entry.emplace(script_code, writer);
+@@ -1678,51 +1696,96 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
+ 
+ template <class T>
+ bool GenericTransactionSignatureChecker<T>::VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& pubkey, const uint256& sighash) const
+ {
+     return pubkey.Verify(sighash, vchSig);
+ }
+ 
+ template <class T>
+ bool GenericTransactionSignatureChecker<T>::VerifySchnorrSignature(std::span<const unsigned char> sig, const XOnlyPubKey& pubkey, const uint256& sighash) const
+ {
++    census_inc(C_SCHNORR_VERIFY_CALLS);
+     return pubkey.VerifySchnorr(sighash, sig);
+ }
+ 
+ template <class T>
+ bool GenericTransactionSignatureChecker<T>::CheckECDSASignature(const std::vector<unsigned char>& vchSigIn, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const
+ {
++    // I8: census CheckECDSASignature entry
++    census_inc(C_CHECKECDSA_ENTRIES);
++    if (tl_census.cur_op == 1 || tl_census.cur_op == 2) {
++        census_inc(C_ECDSA_FROM_CHECKSIG);
++    } else if (tl_census.cur_op == 3 || tl_census.cur_op == 4) {
++        census_inc(C_ECDSA_FROM_CHECKMULTISIG);
++    }
++
++    // Map SigVersion to byte for record
++    uint8_t sig_ver_byte = 0;
++    if (sigversion == SigVersion::WITNESS_V0) sig_ver_byte = 1;
++    else if (sigversion == SigVersion::TAPSCRIPT) sig_ver_byte = 2;
++    else if (sigversion == SigVersion::TAPROOT) sig_ver_byte = 3;
++
+     CPubKey pubkey(vchPubKey);
+-    if (!pubkey.IsValid())
++    if (!pubkey.IsValid()) {
++        // I9: reject bad pubkey
++        census_inc(C_CHECKECDSA_REJECT_PUBKEY);
++        census_emit_record(tl_census.cur_op, sig_ver_byte, 2, 0, (uint8_t)vchPubKey.size(), 0, 1, nullptr, nullptr, nullptr);
+         return false;
++    }
+ 
+     // Hash type is one byte tacked on to the end of the signature
+     std::vector<unsigned char> vchSig(vchSigIn);
+-    if (vchSig.empty())
++    if (vchSig.empty()) {
++        // I9: reject empty sig
++        census_inc(C_CHECKECDSA_REJECT_EMPTY_SIG);
++        census_emit_record(tl_census.cur_op, sig_ver_byte, 2, 0, (uint8_t)vchPubKey.size(), 0, 2, nullptr, nullptr, vchPubKey.data());
+         return false;
++    }
+     int nHashType = vchSig.back();
+     vchSig.pop_back();
+ 
+     // Witness sighashes need the amount.
+-    if (sigversion == SigVersion::WITNESS_V0 && amount < 0) return HandleMissingData(m_mdb);
++    if (sigversion == SigVersion::WITNESS_V0 && amount < 0) {
++        // I9: reject missing data
++        census_inc(C_CHECKECDSA_REJECT_MISSING_DATA);
++        census_emit_record(tl_census.cur_op, sig_ver_byte, 2, (uint8_t)vchSig.size(), (uint8_t)vchPubKey.size(), (uint8_t)nHashType, 3, nullptr, vchSig.data(), vchPubKey.data());
++        return HandleMissingData(m_mdb);
++    }
+ 
++    // I10: sighash computed
++    census_inc(C_SIGHASH_COMPUTED);
+     uint256 sighash = SignatureHash(scriptCode, *txTo, nIn, nHashType, amount, sigversion, this->txdata, &m_sighash_cache);
+ 
+-    if (!VerifyECDSASignature(vchSig, pubkey, sighash))
++    // I11: around VerifyECDSASignature
++    bool ecdsa_ok = VerifyECDSASignature(vchSig, pubkey, sighash);
++    census_inc(C_ECDSA_VERIFY_CALLS);
++    ++tl_census.ecdsa_calls;
++    if (ecdsa_ok) {
++        census_inc(C_ECDSA_VERIFY_OK);
++        ++tl_census.ecdsa_ok;
++    } else {
++        census_inc(C_ECDSA_VERIFY_FAIL);
++    }
++    census_emit_record(tl_census.cur_op, sig_ver_byte, ecdsa_ok ? 1 : 0,
++        (uint8_t)vchSig.size(), (uint8_t)vchPubKey.size(), (uint8_t)nHashType, 0,
++        sighash.begin(), vchSig.data(), vchPubKey.data());
++
++    if (!ecdsa_ok)
+         return false;
+ 
+     return true;
+ }
+ 
+ template <class T>
+ bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey_in, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const
+ {
++    census_inc(C_CHECKSCHNORR_ENTRIES);
+     assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
+     // Schnorr signatures have 32-byte public keys. The caller is responsible for enforcing this.
+     assert(pubkey_in.size() == 32);
+     // Note that in Tapscript evaluation, empty signatures are treated specially (invalid signature that does not
+     // abort script execution). This is implemented in EvalChecksigTapscript, which won't invoke
+     // CheckSchnorrSignature in that case. In other contexts, they are invalid like every other signature with
+     // size different from 64 or 65.
+     if (sig.size() != 64 && sig.size() != 65) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG_SIZE);
+ 
+     XOnlyPubKey pubkey{pubkey_in};
+@@ -1994,20 +2057,21 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion,
+             return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
+         }
+         // Other version/size/p2sh combinations return true for future softfork compatibility
+         return true;
+     }
+     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
+ }
+ 
+ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror)
+ {
++    census_inc(C_VERIFY_SCRIPT_CALLS);
+     static const CScriptWitness emptyWitness;
+     if (witness == nullptr) {
+         witness = &emptyWitness;
+     }
+     bool hadWitness = false;
+ 
+     set_error(serror, SCRIPT_ERR_UNKNOWN_ERROR);
+ 
+     if ((flags & SCRIPT_VERIFY_SIGPUSHONLY) != 0 && !scriptSig.IsPushOnly()) {
+         return set_error(serror, SCRIPT_ERR_SIG_PUSHONLY);
+diff --git a/pristine/src/lib.rs b/patched/src/lib.rs
+index 96175be..eead168 100644
+--- a/pristine/src/lib.rs
++++ b/patched/src/lib.rs
+@@ -191,20 +191,42 @@ pub struct btck_TransactionOutput {
+ }
+ #[repr(C)]
+ pub struct btck_TransactionSpentOutputs {
+     _unused: [u8; 0],
+ }
+ #[repr(C)]
+ pub struct btck_Txid {
+     _unused: [u8; 0],
+ }
+ 
++// Census bare-verify benchmark types
++#[repr(C)]
++pub struct btck_bare_input {
++    pub sighash: [u8; 32],
++    pub der_sig: [u8; 72],
++    pub pubkey: [u8; 65],
++    pub der_len: u8,
++    pub pubkey_len: u8,
++    pub expected: u8,
++    pub pad: [u8; 4],
++}
++
++#[repr(C)]
++pub struct btck_bare_result {
++    pub attempts: u64,
++    pub rounds: u64,
++    pub mismatches: u64,
++    pub first_mismatch: u64,
++    pub ok_count: u64,
++    pub round_ns: [u64; 64],
++}
++
+ // Function-pointer type aliases - alphabetical order
+ 
+ pub type btck_DestroyCallback = Option<unsafe extern "C" fn(user_data: *mut c_void)>;
+ 
+ pub type btck_LogCallback = Option<
+     unsafe extern "C" fn(user_data: *mut c_void, message: *const c_char, message_len: usize),
+ >;
+ 
+ pub type btck_NotifyBlockTip = Option<
+     unsafe extern "C" fn(
+@@ -824,11 +846,26 @@ extern "C" {
+ 
+     pub fn btck_block_header_get_nonce(header: *const btck_BlockHeader) -> u32;
+ 
+     pub fn btck_block_header_to_bytes(
+         header: *const btck_BlockHeader,
+         output: *mut c_uchar,
+     ) -> c_int;
+ 
+     pub fn btck_block_header_destroy(header: *mut btck_BlockHeader);
+ 
++    // === Census API ===
++    pub fn btck_census_reset();
++    pub fn btck_census_counter_count() -> usize;
++    pub fn btck_census_snapshot(out_counters: *mut u64, counter_count: usize);
++    pub fn btck_census_flush() -> c_int;
++    pub fn btck_bare_verify_bench(
++        inputs: *const btck_bare_input,
++        count: u64,
++        warmup_rounds: u32,
++        timed_rounds: u32,
++        mode: u32,
++        result: *mut btck_bare_result,
++    ) -> c_int;
++
++
+ } // extern "C"
