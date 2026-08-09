@@ -26,6 +26,17 @@ use crate::set::{UndoBatch, UtxoAdd};
 /// Current undo-record format version.
 pub const UNDO_FORMAT_VERSION: u8 = 1;
 
+#[cfg(test)]
+const VERSION_BYTES: usize = 1;
+#[cfg(test)]
+const BLOCK_HASH_BYTES: usize = 32;
+#[cfg(test)]
+const COUNT_BYTES: usize = core::mem::size_of::<u32>();
+#[cfg(test)]
+const RESTORE_COUNT_OFFSET: usize = VERSION_BYTES + BLOCK_HASH_BYTES;
+#[cfg(test)]
+const RESTORE_TRAILER_BYTES: usize = 1 + core::mem::size_of::<u32>() + COUNT_BYTES;
+
 /// Errors returned when decoding an undo record.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum UndoCodecError {
@@ -287,7 +298,10 @@ impl<'a> Cursor<'a> {
 mod tests {
     use bitcoin::{Amount, ScriptBuf};
 
-    use super::{UNDO_FORMAT_VERSION, UndoCodecError, UtxoAdd, decode, encode};
+    use super::{
+        COUNT_BYTES, RESTORE_COUNT_OFFSET, RESTORE_TRAILER_BYTES, UNDO_FORMAT_VERSION,
+        UndoCodecError, UtxoAdd, decode, encode,
+    };
     use crate::set::UndoBatch;
     use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 
@@ -389,7 +403,8 @@ mod tests {
     fn an_impossible_entry_count_is_refused_without_looping() {
         let mut bytes = encode(&UndoBatch::default(), hash(1));
         // Overwrite the restore count with a value no record could hold.
-        bytes[33..37].copy_from_slice(&u32::MAX.to_le_bytes());
+        let count = RESTORE_COUNT_OFFSET..RESTORE_COUNT_OFFSET + COUNT_BYTES;
+        bytes[count].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             decode(&bytes, hash(1)),
             Err(UndoCodecError::CountTooLarge { .. })
@@ -401,8 +416,7 @@ mod tests {
         let mut batch = UndoBatch::default();
         batch.restore(UtxoAdd::new(OutPoint::new(hash(1), 0), txout(10), false, 5));
         let mut bytes = encode(&batch, hash(1));
-        // Tail layout after the TxOut: coinbase(1) height(4) remove_count(4).
-        let flag = bytes.len() - 9;
+        let flag = bytes.len() - RESTORE_TRAILER_BYTES;
         bytes[flag] = 2;
         assert!(matches!(
             decode(&bytes, hash(1)),

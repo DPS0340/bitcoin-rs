@@ -25,35 +25,36 @@ tags:
 
 ## Status
 
-**Layers 1-2 implemented. Layer 3 is a primitive with no caller. Layer 4 not
-started.**
+**Live branch switching is implemented and called from sync. Crash replay remains
+open.**
 
-Done, all in `crates/node/src/apply.rs` unless noted:
+Done:
 
 * `ColumnFamily::UndoData` across all four backends, and a versioned undo codec
   bound to the block hash (`crates/utxo/src/undo_codec.rs`).
-* Undo generation in the same pass as the forward UTXO changes, so the two
-  cannot drift. `UndoStore` is a mandatory handle, not an `Option`, and the
-  record is written before the block body, the index, and the UTXO commit.
+* Undo generation in the same pass as the forward UTXO changes. The undo write
+  is queued before the block body, the index, and the UTXO commit. A clean
+  checkpoint makes the queued record durable.
 * `disconnect_block`, which restores the UTXO set, the transaction index, and
-  `applied_tip`. Its four ordering claims are mutation-verified.
-* The index half: `IndexerLike::rollback_block` exists, is tested, and refuses
-  by default rather than reporting a false success.
+  `applied_tip`. Its ordering claims are mutation-verified.
+* `switch_to_branch` (`crates/node/src/reorg.rs`), called by sync when the
+  best-work header branch outweighs the applied branch. It preloads every body,
+  takes one admission-and-transition witness, recomputes the plan under that
+  guard, and mutates only when the ordered plan is unchanged. Every loaded
+  block and its preserved bytes are bound to the planned hash before the first
+  disconnect. Body lookup uses bounded staging, durable storage, then the
+  applied in-memory body cache as a no-store fallback. Committed new-branch
+  blocks release staging and download-window accounting.
+* Fork-aware download requests start at the common ancestor's child. A target
+  change discards pending ownership from the losing branch.
+* A fatal disconnect closes apply admission and sets the process shutdown token.
+  The durable marker prevents a restart on torn state.
 
-Not done: `bitcoin_rs_chain::plan_reorg` still has no production caller, and
-`bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs` is still `#[ignore]`d.
-
-`disconnect_block` also has no production caller, deliberately. The derived
-state connection touches is now accounted for and the answers were not uniform:
-`coin_stats` needed an explicit inverse for its block-level fields only, the
-filter index needed no rollback because its rows are hash-addressed, the
-`blocks` RPC cache needed an opportunistic pop, and `transactions` needed
-nothing because connection never populates it. What still blocks wiring is
-recovery and routing, not derived state: the durable poison marker, returning a
-disconnected block's transactions to the mempool, publishing a disconnect
-notification, backfilling the filter index after a gap, and routing a block that
-extends a known side branch. The function's own doc comment carries the same
-table.
+Still open: transaction reconsideration, disconnect notification, filter-index
+backfill, real crash replay, and the ignored live `g10_reorg_deep` gate.
+Transaction reconsideration requires one production admission pipeline shared
+by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
+the required fee, policy, conflict, and ancestry metadata.
 
 ## Why it matters
 
@@ -75,35 +76,18 @@ not reach for a single mechanism.
 
 Consequences:
 
-1. **Undo records serve live reorgs, not crash recovery.** A crash cannot leave
-   a half-applied UTXO undo, because the in-memory set does not survive the
-   crash at all.
-
-   An earlier version of this note said recovery is checkpoint-plus-replay.
-   Only the checkpoint half exists. `run.rs` does call `recover_if_needed`, but
-   nothing in production ever writes the metadata it reads. Two functions can
-   write it, `crash_recovery::set_last_committed_height` and
-   `NodeState::record_synthetic_block_for_recovery`, and neither has a
-   production caller; the second's own doc calls it a test helper. So on a
-   normal boot `read_meta` finds no sidecar and the fresh-node path is taken.
-   Nothing in block connection fsyncs either.
-
-   Note what this does NOT mean. The two halves do not fail together, for the
-   reason this whole section exists: the undo record is a journaled KV write
-   and the UTXO set is RAM behind periodic checkpoints. A crash can leave a
-   durable undo record for a UTXO commit that vanished, or a checkpointed UTXO
-   commit whose undo record was still in the journal. Rolling either forward
-   needs the replay that is not wired. Tracked below.
-2. **Whether a durable phase marker is needed is undecided.** An earlier draft
-   specified one and a later draft called it unnecessary, reasoning that the
-   in-memory set discards uncommitted mutation on a crash so the two halves
-   cannot disagree. The paragraph above refutes that: a checkpoint can retain a
-   UTXO commit whose undo record was lost with the journal, which is exactly
-   the mismatch a durable boundary would detect. Neither draft settled it.
-   Decide it with the recovery protocol, not before.
-3. **Index rollback must be one atomic write batch.** A partial index rollback
-   does survive a crash, and no marker helps because the crash lands inside the
-   phase. This is already implemented that way.
+1. **Undo records serve live reorgs, not per-block crash recovery.** Connection
+   queues each record before later apply mutations. The backend write is
+   deferred. A clean checkpoint flushes block and index storage, publishes the
+   matching UTXO state, and then advances the durable horizon. The record is not
+   a per-block fsync boundary.
+2. **The durable disconnect marker is implemented.** `InFlight` is flushed
+   before the first rollback mutation. A completed rollback changes the marker
+   to `RolledBack`; only a clean checkpoint can clear it after publication. A
+   checkpoint refuses `InFlight`, and startup refuses either phase. The marker
+   prevents service on inconsistent state. It does not repair that state.
+3. **Index rollback is one atomic write batch.** A partial index rollback can
+   survive a crash, so one batch is the required boundary.
 
 ## Disconnect order
 
@@ -149,39 +133,34 @@ Done:
 | `ColumnFamily::UndoData` | enum, its `ALL` list, and all four backends |
 | Versioned undo codec | first byte a format version; keyed by height **and** block hash, with 10 rejection tests |
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
-| Persistence | before the block body, the index, and the UTXO commit; ordering mutation-verified |
+| Persistence | queued before the block body, index, and UTXO commit; flushed with a clean checkpoint, not per block |
 | `disconnect_block` | restores UTXO, index, and tip, in that order, all four orderings mutation-verified |
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
 | `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
 | Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first mutation and above the index rollback; startup refuses while it is set. See *Disconnect marker phase* in `CONCEPTS.md` |
-| Chain-transition serialization | an exclusive lock spanning read-decide-mutate-publish for connects, windows, and disconnects, held across `plan_disconnect`. `ApplyAdmission::enter` is a shutdown barrier taking a READ guard and serialized nothing |
+| Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. A branch switch holds one witness across authoritative replanning and the complete disconnect-and-connect walk. |
+| Branch switching | `switch_to_branch` preloads optimistically, recomputes the exact ordered `plan_reorg` result under the transition guard, and retries without mutation if the plan changed. A shorter branch is eligible when its accumulated work is greater. |
+| Body acquisition | fork requests start at the common ancestor's child; every body is loaded from bounded staging, durable storage, then the applied body cache as a no-store fallback before disconnect begins. Header hash and preserved bytes must match the planned node. Each committed connect retires its exact staging and download-window entry, including a prefix committed before a later connect fails. |
+| Fatal lifecycle | `Fatal` and `MarkerStuck` close apply admission while the transition lock is held; sync sets the shared process shutdown token |
 
-Open, and prerequisites for giving `disconnect_block` a caller:
+Open:
 
 | Piece | Notes |
 |---|---|
-| Mempool reconsideration | a disconnected block's transactions belong back in the mempool |
+| Mempool reconsideration | Block transactions need the same production admission pipeline as Electrum and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
 | Disconnect notification | ZMQ publishes connects; disconnects are silent |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
-| Side-branch routing | a block extending a known side branch is rejected with no distinguishable error, so no caller can route it to a reorg |
-| Partial-transition gating | **Retry is ruled out** and the durable half is now built: a phased marker is armed before mutation and startup refuses while it is set, so a restart no longer clears the poison. What remains is reach — the refusal is at node startup, so RPC, P2P and Electrum are gated only by the node failing to start, not by an in-process check. A running node that hits `Fatal` keeps serving until it is restarted |
+| Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
+| Un-ignore `g10_reorg_deep` | prove the full path against `bitcoind` regtest |
 
-Open, layer 4:
-
-| Piece | Notes |
-|---|---|
-| `crates/node/src/reorg.rs` | switch branches via `plan_reorg` |
-| Apply-path routing | keep rejecting a non-extending block, but with a distinguishable error naming the known-side-branch case so the caller can route to reorg. Deleting the rejection outright corrupts the UTXO set |
-| Failure handling | attempt a compensating rollback; if that also fails, poison the apply path and refuse further blocks rather than serving a chain the node cannot describe. Refuse cleanly, never panic mid-write |
-| Real crash replay | `crash_recovery` has no production writer today, so its watermark records nothing and regenerates nothing. This is also what leaves the checkpoint skew open: a disconnect makes the index rollback durable immediately while the UTXO set and tip wait for a checkpoint, so the marker is held until that checkpoint rather than cleared when the disconnect returns |
-| Un-ignore `g10_reorg_deep` | prove against `bitcoind` regtest |
-
-Absolute "a failed reorg leaves the original tip" is not achievable, because the
-compensating rollback can itself fail. The honest contract is: attempt it, and
-on failure stop applying blocks with an operator-facing message naming the block
-hash and height where it wedged.
+Body-load failures occur before mutation. A refused disconnect can leave a
+shorter coherent applied chain when earlier disconnects completed. A connect
+failure leaves a coherent prefix of the target branch. The node does not run a
+compensating rollback because that second rollback can turn a recoverable stop
+into a fatal one. `Fatal` and `MarkerStuck` stop further mutation and trigger the
+normal shutdown path.
 
 ## Guidance
 
@@ -192,11 +171,10 @@ hash and height where it wedged.
    it was wishful: it assumed each step either happens or does not, which the
    shard-walking UTXO commit does not honour.
 2. **Do not add a mechanism whose failure mode cannot occur, and do not assume a
-   failure mode cannot occur because one store is in RAM.** The phase marker was
-   called a mistake on that reasoning. It is not settled: a checkpoint can
-   retain a UTXO commit whose undo record was lost with the journal, and a
-   durable boundary is one way to detect that. Decide it with the recovery
-   protocol.
+   failure mode cannot occur because one store is in RAM.** The phase marker is
+   the durable boundary for disconnect. Keep `InFlight` until rollback completes,
+   keep `RolledBack` until a clean checkpoint is durable, and refuse to clear an
+   incomplete operation.
 3. **A trait default that returns success is a silent-corruption path.** When a
    consumer must participate in rollback, make the default refuse. See
    `IndexError::UnsupportedRollback`.

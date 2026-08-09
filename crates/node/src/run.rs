@@ -582,7 +582,7 @@ pub fn run(mut config: Config) -> Result<()> {
         rx
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = state.shutdown();
     let banned = state.banned_subnets();
     let block_body_source = state.block_body_source();
     let p2p_chain_query: P2pChainQuery = Arc::new(

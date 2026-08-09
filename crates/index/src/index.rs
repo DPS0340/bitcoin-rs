@@ -506,7 +506,36 @@ impl<S: KvStore> Indexer<S> {
             .iter()
             .map(bitcoin::Transaction::compute_txid)
             .collect();
-        let mut rows = pending_rows_for_decoded_block(block, height, &txids)?;
+        self.rollback_block_inner(block, height, &txids)
+    }
+
+    /// Same as [`Self::rollback_block`] but reuses caller-verified transaction
+    /// IDs, avoiding a second pass of `compute_txid` when the caller has
+    /// already computed them for merkle verification.
+    ///
+    /// Falls back to [`Self::rollback_block`] when the supplied txid count
+    /// does not match the block's transaction count, preserving semantics for
+    /// mismatched input.
+    pub fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        if txids.len() != block.txdata.len() {
+            return self.rollback_block(block, height);
+        }
+        self.rollback_block_inner(block, height, txids)
+    }
+
+    fn rollback_block_inner(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let mut rows = pending_rows_for_decoded_block(block, height, txids)?;
         rows.sort();
         let counts = rows.counts();
 
@@ -537,7 +566,6 @@ impl<S: KvStore> Indexer<S> {
             None => false,
         };
         if !identity_present {
-            self.last_counts = counts;
             debug!(
                 height,
                 "rollback skipped: block header row absent, rows belong to another block"
@@ -559,7 +587,6 @@ impl<S: KvStore> Indexer<S> {
             batch.delete(ColumnFamily::BlockHeaders, row);
         }
         self.store.write(batch)?;
-        self.last_counts = counts;
         debug!(
             txids = counts.txids,
             funding = counts.funding,
@@ -922,6 +949,21 @@ pub trait IndexerLike: Send + Sync {
         Err(IndexError::UnsupportedRollback)
     }
 
+    /// Same as [`IndexerLike::rollback_block`] but reuses caller-verified
+    /// transaction IDs when supported.
+    ///
+    /// The default implementation preserves existing implementations by
+    /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = txids;
+        self.rollback_block(block, height)
+    }
+
     /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
     fn begin_batch(&mut self) {}
 
@@ -1008,6 +1050,15 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block(self, block, height)
+    }
+
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block_with_verified_txids(self, block, height, txids)
     }
 
     fn begin_batch(&mut self) {
@@ -1571,6 +1622,43 @@ mod tests {
             stored_rows(&indexer)?,
             before,
             "rollback must restore the pre-ingest row set exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn last_counts_remains_ingest_after_rollback() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let old = rollback_fixture_block();
+        let old_written = indexer.ingest_block(&serialize(&old), HEIGHT)?;
+        let _ = indexer.rollback_block(&old, HEIGHT)?;
+
+        // A replacement at the same height with a different shape so its
+        // ingest counts differ from the old block's rollback counts.
+        let replacement = block(vec![
+            tx(
+                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                ScriptBuf::from_bytes(vec![0x51]),
+            ),
+            tx(
+                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                ScriptBuf::from_bytes(vec![0x52]),
+            ),
+        ]);
+        let replacement_written = indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        assert_ne!(
+            replacement_written, old_written,
+            "replacement counts must differ from the old block's counts"
+        );
+
+        // Re-rolling the already-gone old block returns its original counts
+        // but must not overwrite the last successful ingest counts.
+        let old_again = indexer.rollback_block(&old, HEIGHT)?;
+        assert_eq!(old_again, old_written);
+        assert_eq!(
+            indexer.last_counts(),
+            replacement_written,
+            "last_counts must stay the last ingest counts, not the rollback counts"
         );
         Ok(())
     }

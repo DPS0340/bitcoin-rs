@@ -181,21 +181,36 @@ impl FeeEstimator {
     /// the connected block. Transactions not tracked by the estimator are
     /// silently ignored.
     pub fn block_connected(&mut self, confirmed_txids: &[Txid], block_height: u32) {
+        let advances_height = match self.last_decayed_height {
+            Some(last_height) => block_height > last_height,
+            None => true,
+        };
+
+        if let Some(last_height) = self.last_decayed_height
+            && advances_height
+        {
+            for skipped_height in last_height.saturating_add(1)..block_height {
+                self.advance_height(skipped_height);
+            }
+        }
+
         for txid in confirmed_txids {
             if let Some(entry) = self.pending.remove(txid) {
                 let blocks_waited = block_height.saturating_sub(entry.entry_height).max(1);
                 self.record_confirmation(&entry, blocks_waited);
             }
         }
-        self.expire_targets(block_height);
-        // Once per height, not once per call. Decay models blocks elapsing, and
-        // the same height arriving twice is not two blocks; decaying again
-        // would age every observation for no elapsed time and could push a
-        // bucket below `MIN_OBSERVATIONS` on duplicate notifications alone.
-        if self.last_decayed_height != Some(block_height) {
-            self.last_decayed_height = Some(block_height);
-            self.apply_decay();
+
+        if advances_height {
+            self.advance_height(block_height);
         }
+    }
+
+    /// Expires targets and decays observations for one newly reached height.
+    fn advance_height(&mut self, block_height: u32) {
+        self.expire_targets(block_height);
+        self.last_decayed_height = Some(block_height);
+        self.apply_decay();
     }
 
     /// Samples a failure for every target that expired on this block.
@@ -363,6 +378,119 @@ mod tests {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&n.to_le_bytes());
         Txid::from_byte_array(bytes)
+    }
+
+    fn assert_estimator_state_eq(left: &FeeEstimator, right: &FeeEstimator) {
+        assert_eq!(left.last_decayed_height, right.last_decayed_height);
+        assert_eq!(left.buckets.len(), right.buckets.len());
+        for (left_bucket, right_bucket) in left.buckets.iter().zip(&right.buckets) {
+            assert_eq!(
+                left_bucket.fee_rate_sat_per_kvb,
+                right_bucket.fee_rate_sat_per_kvb
+            );
+            assert_eq!(left_bucket.confirmed_within, right_bucket.confirmed_within);
+            assert_eq!(left_bucket.resolved_within, right_bucket.resolved_within);
+        }
+
+        assert_eq!(left.pending.len(), right.pending.len());
+        for (txid, left_entry) in &left.pending {
+            let Some(right_entry) = right.pending.get(txid) else {
+                panic!("pending transaction {txid} is missing from the comparison state");
+            };
+            assert_eq!(left_entry.bucket_index, right_entry.bucket_index);
+            assert_eq!(left_entry.entry_height, right_entry.entry_height);
+            assert_eq!(left_entry.resolved_through, right_entry.resolved_through);
+        }
+    }
+
+    fn estimator_at_height_105_with_pending(pending_txid: Txid) -> FeeEstimator {
+        let mut estimator = FeeEstimator::new();
+        for n in 0..10_u8 {
+            estimator.tx_entered(test_txid(n), 2_000, 100);
+        }
+        let confirmed: Vec<Txid> = (0..10_u8).map(test_txid).collect();
+        estimator.block_connected(&confirmed, 101);
+        estimator.block_connected(&[], 102);
+        estimator.block_connected(&[], 103);
+        estimator.tx_entered(pending_txid, 500_000, 103);
+        estimator.block_connected(&[], 104);
+        estimator.block_connected(&[], 105);
+        estimator
+    }
+
+    #[test]
+    fn skipped_height_jump_matches_sequential_empty_notifications() {
+        let mut sequential = FeeEstimator::new();
+        let mut jumped = FeeEstimator::new();
+        let final_txid = test_txid(200);
+        let pending_txid = test_txid(201);
+
+        for estimator in [&mut sequential, &mut jumped] {
+            for n in 0..10_u8 {
+                estimator.tx_entered(test_txid(n), 2_000, 100);
+            }
+            let confirmed: Vec<Txid> = (0..10_u8).map(test_txid).collect();
+            estimator.block_connected(&confirmed, 101);
+            estimator.tx_entered(final_txid, 500_000, 101);
+            estimator.tx_entered(pending_txid, 100_000, 101);
+        }
+
+        sequential.block_connected(&[], 102);
+        sequential.block_connected(&[], 103);
+        sequential.block_connected(&[], 104);
+        sequential.block_connected(&[final_txid], 105);
+        jumped.block_connected(&[final_txid], 105);
+
+        assert_estimator_state_eq(&jumped, &sequential);
+        assert!(!jumped.pending.contains_key(&final_txid));
+        let Some(pending) = jumped.pending.get(&pending_txid) else {
+            panic!("the unconfirmed transaction must remain pending");
+        };
+        assert_eq!(pending.resolved_through, 4);
+
+        let bucket_index = jumped.bucket_index_for_rate(500_000);
+        assert_eq!(
+            jumped.buckets[bucket_index].confirmed_within[3].to_bits(),
+            DECAY_FACTOR.to_bits(),
+            "the final-height sample must receive only the final block's decay"
+        );
+        assert_eq!(
+            jumped.buckets[bucket_index].resolved_within[3].to_bits(),
+            DECAY_FACTOR.to_bits(),
+            "the final-height denominator must receive only the final block's decay"
+        );
+    }
+
+    #[test]
+    fn duplicate_height_confirmation_does_not_advance_or_decay() {
+        let txid = test_txid(210);
+        let mut actual = estimator_at_height_105_with_pending(txid);
+        let mut expected = estimator_at_height_105_with_pending(txid);
+
+        let Some(entry) = expected.pending.remove(&txid) else {
+            panic!("the duplicate-height confirmation must start pending");
+        };
+        expected.record_confirmation(&entry, 105_u32.saturating_sub(entry.entry_height).max(1));
+        actual.block_connected(&[txid], 105);
+
+        assert_estimator_state_eq(&actual, &expected);
+        assert_eq!(actual.last_decayed_height, Some(105));
+    }
+
+    #[test]
+    fn backward_height_confirmation_does_not_lower_high_water_or_decay() {
+        let txid = test_txid(211);
+        let mut actual = estimator_at_height_105_with_pending(txid);
+        let mut expected = estimator_at_height_105_with_pending(txid);
+
+        let Some(entry) = expected.pending.remove(&txid) else {
+            panic!("the backward-height confirmation must start pending");
+        };
+        expected.record_confirmation(&entry, 104_u32.saturating_sub(entry.entry_height).max(1));
+        actual.block_connected(&[txid], 104);
+
+        assert_estimator_state_eq(&actual, &expected);
+        assert_eq!(actual.last_decayed_height, Some(105));
     }
 
     /// Fresh arrivals must not be counted as failures.

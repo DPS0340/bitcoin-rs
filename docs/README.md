@@ -45,14 +45,17 @@ a description of how the node works today.
 
 ## Known gaps
 
-**Do not run this on mainnet as your only node.** The gap that matters is reorg
-execution: the node persists undo records and can disconnect a block, but
-nothing yet drives a branch switch end to end, so it follows the chain forward
-and cannot reorganise off a branch that loses. A node that cannot reorg is not
-a node you should rely on.
+**Do not run this on mainnet as your only node.** Sync now calls
+`switch_to_branch` when a higher-work header branch wins. It preloads the
+divergent bodies, revalidates the plan under one chain-transition guard, and
+retires staged accounting after each committed connect. A fatal partial
+transition stops the process.
 
-Also incomplete: relay, metrics coverage, and parts of the CLI and RPC surface.
-`plan_reorg` exists in the chain crate with no production caller.
+Reorg handling still does not return disconnected transactions to the mempool.
+That requires one production admission pipeline shared by Electrum, P2P relay,
+and reorg handling. Production transaction relay is also incomplete.
+
+Also incomplete: metrics coverage and parts of the CLI and RPC surface.
 
 On documentation itself: there is no API reference and no tutorial series.
 JSON-RPC uses Bitcoin Core's method names, so Core's API documentation applies

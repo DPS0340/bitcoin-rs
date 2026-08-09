@@ -54,7 +54,7 @@ pub use verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_borrowed,
     verify_block_rules_borrowed_contextual, verify_block_rules_borrowed_contextual_with_txids,
     verify_block_rules_borrowed_contextual_with_txids_and_witness_hint,
-    verify_block_rules_contextual,
+    verify_block_rules_contextual, verify_merkle_root_with_txids,
 };
 pub use verify_tx::{
     ScriptStageTimings, is_final_tx, verify_block_input_scripts, verify_coinbase_script_sig_size,

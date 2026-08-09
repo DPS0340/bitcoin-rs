@@ -151,7 +151,27 @@ pub(crate) fn write_headers<W: Write>(
     if tree.tip_id() != Some(best_tip_id) {
         return Err(HeaderCheckpointError::BestTipNotActive);
     }
+    write_headers_inner(writer, tree, config, best_tip_id, applied)
+}
 
+fn write_selected_headers<W: Write>(
+    writer: &mut W,
+    tree: &BlockTree,
+    config: HeaderCheckpointConfig,
+    best_tip_id: NodeId,
+    applied: HeaderCheckpointPoint,
+) -> Result<HeaderCheckpointWrite, HeaderCheckpointError> {
+    validate_config(config)?;
+    write_headers_inner(writer, tree, config, best_tip_id, applied)
+}
+
+fn write_headers_inner<W: Write>(
+    writer: &mut W,
+    tree: &BlockTree,
+    config: HeaderCheckpointConfig,
+    best_tip_id: NodeId,
+    applied: HeaderCheckpointPoint,
+) -> Result<HeaderCheckpointWrite, HeaderCheckpointError> {
     let mut ancestry = tree.ancestor_chain(best_tip_id)?;
     ancestry.reverse();
     let count = u64::try_from(ancestry.len())
@@ -541,6 +561,8 @@ pub(crate) enum CheckpointError {
     Invalid(String),
     #[error("checkpoint block-body durability failed: {0}")]
     Storage(#[from] bitcoin_rs_storage::StorageError),
+    #[error("checkpoint refused while disconnect of block {hash} at height {height} is in flight")]
+    DisconnectInFlight { hash: Hash256, height: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -777,6 +799,22 @@ fn write_checkpoint(
     )
 }
 
+fn checkpoint_best_tip_id(
+    tree: &BlockTree,
+    applied_tip: &TipSnapshot,
+) -> Result<NodeId, CheckpointError> {
+    let applied_id = tree.lookup(applied_tip.hash).ok_or_else(|| {
+        CheckpointError::Invalid("applied tip disappeared during checkpoint".to_owned())
+    })?;
+    let best_tip_id = tree.tip_id().ok_or_else(|| {
+        CheckpointError::Invalid("applied tip exists without a best header tip".to_owned())
+    })?;
+    if tree.node_at_height_from(best_tip_id, applied_tip.height) == Some(applied_id) {
+        return Ok(best_tip_id);
+    }
+    Ok(applied_id)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_checkpoint_inner(
     data_dir: &Dir,
@@ -804,22 +842,19 @@ fn write_checkpoint_inner(
 
     let (headers_write, headers_bytes, headers_sha256) = {
         let tree = block_tree.read();
-        let best_tip_id = tree.tip_id().ok_or_else(|| {
-            CheckpointError::Invalid("applied tip exists without a best header tip".to_owned())
-        })?;
+        let best_tip_id = checkpoint_best_tip_id(&tree, applied_tip)?;
         let mut file = create_file(&staging, HEADERS_FILE)?;
         let mut writer =
             HashingWriter::new(&mut file, failpoint, CheckpointFailpoint::HeadersWrite);
-        let metadata = write_headers(
-            &mut writer,
-            &tree,
-            config,
-            best_tip_id,
-            HeaderCheckpointPoint {
-                height: applied_tip.height,
-                hash: applied_tip.hash,
-            },
-        )?;
+        let applied_point = HeaderCheckpointPoint {
+            height: applied_tip.height,
+            hash: applied_tip.hash,
+        };
+        let metadata = if tree.tip_id() == Some(best_tip_id) {
+            write_headers(&mut writer, &tree, config, best_tip_id, applied_point)?
+        } else {
+            write_selected_headers(&mut writer, &tree, config, best_tip_id, applied_point)?
+        };
         writer.flush()?;
         let (bytes, digest) = writer.finish();
         sync_file(&file, failpoint, CheckpointFailpoint::HeadersSync)?;
@@ -895,17 +930,7 @@ fn write_checkpoint_inner(
     )?;
 
     let tree = block_tree.read();
-    let best_tip_id = tree.tip_id().ok_or_else(|| {
-        CheckpointError::Invalid("best header tip disappeared during checkpoint".to_owned())
-    })?;
-    let applied_id = tree.lookup(applied_tip.hash).ok_or_else(|| {
-        CheckpointError::Invalid("applied tip disappeared during checkpoint".to_owned())
-    })?;
-    if tree.node_at_height_from(best_tip_id, applied_tip.height) != Some(applied_id) {
-        return Err(CheckpointError::Invalid(
-            "applied tip moved off the active best chain during checkpoint".to_owned(),
-        ));
-    }
+    let best_tip_id = checkpoint_best_tip_id(&tree, applied_tip)?;
     let best = tree.node(best_tip_id)?;
     if best.hash != headers_write.metadata.best.hash
         || best.height != headers_write.metadata.best.height
@@ -1986,6 +2011,79 @@ mod tests {
         assert_eq!(restored.applied_tip.hash, applied.hash);
         assert_eq!(restored.utxo.record_count(), 0);
         assert_eq!(restored.coin_stats.height, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn publication_selects_applied_ancestry_and_forgets_competing_fork()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let (mut tree, main_best_id, applied_point) = chain_with_applied_height(3, 1)?;
+        let main_best_hash = tree.node(main_best_id)?.hash;
+
+        let genesis_hash = tree.node(NodeId::new(0))?.hash;
+        let mut prev = BlockHash::from_byte_array(genesis_hash.to_le_bytes());
+        let mut fork_best_id = NodeId::new(0);
+        for height in 1..=4 {
+            let mut header = next_header(prev, height);
+            header.time = header.time.saturating_add(100);
+            mine_header_to_declared_target(&mut header)?;
+            fork_best_id = accept_headers(
+                &mut tree,
+                core::slice::from_ref(&header),
+                NETWORK,
+                bitcoin_rs_chain::current_unix_seconds(),
+            )?[0];
+            prev = BlockHash::from_byte_array(tree.node(fork_best_id)?.hash.to_le_bytes());
+        }
+        let fork_best_hash = tree.node(fork_best_id)?.hash;
+        assert_eq!(tree.tip().map(|tip| tip.tip_id), Some(fork_best_id));
+        assert_ne!(
+            tree.node_at_height_from(fork_best_id, applied_point.height),
+            tree.lookup(applied_point.hash),
+            "fixture must place the applied tip outside the live best ancestry"
+        );
+
+        let applied_tip = tip_snapshot(&tree, applied_point)?;
+        let tree = RwLock::new(tree);
+        let utxo = UtxoSet::new();
+        let mut stats = CoinStats::new();
+        stats.height = applied_point.height;
+        let listener = CoinStatsListener::new(stats);
+
+        assert!(matches!(
+            super::write_checkpoint(
+                dir.path(),
+                config(),
+                &tree,
+                &utxo,
+                &listener,
+                Some(&applied_tip),
+                false,
+            )?,
+            CheckpointWrite::Published { .. }
+        ));
+
+        let loaded = load_checkpoint(dir.path(), config())?;
+        let CheckpointLoad::Complete(restored) = loaded else {
+            return Err("checkpoint did not restore complete chainstate".into());
+        };
+
+        assert_eq!(
+            restored.tree.tip().map(|tip| (tip.height, tip.hash)),
+            Some((applied_point.height, applied_point.hash)),
+            "checkpoint must publish the coherent applied ancestry"
+        );
+        assert!(
+            restored.tree.lookup(fork_best_hash).is_none(),
+            "the competing best-work fork must be rediscovered after restart"
+        );
+        assert!(
+            restored.tree.lookup(main_best_hash).is_none(),
+            "headers above the applied tip must be rediscovered after restart"
+        );
+        assert_eq!(restored.applied_tip.height, applied_point.height);
+        assert_eq!(restored.applied_tip.hash, applied_point.hash);
         Ok(())
     }
 

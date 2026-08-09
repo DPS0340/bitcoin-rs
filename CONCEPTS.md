@@ -70,7 +70,7 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first is what tells you which steps need atomicity, and the answer differs per store: the index is on disk, but its rollback is one write batch, so a failure leaves it un-started; the UTXO set is RAM-resident with checkpoint durability, so a crash discards its partial mutation entirely. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo is not all-or-nothing: it walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Separately, a checkpoint can retain a UTXO commit whose undo record was lost with the journal. Retry is ruled out as the answer, because the commit fires the set's change listener and coinstats is one, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). Fatal is now backed by a mechanism: an in-flight marker in `UndoData`, armed and flushed before the first mutation and read at startup, which refuses to start rather than serve a torn chainstate. See *Disconnect marker phase*. See `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first shows which steps need atomicity. The index rollback is one disk batch. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
 ### Refusing default (trait participation)
 A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
@@ -78,11 +78,13 @@ A trait method whose default returns success lets an implementation that never o
 ### Undo record
 
 The per-block inverse of a UTXO commit: the outputs the block spent, with
-enough metadata to recreate them, plus the outputs it created. Written during
-connection, keyed by height **and** block hash so a record from an abandoned
-branch can never be replayed against a different block at the same height.
-Retained after a disconnect, because flip-flop between competing branches is
-normal.
+enough metadata to recreate them, plus the outputs it created. Connection queues
+the record before later apply mutations. The clean checkpoint flushes the shared
+storage backend before it publishes the matching UTXO state, so the queued
+record is not a separate per-block fsync boundary. The key contains height
+**and** block hash so an abandoned branch record cannot be replayed against a
+different block at the same height. The node retains the record after a
+disconnect because flip-flop between competing branches is normal.
 
 ### Owed derived state
 
@@ -98,22 +100,25 @@ for a block that left the chain; only its last-tip cache is repointed, and that
 cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
 inverses. `transactions` needed nothing, because connection never populates it.
 
-`disconnect_block` has a production caller: `switch_to_branch`
-(`crates/node/src/reorg.rs`), driven each sync tick when the header tip and the
-applied tip sit on different branches.
+`switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect
+caller. Sync drives it when the header and applied tips diverge. It holds one
+`ChainTransition` witness across the full disconnect-and-connect walk, so no
+ordinary connect can invalidate a preloaded plan between blocks.
 
-Still open around it: returning a disconnected block's transactions to the
-mempool, publishing a disconnect notification, backfilling the filter index
-after a gap, and routing a block that extends a known side branch.
+Still open around it: returning a disconnected block's transactions through one
+production admission pipeline shared by Electrum, P2P relay, and reorg handling;
+publishing a disconnect notification; and backfilling the filter index after a
+gap. Raw mempool insertion is not reconsideration because it cannot reconstruct
+fee, policy, conflict, and ancestry metadata.
 
 ### Dispatch-bound parallelism
 
 A stage that is parallel in shape but serial in effect because each dispatch is
 too small to amortise waking the workers. Script verification on mainnet
 0..150_000 is the case: 2,868,199 input checks at a mean 69.4 us each yield only
-4.4x on 32 threads. A block there carries about
-19 checks, so 14.6% of checks fall below `MIN_PARALLEL_SCRIPT_CHECKS` and run
-serially while the rest pay roughly 11s of dispatch across 21,474 fan-outs. The
+4.4x on 32 threads. Blocks in the parallel row carry about 114 checks, while
+14.6% of all checks fall below `MIN_PARALLEL_SCRIPT_CHECKS` and run serially.
+The parallel rows still pay roughly 11s of dispatch across 21,474 fan-outs. The
 diagnosis is a scaling sweep, not a profiler: measure the stage at 1, 4 and 32
 threads and compare the speedup against the thread count. Coarsening each
 dispatch does not fix it and makes it worse, because it throttles the blocks
@@ -132,7 +137,9 @@ mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
 the block hash, its predecessor, the height, the flags, and the locktime cutoff,
 travels bundled with the prepared state it covers, and is re-checked against
 what the apply derives; a window that cannot be proven yields nothing and every
-block verifies normally. See
+block verifies normally. The historical pre-batching capture measured 78.4s /
+643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
+not one interleaved run. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
 ### Front-half duplication

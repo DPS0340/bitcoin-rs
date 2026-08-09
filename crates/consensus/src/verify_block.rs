@@ -120,7 +120,16 @@ fn block_has_witness(block: &bitcoin::Block) -> bool {
         .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()))
 }
 
-fn verify_merkle_root_with_txids(
+/// Verifies the header Merkle root and rejects mutated Merkle trees.
+///
+/// `txids` must contain one transaction ID per block transaction in block order.
+///
+/// # Errors
+///
+/// Returns [`ConsensusError::MerkleRoot`] for an empty or mismatched tree and
+/// [`ConsensusError::MerkleMutation`] when duplicate branches make the tree
+/// ambiguous.
+pub fn verify_merkle_root_with_txids(
     block: &bitcoin::Block,
     txids: &[bitcoin::Txid],
 ) -> Result<(), ConsensusError> {

@@ -6,7 +6,7 @@
 
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::opcodes::all::{OP_PUSHNUM_1, OP_PUSHNUM_16, OP_PUSHNUM_NEG1};
-use bitcoin::{Script, Transaction, TxOut};
+use bitcoin::{FeeRate, Script, Transaction, TxOut, VarInt};
 use thiserror::Error;
 
 /// Maximum weight of a standard transaction (400 000 weight units).
@@ -15,8 +15,14 @@ const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 /// Maximum length of a standard `scriptSig` in bytes.
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 
-/// Maximum number of bytes in an `OP_RETURN` payload for a standard output.
-const MAX_OP_RETURN_RELAY: usize = 83;
+/// Standard relay policy values that are configurable by the node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StandardnessPolicy {
+    /// Fee rate used to classify outputs as dust.
+    pub dust_relay_fee: FeeRate,
+    /// Maximum aggregate serialized nulldata script bytes, or `None` to disable nulldata.
+    pub max_datacarrier_bytes: Option<usize>,
+}
 
 /// Minimum transaction version considered standard.
 const TX_VERSION_MIN: i32 = 1;
@@ -56,15 +62,18 @@ pub enum StandardnessError {
     /// An output script is not a recognized standard type.
     #[error("non-standard output script")]
     NonStandardOutput,
-    /// Transaction contains more than one `OP_RETURN` output.
-    #[error("transaction has multiple OP_RETURN outputs")]
-    MultipleOpReturn,
+    /// Nulldata outputs are disabled by policy.
+    #[error("nulldata outputs are disabled")]
+    DataCarrierDisabled,
+    /// Aggregate serialized nulldata script bytes exceed the policy limit.
+    #[error("aggregate nulldata script bytes exceed the policy limit")]
+    DataCarrierBytesExceeded,
+    /// Aggregate serialized nulldata script length overflowed.
+    #[error("aggregate nulldata script length overflowed")]
+    DataCarrierSizeOverflow,
     /// Non-witness serialization is below the relay minimum.
     #[error("transaction non-witness size is below the relay minimum")]
     TransactionTooSmall,
-    /// An `OP_RETURN` output payload exceeds 83 bytes.
-    #[error("OP_RETURN payload exceeds maximum relay size")]
-    OpReturnPayloadTooLarge,
     /// A non-`OP_RETURN` output value is below the dust threshold.
     #[error("dust output")]
     DustOutput,
@@ -74,15 +83,18 @@ pub enum StandardnessError {
 ///
 /// This mirrors `IsStandardTx` in Bitcoin Core's `policy/policy.cpp`:
 /// version, weight, `scriptSig` push-only/size, output script type,
-/// `OP_RETURN` count/payload, and dust.
+/// aggregate nulldata script bytes, and dust.
 ///
 /// Returns `Ok(())` if the transaction is standard, or the first
 /// `StandardnessError` encountered.
-pub fn is_standard_tx(tx: &Transaction) -> Result<(), StandardnessError> {
+pub fn is_standard_tx(
+    tx: &Transaction,
+    policy: &StandardnessPolicy,
+) -> Result<(), StandardnessError> {
     check_version(tx)?;
     check_weight(tx)?;
     check_script_sigs(tx)?;
-    check_outputs(tx)?;
+    check_outputs(tx, policy)?;
     // Last, matching Core: `IsStandardTx` runs first and `PreChecks` applies
     // `tx-size-small` after it, so a transaction that is both undersized and
     // carries a non-standard output reports the output.
@@ -135,32 +147,34 @@ fn check_script_sigs(tx: &Transaction) -> Result<(), StandardnessError> {
     Ok(())
 }
 
-fn check_outputs(tx: &Transaction) -> Result<(), StandardnessError> {
-    let mut op_return_count: u32 = 0;
+fn check_outputs(tx: &Transaction, policy: &StandardnessPolicy) -> Result<(), StandardnessError> {
+    let mut datacarrier_bytes = 0_usize;
     for output in &tx.output {
         let script = &output.script_pubkey;
         if script.is_op_return() {
-            op_return_count += 1;
-            if op_return_count > 1 {
-                return Err(StandardnessError::MultipleOpReturn);
-            }
             if !is_standard_nulldata(script) {
                 return Err(StandardnessError::NonStandardOutput);
             }
-            // The limit is on the SERIALIZED script, not the payload it
-            // carries. An 81-byte push encoded with OP_PUSHDATA1 makes an
-            // 84-byte script, which Core rejects and a payload-only measure
-            // accepted at 81.
-            if script.len() > MAX_OP_RETURN_RELAY {
-                return Err(StandardnessError::OpReturnPayloadTooLarge);
+            let Some(limit) = policy.max_datacarrier_bytes else {
+                return Err(StandardnessError::DataCarrierDisabled);
+            };
+            let serialized_script_bytes = VarInt::from(script.len())
+                .size()
+                .checked_add(script.len())
+                .ok_or(StandardnessError::DataCarrierSizeOverflow)?;
+            datacarrier_bytes = datacarrier_bytes
+                .checked_add(serialized_script_bytes)
+                .ok_or(StandardnessError::DataCarrierSizeOverflow)?;
+            if datacarrier_bytes > limit {
+                return Err(StandardnessError::DataCarrierBytesExceeded);
             }
-        } else {
-            if !is_standard_output_script(script) {
-                return Err(StandardnessError::NonStandardOutput);
-            }
-            if is_dust(output) {
-                return Err(StandardnessError::DustOutput);
-            }
+            continue;
+        }
+        if !is_standard_output_script(script) {
+            return Err(StandardnessError::NonStandardOutput);
+        }
+        if is_dust(output, policy.dust_relay_fee) {
+            return Err(StandardnessError::DustOutput);
         }
     }
     Ok(())
@@ -231,8 +245,12 @@ fn multisig_key_count(script: &Script) -> Option<u8> {
 }
 
 /// Returns `true` if a non-`OP_RETURN` output is dust.
-fn is_dust(output: &TxOut) -> bool {
-    output.value.to_sat() < output.script_pubkey.minimal_non_dust().to_sat()
+fn is_dust(output: &TxOut, dust_relay_fee: FeeRate) -> bool {
+    output.value.to_sat()
+        < output
+            .script_pubkey
+            .minimal_non_dust_custom(dust_relay_fee)
+            .to_sat()
 }
 
 /// Extracts the payload length from an `OP_RETURN` script.
@@ -273,12 +291,12 @@ mod tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash as _;
     use bitcoin::opcodes::all::OP_RETURN;
-    use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1};
+    use bitcoin::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_3, OP_PUSHNUM_4};
     use bitcoin::script::{Builder, PushBytesBuf};
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, PubkeyHash, ScriptBuf, Sequence, TxIn, TxOut, Witness};
 
-    fn empty_tx(version: Version) -> Transaction {
+    fn standard_tx(version: Version) -> Transaction {
         Transaction {
             version,
             lock_time: LockTime::ZERO,
@@ -295,22 +313,32 @@ mod tests {
         }
     }
 
+    fn policy() -> StandardnessPolicy {
+        StandardnessPolicy {
+            dust_relay_fee: FeeRate::DUST,
+            max_datacarrier_bytes: Some(83),
+        }
+    }
+
     #[test]
     fn accepts_standard_version_one() {
-        let tx = empty_tx(Version::ONE);
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        let tx = standard_tx(Version::ONE);
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn accepts_standard_version_two() {
-        let tx = empty_tx(Version::TWO);
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        let tx = standard_tx(Version::TWO);
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn rejects_version_zero() {
-        let tx = empty_tx(Version(0));
-        assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
+        let tx = standard_tx(Version(0));
+        assert_eq!(
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::Version)
+        );
     }
 
     /// Rejected until a TRUC policy layer exists to carry its restrictions.
@@ -318,35 +346,19 @@ mod tests {
     /// the "here".
     #[test]
     fn rejects_version_three_while_truc_policy_is_absent() {
-        let tx = empty_tx(Version(3));
-        assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
+        let tx = standard_tx(Version(3));
+        assert_eq!(
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::Version)
+        );
     }
 
     #[test]
     fn rejects_version_four() {
-        let tx = empty_tx(Version(4));
-        assert_eq!(is_standard_tx(&tx), Err(StandardnessError::Version));
-    }
-
-    /// An 81-byte push needs `OP_PUSHDATA1`, making an 84-byte script. The limit
-    /// is on the script, so this must be rejected even though the payload is
-    /// under it.
-    #[test]
-    fn rejects_op_return_whose_script_exceeds_the_limit() {
-        let mut tx = empty_tx(Version::ONE);
-        let payload = [0x2b_u8; 81];
-        let Ok(pushable) = <&bitcoin::script::PushBytes>::try_from(payload.as_slice()) else {
-            panic!("81 bytes must be pushable");
-        };
-        tx.output[0].value = Amount::ZERO;
-        tx.output[0].script_pubkey = ScriptBuf::new_op_return(pushable);
-        assert!(
-            tx.output[0].script_pubkey.len() > MAX_OP_RETURN_RELAY,
-            "the script must exceed the limit or this test proves nothing"
-        );
+        let tx = standard_tx(Version(4));
         assert_eq!(
-            is_standard_tx(&tx),
-            Err(StandardnessError::OpReturnPayloadTooLarge)
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::Version)
         );
     }
 
@@ -357,7 +369,7 @@ mod tests {
     /// non-standard when Core relays it.
     #[test]
     fn accepts_op_return_followed_by_a_numeric_push() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output[0].value = Amount::ZERO;
         tx.output[0].script_pubkey = Builder::new()
             .push_opcode(bitcoin::opcodes::all::OP_RETURN)
@@ -368,20 +380,20 @@ mod tests {
             value: Amount::from_sat(50_000),
             script_pubkey: ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([9_u8; 20])),
         });
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     /// `OP_RETURN` followed by a non-push opcode is not standard nulldata.
     #[test]
     fn rejects_op_return_followed_by_an_opcode() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output[0].value = Amount::ZERO;
         tx.output[0].script_pubkey = Builder::new()
             .push_opcode(bitcoin::opcodes::all::OP_RETURN)
             .push_opcode(bitcoin::opcodes::all::OP_DUP)
             .into_script();
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
         );
     }
@@ -405,10 +417,10 @@ mod tests {
             "the shape check must accept this, or the length check is never reached"
         );
 
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output[0].script_pubkey = script;
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
         );
     }
@@ -420,14 +432,50 @@ mod tests {
         let Ok(pushable) = <&bitcoin::script::PushBytes>::try_from(key.as_slice()) else {
             panic!("33 bytes must be pushable");
         };
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output[0].script_pubkey = Builder::new()
             .push_opcode(OP_PUSHNUM_1)
             .push_slice(pushable)
             .push_opcode(OP_PUSHNUM_1)
             .push_opcode(OP_CHECKMULTISIG)
             .into_script();
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
+    }
+
+    #[test]
+    fn accepts_three_of_three_bare_multisig() {
+        let key = [0x02_u8; 33];
+        let mut tx = standard_tx(Version::ONE);
+        tx.output[0].script_pubkey = Builder::new()
+            .push_opcode(OP_PUSHNUM_3)
+            .push_slice(key)
+            .push_slice(key)
+            .push_slice(key)
+            .push_opcode(OP_PUSHNUM_3)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_one_of_four_bare_multisig() {
+        let key = [0x02_u8; 33];
+        let mut tx = standard_tx(Version::ONE);
+        tx.output[0].script_pubkey = Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice(key)
+            .push_slice(key)
+            .push_slice(key)
+            .push_slice(key)
+            .push_opcode(OP_PUSHNUM_4)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+
+        assert_eq!(
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::NonStandardOutput)
+        );
     }
 
     /// The pay-to-anchor template, `OP_1` plus a two-byte push of 0x4e73.
@@ -437,12 +485,12 @@ mod tests {
     /// script being recognised, not about that.
     #[test]
     fn accepts_a_pay_to_anchor_output() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output.push(TxOut {
             value: Amount::from_sat(240),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]),
         });
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     /// A `SegWit` spend can be consensus-valid and still below the relay
@@ -450,7 +498,7 @@ mod tests {
     /// cannot see.
     #[test]
     fn rejects_a_transaction_below_the_non_witness_minimum() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         tx.output[0].value = Amount::ZERO;
         tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
         assert!(
@@ -458,82 +506,109 @@ mod tests {
             "the fixture must be undersized or this test proves nothing"
         );
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::TransactionTooSmall)
         );
     }
 
     #[test]
     fn rejects_non_pushonly_scriptsig() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         // OP_DUP is not a push opcode.
         tx.input[0].script_sig = Builder::new()
             .push_opcode(bitcoin::opcodes::all::OP_DUP)
             .into_script();
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::ScriptSigNotPushOnly)
         );
     }
 
     #[test]
     fn rejects_oversized_scriptsig() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         // Build a push-only scriptSig that exceeds 1650 bytes.
         let big_data = PushBytesBuf::try_from(vec![0_u8; MAX_STANDARD_SCRIPTSIG_SIZE])
             .expect("push payload fits");
         tx.input[0].script_sig = Builder::new().push_slice(big_data).into_script();
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::ScriptSigTooLarge)
         );
     }
 
     #[test]
-    fn rejects_two_op_returns() {
-        let mut tx = empty_tx(Version::ONE);
-        let op_return = Builder::new()
+    fn accepts_two_nulldata_outputs_within_the_aggregate_limit() {
+        let mut tx = standard_tx(Version::ONE);
+        let first = Builder::new()
             .push_opcode(OP_RETURN)
-            .push_slice(b"hello")
+            .push_slice(b"first")
             .into_script();
+        let second = Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice(b"second")
+            .into_script();
+        let limit = [&first, &second]
+            .into_iter()
+            .fold(0_usize, |total, script| {
+                total + VarInt::from(script.len()).size() + script.len()
+            });
         tx.output = vec![
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: op_return.clone(),
+                script_pubkey: first,
             },
             TxOut {
                 value: Amount::ZERO,
-                script_pubkey: op_return,
+                script_pubkey: second,
             },
         ];
+        let aggregate = StandardnessPolicy {
+            max_datacarrier_bytes: Some(limit),
+            ..policy()
+        };
+
+        assert_eq!(is_standard_tx(&tx, &aggregate), Ok(()));
+        let over = StandardnessPolicy {
+            max_datacarrier_bytes: Some(limit - 1),
+            ..aggregate
+        };
         assert_eq!(
-            is_standard_tx(&tx),
-            Err(StandardnessError::MultipleOpReturn)
+            is_standard_tx(&tx, &over),
+            Err(StandardnessError::DataCarrierBytesExceeded)
+        );
+        let disabled = StandardnessPolicy {
+            max_datacarrier_bytes: None,
+            ..aggregate
+        };
+        assert_eq!(
+            is_standard_tx(&tx, &disabled),
+            Err(StandardnessError::DataCarrierDisabled)
         );
     }
 
     #[test]
-    fn rejects_oversized_op_return_payload() {
-        let mut tx = empty_tx(Version::ONE);
-        let payload =
-            PushBytesBuf::try_from(vec![0_u8; MAX_OP_RETURN_RELAY + 1]).expect("push payload fits");
-        let script = Builder::new()
-            .push_opcode(OP_RETURN)
-            .push_slice(payload)
-            .into_script();
-        tx.output = vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: script,
-        }];
+    fn dust_relay_fee_changes_the_boundary() {
+        let mut tx = standard_tx(Version::ONE);
+        let threshold = tx.output[0]
+            .script_pubkey
+            .minimal_non_dust_custom(FeeRate::DUST);
+        tx.output[0].value = threshold - Amount::ONE_SAT;
+
         assert_eq!(
-            is_standard_tx(&tx),
-            Err(StandardnessError::OpReturnPayloadTooLarge)
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::DustOutput)
         );
+        let lower_fee = StandardnessPolicy {
+            dust_relay_fee: FeeRate::BROADCAST_MIN,
+            ..policy()
+        };
+        assert_eq!(is_standard_tx(&tx, &lower_fee), Ok(()));
     }
 
     #[test]
     fn accepts_single_op_return_within_limit() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         let script = Builder::new()
             .push_opcode(OP_RETURN)
             .push_slice(b"ok")
@@ -542,26 +617,29 @@ mod tests {
             value: Amount::ZERO,
             script_pubkey: script,
         });
-        assert_eq!(is_standard_tx(&tx), Ok(()));
+        assert_eq!(is_standard_tx(&tx, &policy()), Ok(()));
     }
 
     #[test]
     fn rejects_dust_output() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         // 1 sat to a P2PKH output is dust.
         tx.output[0].value = Amount::from_sat(1);
-        assert_eq!(is_standard_tx(&tx), Err(StandardnessError::DustOutput));
+        assert_eq!(
+            is_standard_tx(&tx, &policy()),
+            Err(StandardnessError::DustOutput)
+        );
     }
 
     #[test]
     fn rejects_non_standard_output_script() {
-        let mut tx = empty_tx(Version::ONE);
+        let mut tx = standard_tx(Version::ONE);
         // A random non-standard script.
         tx.output[0].script_pubkey = Builder::new()
             .push_opcode(bitcoin::opcodes::all::OP_DEPTH)
             .into_script();
         assert_eq!(
-            is_standard_tx(&tx),
+            is_standard_tx(&tx, &policy()),
             Err(StandardnessError::NonStandardOutput)
         );
     }

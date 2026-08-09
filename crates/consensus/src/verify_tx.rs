@@ -447,6 +447,7 @@ pub struct BlockScriptChecks<'b> {
 /// The index is the position in the slice handed to [`verify_prepared_units`],
 /// so a caller batching several blocks learns which one to re-run through the
 /// ordinary path to reproduce the error in its documented position.
+#[derive(Debug)]
 pub struct BatchScriptFailure {
     /// Position of the failing unit.
     pub unit: usize,
@@ -505,8 +506,8 @@ pub fn prepare_block_script_checks<'b>(
 /// # Errors
 ///
 /// Returns the first failure in that order, tagged with its unit, or a
-/// [`ConsensusError::PrevoutMatrixSize`] against unit zero when the flag count
-/// does not match the unit count.
+/// [`ConsensusError::Kernel`] against unit zero when the flag count does not
+/// match the unit count.
 pub fn verify_prepared_units(
     units: &[BlockScriptChecks<'_>],
     flags_per_unit: &[VerifyFlags],
@@ -573,16 +574,7 @@ pub fn verify_prepared_units(
     Ok(())
 }
 
-/// First failure within one prepared block, in transaction order with phase
-/// `pre < script < post`.
-///
-/// Shared by the single-block and batched entry points on purpose: a second
-/// copy of this ordering is how the two paths would silently disagree about
-/// which error a block produces.
-/// A result slice that does not cover a transaction's checks means this
-/// function and its caller disagree about the layout. That cannot happen from
-/// any input, only from a bug here, but it must never be answered with "no
-/// error found": that reports success for scripts nobody ran.
+/// Reports an internal prepared-check layout mismatch.
 fn layout_failure(unit: usize) -> BatchScriptFailure {
     BatchScriptFailure {
         unit,
@@ -592,6 +584,16 @@ fn layout_failure(unit: usize) -> BatchScriptFailure {
     }
 }
 
+/// First failure within one prepared block, in transaction order with phase
+/// `pre < script < post`.
+///
+/// Shared by the single-block and batched entry points on purpose: a second
+/// copy of this ordering is how the two paths would silently disagree about
+/// which error a block produces. A result slice that does not cover a
+/// transaction's checks means this function and its caller disagree about the
+/// layout. That cannot happen from any input, only from a bug here, but it must
+/// never be answered with "no error found": that reports success for scripts
+/// nobody ran.
 fn first_prepared_error(
     prepared: &[PreparedTx<'_>],
     results: &[Result<(), ConsensusError>],
@@ -1479,26 +1481,53 @@ mod tests {
     #[test]
     #[cfg(feature = "kernel")]
     fn each_unit_is_checked_under_its_own_flags() {
-        let txs = vec![
+        use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
+
+        let first_txs = vec![
             coinbase_transaction_with_script_sig_len(2).0,
             spend_tx(vec![true_spending_input(outpoint(9))], 50),
         ];
-        let block = kernel_block_for(&txs);
-        let resolved = vec![Vec::new(), vec![Some(op1_txout(50))]];
-        let units = [prepared_unit(&txs, resolved, &block)];
+        let first_block = kernel_block_for(&first_txs);
+        let first_resolved = vec![Vec::new(), vec![Some(op1_txout(50))]];
 
-        assert!(
-            super::verify_prepared_units(&units, &[VerifyFlags::MANDATORY]).is_ok(),
-            "the fixture must pass under its own flags, or this proves nothing"
-        );
-        match super::verify_prepared_units(&units, &[]) {
-            Err(failure) => assert!(
-                format!("{}", failure.error).contains("one flag set per unit"),
-                "a flag count that does not cover every unit must be refused, got {}",
-                failure.error
+        let redeem_script = [0_u8];
+        let redeem_hash = bitcoin::hashes::hash160::Hash::hash(&redeem_script);
+        let p2sh_output = TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: Builder::new()
+                .push_opcode(OP_HASH160)
+                .push_slice(redeem_hash.to_byte_array())
+                .push_opcode(OP_EQUAL)
+                .into_script(),
+        };
+        let second_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(
+                vec![TxIn {
+                    previous_output: outpoint(10),
+                    script_sig: Builder::new().push_slice(redeem_script).into_script(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                50,
             ),
-            Ok(()) => panic!("a missing flag entry must not be treated as permissive"),
-        }
+        ];
+        let second_block = kernel_block_for(&second_txs);
+        let second_resolved = vec![Vec::new(), vec![Some(p2sh_output)]];
+
+        let units = [
+            prepared_unit(&first_txs, first_resolved, &first_block),
+            prepared_unit(&second_txs, second_resolved, &second_block),
+        ];
+        assert!(
+            super::verify_prepared_units(&units[1..], &[VerifyFlags::MANDATORY],).is_err(),
+            "the second fixture must require its permissive flag set"
+        );
+        assert!(
+            super::verify_prepared_units(&units, &[VerifyFlags::MANDATORY, VerifyFlags::NONE],)
+                .is_ok(),
+            "each unit must use the flag set at its own index"
+        );
     }
 
     fn prepared_unit<'b>(

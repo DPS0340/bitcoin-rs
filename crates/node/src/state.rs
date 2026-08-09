@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -429,7 +429,6 @@ impl NodeStorage {
         }
     }
 
-    #[cfg(test)]
     #[cfg(test)]
     fn stored_prune_body(
         &self,
@@ -971,21 +970,21 @@ impl NodeState {
             // node has no reindex. An instruction the operator cannot follow is
             // worse than none.
             //
-            // All three stores, not just the chainstate: a torn disconnect can
-            // have rolled the transaction index back while the UTXO set and tip
-            // still name the block, so resetting the chainstate alone would
-            // start a node whose index disagrees with it. The marker lives in
-            // the chainstate store, so removing these clears it too; there is no
-            // separate clear step to forget.
+            // Remove all durable views. A torn disconnect can roll the
+            // transaction index back while the UTXO checkpoint and tip still
+            // name the block. Keeping an older checkpoint can restore that
+            // stale chainstate beside the rolled-back index. The marker lives
+            // in the chainstate store, so removing it clears the marker too.
             bail!(
                 "refusing to start: a disconnect of block {hash} at height {height} never \
                  completed, so the UTXO set, the transaction index, and the chain tip may \
                  disagree. The node cannot repair this in place, because it cannot tell \
                  which of those commits landed before the disconnect stopped. Remove \
-                 {chainstate}, {txindex}, and {filters}, then resync.",
+                 or quarantine {chainstate}, {checkpoints}, {txindex}, and {filters}, then resync.",
                 hash = marker.hash,
                 height = marker.height,
                 chainstate = config.data_dir.join("chainstate").display(),
+                checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
                 txindex = config.data_dir.join("txindex").display(),
                 filters = config.data_dir.join("filters").display(),
             );
@@ -1094,6 +1093,7 @@ impl NodeState {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -1114,6 +1114,7 @@ impl NodeState {
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
+            shutdown: Arc::clone(&shutdown),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: config.assume_valid_height,
             assume_valid_gate: Arc::new(crate::apply::AssumeValidGate::new(
@@ -1211,6 +1212,14 @@ impl NodeState {
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
         let _exclusive_apply = self.apply_handles.admission.close();
+        if let Some(marker) = self.apply_handles.undo_store.load_disconnect_marker()?
+            && marker.phase == crate::apply::DisconnectPhase::InFlight
+        {
+            return Err(crate::checkpoint::CheckpointError::DisconnectInFlight {
+                hash: marker.hash,
+                height: marker.height,
+            });
+        }
         // A checkpoint may name this tip only after body files then index rows sync.
         self.block_body_store.sync()?;
         let applied_tip = self.applied_tip.load_full();
@@ -1483,6 +1492,12 @@ impl NodeState {
             last_committed_height: height,
         };
         crate::crash_recovery::write_meta(self, &meta)
+    }
+
+    /// Returns the process-wide shutdown signal shared by all runtime workers.
+    #[must_use]
+    pub fn shutdown(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.apply_handles.shutdown)
     }
 
     /// Snapshot of the handle set needed by `crate::apply::apply_block`.
@@ -2502,6 +2517,106 @@ mod tests {
         })?;
         scanned.tx_count = rolling.tx_count;
         assert_eq!(rolling, scanned);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_arc_is_shared_with_apply_handles() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        assert!(Arc::ptr_eq(
+            &state.shutdown(),
+            &state.apply_handles().shutdown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_refuses_inflight_disconnect_and_preserves_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        state.apply_block(&genesis)?;
+        assert!(matches!(
+            state.write_clean_checkpoint()?,
+            crate::checkpoint::CheckpointWrite::Published { .. }
+        ));
+
+        let checkpoint_root = data_dir.join("chainstate-checkpoints");
+        let armed_hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xab; 32]);
+        let armed_height = 10;
+        state
+            .apply_handles()
+            .undo_store
+            .arm_disconnect(armed_height, armed_hash)?;
+        let marker_before = state.apply_handles().undo_store.load_disconnect_marker()?;
+        let current_before = std::fs::read(checkpoint_root.join("CURRENT"))?;
+        let mut dirs_before = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&checkpoint_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs_before.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        let result = state.write_clean_checkpoint();
+        let Err(crate::checkpoint::CheckpointError::DisconnectInFlight { hash, height }) = result
+        else {
+            anyhow::bail!("expected DisconnectInFlight refusal, got {result:?}");
+        };
+        assert_eq!(hash, armed_hash);
+        assert_eq!(height, armed_height);
+
+        let marker_after = state.apply_handles().undo_store.load_disconnect_marker()?;
+        let current_after = std::fs::read(checkpoint_root.join("CURRENT"))?;
+        let mut dirs_after = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&checkpoint_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs_after.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        assert_eq!(marker_before, marker_after);
+        assert_eq!(current_before, current_after);
+        assert_eq!(dirs_before, dirs_after);
+        Ok(())
+    }
+
+    #[test]
+    fn torn_disconnect_refusal_names_every_store_to_remove() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config.clone())?;
+        state.apply_handles().undo_store.arm_disconnect(
+            10,
+            bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
+        )?;
+        drop(state);
+
+        let error = match NodeState::open(config) {
+            Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        for store in ["chainstate", "chainstate-checkpoints", "txindex", "filters"] {
+            let path = data_dir.join(store);
+            assert!(
+                message.contains(&path.display().to_string()),
+                "startup refusal omitted {}: {message}",
+                path.display()
+            );
+        }
         Ok(())
     }
 

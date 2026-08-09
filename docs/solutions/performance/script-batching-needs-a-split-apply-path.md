@@ -3,15 +3,24 @@
 Status: **shipped.** The first attempt was a wash and was reverted; the second,
 built on a split apply path so preparation happens once, holds up.
 
+Current shipped capture:
+
 | blocks 0..150,000, full verification | wall | CPU |
 |---|---|---|
 | Bitcoin Core 31.0 | 60.7s | 466.5s |
-| bitcoin-rs before | 78.4s | 643.4s |
 | bitcoin-rs after | **69.6s** | **558.4s** |
 
-Three interleaved pairs, medians, pinned to `taskset -c 0-31`. Both axes
-improve, so this is not a wall-for-CPU trade. Core still leads: 1.15x on wall
-and 1.20x on CPU, down from 1.28x and 1.37x.
+Historical pre-batching capture:
+
+| blocks 0..150,000, full verification | wall | CPU |
+|---|---|---|
+| Bitcoin Core 31.0 | 61.2s | 470.7s |
+| bitcoin-rs before | 78.4s | 643.4s |
+
+Each panel reports the median of its own three interleaved pairs, pinned to
+`taskset -c 0-31`. The captures are separate and must not be combined as one
+run. In the current capture, Core leads by 1.15x on wall and 1.20x on CPU. In
+the historical capture, it led by 1.28x and 1.37x.
 
 Script verification inside apply fell from 49.26s to 6.91s, and the dispatch it
 replaced from 44.08s across 21,474 fan-outs to 12.55s across 2,343.
@@ -22,19 +31,14 @@ success.
 
 ## The gap
 
-Mainnet 0..150_000, full verification (`assume_valid_height 0`), interleaved
-pairs pinned to `taskset -c 0-31`:
-
-| | wall | CPU |
-|---|---|---|
-| Bitcoin Core 31.0 | 61.2s | 470.7s |
-| bitcoin-rs | 78.4s | 643.4s |
-
-Core leads 1.28x on wall and burns 172.7 fewer CPU-seconds.
+The historical pre-batching panel measured the original cross-node gap. Its
+78.4s bitcoin-rs value is a benchmark median, not the same run as the 77.5s
+instrumented profile below.
 
 ## Where our time goes
 
-Script verification is 49.26s of the 77.5s wall (63.6%). Inside it:
+In that separate 77.5s instrumented run, script verification took 49.26s
+(63.6%). Inside it:
 
 | | |
 |---|---|
@@ -82,8 +86,8 @@ That 4.4x decomposes:
 | below `MIN_PARALLEL_SCRIPT_CHECKS` (32), fully serial | 417,394 (14.6%) | 46,417 | ~29s |
 | above it, 10.2x on 32 threads | 2,450,805 | 21,474 | ~16.7s, of which ~11s is dispatch |
 
-A mainnet block in this range carries about 19 input checks. Fanning 19 items
-across 32 workers costs more in wakeups than the 1.3 ms of work being spread.
+A block in the parallel row carries about 114 input checks. Fanning those items
+across 32 workers costs more in wakeups than the work being spread.
 
 ## Four hypotheses, all refuted by measurement
 
@@ -134,17 +138,20 @@ Wall time did not move: 79.3s against a 78.4s baseline.
 | kernel parse | 6.12s |
 | prepare | 4.05s |
 
+The listed stages total 35.05s. A separate aggregate batch timer recorded
+41.9s.
+
 The batch resolves every prevout and parses every block, and then `apply_block`
 does both again for its own purposes: the resolved view feeds coinbase
 maturity, BIP68, and the UTXO change set, not just scripts. Apply fell from
-71.80s to 36.08s; the batch cost 41.9s. A 37.9s saving bought for 41.9s.
+71.80s to 36.08s, a 35.72s saving bought for 41.9s.
 
 ## The shape that would work
 
 The front half of `apply_block_inner` must run **once**, not twice. That means
 splitting it:
 
-```
+```text
 prepare_apply(block, captured_context) -> PreparedApply   // resolve, parse, plan
 commit_apply(PreparedApply)                                // utxo, index, tip
 ```

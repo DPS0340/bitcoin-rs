@@ -62,11 +62,14 @@ pub fn accept_headers(
 /// A clock before the epoch yields 0, which only makes the future-drift bound
 /// stricter and can never wrongly accept a header.
 pub fn current_unix_seconds() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| u32::try_from(elapsed.as_secs()).ok())
-        .unwrap_or(0)
+    unix_seconds_at(std::time::SystemTime::now())
+}
+
+fn unix_seconds_at(now: std::time::SystemTime) -> u32 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX)
+        })
 }
 
 /// Enforces the two consensus timestamp rules against `now_secs`.
@@ -392,8 +395,11 @@ mod timestamp_tests {
             let header = mine(prev, height, height);
             prev = header.block_hash();
             let hash = hash_from_header(&header);
-            tree.insert_header_with_hash(header, hash, NodeStatus::HeaderValid)
-                .expect("fixture header inserts");
+            let inserted = tree.insert_header_with_hash(header, hash, NodeStatus::HeaderValid);
+            assert!(
+                inserted.is_ok(),
+                "fixture header failed to insert: {inserted:?}"
+            );
             tip = header;
         }
         (tree, tip)
@@ -444,5 +450,18 @@ mod timestamp_tests {
         let tree = BlockTree::new();
         let orphan = mine(BlockHash::all_zeros(), 0, 0);
         assert!(check(&tree, &orphan, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn wall_clock_conversion_saturates_after_u32_seconds() {
+        let after_u32 =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX) + 1);
+        assert_eq!(super::unix_seconds_at(after_u32), u32::MAX);
+    }
+
+    #[test]
+    fn wall_clock_conversion_maps_pre_epoch_to_zero() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(super::unix_seconds_at(before_epoch), 0);
     }
 }

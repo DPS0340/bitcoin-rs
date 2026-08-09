@@ -54,8 +54,8 @@ fn replay_prefix(
 
     let window = args.window.max(1);
     let mut source = open_block_source(args)?;
-    let mut window_blocks: Vec<Block> = Vec::with_capacity(window);
-    let mut window_bytes: Vec<bytes::Bytes> = Vec::with_capacity(window);
+    let mut window_blocks: Vec<Block> = Vec::new();
+    let mut window_bytes: Vec<bytes::Bytes> = Vec::new();
     let mut window_bytes_held = 0_usize;
     for height in args.start_height..=args.stop_height {
         let fetch_started = Instant::now();
@@ -89,7 +89,7 @@ fn replay_prefix(
         window_blocks.push(block);
         window_bytes_held = window_bytes_held.saturating_add(bytes.len());
         window_bytes.push(bytes::Bytes::from(bytes));
-        if window_blocks.len() >= window || height == args.stop_height {
+        if window_blocks.len() >= window {
             apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
             window_bytes_held = 0;
         }

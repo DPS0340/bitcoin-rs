@@ -39,9 +39,9 @@ compiles in none and the node then refuses to start:
 cargo build --release -p bitcoin-rs --no-default-features --features fjall
 ```
 
-That node cannot verify the script types libbitcoinkernel handles, and a
-mainnet sync stops early as a result. Use it for development, not for
-following the chain.
+The portable verifier supports only Taproot key-path spends. It cannot validate
+non-Taproot spends or Taproot script-path spends, so a mainnet sync stops early.
+Use it for development, not for following the chain.
 
 ## Step 2: choose a storage backend
 

@@ -284,6 +284,45 @@ mod tests {
     }
 
     #[test]
+    fn script_size_boundary_matches_the_committed_utxo_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = UtxoSet::new();
+        let mut overlay = WindowOverlay::new(&utxo);
+        let accepted = paying_tx(
+            ScriptBuf::from_bytes(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE]),
+            1,
+        );
+        let rejected = paying_tx(
+            ScriptBuf::from_bytes(vec![0x51; bitcoin_rs_consensus::MAX_SCRIPT_SIZE + 1]),
+            1,
+        );
+        let accepted_txid = accepted.compute_txid();
+        let rejected_txid = rejected.compute_txid();
+
+        overlay.advance(&block_of(vec![accepted]), &[accepted_txid], HEIGHT, &none())?;
+        overlay.advance(
+            &block_of(vec![rejected]),
+            &[rejected_txid],
+            HEIGHT + 1,
+            &none(),
+        )?;
+
+        assert!(
+            overlay
+                .get_entry(&internal_outpoint(&outpoint_of(accepted_txid, 0)))
+                .is_some(),
+            "MAX_SCRIPT_SIZE must remain spendable"
+        );
+        assert!(
+            overlay
+                .get_entry(&internal_outpoint(&outpoint_of(rejected_txid, 0)))
+                .is_none(),
+            "MAX_SCRIPT_SIZE + 1 must remain absent"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn genesis_contributes_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let utxo = UtxoSet::new();
         let mut overlay = WindowOverlay::new(&utxo);

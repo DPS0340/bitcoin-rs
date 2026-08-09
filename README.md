@@ -130,8 +130,9 @@ configuration.
 cargo build --release -p bitcoin-rs --no-default-features --features fjall
 ```
 
-That node **cannot validate non-Taproot script-path spends on mainnet** and
-stops early in a real sync. It is for development only.
+The portable verifier supports only Taproot key-path spends. It cannot validate
+non-Taproot spends or Taproot script-path spends, so a mainnet sync stops early.
+Use it for development only.
 
 ## Tests
 
