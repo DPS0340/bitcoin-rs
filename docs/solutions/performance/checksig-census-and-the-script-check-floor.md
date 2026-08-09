@@ -1,10 +1,12 @@
 # CHECKSIG census and the script-check floor
 
 Status: **OPEN.** The CHECKSIG census over mainnet blocks 0..150,000 shows
-that native Core `CPubKey::Verify` accounts for 39.32 µs (53.41%) of the
-73.62 µs width-1 kernel verification cost per input check. The remaining
-34.30 µs (46.59%) covers legacy sighash construction, script evaluation,
-and wrapper overhead. That residual exceeds the 27.73% lever threshold.
+that `CPubKey::Verify` from libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1,
+embedding Bitcoin Core 31.99.0 development sources) accounts for 39.32 µs
+(53.41%) of the 73.62 µs width-1 kernel verification cost per input check.
+The remaining 34.30 µs (46.59%) covers legacy sighash construction, script
+evaluation, and wrapper overhead. That residual exceeds the 27.73% lever
+threshold.
 
 ## Census methodology and 22-counter results
 
@@ -42,9 +44,11 @@ Across 2,868,199 input checks, the 22 u64 counters yielded:
 ## Capture corpus and integrity proofs
 
 - **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`
-- **Corpus Size & SHA-256**: 39,815,149 bytes; SHA-256 `16cbaf17feb16ad9b567b4680a5eaf449699037f9696ccb2366af3f48b756fa2` (300 blocks, 159,259 non-coinbase inputs).
+- **Native Comparator**: `CPubKey::Verify` from libbitcoinkernel-sys 0.3.0
+  (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development
+  sources), executing public key parsing, lax DER parsing, signature
+  normalization, and `secp256k1_ecdsa_verify`.
 - **Capture Repeat (INV-13)**: Both 159,259-record captures produced sorted-record SHA-256 `9841e3afc79018400c568d86b60747f9a0c1d6d1184fc3caf4815860f88739d2`.
-- **Native Comparator**: Vendored Bitcoin Core 0.7.2 `CPubKey::Verify` compiled inside `libbitcoinkernel-sys`, executing public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`.
 - **Source Integrity (INV-14)**: `bitcoin/src/pubkey.cpp` SHA-256 is byte-identical in pristine and instrumented trees (`0c86716f3626f591e643bd327fe0e48f6cebba8da3aba91ec6587256d725f1c0`). The 178-file `secp256k1` tree manifest SHA-256 is byte-identical (`b61a27000f45b4408f8699bea9ec69668677696fbc22685e8c4111e1a5e7c6ee`). Source identity is authoritative as the debug build (`RelWithDebInfo`) embeds source paths with no LTO/IPO.
 - **Native Correctness (INV-8)**: 159,259 expected true vs 159,259 native true; 0 mismatches (`mismatches == 0`, `ok_equals_count_outcome_1 == true`).
 - **Instrumentation Isolation (INV-15)**: All 22 counters stayed at 0 during direct native timing runs.
@@ -68,7 +72,7 @@ All runs pinned to `taskset -c 0-31`:
   - Run 3: 73.622370 µs/check
   - **Median $X$**: **73.622370 µs/check**
 
-- **Run C (native Core `CPubKey::Verify` per-attempt cost $Y$)**:
+- **Run C (native `CPubKey::Verify` per-attempt cost $Y$)**:
   - Run 1: 38.274023 µs/attempt (38,274.02 ns)
   - Run 2: 39.322511 µs/attempt (39,322.51 ns)
   - Run 3: 41.544015 µs/attempt (41,544.02 ns)
@@ -89,6 +93,9 @@ Because $r = 46.5889\% \ge 27.7291\%$, the verdict is **OPEN**.
 ## Scope and limits
 
 1. The 46.59% residual is a **ceiling**, not a promised speedup. It includes legacy sighash construction (re-serializing spending transactions), script parsing and stack evaluation, `bitcoinkernel` C++/FFI boundary costs, and memory allocation overhead.
-2. This ticket treats native Core `CPubKey::Verify` ($F = 39.32\ \mu\text{s}$) as the reference implementation and does not measure lower-level cryptographic optimizations or signature caching.
+2. This ticket treats `CPubKey::Verify` from libbitcoinkernel-sys 0.3.0
+   (Bitcoin Core 31.99.0 development sources, $F = 39.32\ \mu\text{s}$) as the
+   reference implementation and does not measure lower-level cryptographic
+   optimizations or signature caching.
 3. The non-crypto residual investigation remains **OPEN**, while transaction marshalling, parallel pool width, and threshold sweeps remain closed based on prior benchmarks.
 4. This finding makes no production code changes or performance promises; it establishes the empirical ceiling for any future non-crypto script path optimization.

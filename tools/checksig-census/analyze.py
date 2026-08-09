@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import statistics
 import struct
@@ -73,6 +74,30 @@ class AnalyzerError(Exception):
     """Fatal: malformed input or unparseable file."""
 
 
+def _require_positive_finite_float(value: object, field: str) -> float:
+    """Return value as float, or raise AnalyzerError if it is not a finite,
+    non-boolean, positive int/float.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AnalyzerError(
+            f"{field} must be a non-boolean int or float, got {type(value).__name__}"
+        )
+    f = float(value)
+    if math.isnan(f) or math.isinf(f):
+        raise AnalyzerError(f"{field} must be finite, got {value!r}")
+    if f <= 0.0:
+        raise AnalyzerError(f"{field} must be > 0, got {value!r}")
+    return f
+
+
+def _require_non_bool_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AnalyzerError(
+            f"{field} must be a non-boolean integer, got {type(value).__name__}"
+        )
+    return value
+
+
 # ── Data classes ────────────────────────────────────────────────────────────
 
 
@@ -107,7 +132,18 @@ class Counters:
         self.schema: int = int(raw.get("schema", 0))
         self.label: str = str(raw.get("label", ""))
         for name in COUNTER_NAMES:
-            setattr(self, name, int(raw.get(name, 0)))
+            if name not in raw:
+                raise AnalyzerError(f"counters JSON: missing required field {name!r}")
+            value = raw[name]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise AnalyzerError(
+                    f"counters JSON: field {name!r} must be int, got {type(value).__name__}"
+                )
+            if value < 0:
+                raise AnalyzerError(
+                    f"counters JSON: field {name!r} must be >= 0, got {value}"
+                )
+            setattr(self, name, value)
         self.record_count: int = int(raw.get("record_count", 0))
         self.journal_count: int = int(raw.get("journal_count", 0))
 
@@ -116,21 +152,46 @@ class Record:
     """Parsed 224-byte record."""
 
     __slots__ = (
-        "spend_txid", "input_index", "op_seq",
-        "op_kind", "sig_version", "outcome",
-        "der_len", "pubkey_len", "sighash_type",
-        "reject_reason", "sighash", "der_sig", "pubkey",
+        "spend_txid",
+        "input_index",
+        "op_seq",
+        "op_kind",
+        "sig_version",
+        "outcome",
+        "der_len",
+        "pubkey_len",
+        "sighash_type",
+        "reject_reason",
+        "sighash",
+        "der_sig",
+        "pubkey",
     )
 
     def __init__(self, raw: bytes) -> None:
         unpacked = RECORD_STRUCT.unpack(raw)
         (
-            self.spend_txid, self.input_index, self.op_seq,
-            self.op_kind, self.sig_version, self.outcome,
-            self.der_len, self.pubkey_len, self.sighash_type,
-            self.reject_reason, _pad0,
-            self.sighash, self.der_sig, self.pubkey, _pad1,
+            self.spend_txid,
+            self.input_index,
+            self.op_seq,
+            self.op_kind,
+            self.sig_version,
+            self.outcome,
+            self.der_len,
+            self.pubkey_len,
+            self.sighash_type,
+            self.reject_reason,
+            _pad0,
+            self.sighash,
+            self.der_sig,
+            self.pubkey,
+            _pad1,
         ) = unpacked
+        if self.outcome > 2:
+            raise AnalyzerError(f"record outcome {self.outcome} exceeds 2")
+        if self.der_len > 72:
+            raise AnalyzerError(f"record der_len {self.der_len} exceeds 72")
+        if self.pubkey_len > 65:
+            raise AnalyzerError(f"record pubkey_len {self.pubkey_len} exceeds 65")
 
     @property
     def sort_key(self) -> tuple[bytes, int, int]:
@@ -141,19 +202,26 @@ class JournalEntry:
     """Parsed 56-byte journal entry."""
 
     __slots__ = (
-        "spend_txid", "input_index",
-        "checksig_ops", "checkmultisig_ops",
-        "ecdsa_verify_calls", "ecdsa_verify_ok",
+        "spend_txid",
+        "input_index",
+        "checksig_ops",
+        "checkmultisig_ops",
+        "ecdsa_verify_calls",
+        "ecdsa_verify_ok",
         "verdict",
     )
 
     def __init__(self, raw: bytes) -> None:
         unpacked = JOURNAL_STRUCT.unpack(raw)
         (
-            self.spend_txid, self.input_index,
-            self.checksig_ops, self.checkmultisig_ops,
-            self.ecdsa_verify_calls, self.ecdsa_verify_ok,
-            self.verdict, _pad,
+            self.spend_txid,
+            self.input_index,
+            self.checksig_ops,
+            self.checkmultisig_ops,
+            self.ecdsa_verify_calls,
+            self.ecdsa_verify_ok,
+            self.verdict,
+            _pad,
         ) = unpacked
 
     @property
@@ -164,11 +232,15 @@ class JournalEntry:
 # ── Binary parsing ──────────────────────────────────────────────────────────
 
 
-def read_raw_entries(path: Path, magic: bytes, entry_size: int, name: str) -> list[bytes]:
+def read_raw_entries(
+    path: Path, magic: bytes, entry_size: int, name: str
+) -> list[bytes]:
     """Read a binary file with magic + u64 count header, return raw entry bytes."""
     data = path.read_bytes()
     if len(data) < HEADER_SIZE:
-        raise AnalyzerError(f"{path}: file too short ({len(data)} bytes < {HEADER_SIZE} header)")
+        raise AnalyzerError(
+            f"{path}: file too short ({len(data)} bytes < {HEADER_SIZE} header)"
+        )
     file_magic, count = HEADER_STRUCT.unpack_from(data, 0)
     if file_magic != magic:
         raise AnalyzerError(f"{path}: bad magic {file_magic!r}, expected {magic!r}")
@@ -279,7 +351,8 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, Any]]:
     inv(
         "INV-6",
         c.ecdsa_from_checksig <= c.op_checksig + c.op_checksigverify
-        and c.ecdsa_from_checkmultisig <= 20 * (c.op_checkmultisig + c.op_checkmultisigverify),
+        and c.ecdsa_from_checkmultisig
+        <= 20 * (c.op_checkmultisig + c.op_checkmultisigverify),
         "C_ECDSA_FROM_CHECKSIG <= C_OP_CHECKSIG + C_OP_CHECKSIGVERIFY; "
         "C_ECDSA_FROM_CHECKMULTISIG <= 20 * (C_OP_CHECKMULTISIG + C_OP_CHECKMULTISIGVERIFY)",
         from_checksig=c.ecdsa_from_checksig,
@@ -289,7 +362,9 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, Any]]:
     )
     inv(
         "INV-7",
-        c.op_checksigadd == 0 and c.checkschnorr_entries == 0 and c.schnorr_verify_calls == 0,
+        c.op_checksigadd == 0
+        and c.checkschnorr_entries == 0
+        and c.schnorr_verify_calls == 0,
         "C_OP_CHECKSIGADD == 0 and C_CHECKSCHNORR_ENTRIES == 0 and C_SCHNORR_VERIFY_CALLS == 0",
         op_checksigadd=c.op_checksigadd,
         checkschnorr_entries=c.checkschnorr_entries,
@@ -333,7 +408,8 @@ def check_journal_sums(journal: list[JournalEntry], c: Counters) -> dict[str, An
         "journal_sum_ecdsa_verify_calls": s_ecdsa_calls,
         "journal_sum_ecdsa_verify_ok": s_ecdsa_ok,
         "counter_op_checksig_plus_verify": c.op_checksig + c.op_checksigverify,
-        "counter_op_checkmultisig_plus_verify": c.op_checkmultisig + c.op_checkmultisigverify,
+        "counter_op_checkmultisig_plus_verify": c.op_checkmultisig
+        + c.op_checkmultisigverify,
         "counter_ecdsa_verify_calls": c.ecdsa_verify_calls,
         "counter_ecdsa_verify_ok": c.ecdsa_verify_ok,
     }
@@ -372,9 +448,11 @@ def check_count_repeat(
     c1: Counters, c2: Counters, sha1: str, sha2: str
 ) -> dict[str, Any]:
     """INV-13: two Run-B executions produce identical counters and sorted records SHA256."""
-    counters_identical = all(
-        getattr(c1, name) == getattr(c2, name) for name in COUNTER_NAMES
-    ) and c1.record_count == c2.record_count and c1.journal_count == c2.journal_count
+    counters_identical = (
+        all(getattr(c1, name) == getattr(c2, name) for name in COUNTER_NAMES)
+        and c1.record_count == c2.record_count
+        and c1.journal_count == c2.journal_count
+    )
     sha_match = sha1 == sha2
     return {
         "id": "INV-13",
@@ -415,7 +493,12 @@ def check_census_capture_agreement(
     for key in sorted(intersection):
         c = census_map[key]
         b = capture_map[key]
-        for field_name in ("checksig_ops", "checkmultisig_ops", "ecdsa_verify_calls", "ecdsa_verify_ok"):
+        for field_name in (
+            "checksig_ops",
+            "checkmultisig_ops",
+            "ecdsa_verify_calls",
+            "ecdsa_verify_ok",
+        ):
             cv = int(getattr(c, field_name))
             bv = int(getattr(b, field_name))
             if cv != bv:
@@ -490,15 +573,22 @@ def extract_bare_mode0(bare: dict[str, Any]) -> dict[str, Any]:
     missing = [f for f in _REQUIRED_FIELDS if f not in mode0]
     if missing:
         raise AnalyzerError(
-            "bare JSON: native_mode0 missing required fields: "
-            + ", ".join(missing)
+            "bare JSON: native_mode0 missing required fields: " + ", ".join(missing)
         )
 
-    inputs_per_round = int(mode0["inputs_per_round"])
-    rounds = int(mode0["rounds"])
-    attempts_total = int(mode0["attempts_total"])
-    mismatches = int(mode0["mismatches"])
-    ok_count = int(mode0["ok_count"])
+    inputs_per_round = _require_non_bool_int(
+        mode0["inputs_per_round"], "bare JSON: native_mode0.inputs_per_round"
+    )
+    rounds = _require_non_bool_int(mode0["rounds"], "bare JSON: native_mode0.rounds")
+    attempts_total = _require_non_bool_int(
+        mode0["attempts_total"], "bare JSON: native_mode0.attempts_total"
+    )
+    mismatches = _require_non_bool_int(
+        mode0["mismatches"], "bare JSON: native_mode0.mismatches"
+    )
+    ok_count = _require_non_bool_int(
+        mode0["ok_count"], "bare JSON: native_mode0.ok_count"
+    )
     first_mismatch = mode0["first_mismatch"]
 
     # Validate positive / non-negative values
@@ -518,13 +608,11 @@ def extract_bare_mode0(bare: dict[str, Any]) -> dict[str, Any]:
         )
     if ok_count < 0:
         raise AnalyzerError(
-            f"bare JSON: native_mode0.ok_count = {ok_count} "
-            "(must be non-negative)"
+            f"bare JSON: native_mode0.ok_count = {ok_count} (must be non-negative)"
         )
     if mismatches < 0:
         raise AnalyzerError(
-            f"bare JSON: native_mode0.mismatches = {mismatches} "
-            "(must be non-negative)"
+            f"bare JSON: native_mode0.mismatches = {mismatches} (must be non-negative)"
         )
 
     # Require attempts_total == inputs_per_round * rounds
@@ -540,33 +628,37 @@ def extract_bare_mode0(bare: dict[str, Any]) -> dict[str, Any]:
         raise AnalyzerError("bare JSON: native_mode0.round_ns is not a list")
     if len(round_ns_raw) != rounds:
         raise AnalyzerError(
-            f"bare JSON: round_ns length ({len(round_ns_raw)}) != "
-            f"rounds ({rounds})"
+            f"bare JSON: round_ns length ({len(round_ns_raw)}) != rounds ({rounds})"
         )
 
     round_ns: list[int] = []
     for i, ns in enumerate(round_ns_raw):
-        val = int(ns)
-        if val <= 0:
+        if isinstance(ns, bool) or not isinstance(ns, int):
             raise AnalyzerError(
-                f"bare JSON: round_ns[{i}] = {val} (must be positive)"
+                f"bare JSON: round_ns[{i}] = {ns!r} (must be a positive non-boolean integer)"
             )
-        round_ns.append(val)
+        if ns <= 0:
+            raise AnalyzerError(f"bare JSON: round_ns[{i}] = {ns} (must be positive)")
+        round_ns.append(ns)
 
     # Independently recompute per-round ns/attempt as round_ns / inputs_per_round.
     # Never divide by attempts_total for a single round.
-    per_attempt: list[float] = [
-        float(ns) / float(inputs_per_round) for ns in round_ns
-    ]
+    per_attempt: list[float] = [float(ns) / float(inputs_per_round) for ns in round_ns]
 
     # Median is the authoritative Y (not mean).
     recomputed_median = statistics.median(per_attempt)
     recomputed_min = min(per_attempt)
     recomputed_max = max(per_attempt)
 
-    reported_median = float(mode0["median_ns_per_attempt"])
-    reported_min = float(mode0["min_ns_per_attempt"])
-    reported_max = float(mode0["max_ns_per_attempt"])
+    reported_median = _require_positive_finite_float(
+        mode0["median_ns_per_attempt"], "bare JSON: median_ns_per_attempt"
+    )
+    reported_min = _require_positive_finite_float(
+        mode0["min_ns_per_attempt"], "bare JSON: min_ns_per_attempt"
+    )
+    reported_max = _require_positive_finite_float(
+        mode0["max_ns_per_attempt"], "bare JSON: max_ns_per_attempt"
+    )
 
     # Require reported median/min/max agree within floating tolerance.
     _REL_TOL = 1e-6
@@ -613,11 +705,35 @@ def extract_spike_width1(spike: dict[str, Any]) -> float:
     """Extract width-1 us_per_input from a spike run JSON."""
     if "runs" in spike and isinstance(spike["runs"], list):
         for run in spike["runs"]:
-            if isinstance(run, dict) and run.get("threads") == 1:
-                return float(run["us_per_input"])
+            if not isinstance(run, dict):
+                raise AnalyzerError("spike JSON: runs entry is not an object")
+            threads = run.get("threads")
+            if isinstance(threads, bool) or not isinstance(threads, int):
+                raise AnalyzerError(
+                    "spike JSON: run.threads must be a non-boolean integer"
+                )
+            if threads != 1:
+                continue
+            us = run.get("us_per_input")
+            if us is None:
+                raise AnalyzerError(
+                    "spike JSON: run with threads == 1 missing us_per_input"
+                )
+            return _require_positive_finite_float(us, "spike JSON: run.us_per_input")
         raise AnalyzerError("spike JSON: no run with threads == 1")
     if "us_per_input" in spike:
-        return float(spike["us_per_input"])
+        threads = spike.get("threads")
+        if isinstance(threads, bool) or not isinstance(threads, int):
+            raise AnalyzerError(
+                "spike JSON: top-level us_per_input requires threads to be a non-boolean integer"
+            )
+        if threads != 1:
+            raise AnalyzerError(
+                "spike JSON: top-level us_per_input requires threads == 1"
+            )
+        return _require_positive_finite_float(
+            spike["us_per_input"], "spike JSON: top-level us_per_input"
+            )
     raise AnalyzerError("spike JSON: no us_per_input found")
 
 
@@ -635,7 +751,9 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
 
     # Sort records and compute SHA256 for both runs
     raw1 = read_raw_entries(Path(args.records), RECORD_MAGIC, RECORD_SIZE, "records")
-    raw2 = read_raw_entries(Path(args.repeat_records), RECORD_MAGIC, RECORD_SIZE, "records")
+    raw2 = read_raw_entries(
+        Path(args.repeat_records), RECORD_MAGIC, RECORD_SIZE, "records"
+    )
     sorted1 = sort_records_raw(raw1)
     sorted2 = sort_records_raw(raw2)
     sha1 = sha256_hex(sorted1)
@@ -644,7 +762,7 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
     if args.sorted_records_output:
         out = Path(args.sorted_records_output)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(sorted1)
+        out.write_bytes(HEADER_STRUCT.pack(RECORD_MAGIC, len(raw1)) + sorted1)
 
     inv_results: list[dict[str, Any]] = []
     inv_results.extend(check_counter_arithmetic(counters))
@@ -653,7 +771,10 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
     inv_results.append(check_duplicate_keys(records))
     inv_results.append(check_count_repeat(counters, repeat_counters, sha1, sha2))
 
-    all_passed = all(r["passed"] for r in inv_results)
+    all_passed = (
+        all(r["passed"] for r in inv_results)
+        and counters.ffi_verify_entries == EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1
+    )
 
     report = {
         "schema": "validate-capture-v1",
@@ -671,6 +792,8 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
     out_path.write_text(json.dumps(report, indent=2) + "\n")
 
     failed = [r["id"] for r in inv_results if not r["passed"]]
+    if counters.ffi_verify_entries != EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1:
+        failed.append("EXP-KSPIKE1")
     if failed:
         print(f"validate-capture: FAILED — {', '.join(failed)}", file=sys.stderr)
         return 1
@@ -702,10 +825,16 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
         "actual": counters.ffi_verify_entries,
     }
     if not exp1_passed:
-        exp1["warning"] = "Value differs from published anchor — window, corpus, or published figure may have moved."
+        exp1["warning"] = (
+            "Value differs from published anchor — window, corpus, or published figure may have moved."
+        )
 
     # EXP-4: attempts-per-check comparison (census vs capture)
-    census_a = counters.ecdsa_verify_calls / counters.ffi_verify_entries if counters.ffi_verify_entries else 0.0
+    census_a = (
+        counters.ecdsa_verify_calls / counters.ffi_verify_entries
+        if counters.ffi_verify_entries
+        else 0.0
+    )
     capture_ecdsa_sum = sum(e.ecdsa_verify_calls for e in capture_journal)
     capture_count = len(capture_journal)
     capture_a = capture_ecdsa_sum / capture_count if capture_count else 0.0
@@ -724,9 +853,13 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
         "ratio": ratio,
     }
     if not exp4_passed and ratio > 0:
-        exp4["warning"] = "Corpus over-represents multisig; report both ratios and extrapolate with the whole-window ratio."
+        exp4["warning"] = (
+            "Corpus over-represents multisig; report both ratios and extrapolate with the whole-window ratio."
+        )
 
-    all_passed = all(r["passed"] for r in inv_results) and exp1["passed"] and exp4["passed"]
+    all_passed = (
+        all(r["passed"] for r in inv_results) and exp1["passed"] and exp4["passed"]
+    )
 
     report = {
         "schema": "validate-census-v1",
@@ -758,9 +891,13 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
 
 def cmd_verdict(args: argparse.Namespace) -> int:
     if len(args.bare_runs) != 3:
-        raise AnalyzerError(f"verdict requires exactly three bare-runs, got {len(args.bare_runs)}")
+        raise AnalyzerError(
+            f"verdict requires exactly three bare-runs, got {len(args.bare_runs)}"
+        )
     if len(args.spike_runs) != 3:
-        raise AnalyzerError(f"verdict requires exactly three spike-runs, got {len(args.spike_runs)}")
+        raise AnalyzerError(
+            f"verdict requires exactly three spike-runs, got {len(args.spike_runs)}"
+        )
     capture_counters = parse_counters(Path(args.capture_counters))
     k_entries = capture_counters.ffi_verify_entries
     if k_entries == 0:
@@ -778,7 +915,9 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         raise AnalyzerError("no spike run files provided")
 
     x_us = statistics.median(spike_values)
-    spike_spread_us = (max(spike_values) - min(spike_values)) if len(spike_values) > 1 else 0.0
+    spike_spread_us = (
+        (max(spike_values) - min(spike_values)) if len(spike_values) > 1 else 0.0
+    )
 
     # Extract and validate every bare timing run.
     run_records: list[dict[str, Any]] = []
@@ -806,9 +945,16 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         ):
             if field not in inv8_raw:
                 raise AnalyzerError(f"{bare_path}: inv_8 missing {field}")
-        inv8_mismatches = int(inv8_raw["mismatches"])
-        inv8_ok_count = int(inv8_raw["ok_count"])
-        inv8_expected = int(inv8_raw["expected_true_count"])
+        inv8_mismatches = _require_non_bool_int(
+            inv8_raw["mismatches"], f"{bare_path}: inv_8 mismatches"
+        )
+        inv8_ok_count = _require_non_bool_int(
+            inv8_raw["ok_count"], f"{bare_path}: inv_8 ok_count"
+        )
+        inv8_expected = _require_non_bool_int(
+            inv8_raw["expected_true_count"],
+            f"{bare_path}: inv_8 expected_true_count",
+        )
         inv8_ok_eq = inv8_raw["ok_equals_count_outcome_1"]
         if not isinstance(inv8_ok_eq, bool):
             raise AnalyzerError(
@@ -816,15 +962,15 @@ def cmd_verdict(args: argparse.Namespace) -> int:
             )
         inv8_emitted_passed = inv8_raw["passed"]
         if not isinstance(inv8_emitted_passed, bool):
-            raise AnalyzerError(
-                f"{bare_path}: inv_8 passed is not a boolean"
-            )
+            raise AnalyzerError(f"{bare_path}: inv_8 passed is not a boolean")
         inv8_run_passed = (
             inv8_mismatches == 0
             and inv8_ok_count == inv8_expected
             and inv8_expected == k_entries
             and inv8_ok_eq
             and inv8_emitted_passed
+            and mode0["mismatches"] == inv8_mismatches
+            and mode0["ok_count"] == inv8_ok_count
         )
 
         # INV-15: every run must contain exactly the 22 COUNTER_NAMES with
@@ -842,9 +988,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                 f"{bare_path}: inv_15 all_counters_zero is not a boolean"
             )
         if not isinstance(inv15_passed_emitted, bool):
-            raise AnalyzerError(
-                f"{bare_path}: inv_15 passed is not a boolean"
-            )
+            raise AnalyzerError(f"{bare_path}: inv_15 passed is not a boolean")
         inv15_counters = inv15_raw["counters"]
         if not isinstance(inv15_counters, dict):
             raise AnalyzerError(f"{bare_path}: inv_15 counters is not a dict")
@@ -902,7 +1046,9 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                     "all_counters_zero": inv15_all_zero,
                     "passed_emitted": inv15_passed_emitted,
                     "computed_all_zero": computed_all_zero,
-                    "counters": {name: int(inv15_counters[name]) for name in COUNTER_NAMES},
+                    "counters": {
+                        name: int(inv15_counters[name]) for name in COUNTER_NAMES
+                    },
                 },
                 "rust_secp_diagnostic": bare_raw.get("rust_secp_diagnostic"),
             }
@@ -925,7 +1071,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     # Rust secp diagnostic is a per-run non-gating observation; report first present.
     rust_secp_diagnostic = next(
-        (r["rust_secp_diagnostic"] for r in run_records if r["rust_secp_diagnostic"] is not None),
+        (
+            r["rust_secp_diagnostic"]
+            for r in run_records
+            if r["rust_secp_diagnostic"] is not None
+        ),
         None,
     )
 
@@ -944,7 +1094,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         if field not in integrity_raw:
             raise AnalyzerError(f"{args.integrity}: missing {field}")
         value = integrity_raw[field]
-        if not isinstance(value, str) or len(value) != 64 or not re.fullmatch(r"[0-9a-f]{64}", value):
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or not re.fullmatch(r"[0-9a-f]{64}", value)
+        ):
             raise AnalyzerError(
                 f"{args.integrity}: {field} is not a 64-character lowercase hex string"
             )
@@ -982,10 +1136,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     r_frac = r_us / x_us if x_us != 0 else 0.0
 
     # Threshold: 5% of total wall, expressed as fraction of script wall
-    current_wall = float(args.current_wall_seconds)
-    current_script_wall = float(args.current_script_wall_seconds)
-    if current_script_wall == 0:
-        raise AnalyzerError("current_script_wall_seconds == 0")
+    current_wall = _require_positive_finite_float(
+        args.current_wall_seconds, "current_wall_seconds"
+    )
+    current_script_wall = _require_positive_finite_float(
+        args.current_script_wall_seconds, "current_script_wall_seconds"
+    )
     threshold = 0.05 * current_wall / current_script_wall
 
     # Noise estimate
@@ -1063,6 +1219,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     print(f"verdict: {verdict} — {rationale}")
     return 0 if verdict != "INVALID" else 2
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze.py",
@@ -1074,9 +1231,15 @@ def build_parser() -> argparse.ArgumentParser:
     vc.add_argument("--counters", required=True, help="Run B counters JSON (first run)")
     vc.add_argument("--records", required=True, help="Run B records binary (first run)")
     vc.add_argument("--journal", required=True, help="Run B journal binary (first run)")
-    vc.add_argument("--repeat-counters", required=True, help="Run B counters JSON (second run)")
-    vc.add_argument("--repeat-records", required=True, help="Run B records binary (second run)")
-    vc.add_argument("--repeat-journal", required=True, help="Run B journal binary (second run)")
+    vc.add_argument(
+        "--repeat-counters", required=True, help="Run B counters JSON (second run)"
+    )
+    vc.add_argument(
+        "--repeat-records", required=True, help="Run B records binary (second run)"
+    )
+    vc.add_argument(
+        "--repeat-journal", required=True, help="Run B journal binary (second run)"
+    )
     vc.add_argument("--output", required=True, help="output validation report JSON")
     vc.add_argument(
         "--sorted-records-output",
@@ -1085,15 +1248,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vc.set_defaults(func=cmd_validate_capture)
 
-    vs = sub.add_parser("validate-census", help="validate Run A census + cross-check with Run B")
+    vs = sub.add_parser(
+        "validate-census", help="validate Run A census + cross-check with Run B"
+    )
     vs.add_argument("--counters", required=True, help="Run A census counters JSON")
     vs.add_argument("--journal", required=True, help="Run A census journal binary")
-    vs.add_argument("--capture-journal", required=True, help="Run B capture journal binary")
+    vs.add_argument(
+        "--capture-journal", required=True, help="Run B capture journal binary"
+    )
     vs.add_argument("--output", required=True, help="output validation report JSON")
     vs.set_defaults(func=cmd_validate_census)
 
     vd = sub.add_parser("verdict", help="compute OPEN/CLOSED/INVALID verdict")
-    vd.add_argument("--capture-counters", required=True, help="Run B capture counters JSON")
+    vd.add_argument(
+        "--capture-counters", required=True, help="Run B capture counters JSON"
+    )
     vd.add_argument(
         "--bare-runs",
         required=True,

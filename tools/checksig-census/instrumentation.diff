@@ -99,7 +99,7 @@ index f21ea04..f8706c5 100644
  
  const btck_TransactionOutPoint* btck_transaction_input_get_out_point(const btck_TransactionInput* input)
  {
-@@ -1437,10 +1458,99 @@ int btck_block_header_to_bytes(const btck_BlockHeader* header, unsigned char out
+@@ -1437,10 +1458,100 @@ int btck_block_header_to_bytes(const btck_BlockHeader* header, unsigned char out
          return 0;
      } catch (...) {
          return -1;
@@ -152,6 +152,7 @@ index f21ea04..f8706c5 100644
 +
 +    for (uint64_t i = 0; i < count; i++) {
 +        const auto& inp = inputs[i];
++        if (inp.der_len > 72 || inp.pubkey_len > 65 || inp.expected > 1) return -1;
 +        pubkeys.emplace_back(inp.pubkey, inp.pubkey + inp.pubkey_len);
 +        sigs.emplace_back(inp.der_sig, inp.der_sig + inp.der_len);
 +        uint256 h;
@@ -183,11 +184,11 @@ index f21ea04..f8706c5 100644
 +    // Timed rounds - no I/O, no counters, no locks
 +    uint64_t attempts = count * timed_rounds;
 +    for (uint32_t r = 0; r < timed_rounds; r++) {
-+        auto start = std::chrono::high_resolution_clock::now();
++        auto start = std::chrono::steady_clock::now();
 +        for (uint64_t i = 0; i < count; i++) {
 +            pubkeys[i].Verify(hashes[i], sigs[i]);
 +        }
-+        auto end = std::chrono::high_resolution_clock::now();
++        auto end = std::chrono::steady_clock::now();
 +        result->round_ns[r] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 +    }
 +

@@ -154,12 +154,14 @@ not one interleaved run. See
 ### Script-check floor
 
 The native reference baseline for script verification, calculated by
-running the exact captured input corpus through native Core `CPubKey::Verify`
-(public key parsing, lax DER parsing, signature normalization, and
-`secp256k1_ecdsa_verify`). On mainnet 0..150,000, all 2,868,199 input checks
-execute exactly one `OP_CHECKSIG` and one successful ECDSA verification
-($a = 1.0$). Native `CPubKey::Verify` execution averages 39.32 µs per attempt
-($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$).
+running the exact captured input corpus through `CPubKey::Verify` from
+libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
+31.99.0 development sources: public key parsing, lax DER parsing, signature
+normalization, and `secp256k1_ecdsa_verify`). On mainnet 0..150,000, all
+2,868,199 input checks execute exactly one `OP_CHECKSIG` and one successful
+ECDSA verification ($a = 1.0$). Native `CPubKey::Verify` execution averages
+39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs
+per check ($X$).
 
 The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA
 overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI

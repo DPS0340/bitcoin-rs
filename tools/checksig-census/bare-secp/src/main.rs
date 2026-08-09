@@ -2,9 +2,10 @@
 //!
 //! Reads BRSREC1 records produced by the capture/census phase, converts them
 //! to `btck_bare_input` structs, and calls the native `btck_bare_verify_bench`
-//! mode 0 (Core 0.7.2 `CPubKey::Verify`: parse pubkey + lax DER + normalize +
-//! verify). Also runs Rust secp256k1 0.31.1 verify-only and parse+verify as
-//! diagnostics.
+//! mode 0 (`CPubKey::Verify` from libbitcoinkernel-sys 0.3.0 via bitcoinkernel
+//! 0.2.1, embedding Bitcoin Core 31.99.0 development sources: parse pubkey +
+//! lax DER + normalize + verify). Also runs Rust secp256k1 0.31.1 verify-only
+//! and parse+verify as diagnostics.
 //!
 //! CLI: `--records PATH --warmup N --rounds N [--output PATH]`
 //! Emits JSON to `--output` or stdout.
@@ -81,10 +82,9 @@ fn main() -> Result<()> {
             pad: [0u8; 4],
         };
         input.sighash.copy_from_slice(&rec.sighash);
-        let der_copy = rec.der_len.min(72) as usize;
-        input.der_sig[..der_copy].copy_from_slice(&rec.der_sig[..der_copy]);
-        let pk_copy = rec.pubkey_len.min(65) as usize;
-        input.pubkey[..pk_copy].copy_from_slice(&rec.pubkey[..pk_copy]);
+        input.der_sig[..rec.der_len as usize].copy_from_slice(&rec.der_sig[..rec.der_len as usize]);
+        input.pubkey[..rec.pubkey_len as usize]
+            .copy_from_slice(&rec.pubkey[..rec.pubkey_len as usize]);
         inputs.push(input);
     }
     let expected_true_count: u64 = inputs.iter().filter(|inp| inp.expected == 1).count() as u64;
@@ -349,6 +349,39 @@ struct ParsedRecord {
     pubkey_len: u8,
     outcome: u8,
 }
+fn parse_record(buf: &[u8; RECORD_SIZE], index: u64) -> Result<ParsedRecord> {
+    let outcome = buf[42];
+    let der_len = buf[43];
+    let pubkey_len = buf[44];
+
+    if der_len > 72 {
+        bail!("record {index}: der_len {der_len} exceeds 72");
+    }
+    if pubkey_len > 65 {
+        bail!("record {index}: pubkey_len {pubkey_len} exceeds 65");
+    }
+    if outcome > 2 {
+        bail!("record {index}: outcome {outcome} exceeds 2");
+    }
+
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(&buf[48..80]);
+
+    let mut der_sig = [0u8; 72];
+    der_sig.copy_from_slice(&buf[80..152]);
+
+    let mut pubkey = [0u8; 65];
+    pubkey.copy_from_slice(&buf[152..217]);
+
+    Ok(ParsedRecord {
+        sighash,
+        der_sig,
+        pubkey,
+        der_len,
+        pubkey_len,
+        outcome,
+    })
+}
 
 fn load_records(path: &std::path::Path) -> Result<Vec<ParsedRecord>> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -371,24 +404,7 @@ fn load_records(path: &std::path::Path) -> Result<Vec<ParsedRecord>> {
         reader
             .read_exact(&mut buf)
             .with_context(|| format!("read record {i}"))?;
-
-        let mut sighash = [0u8; 32];
-        sighash.copy_from_slice(&buf[48..80]);
-
-        let mut der_sig = [0u8; 72];
-        der_sig.copy_from_slice(&buf[80..152]);
-
-        let mut pubkey = [0u8; 65];
-        pubkey.copy_from_slice(&buf[152..217]);
-
-        records.push(ParsedRecord {
-            sighash,
-            der_sig,
-            pubkey,
-            der_len: buf[43],
-            pubkey_len: buf[44],
-            outcome: buf[42],
-        });
+        records.push(parse_record(&buf, i)?);
     }
 
     // Reject trailing bytes
@@ -398,4 +414,136 @@ fn load_records(path: &std::path::Path) -> Result<Vec<ParsedRecord>> {
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_buf() -> [u8; RECORD_SIZE] {
+        let mut buf = [0u8; RECORD_SIZE];
+        buf[42] = 1;
+        buf[43] = 72;
+        buf[44] = 65;
+        for (i, byte) in buf[48..80].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        for (i, byte) in buf[80..152].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        for (i, byte) in buf[152..217].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_valid_boundary() {
+        let mut buf = valid_buf();
+        // exact boundary: der_len=72, pubkey_len=65, outcome=2
+        buf[42] = 2;
+        let rec = parse_record(&buf, 0).unwrap();
+        assert_eq!(rec.outcome, 2);
+        assert_eq!(rec.der_len, 72);
+        assert_eq!(rec.pubkey_len, 65);
+        assert_eq!(&rec.sighash, &buf[48..80]);
+        assert_eq!(&rec.der_sig[..], &buf[80..152]);
+        assert_eq!(&rec.pubkey[..], &buf[152..217]);
+    }
+
+    #[test]
+    fn parse_rejects_der_len_too_large() {
+        let mut buf = valid_buf();
+        buf[43] = 73;
+        assert!(parse_record(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_pubkey_len_too_large() {
+        let mut buf = valid_buf();
+        buf[44] = 66;
+        assert!(parse_record(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_outcome_too_large() {
+        let mut buf = valid_buf();
+        buf[42] = 3;
+        assert!(parse_record(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn ffi_rejects_invalid_der_len() {
+        let input = libbitcoinkernel_sys::btck_bare_input {
+            sighash: [0u8; 32],
+            der_sig: [0u8; 72],
+            pubkey: [0u8; 65],
+            der_len: 73,
+            pubkey_len: 65,
+            expected: 1,
+            pad: [0u8; 4],
+        };
+        let mut result = libbitcoinkernel_sys::btck_bare_result {
+            attempts: 0,
+            rounds: 0,
+            mismatches: 0,
+            first_mismatch: u64::MAX,
+            ok_count: 0,
+            round_ns: [0u64; 64],
+        };
+        let rc = unsafe {
+            libbitcoinkernel_sys::btck_bare_verify_bench(&input, 1, 0, 1, 0, &mut result)
+        };
+        assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn ffi_rejects_invalid_pubkey_len() {
+        let input = libbitcoinkernel_sys::btck_bare_input {
+            sighash: [0u8; 32],
+            der_sig: [0u8; 72],
+            pubkey: [0u8; 65],
+            der_len: 72,
+            pubkey_len: 66,
+            expected: 1,
+            pad: [0u8; 4],
+        };
+        let mut result = libbitcoinkernel_sys::btck_bare_result {
+            attempts: 0,
+            rounds: 0,
+            mismatches: 0,
+            first_mismatch: u64::MAX,
+            ok_count: 0,
+            round_ns: [0u64; 64],
+        };
+        let rc = unsafe {
+            libbitcoinkernel_sys::btck_bare_verify_bench(&input, 1, 0, 1, 0, &mut result)
+        };
+        assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn ffi_rejects_expected_greater_than_one() {
+        let input = libbitcoinkernel_sys::btck_bare_input {
+            sighash: [0u8; 32],
+            der_sig: [0u8; 72],
+            pubkey: [0u8; 65],
+            der_len: 72,
+            pubkey_len: 65,
+            expected: 2,
+            pad: [0u8; 4],
+        };
+        let mut result = libbitcoinkernel_sys::btck_bare_result {
+            attempts: 0,
+            rounds: 0,
+            mismatches: 0,
+            first_mismatch: u64::MAX,
+            ok_count: 0,
+            round_ns: [0u64; 64],
+        };
+        let rc = unsafe {
+            libbitcoinkernel_sys::btck_bare_verify_bench(&input, 1, 0, 1, 0, &mut result)
+        };
+        assert_eq!(rc, -1);
+    }
 }

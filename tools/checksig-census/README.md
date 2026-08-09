@@ -2,13 +2,15 @@
 
 Answers wayfinder ticket **Task: CHECKSIG census and per-check floor comparison over 0-150k**.
 
-Measures the per-CHECKSIG-attempt cost floor in Bitcoin Core 0.7.2 `CPubKey::Verify`
-and compares it against the per-input script-verification cost in bitcoin-rs.
-If the residual `R = X - F` is large enough, script verification has headroom
-worth optimizing; if `R` is near zero or negative, CHECKSIG attempts are the
-floor and no script-path optimization can help. The comparator is native Core
-`CPubKey::Verify`, not an irreducible cryptographic floor; the residual is a
-ceiling over non-native per-check work, not a guaranteed removable gain.
+Measures the per-CHECKSIG-attempt cost floor in `CPubKey::Verify` from
+libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
+31.99.0 development sources) and compares it against the per-input
+script-verification cost in bitcoin-rs. If the residual `R = X - F` is large
+enough, script verification has headroom worth optimizing; if `R` is near zero
+or negative, CHECKSIG attempts are the floor and no script-path optimization
+can help. The comparator is native `CPubKey::Verify` from that development
+tree, not an irreducible cryptographic floor; the residual is a ceiling over
+non-native per-check work, not a guaranteed removable gain.
 
 ## Layout
 
@@ -171,7 +173,7 @@ python3 analyze.py validate-capture \
 Checks INV-1 through INV-11 and INV-13 (count-repeat equivalence).
 Writes `kspike1.records.sorted.bin` (sorted by spend_txid, input_index, op_seq).
 
-### Run C — bare-secp per-attempt timing (Core 0.7.2 mode 0)
+### Run C — bare-secp per-attempt timing (native mode 0)
 
 ```bash
 REPO=/home/alpha/exp/bitcoin-rs
@@ -197,10 +199,11 @@ spike inputs. Each file also contains:
 - `inv_15` (exactly the 22 named post-timing counters, each integer zero,
   plus `all_counters_zero == true` and `passed == true`);
 - `rust_secp_diagnostic` — a 2-record parser incompatibility between Rust
-  secp256k1 0.31.1/libsecp 0.6.0 and Core 0.7.2 that causes 2 expected-valid
-  preparse failures. This is a **diagnostic** incompatibility and does NOT
-  invalidate the Core-native authoritative arm. INV-8 gates only on
-  native correctness; the Rust diagnostic is reported but not gated.
+  secp256k1 0.31.1/libsecp 0.6.0 and the native tree (Bitcoin Core 31.99.0
+  development sources) that causes 2 expected-valid preparse failures. This
+  is a **diagnostic** incompatibility and does NOT invalidate the native
+  authoritative arm. INV-8 gates only on native correctness; the Rust
+  diagnostic is reported but not gated.
 - `schema` and `records_total`/`records_rejected_pre_secp` for cross-checks.
 
 INV-14 is supplied through `--integrity`. The analyzer validates all four
@@ -279,8 +282,9 @@ EXP-1 (expected input count), EXP-4 (attempts/check ratio).
 
 INV-14 proves the patched `libbitcoinkernel-sys` builds from the same
 `bitcoin/src/pubkey.cpp` and `bitcoin/src/secp256k1` tree as the pristine
-cargo-registry source, so the native timing reflects unmodified Core 0.7.2
-`CPubKey::Verify` logic. Object-byte identity is deliberately not required
+cargo-registry source, so the native timing reflects unmodified
+`CPubKey::Verify` logic from Bitcoin Core 31.99.0 development sources.
+Object-byte identity is deliberately not required
 because RelWithDebInfo embeds absolute source paths in debug info; the build
 has no LTO or IPO.
 
