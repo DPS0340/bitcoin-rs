@@ -22,24 +22,13 @@ tags:
   - replay
 ---
 
-# Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5× and took Core's lead to 1.28×
+# Contended pool tuning hid CPU cost; prepared txids and AVX2 Merkle hashing now beat Core by 1.32×
 
 ## Current matched result (2026-08-09)
 
-The current local-file, full-verification replay no longer trails Core. At
-commit `ff2615a`, three interleaved rounds measured production-matched
-bitcoin-rs at **56.16s / 396.50 CPU-s** and Core 31.0 at
-**64.74s / 477.82 CPU-s**. bitcoin-rs leads 1.153× on wall time and 1.205× on
-total CPU for this processing-bound fjall panel.
+The current local-file, full-verification replay uses prepared txids and the AVX2 Merkle reducer from commits `b7e5657` and `65bae8d`. Three interleaved rounds measured bitcoin-rs at **49.356s / 390.542 CPU-s** and Core 31.0 at **64.914s / 481.092 CPU-s**. bitcoin-rs leads 1.315× on wall time and 1.232× on total CPU for this processing-bound fjall panel. Candidate peak RSS was 1.042× Core.
 
-Allocator parity is load-bearing for wall time: the same bitcoin-rs source
-with the system allocator measured 63.43s / 399.63 CPU-s. Mimalloc clears the
-wall gate but not the CPU gate, and raises peak RSS from 573,440,000 to
-664,252,416 bytes. The system and mimalloc validation passes matched Core's
-height-150,000 MuHash, UTXO count, total amount, and stop hash. See
-[`allocator-parity-changes-wall-not-cpu.md`](../performance/allocator-parity-changes-wall-not-cpu.md)
-and the tracked
-[`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json).
+The preceding allocator panel at `ff2615a` established the production-matched control: mimalloc changed wall scheduling, not total work. That panel measured 56.16s / 396.50 CPU-s with mimalloc and 63.43s / 399.63 CPU-s with the system allocator. Its validation passes matched Core's height-150000 MuHash, UTXO count, total amount, and stop hash. See [`allocator-parity-changes-wall-not-cpu.md`](../performance/allocator-parity-changes-wall-not-cpu.md), [`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json), and the final [`avx2-merkle-custody-v1.json`](../../benchmarks/data/end-to-end-sync/avx2-merkle-custody-v1.json).
 
 All older processing-bound Core-lead figures below remain historical evidence;
 they are not the current verdict. The P2P figures describe a different sync
