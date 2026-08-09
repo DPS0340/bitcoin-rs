@@ -1,0 +1,158 @@
+# CHECKSIG census and the script-check floor
+
+Status: **OPEN.** The CHECKSIG census over mainnet blocks 0..150,000 shows
+that native Core `CPubKey::Verify` accounts for 39.32 µs (53.41%) of the
+73.62 µs width-1 kernel verification cost per input check. The remaining
+34.30 µs (46.59%) covers legacy sighash construction, script evaluation,
+and wrapper overhead. That residual exceeds the 27.73% lever threshold.
+
+## Census methodology and 22-counter results
+
+The production `libbitcoinkernel` FFI verification path was instrumented to capture all script execution and cryptographic operations across mainnet blocks 0..150,000 without altering verification semantics.
+
+Across 2,868,199 input checks, the 22 u64 counters yielded:
+
+| Counter Name | Count | Description |
+|---|---|---|
+| `verify_script_calls` | 2,868,199 | Total script verification invocations |
+| `ffi_verify_entries` | 2,868,199 | Bitcoinkernel FFI verify entry calls |
+| `ffi_verify_true` | 2,868,199 | Successful FFI verify returns |
+| `eval_script_entries` | 5,736,398 | Script evaluator entry points (scriptPubKey & scriptSig) |
+| `op_checksig` | 2,868,199 | `OP_CHECKSIG` executions |
+| `op_checksigverify` | 0 | `OP_CHECKSIGVERIFY` executions |
+| `op_checkmultisig` | 0 | `OP_CHECKMULTISIG` executions |
+| `op_checkmultisigverify` | 0 | `OP_CHECKMULTISIGVERIFY` executions |
+| `op_checksigadd` | 0 | `OP_CHECKSIGADD` executions (Taproot/BIP342) |
+| `checkecdsa_entries` | 2,868,199 | Internal ECDSA check entries |
+| `checkecdsa_reject_pubkey` | 0 | Invalid public key pre-secp rejects |
+| `checkecdsa_reject_empty_sig` | 0 | Empty signature pre-secp rejects |
+| `checkecdsa_reject_missing_data` | 0 | Missing transaction data rejects |
+| `ecdsa_verify_calls` | 2,868,199 | `secp256k1_ecdsa_verify` calls |
+| `ecdsa_verify_ok` | 2,868,199 | Successful `secp256k1_ecdsa_verify` calls |
+| `ecdsa_verify_fail` | 0 | Failed `secp256k1_ecdsa_verify` calls |
+| `ecdsa_from_checksig` | 2,868,199 | ECDSA calls originating from `OP_CHECKSIG` |
+| `ecdsa_from_checkmultisig` | 0 | ECDSA calls originating from `OP_CHECKMULTISIG` |
+| `sighash_computed` | 2,868,199 | Legacy signature hash computations |
+| `sighash_midstate_hit` | 0 | Sighash midstate cache hits |
+| `checkschnorr_entries` | 0 | Schnorr check entries |
+| `schnorr_verify_calls` | 0 | Schnorr verification calls |
+
+**Key Census Fact**: Exactly $a = 1.0$ ECDSA attempts occur per kernel script check ($2,868,199 / 2,868,199$). There are zero pre-secp rejects, zero failures, zero multisig operations, and zero Schnorr checks in this historical 0..150,000 window.
+
+## Capture corpus and integrity proofs
+
+- **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`
+- **Corpus Size & SHA-256**: 39,815,149 bytes; SHA-256 `16cbaf17feb16ad9b567b4680a5eaf449699037f9696ccb2366af3f48b756fa2` (300 blocks, 159,259 non-coinbase inputs).
+- **Capture Repeat (INV-13)**: Both 159,259-record captures produced sorted-record SHA-256 `9841e3afc79018400c568d86b60747f9a0c1d6d1184fc3caf4815860f88739d2`.
+- **Native Comparator**: Vendored Bitcoin Core 0.7.2 `CPubKey::Verify` compiled inside `libbitcoinkernel-sys`, executing public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`.
+- **Source Integrity (INV-14)**: `bitcoin/src/pubkey.cpp` SHA-256 is byte-identical in pristine and instrumented trees (`0c86716f3626f591e643bd327fe0e48f6cebba8da3aba91ec6587256d725f1c0`). The 178-file `secp256k1` tree manifest SHA-256 is byte-identical (`b61a27000f45b4408f8699bea9ec69668677696fbc22685e8c4111e1a5e7c6ee`). Source identity is authoritative as the debug build (`RelWithDebInfo`) embeds source paths with no LTO/IPO.
+- **Native Correctness (INV-8)**: 159,259 expected true vs 159,259 native true; 0 mismatches (`mismatches == 0`, `ok_equals_count_outcome_1 == true`).
+- **Instrumentation Isolation (INV-15)**: All 22 counters stayed at 0 during direct native timing runs.
+- **Rust Diagnostic**: Rust `secp256k1` 0.31.1 rejected 2 lax-DER records pre-verification due to strict DER parser differences; Core native parity is authoritative.
+
+## Reproducible experiment commands
+
+The experiment harness lives in `.outline/experiments/checksig-census/`:
+
+```bash
+EXP=.outline/experiments/checksig-census
+
+# 1. Build harnesses from repo root with explicit target directories
+cargo build --release --manifest-path $EXP/capture/Cargo.toml --target-dir $EXP/capture/target
+cargo build --release --manifest-path $EXP/bare-secp/Cargo.toml --target-dir $EXP/bare-secp/target
+cargo build --release -p bitcoin-rs-node --example mainnet_prefix_replay \
+  --config 'patch.crates-io.libbitcoinkernel-sys.path=".outline/experiments/checksig-census/libbitcoinkernel-sys-0.3.0"' \
+  --target-dir $EXP/target-instrumented
+cargo build --release -p bitcoin-rs-consensus --example kernel_verify_spike --target-dir target
+
+# 2. Run A — full census (0..150k) using direct instrumented replay binary
+mkdir -p $EXP/out
+BRS_CENSUS_COUNTERS=$EXP/out/census-0-150k.counters.json \
+BRS_CENSUS_JOURNAL=$EXP/out/census-0-150k.journal.bin \
+BRS_CENSUS_LABEL=census-0-150k \
+taskset -c 0-31 \
+./$EXP/target-instrumented/release/examples/mainnet_prefix_replay \
+  --stop-height 150000 --rest-url 127.0.0.1:18443 --assume-valid-height 0 \
+  --data-dir $EXP/out/census-datadir --output json
+
+# 3. Run B — KSPIKE1 capture (run 2x for INV-13 count-repeat check)
+CORPUS=/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin
+CAPTURE=./$EXP/capture/target/release/checksig-census-capture
+
+BRS_CENSUS_COUNTERS=$EXP/out/kspike1.counters.json BRS_CENSUS_JOURNAL=$EXP/out/kspike1.journal.bin \
+BRS_CENSUS_RECORDS=$EXP/out/kspike1.records.bin BRS_CENSUS_LABEL=kspike1 \
+$CAPTURE --corpus $CORPUS --output $EXP/out/kspike1.summary.json
+
+BRS_CENSUS_COUNTERS=$EXP/out/kspike1-repeat.counters.json BRS_CENSUS_JOURNAL=$EXP/out/kspike1-repeat.journal.bin \
+BRS_CENSUS_RECORDS=$EXP/out/kspike1-repeat.records.bin BRS_CENSUS_LABEL=kspike1 \
+$CAPTURE --corpus $CORPUS --output $EXP/out/kspike1-repeat.summary.json
+
+# 4. Validate capture & sort records
+python3 $EXP/analyze.py validate-capture \
+  --counters $EXP/out/kspike1.counters.json --records $EXP/out/kspike1.records.bin --journal $EXP/out/kspike1.journal.bin \
+  --repeat-counters $EXP/out/kspike1-repeat.counters.json --repeat-records $EXP/out/kspike1-repeat.records.bin --repeat-journal $EXP/out/kspike1-repeat.journal.bin \
+  --output $EXP/out/validate-capture.json --sorted-records-output $EXP/out/kspike1.records.sorted.bin
+
+# 5. Run C — bare-secp timing (Core 0.7.2 mode 0, 3 runs pinned to taskset -c 0-31)
+BARE=./$EXP/bare-secp/target/release/checksig-bare-secp
+for i in 1 2 3; do
+  taskset -c 0-31 $BARE \
+    --records $EXP/out/kspike1.records.sorted.bin \
+    --output $EXP/out/bare-secp-$i.json
+done
+
+# 6. Run D — uninstrumented kernel_verify_spike (3 pinned runs)
+SPIKE=./target/release/examples/kernel_verify_spike
+for i in 1 2 3; do
+  taskset -c 0-31 $SPIKE \
+    --corpus /home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin \
+    --output $EXP/out/spike-control-$i.json
+done
+
+# 7. Validate census, integrity & compute final verdict
+python3 $EXP/analyze.py validate-census \
+  --counters $EXP/out/census-0-150k.counters.json --journal $EXP/out/census-0-150k.journal.bin \
+  --capture-journal $EXP/out/kspike1.journal.bin --output $EXP/out/validate-census.json
+
+python3 $EXP/analyze.py verdict \
+  --capture-counters $EXP/out/kspike1.counters.json \
+  --bare-runs $EXP/out/bare-secp-1.json $EXP/out/bare-secp-2.json $EXP/out/bare-secp-3.json \
+  --spike-runs $EXP/out/spike-control-1.json $EXP/out/spike-control-2.json $EXP/out/spike-control-3.json \
+  --current-wall-seconds 69.6 --current-script-wall-seconds 12.55 \
+  --integrity $EXP/out/integrity.json --output $EXP/out/verdict.json
+```
+
+## Three-run timing and decision arithmetic
+
+All runs pinned to `taskset -c 0-31`:
+
+- **Run D (Spike Width-1 Per-Input Verification Cost $X$)**:
+  - Run 1: 74.361958 µs/check
+  - Run 2: 70.508882 µs/check
+  - Run 3: 73.622370 µs/check
+  - **Median $X$**: **73.622370 µs/check**
+
+- **Run C (native Core `CPubKey::Verify` per-attempt cost $Y$)**:
+  - Run 1: 38.274023 µs/attempt (38,274.02 ns)
+  - Run 2: 39.322511 µs/attempt (39,322.51 ns)
+  - Run 3: 41.544015 µs/attempt (41,544.02 ns)
+  - **Median $Y$**: **39.322511 µs/attempt**
+
+- **Arithmetic**:
+  - Attempts per check $a = 1.0$
+  - Native comparator floor $F = a \times Y = 39.322511\ \mu\text{s/check}$
+  - Residual $R = X - F = 73.622370 - 39.322511 = 34.299859\ \mu\text{s/check}$
+  - Residual fraction $r = R / X = 34.299859 / 73.622370 = 0.465889$ (**46.5889%**)
+  - Required 5% wall-time win threshold: $\text{threshold} = 0.05 \times 69.6\text{s} / 12.55\text{s} = 0.277291$ (**27.7291%**)
+  - Residual ceiling in script stage: $r \times 12.55\text{s} = 5.846908\text{s}$ (~5.85s max theoretical win)
+  - Conservative spread bound: 8.517721 µs. Subtracting it leaves
+    25.782138 µs/check (35.0194%), still above the 27.7291% threshold.
+
+Because $r = 46.5889\% \ge 27.7291\%$, the verdict is **OPEN**.
+
+## Scope and limits
+
+1. The 46.59% residual is a **ceiling**, not a promised speedup. It includes legacy sighash construction (re-serializing spending transactions), script parsing and stack evaluation, `bitcoinkernel` C++/FFI boundary costs, and memory allocation overhead.
+2. This ticket treats native Core `CPubKey::Verify` ($F = 39.32\ \mu\text{s}$) as the reference implementation and does not measure lower-level cryptographic optimizations or signature caching.
+3. The non-crypto residual investigation remains **OPEN**, while transaction marshalling, parallel pool width, and threshold sweeps remain closed based on prior benchmarks.
+4. This finding makes no production code changes or performance promises; it establishes the empirical ceiling for any future non-crypto script path optimization.

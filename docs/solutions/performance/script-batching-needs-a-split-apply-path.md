@@ -59,20 +59,23 @@ Second, and more importantly, **the two numbers cannot simply be subtracted.**
 One input check is not one signature verification: an input may perform none
 (anyone-can-spend), one (P2PKH, P2PK), or several (bare multisig), and it also
 pays script parsing, interpretation, and a legacy sighash that re-serializes
-the spending transaction. Dividing one by the other, or subtracting them to
-get a per-input overhead, assumes a signature count nobody has counted.
+the spending transaction. Before the census, dividing one by the other or
+subtracting them would have assumed an unmeasured signature count.
 
-So the honest position is narrower than the original claim and narrower than
-its first correction: **the per-check cost and the per-verification cost are
-both measured, and the relationship between them is not yet established.**
+The census below resolves that uncertainty. It counts actual signature
+attempts per check, then compares width-1 kernel verification with native
+Core `CPubKey::Verify` over the same captured input corpus.
 
-## The open question this leaves
+## The measured floor and residual
 
-Count the actual `CHECKSIG` / `CHECKMULTISIG` operations executed across the
-window, then compare like with like: run the same captured input corpus through
-the verifier and through a bare signature loop. Only that answers whether the
-per-check cost is near its floor or well above it. Until it does, no conclusion
-about per-input overhead is supportable in either direction.
+The CHECKSIG census ([checksig-census-and-the-script-check-floor.md](checksig-census-and-the-script-check-floor.md)) counted all 2,868,199 input checks across mainnet 0..150,000. Every check executes exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$).
+
+Native Core `CPubKey::Verify` takes **39.32 µs** per attempt ($Y$), while
+width-1 kernel verification takes **73.62 µs** per check ($X$). The residual
+$R = X - F = 34.30\ \mu\text{s/check}$ is 46.59% of the per-check cost. It
+covers legacy sighash construction, script evaluation, and wrapper overhead.
+That exceeds the 27.73% lever threshold, so the next optimization lever remains
+**OPEN**.
 
 What IS established by direct measurement, independent of any of the above:
 199.1s of check work becomes 45.66s on 32 threads, a **4.4x speedup**, and
@@ -97,7 +100,7 @@ Do not retry these.
 |---|---|
 | rayon `with_min_len(N)` to coarsen jobs | N=4 105.3s, N=8 132.1s, N=16 184.1s vs N=1 77.6s. Throttles the big blocks that were scaling fine. |
 | Bounded split for small blocks only (2/4/8 tasks below the threshold) | 120.4s / 102.0s / 98.2s vs 79.1s serial. Dispatching tiny blocks costs more than the serial work it saves. |
-| Per-input FFI overhead in the kernel path | Not refuted, and not established either. See the open question above: the per-check cost is measured, the per-verification cost is measured, and the signature count that would relate them is not. |
+| Non-native per-check cost above `CPubKey::Verify` | Measured and still open: $a = 1.0$, and $X - aY = 34.30\ \mu\text{s/check}$ (46.59%). This is a ceiling over sighash construction, script evaluation, and wrapper costs, not guaranteed removable overhead. |
 | Script pool width | 1 thread 334.8s, 4 threads 185.4s, 32 threads 81.1s. 32 is the measured optimum; 8, 16 and 64 were worse in an earlier sweep. |
 
 The shape of these results is consistent: rayon's default splitting is already

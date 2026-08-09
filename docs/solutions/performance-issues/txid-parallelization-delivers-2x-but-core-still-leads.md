@@ -325,7 +325,7 @@ Core re-run with `-debug=bench` over the identical window, aggregating its own s
 | Sanity checks | 1.41s |
 | **Connect block (total)** | **55.80s** |
 
-Our `script_parallel` is **36.42s**. Core's `Verify txins` is **36.07s**. Within a percent of each other, on the same inputs, through the same libsecp256k1. **The crypto is a tie.**
+Our `script_parallel` is **36.42s**. Core's `Verify txins` is **36.07s**. Within a percent of each other, on the same inputs, through the same libsecp256k1. **The script stage is an end-to-end tie for that historical measurement** (though the non-ECDSA script check residual of 34.30 µs/check, or 46.59% of width-1 verification, remains open per the [CHECKSIG census](../performance/checksig-census-and-the-script-check-floor.md)).
 
 That kills three hypotheses at once, and they should not be re-opened without new evidence:
 
@@ -427,7 +427,7 @@ Post-refactor decomposition beside Core's `-debug=bench` figures for the identic
 
 | Stage | bitcoin-rs | Core | Note |
 |---|---|---|---|
-| script verification | 36.47s | 36.07s | **tie** — same libsecp256k1, nothing to win |
+| script verification | 36.47s | 36.07s | **tie** — end-to-end script-stage tie for that historical measurement; non-crypto script/sighash residual open (46.59% floor residual) |
 | block parsing | ~14.0s (`Block::new` + txid harvest ~10.9s, rust-bitcoin decode 3.1s) | 7.18s (`Load block from disk`) | only the 3.1s is removable — see below |
 | consensus rules / merkle | 4.79s (`block_rules`) | 1.41s (`Sanity checks`) | merkle root over scalar SHA-256 vs Core's AVX2 |
 | UTXO commit | 6.10s | 2.59s (`Flush`) | |
@@ -454,7 +454,7 @@ Why ours is ~1.5× slower on the same code is unexplained and worth knowing, but
 * `block_rules` 4.79s vs Core's 1.41s — the merkle root is SHA-256d over txids with a scalar implementation while Core uses its runtime-selected AVX2 one. The kernel does not expose a merkle helper, so this needs either an exposed hash primitive or a parallel merkle tree.
 * `utxo_commit` 6.10s vs Core's 2.59s flush.
 
-Do not re-open script verification: it is a measured tie, and four marshalling micro-optimizations plus a pool-width and threshold sweep are already closed above.
+Do not re-open pure signature verification: it is a measured end-to-end script-stage tie for that historical measurement, though non-ECDSA script interpretation and sighash re-serialization residual remains open at 46.59% per the CHECKSIG census, and four marshalling micro-optimizations plus a pool-width and threshold sweep are already closed above.
 
 ## The gap is now fully accounted for, and it is a program of small items
 
@@ -462,7 +462,7 @@ With the harness matched, the arithmetic closes for the first time. Apply is 76.
 
 | Stage | bitcoin-rs | Core | delta | alone |
 |---|---|---|---|---|
-| script verification | 36.47s | 36.07s | ~0 | tie |
+| script verification | 36.47s | 36.07s | ~0 | end-to-end tie |
 | `script_prepare` + `script_resolution` | 5.80s | folded into Connect | 5.80s | 1.074× |
 | `block_body_persist` | 4.18s | none in reindex | 4.18s | 1.052× |
 | block parse | 10.88s | 7.18s | 3.70s | 1.046× |
@@ -481,7 +481,7 @@ Closing all of them lands at **64.0s against Core's 59.6s = 1.07×**, which is p
 
 Identical. On blocks this small the active shard count rarely reaches 8, so the serial path is already what runs — there is no dispatch to remove. Closing the 3.51s against Core's flush needs a change to what the commit *does*, not to how it is scheduled. That drops the program to four items worth ~17s.
 
-**A second item is closed: `block_rules` is merkle, and merkle is at its floor.** Probes split the 4.59s stage into merkle **4.34s**, `block.weight()` 0.18s, everything else 0.07s — so the stage *is* the merkle root. Three attempts, all rejected:
+**`block_rules` is merkle: historical scalar and task parallelism attempts were neutral-to-worse, but multi-buffer AVX2 SIMD remains open.** Probes split the 4.59s stage into merkle **4.34s**, `block.weight()` 0.18s, everything else 0.07s — so the stage *is* the merkle root. Three scalar/task attempts were rejected:
 
 | Attempt | Result |
 |---|---|
@@ -489,11 +489,17 @@ Identical. On blocks this small the active shard count rarely reaches 8, so the 
 | parallel fold, threshold 512 | 4.11s — 0.26s, inside run noise |
 | parallel fold, threshold 32 | **6.52s** — worse; dispatch on small levels |
 
-A calibration worth recording, because it corrected my own reasoning: raw double-SHA256 of 64 bytes on this host measures **873 ns** (`sha2`) and **907 ns** (`bitcoin_hashes`), not the ~400 ns I had assumed from theory. The fold runs at ~2586 ns/node, so the real overhead ratio is 2.9×, not the 6.4× an earlier draft claimed. The two libraries are equivalent; there is no faster-SHA lever hiding here.
+A calibration worth recording: those historical experiments tested scalar hashing and Rayon task parallelism, NOT Bitcoin Core's 8-way AVX2 multi-buffer SHA256d64 path (`TransformD64_8way`). On this Xeon Gold 6138, `/proc/cpuinfo` lacks the `sha` flag (no hardware SHA-NI support), so `bitcoin_hashes` 0.14 falls back to scalar software (`software_process_block`). Meanwhile, Core's `SHA256AutoDetect` selects AVX2 8-way multi-buffer hashing to compute 8 independent 64-byte leaf pairs in parallel 256-bit SIMD lanes.
 
-Where the remaining 2.9× goes is per-node overhead in *small* levels — most blocks in this window have a handful of transactions, so each `next_merkle_level` call folds one or two nodes and amortizes its own call, bounds, and truncate over almost nothing. Parallelism cannot touch that (there is nothing to spread), and neither can a faster hash (hashing is only 1.46s of the 4.3s). Core reaches 1.41s for the whole of `Sanity checks` because its blocks come pre-parsed with the tree work batched differently, not because its SHA is faster.
+As analyzed in [Research: SHA-256d merkle acceleration for block_rules
+(4.79s vs Core 1.41s)](https://github.com/gosuda/bitcoin-rs/issues/17), scalar
+library swaps (`sha2` vs `bitcoin_hashes`) and per-block Rayon task fan-out
+were neutral or worse, but SIMD multi-buffer hashing is a different lever. An
+8-way AVX2 SIMD implementation has a **probable projection of 3.0–3.6s
+saved** against the 4.79s `block_rules` stage. This is a research projection
+that requires a benchmark gate, not a measured result.
 
-**A third item is closed: `block_body_persist` is genuinely storage work, not overhead.** It looked suspicious — 687 MB in 4.18s is 164 MB/s on a tmpfs-backed data dir, an order of magnitude under what the device does. Probing the path found two KV reads wrapping the append (an idempotency lookup that is always `None` during linear replay, and a read-modify-write of a per-file max height that is monotonic and therefore cacheable). Both are real inefficiencies. Neither is worth fixing:
+**A second item is closed: `block_body_persist` is genuinely storage work, not overhead.** It looked suspicious — 687 MB in 4.18s is 164 MB/s on a tmpfs-backed data dir, an order of magnitude under what the device does. Probing the path found two KV reads wrapping the append (an idempotency lookup that is always `None` during linear replay, and a read-modify-write of a per-file max height that is monotonic and therefore cacheable). Both are real inefficiencies. Neither is worth fixing:
 
 | Sub-stage | Cost |
 |---|---|
@@ -507,12 +513,12 @@ The two removable reads are **0.66s together, 0.8% of the run**. The remainder i
 
 **This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
 
-**Three of the five are now closed, all negative**, which retires most of the 20.6s on paper:
+**Two of the five are closed (`utxo_commit` and `block_body_persist`), while `block_rules` remains open under an unmeasured SIMD lever**:
 
 | Item | Verdict |
 |---|---|
 | `utxo_commit` 3.51s | real work; the shard fan-out is not even taken at this block size |
-| `block_rules` 3.38s | merkle is at its floor; sha2 identical, parallelism neutral-to-worse |
+| `block_rules` 3.38s | scalar `sha2` was identical and Rayon task parallelism worse, but 8-way AVX2 SIMD hashing is an unmeasured 3.0–3.6s projection |
 | `block_body_persist` 4.18s | policy call; only 0.66s is removable overhead |
 
 That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**, both inside the FFI boundary where four separate marshalling attempts already measured 0.98–1.00×. Closing both perfectly would reach ~75s against Core's 59.6s — **1.26×, still not parity**.
@@ -523,11 +529,11 @@ That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**
 |---|---|---|
 | the architectural change alone (remove the rust-bitcoin decode, 3.1s) | 81.5s | 1.37× |
 | every still-open item (decode + block parse + prepare/resolve, 12.6s) | 72.0s | 1.21× |
-| literally every item including the three proven unreachable | 61.8s | 1.04× |
+| literally every item including the closed items and unmeasured merkle SIMD projection | 61.8s | 1.04× |
 
-Only the last row approaches parity, and it requires undoing three things that are measured as irreducible: merkle is at its hashing floor, `utxo_commit` is real work, and `block_body_persist` has 0.66s of removable overhead in 3.28s. So parity is not one refactor away. Core is modestly faster across nearly every non-crypto stage at once — 3-4s here, 3-4s there — which is what a mature C++ implementation with tuned allocation and batching looks like, not a defect with a fix.
+Only the last row approaches parity, and it requires closing non-crypto storage/commit limits and realizing the unmeasured 8-way AVX2 merkle SIMD projection. So parity is not one refactor away. Core is modestly faster across nearly every non-crypto stage at once — 3-4s here, 3-4s there — which is what a mature C++ implementation with tuned allocation and batching looks like, not a defect with a fix.
 
-What is genuinely true and worth carrying forward: script verification is a **tie**, memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.26×** and itemised. Anyone resuming should decide whether 1.26× on throughput is worth a broad re-engineering of the non-crypto apply path, rather than starting a multi-crate refactor expecting parity from it.
+What is genuinely true and worth carrying forward: signature verification script stage is an **end-to-end tie for that historical measurement** (with a 46.59% non-ECDSA script/sighash residual recorded by the CHECKSIG census), memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.26×** and itemised.
 
 ## Guidance
 
