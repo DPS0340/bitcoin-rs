@@ -1,10 +1,14 @@
 #![allow(missing_docs)]
 #![allow(clippy::print_stdout)]
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -189,6 +193,12 @@ fn main() -> Result<()> {
         decode_time,
         elapsed,
     } = replay_prefix(&args, &apply_handles)?;
+    // The full UTXO scan is opt-in and starts after the internal replay timer.
+    // Performance custody runs must omit it because process wall and CPU still
+    // include the scan; separate validation runs pass this option.
+    if let Some(path) = args.validation_output.as_deref() {
+        write_validation_artifact(path, &apply_handles, args.stop_height, stop_hash.as_deref())?;
+    }
     let window = args.window.max(1);
 
     let block_count = args
@@ -196,6 +206,13 @@ fn main() -> Result<()> {
         .saturating_sub(args.start_height)
         .saturating_add(1);
     let stage_seconds = stage_decomposition(metrics_handle);
+    let block_source = if args.blocks_file.is_some() {
+        "file"
+    } else if args.rest_url.is_some() {
+        "rest"
+    } else {
+        "bitcoin-cli"
+    };
     let artifact = json!({
         "schema": "mainnet-prefix-replay-v1",
         "measurement_target": "mainnet-prefix-replay",
@@ -224,8 +241,9 @@ fn main() -> Result<()> {
         "rss_high_water_bytes": rss_high_water_bytes(),
         "bitcoin_cli": args.bitcoin_cli,
         "bitcoin_cli_args": args.bitcoin_cli_args,
-        "block_source": args.rest_url.as_ref().map_or("bitcoin-cli", |_| "rest"),
+        "block_source": block_source,
         "rest_url": args.rest_url,
+        "blocks_file": args.blocks_file,
         "data_dir": args.data_dir,
     });
     let rendered = serde_json::to_string_pretty(&artifact).context("render artifact JSON")?;
@@ -238,6 +256,32 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn write_validation_artifact(
+    path: &Path,
+    handles: &bitcoin_rs_node::apply::ApplyHandles,
+    stop_height: u32,
+    stop_hash: Option<&str>,
+) -> Result<()> {
+    let stats = handles
+        .utxo
+        .with_stable_view(|view| bitcoin_rs_coinstats::scan_coin_stats(view, stop_height, true))
+        .context("scan UTXO set for CoinStats validation")?;
+    let utxo_hash = bitcoin_rs_utxo::aggregate_hash(&handles.utxo)
+        .context("compute deterministic UTXO aggregate hash")?;
+    let artifact = json!({
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_height": stop_height,
+        "stop_hash": stop_hash,
+        "utxo_hash_serialized_3": utxo_hash.to_string_be(),
+        "muhash": stats.muhash.finalize_hash().to_string_be(),
+        "utxo_count": stats.utxo_count,
+        "total_amount": stats.total_amount,
+    });
+    let rendered =
+        serde_json::to_string_pretty(&artifact).context("render validation artifact JSON")?;
+    std::fs::write(path, rendered + "\n").with_context(|| format!("write {}", path.display()))
+}
+
 #[derive(Debug)]
 struct Args {
     bitcoin_cli: String,
@@ -247,6 +291,7 @@ struct Args {
     assume_valid_height: u32,
     data_dir: PathBuf,
     output: Option<PathBuf>,
+    validation_output: Option<PathBuf>,
     window: usize,
     start_height: u32,
     stop_height: u32,
@@ -265,6 +310,7 @@ impl Args {
             assume_valid_height: 0,
             data_dir: PathBuf::from(".bitcoin-rs-mainnet-prefix-replay"),
             output: None,
+            validation_output: None,
             window: bitcoin_rs_node::apply::SCRIPT_BATCH_WINDOW,
             start_height: 0,
             stop_height: 0,
@@ -298,6 +344,10 @@ impl Args {
                 }
                 "--data-dir" => parsed.data_dir = PathBuf::from(next_arg(&mut args, "--data-dir")?),
                 "--output" => parsed.output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
+                "--validation-output" => {
+                    parsed.validation_output =
+                        Some(PathBuf::from(next_arg(&mut args, "--validation-output")?));
+                }
                 "--window" => parsed.window = next_arg(&mut args, "--window")?.parse()?,
                 "--start-height" => {
                     parsed.start_height = parse_height(&next_arg(&mut args, "--start-height")?)?;
@@ -612,6 +662,6 @@ fn rss_high_water_bytes() -> Option<u64> {
 
 fn print_usage() {
     println!(
-        "usage: cargo run -p bitcoin-rs-node --example mainnet_prefix_replay --no-default-features --features fjall -- --stop-height <height> [--rest-url <host:port>] [--assume-valid-height <height>] [--bitcoin-cli <path>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--txindex] [--blockfilterindex]"
+        "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <path> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex] [--blockfilterindex]"
     );
 }
