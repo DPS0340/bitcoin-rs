@@ -3,7 +3,7 @@
 Status: **shipped.** The first attempt was a wash and was reverted; the second,
 built on a split apply path so preparation happens once, holds up.
 
-Current shipped capture:
+> **Historical cross-node panel.** The 69.6s / 558.4 CPU-s Core-lead panel below is historical and has been superseded by the allocator-matched current result. See [allocator-parity-changes-wall-not-cpu.md](allocator-parity-changes-wall-not-cpu.md).
 
 | blocks 0..150,000, full verification | wall | CPU |
 |---|---|---|
