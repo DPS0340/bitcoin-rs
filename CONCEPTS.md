@@ -51,6 +51,14 @@ Whether a fan-out pays is decided by per-item work against dispatch cost, not by
 ### Matched-harness comparison
 The requirement that a cross-node benchmark match every input that is not the thing under test — block source, validation posture, CPU pinning, and time of measurement — before any ratio is quoted. Each mismatch found in this repo moved the headline materially: Core's reference was months stale (67s → re-derived 59.6s); bitcoin-rs fetched blocks over REST from a live `bitcoind` while Core read local `blk*.dat`, which cost ~35s of harness *and* contended for CPU (121.9s → 84.6s once `--blocks-file` matched it); and GoCoin skips script verification below its default `LastTrustedBlock` of #940000, so it must be compared either against an assume-valid bitcoin-rs run or with that asymmetry stated. Interleave both nodes back-to-back on an idle host and quote paired medians; comparing your best run against someone else's old run is not a measurement.
 
+The allocator is part of the harness too. At commit `ff2615a`, the same local
+0→150,000 replay measured 63.43s / 399.63 CPU-s with the system allocator and
+56.16s / 396.50 CPU-s with production-matched mimalloc. The allocator changed
+wall scheduling, not total work, and raised peak RSS by 15.8%. A replay control
+must therefore match the production allocator and report RSS with both time
+axes. See
+`docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
+
 ### Script-flag exceptions (BIP16Exception)
 The historical blocks Bitcoin Core hardcodes in `consensus.script_flag_exceptions` (chainparams) to be validated under a reduced script-verification flag set, because they contain spends valid under the rules in force at the time but invalid under a later-enforced flag. As of Core v29: mainnet block 170060 (`…ac4f9c22`, the BIP16/P2SH exception) and 692261 (`…e1e395ad`, the Taproot exception); testnet3 block 394; none on testnet4/signet/regtest. The two **P2SH waivers** (170060, 394) are reproduced explicitly by `Network::is_bip16_p2sh_exception` (keyed by block hash, mainnet/testnet3 only); missing them rejects canonical blocks and wedges full-validation sync past the assume-valid height. The **692261 Taproot override** needs no rs exception: Core's override only strips TAPROOT (which Core defaults on for all blocks), and rs already height-gates taproot (`is_taproot_active`, 709632 > 692261) so it never sets TAPROOT there — its computed flags already match Core's effective set. Compare *effective* flag sets, not raw overrides. See `docs/solutions/architecture-patterns/p2sh-flag-must-honor-core-script-flag-exceptions.md`.
 
@@ -62,6 +70,13 @@ The rule that a branch is green only against the commands in `.github/workflows/
 
 ### CPU-seconds as a first-class metric
 The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name. On the loopback P2P sync to 150k, bitcoin-rs takes 76.3s wall and **318.4s CPU** against Core's 42.5s and **65.0s** — a 1.77× wall gap concealing a 4.9× CPU gap, which becomes wall time on the 4-8 core machines most nodes run on. The excess is broad rather than one hot spot: collapsing `SCRIPT_VERIFY_POOL` to a single thread still burns 230.1s, so rayon spin is a minority of it and no pool width converges. This also puts a caveat on every wall-only sweep in the performance note, `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 most of all, since pushing more blocks through the pool is exactly the shape of change that trades CPU for wall.
+
+The matched local-file processing panel at commit `ff2615a` supersedes the
+older processing-bound CPU deficit: production-matched bitcoin-rs measured
+56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The loopback
+P2P result above remains valid for its network regime; it cannot be carried
+into the local replay regime. See
+`docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
 
 ### Global rayon pool cap
 The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_global_thread_pool` in `crates/node/src/run.rs`, called at the top of `run`. rayon otherwise sizes that pool at one worker per core, and because it leaves those workers unnamed they inherit the process name — which is why per-thread CPU attribution first blamed the async runtime. The pool runs only short coarse jobs (block txid hashing, shard commits) while `SCRIPT_VERIFY_POOL` separately holds up to 32 threads, so an uncapped global pool oversubscribes a many-core host and its workers spin for work that is not there. Capping it cut a loopback P2P sync to 150k from 75.6s wall / 314.4s CPU to 64.4s / 162.4s across three interleaved pairs — **both axes at once**, so it is not a wall-for-CPU trade. With the `MIN_PARALLEL_SCRIPT_CHECKS` correction stacked on top, that sync finally lands at 62.8s / 90.1s against Core's 45.9s / 67.8s. The width sweep is flat from 2 to 8; the full-verification replay is insensitive at every width because script verification dominates it and runs in its own pool. Contrast `Parallel granularity (per-item cost rule)`, which is about *when* to fan out; this is about *how wide* the shared pool may be.
