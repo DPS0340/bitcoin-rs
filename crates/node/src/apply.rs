@@ -1557,8 +1557,15 @@ fn prove_window(
     // script verification for a block that is rejected immediately either way.
     // Both checks below depend on nothing but the block, so running them here
     // costs a hash per block and removes the amplification.
-    for (block, context) in blocks.iter().zip(&contexts) {
-        if !block.check_merkle_root() {
+    let max_txs = blocks.iter().map(|b| b.txdata.len()).max().unwrap_or(0);
+    let mut merkle_scratch = Vec::with_capacity(max_txs);
+    for (block, (unit, context)) in blocks.iter().zip(prepared.iter().zip(&contexts)) {
+        merkle_scratch.clear();
+        merkle_scratch.extend_from_slice(unit.tx_plan.txids());
+        if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
+            block,
+            &mut merkle_scratch,
+        ) {
             return Vec::new();
         }
         if context

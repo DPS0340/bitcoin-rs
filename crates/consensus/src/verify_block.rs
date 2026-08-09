@@ -146,6 +146,22 @@ pub fn verify_merkle_root_with_txids(
     Ok(())
 }
 
+/// Root-only precheck for the hot windowed apply path.
+///
+/// Computes the merkle root from caller-supplied transaction IDs and compares
+/// it to the block header. Mutation is intentionally ignored here; the later
+/// consensus path owns the mutation check and its error precedence.
+#[doc(hidden)]
+pub fn block_merkle_root_matches_txids(
+    block: &bitcoin::Block,
+    txids: &mut Vec<bitcoin::Txid>,
+) -> bool {
+    match merkle_root_and_mutation(txids) {
+        Ok(Some((root, _))) => block.header.merkle_root == root.into(),
+        _ => false,
+    }
+}
+
 fn merkle_root_and_mutation<T>(hashes: &mut Vec<T>) -> Result<Option<(T, bool)>, ConsensusError>
 where
     T: bitcoin::hashes::Hash + bitcoin::consensus::Encodable + Eq + Copy,
