@@ -520,12 +520,12 @@ The reducer also matched the scalar root at every Merkle level for all blocks 0â
 
 The 2.831s value is an overlap ceiling, not removable work. Moving the append before apply admission or into the event loop must still preserve side-branch bodies for heavier-chain reorgs, aggregate per-file height metadata across a batch, and define recovery after an append succeeds but index publication fails. It would also put synchronous storage I/O on the event loop. The design review rejected that lifecycle cost for a bounded 2.831s ceiling. Do not delete persistence or weaken reorg availability to improve the benchmark.
 
-**The measured AVX2 result closes the only remaining stage lever that passed its gate.**
+**PR #30 implements the only remaining stage lever that passed its gate.**
 
 | Item | Verdict |
 |---|---|
 | `utxo_commit` | real work; the shard fan-out is not taken at this block size |
-| `block_rules` | **closed and landed**; prepared-txid reuse plus AVX2 multi-buffer SHA256d64 |
+| `block_rules` | **implemented in PR #30**; prepared-txid reuse plus AVX2 multi-buffer SHA256d64; closes when the PR merges |
 | `block_body_persist` | rejected; 2.831s overlap ceiling does not justify the reorg and event-loop failure surface |
 
 The final matched comparison interleaved three candidate runs with three Bitcoin Core runs on CPU set `0-31`, with a 30-second cooldown and the same local 0â†’150k corpus:
