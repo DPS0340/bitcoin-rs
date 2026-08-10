@@ -42,6 +42,8 @@ pub mod connect_block;
 pub mod kernel;
 /// Portable Rust validator.
 pub mod rust_path;
+/// Private AVX2 SHA256d64 kernel for Merkle hashing.
+mod sha256d64;
 /// Block rule checks.
 pub mod verify_block;
 /// Transaction rule checks.

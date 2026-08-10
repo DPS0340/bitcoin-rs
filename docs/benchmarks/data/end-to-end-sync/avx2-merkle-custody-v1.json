@@ -1,0 +1,429 @@
+{
+  "schema": "bitcoin-rs-avx2-merkle-custody-v1",
+  "captured_at": "2026-08-09",
+  "scope": "mainnet blocks 0 through 150000, full validation, local block corpus",
+  "identity": {
+    "control_commit": "9f9eb0b5aca6bb6776cf919ee9dac8fc8843a1f2",
+    "prepared_txids_commit": "b7e56570523111ff21727887af03ad140e07d7e7",
+    "avx2_commit": "65bae8dab0cbab41f2ef5d7cbc2cb906b2105643",
+    "control_binary_sha256": "d97e429acaa2216ab1f6bfd20354f0be631a04626649be4f561c80f9b1e93e6d",
+    "candidate_binary_sha256": "f48272d53b163bb46a234abcda08f680175c783c5d799ad349637e98591bf30a",
+    "bitcoin_core_binary_sha256": "dae69848ae9aaadcc3aa697d1c92b1283273a59c8d87b220b29ddc2813e25eb6",
+    "corpus_sha256": "c0a2b9aa35498dacdf1aec792a1b68d9ec68e372fba88ef0e62bbccb1732fe2c"
+  },
+  "harness": {
+    "cpu_affinity": "0-31",
+    "cooldown_seconds": 30,
+    "build": "cargo build --release --features 'mimalloc,rocksdb,redb' --example mainnet_prefix_replay",
+    "candidate_command_template": "taskset -c 0-31 target/release/examples/mainnet_prefix_replay --stop-height 150000 --blocks-file $CORPUS --assume-valid-height 0 --storage-backend $BACKEND --data-dir $DATA_DIR --output $OUTPUT",
+    "bitcoin_core_command_template": "taskset -c 0-31 bitcoind -conf=/dev/null -datadir=$CORE_DATADIR -reindex-chainstate=1 -assumevalid=0 -connect=0 -listen=0 -server=0 -daemon=0 -printtoconsole=0 -stopatheight=150000 -dbcache=450 -txindex=0 -blockfilterindex=0 -debuglogfile=$LOG",
+    "candidate_core_order": [
+      "candidate-final-r1",
+      "core-final-r1",
+      "core-final-r2",
+      "candidate-final-r2",
+      "candidate-final-r3",
+      "core-final-r3"
+    ]
+  },
+  "prepared_txids_scalar_attribution": {
+    "wall_seconds": 51.97467110399157,
+    "total_cpu_seconds": 388.264416,
+    "max_rss_bytes": 687386624,
+    "block_count": 150001,
+    "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+    "block_rules_seconds": 4.311016288999972,
+    "prepare_seconds": 2.766098163
+  },
+  "paired_backends": {
+    "fjall": {
+      "order": [
+        "control-r1",
+        "candidate-r1",
+        "candidate-r2",
+        "control-r2",
+        "control-r3",
+        "candidate-r3"
+      ],
+      "runs": [
+        {
+          "label": "control-r1",
+          "wall_seconds": 56.51694890100043,
+          "total_cpu_seconds": 394.85784900000004,
+          "max_rss_bytes": 711213056,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-r1",
+          "wall_seconds": 47.603071484016255,
+          "total_cpu_seconds": 390.45158100000003,
+          "max_rss_bytes": 685522944,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-r2",
+          "wall_seconds": 48.01968115393538,
+          "total_cpu_seconds": 388.363584,
+          "max_rss_bytes": 682811392,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-r2",
+          "wall_seconds": 55.9382336710114,
+          "total_cpu_seconds": 398.237501,
+          "max_rss_bytes": 657870848,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-r3",
+          "wall_seconds": 57.55295488797128,
+          "total_cpu_seconds": 398.392526,
+          "max_rss_bytes": 697745408,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-r3",
+          "wall_seconds": 48.19104071194306,
+          "total_cpu_seconds": 391.341742,
+          "max_rss_bytes": 679038976,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        }
+      ],
+      "summary": {
+        "candidate_cpu_median": 390.45158100000003,
+        "candidate_rss_median": 682811392.0,
+        "candidate_wall_median": 48.01968115393538,
+        "control_cpu_median": 398.237501,
+        "control_rss_median": 697745408.0,
+        "control_wall_median": 56.51694890100043,
+        "cpu_speedup": 1.019940807974344,
+        "rss_ratio": 0.9785967548782493,
+        "wall_speedup": 1.1769538560621757
+      }
+    },
+    "rocksdb": {
+      "order": [
+        "control-rocksdb-r1",
+        "candidate-rocksdb-r1",
+        "candidate-rocksdb-r2",
+        "control-rocksdb-r2",
+        "control-rocksdb-r3",
+        "candidate-rocksdb-r3"
+      ],
+      "runs": [
+        {
+          "label": "control-rocksdb-r1",
+          "wall_seconds": 55.88553423306439,
+          "total_cpu_seconds": 399.693292,
+          "max_rss_bytes": 599330816,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-rocksdb-r1",
+          "wall_seconds": 44.50292976794299,
+          "total_cpu_seconds": 388.341843,
+          "max_rss_bytes": 645353472,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-rocksdb-r2",
+          "wall_seconds": 48.63083490799181,
+          "total_cpu_seconds": 390.346529,
+          "max_rss_bytes": 622116864,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-rocksdb-r2",
+          "wall_seconds": 54.90060818393249,
+          "total_cpu_seconds": 397.1864,
+          "max_rss_bytes": 608600064,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-rocksdb-r3",
+          "wall_seconds": 56.00257509201765,
+          "total_cpu_seconds": 396.853534,
+          "max_rss_bytes": 615735296,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-rocksdb-r3",
+          "wall_seconds": 47.715984654962085,
+          "total_cpu_seconds": 387.613647,
+          "max_rss_bytes": 627417088,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        }
+      ],
+      "summary": {
+        "candidate_cpu_median": 388.341843,
+        "candidate_rss_median": 627417088.0,
+        "candidate_wall_median": 47.715984654962085,
+        "control_cpu_median": 397.1864,
+        "control_rss_median": 608600064.0,
+        "control_wall_median": 55.88553423306439,
+        "cpu_speedup": 1.0227751841822514,
+        "rss_ratio": 1.0309185376621979,
+        "wall_speedup": 1.1712120086628608
+      }
+    },
+    "redb": {
+      "order": [
+        "control-redb-r1",
+        "candidate-redb-r1",
+        "candidate-redb-r2",
+        "control-redb-r2",
+        "control-redb-r3",
+        "candidate-redb-r3"
+      ],
+      "runs": [
+        {
+          "label": "control-redb-r1",
+          "wall_seconds": 82.19556758599356,
+          "total_cpu_seconds": 403.20336799999995,
+          "max_rss_bytes": 741093376,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-redb-r1",
+          "wall_seconds": 73.91682201996446,
+          "total_cpu_seconds": 401.87038800000005,
+          "max_rss_bytes": 740560896,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-redb-r2",
+          "wall_seconds": 74.92745462700259,
+          "total_cpu_seconds": 400.853435,
+          "max_rss_bytes": 745992192,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-redb-r2",
+          "wall_seconds": 81.56934816599824,
+          "total_cpu_seconds": 409.58476199999996,
+          "max_rss_bytes": 720392192,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "control-redb-r3",
+          "wall_seconds": 83.44693508802447,
+          "total_cpu_seconds": 404.333302,
+          "max_rss_bytes": 741228544,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        },
+        {
+          "label": "candidate-redb-r3",
+          "wall_seconds": 73.60019827692304,
+          "total_cpu_seconds": 403.179216,
+          "max_rss_bytes": 734285824,
+          "exit_code": 0,
+          "block_count": 150001,
+          "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+        }
+      ],
+      "summary": {
+        "candidate_cpu_median": 401.87038800000005,
+        "candidate_rss_median": 740560896.0,
+        "candidate_wall_median": 73.91682201996446,
+        "control_cpu_median": 404.333302,
+        "control_rss_median": 741093376.0,
+        "control_wall_median": 82.19556758599356,
+        "cpu_speedup": 1.006128627720637,
+        "rss_ratio": 0.999281494050218,
+        "wall_speedup": 1.1120008320134904
+      }
+    }
+  },
+  "matched_bitcoin_core": {
+    "order": [
+      "candidate-final-r1",
+      "core-final-r1",
+      "core-final-r2",
+      "candidate-final-r2",
+      "candidate-final-r3",
+      "core-final-r3"
+    ],
+    "runs": [
+      {
+        "label": "candidate-final-r1",
+        "wall_seconds": 48.47499491798226,
+        "total_cpu_seconds": 390.54229,
+        "max_rss_bytes": 696569856,
+        "exit_code": 0,
+        "block_count": 150001,
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+      },
+      {
+        "label": "core-final-r1",
+        "wall_seconds": 64.91389806405641,
+        "total_cpu_seconds": 481.092472,
+        "max_rss_bytes": 589299712,
+        "exit_code": 0,
+        "update_tip_count": 150001,
+        "final_tip": "2026-08-09T13:27:26Z UpdateTip: new best=0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b height=150000 version=0x00000001 log2_work=67.003783 tx=1718407 date='2011-10-20T13:44:51Z' progress=0.001234 cache=168.3MiB(1255076txo)"
+      },
+      {
+        "label": "core-final-r2",
+        "wall_seconds": 64.86572733300272,
+        "total_cpu_seconds": 479.854529,
+        "max_rss_bytes": 681328640,
+        "exit_code": 0,
+        "update_tip_count": 150001,
+        "final_tip": "2026-08-09T13:29:01Z UpdateTip: new best=0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b height=150000 version=0x00000001 log2_work=67.003783 tx=1718407 date='2011-10-20T13:44:51Z' progress=0.001234 cache=168.3MiB(1255076txo)"
+      },
+      {
+        "label": "candidate-final-r2",
+        "wall_seconds": 49.35619607393164,
+        "total_cpu_seconds": 394.95741599999997,
+        "max_rss_bytes": 722931712,
+        "exit_code": 0,
+        "block_count": 150001,
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+      },
+      {
+        "label": "candidate-final-r3",
+        "wall_seconds": 51.31128059304319,
+        "total_cpu_seconds": 388.910264,
+        "max_rss_bytes": 709713920,
+        "exit_code": 0,
+        "block_count": 150001,
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+      },
+      {
+        "label": "core-final-r3",
+        "wall_seconds": 66.10502673801966,
+        "total_cpu_seconds": 484.677136,
+        "max_rss_bytes": 680865792,
+        "exit_code": 0,
+        "update_tip_count": 150001,
+        "final_tip": "2026-08-09T13:33:18Z UpdateTip: new best=0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b height=150000 version=0x00000001 log2_work=67.003783 tx=1718407 date='2011-10-20T13:44:51Z' progress=0.001234 cache=168.3MiB(1255076txo)"
+      }
+    ],
+    "summary": {
+      "candidate_cpu_median": 390.54229,
+      "candidate_rss_median": 709713920.0,
+      "candidate_wall_median": 49.35619607393164,
+      "core_cpu_median": 481.092472,
+      "core_rss_median": 680865792.0,
+      "core_wall_median": 64.91389806405641,
+      "cpu_speedup_vs_core": 1.2318575588830598,
+      "rss_ratio_vs_core": 1.0423697714571039,
+      "wall_speedup_vs_core": 1.3152127438431556
+    }
+  },
+  "correctness": {
+    "expected": {
+      "muhash": "383a0b41ac28ddf6ac91723b41527fa64c0b54451cee5f2c4b3823ef92117116",
+      "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+      "stop_height": 150000,
+      "total_amount": 749989998999999,
+      "utxo_count": 1127181,
+      "utxo_hash_serialized_3": "c9c0a3928001d21a20cff79ba4163b4f0d4b4b637f10da6313bc9d310680436a"
+    },
+    "observed_by_backend": [
+      {
+        "backend": "fjall",
+        "muhash": "383a0b41ac28ddf6ac91723b41527fa64c0b54451cee5f2c4b3823ef92117116",
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "stop_height": 150000,
+        "total_amount": 749989998999999,
+        "utxo_count": 1127181,
+        "utxo_hash_serialized_3": "c9c0a3928001d21a20cff79ba4163b4f0d4b4b637f10da6313bc9d310680436a"
+      },
+      {
+        "backend": "rocksdb",
+        "muhash": "383a0b41ac28ddf6ac91723b41527fa64c0b54451cee5f2c4b3823ef92117116",
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "stop_height": 150000,
+        "total_amount": 749989998999999,
+        "utxo_count": 1127181,
+        "utxo_hash_serialized_3": "c9c0a3928001d21a20cff79ba4163b4f0d4b4b637f10da6313bc9d310680436a"
+      },
+      {
+        "backend": "redb",
+        "muhash": "383a0b41ac28ddf6ac91723b41527fa64c0b54451cee5f2c4b3823ef92117116",
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "stop_height": 150000,
+        "total_amount": 749989998999999,
+        "utxo_count": 1127181,
+        "utxo_hash_serialized_3": "c9c0a3928001d21a20cff79ba4163b4f0d4b4b637f10da6313bc9d310680436a"
+      }
+    ],
+    "scalar_candidate_merkle_parity": {
+      "range": "0-150000",
+      "result": "equal at every Merkle level",
+      "label": "corpus-parity-r1",
+      "wall_seconds": 51.54393272299785,
+      "total_cpu_seconds": 392.856728,
+      "max_rss_bytes": 682676224,
+      "exit_code": 0,
+      "block_count": 150001,
+      "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+    }
+  },
+  "criterion": {
+    "command": "cargo bench -p bitcoin-rs-consensus --bench merkle",
+    "leaves_16_speedup": 1.788288556621195,
+    "parents_64_speedup": 4.564475858916201,
+    "parents_1024_speedup": 5.5749675465166595
+  },
+  "criterion_notes": {
+    "ratio_scope": "The reported criterion ratios include identical scratch-buffer refill overhead in both the candidate and scalar arms, so they are conservative end-to-end Merkle-reducer ratios rather than pure-kernel SHA256d ratios.",
+    "conservative": "Because the scalar arm benefits from the same buffer-reuse strategy as the candidate, any AVX2 kernel advantage is partially absorbed by shared setup cost, making these speedup figures lower bounds on the raw kernel speedup."
+  },
+  "final_source_smoke": {
+    "command": "taskset -c 0-31 target/release/examples/mainnet_prefix_replay --stop-height 150000 --blocks-file $CORPUS --assume-valid-height 0 --storage-backend fjall --data-dir $DATA_DIR --output $OUTPUT",
+    "label": "candidate-final-source",
+    "wall_seconds": 49.3551070780959,
+    "total_cpu_seconds": 389.573252,
+    "max_rss_bytes": 701956096,
+    "exit_code": 0,
+    "block_count": 150001,
+    "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+  },
+  "optional_local_archive": {
+    "fjall": "$BENCH_RESULTS/avx2-merkle-paired/packet.json",
+    "rocksdb": "$BENCH_RESULTS/avx2-merkle-rocksdb-paired/packet.json",
+    "redb": "$BENCH_RESULTS/avx2-merkle-redb-paired/packet.json",
+    "core": "$BENCH_RESULTS/avx2-merkle-core-final/packet.json",
+    "validation": "$BENCH_RESULTS/avx2-merkle-validation/packet.json",
+    "smoke": "$BENCH_RESULTS/avx2-merkle-final-smoke/packet.json"
+  }
+}

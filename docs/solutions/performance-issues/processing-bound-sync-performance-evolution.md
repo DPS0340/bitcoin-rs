@@ -1,8 +1,8 @@
 ---
-title: Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5x and took Core's lead to 1.28x
+title: Contended pool tuning hid CPU cost; prepared txids and AVX2 Merkle hashing now beat Core by 1.32x
 date: 2026-08-07
 category: docs/solutions/performance-issues
-module: node apply path (crates/node/src/apply.rs, crates/consensus/src/verify_tx.rs)
+module: node apply path and consensus Merkle reduction (crates/node/src/apply.rs, crates/consensus/src/verify_block.rs)
 problem_type: performance_issue
 component: apply
 severity: medium
@@ -10,6 +10,7 @@ applies_when:
   - "Measuring processing-bound 0→150k replay with full verification (assume_valid_height=0)"
   - "Optimizing txid computation or script verification preparation"
   - "Adding, removing, or tuning a rayon fan-out on the block apply path"
+  - "Implementing or benchmarking Merkle-tree SIMD hashing"
 related_components:
   - consensus
   - utxo
@@ -21,24 +22,13 @@ tags:
   - replay
 ---
 
-# Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5× and took Core's lead to 1.28×
+# Contended pool tuning hid CPU cost; prepared txids and AVX2 Merkle hashing now beat Core by 1.32×
 
 ## Current matched result (2026-08-09)
 
-The current local-file, full-verification replay no longer trails Core. At
-commit `ff2615a`, three interleaved rounds measured production-matched
-bitcoin-rs at **56.16s / 396.50 CPU-s** and Core 31.0 at
-**64.74s / 477.82 CPU-s**. bitcoin-rs leads 1.153× on wall time and 1.205× on
-total CPU for this processing-bound fjall panel.
+The current local-file, full-verification replay uses prepared txids and the AVX2 Merkle reducer from commits `b7e5657` and `65bae8d`. Three interleaved rounds measured bitcoin-rs at **49.356s / 390.542 CPU-s** and Core 31.0 at **64.914s / 481.092 CPU-s**. bitcoin-rs leads 1.315× on wall time and 1.232× on total CPU for this processing-bound fjall panel. Candidate peak RSS was 1.042× Core.
 
-Allocator parity is load-bearing for wall time: the same bitcoin-rs source
-with the system allocator measured 63.43s / 399.63 CPU-s. Mimalloc clears the
-wall gate but not the CPU gate, and raises peak RSS from 573,440,000 to
-664,252,416 bytes. The system and mimalloc validation passes matched Core's
-height-150,000 MuHash, UTXO count, total amount, and stop hash. See
-[`allocator-parity-changes-wall-not-cpu.md`](../performance/allocator-parity-changes-wall-not-cpu.md)
-and the tracked
-[`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json).
+The preceding allocator panel at `ff2615a` established the production-matched control: mimalloc changed wall scheduling, not total work. That panel measured 56.16s / 396.50 CPU-s with mimalloc and 63.43s / 399.63 CPU-s with the system allocator. Its validation passes matched Core's height-150000 MuHash, UTXO count, total amount, and stop hash. See [`allocator-parity-changes-wall-not-cpu.md`](../performance/allocator-parity-changes-wall-not-cpu.md), [`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json), and the final [`avx2-merkle-custody-v1.json`](../../benchmarks/data/end-to-end-sync/avx2-merkle-custody-v1.json).
 
 All older processing-bound Core-lead figures below remain historical evidence;
 they are not the current verdict. The P2P figures describe a different sync
@@ -502,59 +492,53 @@ Closing all of them lands at **64.0s against Core's 59.6s = 1.07×**, which is p
 
 Identical. On blocks this small the active shard count rarely reaches 8, so the serial path is already what runs — there is no dispatch to remove. Closing the 3.51s against Core's flush needs a change to what the commit *does*, not to how it is scheduled. That drops the program to four items worth ~17s.
 
-**`block_rules` is merkle: historical scalar and task parallelism attempts were neutral-to-worse, but multi-buffer AVX2 SIMD remains open.** Probes split the 4.59s stage into merkle **4.34s**, `block.weight()` 0.18s, everything else 0.07s — so the stage *is* the merkle root. Three scalar/task attempts were rejected:
+**`block_rules` is Merkle: scalar and task parallelism were neutral-to-worse, while AVX2 multi-buffer hashing passed the end-to-end gate.** Probes split the old 4.59s stage into Merkle **4.34s**, `block.weight()` 0.18s, and everything else 0.07s. Three scalar and task-parallel attempts were rejected:
 
 | Attempt | Result |
 |---|---|
-| hash via `sha2` (already a dependency, optimized x86_64 backends) instead of `bitcoin_hashes` + `Encodable` | 4.36s — **identical** |
+| hash via `sha2` instead of `bitcoin_hashes` + `Encodable` | 4.36s — **identical** |
 | parallel fold, threshold 512 | 4.11s — 0.26s, inside run noise |
 | parallel fold, threshold 32 | **6.52s** — worse; dispatch on small levels |
 
-A calibration worth recording: those historical experiments tested scalar hashing and Rayon task parallelism, NOT Bitcoin Core's 8-way AVX2 multi-buffer SHA256d64 path (`TransformD64_8way`). On this Xeon Gold 6138, `/proc/cpuinfo` lacks the `sha` flag (no hardware SHA-NI support), so `bitcoin_hashes` 0.14 falls back to scalar software (`software_process_block`). Meanwhile, Core's `SHA256AutoDetect` selects AVX2 8-way multi-buffer hashing to compute 8 independent 64-byte leaf pairs in parallel 256-bit SIMD lanes.
+Those attempts did not test Bitcoin Core's `TransformD64_8way` shape. This Xeon Gold 6138 has no SHA-NI support, so scalar library swaps keep paying for the same software rounds. Commit `b7e5657` first reuses txids already prepared for script verification. Commit `65bae8d` then reduces eight independent 64-byte parent pairs through a private AVX2 capability token, with scalar tails and a scalar fallback on unsupported targets.
 
-As analyzed in [Research: SHA-256d merkle acceleration for block_rules
-(4.79s vs Core 1.41s)](https://github.com/gosuda/bitcoin-rs/issues/17), scalar
-library swaps (`sha2` vs `bitcoin_hashes`) and per-block Rayon task fan-out
-were neutral or worse, but SIMD multi-buffer hashing is a different lever. An
-8-way AVX2 SIMD implementation has a **probable projection of 3.0–3.6s
-saved** against the 4.79s `block_rules` stage. This is a research projection
-that requires a benchmark gate, not a measured result.
+| Backend | control median | candidate median | wall speedup |
+|---|---:|---:|---:|
+| fjall | 56.517s | 48.020s | **1.177×** |
+| RocksDB | 55.886s | 47.716s | **1.171×** |
+| redb | 82.196s | 73.917s | **1.112×** |
 
-**A second item is closed: `block_body_persist` is genuinely storage work, not overhead.** It looked suspicious — 687 MB in 4.18s is 164 MB/s on a tmpfs-backed data dir, an order of magnitude under what the device does. Probing the path found two KV reads wrapping the append (an idempotency lookup that is always `None` during linear replay, and a read-modify-write of a per-file max height that is monotonic and therefore cacheable). Both are real inefficiencies. Neither is worth fixing:
+The reducer also matched the scalar root at every Merkle level for all blocks 0→150k. Criterion measured 1.79× at 16 leaves, 4.56× at 64 parent pairs, and 5.57× at 1024 parent pairs. These are measured results, not the former 3.0–3.6s projection. The commit, binary, corpus, backend, and state identities are in [`avx2-merkle-custody-v1.json`](../../benchmarks/data/end-to-end-sync/avx2-merkle-custody-v1.json).
 
-| Sub-stage | Cost |
-|---|---|
-| idempotency `index.get` | 0.36s |
-| flat-file append (687 MB) | 1.44s |
-| max-height `index.get` | 0.30s |
-| batch write + other | 1.18s |
-| total | 3.28s |
+**`block_body_persist` remains closed after a receipt-level decomposition.** A later one-run split measured the full stage at 4.660s:
 
-The two removable reads are **0.66s together, 0.8% of the run**. The remainder is the write itself plus the index batch. So this item is a *policy* call — include it in the ratio or exclude it as work Core's reindex does not do — and not an optimization target. Do not delete block-body persistence to improve a benchmark; a real node must store blocks.
+| Variant | Cost |
+|---|---:|
+| flat-file append plus the existing row lookup | 2.831s |
+| index publication | 1.751s |
+| full body persistence | 4.660s |
 
-**This changes how the remaining work should be run.** Every item is individually 1.04–1.07×, at or under the 1.05× single-candidate gate, so none of them will ever look convincing on its own — and at ±5% single-run noise on an 84.6s run, a 3.5s effect is at the edge of what a 3× median can resolve. The next session should therefore:
+The 2.831s value is an overlap ceiling, not removable work. Moving the append before apply admission or into the event loop must still preserve side-branch bodies for heavier-chain reorgs, aggregate per-file height metadata across a batch, and define recovery after an append succeeds but index publication fails. It would also put synchronous storage I/O on the event loop. The design review rejected that lifecycle cost for a bounded 2.831s ceiling. Do not delete persistence or weaken reorg availability to improve the benchmark.
 
-**Two of the five are closed (`utxo_commit` and `block_body_persist`), while `block_rules` remains open under an unmeasured SIMD lever**:
+**PR #30 implements the only remaining stage lever that passed its gate.**
 
 | Item | Verdict |
 |---|---|
-| `utxo_commit` 3.51s | real work; the shard fan-out is not even taken at this block size |
-| `block_rules` 3.38s | scalar `sha2` was identical and Rayon task parallelism worse, but 8-way AVX2 SIMD hashing is an unmeasured 3.0–3.6s projection |
-| `block_body_persist` 4.18s | policy call; only 0.66s is removable overhead |
+| `utxo_commit` | real work; the shard fan-out is not taken at this block size |
+| `block_rules` | **implemented in PR #30**; prepared-txid reuse plus AVX2 multi-buffer SHA256d64; closes when the PR merges |
+| `block_body_persist` | rejected; 2.831s overlap ceiling does not justify the reorg and event-loop failure surface |
 
-That leaves **block parse (3.70s)** and **`script_prepare` + `resolve` (5.80s)**, both inside the FFI boundary where four separate marshalling attempts already measured 0.98–1.00×. Closing both perfectly would reach ~75s against Core's 59.6s — **1.26×, still not parity**.
+The final matched comparison interleaved three candidate runs with three Bitcoin Core runs on CPU set `0-31`, with a 30-second cooldown and the same local 0→150k corpus:
 
-**No identified change reaches parity, including the architectural one.** An earlier draft of this section said parity "needs the architectural change". That was wrong and contradicted this note's own costing of that change at 3.1s. The arithmetic, from 84.6s against Core's 59.6s:
+| | bitcoin-rs candidate | Bitcoin Core | candidate speedup |
+|---|---:|---:|---:|
+| wall median | **49.356s** | 64.914s | **1.315×** |
+| CPU median | **390.542s** | 481.092s | **1.232×** |
+| peak RSS median | 709.7 MB | 680.9 MB | 1.042× Core |
 
-| Do this | Lands at | Ratio |
-|---|---|---|
-| the architectural change alone (remove the rust-bitcoin decode, 3.1s) | 81.5s | 1.37× |
-| every still-open item (decode + block parse + prepare/resolve, 12.6s) | 72.0s | 1.21× |
-| literally every item including the closed items and unmeasured merkle SIMD projection | 61.8s | 1.04× |
+A separate validation run for each of fjall, RocksDB, and redb reached the exact height-150000 tip, UTXO count, total amount, MuHash, and serialized UTXO hash. Every paired timing run also reached the exact tip. Peak RSS stayed inside the predeclared 1.05× gate. This processing-bound result supersedes the earlier 84.6s model and the statement that no identified change reaches parity. It does not claim network-bound full-tip IBD leadership; the local corpus isolates block processing, which is the surface changed here.
 
-Only the last row approaches parity, and it requires closing non-crypto storage/commit limits and realizing the unmeasured 8-way AVX2 merkle SIMD projection. So parity is not one refactor away. Core is modestly faster across nearly every non-crypto stage at once — 3-4s here, 3-4s there — which is what a mature C++ implementation with tuned allocation and batching looks like, not a defect with a fix.
-
-What is genuinely true and worth carrying forward: signature verification script stage is an **end-to-end tie for that historical measurement** (with a 46.59% non-ECDSA script/sighash residual recorded by the CHECKSIG census), memory is **2.9× better**, GoCoin is beaten by **2.3×**, and the total gap is **1.26×** and itemised.
+The residual parse, prepare, and commit deltas remain useful attribution. They no longer justify speculative changes: the measured candidate already beats the matched Core control on both wall and CPU time without consensus shortcuts.
 
 ## Guidance
 
