@@ -1644,6 +1644,7 @@ fn prove_window(
         if verdict.is_err() {
             return Vec::new();
         }
+        metrics::counter!("node.window.verify_success_total").increment(1);
     }
 
     prepared

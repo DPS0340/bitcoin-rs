@@ -9,6 +9,8 @@ pub mod column_families;
 pub mod error;
 /// Backend-neutral key-value store traits.
 pub mod trait_;
+/// Streaming length-prefixed Core frame reader and writer.
+pub mod corpus;
 
 #[cfg(feature = "fjall")]
 /// Fjall-backed [`KvStore`](trait_::KvStore) implementation.
@@ -30,6 +32,10 @@ pub use block_file::{
 pub use column_families::ColumnFamily;
 pub use error::StorageError;
 pub use trait_::{KvIter, KvPair, KvSnapshot, KvStore, WriteBatch};
+pub use corpus::{
+    CoreFrameError, CoreFrameMetadata, CoreFrameReader, CoreFrameRecord, CoreFrameWriter,
+    CORE_FRAME_HEADER_LEN, CORE_FRAME_MAGIC_LEN,
+};
 
 #[cfg(feature = "fjall")]
 pub use fjall_impl::FjallStore;
