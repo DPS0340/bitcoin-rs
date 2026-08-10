@@ -103,25 +103,46 @@ Binaries produced:
 
 ## Run sequence
 
-### Run A — full census (0..150k, counters + journal only)
+### Run A — authoritative C150 cumulative evidence
 
 ```bash
 REPO=/home/alpha/exp/bitcoin-rs
 EXP=$REPO/tools/checksig-census
+C150=/home/alpha/bench-g14/corpora/c150
 
 mkdir -p "$EXP/out"
 
-BRS_CENSUS_COUNTERS=$EXP/out/census-0-150k.counters.json \
-BRS_CENSUS_JOURNAL=$EXP/out/census-0-150k.journal.bin \
-BRS_CENSUS_LABEL=census-0-150k \
+BRS_CENSUS_COUNTERS=$EXP/out/c150.counters.json \
+BRS_CENSUS_CONTEXTS=$EXP/out/c150.contexts.bin \
+BRS_CENSUS_JOURNAL=$EXP/out/c150.journal.bin \
+BRS_CENSUS_RECORDS=$EXP/out/c150.records.bin \
+BRS_CENSUS_LABEL=c150 \
 taskset -c 0-31 \
 "$EXP/target/release/examples/mainnet_prefix_replay" \
   --stop-height 150000 \
-  --rest-url 127.0.0.1:18443 \
+  --block-file "$C150/blocks.dat" \
+  --corpus-manifest "$C150/manifest.json" \
   --assume-valid-height 0 \
-  --data-dir "$EXP/out/census-datadir" \
-  --output "$EXP/out/census-replay.json"
+  --data-dir "$EXP/out/c150-datadir" \
+  --output "$EXP/out/c150.replay.json"
+
+cd "$EXP"
+python3 analyze.py classify-corpus \
+  --counters out/c150.counters.json \
+  --contexts out/c150.contexts.bin \
+  --records out/c150.records.bin \
+  --journal out/c150.journal.bin \
+  --replay out/c150.replay.json \
+  --corpus-manifest "$C150/manifest.json" \
+  --archive "$C150/blocks.dat" \
+  --output out/c150.classification.json \
+  --contract c150
 ```
+
+The replay produces the authoritative `c150.counters.json`, `c150.contexts.bin`,
+`c150.journal.bin`, and `c150.records.bin` artifacts in one process. The strict
+classifier validates each stream's magic and framing, the exact native count
+equations, and every context, record, and journal join.
 
 Expected: `ffi_verify_entries == 2,868,199`, all verdicts true, pre-taproot
 counters (`op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls`,
@@ -151,9 +172,8 @@ BRS_CENSUS_LABEL=kspike1 \
 "$CAPTURE" --corpus "$CORPUS" --output "$EXP/out/kspike1-repeat.summary.json"
 ```
 
-An optional `BRS_CENSUS_CONTEXTS` path may be added to either run above (for
-example `BRS_CENSUS_CONTEXTS=$EXP/out/kspike1.contexts.bin`) to emit one
-variable-length BRSCTX1 row per executed `VerifyScript`.
+`BRS_CENSUS_CONTEXTS` is mandatory for authoritative Run A. It is optional for
+the separate KSPIKE1 diagnostic in Run B.
 
 Expected: `ffi_verify_entries == 159,259`, all inputs verify successfully.
 
