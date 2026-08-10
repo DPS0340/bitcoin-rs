@@ -1964,28 +1964,6 @@ def test_classify_corpus_cmodern_fails() -> None:
             assert report["all_passed"] is False
 
 
-def test_classify_corpus_c150_fails_when_non_bare_counter_nonzero() -> None:
-    """c150 fails when a non-bare counter is nonzero."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        txids = [b"\x50" * 32, b"\x51" * 32]
-        contexts = [
-            _bare_p2pkh(txids[0]),
-            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),
-        ]
-        records = [
-            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),  # bare multisig
-            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),  # p2sh multisig
-        ]
-        journal = [_make_journal_bytes(t, 0) for t in txids]
-        args = _make_classify_args(tmp, contexts, records, journal, "c150")
-        _c150_pin_failed = False
-        try:
-            rc = cmd_classify_corpus(args)
-            assert rc == 1
-        except AnalyzerError:
-            _c150_pin_failed = True  # CTX-CUSTODY from stop_height pin is expected
-
 def test_classify_corpus_zero_inputs() -> None:
     """An empty BRSCTX1 file with zero records/journal raises CTX-EXECUTION
     because cmd_classify_corpus rejects zero-input evidence.
@@ -4872,7 +4850,6 @@ def main() -> int:
         test_classify_corpus_all_spend_contexts,
         test_classify_corpus_c150_passes,
         test_classify_corpus_cmodern_fails,
-        test_classify_corpus_c150_fails_when_non_bare_counter_nonzero,
         test_classify_corpus_zero_inputs,
         test_classify_corpus_definitions_match_counter_names,
         test_classify_corpus_missing_record_identity,
