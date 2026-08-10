@@ -29,11 +29,11 @@ pub enum ReorgError {
     /// Nothing was touched.
     #[error("reorg planning failed: {0}")]
     Plan(#[source] bitcoin_rs_chain::ChainError),
-    /// A block named by the plan has no stored body.
+    /// A block in the remaining target branch has no stored body.
     ///
-    /// Nothing was touched. A pruned node legitimately reaches this, which is
-    /// why it is not fatal: it means this reorg cannot be performed, not that
-    /// the chain is broken.
+    /// If the first connect body is missing, chainstate is untouched. A later
+    /// missing body can follow a committed contiguous prefix; the caller must
+    /// continue from the published applied tip when that body arrives.
     #[error("no stored body for block {hash} at height {height}")]
     MissingBody {
         /// Block whose body is absent.
@@ -115,13 +115,25 @@ pub enum ReorgError {
     /// rolled back — undoing the prefix means disconnecting blocks that just
     /// applied, which can fail Fatal and turn a recoverable stop into an
     /// unrecoverable one. A later switch can move the chain from here.
-    #[error("reorg stopped after connecting to height {stopped_at}: {source}")]
+    ///
+    /// When `source` is permanently invalid (`PoW`, `nBits`, or consensus),
+    /// the failed block's subtree is invalidated while the chain transition is
+    /// still held, and `invalidated` carries every hash that was marked
+    /// `Invalid` so the caller can purge staged/download state after releasing
+    /// the transition. Operational failures leave `invalidated` empty.
+    #[error("reorg stopped after connecting to height {stopped_at} at block {hash}: {source}")]
     ConnectFailed {
+        /// Hash of the block that failed to connect.
+        hash: Hash256,
         /// Height the applied tip reached before stopping.
         stopped_at: u32,
         /// Why the connect failed.
         #[source]
         source: Box<ApplyError>,
+        /// Hashes of the invalid subtree, in deterministic slab order, when the
+        /// failure was allowlisted for permanent invalidation. Empty for
+        /// operational failures.
+        invalidated: Vec<Hash256>,
     },
     /// A disconnect died partway. The chainstate is torn.
     ///
@@ -160,9 +172,15 @@ where
             return Ok(());
         };
 
-        // Load every body before the first disconnect. A missing body halfway
-        // through must not strand the chain at the common ancestor.
-        let connect = load_branch_bodies(handles, &plan.connect, &mut staged_body)?;
+        // A staged prefix can be committed without waiting for the entire
+        // winning branch to fit in the bounded stager.
+        let (connect, missing_connect) =
+            load_available_branch_prefix(handles, &plan.connect, &mut staged_body)?;
+        if connect.is_empty()
+            && let Some((hash, height)) = missing_connect
+        {
+            return Err(ReorgError::MissingBody { hash, height });
+        }
         let disconnect = load_branch_bodies(handles, &plan.disconnect, &mut staged_body)?;
 
         let transition = handles
@@ -208,9 +226,19 @@ where
             ) {
                 Ok(_) => connected += 1,
                 Err(source) => {
+                    let invalidated = if is_permanent_invalid(&source) {
+                        let mut tree = handles.block_tree.write();
+                        tree.lookup(body.hash)
+                            .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     failure = Some(ReorgError::ConnectFailed {
+                        hash: body.hash,
                         stopped_at: body.height.saturating_sub(1),
                         source: Box::new(source),
+                        invalidated,
                     });
                     break;
                 }
@@ -222,6 +250,9 @@ where
         }
         if let Some(error) = failure {
             return Err(error);
+        }
+        if let Some((hash, height)) = missing_connect {
+            return Err(ReorgError::MissingBody { hash, height });
         }
         return Ok(());
     }
@@ -252,6 +283,8 @@ struct LoadedBranchBody {
     height: u32,
 }
 
+type LoadedBranchPrefix = (Vec<LoadedBranchBody>, Option<(Hash256, u32)>);
+
 /// Loads every block named by a branch, in the order given.
 fn load_branch_bodies<F>(
     handles: &ApplyHandles,
@@ -261,41 +294,76 @@ fn load_branch_bodies<F>(
 where
     F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
 {
-    let nodes = {
-        let tree = handles.block_tree.read();
-        ids.iter()
-            .map(|id| {
-                let node = tree.node(*id).map_err(ReorgError::Plan)?;
-                Ok((node.hash, node.height))
-            })
-            .collect::<core::result::Result<Vec<_>, ReorgError>>()?
-    };
+    branch_nodes(handles, ids)?
+        .into_iter()
+        .map(|(hash, height)| load_branch_body(handles, hash, height, staged_body))
+        .collect()
+}
+
+/// Loads the contiguous available prefix and names the first missing body.
+fn load_available_branch_prefix<F>(
+    handles: &ApplyHandles,
+    ids: &[NodeId],
+    staged_body: &mut F,
+) -> core::result::Result<LoadedBranchPrefix, ReorgError>
+where
+    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+{
+    let nodes = branch_nodes(handles, ids)?;
     let mut loaded = Vec::with_capacity(nodes.len());
     for (hash, height) in nodes {
-        if let Some((block, serialized)) = staged_body(hash) {
-            loaded.push(validate_branch_body(hash, height, block, serialized)?);
-            continue;
+        match load_branch_body(handles, hash, height, staged_body) {
+            Ok(body) => loaded.push(body),
+            Err(ReorgError::MissingBody { .. }) => {
+                return Ok((loaded, Some((hash, height))));
+            }
+            Err(error) => return Err(error),
         }
-        if let Some(store) = handles.block_body_store.as_ref()
-            && let Some(body) =
-                store
-                    .load_block_body(height, hash)
-                    .map_err(|source| ReorgError::BodyStore {
-                        hash,
-                        height,
-                        source,
-                    })?
-        {
-            loaded.push(decode_branch_body(hash, height, bytes::Bytes::from(body))?);
-            continue;
-        }
-        if let Some(serialized) = cached_applied_body(handles, hash) {
-            loaded.push(decode_branch_body(hash, height, serialized)?);
-            continue;
-        }
-        return Err(ReorgError::MissingBody { hash, height });
     }
-    Ok(loaded)
+    Ok((loaded, None))
+}
+
+fn branch_nodes(
+    handles: &ApplyHandles,
+    ids: &[NodeId],
+) -> core::result::Result<Vec<(Hash256, u32)>, ReorgError> {
+    let tree = handles.block_tree.read();
+    ids.iter()
+        .map(|id| {
+            let node = tree.node(*id).map_err(ReorgError::Plan)?;
+            Ok((node.hash, node.height))
+        })
+        .collect()
+}
+
+fn load_branch_body<F>(
+    handles: &ApplyHandles,
+    hash: Hash256,
+    height: u32,
+    staged_body: &mut F,
+) -> core::result::Result<LoadedBranchBody, ReorgError>
+where
+    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+{
+    if let Some((block, serialized)) = staged_body(hash) {
+        return validate_branch_body(hash, height, block, serialized);
+    }
+    if let Some(store) = handles.block_body_store.as_ref()
+        && let Some(body) =
+            store
+                .load_block_body(height, hash)
+                .map_err(|source| ReorgError::BodyStore {
+                    hash,
+                    height,
+                    source,
+                })?
+    {
+        return decode_branch_body(hash, height, bytes::Bytes::from(body));
+    }
+    if let Some(serialized) = cached_applied_body(handles, hash) {
+        return decode_branch_body(hash, height, serialized);
+    }
+    Err(ReorgError::MissingBody { hash, height })
 }
 
 fn cached_applied_body(handles: &ApplyHandles, hash: Hash256) -> Option<bytes::Bytes> {
@@ -351,4 +419,27 @@ fn validate_branch_body(
         serialized,
         height,
     })
+}
+
+/// Returns true when a connect failure is a permanent block-invalidity
+/// condition, not an operational error.
+///
+/// Only these failures poison the branch: the block and its descendants can
+/// never become valid, so invalidating the subtree is safe and the node
+/// republishes the best valid tip rather than retrying the same block.
+/// Operational failures (storage, UTXO commit, undo record) are transient
+/// and must not permanently mark a block invalid.
+fn is_permanent_invalid(error: &ApplyError) -> bool {
+    match error {
+        ApplyError::ProofOfWork { .. }
+        | ApplyError::TargetAboveLimit
+        | ApplyError::NbitsNonRetargetMismatch { .. } => true,
+        ApplyError::Consensus(error) => !matches!(
+            error,
+            bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
+                | bitcoin_rs_consensus::ConsensusError::Kernel(_)
+                | bitcoin_rs_consensus::ConsensusError::Encoding(_)
+        ),
+        _ => false,
+    }
 }

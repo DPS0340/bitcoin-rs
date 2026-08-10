@@ -395,6 +395,22 @@ impl BlockSync {
         while let Ok(InboundHeaders { headers, source }) = receiver.try_recv() {
             let batch_len = headers.len();
             total_headers = total_headers.saturating_add(batch_len);
+
+            // A response consumes the current peer's request even when header
+            // acceptance rejects it; otherwise sync stalls until timeout.
+            if let Some(source) = source {
+                let outbound = self.peer_outbound.read();
+                if outbound
+                    .get(&source.addr)
+                    .is_some_and(|lease| lease.is_current(source))
+                {
+                    let mut pending = self.pending_getheaders.lock();
+                    if pending.is_some_and(|request| request.peer_addr == source.addr) {
+                        *pending = None;
+                    }
+                }
+            }
+
             let mut tree = self.handles.block_tree.write();
             let acceptance = bitcoin_rs_chain::accept_headers(
                 &mut tree,
@@ -406,19 +422,6 @@ impl BlockSync {
                 Ok(node_ids) => {
                     self.handles.assume_valid_gate.evaluate(&tree);
                     drop(tree);
-                    if let Some(source) = source {
-                        let _window = self.download_window.lock();
-                        let outbound = self.peer_outbound.read();
-                        if outbound
-                            .get(&source.addr)
-                            .is_some_and(|lease| lease.is_current(source))
-                        {
-                            let mut pending = self.pending_getheaders.lock();
-                            if pending.is_some_and(|request| request.peer_addr == source.addr) {
-                                *pending = None;
-                            }
-                        }
-                    }
                     tracing::debug!(
                         accepted = node_ids.len(),
                         received = batch_len,
@@ -440,10 +443,6 @@ impl BlockSync {
                             }
                             self.peers.write().retain(|peer| peer.addr != source.addr);
                             window.mark_peer_unresponsive(source.addr, Instant::now());
-                            let mut pending = self.pending_getheaders.lock();
-                            if pending.is_some_and(|request| request.peer_addr == source.addr) {
-                                *pending = None;
-                            }
                             blamed_peer = Some(source.addr);
                         }
                     }
@@ -708,11 +707,12 @@ impl BlockSync {
     /// application cannot close that gap, because the blocks it wants to apply
     /// do not build on the applied tip.
     ///
-    /// Availability is left to [`crate::reorg::switch_to_branch`], which loads
-    /// every body before disconnecting anything and touches nothing if one is
-    /// absent. A branch still downloading therefore reports `MissingBody` and
-    /// is retried next tick, rather than being pre-checked here — two copies of
-    /// that condition would be two chances to disagree.
+    /// Availability is left to [`crate::reorg::switch_to_branch`]. It may
+    /// commit the contiguous winning prefix already present in bounded staging,
+    /// then report `MissingBody` for the first absent suffix block. Only a
+    /// zero-length available connect prefix guarantees no mutation. Keeping
+    /// this as one authority avoids a pre-check that can disagree with the
+    /// transition witness.
     fn switch_branch_if_outweighed(&self) {
         let Some(target) = self.outweighed_branch_target() else {
             return;
@@ -743,6 +743,36 @@ impl BlockSync {
                 tracing::error!(
                     %error,
                     "block sync: chainstate torn by a failed disconnect, shutting down"
+                );
+            }
+            Err(crate::reorg::ReorgError::ConnectFailed {
+                hash, invalidated, ..
+            }) => {
+                // Invalid descendants cannot occupy bounded download state or
+                // they can prevent the newly selected valid branch from refilling.
+                if !invalidated.is_empty() {
+                    {
+                        let mut stager = self.block_stager.lock();
+                        for invalid_hash in &invalidated {
+                            stager.retire_applied(invalid_hash);
+                        }
+                    }
+                    {
+                        let mut window = self.download_window.lock();
+                        for invalid_hash in &invalidated {
+                            window.drop_for_retry(invalid_hash);
+                        }
+                    }
+                    // Invalidation can move the active branch away from the
+                    // pinned assume-valid anchor.
+                    self.handles
+                        .assume_valid_gate
+                        .evaluate(&self.handles.block_tree.read());
+                }
+                tracing::warn!(
+                    failed_hash = %hash,
+                    invalidated = invalidated.len(),
+                    "block sync: connect failed"
                 );
             }
             Err(error) => {
@@ -1985,6 +2015,13 @@ mod tests {
         let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
             sync_with_mined_chain(2)?;
         sync.ensure_genesis_tip();
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_received_blocks: 3,
+                ..super::default_sync_budget()
+            },
+        );
         for block in &main {
             stage_body(&sync, block);
         }
@@ -2026,46 +2063,54 @@ mod tests {
             .tip()
             .ok_or_else(|| std::io::Error::other("fork tip was not published"))?;
         sync.handles.chain_tip.store(Some(fork_tip));
-        for block in &fork {
+        assert_eq!(sync.block_stager.lock().received_len(), 2);
+        assert_eq!(sync.download_window.lock().received_len(), 0);
+
+        let stage_received = |block: &bitcoin::Block| {
             stage_body(&sync, block);
             let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
             let bytes = bitcoin::consensus::encode::serialize(block).len();
             sync.download_window
                 .lock()
                 .mark_received(hash, bytes, Instant::now());
-        }
-        assert_eq!(sync.block_stager.lock().received_len(), 5);
-        assert_eq!(sync.download_window.lock().received_len(), 3);
+            hash
+        };
 
+        let first_hash = stage_received(&fork[0]);
+        assert_eq!(sync.block_stager.lock().received_len(), 3);
         assert_eq!(
             sync.outweighed_branch_target(),
             Some(fork_parent),
-            "the staged fork must be the selected reorg target"
+            "the full fork tip must select the initial branch switch"
         );
         sync.switch_branch_if_outweighed();
-
-        let tip = applied_tip
+        let first_tip = applied_tip
             .load_full()
-            .ok_or_else(|| std::io::Error::other("branch switch did not publish a tip"))?;
-        assert_eq!(tip.height, 3);
-        assert_eq!(
-            tip.hash,
-            Hash256::from_le_bytes(fork[2].block_hash().as_byte_array()),
-            "staged branch bodies must be sufficient to complete the switch"
-        );
-        assert_eq!(
-            sync.block_stager.lock().received_len(),
-            2,
-            "only disconnected old-branch bodies may remain staged"
-        );
-        assert_eq!(
-            sync.download_window.lock().received_len(),
-            0,
-            "connected reorg bodies must release download accounting"
-        );
-        for block in &fork {
-            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-            assert!(!sync.block_stager.lock().contains(&hash));
+            .ok_or_else(|| std::io::Error::other("branch prefix did not publish a tip"))?;
+        assert_eq!(first_tip.height, 1);
+        assert_eq!(first_tip.hash, first_hash);
+        assert_eq!(sync.block_stager.lock().received_len(), 2);
+        assert_eq!(sync.download_window.lock().received_len(), 0);
+
+        for (index, block) in fork.iter().enumerate().skip(1) {
+            let hash = stage_received(block);
+            assert_eq!(
+                sync.block_stager.lock().received_len(),
+                3,
+                "the tiny stager has room for one suffix body"
+            );
+            assert_eq!(
+                sync.apply_buffered_blocks(None),
+                (1, 0),
+                "the committed prefix must turn the remaining fork into forward apply"
+            );
+            let tip = applied_tip
+                .load_full()
+                .ok_or_else(|| std::io::Error::other("forward suffix did not publish a tip"))?;
+            assert_eq!(tip.height, u32::try_from(index + 1)?);
+            assert_eq!(tip.hash, hash);
+            assert_eq!(sync.block_stager.lock().received_len(), 2);
+            assert_eq!(sync.download_window.lock().received_len(), 0);
         }
 
         let main_target = sync
@@ -2259,6 +2304,129 @@ mod tests {
             1,
             "only the failed block may retain download accounting"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn permanent_reorg_failure_invalidates_descendants_and_purges_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, _peers, _peer_outbound, _applied_tip, main, _blocks_tx) =
+            sync_with_mined_chain(1)?;
+        sync.ensure_genesis_tip();
+        stage_body(&sync, &main[0]);
+        assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
+        stage_body(&sync, &main[0]);
+
+        let main_hash = Hash256::from_le_bytes(main[0].block_hash().as_byte_array());
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_id = sync
+            .handles
+            .block_tree
+            .read()
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
+        let invalid = mined_block_with_prev_hash(genesis.block_hash(), 1, Vec::new());
+        let invalid_id = sync.handles.block_tree.write().insert_node(
+            Some(genesis_id),
+            invalid.header,
+            NodeStatus::HeaderValid,
+        )?;
+        let descendant =
+            mined_block_with_prev_hash(invalid.block_hash(), 2, vec![coinbase_transaction(2)]);
+        let descendant_id = sync.handles.block_tree.write().insert_node(
+            Some(invalid_id),
+            descendant.header,
+            NodeStatus::HeaderValid,
+        )?;
+        let invalid_hash = Hash256::from_le_bytes(invalid.block_hash().as_byte_array());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_byte_array());
+        for block in [&invalid, &descendant] {
+            stage_body(&sync, block);
+            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            let bytes = bitcoin::consensus::encode::serialize(block).len();
+            sync.download_window
+                .lock()
+                .mark_received(hash, bytes, Instant::now());
+        }
+
+        sync.switch_branch_if_outweighed();
+
+        {
+            let tree = sync.handles.block_tree.read();
+            assert_eq!(tree.node(invalid_id)?.status, NodeStatus::Invalid);
+            assert_eq!(tree.node(descendant_id)?.status, NodeStatus::Invalid);
+            assert_eq!(
+                tree.tip().map(|tip| tip.hash),
+                Some(main_hash),
+                "the valid main branch must win after subtree invalidation"
+            );
+        }
+        let stager = sync.block_stager.lock();
+        assert!(stager.contains(&main_hash));
+        assert!(!stager.contains(&invalid_hash));
+        assert!(!stager.contains(&descendant_hash));
+        drop(stager);
+        assert_eq!(sync.download_window.lock().received_len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn operational_reorg_failure_preserves_branch_and_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut sync, _peers, _peer_outbound, _applied_tip, main, _blocks_tx) =
+            sync_with_mined_chain(1)?;
+        sync.ensure_genesis_tip();
+        stage_body(&sync, &main[0]);
+        assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
+        stage_body(&sync, &main[0]);
+        sync.handles.block_body_store = Some(Arc::new(FailOnceBodyStore::new(1)));
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_id = sync
+            .handles
+            .block_tree
+            .read()
+            .lookup(Hash256::from_le_bytes(genesis.block_hash().as_byte_array()))
+            .ok_or_else(|| std::io::Error::other("missing genesis node"))?;
+        let mut fork_coinbase = coinbase_transaction(1);
+        fork_coinbase.output[0].script_pubkey = Builder::new().push_int(2).into_script();
+        let fork = mined_block_with_prev_hash(genesis.block_hash(), 1, vec![fork_coinbase]);
+        let fork_id = sync.handles.block_tree.write().insert_node(
+            Some(genesis_id),
+            fork.header,
+            NodeStatus::HeaderValid,
+        )?;
+        let descendant =
+            mined_block_with_prev_hash(fork.block_hash(), 2, vec![coinbase_transaction(2)]);
+        let descendant_id = sync.handles.block_tree.write().insert_node(
+            Some(fork_id),
+            descendant.header,
+            NodeStatus::HeaderValid,
+        )?;
+        let fork_hash = Hash256::from_le_bytes(fork.block_hash().as_byte_array());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_byte_array());
+        for block in [&fork, &descendant] {
+            stage_body(&sync, block);
+            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            let bytes = bitcoin::consensus::encode::serialize(block).len();
+            sync.download_window
+                .lock()
+                .mark_received(hash, bytes, Instant::now());
+        }
+
+        sync.switch_branch_if_outweighed();
+
+        {
+            let tree = sync.handles.block_tree.read();
+            assert_ne!(tree.node(fork_id)?.status, NodeStatus::Invalid);
+            assert_ne!(tree.node(descendant_id)?.status, NodeStatus::Invalid);
+            assert_eq!(tree.tip().map(|tip| tip.tip_id), Some(descendant_id));
+        }
+        let stager = sync.block_stager.lock();
+        assert!(stager.contains(&fork_hash));
+        assert!(stager.contains(&descendant_hash));
+        drop(stager);
+        assert_eq!(sync.download_window.lock().received_len(), 2);
         Ok(())
     }
 
@@ -2571,8 +2739,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_inbound_headers_keep_getheaders_gate_pending() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn rejected_matching_peer_headers_release_gate_and_retry_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let genesis = genesis_header();
         let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
@@ -2618,9 +2786,8 @@ mod tests {
             return Err(std::io::Error::other("expected first getheaders").into());
         }
 
-        // An orphan header from any peer that does not connect to our tip must
-        // not advance the header chain, so the gate stays pending and no
-        // duplicate getheaders is sent before the request times out.
+        // A syntactically valid response consumes the matching request even when
+        // acceptance rejects its headers. Otherwise one bad response stalls sync.
         let orphan_prev = BlockHash::from_byte_array([0x11; 32]);
         let orphan = test_header(orphan_prev, 5);
         inbound_headers_tx.send(InboundHeaders {
@@ -2628,10 +2795,8 @@ mod tests {
             source: Some(current_source(&peer_outbound, addr)),
         })?;
         sync.tick();
-        assert!(
-            rx.try_recv().is_err(),
-            "stale inbound headers must not release the getheaders gate"
-        );
+        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(rx.try_recv().is_err());
         let tip = chain_tip
             .load_full()
             .ok_or_else(|| std::io::Error::other("missing header tip"))?;
@@ -7320,6 +7485,21 @@ mod tests {
         panic!("exhausted the header nonce space while mining a regtest fixture");
     }
 
+    fn far_future_header(
+        prev_blockhash: BlockHash,
+        height: u32,
+    ) -> Result<BlockHeader, Box<dyn std::error::Error>> {
+        let mut header = test_header(prev_blockhash, height);
+        header.time = bitcoin_rs_chain::current_unix_seconds().saturating_add(3 * 60 * 60);
+        for nonce in 0..=u32::MAX {
+            header.nonce = nonce;
+            if header.target().is_met_by(header.block_hash()) {
+                return Ok(header);
+            }
+        }
+        Err(std::io::Error::other("exhausted future-header nonce space").into())
+    }
+
     struct HeaderSyncFixture {
         genesis: BlockHeader,
         sync: BlockSync,
@@ -7824,6 +8004,57 @@ mod tests {
         assert_eq!(
             witness_block_inventory(next_getdata(&alternate_rx)?)?,
             expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn far_future_matching_peer_retries_without_peer_blame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let HeaderSyncFixture {
+            genesis,
+            sync,
+            inbound_headers_tx,
+            peers,
+            peer_outbound,
+        } = header_sync_with_genesis()?;
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        peers.write().push(synthetic_peer(peer_addr, 8));
+        let (tx, rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peer_outbound.write().insert(peer_addr, lease.clone());
+        let tip_before = sync
+            .handles
+            .chain_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing genesis tip"))?;
+
+        sync.tick();
+        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        inbound_headers_tx.send(InboundHeaders {
+            headers: vec![far_future_header(genesis.block_hash(), 1)?],
+            source: Some(current_source(&peer_outbound, peer_addr)),
+        })?;
+        sync.tick();
+
+        assert_eq!(
+            sync.handles.chain_tip.load_full().as_deref(),
+            Some(tip_before.as_ref())
+        );
+        assert!(matches!(rx.try_recv()?, NetworkMessage::GetHeaders(_)));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !lease.is_cancelled(),
+            "local-clock rejection must not cancel the peer lease"
+        );
+        assert!(peer_outbound.read().contains_key(&peer_addr));
+        assert!(peers.read().iter().any(|peer| peer.addr == peer_addr));
+        assert!(
+            !sync
+                .download_window
+                .lock()
+                .peer_in_staller_cooldown(peer_addr, Instant::now()),
+            "local-clock rejection must not blame the peer"
         );
         Ok(())
     }

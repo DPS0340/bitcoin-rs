@@ -38,13 +38,16 @@ Done:
 * `disconnect_block`, which restores the UTXO set, the transaction index, and
   `applied_tip`. Its ordering claims are mutation-verified.
 * `switch_to_branch` (`crates/node/src/reorg.rs`), called by sync when the
-  best-work header branch outweighs the applied branch. It preloads every body,
-  takes one admission-and-transition witness, recomputes the plan under that
-  guard, and mutates only when the ordered plan is unchanged. Every loaded
-  block and its preserved bytes are bound to the planned hash before the first
-  disconnect. Body lookup uses bounded staging, durable storage, then the
-  applied in-memory body cache as a no-store fallback. Committed new-branch
-  blocks release staging and download-window accounting.
+  best-work header branch outweighs the applied branch. It loads all
+  disconnect bodies and the contiguous target prefix that fits in bounded
+  staging. The disconnect preload remains $O(\text{disconnect depth})$. If the
+  first connect body is absent, chainstate does not change. The transition
+  witness recomputes the complete authoritative plan and permits mutation only
+  when that plan is unchanged. Each available prefix then forms a coherent
+  applied-tip checkpoint; `MissingBody` names the next suffix block. A permanent
+  connect failure invalidates its header subtree, selects the best valid tip,
+  and purges that subtree from staging and download ownership. Operational
+  failures preserve both branch eligibility and ownership.
 * Fork-aware download requests start at the common ancestor's child. A target
   change discards pending ownership from the losing branch.
 * A fatal disconnect closes apply admission and sets the process shutdown token.
@@ -140,9 +143,9 @@ Done:
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
 | `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
 | Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first mutation and above the index rollback; startup refuses while it is set. See *Disconnect marker phase* in `CONCEPTS.md` |
-| Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. A branch switch holds one witness across authoritative replanning and the complete disconnect-and-connect walk. |
-| Branch switching | `switch_to_branch` preloads optimistically, recomputes the exact ordered `plan_reorg` result under the transition guard, and retries without mutation if the plan changed. A shorter branch is eligible when its accumulated work is greater. |
-| Body acquisition | fork requests start at the common ancestor's child; every body is loaded from bounded staging, durable storage, then the applied body cache as a no-store fallback before disconnect begins. Header hash and preserved bytes must match the planned node. Each committed connect retires its exact staging and download-window entry, including a prefix committed before a later connect fails. |
+| Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. One witness covers authoritative replanning, all disconnects, and the available contiguous connect prefix. |
+| Branch switching | `switch_to_branch` recomputes the complete ordered `plan_reorg` result under the transition guard and mutates only when it equals the optimistic plan. A shorter branch is eligible when its accumulated work is greater. A permanent connect failure invalidates its subtree and selects the best valid tip. |
+| Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix available from bounded staging, durable storage, or the applied body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
 | Fatal lifecycle | `Fatal` and `MarkerStuck` close apply admission while the transition lock is held; sync sets the shared process shutdown token |
 
 Open:
@@ -155,9 +158,11 @@ Open:
 | Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
 | Un-ignore `g10_reorg_deep` | prove the full path against `bitcoind` regtest |
 
-Body-load failures occur before mutation. A refused disconnect can leave a
-shorter coherent applied chain when earlier disconnects completed. A connect
-failure leaves a coherent prefix of the target branch. The node does not run a
+A body-load error occurs before its attempt mutates. A missing suffix body can
+be reported after a coherent target prefix commits. A refused disconnect can
+leave a shorter coherent applied chain when earlier disconnects completed. A
+connect failure leaves a coherent prefix of the target branch. The node does
+not run a
 compensating rollback because that second rollback can turn a recoverable stop
 into a fatal one. `Fatal` and `MarkerStuck` stop further mutation and trigger the
 normal shutdown path.

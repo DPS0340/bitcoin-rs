@@ -101,9 +101,18 @@ cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
 inverses. `transactions` needed nothing, because connection never populates it.
 
 `switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect
-caller. Sync drives it when the header and applied tips diverge. It holds one
-`ChainTransition` witness across the full disconnect-and-connect walk, so no
-ordinary connect can invalidate a preloaded plan between blocks.
+caller. Sync drives it when the header and applied tips diverge. Each attempt
+loads all disconnect bodies and the available contiguous connect prefix. The
+disconnect preload is $O(\text{disconnect depth})$. A `ChainTransition`
+witness then requires the complete authoritative plan to equal the preloaded
+plan before mutation starts.
+
+The available prefix becomes one coherent applied-tip checkpoint. If the next
+body is absent, `MissingBody` identifies that suffix and sync resumes from the
+published tip. A permanent connect failure invalidates the failed header and
+its descendants, selects the best valid tip, and purges their bounded staging
+and download ownership. An operational failure leaves the branch eligible and
+keeps its ownership for retry.
 
 Still open around it: returning a disconnected block's transactions through one
 production admission pipeline shared by Electrum, P2P relay, and reorg handling;
