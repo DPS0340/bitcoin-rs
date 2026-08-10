@@ -4263,11 +4263,11 @@ def test_classify_corpus_inv2_ffi_verify_true_mismatch() -> None:
         assert inv2["passed"] is False
 
 
-def test_classify_corpus_inv3_eval_script_entries_mismatch() -> None:
-    """eval_script_entries is not in the equality chain or complementary-zero
-    set, so _c150_passed does not check it.  But INV-3 checks
-    checkecdsa_entries == ecdsa_from_checksig + ecdsa_from_checkmultisig,
-    not eval_script_entries.  Using cmodern to verify the report is written."""
+def test_classify_corpus_cmodern_bad_eval_counter_fails_closed() -> None:
+    """C150 separately pins eval_script_entries to twice the canonical
+    ordinary total; this cmodern fixture supplies a bad eval counter and
+    proves the fail-closed classifier still writes a failure report/returns
+    1, not the C150 predicate."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xc4" * 32
@@ -4927,7 +4927,7 @@ def main() -> int:
         test_classify_corpus_journal_sum_op_checksig_mismatch,
         test_classify_corpus_inv1_verify_script_calls_mismatch,
         test_classify_corpus_inv2_ffi_verify_true_mismatch,
-        test_classify_corpus_inv3_eval_script_entries_mismatch,
+        test_classify_corpus_cmodern_bad_eval_counter_fails_closed,
         test_classify_corpus_sighash_computed_mismatch,
         test_classify_corpus_sighash_midstate_hit_mismatch,
         test_record_rejects_outcome0_with_reject_reason,
