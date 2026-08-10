@@ -7,22 +7,33 @@
 //! the two backends cannot share a binary).
 //!
 //! Two idempotent phases:
-//! 1. **Extract** (skipped when the corpus file already exists): stream
-//!    mainnet blocks `0..=150_000` from a local `bitcoind -rest` endpoint,
-//!    maintain an in-memory outpoint -> prevout map, and keep the top N
-//!    (default 300) blocks by non-coinbase input count, together with every
-//!    spent prevout (script bytes + amount). Coinbase inputs have no prevout
-//!    and are excluded from sampling and measurement.
+//! 1. **Extract** (skipped when the corpus file already exists): replay
+//!    mainnet blocks `0..=--stop-height` from a local `bitcoind -rest`
+//!    endpoint to seed an in-memory outpoint map, then keep the top
+//!    `--sample-count` blocks in `--start-height..=--stop-height` by
+//!    non-coinbase input count, together with every spent prevout.
+//!    Extraction requires `--stop-height`, `--sample-count`, and
+//!    `--min-inputs`. Coinbase inputs have no prevout and are excluded from
+//!    sampling and measurement.
 //! 2. **Measure**: verify every sampled non-coinbase transaction's scripts
-//!    through `KernelContext::verify_tx` at rayon widths 1/8/32 (a dedicated
-//!    `ThreadPoolBuilder` pool per width), with per-height flags derived
-//!    exactly as production's `compute_verify_flags` derives them. Every
-//!    pristine input must verify OK; any rejection aborts loudly with
+//!    through `KernelContext::verify_tx` at rayon widths 1/8/32, with one
+//!    dedicated `ThreadPoolBuilder` pool per width and mainnet
+//!    activation-height flags matching the active chain. Every pristine input
+//!    must verify OK; any rejection aborts loudly with
 //!    height/txid/input index. The timed window includes the per-tx
 //!    serialization + `bitcoinkernel::Transaction` parse inside `verify_tx`
 //!    (production pays both per tx) but excludes corpus load and work-item
 //!    construction (production amortizes block decode and prevout lookup in
 //!    its own pipeline stages).
+//!
+//! CLI:
+//!   --rest-url <host:port>       [127.0.0.1:8332]
+//!   --corpus PATH                (required)
+//!   --output PATH                (required)
+//!   --start-height <u32>         [0]
+//!   --stop-height <u32>          (required when extracting)
+//!   --sample-count <usize>       (required when extracting)
+//!   --min-inputs <usize>         (required when extracting)
 //!
 //! Corpus format (single file, all integers little-endian):
 //! ```text
@@ -49,30 +60,29 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin::consensus::Decodable as _;
+use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_consensus::kernel::KernelContext;
-use bitcoin_rs_primitives::{Network, Tx};
+use bitcoin_rs_primitives::{Hash256, Network, Tx};
 use bitcoin_rs_script::VerifyFlags;
 use rayon::prelude::*;
 use serde_json::json;
 
 const CORPUS_MAGIC: &[u8; 8] = b"KSPIKE1\0";
-const STOP_HEIGHT: u32 = 150_000;
-const SAMPLE_BLOCKS: usize = 300;
-const MIN_CORPUS_INPUTS: usize = 20_000;
 const THREAD_WIDTHS: [usize; 3] = [1, 8, 32];
 
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
 
-    if args.corpus.exists() {
+    let needs_extract = !args.corpus.exists();
+    if needs_extract {
+        extract_corpus(&args)?;
+    } else {
         eprintln!(
             "corpus {} exists; skipping extraction",
             args.corpus.display()
         );
-    } else {
-        extract_corpus(&args)?;
     }
 
     let corpus = load_corpus(&args.corpus)?;
@@ -81,9 +91,7 @@ fn main() -> Result<()> {
 
     let rendered = serde_json::to_string_pretty(&report).context("render report JSON")?;
     println!("{rendered}");
-    if let Some(parent) = args.output.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    ensure_parent(&args.output)?;
     std::fs::write(&args.output, rendered + "\n")
         .with_context(|| format!("write {}", args.output.display()))?;
     Ok(())
@@ -94,31 +102,54 @@ struct Args {
     rest_url: String,
     corpus: PathBuf,
     output: PathBuf,
+    start_height: u32,
+    stop_height: Option<u32>,
+    sample_count: Option<usize>,
+    min_inputs: Option<usize>,
 }
 
 impl Args {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
-        let mut parsed = Self {
-            rest_url: "127.0.0.1:8332".to_owned(),
-            corpus: PathBuf::from("/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin"),
-            output: PathBuf::from("/home/alpha/bench-g14/results/u0-kernel-spike.json"),
-        };
+        let mut rest_url = "127.0.0.1:8332".to_owned();
+        let mut corpus: Option<PathBuf> = None;
+        let mut output: Option<PathBuf> = None;
+        let mut start_height: Option<u32> = None;
+        let mut stop_height: Option<u32> = None;
+        let mut sample_count: Option<usize> = None;
+        let mut min_inputs: Option<usize> = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let arg = arg
                 .into_string()
                 .map_err(|value| anyhow::anyhow!("argument is not UTF-8: {}", value.display()))?;
             match arg.as_str() {
-                "--rest-url" => parsed.rest_url = next_arg(&mut args, "--rest-url")?,
-                "--corpus" => parsed.corpus = PathBuf::from(next_arg(&mut args, "--corpus")?),
-                "--output" => parsed.output = PathBuf::from(next_arg(&mut args, "--output")?),
-                other => bail!(
-                    "unknown argument: {other}\nusage: kernel_verify_spike \
-                     [--rest-url <host:port>] [--corpus <path>] [--output <path>]"
-                ),
+                "--rest-url" => rest_url = next_arg(&mut args, "--rest-url")?,
+                "--corpus" => corpus = Some(PathBuf::from(next_arg(&mut args, "--corpus")?)),
+                "--output" => output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
+                "--start-height" => {
+                    start_height = Some(parse_u32(&next_arg(&mut args, "--start-height")?, "--start-height")?)
+                }
+                "--stop-height" => {
+                    stop_height = Some(parse_u32(&next_arg(&mut args, "--stop-height")?, "--stop-height")?)
+                }
+                "--sample-count" => {
+                    sample_count = Some(parse_usize(&next_arg(&mut args, "--sample-count")?, "--sample-count")?)
+                }
+                "--min-inputs" => {
+                    min_inputs = Some(parse_usize(&next_arg(&mut args, "--min-inputs")?, "--min-inputs")?)
+                }
+                other => bail!("unknown argument: {other}\nusage: kernel_verify_spike --corpus <path> --output <path> [--rest-url <host:port>] [--start-height <u32>] [--stop-height <u32>] [--sample-count <usize>] [--min-inputs <usize>]"),
             }
         }
-        Ok(parsed)
+        Ok(Self {
+            rest_url,
+            corpus: corpus.context("--corpus is required")?,
+            output: output.context("--output is required")?,
+            start_height: start_height.unwrap_or(0),
+            stop_height,
+            sample_count,
+            min_inputs,
+        })
     }
 }
 
@@ -129,14 +160,36 @@ fn next_arg(args: &mut impl Iterator<Item = OsString>, name: &str) -> Result<Str
         .map_err(|value| anyhow::anyhow!("{name} value is not UTF-8: {}", value.display()))
 }
 
-/// Mirrors `compute_verify_flags` in `crates/node/src/apply.rs`: P2SH is
-/// always-on for supported validation paths; DERSIG/CLTV/CSV/WITNESS/TAPROOT
-/// gate on activation height. Production resolves CSV/segwit through BIP9
-/// contextual state with these same height predicates as fallback; at the
-/// corpus heights (<= 150k, far below every activation) the two derivations
-/// are identical and every flag except P2SH is off.
-fn production_verify_flags(network: Network, height: u32) -> VerifyFlags {
-    let mut flags = VerifyFlags::P2SH;
+fn parse_u32(value: &str, name: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("{name} must be a non-negative 32-bit integer, got {value}"))
+}
+
+fn parse_usize(value: &str, name: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a non-negative integer, got {value}"))
+}
+
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Uses the mainnet activation-height fallback, including Core's hash-pinned
+/// BIP16 exception. Production derives BIP9 state from the active header chain.
+fn production_verify_flags(
+    network: Network,
+    height: u32,
+    block_hash: Hash256,
+) -> VerifyFlags {
+    let mut flags = VerifyFlags::NONE;
+    if !network.is_bip16_p2sh_exception(block_hash) {
+        flags = flags.union(VerifyFlags::P2SH);
+    }
     if network.is_bip66_active(height) {
         flags = flags.union(VerifyFlags::DERSIG);
     }
@@ -173,8 +226,32 @@ struct SampleBlock {
 }
 
 fn extract_corpus(args: &Args) -> Result<()> {
+    let stop_height = args
+        .stop_height
+        .context("--stop-height is required to extract a new corpus")?;
+    let sample_count = args
+        .sample_count
+        .context("--sample-count is required to extract a new corpus")?;
+    let min_inputs = args
+        .min_inputs
+        .context("--min-inputs is required to extract a new corpus")?;
+
+    if stop_height < args.start_height {
+        bail!(
+            "inconsistent bounds: stop-height {stop_height} < start-height {}",
+            args.start_height
+        );
+    }
+    if sample_count == 0 {
+        bail!("--sample-count must be greater than zero");
+    }
+    if min_inputs == 0 {
+        bail!("--min-inputs must be greater than zero");
+    }
+
     eprintln!(
-        "extracting corpus: streaming blocks 0..={STOP_HEIGHT} from {}",
+        "extracting corpus: replaying blocks 0..={stop_height}, sampling {}..={stop_height} from {}",
+        args.start_height,
         args.rest_url
     );
     let started = Instant::now();
@@ -184,7 +261,7 @@ fn extract_corpus(args: &Args) -> Result<()> {
     let mut keys: BinaryHeap<Reverse<(usize, u32)>> = BinaryHeap::new();
     let mut candidates: hashbrown::HashMap<u32, SampleBlock> = hashbrown::HashMap::new();
 
-    for height in 0..=STOP_HEIGHT {
+    for height in 0..=stop_height {
         let raw = fetch_block(&mut client, height)?;
         let block = bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(raw.as_slice()))
             .with_context(|| format!("decode block at height {height}"))?;
@@ -217,13 +294,13 @@ fn extract_corpus(args: &Args) -> Result<()> {
         }
 
         let input_count = prevouts.len();
-        if input_count > 0 {
+        if height >= args.start_height && input_count > 0 {
             let candidate = SampleBlock {
                 height,
                 raw,
                 prevouts,
             };
-            if keys.len() < SAMPLE_BLOCKS {
+            if keys.len() < sample_count {
                 keys.push(Reverse((input_count, height)));
                 candidates.insert(height, candidate);
             } else if let Some(&Reverse((min_count, min_height))) = keys.peek()
@@ -254,9 +331,9 @@ fn extract_corpus(args: &Args) -> Result<()> {
         samples.len(),
         started.elapsed()
     );
-    if total_inputs < MIN_CORPUS_INPUTS {
+    if total_inputs < min_inputs {
         bail!(
-            "corpus too small: {total_inputs} non-coinbase inputs < required {MIN_CORPUS_INPUTS}"
+            "corpus too small: {total_inputs} non-coinbase inputs < required {min_inputs}"
         );
     }
     write_corpus(&args.corpus, &samples)
@@ -276,9 +353,7 @@ fn fetch_block(client: &mut RestClient, height: u32) -> Result<Vec<u8>> {
 }
 
 fn write_corpus(path: &Path, samples: &[SampleBlock]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
+    ensure_parent(path)?;
     let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writer.write_all(CORPUS_MAGIC)?;
@@ -379,7 +454,8 @@ fn build_work_items(corpus: &[SampleBlock]) -> Result<Vec<WorkItem>> {
         let block =
             bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(sample.raw.as_slice()))
                 .with_context(|| format!("decode corpus block at height {}", sample.height))?;
-        let flags = production_verify_flags(Network::Mainnet, sample.height);
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let flags = production_verify_flags(Network::Mainnet, sample.height, block_hash);
         let mut prevouts = sample.prevouts.iter();
         for tx in &block.txdata {
             if tx.is_coinbase() {
@@ -522,10 +598,14 @@ fn measure(corpus: &[SampleBlock], items: &[WorkItem], args: &Args) -> Result<se
     }
 
     Ok(json!({
-        "schema": "u0-kernel-verify-spike-v1",
+        "schema": "u0-kernel-verify-spike-v2",
         "measurement_target": "bitcoinkernel per-input script verify",
         "git_head": git_head().ok(),
         "comparator": "recorded ~65 us/input effective-serial, bitcoinconsensus backend, same machine",
+        "start_height": args.start_height,
+        "stop_height": args.stop_height,
+        "sample_count": args.sample_count,
+        "min_inputs": args.min_inputs,
         "corpus": {
             "path": args.corpus.display().to_string(),
             "block_count": corpus.len(),
@@ -539,12 +619,12 @@ fn measure(corpus: &[SampleBlock], items: &[WorkItem], args: &Args) -> Result<se
 }
 
 fn duration_us_per_input(elapsed: Duration, total_inputs: usize) -> Result<f64> {
-    let micros = u32::try_from(elapsed.as_micros()).context("elapsed micros exceed u32")?;
-    let inputs = u32::try_from(total_inputs).context("input count exceeds u32")?;
+    let micros = u64::try_from(elapsed.as_micros()).context("elapsed micros exceed u64")?;
+    let inputs = u64::try_from(total_inputs).context("input count exceeds u64")?;
     if inputs == 0 {
         bail!("corpus contains zero inputs");
     }
-    Ok(f64::from(micros) / f64::from(inputs))
+    Ok((micros as f64) / (inputs as f64))
 }
 
 fn git_head() -> Result<String> {
