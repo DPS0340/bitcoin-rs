@@ -638,6 +638,29 @@ impl UndoBatch {
     pub const fn is_empty(&self) -> bool {
         self.restores.is_empty() && self.removes.is_empty()
     }
+
+    /// Outputs this batch restores, i.e. those the disconnected block spent.
+    #[must_use]
+    pub fn restores(&self) -> &[UtxoAdd] {
+        &self.restores
+    }
+
+    /// Outputs this batch removes, i.e. those the disconnected block created.
+    #[must_use]
+    pub fn removes(&self) -> &[OutPoint] {
+        &self.removes
+    }
+
+    /// Rebuilds a batch from its decoded parts.
+    ///
+    /// Crate-visible on purpose. `undo_codec::decode` rejects a record where one
+    /// outpoint appears in both halves, and this constructor performs no check
+    /// at all, so a public one is a way to build exactly the batch the codec
+    /// refuses. The decoder is the only caller and it has already done the work.
+    #[must_use]
+    pub(crate) const fn from_parts(restores: Vec<UtxoAdd>, removes: Vec<OutPoint>) -> Self {
+        Self { restores, removes }
+    }
 }
 
 #[derive(Copy, Clone)]

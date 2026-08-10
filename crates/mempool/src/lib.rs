@@ -7,6 +7,10 @@ extern crate alloc;
 pub mod entry;
 /// Package eviction policy.
 pub mod eviction;
+/// History-based fee-rate estimator.
+pub mod fee_estimator;
+/// Orphan transaction pool for transactions with missing parents.
+pub mod orphan;
 /// Pareto-front transaction priority ordering.
 pub mod pareto;
 /// Mempool policy limits.
@@ -15,6 +19,8 @@ pub mod policy;
 pub mod pool;
 /// BIP125 replacement-by-fee checks.
 pub mod rbf;
+/// Transaction relay standardness policy.
+pub mod standardness;
 
 pub use entry::{EntryId, MempoolEntry};
 pub use eviction::evict_lowest_fee_packages;

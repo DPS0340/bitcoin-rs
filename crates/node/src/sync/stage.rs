@@ -31,7 +31,7 @@ struct ReceivedBlock {
     bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct DrainedBlock {
     pub(super) hash: Hash256,
     pub(super) block: bitcoin::Block,
@@ -150,6 +150,24 @@ impl BlockStager {
     /// the frontier.
     pub(super) fn contains(&self, hash: &Hash256) -> bool {
         self.received.contains_key(hash)
+    }
+
+    /// Clones one staged decoded body and its original wire bytes without
+    /// removing it from the bounded staging set.
+    pub(super) fn staged_body(&self, hash: Hash256) -> Option<(bitcoin::Block, bytes::Bytes)> {
+        self.received
+            .get(&hash)
+            .map(|entry| (entry.block.clone(), entry.serialized.clone()))
+    }
+
+    /// Releases one body after that exact block commits during a branch switch.
+    pub(super) fn retire_applied(&mut self, hash: &Hash256) -> bool {
+        let removed = self.take_entry(hash).is_some();
+        if self.received.is_empty() {
+            self.received_order.clear();
+            self.next_received_deadline = None;
+        }
+        removed
     }
 
     pub(super) fn drain_expected_prefix(
@@ -377,6 +395,30 @@ mod tests {
         assert_eq!(stager.received_bytes(), block_bytes.saturating_mul(2));
         assert!(stager.contains(&third));
         assert!(stager.contains(&fourth));
+    }
+
+    #[test]
+    fn staged_body_lookup_preserves_the_entry() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let serialized = bytes::Bytes::from(serialize(&block));
+        let hash = Hash256::from_le_bytes(&[0x05; 32]);
+        let mut stager = BlockStager::new(default_sync_budget());
+        stager.insert(
+            hash,
+            None,
+            block.clone(),
+            serialized.clone(),
+            Instant::now(),
+        );
+
+        let Some((loaded, loaded_serialized)) = stager.staged_body(hash) else {
+            panic!("inserted body must remain readable");
+        };
+
+        assert_eq!(loaded, block);
+        assert_eq!(loaded_serialized, serialized);
+        assert_eq!(stager.received_len(), 1);
+        assert!(stager.contains(&hash));
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub enum ColumnFamily {
     UtxoMeta = 9,
     /// Serialized block body rows.
     BlockBodies = 10,
+    /// Per-block UTXO undo records, needed to disconnect a block during a reorg.
+    UndoData = 11,
 }
 
 impl ColumnFamily {
@@ -40,6 +42,7 @@ impl ColumnFamily {
         Self::BlockTree,
         Self::UtxoMeta,
         Self::BlockBodies,
+        Self::UndoData,
     ];
 
     /// Stable backend column-family/table name.
@@ -56,6 +59,7 @@ impl ColumnFamily {
             Self::BlockTree => "block_tree",
             Self::UtxoMeta => "utxo_meta",
             Self::BlockBodies => "block_bodies",
+            Self::UndoData => "undo_data",
         }
     }
 
@@ -78,6 +82,7 @@ impl ColumnFamily {
             8 => Some(Self::BlockTree),
             9 => Some(Self::UtxoMeta),
             10 => Some(Self::BlockBodies),
+            11 => Some(Self::UndoData),
             _ => None,
         }
     }
@@ -96,6 +101,7 @@ impl ColumnFamily {
             Self::BlockTree => 8,
             Self::UtxoMeta => 9,
             Self::BlockBodies => 10,
+            Self::UndoData => 11,
         }
     }
 }

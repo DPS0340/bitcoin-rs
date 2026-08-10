@@ -25,11 +25,21 @@ use thiserror::Error;
 /// This is intentionally narrow: node wiring uses it to combine manual-prune
 /// row deletion with prune-height metadata in one backend commit.
 #[doc(hidden)]
+/// `durable_tip_height` is the height the node would restore to after a crash.
+///
+/// Undo records are pruned against it rather than against `current_tip_height`,
+/// because the in-memory applied tip can run far ahead of the last durable
+/// checkpoint. Pruning to the in-memory tip can delete the undo record for the
+/// block the checkpoint names, and a crash then restores a chainstate that
+/// cannot disconnect its own tip: the reorg fails with `UndoRecordMissing`.
+/// Block bodies do not need this — they are re-downloadable, and undo records
+/// are not.
 pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
     store: &S,
     batch: &mut S::WriteBatch,
     block_files: &bitcoin_rs_storage::FlatFileBlockStore,
     current_tip_height: u32,
+    durable_tip_height: u32,
     policy: PrunePolicy,
 ) -> Result<(PruneOutcome, PruneOutcome, Vec<u32>), PruneError> {
     if policy.is_full_node() {
@@ -49,7 +59,12 @@ pub fn stage_block_and_undo_prune<S: bitcoin_rs_storage::KvStore>(
         batch,
         undo_pruner::BLOCK_UNDO_CF,
         undo_pruner::BLOCK_UNDO_PREFIX_BYTES,
-        current_tip_height,
+        // The lower of the two tips, with the retention depth then subtracted
+        // by the callee. Adding the depth to the durable tip first would prune
+        // undo records within the reorg-safety margin of it, and that margin is
+        // exactly the guarantee being protected: a restore to the durable tip
+        // must be able to disconnect back through it.
+        current_tip_height.min(durable_tip_height),
         policy,
     )?;
 

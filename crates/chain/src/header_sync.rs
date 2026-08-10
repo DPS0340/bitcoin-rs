@@ -7,6 +7,13 @@ use crate::{
     tree::{BlockTree, hash_from_header, prev_hash_from_header},
 };
 
+/// Maximum number of seconds a header timestamp may lie ahead of the
+/// current system time, per the Bitcoin consensus future-drift bound.
+const MAX_FUTURE_TIME_SECONDS: u32 = 7200;
+
+/// Number of blocks the median-time-past rule spans, per consensus.
+const MEDIAN_TIME_SPAN: usize = 11;
+
 /// Accepts a contiguous batch of headers after proof-of-work validation.
 ///
 /// An already-present header is treated as an idempotent input: before any
@@ -17,10 +24,21 @@ use crate::{
 /// Genesis on a non-empty tree) without relaxing validation or error
 /// propagation for unknown headers, which continue through proof-of-work and
 /// contextual nBits validation before insertion.
+/// `now_secs` is the reference time for the future-drift bound, supplied by
+/// the caller rather than read here.
+///
+/// `TimestampTooFarAhead` documents a network-adjusted limit, and a host clock
+/// running an hour slow would reject a header ninety minutes ahead of network
+/// time even though it is well inside the two-hour window — across every peer,
+/// stalling the sync. This node tracks no peer time offset yet, so every caller
+/// passes [`current_unix_seconds`] today; the parameter is what lets one
+/// callsite change when it does, and what makes the bound testable without
+/// moving the system clock.
 pub fn accept_headers(
     tree: &mut BlockTree,
     headers: &[BlockHeader],
     network: Network,
+    now_secs: u32,
 ) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
     for header in headers {
@@ -32,10 +50,75 @@ pub fn accept_headers(
         validate_pow(header, hash, network)?;
         validate_empty_tree_root(tree, header, hash, network)?;
         validate_candidate_nbits(tree, header, network)?;
+        validate_header_timestamp(tree, header, hash, now_secs)?;
         let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
         accepted.push(id);
     }
     Ok(accepted)
+}
+
+/// Reads the wall clock as whole seconds since the UNIX epoch.
+///
+/// A clock before the epoch yields 0, which only makes the future-drift bound
+/// stricter and can never wrongly accept a header.
+pub fn current_unix_seconds() -> u32 {
+    unix_seconds_at(std::time::SystemTime::now())
+}
+
+fn unix_seconds_at(now: std::time::SystemTime) -> u32 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX)
+        })
+}
+
+/// Enforces the two consensus timestamp rules against `now_secs`.
+///
+/// The median is taken over the candidate's parent and up to ten of its
+/// ancestors. Batch parents are already in the tree because `accept_headers`
+/// inserts each header before moving to the next, so a header whose parent
+/// arrived in the same batch is validated against it.
+///
+/// `now_secs` is passed in rather than read here so the drift bound is a pure
+/// function of its inputs and testable at its boundaries.
+/// Checks a header's timestamp against median-time-past and the future bound.
+///
+/// Public because header sync is not the only path that admits a header: the
+/// apply path inserts one directly when a block arrives whose header was never
+/// seen, and without this it could make a block with an invalid timestamp the
+/// applied consensus tip.
+pub fn validate_header_timestamp(
+    tree: &BlockTree,
+    header: &BlockHeader,
+    hash: bitcoin_rs_primitives::Hash256,
+    now_secs: u32,
+) -> Result<(), ChainError> {
+    let Some(parent_id) = tree.lookup(prev_hash_from_header(header)) else {
+        // No parent in the tree: the root path is validated by
+        // `validate_empty_tree_root`, and a genuinely unknown parent is
+        // rejected by insertion. Neither case has ancestors to take a median
+        // over, so there is no timestamp rule to apply.
+        return Ok(());
+    };
+    let median = tree
+        .median_time_past_at(parent_id, MEDIAN_TIME_SPAN)
+        .ok_or(ChainError::UnknownNode { id: parent_id })?;
+    if header.time <= median {
+        return Err(ChainError::TimestampTooEarly {
+            hash,
+            timestamp: header.time,
+            median,
+        });
+    }
+    let max_allowed = now_secs.saturating_add(MAX_FUTURE_TIME_SECONDS);
+    if header.time > max_allowed {
+        return Err(ChainError::TimestampTooFarAhead {
+            hash,
+            timestamp: header.time,
+            max_allowed,
+        });
+    }
+    Ok(())
 }
 
 fn validate_empty_tree_root(
@@ -232,4 +315,153 @@ fn pow_limit_bits(network: Network) -> CompactTarget {
 
 fn target_to_bits(target: ChainWork) -> CompactTarget {
     bitcoin::Target::from_be_bytes(target.to_be_bytes::<32>()).to_compact_lossy()
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::{MAX_FUTURE_TIME_SECONDS, validate_header_timestamp};
+    use crate::{
+        ChainError,
+        node::{BlockHeader, NodeStatus},
+        tree::{BlockTree, hash_from_header},
+    };
+    use bitcoin::{BlockHash, TxMerkleNode, block::Version, hashes::Hash as _, pow::CompactTarget};
+
+    const REGTEST_BITS: u32 = 0x207f_ffff;
+
+    fn mine(prev_blockhash: BlockHash, height: u32, time: u32) -> BlockHeader {
+        let mut merkle = [0_u8; 32];
+        merkle[..4].copy_from_slice(&height.to_le_bytes());
+        let mut header = BlockHeader {
+            version: Version::ONE,
+            prev_blockhash,
+            merkle_root: TxMerkleNode::from_byte_array(merkle),
+            time,
+            bits: CompactTarget::from_consensus(REGTEST_BITS),
+            nonce: 0,
+        };
+        while !header.target().is_met_by(header.block_hash()) {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        header
+    }
+
+    /// The future bound must follow the supplied time, not the host clock.
+    ///
+    /// A host running slow used to reject headers that were well inside the
+    /// two-hour window relative to network time, and it would do that against
+    /// every peer at once.
+    #[test]
+    fn the_future_bound_follows_the_supplied_time_not_the_host_clock() {
+        let (tree, tip) = chain_with_median_five();
+        // Far past any plausible host clock, so a raw-clock bound rejects it.
+        let network_now = 2_000_000_000_u32;
+        let header = mine(tip.block_hash(), 11, network_now + MAX_FUTURE_TIME_SECONDS);
+        let hash = hash_from_header(&header);
+
+        assert!(
+            super::current_unix_seconds() + MAX_FUTURE_TIME_SECONDS < header.time,
+            "the host clock must reject this header, or the test proves nothing"
+        );
+        assert!(
+            validate_header_timestamp(&tree, &header, hash, network_now).is_ok(),
+            "a header exactly at the bound relative to the supplied time is valid"
+        );
+
+        // One second past it is not.
+        let beyond = mine(
+            tip.block_hash(),
+            12,
+            network_now + MAX_FUTURE_TIME_SECONDS + 1,
+        );
+        let beyond_hash = hash_from_header(&beyond);
+        assert!(
+            matches!(
+                validate_header_timestamp(&tree, &beyond, beyond_hash, network_now),
+                Err(ChainError::TimestampTooFarAhead { .. })
+            ),
+            "one second past the bound must still be rejected"
+        );
+    }
+
+    /// Builds a chain of 11 headers with times 0..=10, so the median-time-past
+    /// of the tip is exactly 5. Insertion bypasses `accept_headers` so the
+    /// fixture itself is not subject to the rule under test.
+    fn chain_with_median_five() -> (BlockTree, BlockHeader) {
+        let mut tree = BlockTree::new();
+        let mut prev = BlockHash::all_zeros();
+        let mut tip = mine(prev, 0, 0);
+        for height in 0_u32..11 {
+            let header = mine(prev, height, height);
+            prev = header.block_hash();
+            let hash = hash_from_header(&header);
+            let inserted = tree.insert_header_with_hash(header, hash, NodeStatus::HeaderValid);
+            assert!(
+                inserted.is_ok(),
+                "fixture header failed to insert: {inserted:?}"
+            );
+            tip = header;
+        }
+        (tree, tip)
+    }
+
+    fn check(tree: &BlockTree, header: &BlockHeader, now: u32) -> Result<(), ChainError> {
+        validate_header_timestamp(tree, header, hash_from_header(header), now)
+    }
+
+    #[test]
+    fn timestamp_equal_to_median_is_rejected() {
+        let (tree, tip) = chain_with_median_five();
+        let candidate = mine(tip.block_hash(), 11, 5);
+        assert!(matches!(
+            check(&tree, &candidate, 1_000_000),
+            Err(ChainError::TimestampTooEarly { median: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn timestamp_one_past_median_is_accepted() {
+        let (tree, tip) = chain_with_median_five();
+        let candidate = mine(tip.block_hash(), 11, 6);
+        assert!(check(&tree, &candidate, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn timestamp_exactly_at_the_drift_bound_is_accepted() {
+        let (tree, tip) = chain_with_median_five();
+        let now = 1_000_000_u32;
+        let candidate = mine(tip.block_hash(), 11, now + MAX_FUTURE_TIME_SECONDS);
+        assert!(check(&tree, &candidate, now).is_ok());
+    }
+
+    #[test]
+    fn timestamp_one_past_the_drift_bound_is_rejected() {
+        let (tree, tip) = chain_with_median_five();
+        let now = 1_000_000_u32;
+        let candidate = mine(tip.block_hash(), 11, now + MAX_FUTURE_TIME_SECONDS + 1);
+        assert!(matches!(
+            check(&tree, &candidate, now),
+            Err(ChainError::TimestampTooFarAhead { .. })
+        ));
+    }
+
+    #[test]
+    fn header_without_a_parent_in_the_tree_is_not_timestamp_checked() {
+        let tree = BlockTree::new();
+        let orphan = mine(BlockHash::all_zeros(), 0, 0);
+        assert!(check(&tree, &orphan, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn wall_clock_conversion_saturates_after_u32_seconds() {
+        let after_u32 =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX) + 1);
+        assert_eq!(super::unix_seconds_at(after_u32), u32::MAX);
+    }
+
+    #[test]
+    fn wall_clock_conversion_maps_pre_epoch_to_zero() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(super::unix_seconds_at(before_epoch), 0);
+    }
 }

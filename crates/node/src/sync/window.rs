@@ -205,6 +205,7 @@ pub(super) struct DownloadWindow {
     received_bytes: usize,
     ewma_block_bytes: usize,
     next_request_height: u32,
+    request_tip: Option<(Hash256, u32)>,
     next_pending_deadline: Option<Instant>,
     /// Eligible outbound witness peers available for new block assignments.
     /// The count sizes each stripe; engagement keeps one-peer hysteresis so a
@@ -289,6 +290,7 @@ impl DownloadWindow {
             received_bytes: 0,
             ewma_block_bytes: 256 * 1024,
             next_request_height: 1,
+            request_tip: None,
             next_pending_deadline: None,
             fanout_eligible_peers: 0,
             fanout_engaged: false,
@@ -1135,11 +1137,12 @@ impl DownloadWindow {
         peer_addr: SocketAddr,
         allow_expired_retry_from_peer: bool,
         chain_tip: &TipSnapshot,
-        applied_tip: &TipSnapshot,
+        request_start_height: u32,
         peer_best_height: u32,
         tree: &BlockTree,
         now: Instant,
     ) -> Option<PeerRequest> {
+        self.retarget_request_branch(chain_tip, request_start_height, tree);
         if self.staged_bytes_exhausted() {
             return None;
         }
@@ -1181,10 +1184,7 @@ impl DownloadWindow {
         let mut entries = self.expired_request_entries(expired, batch_limit, &mut byte_capacity);
         let selected_hashes = SelectedHashes::from_entries(&entries);
 
-        let Some(mut height) = applied_tip.height.checked_add(1) else {
-            return non_empty_request(peer_addr, entries, self.next_request_height);
-        };
-        height = height.max(self.next_request_height);
+        let height = request_start_height.max(self.next_request_height);
         let mut next_request_height = self.next_request_height;
         let request_tip_height = chain_tip.height.min(peer_best_height);
         let remaining_limit = batch_limit
@@ -1219,6 +1219,58 @@ impl DownloadWindow {
             );
         }
         non_empty_request(peer_addr, entries, next_request_height)
+    }
+
+    fn retarget_request_branch(
+        &mut self,
+        chain_tip: &TipSnapshot,
+        request_start_height: u32,
+        tree: &BlockTree,
+    ) {
+        let Some((previous_hash, previous_height)) =
+            self.request_tip.replace((chain_tip.hash, chain_tip.height))
+        else {
+            return;
+        };
+        let extends_request_tip = previous_height <= chain_tip.height
+            && tree.lookup(previous_hash)
+                == tree.node_at_height_from(chain_tip.tip_id, previous_height);
+        if extends_request_tip {
+            return;
+        }
+
+        let is_on_request_branch = |hash: Hash256, height: u32| {
+            height >= request_start_height
+                && tree.lookup(hash) == tree.node_at_height_from(chain_tip.tip_id, height)
+        };
+        let stale_pending: Vec<Hash256> = self
+            .pending
+            .iter()
+            .filter_map(|(hash, pending)| {
+                (!is_on_request_branch(*hash, pending.height)).then_some(*hash)
+            })
+            .collect();
+        for hash in stale_pending {
+            self.remove_pending(&hash);
+        }
+        let stale_received: Vec<Hash256> = self
+            .received
+            .iter()
+            .filter_map(|(hash, received)| {
+                (!is_on_request_branch(*hash, received.height)).then_some(*hash)
+            })
+            .collect();
+        for hash in stale_received {
+            self.remove_received(&hash);
+        }
+
+        self.next_request_height = request_start_height;
+        self.stall = None;
+        self.cold_front = None;
+        self.cold_hedged_fronts.clear();
+        self.prefix_probe = None;
+        self.prefix_probe_attempted_owner = None;
+        self.pending_timeout_observation = None;
     }
 
     fn extend_request_by_reverse_scan(

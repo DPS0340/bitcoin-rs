@@ -18,7 +18,7 @@ use bitcoin_rs_utxo::{
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
 use hashbrown::{HashMap, HashSet};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,6 +46,396 @@ fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
     let mut cursor = bytes.get(SERIALIZED_BLOCK_HEADER_LEN..)?;
     let count = VarInt::consensus_decode(&mut cursor).ok()?.0;
     usize::try_from(count).ok()
+}
+
+/// Storage for per-block UTXO undo records.
+///
+/// Records survive an orderly restart. They are not crash-safe: see
+/// [`KvUndoStore::persist_undo`] for why no fsync sits here.
+///
+/// Undo records are consensus state, not an optional index: without the record
+/// for a block the node cannot disconnect it, so it can advance `applied_tip`
+/// into a chain it is unable to leave. The handle is therefore mandatory rather
+/// than `Option`, and every construction path must supply a real
+/// implementation. [`InMemoryUndoStore`] is a real one — it round-trips — and
+/// is the correct choice for tests that need no durability. A no-op
+/// implementation would recreate exactly the silent failure this type exists to
+/// prevent, so do not add one.
+///
+/// Records are keyed by height AND block hash. Keying by height alone would let
+/// a stale record from an abandoned branch be replayed against a different
+/// block at the same height.
+pub(crate) trait UndoStore: Send + Sync {
+    /// Writes the undo record for one block.
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError>;
+
+    /// Reads the undo record for one block, if present.
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError>;
+
+    /// Records that a disconnect is about to mutate state, durably.
+    ///
+    /// Armed BEFORE the first mutation, not after a failure. A marker written
+    /// on the error path cannot exist for the case that needs it most: the
+    /// process dying mid-rollback writes nothing at all. Armed first, both a
+    /// crash and a returned `Fatal` leave the same evidence behind.
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError>;
+
+    /// Clears a marker armed for a disconnect that then touched nothing.
+    ///
+    /// Separate from [`Self::disarm_disconnect`] because the two callers know
+    /// different things. This one runs before any mutation, so it may clear
+    /// unconditionally. The checkpoint's clear may not: it cannot tell a
+    /// completed rollback from a half-finished one except by the phase.
+    fn cancel_disconnect(&self) -> Result<(), StorageError>;
+
+    /// Records that the rollback finished, in memory, and is owed a checkpoint.
+    ///
+    /// Distinct from clearing. Both phases refuse a startup, because both mean
+    /// the durable state is torn. What the phase decides is whether a
+    /// checkpoint may clear the marker: only a rollback that ran to completion
+    /// may, and a checkpoint taken over a half-finished or failed one would be
+    /// a checkpoint of the damage.
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError>;
+
+    /// Clears the marker once a disconnect has finished cleanly.
+    ///
+    /// What this pair does NOT close: the UTXO set and the tip are in memory
+    /// behind periodic checkpoints while the transaction index persists
+    /// immediately, so a crash after a clean disconnect but before the next
+    /// checkpoint still restores a tip that names a block whose index rows are
+    /// gone. That skew is the same one block connection has, and closing it
+    /// needs a replay path from the last durable state, which this node does not
+    /// have. The marker guards the window where a single disconnect tears state
+    /// mid-rollback. Do not cite it as crash safety for the whole operation.
+    fn disarm_disconnect(&self) -> Result<(), StorageError>;
+
+    /// Reads the marker left by a disconnect that never finished.
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError>;
+}
+
+/// A disconnect that started and never reported finishing.
+///
+/// Its presence at startup means one of two things, and the node cannot tell
+/// them apart: the disconnect returned `Fatal`, or the process died between the
+/// first mutation and the last. Both leave a chainstate where some of the UTXO
+/// set, the index, and the tip are rolled back and some are not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisconnectMarker {
+    /// Block being disconnected.
+    pub hash: bitcoin_rs_primitives::Hash256,
+    /// Height it was applied at.
+    pub height: u32,
+    /// How far the disconnect got.
+    pub phase: DisconnectPhase,
+}
+
+/// How far a disconnect got before the marker was last written.
+///
+/// Both phases refuse a startup. The phase decides only whether a checkpoint
+/// may clear the marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectPhase {
+    /// Mutation started and was never reported finished: the rollback is
+    /// half-done, or the process died inside it. A checkpoint must NOT clear
+    /// this, because a checkpoint over a half-finished rollback captures the
+    /// damage instead of repairing it.
+    InFlight,
+    /// The rollback completed in memory and is waiting for a checkpoint to make
+    /// it durable. Only this phase may be cleared, and only by that checkpoint.
+    RolledBack,
+}
+
+/// Key for the in-flight disconnect marker.
+///
+/// One key, not one per block: only one disconnect runs at a time, and a
+/// per-block key would leave the reader scanning to find out whether any are
+/// set.
+const DISCONNECT_MARKER_KEY: &[u8] = b"node:disconnect-in-flight";
+
+impl DisconnectMarker {
+    fn encode(&self) -> [u8; 37] {
+        let mut encoded = [0_u8; 37];
+        encoded[..32].copy_from_slice(&self.hash.to_le_bytes());
+        encoded[32..36].copy_from_slice(&self.height.to_be_bytes());
+        encoded[36] = match self.phase {
+            DisconnectPhase::InFlight => 0,
+            DisconnectPhase::RolledBack => 1,
+        };
+        encoded
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        let Ok(fixed): Result<[u8; 37], _> = bytes.try_into() else {
+            // A marker that will not decode is still a marker. Treating a short
+            // read as "no disconnect was in flight" would let corruption clear
+            // the interlock, which is the one thing it must never do.
+            return Err(StorageError::Backend(format!(
+                "disconnect marker is {} bytes, expected 37",
+                bytes.len()
+            )));
+        };
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&fixed[..32]);
+        let mut height = [0_u8; 4];
+        height.copy_from_slice(&fixed[32..36]);
+        let phase = match fixed[36] {
+            0 => DisconnectPhase::InFlight,
+            1 => DisconnectPhase::RolledBack,
+            other => {
+                return Err(StorageError::Backend(format!(
+                    "disconnect marker has unknown phase {other}"
+                )));
+            }
+        };
+        Ok(Self {
+            hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
+            height: u32::from_be_bytes(height),
+            phase,
+        })
+    }
+}
+
+/// Process-local undo storage.
+///
+/// A real implementation: what is written can be read back. Suitable wherever
+/// durability across a restart is not required, such as tests.
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryUndoStore {
+    records: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+    marker: parking_lot::RwLock<Option<DisconnectMarker>>,
+}
+
+impl UndoStore for InMemoryUndoStore {
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError> {
+        self.records.write().insert((height, hash), record.to_vec());
+        Ok(())
+    }
+
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.records.read().get(&(height, hash)).cloned())
+    }
+
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        *self.marker.write() = Some(DisconnectMarker {
+            hash,
+            height,
+            phase: DisconnectPhase::InFlight,
+        });
+        Ok(())
+    }
+
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        *self.marker.write() = None;
+        Ok(())
+    }
+
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        *self.marker.write() = Some(DisconnectMarker {
+            hash,
+            height,
+            phase: DisconnectPhase::RolledBack,
+        });
+        Ok(())
+    }
+
+    fn disarm_disconnect(&self) -> Result<(), StorageError> {
+        let mut marker = self.marker.write();
+        if marker
+            .as_ref()
+            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
+        {
+            return Err(StorageError::InvalidOperation(
+                "cannot disarm an in-flight disconnect",
+            ));
+        }
+        *marker = None;
+        Ok(())
+    }
+
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
+        Ok(self.marker.read().clone())
+    }
+}
+
+/// Undo storage backed by a [`KvStore`] column family.
+pub(crate) struct KvUndoStore<S: KvStore> {
+    store: Arc<S>,
+}
+
+impl<S: KvStore> KvUndoStore<S> {
+    pub(crate) const fn new(store: Arc<S>) -> Self {
+        Self { store }
+    }
+}
+
+impl<S: KvStore> UndoStore for KvUndoStore<S> {
+    /// Deferred, matching the rest of the apply path.
+    ///
+    /// `put` is what this used to call, and on redb `put` commits an
+    /// immediately durable transaction, so every connected block paid an fsync
+    /// on that backend — the same per-block durability cost the deferred
+    /// block-body write path exists to avoid. `write_deferred` leaves the row
+    /// visible to later reads in this process and lets the checkpoint flush
+    /// make it durable, which is what `disconnect_block` needs and all it needs.
+    ///
+    /// This is not crash-safe, and neither is the UTXO commit beside it: no
+    /// part of block connection fsyncs. An fsync on this write alone would cost
+    /// one per connected block and still leave the commit it describes
+    /// unrecoverable, so it would buy a slower node and no guarantee.
+    ///
+    /// Closing the gap needs a crash-recovery path that re-applies the blocks
+    /// between the last durable state and the tip. The node has no such path
+    /// today, so do not cite one here.
+    fn persist_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        record: &[u8],
+    ) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.put(
+            bitcoin_rs_storage::ColumnFamily::UndoData,
+            &bitcoin_rs_pruning::block_undo_key(height, hash),
+            record,
+        );
+        self.store.write_deferred(batch)
+    }
+
+    fn load_undo(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.store.get(
+            bitcoin_rs_storage::ColumnFamily::UndoData,
+            &bitcoin_rs_pruning::block_undo_key(height, hash),
+        )
+    }
+
+    /// Flushed, unlike every other write on this path.
+    ///
+    /// The rest of block apply does not fsync because a crash there is
+    /// recoverable by re-applying blocks. This one is different: it is the only
+    /// record that a rollback started, and it is worthless if the crash that it
+    /// exists to survive can lose it. One fsync per disconnect, and disconnects
+    /// are rare.
+    fn arm_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        self.store.put(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+            &DisconnectMarker {
+                hash,
+                height,
+                phase: DisconnectPhase::InFlight,
+            }
+            .encode(),
+        )?;
+        self.store.flush()
+    }
+
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.delete(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+        );
+        self.store.write(batch)?;
+        self.store.flush()
+    }
+
+    fn complete_disconnect(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), StorageError> {
+        self.store.put(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+            &DisconnectMarker {
+                hash,
+                height,
+                phase: DisconnectPhase::RolledBack,
+            }
+            .encode(),
+        )?;
+        self.store.flush()
+    }
+
+    /// Refuses to clear a marker that is still `InFlight`.
+    ///
+    /// The caller is a checkpoint, and a checkpoint taken while a rollback is
+    /// half-done captures the damage. Only a completed rollback may be cleared.
+    fn disarm_disconnect(&self) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        if self
+            .load_disconnect_marker()?
+            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
+        {
+            return Err(StorageError::InvalidOperation(
+                "cannot disarm an in-flight disconnect",
+            ));
+        }
+        let mut batch = self.store.new_batch();
+        batch.delete(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+        );
+        self.store.write(batch)?;
+        self.store.flush()
+    }
+
+    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
+        self.store
+            .get(
+                bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+                DISCONNECT_MARKER_KEY,
+            )?
+            .map(|bytes| DisconnectMarker::decode(&bytes))
+            .transpose()
+    }
 }
 
 pub(crate) trait PruneBodyStore: Send + Sync {
@@ -220,14 +610,19 @@ impl ApplyAdmission {
         }
     }
 
-    fn enter(&self) -> Result<RwLockReadGuard<'_, ()>, ApplyError> {
+    fn ensure_open(&self) -> Result<(), ApplyError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ApplyError::Shutdown);
         }
+        Ok(())
+    }
+
+    fn enter(&self) -> Result<RwLockReadGuard<'_, ()>, ApplyError> {
+        self.ensure_open()?;
         let permit = self.barrier.read();
-        if self.closed.load(Ordering::Acquire) {
+        if let Err(error) = self.ensure_open() {
             drop(permit);
-            return Err(ApplyError::Shutdown);
+            return Err(error);
         }
         Ok(permit)
     }
@@ -236,6 +631,25 @@ impl ApplyAdmission {
         self.closed.store(true, Ordering::Release);
         self.barrier.write()
     }
+
+    /// Closes admission without taking the barrier.
+    ///
+    /// [`Self::close`] hands back the write guard because shutdown holds it
+    /// while it drains. A torn chainstate has nothing to drain and no owner to
+    /// hold a guard: it needs the flag set and every later `enter` refused,
+    /// including the one that would otherwise apply the next block.
+    pub(crate) fn close_permanently(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+/// Proof that admission and the chain-transition lock are both held.
+///
+/// Private fields make [`ApplyHandles::begin_chain_transition`] the only
+/// constructor. Field order releases the transition lock before the permit.
+pub(crate) struct ChainTransition<'a> {
+    _transition: MutexGuard<'a, ()>,
+    _admission: RwLockReadGuard<'a, ()>,
 }
 
 /// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
@@ -352,9 +766,24 @@ pub struct ApplyHandles {
     pub(crate) filter_header_cache: Arc<Mutex<Option<(Hash256, Hash256)>>>,
     pub(crate) cache_block_bodies_in_memory: bool,
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
+    /// Undo storage. Mandatory: see [`UndoStore`].
+    pub(crate) undo_store: Arc<dyn UndoStore>,
     pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
     pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
+    /// Process-wide shutdown signal shared by all runtime workers.
+    pub(crate) shutdown: Arc<AtomicBool>,
+    /// Serializes whole chain transitions against each other.
+    ///
+    /// Distinct from `admission`, which is a shutdown barrier: `enter` takes a
+    /// READ guard, so any number of applies hold it at once and it excludes
+    /// nothing but a checkpoint close. A transition reads the applied tip,
+    /// decides what follows it, mutates the UTXO set, and publishes a new tip;
+    /// two of those interleaved can both pass the predecessor check against the
+    /// same tip and then race to publish, so one silently discards the other's
+    /// block. This lock spans the whole read-decide-mutate-publish sequence for
+    /// connects, windows, and disconnects alike.
+    pub(crate) chain_transition: Arc<parking_lot::Mutex<()>>,
     /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
     pub assume_valid_height: u32,
@@ -363,6 +792,18 @@ pub struct ApplyHandles {
 }
 
 impl ApplyHandles {
+    pub(crate) fn begin_chain_transition(
+        &self,
+    ) -> core::result::Result<ChainTransition<'_>, ApplyError> {
+        let admission = self.admission.enter()?;
+        let transition = self.chain_transition.lock();
+        self.admission.ensure_open()?;
+        Ok(ChainTransition {
+            _transition: transition,
+            _admission: admission,
+        })
+    }
+
     /// Builds the full shared handle set used by `apply_block`.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
@@ -396,9 +837,12 @@ impl ApplyHandles {
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: true,
             block_body_store: None,
+            undo_store: Arc::new(InMemoryUndoStore::default()),
             g2_muhash_sampler: None,
             g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: 0,
             assume_valid_gate: Arc::new(AssumeValidGate::with_anchor(None)),
         }
@@ -414,6 +858,386 @@ impl ApplyHandles {
         self.zmq_publisher = publisher;
         self
     }
+}
+
+/// Everything a disconnect can refuse, decided before anything is mutated.
+///
+/// Split out because the ordering matters more than the code: if a check can
+/// live here it must, since a refusal from this function costs nothing while a
+/// refusal after the first write leaves a partly disconnected chain. Anything
+/// added to `disconnect_block` that can fail belongs here unless it physically
+/// cannot run this early.
+struct DisconnectPlan {
+    parent_tip: TipSnapshot,
+    undo: bitcoin_rs_utxo::UndoBatch,
+    height: u32,
+    tx_count_delta: u64,
+    txids: Vec<bitcoin::Txid>,
+}
+
+fn plan_disconnect(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    block_hash: Hash256,
+) -> core::result::Result<DisconnectPlan, ApplyError> {
+    let applied = handles
+        .applied_tip
+        .load_full()
+        .ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: block_hash,
+        })?;
+    // The height is read from the snapshot, never from the caller. A caller
+    // that could pass one would be able to disagree with the tip, and the undo
+    // key and the index rollback are both keyed by it.
+    let height = applied.height;
+    if applied.hash != block_hash {
+        return Err(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        });
+    }
+
+    // The header hash proves the caller named the right block; it does not
+    // prove they handed over that block's transactions. Index rollback walks
+    // the body, so an altered body under a matching header would delete rows
+    // belonging to transactions the block never contained.
+    //
+    // Computing txids here and verifying the merkle root with them catches
+    // mutation (a duplicate final transaction on an odd count) that
+    // `check_merkle_root` alone misses, and the txids are reused for index
+    // rollback below.
+    let txids: Vec<bitcoin::Txid> = block
+        .txdata
+        .iter()
+        .map(bitcoin::Transaction::compute_txid)
+        .collect();
+    bitcoin_rs_consensus::verify_merkle_root_with_txids(block, &txids)
+        .map_err(|_| ApplyError::DisconnectBodyMismatch { hash: block_hash })?;
+
+    let parent_tip = {
+        let tree = handles.block_tree.read();
+        let node = tree.node(applied.tip_id)?;
+        let parent_id = node.parent.ok_or(ApplyError::DisconnectNotTip {
+            hash: block_hash,
+            tip: applied.hash,
+        })?;
+        let parent = tree.node(parent_id)?;
+        TipSnapshot {
+            tip_id: parent_id,
+            height: parent.height,
+            chainwork: parent.chainwork,
+            hash: parent.hash,
+        }
+    };
+
+    let encoded = handles
+        .undo_store
+        .load_undo(height, block_hash)
+        .map_err(ApplyError::UndoRead)?
+        .ok_or(ApplyError::UndoRecordMissing {
+            hash: block_hash,
+            height,
+        })?;
+    let undo = bitcoin_rs_utxo::undo_codec::decode(&encoded, block_hash).map_err(|error| {
+        ApplyError::UndoRecordUnreadable {
+            hash: block_hash,
+            reason: error.to_string(),
+        }
+    })?;
+
+    // The coinstats rewind itself has to run after `undo_block`, because the
+    // per-coin fields ride the UTXO change listener. This is the only place its
+    // preconditions can be checked while a refusal is still free.
+    let tx_count_delta = tx_count_delta_for(block);
+    let stats = handles.coin_stats.snapshot();
+    if stats.height != height {
+        return Err(ApplyError::CoinStatsRewind(
+            bitcoin_rs_coinstats::CoinStatsRewindError::HeightMismatch {
+                expected: height,
+                found: stats.height,
+            },
+        ));
+    }
+    if stats.tx_count < tx_count_delta {
+        return Err(ApplyError::CoinStatsRewind(
+            bitcoin_rs_coinstats::CoinStatsRewindError::TxCountUnderflow {
+                tx_count: stats.tx_count,
+                tx_delta: tx_count_delta,
+            },
+        ));
+    }
+
+    Ok(DisconnectPlan {
+        parent_tip,
+        undo,
+        height,
+        tx_count_delta,
+        txids,
+    })
+}
+
+/// Disconnects the applied tip, restoring the consensus state the block
+/// replaced.
+///
+/// Restores the UTXO set, the transaction index, and `applied_tip`. It does
+/// NOT yet restore the other state connection touches, so it has no production
+/// caller and must not get one until they are handled:
+///
+/// | Handle | Status |
+/// |---|---|
+/// | `utxo`, `tx_index`, `applied_tip` | restored here |
+/// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
+/// | `filter_header_cache` | repointed here at the parent, or cleared when the index has no header for it |
+/// | `filter_index` | retained deliberately — its rows are hash-addressed, like block bodies, so a disconnected block's filter stays valid and simply stops being reachable. What is owed is BACKFILL after a gap, not rollback |
+/// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
+/// | `transactions` | nothing owed: connection never populates it |
+/// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
+/// | `block_tree` | retained deliberately — the header stays valid and known |
+/// | `block_body_store` | retained deliberately — the body is still a real block |
+/// | `zmq_publisher` | a notification, not state; a disconnect event belongs here later |
+///
+/// The ordering below is the design: every fallible step that touches nothing
+/// runs first, so the common failures cost nothing.
+///
+/// One partial-failure window remains and is not yet closed. If `undo_block`
+/// fails after the index has rolled back, the index no longer describes the
+/// block while the tip still does. The UTXO set is worse than untouched:
+/// `commit_adds_and_removes` walks shards, and both its serial and its parallel
+/// path can return an error after other shards already committed, so the set
+/// can be left partly undone.
+///
+/// Retry is not the recovery strategy, and this is settled rather than open.
+/// Each individual UTXO operation is idempotent on the set, since restoring a
+/// live output and removing an absent one are both no-ops. The set is not the
+/// whole contract: `undo_block` runs through `commit_adds_and_removes`, which
+/// fires `UtxoSet`'s listener, and `coin_stats` is one. A second pass re-emits
+/// callbacks for operations that changed nothing, so a cumulative listener
+/// double-counts even where the set converges.
+///
+/// The caller must therefore treat a failed disconnect as fatal: stop applying
+/// blocks and report the block hash and height where it wedged, rather than
+/// trying again. That is the same poison path the branch-switch layer needs for
+/// a failed compensating rollback, so it is one mechanism, not two.
+///
+/// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
+///    so a missing or corrupt record costs nothing.
+/// 2. Roll the transaction index back. It is derived state, and its rows still
+///    point at an intact UTXO set at this point.
+/// 3. Restore the UTXO set.
+/// 4. Move `applied_tip` to the parent, last. While it still names this block a
+///    concurrent reader sees a consistent older state; moving it first would
+///    advertise a tip whose outputs are still spent.
+///
+/// Refuses any block that is not the applied tip, because disconnecting from
+/// the middle of a chain restores outputs its descendants have already spent,
+/// and any block whose body does not match its own header.
+///
+/// Takes no height. The applied tip already knows it, and a second source for
+/// the same fact is a second source of disagreement: the undo key and the index
+/// rollback are both keyed by height, so a caller passing a stale one could
+/// delete the wrong rows. There is no parameter to get wrong.
+// Keep the marker, index, UTXO, and tip ordering visible in one operation.
+// Splitting the sequence would hide the fatal boundary this function enforces.
+#[allow(clippy::too_many_lines)]
+pub fn disconnect_block(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
+    let transition = handles
+        .begin_chain_transition()
+        .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
+    disconnect_block_admitted(handles, block, &transition)
+}
+
+/// Disconnects one block while the caller holds admission and `chain_transition`.
+///
+/// The caller MUST hold both guards in admission-then-transition order.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn disconnect_block_admitted(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    _transition: &ChainTransition<'_>,
+) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
+    use bitcoin::hashes::Hash as _;
+
+    let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    let DisconnectPlan {
+        parent_tip,
+        undo,
+        height,
+        tx_count_delta,
+        txids,
+    } = plan_disconnect(handles, block, block_hash)
+        .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
+
+    // Armed before the first mutation and cleared after the last, so the window
+    // it covers is exactly the window in which state can be torn. Errors are not
+    // what this guards against; a crash is. A crash writes no error anywhere,
+    // and the marker is the only thing that survives it.
+    //
+    // Above the index rollback, not below it: that rollback commits a delete
+    // batch, so a crash between it and the arming would leave the index rolled
+    // back while the UTXO set and the tip still name the block.
+    //
+    // Deliberately per-disconnect rather than per-reorg: each disconnect commits
+    // fully, so a branch switch interrupted BETWEEN disconnects leaves a
+    // consistent chain at a lower tip, which is recoverable by connecting
+    // forward. Holding the marker across a whole switch would refuse startup for
+    // that case and force a needless reindex.
+    // Read before arming. A branch switch disconnects several blocks in a row,
+    // and arming overwrites the marker, so an earlier disconnect's `RolledBack`
+    // debt — still owed a checkpoint — would be destroyed by the next arm and
+    // then cleared by a refusal. `prior` is what a refusal restores.
+    let prior = handles
+        .undo_store
+        .load_disconnect_marker()
+        .map_err(|error| {
+            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(error)))
+        })?;
+    handles
+        .undo_store
+        .arm_disconnect(height, block_hash)
+        .map_err(|error| {
+            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(error)))
+        })?;
+    let poison = |error| {
+        handles.admission.close_permanently();
+        error
+    };
+    // Index rollback flushes buffered rows and then issues every delete in one
+    // write batch, so an ERROR at either step leaves the rollback un-started and
+    // the chain exactly as it was. That is still a refusal, so the marker armed
+    // above has nothing to guard and comes back off.
+    if let Some(tx_index) = &handles.tx_index {
+        let rollback = tx_index
+            .lock()
+            .rollback_block_with_verified_txids(block, height, &txids);
+        if let Err(error) = rollback {
+            let refusal = ApplyError::IndexRollback(error);
+            // This disconnect touched nothing, so its own marker goes. Any debt
+            // that predated it is restored rather than dropped: a clean clear
+            // here would tell a restart the chain is whole when an earlier
+            // rollback in this same switch is still waiting for a checkpoint.
+            let restored = match prior {
+                Some(DisconnectMarker {
+                    hash,
+                    height,
+                    phase: DisconnectPhase::RolledBack,
+                }) => handles.undo_store.complete_disconnect(height, hash),
+                _ => handles.undo_store.cancel_disconnect(),
+            };
+            return Err(match restored {
+                Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
+                Err(disarm) => poison(crate::DisconnectError::MarkerStuck {
+                    hash: block_hash,
+                    height,
+                    source: Box::new(ApplyError::UndoPersistence(disarm)),
+                }),
+            });
+        }
+    }
+
+    // Past this line every failure is `Fatal`. The UTXO commit walks shards and
+    // can stop part-way, so from here some state is rolled back and some is
+    // not.
+    handles.utxo.undo_block(&undo).map_err(|error| {
+        poison(crate::DisconnectError::Fatal {
+            hash: block_hash,
+            height,
+            source: Box::new(ApplyError::UtxoCommit(error)),
+        })
+    })?;
+
+    // RPC serves blocks from this vector, so the disconnected block's record
+    // must go or `getblock` keeps answering for it.
+    //
+    // Absence is legitimate and must never be an error. This is a best-effort
+    // in-process cache, not authoritative state: it starts empty on every boot
+    // while `applied_tip` resumes from a checkpoint at height N, and pruning
+    // removes records from it. Failing a consensus rollback because an optional
+    // cache is empty would refuse the first disconnect after any restart.
+    //
+    // The hash check is what stops the pop from truncating a record that is not
+    // ours. The tail can only be ours or gone, because disconnect runs on the
+    // applied tip and connection pushed that tip's record last.
+    {
+        let mut blocks = handles.blocks.write();
+        if blocks
+            .last()
+            .is_some_and(|record| record.hash == block_hash)
+        {
+            blocks.pop();
+        }
+    }
+
+    // The cache maps one block to its filter header. Leaving the disconnected
+    // block there is not a correctness bug, because lookups are keyed by the
+    // tip's hash and would simply miss, but it is a lie about what the node
+    // last indexed. Replace it with the parent's header when the index has one,
+    // and clear it otherwise so the next connect asks storage.
+    {
+        let parent_header = handles
+            .filter_index
+            .filter_header(parent_tip.hash)
+            .ok()
+            .flatten();
+        *handles.filter_header_cache.lock() = parent_header.map(|header| (parent_tip.hash, header));
+    }
+
+    // The per-coin coinstats fields need nothing here: `coin_stats` is the
+    // `UtxoSet` change listener, so `undo_block` already drove them in reverse.
+    // The block-level fields are not part of that, because `finish_block` sets
+    // them directly on connect.
+    handles
+        .coin_stats
+        .rewind_block(height, parent_tip.height, tx_count_delta)
+        .map_err(|error| {
+            poison(crate::DisconnectError::Fatal {
+                hash: block_hash,
+                height,
+                source: Box::new(ApplyError::CoinStatsRewind(error)),
+            })
+        })?;
+
+    handles
+        .applied_tip
+        .store(Some(Arc::new(parent_tip.clone())));
+
+    // The rollback finished in memory, so the marker moves to `RolledBack`.
+    // It stays set: a checkpoint has not captured this yet.
+    handles
+        .undo_store
+        .complete_disconnect(height, block_hash)
+        .map_err(|error| {
+            poison(crate::DisconnectError::MarkerStuck {
+                hash: block_hash,
+                height,
+                source: Box::new(ApplyError::UndoPersistence(error)),
+            })
+        })?;
+
+    // The marker deliberately stays set here.
+    //
+    // Every mutation landed, but only some of them are durable. The index
+    // rollback committed; the UTXO set and the tip are in memory behind
+    // periodic checkpoints. A crash now restores a checkpoint that still
+    // contains this block while its index rows are already gone, which is the
+    // same torn state the marker exists to catch. Clearing it on the strength
+    // of an in-memory rollback would hide exactly that case.
+    //
+    // [`NodeState::write_clean_checkpoint`] clears it, because that is where
+    // the rolled-back set and tip become durable.
+    Ok(parent_tip)
+}
+
+/// The `tx_count` delta one block contributes to coinstats.
+///
+/// One function, used by connect and by disconnect. Two copies of this
+/// expression would be two chances for the rewind to subtract something the
+/// apply never added.
+fn tx_count_delta_for(block: &bitcoin::Block) -> u64 {
+    u64::try_from(block.txdata.len()).unwrap_or(u64::MAX)
 }
 
 /// Synthetically applies `block` as the next tip after consensus checks.
@@ -433,14 +1257,608 @@ pub fn apply_block_with_serialized(
     apply_block_inner(handles, block, Some(serialized))
 }
 
+/// Applies one serialized block while the caller holds admission and `chain_transition`.
+///
+/// The caller MUST hold both guards in admission-then-transition order.
+pub(crate) fn apply_block_with_serialized_admitted(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    serialized: bytes::Bytes,
+    transition: &ChainTransition<'_>,
+) -> core::result::Result<TipSnapshot, ApplyError> {
+    apply_block_admitted(handles, block, Some(serialized), None, transition)
+}
+
+/// How many consecutive blocks share one script-verification dispatch.
+///
+/// The window amortises dispatch, it does not add parallelism. A mainnet block
+/// early in the chain carries about 19 input checks, so fanning those across 32
+/// workers costs more in wakeups than the work itself: measured over blocks
+/// `0..150_000`, per-block dispatch left 29s of checks running serially in blocks
+/// below the parallel threshold and wasted a further 11s above it. Sixty-four
+/// blocks turns roughly 21,000 dispatches into 330.
+///
+/// Bounded by memory: the window holds every block's parsed kernel block and
+/// resolved prevouts at once, which costs far more than the block bytes.
+/// Measured over `0..150_000`, pinned to 32 cores, medians of interleaved runs:
+///
+///   window     wall     CPU     peak RSS
+///       64    66.2s   596.3s      397 MB
+///      128    75.8s   525.6s      409 MB
+///      256    69.8s   471.5s      436 MB
+///     1024    51.8s   388.7s      572 MB
+///     4096    47.2s   377.1s     1205 MB
+///
+/// CPU falls by a third from 64 to 1024 because the cost being removed is rayon
+/// dispatch and spin, not verification. RSS is what stops it: 4096 doubles the
+/// resident set for a few more seconds.
+///
+/// This is a COUNT cap, and count alone is the wrong bound. Early-chain blocks
+/// average about 4.6 KB, so 1024 of them is 5 MB of block data; at the tip they
+/// are 2 MB, so the same 1024 would hold 2 GB. [`SCRIPT_BATCH_MAX_BYTES`] is the
+/// other half, and the window is whichever bound hits first.
+///
+/// Peer sync does not reach 1024 today. `RECEIVED_BLOCK_BUDGET` caps staging at
+/// 128 blocks, so the windows it forms are at most that, worth 525s CPU against
+/// 596s at 64 — a real gain, and not the 389s the replay driver reaches.
+/// Raising the staging cap is not a constant change: the staller-arming
+/// invariant in `sync.rs` ties the staged byte budget to the staged count at
+/// `MAX_SERIALIZED_BLOCK_SIZE`, so a 1024-block stage would demand a 2 GB bound.
+/// That invariant has to be reworked against typical block size first.
+pub const SCRIPT_BATCH_WINDOW: usize = 1024;
+
+/// How many bytes of block data one window may hold.
+///
+/// The count cap above is sized for small early-chain blocks. This is what
+/// keeps the same constant safe at the tip, where a block is roughly 2 MB and
+/// the count would otherwise let a window hold gigabytes. Whichever cap binds
+/// first ends the window, so the batch is large exactly where blocks are small
+/// and dispatch dominates, and small where blocks are large and it does not.
+pub const SCRIPT_BATCH_MAX_BYTES: usize = 64 << 20;
+
+/// Returns how many of `sizes` fit in one window.
+///
+/// At least one block always fits, even one larger than the byte cap on its
+/// own: refusing it would stall the chain on an oversized block rather than
+/// verify it.
+pub fn window_len(sizes: impl IntoIterator<Item = usize>) -> usize {
+    let mut count = 0_usize;
+    let mut bytes = 0_usize;
+    for size in sizes {
+        if count == SCRIPT_BATCH_WINDOW {
+            break;
+        }
+        let next = bytes.saturating_add(size);
+        if count > 0 && next > SCRIPT_BATCH_MAX_BYTES {
+            break;
+        }
+        bytes = next;
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Applies consecutive blocks, verifying all their input scripts in one
+/// dispatch when the window can be proven.
+///
+/// Blocks commit one at a time and in order, exactly as they would
+/// individually, so every rule that depends on committed state still sees the
+/// real chain: BIP30, coinbase maturity, and the relative locks all run after
+/// their predecessor has committed. Only work that depends on nothing but the
+/// block and the outputs it spends moves earlier.
+///
+/// # Errors
+///
+/// Propagates the first failing apply, leaving earlier blocks applied, which is
+/// what applying them one at a time would also do.
+pub fn apply_window(
+    handles: &ApplyHandles,
+    blocks: &[&bitcoin::Block],
+    serialized: &[bytes::Bytes],
+) -> core::result::Result<(), WindowApplyError> {
+    if blocks.len() != serialized.len() {
+        return Err(WindowApplyError {
+            applied: 0,
+            source: ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                "window has {} blocks but {} serialized bodies",
+                blocks.len(),
+                serialized.len()
+            ))),
+        });
+    }
+    // One admission permit and one transition lock for the whole window.
+    //
+    // The permit alone would not do it: `enter` takes a read guard, so two
+    // windows, or a window and a single connect, hold it at the same time. The
+    // transition lock is what actually excludes them. Preparation reads the
+    // applied tip and the UTXO set and the commits mutate both, so a concurrent
+    // applier moving the chain in between would invalidate the proof this window
+    // is about to rely on, and matching the tip hash would not detect a same-tip
+    // partial change.
+    //
+    // Both taken once for the window rather than per block: re-entering the
+    // permit is two read guards that deadlock against a shutdown waiting on the
+    // write side, and re-locking the transition would leave gaps between commits.
+    let transition = handles
+        .begin_chain_transition()
+        .map_err(|source| WindowApplyError { applied: 0, source })?;
+    let mut proven = prove_window(handles, blocks, serialized).into_iter();
+    let mut applied = 0_usize;
+    for (block, raw) in blocks.iter().zip(serialized) {
+        apply_block_admitted(
+            handles,
+            block,
+            Some(raw.clone()),
+            proven.next(),
+            &transition,
+        )
+        .map_err(|source| WindowApplyError { applied, source })?;
+        applied = applied.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// A window that failed partway, and how many of its blocks committed first.
+///
+/// The count is what a caller needs to recover: it must record the hashes that
+/// landed, retry only the one that failed, and put the rest back. A bare
+/// `ApplyError` cannot say where the window stopped.
+#[derive(Debug)]
+pub struct WindowApplyError {
+    /// Blocks that committed before the failure.
+    pub applied: usize,
+    /// What stopped the block at index `applied`.
+    pub source: ApplyError,
+}
+
+impl core::fmt::Display for WindowApplyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "window failed after applying {} block(s): {}",
+            self.applied, self.source
+        )
+    }
+}
+
+impl std::error::Error for WindowApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Prepares consecutive blocks against one overlay and verifies all their input
+/// scripts in a single dispatch.
+///
+/// Returns one proof per block, or nothing at all. There is no partial result
+/// by design: a block must never be applied with its scripts skipped on the
+/// strength of a neighbour.
+///
+/// Every reason to give up is silent and cheap, because the per-block path
+/// behind this is complete and produces the real verdict in its documented
+/// order. A header not yet in the tree, a block that does not extend its
+/// predecessor, a prevout that does not resolve, or any failing check all
+/// return nothing.
 #[allow(clippy::too_many_lines)]
+fn prove_window(
+    handles: &ApplyHandles,
+    blocks: &[&bitcoin::Block],
+    serialized: &[bytes::Bytes],
+) -> Vec<ProvenApply> {
+    use bitcoin::hashes::Hash as _;
+
+    if blocks.is_empty() || blocks.len() != serialized.len() {
+        return Vec::new();
+    }
+    let Some(applied) = handles.applied_tip.load_full() else {
+        return Vec::new();
+    };
+
+    // Context is captured before any block applies, because applying inserts
+    // headers into the shared tree and would move median-time-past and softfork
+    // state under the later blocks. Each apply re-derives all of it and
+    // compares, so a captured value that turns out wrong costs the batch only.
+    let context_started = quanta::Instant::now();
+    let mut contexts = Vec::with_capacity(blocks.len());
+    {
+        let tree = handles.block_tree.read();
+        let mut parent_id = applied.tip_id;
+        let mut parent_hash = applied.hash;
+        for (index, block) in blocks.iter().enumerate() {
+            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            if Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()) != parent_hash {
+                return Vec::new();
+            }
+            let Some(height) = u32::try_from(index)
+                .ok()
+                .and_then(|offset| applied.height.checked_add(offset))
+                .and_then(|height| height.checked_add(1))
+            else {
+                return Vec::new();
+            };
+            let softfork = crate::bip9_context::contextual_softfork_state(
+                &tree,
+                handles.network,
+                Some(parent_id),
+                height,
+            );
+            let cutoff = if softfork.csv_active {
+                tree.median_time_past_at(parent_id, 11).unwrap_or(0)
+            } else {
+                block.header.time
+            };
+            // The next block's context needs this one in the tree. Header-first
+            // sync put it there; without it there is no window.
+            let Some(node_id) = tree.lookup(hash) else {
+                return Vec::new();
+            };
+            contexts.push(ScriptProof {
+                hash,
+                parent: parent_hash,
+                height,
+                flags: compute_verify_flags(handles.network, height, hash, softfork),
+                locktime_cutoff: cutoff,
+            });
+            parent_id = node_id;
+            parent_hash = hash;
+        }
+    }
+
+    metrics::histogram!("node.window.context_seconds")
+        .record(context_started.elapsed().as_secs_f64());
+
+    // Parsing a block and planning its transactions depends on nothing but that
+    // block, so the window does all of it at once. Only the overlay walk below
+    // is order-dependent, and it is the cheaper half.
+    let parse_started = quanta::Instant::now();
+    let parsed: Vec<core::result::Result<_, ApplyError>> = blocks
+        .par_iter()
+        .zip(serialized.par_iter())
+        .map(|(block, raw)| parse_block_for_apply(block, Some(raw.clone())))
+        .collect();
+    metrics::histogram!("node.window.parse_seconds").record(parse_started.elapsed().as_secs_f64());
+
+    let prepare_started = quanta::Instant::now();
+    let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
+    let mut prepared = Vec::with_capacity(blocks.len());
+    for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
+        let Ok((kernel_block, tx_plan)) = parsed else {
+            return Vec::new();
+        };
+        let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
+        if overlay
+            .advance(
+                block,
+                tx_plan.txids(),
+                context.height,
+                tx_plan.same_block_spent_set(),
+            )
+            .is_err()
+        {
+            return Vec::new();
+        }
+        prepared.push(PreparedApply {
+            kernel_block,
+            tx_plan,
+            resolved,
+        });
+    }
+
+    metrics::histogram!("node.window.prepare_seconds")
+        .record(prepare_started.elapsed().as_secs_f64());
+
+    // Cheap structural checks before any script runs.
+    //
+    // Batching changed the cost of a bad body. The per-block path rejects a
+    // broken merkle root or witness commitment before it verifies a single
+    // script, but the window used to dispatch the whole batch first — so a peer
+    // could send a body with the expected header and one altered witness
+    // reserved value, keeping every txid intact, and force a full window of
+    // script verification for a block that is rejected immediately either way.
+    // Both checks below depend on nothing but the block, so running them here
+    // costs a hash per block and removes the amplification.
+    for (block, context) in blocks.iter().zip(&contexts) {
+        if !block.check_merkle_root() {
+            return Vec::new();
+        }
+        if context
+            .flags
+            .contains(bitcoin_rs_script::VerifyFlags::WITNESS)
+            && !block.check_witness_commitment()
+        {
+            return Vec::new();
+        }
+    }
+
+    // One slot per input block, so a skipped unit leaves a hole rather than
+    // shifting every later block onto the wrong prepared state.
+    let mut skipped = vec![false; prepared.len()];
+    // One dispatch for the whole window. The check units borrow their kernel
+    // blocks, so they live and die inside this scope, before anything commits.
+    {
+        // Each block's checks are built from its own prepared state, so the
+        // window builds them all at once. The overlay walk above already fixed
+        // every prevout, which is what makes this independent per block.
+        let checks_started = quanta::Instant::now();
+        // Serial on purpose. Fanning this out measured worse on both axes:
+        // 58.7s wall / 585.2s CPU with it serial against 64.2s / 613.1s
+        // parallel, on the 0..150_000 replay. Each block's preparation is short
+        // enough that the dispatch costs more than it distributes, which is the
+        // same reason the script checks are batched across blocks rather than
+        // split within one.
+        let mut units = Vec::with_capacity(prepared.len());
+        let mut flags: Vec<bitcoin_rs_script::VerifyFlags> = Vec::with_capacity(prepared.len());
+        for (index, ((block, unit), context)) in
+            blocks.iter().zip(&prepared).zip(&contexts).enumerate()
+        {
+            // The same predicate the single-block path applies, per block rather
+            // than per window, because the anchor height can fall inside a
+            // window. Without it the batch prepared and executed every unit
+            // before the per-block decision was ever reached, so assume-valid
+            // did nothing at all on the windowed path.
+            if handles.assume_valid_height > 0
+                && context.height <= handles.assume_valid_height
+                && handles.assume_valid_gate.trusted()
+            {
+                skipped[index] = true;
+                continue;
+            }
+            let Ok(resolved) = resolve_block_prevouts(
+                Arc::clone(&unit.resolved),
+                block,
+                &unit.tx_plan,
+                context.height,
+            ) else {
+                return Vec::new();
+            };
+            match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
+                &block.txdata,
+                resolved,
+                context.height,
+                context.locktime_cutoff,
+                &unit.kernel_block,
+            ) {
+                Ok(checks) => {
+                    units.push(checks);
+                    // Pushed together with the unit so the two stay aligned:
+                    // collecting flags from every context would misalign them
+                    // against a units list that skipped some.
+                    flags.push(context.flags);
+                }
+                Err(_) => return Vec::new(),
+            }
+        }
+        metrics::histogram!("node.window.checks_seconds")
+            .record(checks_started.elapsed().as_secs_f64());
+        let verify_started = quanta::Instant::now();
+        let verdict = bitcoin_rs_consensus::verify_tx::verify_prepared_units(&units, &flags);
+        metrics::histogram!("node.window.verify_seconds")
+            .record(verify_started.elapsed().as_secs_f64());
+        if verdict.is_err() {
+            return Vec::new();
+        }
+    }
+
+    prepared
+        .into_iter()
+        .zip(contexts)
+        .zip(skipped)
+        .map(|((prepared, proof), skipped)| ProvenApply {
+            prepared,
+            // No proof for a block whose scripts this window skipped. A
+            // `ScriptProof` asserts the scripts ran, and handing one back for a
+            // skipped block would do more than lie: the commit would take the
+            // proof branch instead of re-reading the trust gate, so a gate that
+            // flipped to untrusted between here and the commit would let the
+            // block through unverified. `None` sends it down the per-block path,
+            // which makes that decision against the gate as it stands then.
+            proof: (!skipped).then_some(proof),
+        })
+        .collect()
+}
+
+/// Evidence that a block's input scripts were executed and passed as part of a
+/// batch spanning several consecutive blocks.
+///
+/// Bound to more than the block hash on purpose. The verdict also depends on
+/// the height, the rule flags, the median-time-past cutoff, and the block this
+/// one extends, and a reorg can change all four while the hash stays the same.
+struct ScriptProof {
+    hash: Hash256,
+    parent: Hash256,
+    height: u32,
+    flags: bitcoin_rs_script::VerifyFlags,
+    locktime_cutoff: u32,
+}
+
+impl ScriptProof {
+    fn matches(
+        &self,
+        hash: Hash256,
+        parent: Hash256,
+        height: u32,
+        flags: bitcoin_rs_script::VerifyFlags,
+        locktime_cutoff: u32,
+    ) -> bool {
+        self.hash == hash
+            && self.parent == parent
+            && self.height == height
+            && self.flags == flags
+            && self.locktime_cutoff == locktime_cutoff
+    }
+}
+
+/// One block's prepared state together with the proof covering it.
+///
+/// Deliberately one value rather than two parameters. Passed separately, a
+/// caller could hand over block A's proof beside block B's prepared prevouts:
+/// the proof would still match the block being applied, and the scripts skipped
+/// would be the ones verified against different data. Pairing them at
+/// construction makes that unrepresentable.
+struct ProvenApply {
+    prepared: PreparedApply,
+    /// `None` when the window skipped this block's scripts under assume-valid.
+    /// The preparation is still reused; only the script evidence is absent.
+    proof: Option<ScriptProof>,
+}
+
+/// Everything a block's application needs that depends only on the block and
+/// the outputs it spends, not on the chain state the commit will mutate.
+///
+/// Split out because a window of consecutive blocks can produce all of these
+/// at once, against one ordered overlay, and share a single script dispatch.
+/// The measured duplication that made an earlier batching attempt a wash was
+/// exactly the kernel parse and the prevout resolution below being done twice.
+struct PreparedApply {
+    kernel_block: bitcoin_rs_consensus::kernel::KernelBlock,
+    tx_plan: BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
+}
+
+/// Parses a block and resolves the outputs it spends.
+///
+/// `source` is where prevouts come from. Today that is always the committed
+/// UTXO set; a window passes an overlay so a block can see outputs an earlier
+/// block in the same window created.
+///
+/// Runs no consensus rule and mutates nothing, which is what lets a window
+/// prepare several blocks before committing any of them.
+/// A sink that compares what is written to it against `expected`.
+///
+/// Used to check preserved bytes against a block without serialising the block
+/// into a second buffer: nothing is allocated and the first differing byte ends
+/// the walk.
+struct ByteEquality<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    equal: bool,
+}
+
+impl bitcoin::io::Write for ByteEquality<'_> {
+    fn write(&mut self, buf: &[u8]) -> bitcoin::io::Result<usize> {
+        if self.equal {
+            match self
+                .expected
+                .get(self.offset..self.offset.saturating_add(buf.len()))
+            {
+                Some(window) if window == buf => {}
+                _ => self.equal = false,
+            }
+        }
+        self.offset = self.offset.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> bitcoin::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Returns true iff `raw` is exactly the consensus serialization of `block`.
+pub(crate) fn bytes_are_block(raw: &[u8], block: &bitcoin::Block) -> bool {
+    use bitcoin::consensus::Encodable as _;
+
+    let mut sink = ByteEquality {
+        expected: raw,
+        offset: 0,
+        equal: true,
+    };
+    // Encoding to a sink cannot fail; a write error here would be a bug in the
+    // sink above, and treating it as inequality is the safe reading either way.
+    let Ok(written) = block.consensus_encode(&mut sink) else {
+        return false;
+    };
+    sink.equal && written == raw.len()
+}
+
+fn parse_block_for_apply(
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, BlockTxPlan), ApplyError> {
+    // Preserved bytes must BE this block, not merely agree with it on
+    // transaction count. In kernel builds the txids and the transactions that
+    // script verification runs come from these bytes, while the witness
+    // commitment check and the UTXO mutation use the decoded block. Changing a
+    // witness does not change a txid, so a count check lets a caller pair a
+    // block carrying an invalid witness with bytes carrying a valid one: the
+    // scripts verify against the bytes and the invalid block gets applied.
+    if let Some(raw) = provided_serialized.as_deref()
+        && !bytes_are_block(raw, block)
+    {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(
+                "preserved bytes are not the serialization of the block they accompany".to_owned(),
+            ),
+        ));
+    }
+    let raw_block: bytes::Bytes =
+        provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
+    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+        .map_err(ApplyError::Consensus)?;
+    if kernel_block.transaction_count() != block.txdata.len() {
+        return Err(ApplyError::Consensus(
+            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                "kernel parsed {} transactions, decoder produced {}",
+                kernel_block.transaction_count(),
+                block.txdata.len()
+            )),
+        ));
+    }
+    let tx_plan = plan_block_transactions_with_txids(
+        block,
+        kernel_block.txids().map_err(ApplyError::Consensus)?,
+    );
+    Ok((kernel_block, tx_plan))
+}
+
+/// Parses a block and resolves the outputs it spends.
+///
+/// `source` is where prevouts come from. Every caller outside a window passes
+/// the committed UTXO set; a window passes an overlay so a block can see
+/// outputs an earlier block in the same window created.
+fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    source: &S,
+) -> core::result::Result<PreparedApply, ApplyError> {
+    let (kernel_block, tx_plan) = parse_block_for_apply(block, provided_serialized)?;
+    let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &tx_plan));
+    Ok(PreparedApply {
+        kernel_block,
+        tx_plan,
+        resolved,
+    })
+}
+
 fn apply_block_inner(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
+    let transition = handles.begin_chain_transition()?;
+    apply_block_admitted(handles, block, provided_serialized, None, &transition)
+}
+
+/// The apply itself, with the admission permit and the transition lock held.
+///
+/// Callers MUST hold both. `handles.chain_transition` is what serializes this
+/// against another connect or a disconnect; the admission permit only keeps a
+/// checkpoint close from cutting across it.
+///
+/// Split from [`apply_block_inner`] so a window can take both once across its
+/// preparation and all of its ordered commits. Re-entering per block would be
+/// two read guards on the same lock, which deadlocks against a shutdown waiting
+/// on the write side, and would leave gaps in which another applier could move
+/// the chain out from under prepared state.
+#[allow(clippy::too_many_lines)]
+fn apply_block_admitted(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    proven: Option<ProvenApply>,
+    _transition: &ChainTransition<'_>,
+) -> core::result::Result<TipSnapshot, ApplyError> {
     use bitcoin::hashes::Hash as _;
-    let _admission = handles.admission.enter()?;
 
     let total_started = quanta::Instant::now();
     let block_hash =
@@ -502,25 +1920,26 @@ fn apply_block_inner(
     // implementation selected at runtime, so this one parse replaces the
     // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
     // that script preparation used to perform.
-    let raw_block: bytes::Bytes = provided_serialized
-        .clone()
-        .unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
-    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
-        .map_err(ApplyError::Consensus)?;
-    if kernel_block.transaction_count() != block.txdata.len() {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                "kernel parsed {} transactions, decoder produced {}",
-                kernel_block.transaction_count(),
-                block.txdata.len()
-            )),
-        ));
-    }
-    let tx_plan = plan_block_transactions_with_txids(
-        block,
-        kernel_block.txids().map_err(ApplyError::Consensus)?,
-    );
-    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
+    // A window prepares several blocks against one overlay and hands the result
+    // back, so the kernel parse and the prevout resolution happen once.
+    let (prepared, proof) = match proven {
+        Some(ProvenApply { prepared, proof }) => (prepared, proof),
+        None => (
+            prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
+            None,
+        ),
+    };
+    let PreparedApply {
+        kernel_block,
+        tx_plan,
+        resolved,
+    } = prepared;
+    // Before any mutation. A header the tree has never seen skips header sync's
+    // timestamp rules entirely, and `applied_header_tip` — where the insert
+    // happens — runs after the UTXO commit, so checking there would reject the
+    // block with its outputs already installed.
+    check_unseen_header_timestamp(handles, block, block_hash)?;
+
     let block_rules_started = quanta::Instant::now();
     let block_rules_result =
         bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
@@ -555,16 +1974,32 @@ fn apply_block_inner(
 
     let script_verify_started = quanta::Instant::now();
     let verify_flags = compute_verify_flags(handles.network, height, block_hash, softfork_state);
-    let script_verify_result = verify_block_transactions(
-        handles,
-        block,
-        &tx_plan,
-        Arc::clone(&resolved),
-        height,
-        locktime_cutoff,
-        verify_flags,
-        &kernel_block,
-    );
+    // A batch already executed these scripts under exactly the context derived
+    // here. Every bound field is compared, so a proof reached under different
+    // rules simply does not apply and the block verifies in full.
+    let script_verify_result = if proof.is_some_and(|proof| {
+        proof.matches(block_hash, prev_hash, height, verify_flags, locktime_cutoff)
+    }) {
+        run_non_script_checks_only(
+            block,
+            &tx_plan,
+            Arc::clone(&resolved),
+            tx_plan.txids(),
+            height,
+            locktime_cutoff,
+        )
+    } else {
+        verify_block_transactions(
+            handles,
+            block,
+            &tx_plan,
+            Arc::clone(&resolved),
+            height,
+            locktime_cutoff,
+            verify_flags,
+            &kernel_block,
+        )
+    };
     let script_verify_dur = script_verify_started.elapsed();
     metrics::histogram!("node.apply_block.script_verify_seconds")
         .record(script_verify_dur.as_secs_f64());
@@ -639,10 +2074,31 @@ fn apply_block_inner(
     };
 
     let utxo_changes_started = quanta::Instant::now();
-    let changes = build_utxo_changes(block, height, &scratch)?;
+    let (changes, undo) = build_utxo_changes(
+        block,
+        height,
+        &scratch,
+        &resolved,
+        bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
+            .then(|| handles.utxo.as_ref()),
+    )?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_changes_seconds")
         .record(utxo_changes_dur.as_secs_f64());
+
+    // Persist undo before the block body, the index, and the UTXO commit. All
+    // three are derived state for a block that is about to apply; if the undo
+    // record cannot be written the block must not apply at all, and leaving
+    // body bytes or index rows behind for it would be worse than not starting.
+    let undo_persist_started = quanta::Instant::now();
+    let undo_record = bitcoin_rs_utxo::encode_undo(&undo, block_hash);
+    let undo_persist_result = handles
+        .undo_store
+        .persist_undo(height, block_hash, &undo_record)
+        .map_err(ApplyError::UndoPersistence);
+    metrics::histogram!("node.apply_block.undo_persist_seconds")
+        .record(undo_persist_started.elapsed().as_secs_f64());
+    undo_persist_result?;
     // Serialize the block lazily: only when a consumer actually needs the
     // full bytes. During IBD with pruning+txindex disabled this avoids a
     // full-block serialize on every apply.
@@ -782,7 +2238,7 @@ fn apply_block_inner(
     let mempool_evict_dur = mempool_evict_started.elapsed();
     metrics::histogram!("node.apply_block.mempool_evict_seconds")
         .record(mempool_evict_dur.as_secs_f64());
-    let tx_count_delta = u64::try_from(block.txdata.len()).unwrap_or(u64::MAX);
+    let tx_count_delta = tx_count_delta_for(block);
     let coin_stats_started = quanta::Instant::now();
     handles.coin_stats.finish_block(height, tx_count_delta);
     let coin_stats_dur = coin_stats_started.elapsed();
@@ -790,23 +2246,35 @@ fn apply_block_inner(
         .record(coin_stats_dur.as_secs_f64());
     let filter_started = quanta::Instant::now();
     if let Some(filter_bytes) = filter_bytes {
-        let prev_filter_header = previous_filter_header(handles, prior.as_deref());
-        match handles
-            .filter_index
-            .put_filter(block_hash, prev_filter_header, &filter_bytes)
-        {
-            Ok(filter_header) => {
-                *handles.filter_header_cache.lock() = Some((block_hash, filter_header));
-                tracing::debug!(
-                    height,
-                    %filter_header,
-                    bytes = filter_bytes.len(),
-                    "filter_index stored block filter"
-                );
+        if let Some(prev_filter_header) = previous_filter_header(handles, prior.as_deref()) {
+            match handles
+                .filter_index
+                .put_filter(block_hash, prev_filter_header, &filter_bytes)
+            {
+                Ok(filter_header) => {
+                    *handles.filter_header_cache.lock() = Some((block_hash, filter_header));
+                    tracing::debug!(
+                        height,
+                        %filter_header,
+                        bytes = filter_bytes.len(),
+                        "filter_index stored block filter"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(height, %error, "filter_index failed to store block filter");
+                }
             }
-            Err(error) => {
-                tracing::warn!(height, %error, "filter_index failed to store block filter");
-            }
+        } else {
+            // Skip the write rather than chain from zero. A BIP157 header is a
+            // hash over its predecessor, so a chain that restarts mid-way is
+            // invalid, not short, and verifies wrongly with no way to tell.
+            // Writing nothing leaves the index unavailable from here, which a
+            // backfill can repair.
+            tracing::warn!(
+                height,
+                %block_hash,
+                "no BIP157 filter header for the previous block; skipping this block's filter"
+            );
         }
     }
     let filter_dur = filter_started.elapsed();
@@ -898,21 +2366,69 @@ fn applied_predecessor(
     Ok((prior, height))
 }
 
-fn previous_filter_header(handles: &ApplyHandles, prior: Option<&TipSnapshot>) -> Hash256 {
+/// The BIP157 filter header the next filter chains from, when one exists.
+///
+/// Zero is valid for exactly one caller: the genesis block, whose parent
+/// header is defined as zero. Everywhere else zero is a wrong answer that
+/// looks like a right one, because BIP157 defines each header as a hash over
+/// the previous one. A chain that restarts mid-way is not a shorter valid
+/// chain; it is an invalid one, and a light client verifying against it gets
+/// wrong answers with no way to tell.
+///
+/// Never returns an error, and never fails a block. Filters are optional
+/// derived state written after the block has already applied, so neither an
+/// absent row nor a broken backend may turn an applied block into a failure.
+/// Both answer `None`, the caller skips the write, and the index stays
+/// unavailable from that point until a backfill repairs it.
+///
+/// `None` is not the old bug wearing a new hat. The old code returned zero and
+/// wrote a header, producing an index that verifies wrongly. This writes
+/// nothing, which is honest and repairable.
+fn previous_filter_header(handles: &ApplyHandles, prior: Option<&TipSnapshot>) -> Option<Hash256> {
     let Some(tip) = prior else {
-        return Hash256::default();
+        return Some(Hash256::default());
     };
     if let Some((cached_hash, cached_header)) = handles.filter_header_cache.lock().as_ref()
         && *cached_hash == tip.hash
     {
-        return *cached_header;
+        return Some(*cached_header);
     }
-    handles
-        .filter_index
-        .filter_header(tip.hash)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+    match handles.filter_index.filter_header(tip.hash) {
+        Ok(header) => header,
+        Err(error) => {
+            tracing::warn!(
+                prior_hash = %tip.hash,
+                %error,
+                "filter header lookup failed; skipping this block's filter"
+            );
+            None
+        }
+    }
+}
+
+/// Applies header-sync's timestamp rules to a header the tree has not seen.
+///
+/// A header already in the tree went through `accept_headers` and was checked
+/// there. One that is not is about to be inserted by `applied_header_tip`, and
+/// without this a caller handing `apply_block` a block directly could make one
+/// with an invalid median-time-past or an absurd future timestamp the applied
+/// consensus tip.
+fn check_unseen_header_timestamp(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    block_hash: bitcoin_rs_primitives::Hash256,
+) -> core::result::Result<(), ApplyError> {
+    let tree = handles.block_tree.read();
+    if tree.lookup(block_hash).is_some() {
+        return Ok(());
+    }
+    bitcoin_rs_chain::validate_header_timestamp(
+        &tree,
+        &block.header,
+        block_hash,
+        bitcoin_rs_chain::current_unix_seconds(),
+    )?;
+    Ok(())
 }
 
 fn applied_header_tip(
@@ -922,6 +2438,9 @@ fn applied_header_tip(
     height: u32,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let mut tree = handles.block_tree.write();
+    // No timestamp check here: this runs after the UTXO commit, so rejecting a
+    // block at this point would leave its outputs and index rows installed.
+    // `check_unseen_header_timestamp` does it before any mutation.
     let node_id = match tree.lookup(block_hash) {
         Some(node_id) => node_id,
         None => tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?,
@@ -960,6 +2479,17 @@ struct BlockTxPlan {
 }
 
 impl BlockTxPlan {
+    /// Outpoints this block both creates and spends, empty when it has none.
+    ///
+    /// The overlay nets these out exactly as `build_utxo_changes` does: such an
+    /// output never reaches the committed set, so a view carrying it would
+    /// resolve a later spend the real set would refuse.
+    fn same_block_spent_set(&self) -> &SameBlockSpentSet {
+        static NONE: std::sync::LazyLock<SameBlockSpentSet> =
+            std::sync::LazyLock::new(SameBlockSpentSet::new);
+        self.same_block_spent.as_ref().unwrap_or(&NONE)
+    }
+
     fn txids(&self) -> &[Txid] {
         &self.txids
     }
@@ -1153,7 +2683,16 @@ struct ResolvedUtxoView {
 }
 
 impl ResolvedUtxoView {
-    fn resolve(utxo: &UtxoSet, block: &bitcoin::Block, tx_plan: &BlockTxPlan) -> Self {
+    /// Resolves a block's external prevouts from any source of live outputs.
+    ///
+    /// Generic so a window can substitute an overlay carrying the outputs its
+    /// earlier blocks created. Every caller outside a window passes the
+    /// committed set.
+    fn resolve<S: crate::window_overlay::OutputSource + ?Sized>(
+        utxo: &S,
+        block: &bitcoin::Block,
+        tx_plan: &BlockTxPlan,
+    ) -> Self {
         let same_block = tx_plan.same_block_spent.as_ref();
         let candidates = block
             .txdata
@@ -1190,6 +2729,11 @@ impl ResolvedUtxoView {
 
     fn lookup(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::TxOut> {
         self.external.get(outpoint).map(|entry| entry.txout.clone())
+    }
+
+    /// Full resolved entry for a spent outpoint, including creation metadata.
+    fn entry(&self, outpoint: &bitcoin::OutPoint) -> Option<&LiveOutput> {
+        self.external.get(outpoint)
     }
 
     fn lookup_meta(&self, outpoint: &bitcoin::OutPoint) -> Option<LiveOutputMeta> {
@@ -1266,6 +2810,60 @@ fn resolve_block_prevouts(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
+/// Runs every non-script transaction check for a block whose scripts do not
+/// need executing here.
+///
+/// Two callers reach this: assume-valid, which trusts the scripts, and a batch
+/// proof, which already ran them. One implementation for both, because a second
+/// copy is how a trusted path and a proven path drift apart.
+fn run_non_script_checks_only(
+    block: &bitcoin::Block,
+    tx_plan: &BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
+    txids: &[Txid],
+    height: u32,
+    locktime_cutoff: u32,
+) -> core::result::Result<(), ApplyError> {
+    if !tx_plan.needs_local_utxo_overlay {
+        block.txdata.par_iter().try_for_each(|tx| {
+            if tx.is_coinbase() {
+                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
+                return Ok(());
+            }
+            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+                tx,
+                &*resolved,
+                height,
+                locktime_cutoff,
+            )
+        })?;
+        return Ok(());
+    }
+    let mut view =
+        BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
+    for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
+        if tx.is_coinbase() {
+            bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
+            view.add_outputs(tx_index, *txid, tx.output.len())?;
+            continue;
+        }
+        bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+            tx,
+            &view,
+            height,
+            locktime_cutoff,
+        )?;
+        view.spend_inputs(tx);
+        view.add_outputs(tx_index, *txid, tx.output.len())?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
@@ -1289,40 +2887,15 @@ fn verify_block_transactions(
     let skip_scripts = handles.assume_valid_height > 0
         && height <= handles.assume_valid_height
         && handles.assume_valid_gate.trusted();
-    if skip_scripts && !tx_plan.needs_local_utxo_overlay {
-        block.txdata.par_iter().try_for_each(|tx| {
-            if tx.is_coinbase() {
-                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                return Ok(());
-            }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
-                tx,
-                &*resolved,
-                height,
-                locktime_cutoff,
-            )
-        })?;
-        return Ok(());
-    }
     if skip_scripts {
-        let mut view =
-            BlockLocalUtxoView::new(resolved, &block.txdata, height, tx_plan.overlay_capacity);
-        for (tx_index, (tx, txid)) in (0_u32..).zip(block.txdata.iter().zip(txids)) {
-            if tx.is_coinbase() {
-                bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
-                view.add_outputs(tx_index, *txid, tx.output.len())?;
-                continue;
-            }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
-                tx,
-                &view,
-                height,
-                locktime_cutoff,
-            )?;
-            view.spend_inputs(tx);
-            view.add_outputs(tx_index, *txid, tx.output.len())?;
-        }
-        return Ok(());
+        return run_non_script_checks_only(
+            block,
+            tx_plan,
+            resolved,
+            txids,
+            height,
+            locktime_cutoff,
+        );
     }
     // Full-verify: resolve every transaction's prevouts serially in block order
     // into an owned `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec), then
@@ -1439,7 +3012,11 @@ pub(crate) fn check_coinbase_maturity(
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
     let tx_plan = plan_block_transactions(block);
-    let resolved = Arc::new(ResolvedUtxoView::resolve(&handles.utxo, block, &tx_plan));
+    let resolved = Arc::new(ResolvedUtxoView::resolve(
+        handles.utxo.as_ref(),
+        block,
+        &tx_plan,
+    ));
     check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, resolved, height)
 }
 
@@ -1663,7 +3240,9 @@ fn check_bip30_and_bip34(
             }
         }
     }
-    bitcoin_rs_consensus::bip30::check_bip30(height, has_duplicate)?;
+    let block_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    bitcoin_rs_consensus::bip30::check_bip30(height, block_hash, has_duplicate)?;
 
     // BIP34: when active for this network at `height`, the coinbase
     // scriptSig must start with the minimally-encoded height.
@@ -1773,17 +3352,23 @@ fn build_utxo_changes<'a>(
     block: &'a bitcoin::Block,
     height: u32,
     scratch: &ApplyScratch,
-) -> core::result::Result<BorrowedBlockChanges<'a>, ApplyError> {
+    resolved: &ResolvedUtxoView,
+    overwritten: Option<&UtxoSet>,
+) -> core::result::Result<(BorrowedBlockChanges<'a>, bitcoin_rs_utxo::UndoBatch), ApplyError> {
     use bitcoin::hashes::Hash as _;
 
     // Bitcoin Core indexes genesis but does not connect its transactions into
     // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
     if height == 0 {
-        return Ok(BorrowedBlockChanges::default());
+        return Ok((
+            BorrowedBlockChanges::default(),
+            bitcoin_rs_utxo::UndoBatch::default(),
+        ));
     }
 
     let (add_capacity, remove_capacity) = scratch.utxo_change_capacity();
     let mut changes = BorrowedBlockChanges::with_capacity(add_capacity, remove_capacity);
+    let mut undo = bitcoin_rs_utxo::UndoBatch::default();
     let net_same_block_spends = scratch.has_same_block_spends();
     for (tx, txid) in block.txdata.iter().zip(scratch.txids()) {
         let txid = bitcoin_rs_primitives::Hash256::from_le_bytes(txid.as_byte_array());
@@ -1799,7 +3384,27 @@ fn build_utxo_changes<'a>(
             if net_same_block_spends && scratch.contains_same_block_spent(&outpoint) {
                 continue;
             }
+            // At a BIP30 exception height the coinbase reuses an earlier txid
+            // whose outputs are still live, so this add OVERWRITES a coin
+            // rather than creating one. `overwritten` is `Some` only at those
+            // two mainnet heights, so every other block pays no lookup.
+            let replaced = overwritten.and_then(|set| set.get_entry(&outpoint));
             changes.add(BorrowedUtxoAdd::new(outpoint, txout, coinbase, height));
+            match replaced {
+                // The inverse of overwriting is writing the old coin back, not
+                // deleting the outpoint. Emitting a remove as well would depend
+                // on `undo_block` applying restores after removes, and it does
+                // the opposite, so the older coin would be lost and the rewound
+                // UTXO set, MuHash, and coinstats would not match the parent.
+                Some(previous) => undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
+                    outpoint,
+                    previous.txout,
+                    previous.coinbase,
+                    previous.height,
+                )),
+                // Disconnecting the block deletes what it created.
+                None => undo.remove(outpoint),
+            }
         }
 
         if !coinbase {
@@ -1809,10 +3414,25 @@ fn build_utxo_changes<'a>(
                     continue;
                 }
                 changes.remove(previous_output);
+                // ...and restores what it spent. A spend with no resolved
+                // prevout would make the record unable to restore that output,
+                // so refuse rather than persist an undo that silently loses it.
+                let spent = resolved.entry(&tx_input.previous_output).ok_or(
+                    ApplyError::UndoPrevoutMissing {
+                        txid: previous_output.txid,
+                        vout: previous_output.vout,
+                    },
+                )?;
+                undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
+                    previous_output,
+                    spent.txout.clone(),
+                    spent.coinbase,
+                    spent.height,
+                ));
             }
         }
     }
-    Ok(changes)
+    Ok((changes, undo))
 }
 
 fn internal_outpoint(outpoint: &bitcoin::OutPoint) -> OutPoint {
@@ -2873,7 +4493,8 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
@@ -2903,7 +4524,8 @@ mod consensus_rule_tests {
         let txid = coinbase.compute_txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, 1, false, false)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
@@ -2953,7 +4575,16 @@ mod consensus_rule_tests {
         let block = block_with_transactions(vec![funding_tx, same_block_spend]);
 
         let scratch = ApplyScratch::new(&block, 2, false, false)?;
-        let changes = build_utxo_changes(&block, 2, &scratch)?;
+        // The block spends an external prevout, so the undo half needs the
+        // resolved view that spend came from. An empty view would now be
+        // rejected, which is the point of UndoPrevoutMissing.
+        let resolved = ResolvedUtxoView::resolve(utxo.as_ref(), &block, &tx_plan(&block));
+        let (changes, undo) = build_utxo_changes(&block, 2, &scratch, &resolved, None)?;
+        assert_eq!(
+            undo.restores().len(),
+            1,
+            "only the external spend is restorable; the same-block spend never entered the set"
+        );
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x63; 32]))?;
 
         assert!(utxo.get(&internal_outpoint(&base_prevout)).is_none());
@@ -2997,7 +4628,8 @@ mod consensus_rule_tests {
         let block = block_with_transaction(coinbase_transaction(0x70));
 
         let scratch = ApplyScratch::new(&block, 1, false, true)?;
-        let changes = build_utxo_changes(&block, 1, &scratch)?;
+        let (changes, _undo) =
+            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
 
         assert!(
             !scratch.contains_same_block_spent(&internal_outpoint(&bitcoin::OutPoint {
@@ -4068,7 +5700,89 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// With no filter header for the parent, the block's filter must be skipped
+    /// rather than written chained from zero.
+    ///
+    /// A BIP157 header is a hash over its predecessor, so a chain that restarts
+    /// mid-way is invalid rather than short, and a light client verifying
+    /// against it gets wrong answers with nothing to detect. Writing nothing
+    /// leaves the index unavailable from that point, which a backfill repairs.
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_block_whose_parent_has_no_filter_header_writes_no_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let handles = apply_handles_with_filter_index(
+            Network::Regtest,
+            Arc::new(UtxoSet::new()),
+            &filter_index,
+        );
+        // Genesis deliberately NOT seeded: this is the mid-chain enable case,
+        // where earlier blocks were applied without a filter index.
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+
+        assert!(
+            filter_index.headers.lock().get(&block_hash).is_none(),
+            "no filter header may be written when the parent has none"
+        );
+        assert!(
+            filter_index.prev_headers.lock().is_empty(),
+            "put_filter must not be called at all, not called with zero"
+        );
+        assert!(
+            handles.filter_header_cache.lock().is_none(),
+            "the cache must not advertise a header that was never written"
+        );
+        Ok(())
+    }
+
+    /// Records genesis's BIP158 filter, as a real node does when it applies
+    /// genesis through `apply_block`.
+    ///
+    /// Fixtures that install genesis with `applied_header_tip` get the header
+    /// but not the filter, so the block after it finds no predecessor header
+    /// and its own filter is skipped. That skip is correct behaviour and wrong
+    /// setup, so the setup is what changes.
+    ///
+    /// The filter is computed, not stubbed. Genesis's coinbase spends nothing,
+    /// so it needs no prevout lookup, and an arbitrary byte string here would
+    /// seed a header that no real node would ever produce.
+    fn seed_genesis_filter(
+        filter_index: &RecordingFilterIndex,
+        genesis: &bitcoin::Block,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::hashes::Hash as _;
+
+        let filter = bitcoin::bip158::BlockFilter::new_script_filter(
+            genesis,
+            |outpoint| -> Result<ScriptBuf, bitcoin::bip158::Error> {
+                Err(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+            },
+        )?;
+        filter_index.put_filter(
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            Hash256::default(),
+            &filter.content,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn apply_block_persists_non_empty_filter_for_valid_same_block_spend()
     -> Result<(), Box<dyn std::error::Error>> {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -4083,6 +5797,7 @@ mod consensus_rule_tests {
             utxo_with_output(external_prevout, 1)?,
             &filter_index,
         );
+        seed_genesis_filter(&filter_index, &genesis)?;
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -4120,6 +5835,1369 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// The record has to outlive the process that wrote it: a node restarted
+    /// mid-chain must still be able to disconnect its own tip. An in-memory
+    /// store cannot show that, so this one closes the backend and reopens it,
+    /// then checks every restored field rather than just the byte length.
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn a_persisted_undo_record_survives_closing_and_reopening_the_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin_rs_utxo::{UndoBatch, UtxoAdd, undo_codec};
+
+        let dir = tempfile::tempdir()?;
+        let block_hash = Hash256::from_le_bytes(&[0x5a; 32]);
+        let outpoint = bitcoin_rs_primitives::OutPoint::new(Hash256::from_le_bytes(&[0x2c; 32]), 7);
+        let removed = bitcoin_rs_primitives::OutPoint::new(Hash256::from_le_bytes(&[0x3d; 32]), 1);
+        let txout = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(123_456),
+            script_pubkey: op_true_script(),
+        };
+
+        let mut batch = UndoBatch::default();
+        batch.restore(UtxoAdd::new(outpoint, txout.clone(), true, 91));
+        batch.remove(removed);
+        let encoded = undo_codec::encode(&batch, block_hash);
+
+        {
+            let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+            KvUndoStore::new(store).persist_undo(91, block_hash, &encoded)?;
+        }
+
+        let reopened = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+        let loaded = KvUndoStore::new(reopened)
+            .load_undo(91, block_hash)?
+            .ok_or("undo record did not survive the reopen")?;
+
+        let decoded = undo_codec::decode(&loaded, block_hash)?;
+        let restored = decoded
+            .restores()
+            .first()
+            .ok_or("restored entry missing after reopen")?;
+        assert_eq!(restored.outpoint, outpoint, "outpoint must round-trip");
+        assert_eq!(restored.txout, txout, "spent output must round-trip");
+        assert!(restored.coinbase, "coinbase flag must round-trip");
+        assert_eq!(restored.height, 91, "creating height must round-trip");
+        assert_eq!(
+            decoded.removes(),
+            batch.removes(),
+            "outputs to remove must round-trip"
+        );
+        Ok(())
+    }
+
+    /// Deferred durability must not become deferred visibility.
+    ///
+    /// `disconnect_block` reads back the undo record the connect wrote, in the
+    /// same process and before any checkpoint flush. redb is the backend that
+    /// makes this worth pinning: its `put` commits immediately, so moving the
+    /// write to `write_deferred` is exactly the change that could have made the
+    /// row unreadable until a flush.
+    #[cfg(feature = "redb")]
+    #[test]
+    fn a_deferred_undo_record_is_readable_before_any_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(bitcoin_rs_storage::RedbStore::open(dir.path())?);
+        let undo_store = KvUndoStore::new(Arc::clone(&store));
+        let hash = Hash256::from_le_bytes(&[0x4d; 32]);
+
+        undo_store.persist_undo(4_242, hash, b"undo-record")?;
+
+        let loaded = undo_store
+            .load_undo(4_242, hash)?
+            .ok_or("undo record must be readable in-process before any flush")?;
+        assert_eq!(
+            loaded, b"undo-record",
+            "the deferred write must return exactly what was written"
+        );
+        Ok(())
+    }
+
+    /// The marker exists to survive a crash, so an in-memory round trip proves
+    /// nothing. This closes the backend and reopens it, which is the only shape
+    /// of test that can fail if the write is not durable.
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn an_armed_disconnect_marker_survives_closing_and_reopening_the_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let block_hash = Hash256::from_le_bytes(&[0xa7; 32]);
+
+        {
+            let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+            KvUndoStore::new(store).arm_disconnect(140_003, block_hash)?;
+        }
+
+        let reopened = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+        let marker = KvUndoStore::new(Arc::clone(&reopened))
+            .load_disconnect_marker()?
+            .ok_or("armed marker did not survive the reopen")?;
+        assert_eq!(marker.hash, block_hash, "hash must round-trip");
+        assert_eq!(marker.height, 140_003, "height must round-trip");
+        assert_eq!(
+            marker.phase,
+            DisconnectPhase::InFlight,
+            "arming records an unfinished rollback"
+        );
+
+        // A checkpoint must refuse an unfinished rollback. Checkpointing
+        // half-rolled-back state captures the damage instead of repairing it.
+        assert!(matches!(
+            KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect(),
+            Err(StorageError::InvalidOperation(_))
+        ));
+        assert!(
+            KvUndoStore::new(Arc::clone(&reopened))
+                .load_disconnect_marker()?
+                .is_some(),
+            "a checkpoint must not clear an in-flight marker"
+        );
+
+        // Once the rollback completes, the same call clears it, or a node that
+        // disconnected cleanly could never start again.
+        KvUndoStore::new(Arc::clone(&reopened)).complete_disconnect(140_003, block_hash)?;
+        KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect()?;
+        drop(reopened);
+        let after = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
+        assert_eq!(
+            KvUndoStore::new(after).load_disconnect_marker()?,
+            None,
+            "a completed rollback must clear and stay cleared across a reopen"
+        );
+        Ok(())
+    }
+
+    /// A truncated marker must not read as "no disconnect was in flight".
+    /// Corruption clearing the interlock is the one failure it cannot have.
+    #[test]
+    fn a_truncated_disconnect_marker_is_an_error_not_an_absence() {
+        let Err(error) = DisconnectMarker::decode(&[0_u8; 20]) else {
+            panic!("a 20-byte marker must not decode as absent");
+        };
+        assert!(
+            error.to_string().contains("expected 37"),
+            "error must say what it expected, got: {error}"
+        );
+    }
+
+    /// Timestamp rules must hold on the apply path, not only in header sync.
+    ///
+    /// `applied_header_tip` inserts a header the tree has never seen, so before
+    /// this a caller handing `apply_block` a block directly could make one with
+    /// a timestamp at or below its parent's median-time-past the applied
+    /// consensus tip.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn apply_rejects_a_block_whose_timestamp_precedes_its_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let mut block = block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        );
+        // Exactly the parent's timestamp: the rule is strictly greater than the
+        // median, and with one ancestor the median IS the parent's time.
+        block.header.time = genesis.header.time;
+        let target = block.header.target();
+        while block.header.validate_pow(target).is_err() {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("test block nonce exhausted"))?;
+        }
+        let outcome = apply_block(&handles, &block);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(ApplyError::Chain(
+                    bitcoin_rs_chain::ChainError::TimestampTooEarly { .. }
+                ))
+            ),
+            "a block at or below its parent's median-time-past must be refused, got {outcome:?}"
+        );
+
+        // And it must be refused before anything is written. The check first
+        // lived in `applied_header_tip`, which runs AFTER the UTXO commit, so
+        // the rejection left the block's outputs installed and later validation
+        // could spend coins from a block outside the applied chain.
+        assert_eq!(
+            utxo.len(),
+            0,
+            "a refused block must leave no outputs in the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(u32::MAX, |tip| tip.height),
+            0,
+            "and must not move the tip"
+        );
+        Ok(())
+    }
+
+    /// A body that fails a cheap structural check must never reach the batch.
+    ///
+    /// Batching made this a cost question, not just a correctness one: a peer
+    /// can keep the expected header and every txid while breaking the witness
+    /// commitment, and before the preflight that bought a full window of script
+    /// verification for a block rejected either way.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_window_refuses_a_block_whose_merkle_root_does_not_match()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_for_network(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        applied_header_tip(&handles, block_hash, &block, 1)?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        assert_eq!(
+            prove_window(&handles, &[&block], &[raw]).len(),
+            1,
+            "the honest block must prove, or this test proves nothing"
+        );
+
+        // Same header, different body: the merkle root no longer matches.
+        let mut tampered = block.clone();
+        tampered.txdata.push(coinbase_transaction(2));
+        assert_eq!(
+            tampered.header, block.header,
+            "the header must be untouched for this to be the attack described"
+        );
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&tampered));
+        assert!(
+            prove_window(&handles, &[&tampered], &[raw]).is_empty(),
+            "a body that fails the merkle check must not reach the script batch"
+        );
+        Ok(())
+    }
+
+    /// The window's two caps, and which one binds.
+    ///
+    /// Count alone is wrong at the tip and bytes alone is wrong at genesis, so
+    /// the rule is whichever binds first. The oversized-block case is the one
+    /// worth pinning: a block bigger than the whole byte cap must still go
+    /// through, or the chain stalls on it.
+    #[test]
+    fn a_window_stops_at_whichever_cap_binds_first() {
+        // Tiny blocks: the count cap binds.
+        assert_eq!(
+            window_len(std::iter::repeat_n(256, SCRIPT_BATCH_WINDOW * 2)),
+            SCRIPT_BATCH_WINDOW,
+            "small blocks must fill the window to its count cap"
+        );
+
+        // Tip-sized blocks: the byte cap binds long before the count does.
+        let tip_block = 2 << 20;
+        let expected = SCRIPT_BATCH_MAX_BYTES / tip_block;
+        assert_eq!(
+            window_len(std::iter::repeat_n(tip_block, SCRIPT_BATCH_WINDOW)),
+            expected,
+            "tip-sized blocks must be cut off by the byte cap"
+        );
+        assert!(
+            expected < SCRIPT_BATCH_WINDOW,
+            "this assertion is vacuous unless the byte cap binds first here"
+        );
+
+        // A single block larger than the entire byte cap still goes through.
+        assert_eq!(
+            window_len([SCRIPT_BATCH_MAX_BYTES * 2, 256]),
+            1,
+            "an oversized block must be applied alone, not refused"
+        );
+
+        assert_eq!(window_len([]), 0, "an empty window is empty");
+    }
+
+    /// The window must make the same assume-valid decision the single-block path
+    /// makes, and must not hand back script evidence for a block it skipped.
+    ///
+    /// It used to do neither: every unit was prepared and executed before the
+    /// per-block decision was reached, so `--assume-valid-height N` did nothing
+    /// on the windowed path at all.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use bitcoin::opcodes::all::OP_EQUAL;
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x71; 32]),
+            vout: 0,
+        };
+
+        // A spend that cannot pass: the prevout pays to a bare OP_EQUAL, so the
+        // script fails whenever it actually runs. Whether the window ran it is
+        // therefore observable in the result.
+        let build = |assume_valid_height: u32| -> Result<_, Box<dyn std::error::Error>> {
+            let utxo = Arc::new(UtxoSet::new());
+            let mut changes = BlockChanges::default();
+            changes.add(UtxoAdd::new(
+                OutPoint::new(
+                    Hash256::from_le_bytes(prevout.txid.as_byte_array()),
+                    prevout.vout,
+                ),
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: bitcoin::script::Builder::new()
+                        .push_opcode(OP_EQUAL)
+                        .into_script(),
+                },
+                false,
+                0,
+            ));
+            utxo.commit_block(&changes, &Hash256::from_le_bytes(&[0x71; 32]))?;
+
+            let mut handles = apply_handles_for_network(Network::Regtest, utxo);
+            handles.assume_valid_height = assume_valid_height;
+            let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+            let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+            handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+            let spend = spending_transaction_to_script(
+                prevout,
+                Sequence::MAX.to_consensus_u32(),
+                op_true_script(),
+            );
+            let block = mined_block_with_prev_hash_and_transactions(
+                genesis.block_hash(),
+                vec![coinbase_transaction(1), spend],
+            )?;
+            // The window refuses a block whose header the tree has not seen.
+            // This test is about the assume-valid decision, not admission.
+            let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            applied_header_tip(&handles, block_hash, &block, 1)?;
+            let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+            Ok((handles, block, raw))
+        };
+
+        // Height 1 is covered, and with no anchor pinned the gate is trusted.
+        let (handles, block, raw) = build(100)?;
+        let proven = prove_window(&handles, &[&block], &[raw]);
+        assert_eq!(
+            proven.len(),
+            1,
+            "a trusted block must not be failed by a script the window should never have run"
+        );
+        let Some(entry) = proven.first() else {
+            panic!("window returned no entry for the only block");
+        };
+        assert!(
+            entry.proof.is_none(),
+            "a skipped block must carry no script proof: the proof branch bypasses the \
+             trust-gate re-read at commit, so a gate that flips in between would let an \
+             unverified block through"
+        );
+
+        // Full verification must be completely unaffected.
+        let (handles, block, raw) = build(0)?;
+        let proven = prove_window(&handles, &[&block], &[raw]);
+        assert!(
+            proven.is_empty(),
+            "with assume_valid_height 0 the bad script must still fail the window"
+        );
+        Ok(())
+    }
+
+    /// Preserved bytes must be the block, not a block with the same shape.
+    ///
+    /// The witness is the hole a count check leaves open: changing it does not
+    /// change any txid, so the decoded block and the bytes can disagree on
+    /// exactly the data script verification reads while every count and every
+    /// txid still matches.
+    #[test]
+    fn preserved_bytes_carrying_a_different_witness_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+
+        let honest = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        assert!(
+            bytes_are_block(&honest, &block),
+            "the block's own serialization must be accepted"
+        );
+
+        // Swap only the witness. Every txid, the transaction count, and the
+        // header are untouched.
+        let before = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let Some(input) = block.txdata.first_mut().and_then(|tx| tx.input.first_mut()) else {
+            panic!("coinbase has no input");
+        };
+        input.witness.push([0xab_u8; 32]);
+        let after = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before, after,
+            "the witness swap must not move a txid, or this proves nothing"
+        );
+
+        assert!(
+            !bytes_are_block(&honest, &block),
+            "bytes whose witness differs from the block must be rejected"
+        );
+        let outcome = parse_block_for_apply(&block, Some(honest));
+        assert!(
+            outcome.is_err(),
+            "apply must refuse a block whose preserved bytes are not its serialization"
+        );
+        Ok(())
+    }
+
+    /// At a BIP30 exception height the coinbase reuses a txid whose outputs are
+    /// still live, so the add overwrites a coin rather than creating one. The
+    /// undo must put the overwritten coin back; removing the new output instead
+    /// loses the old one for good and the rewound set no longer matches the
+    /// parent.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn bip30_exception_undo_restores_the_coin_it_overwrote()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let block = block_with_transactions(vec![coinbase_transaction(7)]);
+        let coinbase = block.txdata.first().ok_or("block has no coinbase")?;
+        let reused = internal_outpoint(&bitcoin::OutPoint {
+            txid: coinbase.compute_txid(),
+            vout: 0,
+        });
+
+        // The older coin at the very same outpoint, with values the new one does
+        // not share, so a restore that invents a coin cannot pass.
+        let older = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(4_242),
+            script_pubkey: op_true_script(),
+        };
+        let mut seed = bitcoin_rs_utxo::BlockChanges::default();
+        seed.add(bitcoin_rs_utxo::UtxoAdd::new(
+            reused,
+            older.clone(),
+            true,
+            91_722,
+        ));
+        utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x30; 32]))?;
+
+        let scratch = ApplyScratch::new(&block, 91_842, false, false)?;
+        let (_changes, undo) = build_utxo_changes(
+            &block,
+            91_842,
+            &scratch,
+            &ResolvedUtxoView::empty(),
+            Some(utxo.as_ref()),
+        )?;
+
+        assert!(
+            undo.removes().is_empty(),
+            "an overwrite is undone by writing the old coin back, not by deleting the outpoint"
+        );
+        let restored = undo
+            .restores()
+            .iter()
+            .find(|entry| entry.outpoint == reused)
+            .ok_or("undo does not restore the overwritten coin")?;
+        assert_eq!(restored.txout, older, "the ORIGINAL output must come back");
+        assert_eq!(restored.height, 91_722, "at its original height");
+        assert!(restored.coinbase, "and with its original coinbase flag");
+        Ok(())
+    }
+
+    /// Two connects racing for the same height must produce one winner and one
+    /// rejection, never two blocks that both believe they extended the tip.
+    ///
+    /// Before the transition lock this could pass both: `ApplyAdmission::enter`
+    /// hands out read guards, so both threads cleared the predecessor check
+    /// against the same tip and then raced to publish, and whichever published
+    /// second silently discarded the other's block.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn two_concurrent_connects_at_one_height_produce_one_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // Two distinct children of the same parent: both are valid extensions of
+        // the current tip, and exactly one may become it.
+        let left = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let right = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        assert_ne!(
+            left.block_hash(),
+            right.block_hash(),
+            "the two candidates must differ or this races nothing"
+        );
+
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| apply_block(&handles, &left));
+            let b = scope.spawn(|| apply_block(&handles, &right));
+            (a.join(), b.join())
+        });
+        let (Ok(left_outcome), Ok(right_outcome)) = outcomes else {
+            panic!("an applier thread panicked");
+        };
+
+        let winners = usize::from(left_outcome.is_ok()) + usize::from(right_outcome.is_ok());
+        assert_eq!(
+            winners, 1,
+            "exactly one connect may win the height, got left={left_outcome:?} right={right_outcome:?}"
+        );
+
+        let tip = handles
+            .applied_tip
+            .load_full()
+            .ok_or("no applied tip after the race")?;
+        assert_eq!(tip.height, 1, "the tip must advance exactly one block");
+        let winner = if left_outcome.is_ok() { &left } else { &right };
+        assert_eq!(
+            tip.hash,
+            Hash256::from_le_bytes(winner.block_hash().as_byte_array()),
+            "the published tip must be the block that actually won"
+        );
+        Ok(())
+    }
+
+    /// Records the marker calls in order, delegating the rest.
+    ///
+    /// Ordering is the whole property: a marker armed after the index rollback
+    /// would leave a crash between them invisible, and no assertion on the final
+    /// state can tell the two orders apart.
+    #[derive(Debug, Default)]
+    struct MarkerSequenceStore {
+        inner: InMemoryUndoStore,
+        events: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl UndoStore for MarkerSequenceStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("arm");
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("cancel");
+            self.inner.cancel_disconnect()
+        }
+
+        fn complete_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("complete");
+            self.inner.complete_disconnect(height, hash)
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("disarm");
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    /// The index rollback commits a delete batch, so it is a mutation and the
+    /// marker must already be armed when it runs. This uses the refusing indexer
+    /// because that path proves both halves at once: the marker was armed before
+    /// the rollback was attempted, and the refusal took it back off.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn the_marker_is_armed_before_the_index_rollback_and_cleared_on_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let store = Arc::new(MarkerSequenceStore::default());
+        handles.undo_store = Arc::<MarkerSequenceStore>::clone(&store);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer that refuses, or this proves nothing"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert!(
+            store.events.lock().is_empty(),
+            "connecting a block must touch the marker not at all"
+        );
+
+        let outcome = disconnect_block(&handles, &block);
+        assert!(
+            matches!(&outcome, Err(crate::DisconnectError::Refused(boxed))
+                if matches!(**boxed, ApplyError::IndexRollback(_))),
+            "the refusing indexer must still refuse, got {outcome:?}"
+        );
+        assert_eq!(
+            store.events.lock().as_slice(),
+            ["arm", "cancel"],
+            "the marker must be armed before the rollback runs, and a refusal that \
+             touched nothing must cancel it rather than leave a false poison"
+        );
+        assert_eq!(
+            store.load_disconnect_marker()?,
+            None,
+            "a refusal changed nothing, so it must leave no marker behind"
+        );
+        Ok(())
+    }
+
+    /// A store that refuses every write, to prove the undo persistence is a
+    /// real gate rather than a best-effort side effect.
+    #[derive(Debug, Default)]
+    struct RejectingUndoStore;
+
+    impl UndoStore for RejectingUndoStore {
+        fn persist_undo(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+            _record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected undo write failure".to_owned(),
+            ))
+        }
+
+        fn load_undo(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            Ok(None)
+        }
+
+        fn arm_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker write failure".to_owned(),
+            ))
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker cancel failure".to_owned(),
+            ))
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker completion failure".to_owned(),
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker clear failure".to_owned(),
+            ))
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            Ok(None)
+        }
+    }
+
+    /// The ordering contract: undo is written before the UTXO commit and before
+    /// every derived write, so a failure to record it must leave the node
+    /// exactly as it was. Applying the block anyway would produce a chainstate
+    /// the node cannot disconnect.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_failed_undo_write_applies_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        handles.undo_store = Arc::new(RejectingUndoStore);
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let outcome = apply_block(&handles, &block);
+
+        assert!(
+            matches!(outcome, Err(ApplyError::UndoPersistence(_))),
+            "a failed undo write must fail the apply, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            0,
+            "no UTXO mutation may survive a refused undo write"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(u32::MAX, |tip| tip.height),
+            0,
+            "the applied tip must not advance"
+        );
+        assert!(
+            filter_index.headers.lock().is_empty(),
+            "no derived filter row may be written for a block that did not apply"
+        );
+        Ok(())
+    }
+
+    /// The round trip that makes the node a full node: connect a block, then
+    /// disconnect it and land on exactly the state that preceded it. A spend is
+    /// included deliberately, because a coinbase-only block would exercise only
+    /// the removes half and leave the restores half unproven.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnecting_the_tip_restores_the_exact_prior_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        // No indexer: the index half has its own rollback tests in
+        // `crates/index`, one of them mutation-verified, and an indexer that
+        // refuses rollback is pinned separately below. This isolates the UTXO
+        // and tip halves.
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // A mature output for the block to spend, so the undo record carries a
+        // restore as well as a remove.
+        let funding_txid = bitcoin::Txid::from_byte_array([0x8b; 32]);
+        let funded = bitcoin::OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        };
+        let funded_value = bitcoin::Amount::from_sat(50_000);
+        let mut seed = bitcoin_rs_utxo::UndoBatch::default();
+        seed.restore(bitcoin_rs_utxo::UtxoAdd::new(
+            internal_outpoint(&funded),
+            bitcoin::TxOut {
+                value: funded_value,
+                script_pubkey: op_true_script(),
+            },
+            false,
+            0,
+        ));
+        utxo.undo_block(&seed)?;
+        let outputs_before = utxo.len();
+        let funded_before = utxo
+            .get(&internal_outpoint(&funded))
+            .ok_or("seeded output missing before apply")?;
+
+        let spend = spending_transaction_to_script(funded, 0xFFFF_FFFF, op_true_script());
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1), spend.clone()],
+        )?;
+        let applied = apply_block(&handles, &block)?;
+        assert_eq!(applied.height, 1, "the block must connect first");
+        assert!(
+            utxo.get(&internal_outpoint(&funded)).is_none(),
+            "the spend must consume the funded output"
+        );
+
+        let restored_tip = disconnect_block(&handles, &block)?;
+
+        assert_eq!(
+            restored_tip.hash, genesis_hash,
+            "tip must return to genesis"
+        );
+        assert_eq!(restored_tip.height, 0, "height must return to genesis");
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map(|tip| tip.hash)
+                .ok_or("applied tip cleared by disconnect")?,
+            genesis_hash,
+            "the published applied tip must match the returned one"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "the UTXO set must return to its exact prior size"
+        );
+        let funded_after = utxo
+            .get(&internal_outpoint(&funded))
+            .ok_or("spent output was not restored")?;
+        assert_eq!(
+            funded_after, funded_before,
+            "the restored output must be byte-identical to the one spent"
+        );
+        assert!(
+            utxo.get(&internal_outpoint(&bitcoin::OutPoint {
+                txid: spend.compute_txid(),
+                vout: 0,
+            }))
+            .is_none(),
+            "outputs the block created must be gone"
+        );
+        Ok(())
+    }
+
+    /// The header hash names the block; it does not vouch for the transactions
+    /// handed over with it. A duplicate final transaction on an odd-width Merkle
+    /// level preserves the ordinary root, so disconnect must use the
+    /// mutation-aware verifier before touching any state.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
+    fn disconnect_refuses_duplicate_last_transaction_merkle_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let external_prevout = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x92; 32]),
+            vout: 0,
+        };
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = utxo_with_output(external_prevout, 1)?;
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        seed_genesis_filter(&filter_index, &genesis)?;
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let funding_tx = spending_transaction_to_script(
+            external_prevout,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let funding_outpoint = bitcoin::OutPoint {
+            txid: funding_tx.compute_txid(),
+            vout: 0,
+        };
+        let same_block_spend = spending_transaction_to_script(
+            funding_outpoint,
+            Sequence::MAX.to_consensus_u32(),
+            op_true_script(),
+        );
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![
+                coinbase_transaction(1),
+                funding_tx,
+                same_block_spend.clone(),
+            ],
+        )?;
+        let applied = apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+        let block_records_before = handles.blocks.read().len();
+        let filter_rows_before = filter_index.rows.lock().len();
+        let tree_tip_before = handles
+            .block_tree
+            .read()
+            .tip()
+            .map(|tip| (tip.tip_id, tip.height, tip.hash));
+        let marker_before = handles.undo_store.load_disconnect_marker()?;
+
+        let mut mutated = block.clone();
+        mutated.txdata.push(same_block_spend);
+        assert_eq!(
+            mutated.compute_merkle_root(),
+            Some(block.header.merkle_root),
+            "duplicate-last mutation must preserve the ordinary Merkle root"
+        );
+        assert!(
+            mutated.check_merkle_root(),
+            "the ordinary Merkle check must accept this mutation, or the test is only the old mismatch guard"
+        );
+        assert_eq!(
+            mutated.block_hash(),
+            block.block_hash(),
+            "the mutated body must retain the applied header and block hash"
+        );
+
+        let outcome = disconnect_block(&handles, &mutated);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::DisconnectBodyMismatch { hash } if hash == applied.hash)
+            ),
+            "a mutation hidden from the ordinary root must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load_full()
+                .map(|tip| (tip.height, tip.hash)),
+            Some((applied.height, applied.hash)),
+            "a refused disconnect must leave the applied tip unchanged"
+        );
+        assert_eq!(
+            handles.blocks.read().len(),
+            block_records_before,
+            "a refused disconnect must leave the RPC block index unchanged"
+        );
+        assert_eq!(
+            filter_index.rows.lock().len(),
+            filter_rows_before,
+            "a refused disconnect must leave filter-index rows unchanged"
+        );
+        assert_eq!(
+            handles
+                .block_tree
+                .read()
+                .tip()
+                .map(|tip| (tip.tip_id, tip.height, tip.hash)),
+            tree_tip_before,
+            "a refused disconnect must leave the active header index unchanged"
+        );
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            marker_before,
+            "mutation refusal must happen before the disconnect marker is armed"
+        );
+        Ok(())
+    }
+
+    /// RPC reads blocks from `handles.blocks`. Leaving the entry there would let
+    /// `getblock` keep answering for a block the chain no longer contains.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_drops_the_rpc_block_record() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let records_before = handles.blocks.read().len();
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+        assert!(
+            handles
+                .blocks
+                .read()
+                .iter()
+                .any(|record| record.hash == block_hash),
+            "connection must publish the record this test then removes"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        assert!(
+            !handles
+                .blocks
+                .read()
+                .iter()
+                .any(|record| record.hash == block_hash),
+            "RPC must not keep serving a disconnected block"
+        );
+        assert_eq!(
+            handles.blocks.read().len(),
+            records_before,
+            "exactly the one record must go"
+        );
+        Ok(())
+    }
+
+    /// The marker's two ends, on the real disconnect path. Arming without
+    /// disarming would refuse every later start; disarming without arming would
+    /// leave the crash window unguarded. Only running the real disconnect can
+    /// show both ends are wired, so this does not call the store directly.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_clean_disconnect_leaves_no_in_flight_marker() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            None,
+            "connecting a block must not arm the disconnect marker"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        // Deliberately still set. The rollback is complete in memory, but the
+        // index rollback is durable while the UTXO set and tip are not, so the
+        // marker is owed a checkpoint before it may go.
+        let marker = handles
+            .undo_store
+            .load_disconnect_marker()?
+            .ok_or("a completed disconnect must leave a marker for the checkpoint")?;
+        assert_eq!(
+            marker.phase,
+            DisconnectPhase::RolledBack,
+            "a completed rollback must be recorded as such, not left in flight"
+        );
+        Ok(())
+    }
+
+    /// `coin_stats` needs no inverse feed of its own, and this proves it rather
+    /// than assuming it. It is registered as the `UtxoSet` change listener, so
+    /// `undo_block` already delivers the inverse as ordinary inserts and
+    /// removals: restores arrive as inserts, removes as removals. Adding a
+    /// second feed on the disconnect path would double-count.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_returns_coin_stats_to_their_prior_value() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut utxo = UtxoSet::new();
+        let listener = bitcoin_rs_coinstats::CoinStatsListener::new(
+            bitcoin_rs_coinstats::CoinStats::default(),
+        );
+        utxo.set_listener(Box::new(listener.clone()));
+        let utxo = Arc::new(utxo);
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        handles.coin_stats = Arc::new(listener);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let before = handles.coin_stats.snapshot();
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let connected = handles.coin_stats.snapshot();
+        assert_ne!(
+            connected, before,
+            "connection must move the stats, or the test proves nothing"
+        );
+
+        disconnect_block(&handles, &block)?;
+
+        // Every field, not a chosen one. Comparing only the per-coin fields
+        // would pass while `height` and `tx_count` stayed on the child, which
+        // is the gap that made the block-level rewind necessary.
+        //
+        // MuHash is compared by digest rather than by struct. It is a ratio of
+        // a numerator and a denominator, so inserting a coin and removing it
+        // leaves the two equal but not back at the limbs they started from. The
+        // digest is the observable value and it does return.
+        let after = handles.coin_stats.snapshot();
+        assert_eq!(
+            after.muhash.finalize_hash(),
+            before.muhash.finalize_hash(),
+            "the MuHash digest must return to its prior value"
+        );
+        assert_eq!(after.height, before.height, "height must return");
+        assert_eq!(
+            after.total_amount, before.total_amount,
+            "total amount must return"
+        );
+        assert_eq!(after.bogo_size, before.bogo_size, "bogo size must return");
+        assert_eq!(after.tx_count, before.tx_count, "tx count must return");
+        assert_eq!(
+            after.utxo_count, before.utxo_count,
+            "utxo count must return"
+        );
+        Ok(())
+    }
+
+    /// An indexer that cannot roll back must stop the disconnect, not be
+    /// skipped. Finishing would leave index rows describing a block the chain
+    /// no longer contains, and queries would answer from them.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_when_the_indexer_cannot_roll_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer for this test to mean anything"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        let outcome = disconnect_block(&handles, &block);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::IndexRollback(_))
+            ),
+            "an indexer without rollback must refuse the disconnect, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "the UTXO set must be untouched when the index refuses"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "the tip must not move when the index refuses"
+        );
+        Ok(())
+    }
+
+    /// Disconnecting anything but the tip would restore outputs that later
+    /// blocks already spent, so it must be refused rather than attempted.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_a_block_that_is_not_the_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block_1 = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block_1)?;
+        let block_2 = mined_block_with_prev_hash_and_transactions(
+            block_1.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        apply_block(&handles, &block_2)?;
+        let outputs_before = utxo.len();
+
+        let outcome = disconnect_block(&handles, &block_1);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::DisconnectNotTip { .. })
+            ),
+            "disconnecting a non-tip block must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            2,
+            "a refused disconnect must leave the tip where it was"
+        );
+        Ok(())
+    }
+
+    /// Without the record the prior UTXO state is unknowable. Proceeding would
+    /// silently corrupt the set, so the disconnect must fail and change nothing.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_when_the_undo_record_is_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        // Swap in an empty store, standing in for a record lost to pruning.
+        handles.undo_store = Arc::new(InMemoryUndoStore::default());
+        let outcome = disconnect_block(&handles, &block);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::UndoRecordMissing { .. })
+            ),
+            "a missing undo record must refuse the disconnect, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "a refused disconnect must not touch the UTXO set"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "a refused disconnect must leave the tip where it was"
+        );
+        Ok(())
+    }
+
+    /// Layer-2 acceptance: connecting a block leaves a decodable undo record
+    /// bound to that block, which is the prerequisite for ever disconnecting it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn apply_block_persists_a_decodable_undo_record() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let handles = apply_handles_with_filter_index(
+            Network::Regtest,
+            Arc::new(UtxoSet::new()),
+            &filter_index,
+        );
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        apply_block(&handles, &block)?;
+
+        let record = handles
+            .undo_store
+            .load_undo(1, block_hash)?
+            .ok_or_else(|| std::io::Error::other("undo record missing after apply"))?;
+        let undo = bitcoin_rs_utxo::decode_undo(&record, block_hash)?;
+
+        // A coinbase-only block creates one output and spends nothing, so its
+        // inverse removes that output and restores nothing.
+        assert_eq!(undo.removes().len(), 1);
+        assert!(undo.restores().is_empty());
+
+        // The record is bound to its block: it must refuse another hash.
+        let other = Hash256::from_le_bytes(&[0xAB; 32]);
+        assert!(bitcoin_rs_utxo::decode_undo(&record, other).is_err());
+        Ok(())
+    }
+
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn apply_block_carries_filter_header_to_next_contiguous_block()
@@ -4131,6 +7209,7 @@ mod consensus_rule_tests {
             Arc::new(UtxoSet::new()),
             &filter_index,
         );
+        seed_genesis_filter(&filter_index, &genesis)?;
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -4157,10 +7236,30 @@ mod consensus_rule_tests {
             .lock()
             .get(&block_1_hash)
             .ok_or_else(|| std::io::Error::other("first filter header missing"))?;
+        let genesis_filter_header = *filter_index
+            .headers
+            .lock()
+            .get(&Hash256::from_le_bytes(
+                genesis.block_hash().as_byte_array(),
+            ))
+            .ok_or_else(|| std::io::Error::other("genesis filter header missing"))?;
         let prev_headers = filter_index.prev_headers.lock();
-        assert_eq!(prev_headers.len(), 2);
-        assert_eq!(prev_headers[0], Hash256::default());
-        assert_eq!(prev_headers[1], first_filter_header);
+        // Three writes: the seeded genesis row, then blocks 1 and 2. Each links
+        // to the one before it, which is the whole BIP157 chain property.
+        assert_eq!(prev_headers.len(), 3);
+        assert_eq!(
+            prev_headers[0],
+            Hash256::default(),
+            "genesis chains from zero, the one place zero is right"
+        );
+        assert_eq!(
+            prev_headers[1], genesis_filter_header,
+            "block 1 must chain from genesis, not restart at zero"
+        );
+        assert_eq!(
+            prev_headers[2], first_filter_header,
+            "block 2 must chain from block 1"
+        );
         assert_eq!(
             *filter_index.header_lookup_count.lock(),
             1,
@@ -4718,7 +7817,7 @@ mod consensus_rule_tests {
                 version: bitcoin::block::Version::ONE,
                 prev_blockhash,
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-                time: 1,
+                time: next_fixture_time(),
                 bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
@@ -4728,6 +7827,22 @@ mod consensus_rule_tests {
             .compute_merkle_root()
             .unwrap_or_else(bitcoin::TxMerkleNode::all_zeros);
         block
+    }
+
+    /// A timestamp strictly after every fixture block built before it.
+    ///
+    /// The fixtures used to hard-code `1`, which is before the regtest genesis
+    /// timestamp and therefore below its median-time-past. That went unnoticed
+    /// while only header sync checked timestamps; now that the apply path does
+    /// too, a fixture block has to carry a timestamp a real one could have.
+    /// Strictly increasing also keeps deep chains valid, where a constant would
+    /// fall to the median once enough blocks shared it.
+    fn next_fixture_time() -> u32 {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        // Just past the regtest genesis timestamp.
+        static NEXT: AtomicU32 = AtomicU32::new(1_296_688_603);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     fn mined_block_with_prev_hash_and_transactions(
@@ -5339,6 +8454,570 @@ mod consensus_rule_tests {
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
+    }
+
+    /// In-memory bodies, so a branch switch can reload the blocks it needs.
+    #[derive(Default)]
+    struct MapBodyStore {
+        bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+        failed_reads: parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+    }
+
+    struct ReorgBodyLoadingFixture {
+        handles: ApplyHandles,
+        utxo: Arc<UtxoSet>,
+        bodies: Arc<MapBodyStore>,
+        target: bitcoin_rs_chain::NodeId,
+        losing: bitcoin::Block,
+        applied: TipSnapshot,
+    }
+
+    impl crate::apply::PruneBodyStore for MapBodyStore {
+        fn load_block_body(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.failed_reads.read().contains(&(height, hash)) {
+                return Err(StorageError::Backend(
+                    "injected block-body read failure".to_owned(),
+                ));
+            }
+            Ok(self.bodies.read().get(&(height, hash)).cloned())
+        }
+
+        fn persist_block_body(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+            body: &[u8],
+        ) -> Result<(), StorageError> {
+            self.bodies.write().insert((height, hash), body.to_vec());
+            Ok(())
+        }
+
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn reorg_body_loading_fixture() -> Result<ReorgBodyLoadingFixture, Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let losing = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&losing));
+        let applied = apply_block_with_serialized(&handles, &losing, raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), raw.to_vec());
+
+        let win_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let win_two = mined_block_with_prev_hash_and_transactions(
+            win_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut last = None;
+            for (height, block) in [(1_u32, &win_one), (2_u32, &win_two)] {
+                let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+                last = Some(tree.insert_header(block.header, NodeStatus::HeaderValid)?);
+                bodies
+                    .bodies
+                    .write()
+                    .insert((height, hash), bitcoin::consensus::encode::serialize(block));
+            }
+            last.ok_or_else(|| anyhow::anyhow!("no winning branch built"))?
+        };
+
+        Ok(ReorgBodyLoadingFixture {
+            handles,
+            utxo,
+            bodies,
+            target,
+            losing,
+            applied,
+        })
+    }
+
+    fn assert_reorg_load_failure_preserved_state(
+        handles: &ApplyHandles,
+        utxo: &UtxoSet,
+        losing: &bitcoin::Block,
+        applied: &TipSnapshot,
+        tree_tip_before: Option<(bitcoin_rs_chain::NodeId, u32, Hash256)>,
+        block_records_before: &[(u32, Hash256)],
+        utxo_len_before: usize,
+    ) {
+        assert_eq!(
+            handles
+                .applied_tip
+                .load_full()
+                .map(|tip| (tip.tip_id, tip.height, tip.hash)),
+            Some((applied.tip_id, applied.height, applied.hash)),
+            "body loading failure must not move the applied tip"
+        );
+        assert_eq!(
+            handles
+                .block_tree
+                .read()
+                .tip()
+                .map(|tip| (tip.tip_id, tip.height, tip.hash)),
+            tree_tip_before,
+            "body loading failure must not change the active header index"
+        );
+        assert_eq!(
+            handles
+                .blocks
+                .read()
+                .iter()
+                .map(|record| (record.height, record.hash))
+                .collect::<Vec<_>>(),
+            block_records_before,
+            "body loading failure must not change the applied block index"
+        );
+        assert_eq!(
+            utxo.len(),
+            utxo_len_before,
+            "body loading failure must not change UTXO cardinality"
+        );
+        assert!(
+            utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                losing.txdata[0].compute_txid().as_byte_array()
+            )),
+            "body loading failure must leave the applied branch coin live"
+        );
+    }
+
+    #[test]
+    fn a_branch_with_unavailable_bodies_moves_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let applied_block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&applied_block));
+        let applied = apply_block_with_serialized(&handles, &applied_block, raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), raw.to_vec());
+
+        // A competing branch whose headers are known and whose bodies are not.
+        let rival_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let rival_two = mined_block_with_prev_hash_and_transactions(
+            rival_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut last = None;
+            for block in [&rival_one, &rival_two] {
+                last = Some(tree.insert_header(
+                    block.header,
+                    bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+                )?);
+            }
+            last.ok_or_else(|| anyhow::anyhow!("no rival branch built"))?
+        };
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {});
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::MissingBody { .. })),
+            "an unavailable branch must report a missing body, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied.hash),
+            "the applied tip must not move when the candidate branch is incomplete"
+        );
+        assert!(
+            utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                applied_block.txdata[0].compute_txid().as_byte_array()
+            )),
+            "the applied branch's coins must survive an aborted switch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disconnect_body_store_failure_moves_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let ReorgBodyLoadingFixture {
+            handles,
+            utxo,
+            bodies,
+            target,
+            losing,
+            applied,
+        } = reorg_body_loading_fixture()?;
+        bodies
+            .failed_reads
+            .write()
+            .insert((applied.height, applied.hash));
+        let tree_tip_before = handles
+            .block_tree
+            .read()
+            .tip()
+            .map(|tip| (tip.tip_id, tip.height, tip.hash));
+        let block_records_before = handles
+            .blocks
+            .read()
+            .iter()
+            .map(|record| (record.height, record.hash))
+            .collect::<Vec<_>>();
+        let utxo_len_before = utxo.len();
+        let marker_before = handles.undo_store.load_disconnect_marker()?;
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {});
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::reorg::ReorgError::BodyStore {
+                    hash,
+                    height,
+                    source: StorageError::Backend(ref message),
+                }) if hash == applied.hash
+                    && height == applied.height
+                    && message == "injected block-body read failure"
+            ),
+            "disconnect body storage failure must retain its typed error, got {outcome:?}"
+        );
+        assert_reorg_load_failure_preserved_state(
+            &handles,
+            &utxo,
+            &losing,
+            &applied,
+            tree_tip_before,
+            &block_records_before,
+            utxo_len_before,
+        );
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            marker_before,
+            "body storage failure must not arm the disconnect marker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disconnect_body_decode_failure_moves_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let ReorgBodyLoadingFixture {
+            handles,
+            utxo,
+            bodies,
+            target,
+            losing,
+            applied,
+        } = reorg_body_loading_fixture()?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), vec![0]);
+        let tree_tip_before = handles
+            .block_tree
+            .read()
+            .tip()
+            .map(|tip| (tip.tip_id, tip.height, tip.hash));
+        let block_records_before = handles
+            .blocks
+            .read()
+            .iter()
+            .map(|record| (record.height, record.hash))
+            .collect::<Vec<_>>();
+        let utxo_len_before = utxo.len();
+        let marker_before = handles.undo_store.load_disconnect_marker()?;
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {});
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::reorg::ReorgError::BodyDecode { hash, height, .. })
+                    if hash == applied.hash && height == applied.height
+            ),
+            "malformed disconnect body must retain its typed decode error, got {outcome:?}"
+        );
+        assert_reorg_load_failure_preserved_state(
+            &handles,
+            &utxo,
+            &losing,
+            &applied,
+            tree_tip_before,
+            &block_records_before,
+            utxo_len_before,
+        );
+        assert_eq!(
+            handles.undo_store.load_disconnect_marker()?,
+            marker_before,
+            "body decode failure must not arm the disconnect marker"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_closed_admission_refuses_every_chainstate_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        apply_block(&handles, &block)?;
+
+        handles.admission.close_permanently();
+
+        let child = mined_block_with_prev_hash_and_transactions(
+            block.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        assert!(
+            matches!(apply_block(&handles, &child), Err(ApplyError::Shutdown)),
+            "connect must refuse after a tear"
+        );
+        assert!(
+            matches!(
+                apply_window(&handles, &[&child], core::slice::from_ref(&raw)),
+                Err(WindowApplyError {
+                    source: ApplyError::Shutdown,
+                    ..
+                })
+            ),
+            "the window path must refuse after a tear"
+        );
+        let disconnected = disconnect_block(&handles, &block);
+        assert!(
+            matches!(
+                disconnected,
+                Err(crate::DisconnectError::Refused(ref boxed))
+                    if matches!(**boxed, ApplyError::Shutdown)
+            ),
+            "disconnect must refuse after a tear, got {disconnected:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(1),
+            "the applied tip must not have moved while admission was closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_writer_waiting_on_chain_transition_rechecks_fatal_admission_before_mutating()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let child = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let applied_before = handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+        let tree_tip_before = handles
+            .block_tree
+            .read()
+            .tip()
+            .map(|tip| (tip.tip_id, tip.height, tip.hash));
+        let utxo_len_before = utxo.len();
+
+        let transition = handles.chain_transition.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (shutdown, outcome_debug, admission_observed) = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                if started_tx.send(()).is_err() {
+                    return (
+                        false,
+                        "parent stopped before apply worker started".to_owned(),
+                    );
+                }
+                let outcome = apply_block(&handles, &child);
+                (
+                    matches!(&outcome, Err(ApplyError::Shutdown)),
+                    format!("{outcome:?}"),
+                )
+            });
+
+            started_rx
+                .recv()
+                .map_err(|_| std::io::Error::other("writer did not start apply_block"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut admission_observed = false;
+            while std::time::Instant::now() < deadline {
+                if handles.admission.barrier.is_locked() {
+                    admission_observed = true;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+
+            handles.admission.close_permanently();
+            drop(transition);
+            let (shutdown, outcome_debug) = writer
+                .join()
+                .map_err(|_| std::io::Error::other("writer thread panicked"))?;
+            Ok::<_, std::io::Error>((shutdown, outcome_debug, admission_observed))
+        })?;
+
+        assert!(
+            admission_observed,
+            "the public apply path never acquired its admission permit"
+        );
+        assert!(
+            shutdown,
+            "writer must recheck fatal closure after acquiring chain_transition, got {outcome_debug}"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load_full()
+                .map(|tip| (tip.tip_id, tip.height, tip.hash)),
+            Some((
+                applied_before.tip_id,
+                applied_before.height,
+                applied_before.hash
+            )),
+            "the waiting writer must not publish a new applied tip"
+        );
+        assert_eq!(
+            handles
+                .block_tree
+                .read()
+                .tip()
+                .map(|tip| (tip.tip_id, tip.height, tip.hash)),
+            tree_tip_before,
+            "the waiting writer must not mutate the active header index"
+        );
+        assert_eq!(
+            utxo.len(),
+            utxo_len_before,
+            "the waiting writer must not mutate UTXOs"
+        );
+        Ok(())
+    }
+
+    /// `Fatal` is what keeps a torn chainstate from being retried, and the
+    /// reason it stays unreachable is that `plan_disconnect` checks the
+    /// coinstats height before anything mutates. Drop that check and the same
+    /// desync lands mid-rollback instead: the UTXO undo commits, the coinstats
+    /// rewind rejects the height, and the node is torn.
+    ///
+    /// So this pins the precheck, not the tear. A desync must refuse with
+    /// nothing touched — same applied tip, same coins.
+    #[test]
+    fn a_coinstats_desync_refuses_before_it_can_tear_anything()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_arc = Arc::clone(&bodies);
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_arc;
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let losing = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&losing));
+        let applied = apply_block_with_serialized(&handles, &losing, raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((applied.height, applied.hash), raw.to_vec());
+
+        let win_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let win_two = mined_block_with_prev_hash_and_transactions(
+            win_one.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut last = None;
+            for (height, block) in [(1_u32, &win_one), (2_u32, &win_two)] {
+                let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+                last = Some(tree.insert_header(
+                    block.header,
+                    bitcoin_rs_chain::node::NodeStatus::HeaderValid,
+                )?);
+                bodies
+                    .bodies
+                    .write()
+                    .insert((height, hash), bitcoin::consensus::encode::serialize(block));
+            }
+            last.ok_or_else(|| anyhow::anyhow!("no winning branch built"))?
+        };
+
+        // Desynchronise the coinstats height. The disconnect's UTXO undo lands
+        // first and the coinstats rewind then rejects the height, which is a
+        // real tear: some state reverted, some did not.
+        handles.coin_stats.finish_block(999, 0);
+
+        let outcome = crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {});
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::Refused { .. })),
+            "the precheck must refuse rather than tear, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied.hash),
+            "a refused disconnect must leave the applied tip alone"
+        );
+        assert!(
+            utxo.has_live_outputs_for_txid(&Hash256::from_le_bytes(
+                losing.txdata[0].compute_txid().as_byte_array()
+            )),
+            "a refused disconnect must not have undone any coins"
+        );
+        Ok(())
     }
 
     fn apply_handles_for_network(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {

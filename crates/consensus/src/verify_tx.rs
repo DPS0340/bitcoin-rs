@@ -415,21 +415,77 @@ pub struct ScriptStageTimings {
 /// crate has no `metrics` dependency, so the caller owns the histogram recording.
 pub fn verify_block_input_scripts(
     txs: &[bitcoin::Transaction],
-    mut resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
     timings: &mut ScriptStageTimings,
     kernel_block: &crate::kernel::KernelBlock,
 ) -> Result<(), ConsensusError> {
+    let prepare_started = Instant::now();
+    let unit = prepare_block_script_checks(txs, resolved, height, locktime_cutoff, kernel_block)?;
+    timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
+
+    let parallel_started = Instant::now();
+    let mut set_parallel_seconds = || {
+        timings.parallel_seconds = parallel_started.elapsed().as_secs_f64();
+    };
+    let mut before_serial_scan = || {};
+    let verdict = verify_prepared_units_with_hooks(
+        core::slice::from_ref(&unit),
+        &[flags],
+        &mut set_parallel_seconds,
+        &mut before_serial_scan,
+    );
+    verdict.map_err(|failure| failure.error)
+}
+
+/// One block's script checks, prepared but not executed.
+///
+/// Holds the borrow into the caller's parsed kernel block, so the block must
+/// outlive every unit built from it.
+pub struct BlockScriptChecks<'b> {
+    txs: &'b [bitcoin::Transaction],
+    prepared: Vec<PreparedTx<'b>>,
+    checks: Vec<InputCheck>,
+}
+
+/// Which unit failed, and how.
+///
+/// The index is the position in the slice handed to [`verify_prepared_units`],
+/// so a caller batching several blocks learns which one to re-run through the
+/// ordinary path to reproduce the error in its documented position.
+#[derive(Debug)]
+pub struct BatchScriptFailure {
+    /// Position of the failing unit.
+    pub unit: usize,
+    /// The failure, identical to what the single-block path would report.
+    pub error: ConsensusError,
+}
+
+/// Resolves one block's order-sensitive transaction state without executing
+/// any script.
+///
+/// # Errors
+///
+/// Returns [`ConsensusError::PrevoutMatrixSize`] when `resolved` does not
+/// cover every transaction. Consensus failures found during preparation are
+/// not errors here: they are retained in transaction order and reported by
+/// [`verify_prepared_units`], because reporting them now would let a later
+/// transaction's cheap failure outrank an earlier one.
+pub fn prepare_block_script_checks<'b>(
+    txs: &'b [bitcoin::Transaction],
+    mut resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    height: u32,
+    locktime_cutoff: u32,
+    kernel_block: &'b crate::kernel::KernelBlock,
+) -> Result<BlockScriptChecks<'b>, ConsensusError> {
     if txs.len() != resolved.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
             expected: txs.len(),
             actual: resolved.len(),
         });
     }
-
-    let prepare_started = Instant::now();
     let (prepared, checks) = prepare_block_input_checks(
         txs,
         resolved.as_mut_slice(),
@@ -437,38 +493,149 @@ pub fn verify_block_input_scripts(
         locktime_cutoff,
         kernel_block,
     );
-    timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
+    Ok(BlockScriptChecks {
+        txs,
+        prepared,
+        checks,
+    })
+}
 
-    let parallel_started = Instant::now();
-    let results: Vec<Result<(), ConsensusError>> = if checks.len() < MIN_PARALLEL_SCRIPT_CHECKS {
-        checks
-            .iter()
-            .map(|check| check_input(txs, &prepared, check, flags))
-            .collect()
-    } else {
-        SCRIPT_VERIFY_POOL.install(|| {
-            checks
-                .par_iter()
-                .map(|check| check_input(txs, &prepared, check, flags))
-                .collect()
-        })
+fn verify_prepared_units_with_hooks<AfterParallel, BeforeSerialScan>(
+    units: &[BlockScriptChecks<'_>],
+    flags_per_unit: &[VerifyFlags],
+    after_parallel: &mut AfterParallel,
+    before_serial_scan: &mut BeforeSerialScan,
+) -> Result<(), BatchScriptFailure>
+where
+    AfterParallel: FnMut(),
+    BeforeSerialScan: FnMut(),
+{
+    if units.len() != flags_per_unit.len() {
+        return Err(BatchScriptFailure {
+            unit: 0,
+            error: ConsensusError::Kernel(format!(
+                "batch verify needs one flag set per unit: {} units, {} flag sets",
+                units.len(),
+                flags_per_unit.len()
+            )),
+        });
+    }
+
+    // Offsets are precomputed rather than accumulated during the scan. With a
+    // running counter, reversing the scan order misaligns every slice instead
+    // of simply reporting a different unit, which hides an ordering bug behind
+    // an unrelated symptom and lets an ordering test pass for the wrong reason.
+    let mut offsets = Vec::with_capacity(units.len());
+    let mut total = 0_usize;
+    for unit in units {
+        offsets.push(total);
+        let Some(next) = total.checked_add(unit.checks.len()) else {
+            return Err(layout_failure(0));
+        };
+        total = next;
+    }
+
+    let run = |(unit_index, check): &(usize, &InputCheck)| {
+        let unit = &units[*unit_index];
+        check_input(unit.txs, &unit.prepared, check, flags_per_unit[*unit_index])
     };
-    timings.parallel_seconds = parallel_started.elapsed().as_secs_f64();
+    let flat: Vec<(usize, &InputCheck)> = units
+        .iter()
+        .enumerate()
+        .flat_map(|(index, unit)| unit.checks.iter().map(move |check| (index, check)))
+        .collect();
+    let results: Vec<Result<(), ConsensusError>> = if total < MIN_PARALLEL_SCRIPT_CHECKS {
+        flat.iter().map(run).collect()
+    } else {
+        SCRIPT_VERIFY_POOL.install(|| flat.par_iter().map(run).collect())
+    };
 
-    for prep in &prepared {
-        if let Some(error) = &prep.pre_error {
-            return Err(error.clone());
-        }
-        for result in &results[prep.checks_start..prep.checks_start + prep.checks_len] {
-            if let Err(error) = result {
-                return Err(error.clone());
+    // Timing must stop here: the ordered scan below is serial attribution work,
+    // not parallel script execution.
+    after_parallel();
+    before_serial_scan();
+
+    for (unit_index, unit) in units.iter().enumerate() {
+        let from = offsets[unit_index];
+        let Some(to) = from.checked_add(unit.checks.len()) else {
+            return Err(layout_failure(unit_index));
+        };
+        let Some(slice) = results.get(from..to) else {
+            return Err(layout_failure(unit_index));
+        };
+        match first_prepared_error(&unit.prepared, slice) {
+            Ok(Some(error)) => {
+                return Err(BatchScriptFailure {
+                    unit: unit_index,
+                    error,
+                });
             }
-        }
-        if let Some(error) = &prep.post_error {
-            return Err(error.clone());
+            Ok(None) => {}
+            Err(()) => return Err(layout_failure(unit_index)),
         }
     }
     Ok(())
+}
+
+/// Executes prepared script checks and reports the first failure in unit order.
+///
+/// # Errors
+///
+/// Returns the first [`BatchScriptFailure`] in the supplied unit order, or an
+/// internal layout failure when the unit and flag slices do not correspond.
+pub fn verify_prepared_units(
+    units: &[BlockScriptChecks<'_>],
+    flags_per_unit: &[VerifyFlags],
+) -> Result<(), BatchScriptFailure> {
+    let mut after = || {};
+    let mut before = || {};
+    verify_prepared_units_with_hooks(units, flags_per_unit, &mut after, &mut before)
+}
+
+/// Reports an internal prepared-check layout mismatch.
+fn layout_failure(unit: usize) -> BatchScriptFailure {
+    BatchScriptFailure {
+        unit,
+        error: ConsensusError::Kernel(
+            "internal: prepared script-check layout does not match its results".to_owned(),
+        ),
+    }
+}
+
+/// First failure within one prepared block, in transaction order with phase
+/// `pre < script < post`.
+///
+/// Shared by the single-block and batched entry points on purpose: a second
+/// copy of this ordering is how the two paths would silently disagree about
+/// which error a block produces. A result slice that does not cover a
+/// transaction's checks means this function and its caller disagree about the
+/// layout. That cannot happen from any input, only from a bug here, but it must
+/// never be answered with "no error found": that reports success for scripts
+/// nobody ran.
+fn first_prepared_error(
+    prepared: &[PreparedTx<'_>],
+    results: &[Result<(), ConsensusError>],
+) -> Result<Option<ConsensusError>, ()> {
+    for prep in prepared {
+        if let Some(error) = &prep.pre_error {
+            return Ok(Some(error.clone()));
+        }
+        let Some(to) = prep.checks_start.checked_add(prep.checks_len) else {
+            return Err(());
+        };
+        let Some(slice) = results.get(prep.checks_start..to) else {
+            return Err(());
+        };
+        for result in slice {
+            if let Err(error) = result {
+                return Ok(Some(error.clone()));
+            }
+        }
+        if let Some(error) = &prep.post_error {
+            return Ok(Some(error.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolves order-sensitive transaction state before script checks fan out.
@@ -1193,6 +1360,205 @@ mod tests {
         }
     }
 
+    /// Batching is pointless unless a run of units reports the SAME first error
+    /// the per-block path would. These three tests are what make the offset
+    /// table load-bearing; without them a running counter passes by accident.
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn batched_units_report_the_earliest_failing_unit() {
+        let good_txs = vec![coinbase_transaction_with_script_sig_len(2).0];
+        let good_block = kernel_block_for(&good_txs);
+
+        // Unit 0 fails on its SECOND transaction, unit 2 on its first. Block
+        // order must win over position within a block.
+        let first_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![true_spending_input(outpoint(1))], 50),
+            spend_tx(vec![mismatch_input(outpoint(2))], 50),
+        ];
+        let first_block = kernel_block_for(&first_txs);
+        let last_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![mismatch_input(outpoint(3))], 50),
+        ];
+        let last_block = kernel_block_for(&last_txs);
+
+        let units = [
+            prepared_unit(
+                &first_txs,
+                vec![
+                    Vec::new(),
+                    vec![Some(op1_txout(50))],
+                    vec![Some(op_equal_txout(50))],
+                ],
+                &first_block,
+            ),
+            prepared_unit(&good_txs, vec![Vec::new()], &good_block),
+            prepared_unit(
+                &last_txs,
+                vec![Vec::new(), vec![Some(op_equal_txout(50))]],
+                &last_block,
+            ),
+        ];
+        let flags = [VerifyFlags::MANDATORY; 3];
+
+        match super::verify_prepared_units(&units, &flags) {
+            Err(failure) => assert_eq!(
+                failure.unit, 0,
+                "the earliest failing unit must win, got unit {}",
+                failure.unit
+            ),
+            Ok(()) => panic!("a unit with a mismatched script must fail"),
+        }
+    }
+
+    /// Pins the offsets themselves, not just the order they are visited. The
+    /// failing unit is LAST and every earlier unit passes, so the verdict is
+    /// decided purely by whether each unit reads its own slice of results.
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn each_unit_reads_its_own_slice_of_results() {
+        let clean_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![true_spending_input(outpoint(11))], 50),
+            spend_tx(vec![true_spending_input(outpoint(12))], 50),
+        ];
+        let clean_block = kernel_block_for(&clean_txs);
+        let clean_resolved = vec![
+            Vec::new(),
+            vec![Some(op1_txout(50))],
+            vec![Some(op1_txout(50))],
+        ];
+        let bad_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![mismatch_input(outpoint(13))], 50),
+        ];
+        let bad_block = kernel_block_for(&bad_txs);
+
+        let units = [
+            prepared_unit(&clean_txs, clean_resolved.clone(), &clean_block),
+            prepared_unit(&clean_txs, clean_resolved, &clean_block),
+            prepared_unit(
+                &bad_txs,
+                vec![Vec::new(), vec![Some(op_equal_txout(50))]],
+                &bad_block,
+            ),
+        ];
+        let flags = [VerifyFlags::MANDATORY; 3];
+
+        match super::verify_prepared_units(&units, &flags) {
+            Err(failure) => assert_eq!(
+                failure.unit, 2,
+                "only the last unit fails, so misaligned offsets would blame another"
+            ),
+            Ok(()) => panic!("the last unit has a mismatched script and must fail"),
+        }
+    }
+
+    /// A batched unit must produce the identical error the single-block entry
+    /// point produces for the same block, or batching changes consensus.
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn a_batched_unit_matches_the_single_block_path() {
+        let txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![mismatch_input(outpoint(7))], 50),
+        ];
+        let block = kernel_block_for(&txs);
+        let resolved = vec![Vec::new(), vec![Some(op_equal_txout(50))]];
+
+        let mut timings = super::ScriptStageTimings::default();
+        let single = super::verify_block_input_scripts(
+            &txs,
+            resolved.clone(),
+            0,
+            0,
+            VerifyFlags::MANDATORY,
+            &mut timings,
+            &block,
+        );
+        let units = [prepared_unit(&txs, resolved, &block)];
+        let batched = super::verify_prepared_units(&units, &[VerifyFlags::MANDATORY]);
+
+        match (single, batched) {
+            (Err(single_error), Err(failure)) => assert_eq!(
+                format!("{single_error}"),
+                format!("{}", failure.error),
+                "batched and single-block verdicts must be identical"
+            ),
+            (single, batched) => panic!(
+                "both paths must reject this block: single={:?} batched_ok={}",
+                single.err(),
+                batched.is_ok()
+            ),
+        }
+    }
+
+    /// Flags differ per block across softfork activation heights, so a unit
+    /// must be checked under its own.
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn each_unit_is_checked_under_its_own_flags() {
+        use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
+
+        let first_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(vec![true_spending_input(outpoint(9))], 50),
+        ];
+        let first_block = kernel_block_for(&first_txs);
+        let first_resolved = vec![Vec::new(), vec![Some(op1_txout(50))]];
+
+        let redeem_script = [0_u8];
+        let redeem_hash = bitcoin::hashes::hash160::Hash::hash(&redeem_script);
+        let p2sh_output = TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: Builder::new()
+                .push_opcode(OP_HASH160)
+                .push_slice(redeem_hash.to_byte_array())
+                .push_opcode(OP_EQUAL)
+                .into_script(),
+        };
+        let second_txs = vec![
+            coinbase_transaction_with_script_sig_len(2).0,
+            spend_tx(
+                vec![TxIn {
+                    previous_output: outpoint(10),
+                    script_sig: Builder::new().push_slice(redeem_script).into_script(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                50,
+            ),
+        ];
+        let second_block = kernel_block_for(&second_txs);
+        let second_resolved = vec![Vec::new(), vec![Some(p2sh_output)]];
+
+        let units = [
+            prepared_unit(&first_txs, first_resolved, &first_block),
+            prepared_unit(&second_txs, second_resolved, &second_block),
+        ];
+        assert!(
+            super::verify_prepared_units(&units[1..], &[VerifyFlags::MANDATORY],).is_err(),
+            "the second fixture must require its permissive flag set"
+        );
+        assert!(
+            super::verify_prepared_units(&units, &[VerifyFlags::MANDATORY, VerifyFlags::NONE],)
+                .is_ok(),
+            "each unit must use the flag set at its own index"
+        );
+    }
+
+    fn prepared_unit<'b>(
+        txs: &'b [Transaction],
+        resolved: Vec<Vec<Option<TxOut>>>,
+        block: &'b crate::kernel::KernelBlock,
+    ) -> super::BlockScriptChecks<'b> {
+        match super::prepare_block_script_checks(txs, resolved, 0, 0, block) {
+            Ok(unit) => unit,
+            Err(error) => panic!("test fixture prevout matrix is malformed: {error}"),
+        }
+    }
+
     fn true_spending_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
@@ -1628,5 +1994,45 @@ mod tests {
             ),
             "expected portable TaprootUnsupportedWitness rejection, got {result:?}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "kernel")]
+    fn parallel_timing_is_captured_before_ordered_error_scan() {
+        use std::cell::Cell;
+
+        let prepared: Vec<super::PreparedTx> = (0..10)
+            .map(|tx_index| super::PreparedTx {
+                tx_index,
+                prevouts: Vec::new(),
+                pre_error: None,
+                post_error: None,
+                checks_start: 0,
+                checks_len: 0,
+                kernel_state: None,
+            })
+            .collect();
+        let txs: &[Transaction] = &[];
+        let unit = super::BlockScriptChecks {
+            txs,
+            prepared,
+            checks: Vec::new(),
+        };
+        let scan_started = Cell::new(false);
+        let mut before_serial_scan = || scan_started.set(true);
+        let mut after_parallel = || {
+            assert!(
+                !scan_started.get(),
+                "parallel timing hook must run before the serial error scan"
+            );
+        };
+        let result = super::verify_prepared_units_with_hooks(
+            core::slice::from_ref(&unit),
+            &[VerifyFlags::MANDATORY],
+            &mut after_parallel,
+            &mut before_serial_scan,
+        );
+        assert!(result.is_ok());
+        assert!(scan_started.get(), "the serial error scan must have run");
     }
 }

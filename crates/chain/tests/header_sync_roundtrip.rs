@@ -6,7 +6,9 @@ use bitcoin::{
     pow::CompactTarget,
 };
 use bitcoin_rs_chain::header_sync::validate_header_nbits;
-use bitcoin_rs_chain::{BlockTree, ChainError, Network, NodeStatus, accept_headers};
+use bitcoin_rs_chain::{
+    BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
+};
 use bitcoin_rs_primitives::Hash256;
 
 #[test]
@@ -15,8 +17,18 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
     let headers = mine_headers(100);
     let mut tree = BlockTree::new();
 
-    let first = accept_headers(&mut tree, &headers[..40], Network::Regtest)?;
-    let second = accept_headers(&mut tree, &headers[40..], Network::Regtest)?;
+    let first = accept_headers(
+        &mut tree,
+        &headers[..40],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
+    let second = accept_headers(
+        &mut tree,
+        &headers[40..],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
 
     assert_eq!(first.len(), 40);
     assert_eq!(second.len(), 60);
@@ -29,7 +41,12 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
 
     let mut tampered = headers[0];
     tampered.bits = CompactTarget::from_consensus(0x2200_ffff);
-    let err = match accept_headers(&mut BlockTree::new(), &[tampered], Network::Regtest) {
+    let err = match accept_headers(
+        &mut BlockTree::new(),
+        &[tampered],
+        Network::Regtest,
+        current_unix_seconds(),
+    ) {
         Ok(_) => panic!("oversized target must be rejected"),
         Err(error) => error,
     };
@@ -50,7 +67,12 @@ fn rejects_post_genesis_header_as_empty_tree_root() {
     let prev_hash = Hash256::from_le_bytes(child.prev_blockhash.as_byte_array());
     let mut tree = BlockTree::new();
 
-    let err = match accept_headers(&mut tree, &[child], Network::Regtest) {
+    let err = match accept_headers(
+        &mut tree,
+        &[child],
+        Network::Regtest,
+        current_unix_seconds(),
+    ) {
         Ok(_) => panic!("post-genesis header must not become an empty-tree root"),
         Err(error) => error,
     };
@@ -74,7 +96,12 @@ fn rejects_non_retarget_header_that_does_not_inherit_parent_bits_before_insertio
         easier_child_bits,
     );
 
-    let err = match accept_headers(&mut tree, &[child], Network::Regtest) {
+    let err = match accept_headers(
+        &mut tree,
+        &[child],
+        Network::Regtest,
+        current_unix_seconds(),
+    ) {
         Ok(_) => panic!("non-retarget header must inherit parent nBits before insertion"),
         Err(error) => error,
     };
@@ -135,7 +162,12 @@ fn duplicate_genesis_in_overlapping_batch_returns_original_ids_and_inserts_only_
     let headers = mine_headers(5);
     let mut tree = BlockTree::new();
 
-    let first = accept_headers(&mut tree, &headers[..2], Network::Regtest)?;
+    let first = accept_headers(
+        &mut tree,
+        &headers[..2],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
     assert_eq!(first.len(), 2);
     let genesis_id = first[0];
     let first_child_id = first[1];
@@ -143,7 +175,12 @@ fn duplicate_genesis_in_overlapping_batch_returns_original_ids_and_inserts_only_
     assert_eq!(tip_before.height, 1);
 
     let overlapping = [headers[0], headers[1], headers[2], headers[3], headers[4]];
-    let second = accept_headers(&mut tree, &overlapping, Network::Regtest)?;
+    let second = accept_headers(
+        &mut tree,
+        &overlapping,
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
 
     assert_eq!(second.len(), 5, "one returned id per input header");
     assert_eq!(
@@ -188,7 +225,12 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
     );
     let mut tree = BlockTree::new();
 
-    let first = accept_headers(&mut tree, &[genesis, active_child], Network::Regtest)?;
+    let first = accept_headers(
+        &mut tree,
+        &[genesis, active_child],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
     assert_eq!(first.len(), 2);
     let active_tip_id = first[1];
 
@@ -208,7 +250,12 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
         "competing child must have a different hash"
     );
 
-    let second = accept_headers(&mut tree, &[competing], Network::Regtest)?;
+    let second = accept_headers(
+        &mut tree,
+        &[competing],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
     assert_eq!(second.len(), 1);
     let competing_id = second[0];
     assert_ne!(
@@ -231,7 +278,12 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
 
     let node_count_before_resubmit = tree.len();
 
-    let third = accept_headers(&mut tree, &[competing], Network::Regtest)?;
+    let third = accept_headers(
+        &mut tree,
+        &[competing],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
     assert_eq!(third.len(), 1);
     assert_eq!(
         third[0], competing_id,
@@ -256,7 +308,12 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
     let headers = mine_headers(5);
     let mut tree = BlockTree::new();
 
-    let first = accept_headers(&mut tree, &headers[..2], Network::Regtest)?;
+    let first = accept_headers(
+        &mut tree,
+        &headers[..2],
+        Network::Regtest,
+        current_unix_seconds(),
+    )?;
     let genesis_id = first[0];
     let first_child_id = first[1];
     let tip_before = tree.tip().ok_or("missing tip after first batch")?;
@@ -266,7 +323,7 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
     invalid_unknown.bits = CompactTarget::from_consensus(0x2200_ffff);
 
     let batch = [headers[0], headers[1], invalid_unknown];
-    let err = match accept_headers(&mut tree, &batch, Network::Regtest) {
+    let err = match accept_headers(&mut tree, &batch, Network::Regtest, current_unix_seconds()) {
         Ok(_) => panic!("oversized-target suffix must be rejected"),
         Err(error) => error,
     };
@@ -308,11 +365,15 @@ fn genesis_header() -> BlockHeader {
     bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header
 }
 
+/// Regtest genesis timestamp. Headers must advance past it, because the
+/// median-time-past rule compares against the ancestors actually in the tree.
+const GENESIS_TIME: u32 = 1_296_688_602;
+
 fn mine_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
     mine_header_with(
         prev_blockhash,
         height,
-        height,
+        GENESIS_TIME.saturating_add(height),
         CompactTarget::from_consensus(0x207f_ffff),
     )
 }

@@ -40,7 +40,7 @@ Bitcoin Core's C++ consensus engine (`libbitcoinkernel`), compiled into `bitcoin
 Removed historical script verification backend. Previously linked as an extracted C library for non-taproot script checks before being deleted in favor of `bitcoinkernel`. The library lacked complete-prevout and Taproot script-path verification capabilities required for current mainnet script validation (exposed by block 938344 during mainnet IBD).
 
 ### Rust interpreter (portable posture)
-The pure-Rust script verification path maintained alongside the bitcoinkernel default. Enabled under `--no-default-features` without C++ build dependencies. It cannot validate Taproot script-path scripts (such as those past height 709635 / block 938344 on mainnet) and is retained for differential testing and lightweight non-production environments.
+The pure-Rust script verification path maintained alongside the bitcoinkernel default. Enabled under `--no-default-features` without C++ build dependencies. Its non-Taproot path is a stub that accepts only a bare `OP_TRUE` spend with an empty scriptSig and witness, so it cannot validate ordinary spends either, and it has no Taproot script-path support. What it does verify is the Taproot key path, in full. It is retained for differential testing and lightweight non-production environments; a mainnet sync stops early on the first real spend.
 
 ### One-shot kernel block parse
 Parsing each block exactly once with `bitcoinkernel::Block::new` (wrapped as `KernelBlock` in `crates/consensus/src/kernel.rs`) and reusing that parse for everything downstream. It supplies three things at once: the **txids** (Core's `CTransaction` hashes itself while deserializing, using the SHA-256 implementation Core selects at runtime — `avx2(8way)` on Skylake-SP), and the **transaction objects** that script preparation borrows via `TransactionRef` instead of re-serializing. It replaced a scalar `compute_txid` pass plus a per-transaction `encode::serialize` → `Transaction::new` round-trip, cutting `script_prepare` from 18.55s to 4.29s and the 0→150k replay from 137.3s to 121.9s. The costing lesson generalizes: **price a replacement by everything it subsumes**, not by the line item that motivated it — costed against parse-and-serialize alone the same change scores +1.54s and looks like a loss.
@@ -68,3 +68,109 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 
 ### Contended-harness tuning artefact
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
+
+### Commit point (multi-store mutation)
+The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first shows which steps need atomicity. The index rollback is one disk batch. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+
+### Refusing default (trait participation)
+A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
+
+### Undo record
+
+The per-block inverse of a UTXO commit: the outputs the block spent, with
+enough metadata to recreate them, plus the outputs it created. Connection queues
+the record before later apply mutations. The clean checkpoint flushes the shared
+storage backend before it publishes the matching UTXO state, so the queued
+record is not a separate per-block fsync boundary. The key contains height
+**and** block hash so an abandoned branch record cannot be replayed against a
+different block at the same height. The node retains the record after a
+disconnect because flip-flop between competing branches is normal.
+
+### Owed derived state
+
+State that connection writes and disconnection must account for. Naming the
+whole set is what turns "disconnect works" into a checkable claim, and the
+answers are not uniform, which is why the list is kept rather than summarised.
+
+Handled, in three different ways. `coin_stats` needed an explicit inverse for
+its block-level fields only, because the per-coin ones ride the UTXO change
+listener and the undo already reverses them. The filter index needed no
+rollback, because its rows are hash-addressed like block bodies and stay valid
+for a block that left the chain; only its last-tip cache is repointed, and that
+cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
+inverses. `transactions` needed nothing, because connection never populates it.
+
+`switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect
+caller. Sync drives it when the header and applied tips diverge. Each attempt
+loads all disconnect bodies and the available contiguous connect prefix. The
+disconnect preload is $O(\text{disconnect depth})$. A `ChainTransition`
+witness then requires the complete authoritative plan to equal the preloaded
+plan before mutation starts.
+
+The available prefix becomes one coherent applied-tip checkpoint. If the next
+body is absent, `MissingBody` identifies that suffix and sync resumes from the
+published tip. A permanent connect failure invalidates the failed header and
+its descendants, selects the best valid tip, and purges their bounded staging
+and download ownership. An operational failure leaves the branch eligible and
+keeps its ownership for retry.
+
+Still open around it: returning a disconnected block's transactions through one
+production admission pipeline shared by Electrum, P2P relay, and reorg handling;
+publishing a disconnect notification; and backfilling the filter index after a
+gap. Raw mempool insertion is not reconsideration because it cannot reconstruct
+fee, policy, conflict, and ancestry metadata.
+
+### Dispatch-bound parallelism
+
+A stage that is parallel in shape but serial in effect because each dispatch is
+too small to amortise waking the workers. Script verification on mainnet
+0..150_000 is the case: 2,868,199 input checks at a mean 69.4 us each yield only
+4.4x on 32 threads. Blocks in the parallel row carry about 114 checks, while
+14.6% of all checks fall below `MIN_PARALLEL_SCRIPT_CHECKS` and run serially.
+The parallel rows still pay roughly 11s of dispatch across 21,474 fan-outs. The
+diagnosis is a scaling sweep, not a profiler: measure the stage at 1, 4 and 32
+threads and compare the speedup against the thread count. Coarsening each
+dispatch does not fix it and makes it worse, because it throttles the blocks
+that were scaling; only issuing fewer, larger dispatches does. See
+`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
+
+### Window script batching
+
+Verifying the input scripts of several consecutive blocks in one parallel
+dispatch, so the fan-out is amortised over a run of blocks rather than paid per
+block. The window prepares each block against an ordered overlay, dispatches
+once, and issues a per-block proof; the blocks then commit one at a time and in
+order, so every rule needing committed state still sees the real chain. On
+mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
+558.4s, with the dispatch itself falling from 44.08s to 12.55s. The proof binds
+the block hash, its predecessor, the height, the flags, and the locktime cutoff,
+travels bundled with the prepared state it covers, and is re-checked against
+what the apply derives; a window that cannot be proven yields nothing and every
+block verifies normally. The historical pre-batching capture measured 78.4s /
+643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
+not one interleaved run. See
+`docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
+
+### Front-half duplication
+
+The failure mode where a batched fast path recomputes the sequential path's
+preparation instead of replacing it, so a real saving is paid straight back.
+Cross-block script batching cut crypto dispatch from 44.08s to 12.53s and moved
+wall time not at all, because the batch resolved every prevout and parsed every
+block that `apply_block` then resolved and parsed again for coinbase maturity,
+BIP68, and the UTXO change set. The tell is that the accelerated stage shrinks
+by roughly what the new stage costs. The fix is never a cheaper second pass; it
+is splitting the sequential path into a prepare half and a commit half so the
+preparation happens once.
+
+### Disconnect marker phase
+The durable record that a block disconnect started, and how far it got. Armed and flushed BEFORE the first mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. Armed above the index rollback too, because that rollback commits a delete batch, so a crash between the two would leave the index rolled back while the UTXO set and tip still name the block. It carries a phase because two different callers clear it and they know different things. `InFlight` means mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse a startup. The refusal path has a third operation, `cancel_disconnect`, because an index rollback that failed touched nothing and must clear unconditionally — routing it through the checkpoint's guarded clear would no-op on an `InFlight` marker and strand a false poison on an undamaged node. What this does not close: the UTXO set and tip live behind periodic checkpoints while the index persists immediately, so a crash after a clean disconnect but before the next checkpoint still restores a tip whose index rows are gone. Closing that needs a replay path this node does not have.
+
+### Count-and-byte bound
+A window sized by whichever of two caps binds first. A count alone is wrong wherever item size varies by orders of magnitude: early-chain blocks average 4.6 KB, so 1024 of them is 5 MB, while at the tip the same 1024 is 2 GB. A byte cap alone is wrong in the other direction, letting a window hold tens of thousands of tiny items. Taking the minimum makes the batch large exactly where items are small and per-batch overhead dominates, and small where items are large and it does not. The script window uses it, and the same shape is owed by the sync staging budget, whose count is still sized for tip-scale blocks. One item larger than the whole byte cap still goes through alone: refusing it would stall the chain rather than process it.
+
+### Identity-bearing key
+A key that distinguishes which producer wrote a row, as opposed to one that merely locates it. The index's funding, spending, and txid keys are an 8-byte prefix plus a height, so two blocks at one height that share an output script derive identical keys, and rolling the first back a second time deletes the second's rows. The block-header row is identity-bearing because its key is the 80-byte serialized header and the block hash is the double-SHA256 of exactly those bytes. Checking it before deleting is a proxy for rekeying the other three families, taken because rekeying breaks the electrs-compatible layout and forces a reindex.
+
+### Resolution-time sampling
+Recording a statistic when its outcome is known rather than when the subject arrives. The fee estimator counted a transaction against every confirmation target the moment it entered, so a fresh arrival was already a failure at every target and a burst silenced the estimator before anything had missed a deadline. It also broke the decay: the denominator had been decaying since entry while a confirmation arrived undecayed, reporting 81 successes in 100 as roughly 85%. Sampling numerator and denominator together at the moment a target resolves fixes both, because they then decay from the same block. The counterpart rule is that a subject leaving for an unrelated reason is untracked without being sampled: an eviction says something about the mempool, not about whether the transaction would have confirmed.

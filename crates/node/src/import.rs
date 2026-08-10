@@ -120,6 +120,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut block = Block::consensus_decode(&mut cursor)?;
         block.header.prev_blockhash = block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.header.bits = bitcoin::CompactTarget::from_consensus(0x0010_0001);
 
         let mut block_bytes = Vec::new();
@@ -164,6 +165,7 @@ mod tests {
         let genesis_bytes = encode_block(&genesis_block)?;
         let mut block = genesis_block.clone();
         block.header.prev_blockhash = genesis_block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
         block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         block.header.merkle_root = block
@@ -210,6 +212,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut block = Block::consensus_decode(&mut cursor)?;
         block.header.prev_blockhash = block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.header.bits = bitcoin::CompactTarget::from_consensus(0x207e_ffff);
         block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         block.header.merkle_root = block
@@ -260,6 +263,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut follow_up = Block::consensus_decode(&mut cursor)?;
         follow_up.header.prev_blockhash = follow_up.block_hash();
+        follow_up.header.time = follow_up.header.time.saturating_add(1);
         follow_up.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         follow_up.header.merkle_root = follow_up
             .compute_merkle_root()
@@ -292,6 +296,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut follow_up = Block::consensus_decode(&mut cursor)?;
         follow_up.header.prev_blockhash = follow_up.block_hash();
+        follow_up.header.time = follow_up.header.time.saturating_add(1);
         follow_up.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         follow_up.header.merkle_root = follow_up
             .compute_merkle_root()
@@ -320,6 +325,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut block = Block::consensus_decode(&mut cursor)?;
         block.header.prev_blockhash = block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         block.txdata.push(bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -390,6 +396,7 @@ mod tests {
 
         let mut coinbase_block = genesis_block.clone();
         coinbase_block.header.prev_blockhash = genesis_block.block_hash();
+        coinbase_block.header.time = coinbase_block.header.time.saturating_add(1);
         coinbase_block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 1]);
         coinbase_block.header.merkle_root = coinbase_block
             .compute_merkle_root()
@@ -401,6 +408,7 @@ mod tests {
 
         let mut block = coinbase_block;
         block.header.prev_blockhash = block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![1, 2]);
         block.txdata.push(bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -452,6 +460,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(genesis_bytes.as_slice());
         let mut block = Block::consensus_decode(&mut cursor)?;
         block.header.prev_blockhash = block.block_hash();
+        block.header.time = block.header.time.saturating_add(1);
         block.txdata[0].input[0].previous_output = bitcoin::OutPoint {
             txid: bitcoin::Txid::from_byte_array([1_u8; 32]),
             vout: 0,

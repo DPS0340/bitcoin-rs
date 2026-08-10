@@ -572,7 +572,7 @@ impl BlockTree {
         }
 
         let block_work = work_from_header(&header);
-        let (height, chainwork) = match parent {
+        let (height, chainwork, status) = match parent {
             Some(parent_id) => {
                 let parent_node = self.node(parent_id)?;
                 let expected_prev = parent_node.hash;
@@ -591,9 +591,14 @@ impl BlockTree {
                     .chainwork
                     .checked_add(block_work)
                     .ok_or(ChainError::ChainworkOverflow { hash })?;
-                (height, chainwork)
+                let status = if parent_node.status == NodeStatus::Invalid {
+                    NodeStatus::Invalid
+                } else {
+                    status
+                };
+                (height, chainwork, status)
             }
-            None => (0, block_work),
+            None => (0, block_work, status),
         };
 
         let index = self.nodes.insert(BlockTreeNode {
@@ -615,6 +620,102 @@ impl BlockTree {
         Ok(node_id)
     }
 
+    /// Marks `root` and every descendant invalid, then republishes the best valid tip.
+    ///
+    /// The returned hashes are the complete invalid subtree in deterministic slab order;
+    /// callers use them to purge bounded body and download state after releasing their
+    /// chain-transition witness. Equal-work valid tips retain insertion order, matching
+    /// normal tip publication.
+    pub fn invalidate_subtree(&mut self, root: NodeId) -> Result<Vec<Hash256>, ChainError> {
+        let root_index = root.index().ok_or(ChainError::UnknownNode { id: root })?;
+        self.node(root)?;
+
+        // Build child adjacency in one forward pass over the slab.
+        let node_count = self.nodes.capacity();
+        let mut children: Vec<Vec<NodeId>> = (0..node_count).map(|_| Vec::new()).collect();
+        for (index, node) in &self.nodes {
+            if let Some(parent) = node.parent {
+                let parent_index = parent
+                    .index()
+                    .ok_or(ChainError::UnknownNode { id: parent })?;
+                let child_id = u32::try_from(index)
+                    .map(NodeId::new)
+                    .map_err(|_| ChainError::NodeIdOverflow { index })?;
+                children[parent_index].push(child_id);
+            }
+        }
+
+        // Worklist traversal of the child adjacency: each node is visited once.
+        let mut invalid = vec![false; node_count];
+        let mut worklist = vec![root];
+        invalid[root_index] = true;
+        while let Some(id) = worklist.pop() {
+            let idx = id.index().ok_or(ChainError::UnknownNode { id })?;
+            for &child in &children[idx] {
+                let child_index = child.index().ok_or(ChainError::UnknownNode { id: child })?;
+                if !invalid[child_index] {
+                    invalid[child_index] = true;
+                    worklist.push(child);
+                }
+            }
+        }
+
+        // Select the best remaining valid tip before mutating statuses, using the same
+        // deterministic ordering `publish_tip_if_best` applies: greater chainwork wins,
+        // and for equal work the earlier insertion (lower slab index) wins.
+        let best = self
+            .nodes
+            .iter()
+            .filter(|(index, _)| !invalid[*index])
+            .filter(|(_, node)| node.status != NodeStatus::Invalid)
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.chainwork
+                    .cmp(&right.chainwork)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, _)| {
+                u32::try_from(index)
+                    .map(NodeId::new)
+                    .map_err(|_| ChainError::NodeIdOverflow { index })
+            })
+            .transpose()?;
+
+        // Demote the previous active tip to Stale if it is not the new best and is not
+        // about to be marked invalid.
+        if let Some(old_tip) = self.tip_id() {
+            if let Some(best) = best {
+                if best != old_tip {
+                    let old_index = old_tip
+                        .index()
+                        .ok_or(ChainError::UnknownNode { id: old_tip })?;
+                    if !invalid[old_index] {
+                        self.node_mut_without_index_invalidation(old_tip)?.status =
+                            NodeStatus::Stale;
+                    }
+                }
+            }
+        }
+
+        // Wipe the published tip and active index before republishing.
+        self.tip.store(None);
+        self.active_by_height.clear_tainted();
+
+        // Mark the subtree invalid and collect the hashes in deterministic slab order.
+        let mut hashes = Vec::with_capacity(invalid.iter().filter(|&&b| b).count());
+        for (index, node) in &mut self.nodes {
+            if invalid[index] {
+                node.status = NodeStatus::Invalid;
+                hashes.push(node.hash);
+            }
+        }
+
+        // Republish the best valid tip (if any), which also rebuilds the active index.
+        if let Some(best) = best {
+            self.publish_tip_if_best(best)?;
+        }
+
+        Ok(hashes)
+    }
     /// Returns all ancestors from `start` down to the root, including `start`.
     pub fn ancestor_chain(&self, start: NodeId) -> Result<Vec<NodeId>, ChainError> {
         let mut out = Vec::new();
@@ -634,6 +735,9 @@ impl BlockTree {
 
     fn publish_tip_if_best(&mut self, node_id: NodeId) -> Result<(), ChainError> {
         let node = self.node(node_id)?;
+        if node.status == NodeStatus::Invalid {
+            return Ok(());
+        }
         let should_publish = self
             .tip
             .load_full()
@@ -1024,7 +1128,7 @@ mod tests {
         let tip_h = 40_u32;
         let locator = tree.block_locator(tip_id, 32);
         let expected_heights = [
-            tip_h - 0,
+            tip_h,
             tip_h - 1,
             tip_h - 2,
             tip_h - 3,
@@ -1765,5 +1869,124 @@ mod tests {
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: height,
         }
+    }
+
+    #[test]
+    fn invalidate_subtree_marks_root_and_descendants_invalid_and_reselects_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let genesis_hash = tree.node(genesis_id)?.hash;
+
+        // Main chain: genesis -> a1 -> a2
+        let a1_header = test_header(BlockHash::from_byte_array(genesis_hash.to_le_bytes()), 1);
+        let a1_id = tree.insert_node(Some(genesis_id), a1_header, NodeStatus::HeaderValid)?;
+        let a1_hash = tree.node(a1_id)?.hash;
+        let a2_header = test_header(BlockHash::from_byte_array(a1_hash.to_le_bytes()), 2);
+        let a2_id = tree.insert_node(Some(a1_id), a2_header, NodeStatus::HeaderValid)?;
+
+        // Side chain: genesis -> b1 -> b2 -> b3 (longer, active)
+        let mut side_parent = genesis_id;
+        let mut side_parent_hash = genesis_hash;
+        let mut side_ids = Vec::new();
+        let mut side_hashes = Vec::new();
+        for height in 1..=3 {
+            let header = test_header(
+                BlockHash::from_byte_array(side_parent_hash.to_le_bytes()),
+                100 + height,
+            );
+            let id = tree.insert_node(Some(side_parent), header, NodeStatus::HeaderValid)?;
+            side_ids.push(id);
+            side_hashes.push(tree.node(id)?.hash);
+            side_parent = id;
+            side_parent_hash = tree.node(id)?.hash;
+        }
+
+        // The side chain is the active tip because it is longer.
+        assert_eq!(tree.tip_id(), Some(side_ids[2]));
+        assert_eq!(tree.active_by_height.get(1), Some(side_ids[0]));
+
+        // Invalidate the side root (b1). This must mark b1..b3 invalid and reselect a2.
+        let invalid_hashes = tree.invalidate_subtree(side_ids[0])?;
+        assert_eq!(invalid_hashes.len(), 3);
+        for (id, hash) in side_ids.iter().zip(side_hashes.iter()) {
+            assert_eq!(tree.node(*id)?.status, NodeStatus::Invalid);
+            assert!(invalid_hashes.contains(hash));
+        }
+
+        assert_eq!(tree.tip_id(), Some(a2_id));
+        assert_eq!(tree.node(a2_id)?.status, NodeStatus::Active);
+        assert_eq!(tree.active_by_height.get(2), Some(a2_id));
+        assert!(tree.active_by_height.is_trusted());
+        assert_ne!(tree.node(genesis_id)?.status, NodeStatus::Invalid);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_subtree_uses_insertion_order_for_equal_work_tie_break()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let genesis_hash = tree.node(genesis_id)?.hash;
+
+        // Three equal-length forks: a, b, c (inserted in that order).
+        let mut fork_tips = Vec::new();
+        for fork in 0..3 {
+            let first = test_header(
+                BlockHash::from_byte_array(genesis_hash.to_le_bytes()),
+                10 + fork,
+            );
+            let first_id = tree.insert_node(Some(genesis_id), first, NodeStatus::HeaderValid)?;
+            let first_hash = tree.node(first_id)?.hash;
+            let second = test_header(
+                BlockHash::from_byte_array(first_hash.to_le_bytes()),
+                20 + fork,
+            );
+            let second_id = tree.insert_node(Some(first_id), second, NodeStatus::HeaderValid)?;
+            fork_tips.push(second_id);
+        }
+
+        // a is active because it was inserted first and all forks have equal chainwork.
+        assert_eq!(tree.tip_id(), Some(fork_tips[0]));
+
+        // Invalidate the active a fork. The next earliest equal-work fork (b) wins.
+        tree.invalidate_subtree(fork_tips[0])?;
+        assert_eq!(tree.node(fork_tips[0])?.status, NodeStatus::Invalid);
+        assert_eq!(tree.tip_id(), Some(fork_tips[1]));
+        assert_eq!(tree.node(fork_tips[1])?.status, NodeStatus::Active);
+
+        // c is still valid but not active.
+        assert_eq!(tree.node(fork_tips[2])?.status, NodeStatus::HeaderValid);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_under_invalid_parent_is_invalid_and_does_not_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut tree = BlockTree::new();
+        let genesis = test_header(BlockHash::all_zeros(), 0);
+        let genesis_id = tree.insert_node(None, genesis, NodeStatus::HeaderValid)?;
+        let genesis_hash = tree.node(genesis_id)?.hash;
+
+        let a1 = test_header(BlockHash::from_byte_array(genesis_hash.to_le_bytes()), 1);
+        let a1_id = tree.insert_node(Some(genesis_id), a1, NodeStatus::HeaderValid)?;
+        let a1_hash = tree.node(a1_id)?.hash;
+        let a2 = test_header(BlockHash::from_byte_array(a1_hash.to_le_bytes()), 2);
+        let a2_id = tree.insert_node(Some(a1_id), a2, NodeStatus::HeaderValid)?;
+
+        // Invalidate the active chain root a1, leaving only genesis valid.
+        tree.invalidate_subtree(a1_id)?;
+        assert_eq!(tree.node(a1_id)?.status, NodeStatus::Invalid);
+        assert_eq!(tree.node(a2_id)?.status, NodeStatus::Invalid);
+        assert_eq!(tree.tip_id(), Some(genesis_id));
+
+        // Inserting a child under the invalid a1 must itself be invalid and cannot become tip.
+        let a3 = test_header(BlockHash::from_byte_array(a1_hash.to_le_bytes()), 3);
+        let a3_id = tree.insert_node(Some(a1_id), a3, NodeStatus::HeaderValid)?;
+        assert_eq!(tree.node(a3_id)?.status, NodeStatus::Invalid);
+        assert_eq!(tree.tip_id(), Some(genesis_id));
+        Ok(())
     }
 }

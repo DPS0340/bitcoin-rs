@@ -19,6 +19,9 @@ pub enum IndexError {
     /// `bitcoin_slices` rejected the serialized block.
     #[error("invalid serialized block: {0:?}")]
     BlockParse(bitcoin_slices::Error),
+    /// This indexer cannot undo a block, so a reorg cannot be made consistent.
+    #[error("this indexer does not support block disconnect")]
+    UnsupportedRollback,
     /// A block header did not have the consensus 80-byte length.
     #[error("invalid block header length {len}")]
     InvalidHeaderLength {
@@ -470,6 +473,130 @@ impl<S: KvStore> Indexer<S> {
         self.ingest_rows(rows)
     }
 
+    /// Deletes every index row that ingesting `block` at `height` would have written.
+    ///
+    /// Derives the same txid, funding, spending, and header row keys as
+    /// [`Self::ingest_decoded_block_with_verified_txids`] by reusing the shared
+    /// row-construction code, then issues all deletions in a single atomic
+    /// [`KvStore::write`] batch. Either the entire block's rows are removed or
+    /// the method returns `Err` having deleted nothing observable.
+    ///
+    /// Deleting a row that is already absent is not an error: the indexer may
+    /// have been enabled after `block` was applied, so its rows may never have
+    /// existed. The returned [`IndexRowCounts`] reflects the rows targeted for
+    /// deletion (the same counts a matching ingest would have written), which
+    /// may be zero on a repeat call or when the block was never indexed.
+    ///
+    /// Any buffered rows are flushed first. Deletion writes straight to the
+    /// store, so unflushed rows for the block being disconnected would survive
+    /// in `pending_rows` and a later [`Self::end_batch`] would resurrect the
+    /// very block just rolled back. Flushing first also keeps the all-or-
+    /// nothing property: a failing flush returns `Err` before anything is
+    /// deleted.
+    pub fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        // Buffered rows must reach the store before the deletes, or a later
+        // end_batch would write back the block being disconnected.
+        self.flush()?;
+        let txids: Vec<bitcoin::Txid> = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect();
+        self.rollback_block_inner(block, height, &txids)
+    }
+
+    /// Same as [`Self::rollback_block`] but reuses caller-verified transaction
+    /// IDs, avoiding a second pass of `compute_txid` when the caller has
+    /// already computed them for merkle verification.
+    ///
+    /// Falls back to [`Self::rollback_block`] when the supplied txid count
+    /// does not match the block's transaction count, preserving semantics for
+    /// mismatched input.
+    pub fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        if txids.len() != block.txdata.len() {
+            return self.rollback_block(block, height);
+        }
+        self.rollback_block_inner(block, height, txids)
+    }
+
+    fn rollback_block_inner(
+        &self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let mut rows = pending_rows_for_decoded_block(block, height, txids)?;
+        rows.sort();
+        let counts = rows.counts();
+
+        // Only delete if this block's header row is still there.
+        //
+        // Funding, spending, and txid keys are an 8-byte prefix plus the
+        // height, carrying no block identity, so a replacement block at the
+        // same height that shares any data — the same output script is enough —
+        // derives the same keys. Rolling this block back a second time, after
+        // the replacement was indexed, would delete the replacement's rows and
+        // leave Electrum missing active-chain history.
+        //
+        // The header row is the identity: its key is the 80-byte serialized
+        // header, and the block hash is the double-SHA256 of exactly those
+        // bytes, so no two blocks share one. Its absence means this block is
+        // already rolled back and the keys now belong to whatever replaced it.
+        // Rekeying the other three families would carry block identity
+        // directly, but it would break the electrs-compatible layout and force
+        // a reindex, which is a far larger change than the bug warrants.
+        // A read failure is propagated, not treated as absence: silently
+        // reporting a clean rollback because storage was unreachable would
+        // leave the caller believing the block is gone.
+        let identity_present = match rows.header_rows.first() {
+            Some(header) => self
+                .store
+                .get(ColumnFamily::BlockHeaders, header)?
+                .is_some(),
+            None => false,
+        };
+        if !identity_present {
+            debug!(
+                height,
+                "rollback skipped: block header row absent, rows belong to another block"
+            );
+            return Ok(counts);
+        }
+
+        let mut batch = self.store.new_batch();
+        for row in &rows.txid_rows {
+            batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
+        }
+        for row in &rows.funding_rows {
+            batch.delete(ColumnFamily::Funding, row.as_bytes());
+        }
+        for row in &rows.spending_rows {
+            batch.delete(ColumnFamily::Spending, row.as_bytes());
+        }
+        for row in &rows.header_rows {
+            batch.delete(ColumnFamily::BlockHeaders, row);
+        }
+        self.store.write(batch)?;
+        debug!(
+            txids = counts.txids,
+            funding = counts.funding,
+            spending = counts.spending,
+            headers = counts.headers,
+            "rolled back block"
+        );
+        Ok(counts)
+    }
+
     fn ingest_rows(&mut self, mut rows: PendingRows) -> Result<IndexRowCounts, IndexError> {
         // Dedup before counting: a block can generate the same funding or
         // spending row twice, and only one copy is ever written. Counting the
@@ -804,6 +931,39 @@ pub trait IndexerLike: Send + Sync {
         self.ingest_block_with_verified_txids(serialized_block, height, txids)
     }
 
+    /// Deletes every index row that ingesting `block` at `height` would have written.
+    ///
+    /// The inverse of the ingest methods above. The default returns
+    /// [`IndexError::UnsupportedRollback`] rather than succeeding: an
+    /// implementation that silently reports a successful rollback while
+    /// deleting nothing would let the node advance its tip believing the index
+    /// is consistent, and the Electrum server would then serve transactions
+    /// that are no longer in the chain. Failing loudly is the only safe
+    /// default. Concrete indexers that persist rows override this.
+    fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = (block, height);
+        Err(IndexError::UnsupportedRollback)
+    }
+
+    /// Same as [`IndexerLike::rollback_block`] but reuses caller-verified
+    /// transaction IDs when supported.
+    ///
+    /// The default implementation preserves existing implementations by
+    /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = txids;
+        self.rollback_block(block, height)
+    }
+
     /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
     fn begin_batch(&mut self) {}
 
@@ -882,6 +1042,23 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         txids: &[bitcoin::Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
+    }
+
+    fn rollback_block(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block(self, block, height)
+    }
+
+    fn rollback_block_with_verified_txids(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        txids: &[bitcoin::Txid],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block_with_verified_txids(self, block, height, txids)
     }
 
     fn begin_batch(&mut self) {
@@ -1393,6 +1570,323 @@ mod tests {
             }
             None
         }
+    }
+
+    /// A block whose rows populate all four column families: a coinbase plus a
+    /// spend, so funding and spending rows both exist alongside txid and header
+    /// rows.
+    fn rollback_fixture_block() -> Block {
+        let funded = tx(
+            OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+            ScriptBuf::from_bytes(vec![0x51]),
+        );
+        let spender = tx(
+            OutPoint::new(funded.compute_txid(), 0),
+            ScriptBuf::from_bytes(vec![0x52]),
+        );
+        block(vec![funded, spender])
+    }
+
+    #[test]
+    fn rollback_removes_every_row_a_matching_ingest_wrote() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+        let before = stored_rows(&indexer)?;
+
+        let written = indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        let after_ingest = stored_rows(&indexer)?;
+        assert!(
+            after_ingest.len() > before.len(),
+            "fixture must write rows to be a meaningful rollback test"
+        );
+        // All four column families must be exercised, or the test proves little.
+        for cf in [
+            ColumnFamily::TxConfirmed,
+            ColumnFamily::Funding,
+            ColumnFamily::Spending,
+            ColumnFamily::BlockHeaders,
+        ] {
+            assert!(
+                after_ingest.iter().any(|(family, _)| *family == cf),
+                "fixture wrote no rows to {cf:?}"
+            );
+        }
+
+        let removed = indexer.rollback_block(&candidate, HEIGHT)?;
+        assert_eq!(removed.txids, written.txids);
+        assert_eq!(removed.funding, written.funding);
+        assert_eq!(removed.spending, written.spending);
+        assert_eq!(removed.headers, written.headers);
+        assert_eq!(
+            stored_rows(&indexer)?,
+            before,
+            "rollback must restore the pre-ingest row set exactly"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn last_counts_remains_ingest_after_rollback() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let old = rollback_fixture_block();
+        let old_written = indexer.ingest_block(&serialize(&old), HEIGHT)?;
+        let _ = indexer.rollback_block(&old, HEIGHT)?;
+
+        // A replacement at the same height with a different shape so its
+        // ingest counts differ from the old block's rollback counts.
+        let replacement = block(vec![
+            tx(
+                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                ScriptBuf::from_bytes(vec![0x51]),
+            ),
+            tx(
+                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                ScriptBuf::from_bytes(vec![0x52]),
+            ),
+        ]);
+        let replacement_written = indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        assert_ne!(
+            replacement_written, old_written,
+            "replacement counts must differ from the old block's counts"
+        );
+
+        // Re-rolling the already-gone old block returns its original counts
+        // but must not overwrite the last successful ingest counts.
+        let old_again = indexer.rollback_block(&old, HEIGHT)?;
+        assert_eq!(old_again, old_written);
+        assert_eq!(
+            indexer.last_counts(),
+            replacement_written,
+            "last_counts must stay the last ingest counts, not the rollback counts"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_of_a_never_indexed_block_is_not_an_error() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+
+        // An indexer enabled after the block was applied never wrote its rows.
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        assert!(stored_rows(&indexer)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_rollback_is_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        let after_first = stored_rows(&indexer)?;
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        assert_eq!(
+            stored_rows(&indexer)?,
+            after_first,
+            "a second rollback must be observationally inert"
+        );
+        Ok(())
+    }
+
+    /// Regression: rollback writes deletions straight to the store, so rows
+    /// still buffered in `pending_rows` used to survive it and a later
+    /// `end_batch` resurrected the disconnected block.
+    #[test]
+    fn rollback_inside_an_open_batch_is_not_undone_by_end_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let candidate = rollback_fixture_block();
+
+        indexer.begin_batch();
+        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.rollback_block(&candidate, HEIGHT)?;
+        indexer.end_batch()?;
+
+        assert!(
+            stored_rows(&indexer)?.is_empty(),
+            "end_batch must not write back rows for a rolled-back block"
+        );
+        Ok(())
+    }
+
+    /// Delegates every operation to a real store but fails `write`, so the
+    /// all-or-nothing claim on `rollback_block` can be exercised rather than
+    /// merely asserted in a doc comment.
+    struct FailingWriteStore(RocksDbStore);
+
+    impl bitcoin_rs_storage::KvStore for FailingWriteStore {
+        type WriteBatch = <RocksDbStore as KvStore>::WriteBatch;
+
+        fn get(
+            &self,
+            cf: ColumnFamily,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.0.get(cf, key)
+        }
+
+        fn iter_prefix<'a>(
+            &'a self,
+            cf: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<bitcoin_rs_storage::KvIter<'a>, bitcoin_rs_storage::StorageError> {
+            self.0.iter_prefix(cf, prefix)
+        }
+
+        fn new_batch(&self) -> Self::WriteBatch {
+            self.0.new_batch()
+        }
+
+        fn write(&self, _batch: Self::WriteBatch) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected write failure".to_owned(),
+            ))
+        }
+
+        fn flush(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.0.flush()
+        }
+
+        fn snapshot(
+            &self,
+        ) -> Result<Box<dyn bitcoin_rs_storage::KvSnapshot + '_>, bitcoin_rs_storage::StorageError>
+        {
+            self.0.snapshot()
+        }
+    }
+
+    #[test]
+    fn rollback_deletes_nothing_when_the_write_fails() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let candidate = rollback_fixture_block();
+
+        // Populate through a normal indexer, then reopen behind the failing
+        // store so the rows exist but no write can land.
+        {
+            let store = Arc::new(RocksDbStore::open(dir.path())?);
+            let mut indexer = Indexer::new(store);
+            indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        }
+        let store = Arc::new(RocksDbStore::open(dir.path())?);
+        let before = stored_rows(&Indexer::new(Arc::clone(&store)))?;
+        assert!(!before.is_empty(), "fixture must have rows to preserve");
+        drop(store);
+
+        let failing = Arc::new(FailingWriteStore(RocksDbStore::open(dir.path())?));
+        let mut indexer = Indexer::new(Arc::clone(&failing));
+        let outcome = indexer.rollback_block(&candidate, HEIGHT);
+        assert!(outcome.is_err(), "a failing write must surface as an error");
+        drop(indexer);
+        drop(failing);
+
+        let reopened = Indexer::new(Arc::new(RocksDbStore::open(dir.path())?));
+        assert_eq!(
+            stored_rows(&reopened)?,
+            before,
+            "a failed rollback must leave every row in place"
+        );
+        Ok(())
+    }
+
+    /// An indexer that persists nothing and does not override the rollback
+    /// default. It must refuse rather than report a successful no-op, or the
+    /// node would advance its tip believing a stale index is consistent.
+    struct RollbackUnawareIndexer;
+
+    impl super::IndexerLike for RollbackUnawareIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<super::IndexRowCounts, super::IndexError> {
+            Ok(super::IndexRowCounts::default())
+        }
+
+        fn resolve_transaction(
+            &self,
+            _txid: Txid,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<Transaction>, super::IndexError> {
+            Ok(None)
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, super::IndexError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn the_rollback_default_refuses_rather_than_silently_succeeding() {
+        let mut indexer = RollbackUnawareIndexer;
+        let candidate = rollback_fixture_block();
+        assert!(matches!(
+            super::IndexerLike::rollback_block(&mut indexer, &candidate, HEIGHT),
+            Err(super::IndexError::UnsupportedRollback)
+        ));
+    }
+
+    /// A repeated rollback must not delete a replacement block's rows.
+    ///
+    /// Funding, spending, and txid keys are an 8-byte prefix plus the height
+    /// and carry no block identity, so a replacement at the same height that
+    /// shares an output script derives the same keys. Without the header-row
+    /// identity check, rolling the old block back twice deleted the
+    /// replacement's history.
+    #[test]
+    fn a_repeated_rollback_leaves_a_replacement_blocks_rows_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, mut indexer) = indexer()?;
+        let shared_script = ScriptBuf::from_bytes(vec![0x51]);
+
+        // Two different blocks at the same height that both pay the same
+        // script, so their funding rows collide.
+        // The shared `block` fixture pins a zero merkle root, so the nonce is
+        // what distinguishes these two headers.
+        let mut old_block = block(vec![tx(
+            OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0),
+            shared_script.clone(),
+        )]);
+        old_block.header.nonce = 1;
+        let mut replacement = block(vec![tx(
+            OutPoint::new(Txid::from_byte_array([0xb2; 32]), 0),
+            shared_script,
+        )]);
+        replacement.header.nonce = 2;
+        assert_ne!(
+            old_block.header.block_hash(),
+            replacement.header.block_hash(),
+            "the two blocks must differ, or there is nothing to confuse"
+        );
+
+        indexer.ingest_block(&serialize(&old_block), HEIGHT)?;
+        indexer.rollback_block(&old_block, HEIGHT)?;
+        indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        indexer.flush()?;
+        let after_replacement = stored_rows(&indexer)?;
+        assert!(
+            !after_replacement.is_empty(),
+            "the replacement must have written rows"
+        );
+
+        // Roll the OLD block back again. It is already gone; its keys now
+        // belong to the replacement.
+        indexer.rollback_block(&old_block, HEIGHT)?;
+        indexer.flush()?;
+
+        assert_eq!(
+            stored_rows(&indexer)?,
+            after_replacement,
+            "a repeated rollback must not touch the replacement's rows"
+        );
+        Ok(())
     }
 
     fn indexer() -> Result<(tempfile::TempDir, Indexer<RocksDbStore>), Box<dyn std::error::Error>> {

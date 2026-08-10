@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -130,6 +131,136 @@ pub enum ApplyError {
     /// Persisting the canonical prunable block body failed.
     #[error("block body persistence: {0}")]
     BlockBodyPersistence(#[from] bitcoin_rs_storage::StorageError),
+    /// Persisting the UTXO undo record failed.
+    ///
+    /// Fatal for the block: without a recoverable undo record the node could
+    /// not disconnect it, so the block must not be applied.
+    #[error("undo persistence: {0}")]
+    UndoPersistence(#[source] bitcoin_rs_storage::StorageError),
+    /// A spent output had no resolved prevout, so the undo record would be
+    /// unable to restore it.
+    #[error("undo record cannot restore spent output {txid}:{vout}")]
+    UndoPrevoutMissing {
+        /// Transaction id of the unresolvable spend.
+        txid: bitcoin_rs_primitives::Hash256,
+        /// Output index of the unresolvable spend.
+        vout: u32,
+    },
+    /// The undo record for a block being disconnected is absent.
+    ///
+    /// Fatal: without it the UTXO set cannot be restored, and guessing would
+    /// silently corrupt the chainstate.
+    #[error("no undo record for block {hash} at height {height}")]
+    UndoRecordMissing {
+        /// Block whose record is absent.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height the block was applied at.
+        height: u32,
+    },
+    /// A stored undo record could not be decoded.
+    #[error("undo record for block {hash} is unreadable: {reason}")]
+    UndoRecordUnreadable {
+        /// Block whose record is unreadable.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Why the codec rejected it.
+        reason: String,
+    },
+    /// Reading a stored undo record failed.
+    #[error("undo record read: {0}")]
+    UndoRead(#[source] bitcoin_rs_storage::StorageError),
+    /// The block asked to be disconnected is not the applied tip.
+    ///
+    /// Blocks must be disconnected tip-first. Taking one from the middle would
+    /// restore outputs that its descendants have already spent.
+    #[error("block {hash} is not the applied tip {tip}")]
+    DisconnectNotTip {
+        /// Block the caller asked to disconnect.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Block that is actually applied.
+        tip: bitcoin_rs_primitives::Hash256,
+    },
+    /// The supplied block body does not match its own header.
+    ///
+    /// The header hash commits to the merkle root, not to the transactions the
+    /// caller handed over. A body swapped under a matching header would roll
+    /// the index back over the wrong rows.
+    #[error("block {hash} body does not match its header merkle root")]
+    DisconnectBodyMismatch {
+        /// Block whose body was rejected.
+        hash: bitcoin_rs_primitives::Hash256,
+    },
+    /// Reading a BIP157 filter header failed.
+    ///
+    /// A broken backend, not a missing row: an absent header is answered by
+    /// skipping the filter write, which keeps the chain moving.
+    #[error("filter header lookup: {0}")]
+    FilterHeaderLookup(#[source] bitcoin_rs_filters::FilterIndexError),
+    /// Rewinding the block-level coinstats failed.
+    ///
+    /// The per-coin fields ride the UTXO change listener and are already
+    /// reversed by the undo; only height and transaction count are set
+    /// directly, and a refusal here means they do not describe the block being
+    /// disconnected.
+    #[error("coinstats rewind: {0}")]
+    CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
+    /// Rolling the transaction index back failed.
+    #[error("index rollback: {0}")]
+    IndexRollback(#[source] bitcoin_rs_index::IndexError),
+}
+
+/// The outcome of a refused or failed block disconnect.
+///
+/// Two variants because the caller must act differently, and a single error
+/// type let that distinction live in prose where it can be missed. Every
+/// disconnect failure is one or the other; there is no third case.
+#[derive(Debug, thiserror::Error)]
+pub enum DisconnectError {
+    /// Refused before anything was touched. The chain is exactly as it was.
+    ///
+    /// Safe to report and carry on: no rollback started, so no state is half
+    /// applied. Every check that can produce this runs in the planning step
+    /// precisely so that refusing stays free.
+    #[error("disconnect refused: {0}")]
+    Refused(#[source] Box<ApplyError>),
+    /// Failed after the rollback began. Some state is rolled back and some is
+    /// not, and which is which depends on where it stopped.
+    ///
+    /// Fatal. Do not retry: the UTXO commit fires the set's change listener and
+    /// coinstats is registered as one, so a second pass double-counts even
+    /// where the set itself converges. Stop applying blocks and report the
+    /// block named here, which is why the hash and height are carried rather
+    /// than left for the caller to reconstruct.
+    #[error(
+        "disconnect of block {hash} at height {height} failed after mutation began, chain state is partial: {source}"
+    )]
+    Fatal {
+        /// Block whose disconnect wedged.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height it was applied at.
+        height: u32,
+        /// What failed.
+        #[source]
+        source: Box<ApplyError>,
+    },
+    /// Rolled back cleanly, but the in-flight marker could not be cleared.
+    ///
+    /// The chain is consistent and no data is lost. What is broken is the
+    /// interlock: the marker still says a disconnect was in flight, so the next
+    /// start refuses until it is cleared. Reported rather than folded into
+    /// success because a caller that heard "done" would restart into a refusal
+    /// it had no warning of.
+    #[error(
+        "disconnect of block {hash} at height {height} completed but the in-flight marker remains set: {source}"
+    )]
+    MarkerStuck {
+        /// Block that was disconnected.
+        hash: bitcoin_rs_primitives::Hash256,
+        /// Height it was applied at.
+        height: u32,
+        /// Why the marker could not be cleared.
+        #[source]
+        source: Box<ApplyError>,
+    },
 }
 
 enum NodeStorage {
@@ -205,6 +336,7 @@ impl NodeStorage {
         block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -214,6 +346,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => Ok(Arc::new(NodePruneService::new(
@@ -222,6 +355,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "redb")]
             Self::Redb(store) => Ok(Arc::new(NodePruneService::new(
@@ -230,6 +364,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => Ok(Arc::new(NodePruneService::new(
@@ -238,6 +373,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                Arc::clone(durable_tip_height),
             )?)),
         }
     }
@@ -275,22 +411,21 @@ impl NodeStorage {
         }
     }
 
-    #[cfg(test)]
-    fn seed_prune_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        undo: &[u8],
-    ) -> Result<()> {
+    /// Builds the undo store for the configured backend.
+    ///
+    /// Mandatory rather than optional: without undo records the node cannot
+    /// disconnect a block, so it could advance its tip into a chain it is
+    /// unable to leave.
+    fn undo_store(&self) -> Arc<dyn crate::apply::UndoStore> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => seed_prune_undo(&**store, height, hash, undo),
+            Self::RocksDb(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => seed_prune_undo(&**store, height, hash, undo),
+            Self::Fjall(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => seed_prune_undo(&**store, height, hash, undo),
+            Self::Redb(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => seed_prune_undo(&**store, height, hash, undo),
+            Self::Mdbx(store) => Arc::new(crate::apply::KvUndoStore::new(Arc::clone(store))),
         }
     }
 
@@ -322,13 +457,13 @@ impl NodeStorage {
         let key = bitcoin_rs_pruning::block_undo_key(height, hash);
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::RocksDb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Fjall(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Redb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Ok(store.get(ColumnFamily::BlockTree, &key)?),
+            Self::Mdbx(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
         }
     }
 }
@@ -393,6 +528,11 @@ pub struct NodePruneService<S: KvStore> {
     blocks: Arc<RwLock<Vec<BlockRecord>>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     pruneheight: Mutex<Option<u32>>,
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    ///
+    /// Undo pruning is bounded by this, not by the in-memory applied tip, which
+    /// can run far ahead of it.
+    durable_tip_height: Arc<AtomicU32>,
 }
 
 impl<S: KvStore> NodePruneService<S> {
@@ -403,6 +543,7 @@ impl<S: KvStore> NodePruneService<S> {
         block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
         Ok(Self {
@@ -412,6 +553,7 @@ impl<S: KvStore> NodePruneService<S> {
             blocks,
             transactions,
             pruneheight: Mutex::new(pruneheight),
+            durable_tip_height,
         })
     }
 }
@@ -471,6 +613,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             &mut batch,
             &self.block_files,
             pruner_tip,
+            self.durable_tip_height.load(Ordering::Acquire),
             policy,
         )
         .map_err(|err| PruneServiceError::failed(err.to_string()))?;
@@ -516,21 +659,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             pruneheight: *self.pruneheight.lock(),
         }
     }
-}
-
-#[cfg(test)]
-fn seed_prune_undo<S: KvStore>(
-    store: &S,
-    height: u32,
-    hash: bitcoin_rs_primitives::Hash256,
-    undo: &[u8],
-) -> Result<()> {
-    store.put(
-        ColumnFamily::BlockTree,
-        &bitcoin_rs_pruning::block_undo_key(height, hash),
-        undo,
-    )?;
-    Ok(())
 }
 
 /// Concrete txindex store handles retained per backend.
@@ -733,6 +861,11 @@ fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
 
 /// Aggregate handle to a running node.
 pub struct NodeState {
+    /// Height the last clean checkpoint would restore to, 0 when none exists.
+    ///
+    /// Published by `write_clean_checkpoint` and read by the pruner, which must
+    /// not delete an undo record a crash-restore would still need.
+    durable_tip_height: Arc<AtomicU32>,
     config: Config,
     data_dir: PathBuf,
     checkpoint_data_dir: cap_std::fs::Dir,
@@ -825,6 +958,37 @@ impl NodeState {
             }
         };
         let storage = NodeStorage::open(&config)?;
+        let undo_store = storage.undo_store();
+        // Before anything reads the chainstate, let alone serves or syncs it.
+        // A node that starts on a torn chainstate builds on it, and every block
+        // it adds makes the damage harder to find.
+        if let Some(marker) = undo_store
+            .load_disconnect_marker()
+            .map_err(anyhow::Error::new)?
+        {
+            // Names directories rather than a `-reindex` option, because this
+            // node has no reindex. An instruction the operator cannot follow is
+            // worse than none.
+            //
+            // Remove all durable views. A torn disconnect can roll the
+            // transaction index back while the UTXO checkpoint and tip still
+            // name the block. Keeping an older checkpoint can restore that
+            // stale chainstate beside the rolled-back index. The marker lives
+            // in the chainstate store, so removing it clears the marker too.
+            bail!(
+                "refusing to start: a disconnect of block {hash} at height {height} never \
+                 completed, so the UTXO set, the transaction index, and the chain tip may \
+                 disagree. The node cannot repair this in place, because it cannot tell \
+                 which of those commits landed before the disconnect stopped. Remove \
+                 or quarantine {chainstate}, {checkpoints}, {txindex}, and {filters}, then resync.",
+                hash = marker.hash,
+                height = marker.height,
+                chainstate = config.data_dir.join("chainstate").display(),
+                checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
+                txindex = config.data_dir.join("txindex").display(),
+                filters = config.data_dir.join("filters").display(),
+            );
+        }
         let block_files =
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
         let block_body_store =
@@ -929,6 +1093,7 @@ impl NodeState {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -945,9 +1110,12 @@ impl NodeState {
             filter_header_cache: Arc::new(Mutex::new(None)),
             cache_block_bodies_in_memory: false,
             block_body_store: Some(Arc::clone(&block_body_store)),
+            undo_store,
             g2_muhash_sampler,
             g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
+            shutdown: Arc::clone(&shutdown),
+            chain_transition: Arc::new(parking_lot::Mutex::new(())),
             assume_valid_height: config.assume_valid_height,
             assume_valid_gate: Arc::new(crate::apply::AssumeValidGate::new(
                 config.network,
@@ -962,12 +1130,18 @@ impl NodeState {
             Arc::clone(&inbound_headers_rx),
             Arc::clone(&inbound_blocks_rx),
         ));
+        // A restored checkpoint is durable at its own height by definition, so
+        // start there rather than at zero, which would refuse all undo pruning.
+        let durable_tip_height = Arc::new(AtomicU32::new(
+            applied_tip.load().as_ref().map_or(0, |tip| tip.height),
+        ));
         let prune_service = if config.prune_target_mb > 0 {
             Some(storage.prune_service(
                 &block_files,
                 &block_body_store,
                 Arc::clone(&blocks),
                 Arc::clone(&transactions),
+                &durable_tip_height,
             )?)
         } else {
             None
@@ -979,6 +1153,7 @@ impl NodeState {
         );
         let data_dir = config.data_dir.clone();
         Ok(Self {
+            durable_tip_height,
             config,
             data_dir,
             checkpoint_data_dir,
@@ -1037,10 +1212,18 @@ impl NodeState {
     ) -> core::result::Result<crate::checkpoint::CheckpointWrite, crate::checkpoint::CheckpointError>
     {
         let _exclusive_apply = self.apply_handles.admission.close();
+        if let Some(marker) = self.apply_handles.undo_store.load_disconnect_marker()?
+            && marker.phase == crate::apply::DisconnectPhase::InFlight
+        {
+            return Err(crate::checkpoint::CheckpointError::DisconnectInFlight {
+                hash: marker.hash,
+                height: marker.height,
+            });
+        }
         // A checkpoint may name this tip only after body files then index rows sync.
         self.block_body_store.sync()?;
         let applied_tip = self.applied_tip.load_full();
-        crate::checkpoint::write_checkpoint_from_dir(
+        let written = crate::checkpoint::write_checkpoint_from_dir(
             &self.checkpoint_data_dir,
             crate::checkpoint::HeaderCheckpointConfig {
                 network: self.config.network,
@@ -1051,7 +1234,24 @@ impl NodeState {
             &self.coin_stats,
             applied_tip.as_deref(),
             self.config.g2_muhash_samples.is_some(),
-        )
+        )?;
+        // The disconnect marker comes off here, not when the disconnect
+        // finished. A disconnect leaves the index rollback durable while the
+        // rolled-back UTXO set and tip are still only in memory, so until a
+        // checkpoint captures them a crash restores a chainstate that still
+        // contains the disconnected block with its index rows already deleted.
+        // This is the first point at which the rollback is whole on disk.
+        self.apply_handles
+            .undo_store
+            .disarm_disconnect()
+            .map_err(crate::checkpoint::CheckpointError::from)?;
+        // Everything up to this tip is now recoverable, so undo records below it
+        // may be pruned. Published after the write, never before.
+        self.durable_tip_height.store(
+            applied_tip.as_ref().map_or(0, |tip| tip.height),
+            Ordering::Release,
+        );
+        Ok(written)
     }
 
     /// Returns the configured storage backend that was opened.
@@ -1292,6 +1492,12 @@ impl NodeState {
             last_committed_height: height,
         };
         crate::crash_recovery::write_meta(self, &meta)
+    }
+
+    /// Returns the process-wide shutdown signal shared by all runtime workers.
+    #[must_use]
+    pub fn shutdown(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.apply_handles.shutdown)
     }
 
     /// Snapshot of the handle set needed by `crate::apply::apply_block`.
@@ -1833,6 +2039,72 @@ mod tests {
         Ok(())
     }
 
+    /// Undo pruning must respect the durable tip, not the in-memory one.
+    ///
+    /// The applied tip can run far ahead of the last clean checkpoint. Pruning
+    /// undo to the in-memory tip deletes the record for the block the
+    /// checkpoint names, and a crash then restores a chainstate that cannot
+    /// disconnect its own tip.
+    #[test]
+    fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()> {
+        fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
+            let byte = u8::try_from(height)
+                .map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
+            Ok(bitcoin_rs_primitives::Hash256::from_le_bytes(&[byte; 32]))
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config)?;
+
+        for height in 10_u32..=12 {
+            let hash = hash(height)?;
+            state
+                .block_body_store
+                .persist_block_body(height, hash, b"block-body")?;
+            state
+                .apply_handles()
+                .undo_store
+                .persist_undo(height, hash, b"undo-body")?;
+            state.blocks.write().push(BlockRecord {
+                hash,
+                height,
+                block_hex: "00".to_owned(),
+                body_size: 1,
+                header_hex: String::new(),
+                tx_count: 0,
+                time: 0,
+            });
+        }
+
+        // No checkpoint has been written, so nothing is durable above genesis.
+        assert_eq!(
+            state.durable_tip_height.load(Ordering::Acquire),
+            0,
+            "the fixture must have no durable checkpoint, or this proves nothing"
+        );
+
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        let result = service
+            .prune_to_height(11)
+            .map_err(|err| anyhow::anyhow!("prune failed: {err}"))?;
+
+        assert_eq!(
+            result.undo_rows_removed, 0,
+            "no undo record may go while a crash would restore below all of them"
+        );
+        assert!(
+            state.storage.stored_prune_undo(10, hash(10)?)?.is_some(),
+            "the record a restore would need must survive"
+        );
+        Ok(())
+    }
+
     #[test]
     fn prune_service_deletes_seeded_storage_rows_and_clears_cached_bodies() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
@@ -1853,7 +2125,13 @@ mod tests {
             state
                 .block_body_store
                 .persist_block_body(height, hash, b"block-body")?;
-            state.storage.seed_prune_undo(height, hash, b"undo-body")?;
+            // Written through the production undo store, not a test helper.
+            // A helper writing where the pruner happened to look is how the
+            // pruner came to target a column family nothing produced.
+            state
+                .apply_handles()
+                .undo_store
+                .persist_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
@@ -1864,6 +2142,15 @@ mod tests {
                 time: 0,
             });
         }
+
+        // A node pruning old history has a durable tip far above it. Undo
+        // records within the reorg-safety margin of that tip are kept, so the
+        // durable tip has to clear height 11 by more than the margin for this
+        // prune to touch anything. Without that the prune is correctly refused,
+        // which the sibling test asserts.
+        state
+            .durable_tip_height
+            .store(11 + CORE_REORG_SAFETY_MARGIN, Ordering::Release);
 
         let Some(service) = state.prune_service() else {
             anyhow::bail!("prune service should exist when prune_target_mb > 0");
@@ -2013,8 +2300,9 @@ mod tests {
             .block_body_store
             .persist_block_body(10, pruned_hash, &serialize(&pruned_block))?;
         state
-            .storage
-            .seed_prune_undo(10, pruned_hash, b"undo-body")?;
+            .apply_handles()
+            .undo_store
+            .persist_undo(10, pruned_hash, b"undo-body")?;
         state
             .blocks
             .write()
@@ -2229,6 +2517,106 @@ mod tests {
         })?;
         scanned.tx_count = rolling.tx_count;
         assert_eq!(rolling, scanned);
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_arc_is_shared_with_apply_handles() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        assert!(Arc::ptr_eq(
+            &state.shutdown(),
+            &state.apply_handles().shutdown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_refuses_inflight_disconnect_and_preserves_state() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        state.apply_block(&genesis)?;
+        assert!(matches!(
+            state.write_clean_checkpoint()?,
+            crate::checkpoint::CheckpointWrite::Published { .. }
+        ));
+
+        let checkpoint_root = data_dir.join("chainstate-checkpoints");
+        let armed_hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xab; 32]);
+        let armed_height = 10;
+        state
+            .apply_handles()
+            .undo_store
+            .arm_disconnect(armed_height, armed_hash)?;
+        let marker_before = state.apply_handles().undo_store.load_disconnect_marker()?;
+        let current_before = std::fs::read(checkpoint_root.join("CURRENT"))?;
+        let mut dirs_before = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&checkpoint_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs_before.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        let result = state.write_clean_checkpoint();
+        let Err(crate::checkpoint::CheckpointError::DisconnectInFlight { hash, height }) = result
+        else {
+            anyhow::bail!("expected DisconnectInFlight refusal, got {result:?}");
+        };
+        assert_eq!(hash, armed_hash);
+        assert_eq!(height, armed_height);
+
+        let marker_after = state.apply_handles().undo_store.load_disconnect_marker()?;
+        let current_after = std::fs::read(checkpoint_root.join("CURRENT"))?;
+        let mut dirs_after = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&checkpoint_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                dirs_after.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+
+        assert_eq!(marker_before, marker_after);
+        assert_eq!(current_before, current_after);
+        assert_eq!(dirs_before, dirs_after);
+        Ok(())
+    }
+
+    #[test]
+    fn torn_disconnect_refusal_names_every_store_to_remove() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+        let state = NodeState::open(config.clone())?;
+        state.apply_handles().undo_store.arm_disconnect(
+            10,
+            bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xcd; 32]),
+        )?;
+        drop(state);
+
+        let error = match NodeState::open(config) {
+            Ok(_) => anyhow::bail!("node reopened with an armed disconnect marker"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        for store in ["chainstate", "chainstate-checkpoints", "txindex", "filters"] {
+            let path = data_dir.join(store);
+            assert!(
+                message.contains(&path.display().to_string()),
+                "startup refusal omitted {}: {message}",
+                path.display()
+            );
+        }
         Ok(())
     }
 

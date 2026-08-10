@@ -36,6 +36,9 @@ pub mod logging;
 pub mod metrics;
 /// Node-side active-chain view for server-side P2P responders.
 pub mod p2p_chain;
+
+/// Switching the applied chain from one branch to another.
+pub mod reorg;
 /// Top-level node runner.
 pub mod run;
 /// Graceful shutdown.
@@ -48,6 +51,8 @@ pub mod state;
 pub mod sync;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
+/// Prevout lookups across a window of consecutive blocks.
+mod window_overlay;
 /// ZMQ publisher trait + implementations for the notification subsystem.
 pub mod zmq_publisher;
 
@@ -57,7 +62,7 @@ pub use block_source::NodeBlockSource;
 pub use config::{Auth, Config};
 pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;
-pub use state::ApplyError;
+pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
 pub use utxo_view::UtxoSetView;
 pub use zmq_publisher::{NoOpZmqPublisher, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher};
