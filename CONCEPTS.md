@@ -46,7 +46,7 @@ The pure-Rust script verification path maintained alongside the bitcoinkernel de
 Parsing each block exactly once with `bitcoinkernel::Block::new` (wrapped as `KernelBlock` in `crates/consensus/src/kernel.rs`) and reusing that parse for everything downstream. It supplies three things at once: the **txids** (Core's `CTransaction` hashes itself while deserializing, using the SHA-256 implementation Core selects at runtime — `avx2(8way)` on Skylake-SP), and the **transaction objects** that script preparation borrows via `TransactionRef` instead of re-serializing. It replaced a scalar `compute_txid` pass plus a per-transaction `encode::serialize` → `Transaction::new` round-trip, cutting `script_prepare` from 18.55s to 4.29s and the 0→150k replay from 137.3s to 121.9s. The costing lesson generalizes: **price a replacement by everything it subsumes**, not by the line item that motivated it — costed against parse-and-serialize alone the same change scores +1.54s and looks like a loss.
 
 ### Parallel granularity (per-item cost rule)
-Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks. Measured both directions on the same apply path: script checks (~100 µs per input) wanted *more* parallelism, and lowering `MIN_PARALLEL_SCRIPT_CHECKS` from 16 to 4 bought 1.15×; UTXO lookups (~500 ns) wanted *none*, and deleting two rayon fan-outs bought 1.07× and 1.11×. Merkle nodes (~2.6 µs) sit in between and measured neutral-to-worse. A threshold has an interior optimum in both directions — below 4 the script threshold turns back up, and pool width peaks at 32 then degrades at 64. Always gate on **elapsed**, never on the stage being targeted: parallel prepare makes `script_prepare` 30% faster and the whole run 4% slower by contending with the script-verify pool. See `docs/solutions/performance-issues/txid-parallelization-delivers-2x-but-core-still-leads.md`.
+Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks. Measured both directions on the same apply path: script checks (~100 µs per input) wanted *more* parallelism, and lowering `MIN_PARALLEL_SCRIPT_CHECKS` from 16 to 4 bought 1.15×; UTXO lookups (~500 ns) wanted *none*, and deleting two rayon fan-outs bought 1.07× and 1.11×. Merkle nodes (~2.6 µs) sit in between: Rayon task fan-out over scalar nodes measured neutral-to-worse (SIMD multi-buffer hashing is a different lever because it reduces cost per group rather than changing task granularity). A threshold has an interior optimum in both directions — below 4 the script threshold turns back up, and pool width peaks at 32 then degrades at 64. Always gate on **elapsed**, never on the stage being targeted: parallel prepare makes `script_prepare` 30% faster and the whole run 4% slower by contending with the script-verify pool. See `docs/solutions/performance-issues/txid-parallelization-delivers-2x-but-core-still-leads.md`.
 
 ### Matched-harness comparison
 The requirement that a cross-node benchmark match every input that is not the thing under test — block source, validation posture, CPU pinning, and time of measurement — before any ratio is quoted. Each mismatch found in this repo moved the headline materially: Core's reference was months stale (67s → re-derived 59.6s); bitcoin-rs fetched blocks over REST from a live `bitcoind` while Core read local `blk*.dat`, which cost ~35s of harness *and* contended for CPU (121.9s → 84.6s once `--blocks-file` matched it); and GoCoin skips script verification below its default `LastTrustedBlock` of #940000, so it must be compared either against an assume-valid bitcoin-rs run or with that asymmetry stated. Interleave both nodes back-to-back on an idle host and quote paired medians; comparing your best run against someone else's old run is not a measurement.
@@ -150,6 +150,27 @@ block verifies normally. The historical pre-batching capture measured 78.4s /
 643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
 not one interleaved run. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
+
+### Script-check floor
+
+The native reference baseline for script verification, calculated by
+running the exact captured input corpus through `CPubKey::Verify` from
+libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
+31.99.0 development sources: public key parsing, lax DER parsing, signature
+normalization, and `secp256k1_ecdsa_verify`). On mainnet 0..150,000, all
+2,868,199 input checks execute exactly one `OP_CHECKSIG` and one successful
+ECDSA verification ($a = 1.0$). Native `CPubKey::Verify` execution averages
+39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs
+per check ($X$).
+
+The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA
+overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI
+wrapper costs). The residual is a ceiling over non-native per-check work, not a
+promised or wholly removable gain. At 46.59% of per-check verification cost,
+this residual exceeds the 27.73% threshold required for a 5% total wall-time
+improvement (a 5.85s ceiling within the 12.55s script stage), keeping the
+non-crypto script optimization lever open. See
+`docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
 
 ### Front-half duplication
 
