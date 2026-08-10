@@ -120,7 +120,7 @@ BRS_CENSUS_LABEL=c150 \
 taskset -c 0-31 \
 "$EXP/target/release/examples/mainnet_prefix_replay" \
   --stop-height 150000 \
-  --block-file "$C150/blocks.dat" \
+  --blocks-file "$C150/blocks.dat" \
   --corpus-manifest "$C150/manifest.json" \
   --assume-valid-height 0 \
   --data-dir "$EXP/out/c150-datadir" \
