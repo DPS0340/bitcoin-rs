@@ -8,18 +8,18 @@ The remaining 34.30 µs (46.59%) covers legacy sighash construction, script
 evaluation, and wrapper overhead. That residual exceeds the 27.73% lever
 threshold.
 
-## Census methodology and 22-counter results
+## Census methodology and 24-counter results
 
-The production `libbitcoinkernel` FFI verification path was instrumented to capture all script execution and cryptographic operations across mainnet blocks 0..150,000 without altering verification semantics.
+The production `libbitcoinkernel` FFI verification path was instrumented to capture all script execution and cryptographic operations across mainnet blocks 0..150,000 without altering verification semantics. The pipeline emits four file-bound native streams in the same process run using same-open parse-stream custody: `BRSCTX1\0` (contexts), `BRSJRN1\0` (journal), `BRSREC1\0` (records), and a 24-counter JSON header.
 
-Across 2,868,199 input checks, the 22 u64 counters yielded:
+Across 2,868,199 input checks, the 24 u64 counters yielded:
 
 | Counter Name | Count | Description |
 |---|---|---|
 | `verify_script_calls` | 2,868,199 | Total script verification invocations |
 | `ffi_verify_entries` | 2,868,199 | Bitcoinkernel FFI verify entry calls |
 | `ffi_verify_true` | 2,868,199 | Successful FFI verify returns |
-| `eval_script_entries` | 5,736,398 | Script evaluator entry points (scriptPubKey & scriptSig) |
+| `eval_script_entries` | 5,736,398 | Script evaluator entry points (two passes: scriptSig + scriptPubKey per P2PKH check) |
 | `op_checksig` | 2,868,199 | `OP_CHECKSIG` executions |
 | `op_checksigverify` | 0 | `OP_CHECKSIGVERIFY` executions |
 | `op_checkmultisig` | 0 | `OP_CHECKMULTISIG` executions |
@@ -38,9 +38,12 @@ Across 2,868,199 input checks, the 22 u64 counters yielded:
 | `sighash_midstate_hit` | 0 | Sighash midstate cache hits |
 | `checkschnorr_entries` | 0 | Schnorr check entries |
 | `schnorr_verify_calls` | 0 | Schnorr verification calls |
+| `schnorr_verify_ok` | 0 | Successful Schnorr verification calls |
+| `schnorr_verify_fail` | 0 | Failed Schnorr verification calls |
 
-**Key Census Fact**: Exactly $a = 1.0$ ECDSA attempts occur per kernel script check ($2,868,199 / 2,868,199$). There are zero pre-secp rejects, zero failures, zero multisig operations, and zero Schnorr checks in this historical 0..150,000 window.
+**Key Census Fact**: Exactly $a = 1.0$ ECDSA attempts occur per kernel script check ($2,868,199 / 2,868,199$). Every input in mainnet blocks 0..150,000 is an ordinary legacy bare P2PKH spend. All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) are zero. `eval_script_entries` is exactly $2 \times 2,868,199 = 5,736,398$. The exact product predicate (`_c150_passed`) evaluates to `all_passed: true` and `c150_passed: true`.
 
+**Certification Pipeline and Rule**: Authoritative certification requires strict `mainnet-prefix-replay-validation-v1` inputs, file-bound binary streams, and exact classifier (`classify-corpus-v2`) validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
 ## Capture corpus and integrity proofs
 
 - **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`
@@ -51,7 +54,7 @@ Across 2,868,199 input checks, the 22 u64 counters yielded:
 - **Capture Repeat (INV-13)**: Both 159,259-record captures produced sorted-record SHA-256 `9841e3afc79018400c568d86b60747f9a0c1d6d1184fc3caf4815860f88739d2`.
 - **Source Integrity (INV-14)**: `bitcoin/src/pubkey.cpp` SHA-256 is byte-identical in pristine and instrumented trees (`0c86716f3626f591e643bd327fe0e48f6cebba8da3aba91ec6587256d725f1c0`). The 178-file `secp256k1` tree manifest SHA-256 is byte-identical (`b61a27000f45b4408f8699bea9ec69668677696fbc22685e8c4111e1a5e7c6ee`). Source identity is authoritative as the debug build (`RelWithDebInfo`) embeds source paths with no LTO/IPO.
 - **Native Correctness (INV-8)**: 159,259 expected true vs 159,259 native true; 0 mismatches (`mismatches == 0`, `ok_equals_count_outcome_1 == true`).
-- **Instrumentation Isolation (INV-15)**: All 22 counters stayed at 0 during direct native timing runs.
+- **Instrumentation Isolation (INV-15)**: All 24 counters stayed at 0 during direct native timing runs.
 - **Rust Diagnostic**: Rust `secp256k1` 0.31.1 rejected 2 lax-DER records pre-verification due to strict DER parser differences; Core native parity is authoritative.
 
 ## Reproduce the experiment
@@ -89,6 +92,31 @@ All runs pinned to `taskset -c 0-31`:
     25.782138 µs/check (35.0194%), still above the 27.7291% threshold.
 
 Because $r = 46.5889\% \ge 27.7291\%$, the verdict is **OPEN**.
+## Replay durability proof and storage custody
+
+Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`) proves state stability and reorg safety across all three storage backends (`fjall`, `rocksdb`, `redb`). The harness uses disposable reflink copies (`cp --reflink=always -a`), guaranteeing that original store contents remain untouched and byte-identical.
+
+### Immutable Original Store Custody
+
+Original store digests use deterministic POSIX-path file framing (`sha256(u64le(path_len)||path||u64le(file_size)||file_bytes)`):
+
+| Backend | File Count | Total Bytes | Original Store SHA-256 (Pre == Post) |
+|---|---|---|---|
+| `fjall` | 50 | 1,119,730,063 | `5ea0d8ef6f473a5809e06e6ebc9dc9cfc3a9ed8abe4d92488ca68ebce88d3409` |
+| `rocksdb` | 28 | 1,000,273,901 | `97cec9bc615d040a518f71179ddadd27e7d91effe86cd46f3cdfe502b0f336d0` |
+| `redb` | 12 | 1,317,885,356 | `ecd80f3ada801a66e26090bedfb346f5654c2a497dcc1a0da1c22aebd2d1af15` |
+
+Custody Summary: `/home/alpha/bench-g14/corpora/c150/durability-sdd/custody-summary.json`.
+
+### Durability Proof Invariants
+
+All three proof JSONs in `/home/alpha/bench-g14/corpora/c150/durability-sdd/` pass with checkpoint generation 2, two reopens, and exact invariant equality (`before == after`):
+
+1. **`proof-fjall.json`**: 1,224 B, SHA256 `7fd144699bf714c5b1d7b34b45b0a77790210710056c9f04b6e6f1a6a324bb9b`
+2. **`proof-rocksdb.json`**: 1,226 B, SHA256 `f64786a191597cb1099e3f42e08a21de8dd08a1903dee547d51f2baa4e921a78`
+3. **`proof-redb.json`**: 1,223 B, SHA256 `40a585ff8f1c146b7899f5d62a91d7ce487b9c43ac307d1a1f11e792519b917d`
+
+Each backend executes production `switch_to_branch` to the parent block and back to the original tip using durable bodies and undo records, publishes a clean checkpoint, reopens twice, and confirms zero state drift.
 
 ## Scope and limits
 
