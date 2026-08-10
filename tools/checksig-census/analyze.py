@@ -1807,9 +1807,7 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     elapsed_seconds = _require_float(raw["elapsed_seconds"], "replay.elapsed_seconds", ge=0.0)
     fetch_seconds = _require_float(raw["fetch_seconds"], "replay.fetch_seconds", ge=0.0)
 
-    git_head = raw["git_head"]
-    if not isinstance(git_head, str) or len(git_head) != 40:
-        raise AnalyzerError("CTX-CUSTODY: replay.git_head must be a 40-character hex string")
+    git_head = _require_hex_str(raw["git_head"], "replay.git_head", 40)
 
     measurement_target = raw["measurement_target"]
     if not isinstance(measurement_target, str) or len(measurement_target) == 0:
@@ -1822,12 +1820,38 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
         raise AnalyzerError(f"CTX-CUSTODY: replay.rss_high_water_bytes must be >= 0, got {rss_high_water_bytes}")
 
     stage_seconds = raw["stage_seconds"]
-    if not isinstance(stage_seconds, list) or not all(
-        isinstance(v, dict) and "count" in v and "stage" in v and "sum_seconds" in v
-        and isinstance(v["count"], int) and isinstance(v["stage"], str) and isinstance(v["sum_seconds"], float)
-        and v["count"] >= 0 and v["sum_seconds"] >= 0 for v in stage_seconds
-    ):
-        raise AnalyzerError("CTX-CUSTODY: replay.stage_seconds must be a list of objects with count, stage, and sum_seconds")
+    if not isinstance(stage_seconds, list):
+        raise AnalyzerError("CTX-CUSTODY: replay.stage_seconds must be a list")
+    _STAGE_ENTRY_KEYS = {"count", "stage", "sum_seconds"}
+    for _stage_entry in stage_seconds:
+        if not isinstance(_stage_entry, dict):
+            raise AnalyzerError(
+                "CTX-CUSTODY: replay.stage_seconds entries must be objects with "
+                "count, stage, and sum_seconds"
+            )
+        _require_exact_keys(_stage_entry, _STAGE_ENTRY_KEYS, "replay.stage_seconds entry")
+        _stage_count = _stage_entry["count"]
+        if isinstance(_stage_count, bool) or not isinstance(_stage_count, int):
+            raise AnalyzerError(
+                "CTX-CUSTODY: replay.stage_seconds count must be a non-bool integer"
+            )
+        if _stage_count < 0:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: replay.stage_seconds count must be >= 0, got {_stage_count}"
+            )
+        _stage_name = _stage_entry["stage"]
+        if not isinstance(_stage_name, str):
+            raise AnalyzerError("CTX-CUSTODY: replay.stage_seconds stage must be a string")
+        _stage_sum = _stage_entry["sum_seconds"]
+        if isinstance(_stage_sum, bool) or not isinstance(_stage_sum, float):
+            raise AnalyzerError(
+                "CTX-CUSTODY: replay.stage_seconds sum_seconds must be a float"
+            )
+        if not math.isfinite(_stage_sum) or _stage_sum < 0.0:
+            raise AnalyzerError(
+                "CTX-CUSTODY: replay.stage_seconds sum_seconds must be finite and "
+                f">= 0, got {_stage_sum}"
+            )
 
     storage_backend = raw["storage_backend"]
     if not isinstance(storage_backend, str) or len(storage_backend) == 0:
@@ -2778,9 +2802,17 @@ def _count_context_records_disk(
 def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
     """Exact C150 product predicate.
 
-    All 11 CONTEXT_COUNTER_NAMES are zero; the equality-chain counters all
-    equal EXPECTED_FFI_VERIFY_ENTRIES_FULL (2_868_199); all complementary
-    counters are zero.
+    All 11 CONTEXT_COUNTER_NAMES are zero; the six ordinary equality-chain
+    counters all equal EXPECTED_FFI_VERIFY_ENTRIES_FULL (2_868_199); all
+    complementary counters are zero.
+
+    ``eval_script_entries`` is checked separately and must equal exactly twice
+    the canonical total (2 * 2_868_199 == 5_736_398), not the one-times total.
+    Every ordinary C150 spend is a bare P2PKH whose VerifyScript runs two
+    EvalScript passes -- one over the scriptSig and one over the scriptPubKey --
+    so the instrumented kernel emits two EvalScript entries per VerifyScript
+    call. It is therefore deliberately excluded from the one-times equality
+    tuple and pinned to ``2 * expected`` on its own line.
     """
     # All 11 context counters must be zero
     if any(counts[name] != 0 for name in CONTEXT_COUNTER_NAMES):
@@ -2796,6 +2828,10 @@ def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
         counters.ecdsa_verify_ok,
     )
     if any(v != expected for v in equality_chain):
+        return False
+    # eval_script_entries is exactly twice the ordinary total: two EvalScript
+    # passes (scriptSig + scriptPubKey) per ordinary P2PKH VerifyScript call.
+    if counters.eval_script_entries != 2 * expected:
         return False
     # Complementary counters must be zero
     complementary_zero = (

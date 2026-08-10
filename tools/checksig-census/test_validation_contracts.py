@@ -3463,6 +3463,95 @@ def test_replay_rejects_unknown_field() -> None:
         )
 
 
+def test_replay_rejects_nonhex_git_head() -> None:
+    """A git_head with a non-hex character (but 40 chars) raises CTX-CUSTODY."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xea" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp, [ctx_row], [record], journal, "c150",
+            replay_overrides={"git_head": "z" * 40},
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "nonhex git_head",
+            "CTX-CUSTODY",
+            "lowercase hex",
+        )
+
+
+def test_replay_rejects_uppercase_git_head() -> None:
+    """An uppercase-hex git_head (40 chars) raises CTX-CUSTODY: lowercase only."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xeb" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp, [ctx_row], [record], journal, "c150",
+            replay_overrides={"git_head": "A" * 40},
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "uppercase git_head",
+            "CTX-CUSTODY",
+            "lowercase hex",
+        )
+
+
+def test_replay_rejects_bool_stage_count() -> None:
+    """A stage_seconds entry whose count is a bool raises CTX-CUSTODY."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xec" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp, [ctx_row], [record], journal, "c150",
+            replay_overrides={"stage_seconds": [
+                {"count": True, "stage": "node.apply_block.total_seconds", "sum_seconds": 1.0}
+            ]},
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "bool stage count",
+            "CTX-CUSTODY",
+            "non-bool integer",
+        )
+
+
+def test_replay_rejects_extra_stage_key() -> None:
+    """A stage_seconds entry with an extra key raises CTX-CUSTODY."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xed" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp, [ctx_row], [record], journal, "c150",
+            replay_overrides={"stage_seconds": [
+                {"count": 1, "stage": "node.apply_block.total_seconds",
+                 "sum_seconds": 1.0, "unexpected": 0}
+            ]},
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "extra stage key",
+            "CTX-CUSTODY",
+            "unknown key",
+        )
+
+
 def test_manifest_rejects_unknown_field() -> None:
     """Manifest with an unknown top-level field raises CTX-CUSTODY."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -3938,13 +4027,18 @@ def _c150_canonical_counts() -> dict[str, int]:
 
 
 def _c150_canonical_counters_dict(target: int = EXPECTED_FFI_VERIFY_ENTRIES_FULL) -> dict[str, object]:
-    """A counters dict where the equality chain equals *target* and all
-    complementary counters are zero."""
+    """A counters dict matching the canonical C150 shape.
+
+    The six ordinary equality-chain counters equal *target* (2_868_199) and
+    all complementary counters are zero. ``eval_script_entries`` is set to
+    ``2 * target`` (5_736_398) because every ordinary P2PKH VerifyScript runs
+    two EvalScript passes (scriptSig + scriptPubKey); it must never equal the
+    one-times ordinary total."""
     d = _valid_counters_dict(
         ffi_verify_entries=target,
         verify_script_calls=target,
         ffi_verify_true=target,
-        eval_script_entries=target,
+        eval_script_entries=2 * target,
         op_checksig=target,
         checkecdsa_entries=target,
         ecdsa_from_checksig=target,
@@ -4012,6 +4106,26 @@ def test_c150_nonzero_context_counter_fails() -> None:
         counters = Counters(_c150_canonical_counters_dict())
         assert _c150_passed(counts, counters) is False, (
             f"_c150_passed should fail when {ctx_name} is nonzero"
+        )
+
+
+def test_c150_eval_script_entries_not_double_fails() -> None:
+    """eval_script_entries must equal exactly 2*expected (5_736_398).
+
+    Setting it to the one-times ordinary total (the value the report wrongly
+    claimed) must make _c150_passed return False, and every other off-by-one
+    variant must fail too."""
+    counts = _c150_canonical_counts()
+    for bad in (
+        EXPECTED_FFI_VERIFY_ENTRIES_FULL,            # one-times ordinary total
+        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL - 1,    # one short of double
+        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL + 1,    # one over double
+    ):
+        d = _c150_canonical_counters_dict()
+        d["eval_script_entries"] = bad
+        counters = Counters(d)
+        assert _c150_passed(counts, counters) is False, (
+            f"_c150_passed should fail when eval_script_entries is {bad}"
         )
 
 
@@ -4803,6 +4917,10 @@ def main() -> int:
         test_replay_rejects_block_count_mismatch,
         test_replay_rejects_missing_stop_hash,
         test_replay_rejects_unknown_field,
+        test_replay_rejects_nonhex_git_head,
+        test_replay_rejects_uppercase_git_head,
+        test_replay_rejects_bool_stage_count,
+        test_replay_rejects_extra_stage_key,
         test_manifest_rejects_unknown_field,
         test_manifest_rejects_out_of_u32_range_height,
         test_manifest_rejects_out_of_u64_range_offset,
@@ -4817,6 +4935,7 @@ def main() -> int:
         test_c150_zero_total_fails,
         test_c150_mutate_each_equality_member_fails,
         test_c150_nonzero_context_counter_fails,
+        test_c150_eval_script_entries_not_double_fails,
         test_counters_rejects_missing_context_count,
         test_counters_rejects_missing_record_count,
         test_counters_rejects_missing_journal_count,
