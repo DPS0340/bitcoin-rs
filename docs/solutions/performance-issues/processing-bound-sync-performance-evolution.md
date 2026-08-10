@@ -23,6 +23,27 @@ tags:
 
 # Two thread-pool constants were tuned against a contended harness; fixing them cut CPU 3.5× and took Core's lead to 1.28×
 
+## Current matched result (2026-08-09)
+
+The current local-file, full-verification replay no longer trails Core. At
+commit `ff2615a`, three interleaved rounds measured production-matched
+bitcoin-rs at **56.16s / 396.50 CPU-s** and Core 31.0 at
+**64.74s / 477.82 CPU-s**. bitcoin-rs leads 1.153× on wall time and 1.205× on
+total CPU for this processing-bound fjall panel.
+
+Allocator parity is load-bearing for wall time: the same bitcoin-rs source
+with the system allocator measured 63.43s / 399.63 CPU-s. Mimalloc clears the
+wall gate but not the CPU gate, and raises peak RSS from 573,440,000 to
+664,252,416 bytes. The system and mimalloc validation passes matched Core's
+height-150,000 MuHash, UTXO count, total amount, and stop hash. See
+[`allocator-parity-changes-wall-not-cpu.md`](../performance/allocator-parity-changes-wall-not-cpu.md)
+and the tracked
+[`allocator-custody-v1.json`](../../benchmarks/data/end-to-end-sync/allocator-custody-v1.json).
+
+All older processing-bound Core-lead figures below remain historical evidence;
+they are not the current verdict. The P2P figures describe a different sync
+regime and remain separate.
+
 ## Context
 
 Processing-bound replay `mainnet_prefix_replay --rest-url 127.0.0.1:18443 --assume-valid-height 0 --stop-height 150000` over local `bitcoind -rest` (fjall backend, full script verification both sides) is the correct instrument for CPU work per `small-window-benchmarks-do-not-predict-at-scale-throughput.md`. Baseline at `4700c25` was **389.7s / 385 blk/s** vs Core `67s` / 2240 blk/s (5.8×).

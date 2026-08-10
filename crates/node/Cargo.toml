@@ -84,6 +84,7 @@ mdbx = [
     "bitcoin-rs-storage/mdbx",
 ]
 kernel = ["bitcoin-rs-consensus/kernel"]
+mimalloc = ["dep:mimalloc"]
 utreexo = ["dep:bitcoin-rs-utreexo"]
 prometheus-http = ["metrics-exporter-prometheus/http-listener"]
 
@@ -108,6 +109,7 @@ bitcoin-rs-rpc.workspace = true
 bitcoin-rs-electrum.workspace = true
 
 bitcoin.workspace = true
+mimalloc = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true
 toml.workspace = true
