@@ -214,6 +214,15 @@ fn install_metrics_with(
 }
 
 #[cfg(test)]
+pub(crate) fn test_recorder() -> (impl Recorder, MetricsHandle) {
+    let recorder = InMemoryRecorder::default();
+    let handle = MetricsHandle {
+        bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+        recorder: recorder.clone(),
+    };
+    (recorder, handle)
+}
+#[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -284,12 +293,4 @@ mod tests {
         );
     }
 
-    fn test_recorder() -> (InMemoryRecorder, MetricsHandle) {
-        let recorder = InMemoryRecorder::default();
-        let handle = MetricsHandle {
-            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            recorder: recorder.clone(),
-        };
-        (recorder, handle)
-    }
 }
