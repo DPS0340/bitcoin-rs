@@ -35,7 +35,7 @@ The same difficulty helper also affected `getblockheader`, `getblock`,
 The original calculation divided the current target by the network's own
 proof-of-work limit. That makes the easiest target on every network report
 `1.0`, even though Core defines difficulty as a multiple of the
-difficulty-1 target and therefore uses the mainnet difficulty-1 reference
+difficulty-1 target and therefore uses that network-independent reference
 independently of the selected network.
 
 There is a second compatibility trap after the value is corrected. Core's
@@ -49,10 +49,12 @@ The operation order matters for the final IEEE-754 bit. For
 `0x207fffff`, both implementations produce the double whose bits correspond
 to `4.6565423739069247e-10`.
 
-Core's RPC layer then formats that double with `%.16g`, while serde emits the
-shortest round-trip representation. Consequently, Core prints
-`4.656542373906925e-10` and serde prints `4.6565423739069247e-10`; these are
-different strings even though the underlying value is the same.
+Core's RPC layer then formats that double with `%.16g` through UniValue, while
+the production RPC path here serializes its `sonic_rs::Value` with
+`sonic_rs::to_string`. sonic-rs delegates finite f64 formatting to its
+shortest-round-trip `zmij` formatter. Consequently, Core prints
+`4.656542373906925e-10` and sonic-rs prints `4.6565423739069247e-10`; these
+are different strings even though the underlying value is the same.
 
 ## Fix
 
@@ -60,10 +62,14 @@ Compute difficulty with the Core mantissa ratio and the repeated `256.0`
 scaling loop. Guard a zero mantissa and return `0.0` for that impossible but
 representable header value rather than dividing by zero.
 
-Assert compatibility at the value level with `f64::to_bits()`, not by
-comparing JSON text. Do not add a one-ULP adjustment to make serde's shortest
-spelling resemble Core's `%.16g` output: that changes the API value and makes
-it differ from Core's value precisely to match Core's formatting.
+For direct algorithm tests, where both results are still pre-serialization
+doubles, assert compatibility at the value level with `f64::to_bits()`. Once
+either result has crossed the wire, Core's `%.16g` rendering can parse back to
+an adjacent double; compare with an appropriate tolerance or normalize the
+wire representation instead of requiring exact parsed-bit equality. Do not
+add a one-ULP adjustment to make sonic-rs's shortest spelling resemble Core's
+`%.16g` output: that changes the API value and makes it differ from Core's
+value precisely to match Core's formatting.
 
 ## Why This Works
 
@@ -74,8 +80,9 @@ representations of the same IEEE-754 number.
 
 ## Prevention
 
-- Compare cross-node floating-point RPC results by exact value or
-  `f64::to_bits()`, not by serialized decimal text.
+- Compare direct cross-node floating-point algorithm results by exact value or
+  `f64::to_bits()` before serialization. For values parsed from RPC text, use
+  a documented tolerance or canonicalize the representation before comparing.
 - Preserve the reference implementation's floating-point operation order;
   algebraically equivalent target division or `powi` can change the last bit.
 - Treat a rendering mismatch as a serializer issue. Never change a numeric

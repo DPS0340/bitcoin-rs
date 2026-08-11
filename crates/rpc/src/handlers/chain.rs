@@ -2,8 +2,9 @@ use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use core::str::FromStr as _;
+use core::{fmt, fmt::Write as _};
 
-use bitcoin_rs_chain::NodeStatus;
+use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
@@ -14,21 +15,19 @@ use crate::handlers::{ensure_no_params, optional_bool, params_array, required_st
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let applied = ctx.applied_height();
+    let applied_tip = ctx.applied_tip.load_full();
+    let applied = applied_tip.as_ref().map_or(0, |tip| tip.height);
     let headers = ctx.height();
-    let (difficulty, time, mediantime) =
-        ctx.applied_tip
-            .load_full()
-            .map_or((0.0, 0_u64, 0_u64), |tip| {
-                let tree = ctx.block_tree.read();
-                tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
-                    (
-                        ctx.difficulty_for_bits(node.header.bits),
-                        u64::from(node.header.time),
-                        u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
-                    )
-                })
-            });
+    let (difficulty, time, mediantime) = applied_tip.as_ref().map_or((0.0, 0_u64, 0_u64), |tip| {
+        let tree = ctx.block_tree.read();
+        tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
+            (
+                ctx.difficulty_for_bits(node.header.bits),
+                u64::from(node.header.time),
+                u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+            )
+        })
+    });
     let verification_progress = if headers > 0 {
         f64::from(applied) / f64::from(headers)
     } else {
@@ -47,8 +46,13 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
         fold_block_records(&blocks, applied, None)
     };
     let prune_status = ctx.prune_status();
-    let bestblockhash = ctx.applied_hash().to_string_be();
-    let chainwork = ctx.chainwork_hex();
+    let bestblockhash = applied_tip
+        .as_ref()
+        .map_or_else(Hash256::default, |tip| tip.hash)
+        .to_string_be();
+    let chainwork = applied_tip
+        .as_deref()
+        .map_or_else(|| ctx.chainwork_hex(), chainwork_hex);
     let mut response = sonic_rs::Object::new();
     let _ = response.insert(&"chain", chain);
     let _ = response.insert(&"blocks", applied);
@@ -67,6 +71,15 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     }
     let _ = response.insert(&"warnings", "");
     Ok(Value::from(response))
+}
+
+fn chainwork_hex(tip: &TipSnapshot) -> String {
+    let bytes: [u8; 32] = tip.chainwork.to_be_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _: fmt::Result = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
@@ -1356,6 +1369,52 @@ mod tests {
         assert_eq!(
             difficulty.to_bits(),
             4.656_542_373_906_924_7e-10_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_uses_one_applied_tip_snapshot() {
+        use bitcoin_rs_chain::ChainWork;
+
+        let ctx = context_with_tip(
+            bitcoin_rs_primitives::Network::Regtest,
+            0x207f_ffff,
+            &[100, 300, 200],
+        );
+        let Some(applied) = ctx.applied_tip.load_full() else {
+            panic!("applied tip missing");
+        };
+        let applied_chainwork = ChainWork::from_be_bytes([1; 32]);
+        ctx.set_applied_tip(TipSnapshot {
+            chainwork: applied_chainwork,
+            ..(*applied).clone()
+        });
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: applied.tip_id,
+            height: 99,
+            chainwork: ChainWork::from_be_bytes([2; 32]),
+            hash: Hash256::from_le_bytes(&[9; 32]),
+        });
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        let expected_hash = applied.hash.to_string_be();
+        let expected_chainwork = "01".repeat(32);
+        assert_eq!(
+            result.get("blocks").and_then(JsonValueTrait::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            result.get("headers").and_then(JsonValueTrait::as_u64),
+            Some(99)
+        );
+        assert_eq!(
+            result.get("bestblockhash").and_then(JsonValueTrait::as_str),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            result.get("chainwork").and_then(JsonValueTrait::as_str),
+            Some(expected_chainwork.as_str())
         );
     }
 
