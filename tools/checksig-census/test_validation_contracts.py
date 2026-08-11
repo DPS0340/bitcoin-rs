@@ -5727,6 +5727,112 @@ def test_c150_helper_parity() -> None:
         assert totals["p2sh_wrapped_witness_v0_spends"] == 0
 
 
+def test_diagnostic_multisig_opcode_allows_multiple_ecdsa_records() -> None:
+    """One CHECKMULTISIG opcode may emit multiple ordered ECDSA records."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xc1" * 32
+        _make_brsctx1_file(
+            tmp / "contexts.bin",
+            [_p2sh_push_only(txid_le, flags=VERIFY_P2SH)],
+        )
+        _write_records_file(
+            tmp / "records.bin",
+            [
+                _make_record_bytes(txid_le, 0, op_kind=3, op_seq=0, outcome=1),
+                _make_record_bytes(txid_le, 0, op_kind=3, op_seq=1, outcome=0),
+            ],
+        )
+        _write_journal_file(
+            tmp / "journal.bin",
+            [
+                _make_journal_bytes(
+                    txid_le,
+                    0,
+                    checksig_ops=0,
+                    checkmultisig_ops=1,
+                    ecdsa_verify_calls=2,
+                    ecdsa_verify_ok=1,
+                )
+            ],
+        )
+        paths = {
+            "contexts": tmp / "contexts.bin",
+            "records": tmp / "records.bin",
+            "journal": tmp / "journal.bin",
+        }
+        row = DiagnosticCheckpoint(
+            height=164676,
+            block_hash_le=b"\x01" * 32,
+            context_rows=1,
+            context_end=paths["contexts"].stat().st_size,
+            record_rows=2,
+            record_end=paths["records"].stat().st_size,
+            journal_rows=1,
+            journal_end=paths["journal"].stat().st_size,
+        )
+
+        _classified, records, journal, _context_map, record_counts = (
+            _read_diagnostic_streams(row, None, paths)
+        )
+
+        assert len(records) == 2
+        assert journal[0].checkmultisig_ops == 1
+        assert journal[0].ecdsa_verify_calls == 2
+        assert journal[0].ecdsa_verify_ok == 1
+        assert record_counts["p2sh_multisig_checks"] == 2
+
+
+def test_diagnostic_multisig_short_circuit_zero_ecdsa_records() -> None:
+    """One CHECKMULTISIG opcode may short-circuit before any ECDSA verification."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xc2" * 32
+        _make_brsctx1_file(
+            tmp / "contexts.bin",
+            [_p2sh_push_only(txid_le, flags=VERIFY_P2SH)],
+        )
+        _write_records_file(tmp / "records.bin", [])
+        _write_journal_file(
+            tmp / "journal.bin",
+            [
+                _make_journal_bytes(
+                    txid_le,
+                    0,
+                    checksig_ops=0,
+                    checkmultisig_ops=1,
+                    ecdsa_verify_calls=0,
+                    ecdsa_verify_ok=0,
+                )
+            ],
+        )
+        paths = {
+            "contexts": tmp / "contexts.bin",
+            "records": tmp / "records.bin",
+            "journal": tmp / "journal.bin",
+        }
+        row = DiagnosticCheckpoint(
+            height=2,
+            block_hash_le=b"\x02" * 32,
+            context_rows=1,
+            context_end=paths["contexts"].stat().st_size,
+            record_rows=0,
+            record_end=paths["records"].stat().st_size,
+            journal_rows=1,
+            journal_end=paths["journal"].stat().st_size,
+        )
+
+        _classified, records, journal, _context_map, record_counts = (
+            _read_diagnostic_streams(row, None, paths)
+        )
+
+        assert len(records) == 0
+        assert journal[0].checkmultisig_ops == 1
+        assert journal[0].ecdsa_verify_calls == 0
+        assert journal[0].ecdsa_verify_ok == 0
+        assert record_counts["p2sh_multisig_checks"] == 0
+
+
 def test_diagnostic_helper_synthetic_all_types() -> None:
     """A synthetic fixture with all spend contexts/record rules counts all 11 types."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -6110,6 +6216,8 @@ def main() -> int:
         test_read_bounded_context_rows_trailing_uncommitted,
         test_read_bounded_context_rows_truncated_row,
         test_c150_helper_parity,
+        test_diagnostic_multisig_opcode_allows_multiple_ecdsa_records,
+        test_diagnostic_multisig_short_circuit_zero_ecdsa_records,
         test_diagnostic_helper_synthetic_all_types,
         test_diagnostic_op_seq_stream_order_rejects_one_before_zero,
         test_atomic_publish_rollback_fsyncs_after_unlink,

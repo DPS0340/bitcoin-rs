@@ -1023,17 +1023,15 @@ def _read_diagnostic_streams(
 
         for entry in journal:
             actual = record_sums.get(entry.key, [0, 0, 0, 0])
-            expected = [
-                entry.checksig_ops,
-                entry.checkmultisig_ops,
-                entry.ecdsa_verify_calls,
-                entry.ecdsa_verify_ok,
-            ]
-            if actual != expected:
+            # CHECKMULTISIG may emit multiple ECDSA records for one opcode;
+            # reconcile only record-derived ECDSA calls/ok to the journal per key.
+            actual_ecdsa = [actual[2], actual[3]]
+            expected_ecdsa = [entry.ecdsa_verify_calls, entry.ecdsa_verify_ok]
+            if actual_ecdsa != expected_ecdsa:
                 display_txid = entry.spend_txid[::-1].hex()
                 raise AnalyzerError(
-                    f"CTX-OPERATIONS: journal/record totals mismatch for "
-                    f"{display_txid}:{entry.input_index}: expected {expected}, got {actual}"
+                    f"CTX-OPERATIONS: journal/record ECDSA totals mismatch for "
+                    f"{display_txid}:{entry.input_index}: expected {expected_ecdsa}, got {actual_ecdsa}"
                 )
 
         return classified, records, journal, context_map, record_counts
