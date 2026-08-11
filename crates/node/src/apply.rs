@@ -1206,6 +1206,14 @@ pub(crate) fn disconnect_block_admitted(
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
 
+    if handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
+                block_hash,
+            ));
+    }
+
     // The rollback finished in memory, so the marker moves to `RolledBack`.
     // It stays set: a checkpoint has not captured this yet.
     handles
@@ -1218,14 +1226,6 @@ pub(crate) fn disconnect_block_admitted(
                 source: Box::new(ApplyError::UndoPersistence(error)),
             })
         })?;
-
-    if handles.zmq_publisher.wants_notifications() {
-        handles
-            .zmq_publisher
-            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
-                block_hash,
-            ));
-    }
 
     // The marker deliberately stays set here.
     //
@@ -6594,6 +6594,114 @@ mod consensus_rule_tests {
         ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
             Ok(None)
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct CompleteRejectingUndoStore {
+        inner: InMemoryUndoStore,
+    }
+
+    impl UndoStore for CompleteRejectingUndoStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.cancel_disconnect()
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker completion failure".to_owned(),
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    #[test]
+    fn disconnect_sequence_event_publishes_before_marker_completion_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut handles =
+            apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        handles.undo_store = Arc::new(CompleteRejectingUndoStore::default());
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(6)],
+        )?;
+        apply_block(&handles, &block)?;
+
+        let publisher = Arc::new(RecordingSequencePublisher::default());
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        handles = handles.with_zmq_publisher(publisher_handle);
+        publisher.events.lock().clear();
+        *publisher.next_sequence.lock() = 0;
+
+        let outcome = disconnect_block(&handles, &block);
+        assert!(
+            matches!(outcome, Err(crate::DisconnectError::MarkerStuck { .. })),
+            "marker completion failure must report MarkerStuck, got {outcome:?}"
+        );
+        assert_eq!(
+            publisher.events.lock().as_slice(),
+            &[(
+                Hash256::from_le_bytes(block.block_hash().as_byte_array()),
+                b'D',
+                0
+            )]
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load_full()
+                .as_deref()
+                .map(|tip| tip.height),
+            Some(0),
+            "the applied tip must already be rolled back on MarkerStuck"
+        );
+        Ok(())
     }
 
     /// The ordering contract: undo is written before the UTXO commit and before
