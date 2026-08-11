@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize;
+use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin_rs_primitives::Hash256;
 use sonic_rs::{Value, json};
@@ -116,7 +117,7 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<(BlockRecord,
         let Some(header) = decode_header(&record) else {
             break;
         };
-        if header.prev_blockhash.to_string() != previous_hash.to_string_be() {
+        if Hash256::from_le_bytes(header.prev_blockhash.as_byte_array()) != previous_hash {
             break;
         }
         previous_hash = record.hash;
@@ -250,7 +251,6 @@ fn not_found_with(message: &'static str) -> Response {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Version};
     use sonic_rs::JsonValueTrait;
 
