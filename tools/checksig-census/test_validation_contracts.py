@@ -220,6 +220,26 @@ def _write_journal_file(path: Path, entries: list[bytes]) -> None:
     path.write_bytes(data)
 
 
+_PRESERVED_OVER_CAPACITY_ROW = bytes.fromhex(
+    "cf42bd87b9982595bf2d354c5f758c144d663301cefc3b31ad3132f87f4918d1"
+    "00000000000000000300020042000100"
+    + "00" * 176
+)
+assert len(_PRESERVED_OVER_CAPACITY_ROW) == RECORD_SIZE
+assert hashlib.sha256(_PRESERVED_OVER_CAPACITY_ROW).hexdigest() == (
+    "316f268a31cea2efdd5f8d37c2cd87d0d5597d19756490331978894c42e8c78c"
+)
+
+
+def _assert_over_capacity_length_error(raw: bytes, label: str) -> None:
+    _raises_with(
+        AnalyzerError,
+        lambda: Record(raw),
+        label,
+        "pubkey_len 66 exceeds 65",
+    )
+
+
 # ── BRSCTX1 binary builder ───────────────────────────────────────────────────
 
 # Must match context.py CONTEXT_FIXED = struct.Struct("<32sIIIII") (52 bytes).
@@ -1053,6 +1073,80 @@ def test_records_reject_invalid_encoded_fields() -> None:
             record[offset] = bad
             _write_records_file(path, [bytes(record)])
             _raises(AnalyzerError, lambda p=path: parse_records(p), f"{field}={bad}")
+
+
+def test_records_accept_preserved_over_capacity_ecdsa_reject() -> None:
+    """The public reader accepts the exact native reason-1 preserved row."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "records.bin"
+        _write_records_file(path, [_PRESERVED_OVER_CAPACITY_ROW])
+        records = parse_records(path)
+    assert len(records) == 1
+    record = records[0]
+    assert record.spend_txid[::-1].hex() == (
+        "d118497ff83231ad313bfcce0133664d148c755f4c352dbf952598b987bd42cf"
+    )
+    assert (record.input_index, record.op_kind, record.sig_version) == (0, 3, 0)
+    assert (record.outcome, record.der_len, record.pubkey_len) == (2, 0, 66)
+    assert (record.sighash_type, record.reject_reason) == (0, 1)
+
+
+def test_records_reject_every_over_capacity_shape_near_miss() -> None:
+    """Every valid-domain gating-field near miss retains the length error."""
+    mutations = (
+        (40, 0, "op_kind=0"),
+        (40, 5, "op_kind=5"),
+        (41, 2, "sig_version=2"),
+        (41, 3, "sig_version=3"),
+        (42, 0, "outcome=0"),
+        (42, 1, "outcome=1"),
+        (43, 1, "der_len=1"),
+        (43, 73, "der_len=73"),
+        (45, 1, "sighash_type=1"),
+        (46, 0, "reject_reason=0"),
+        *((46, reason, f"reject_reason={reason}") for reason in range(2, 9)),
+    )
+    for offset, value, label in mutations:
+        raw = bytearray(_PRESERVED_OVER_CAPACITY_ROW)
+        raw[offset] = value
+        _assert_over_capacity_length_error(bytes(raw), label)
+
+    for offset in range(48, 217):
+        raw = bytearray(_PRESERVED_OVER_CAPACITY_ROW)
+        raw[offset] = 1
+        _assert_over_capacity_length_error(bytes(raw), f"nonzero payload/pad byte {offset}")
+
+
+def test_records_reject_ordinary_over_capacity_pubkey() -> None:
+    """An ordinary verification record with pubkey_len=66 stays invalid."""
+    raw = bytearray(_make_record_bytes(b"\x01" * 32, 0))
+    raw[44] = 66
+    _assert_over_capacity_length_error(bytes(raw), "ordinary pubkey_len=66")
+
+
+def test_preserved_over_capacity_padding_checks_remain_unchanged() -> None:
+    """The exact accepted row has all-zero padding, and ordinary records still fail with the existing padding errors."""
+    record = Record(_PRESERVED_OVER_CAPACITY_ROW)
+    assert record is not None  # exact row accepted
+
+    for offset, message in (
+        (47, "record _pad0 is not all-zero"),
+        (217, "record _pad1 is not all-zero"),
+    ):
+        # Ordinary records (pubkey_len=65) retain the unchanged padding checks.
+        raw = bytearray(_make_record_bytes(b"\x01" * 32, 0, outcome=1, reject_reason=0))
+        raw[offset] = 1
+        _raises_with(
+            AnalyzerError,
+            lambda r=bytes(raw): Record(r),
+            f"ordinary padding byte {offset}",
+            message,
+        )
+
+        # Over-capacity near misses fall through to the existing length error.
+        raw = bytearray(_PRESERVED_OVER_CAPACITY_ROW)
+        raw[offset] = 1
+        _assert_over_capacity_length_error(bytes(raw), f"over-capacity padding byte {offset}")
 
 
 # ── Tests: extract_spike_width1 validation (Finding 5) ───────────────────────
@@ -6280,6 +6374,10 @@ def main() -> int:
         test_validate_capture_rejects_wrong_ffi_verify_entries,
         test_validate_capture_sorted_output_has_header,
         test_records_reject_invalid_encoded_fields,
+        test_records_accept_preserved_over_capacity_ecdsa_reject,
+        test_records_reject_every_over_capacity_shape_near_miss,
+        test_records_reject_ordinary_over_capacity_pubkey,
+        test_preserved_over_capacity_padding_checks_remain_unchanged,
         test_spike_rejects_non_integer_threads,
         test_spike_rejects_bool_threads,
         test_spike_rejects_threads_not_1,

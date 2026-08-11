@@ -452,6 +452,14 @@ ECDSA pubkey; 2 empty ECDSA signature; 3 missing ECDSA transaction data;
 6 missing Schnorr transaction data; 7 Schnorr sighash failure; 8 empty
 Tapscript Schnorr signature skipped before `CheckSchnorrSignature`.
 
+The on-disk 224-byte layout is fixed: `pubkey_len` preserves the low 8 bits of
+the source public-key stack element. A semantic reader may accept `pubkey_len >
+65` only for the exact native reason-1 pre-verification reject shape: `outcome
+== 2`, `reject_reason == 1`, `op_kind` in 1..4, `sig_version` in {0, 1},
+`der_len == 0`, `sighash_type == 0`, and all `sighash`, `der_sig`, `pubkey`,
+and padding bytes zero. Every other over-capacity record keeps the existing
+`pubkey_len ... exceeds 65` rejection.
+
 **Journal** (magic `BRSJRN1\0`, 56 bytes each):
 spend_txid[32], input_index u32, checksig_ops u32, checkmultisig_ops u32,
 ecdsa_verify_calls u32, ecdsa_verify_ok u32, verdict u8, pad[3].

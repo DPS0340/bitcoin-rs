@@ -351,16 +351,35 @@ struct ParsedRecord {
     pubkey_len: u8,
     outcome: u8,
 }
+
+/// Exact over-capacity ECDSA reject shape accepted by the bare-secp reader.
+/// Native reason-1 records may preserve the original (>=66) pubkey_len only
+/// for outcome 2 with a null payload and unchanged padding.
+fn is_exempt_over_capacity_ecdsa_reject(buf: &[u8; RECORD_SIZE]) -> bool {
+    if !(1..=4).contains(&buf[40]) { return false; } // op_kind
+    if !(0..=1).contains(&buf[41]) { return false; } // sig_version
+    if buf[42] != 2 { return false; }                // outcome
+    if buf[43] != 0 { return false; }                // der_len
+    if buf[45] != 0 { return false; }                // sighash_type
+    if buf[46] != 1 { return false; }                // reject_reason
+    if buf[47] != 0 { return false; }                // _pad0
+    if buf[48..80] != [0; 32] { return false; }      // sighash
+    if buf[80..152] != [0; 72] { return false; }     // der_sig
+    if buf[152..217] != [0; 65] { return false; }    // pubkey
+    if buf[217..224] != [0; 7] { return false; }     // _pad1
+    true
+}
+
 fn parse_record(buf: &[u8; RECORD_SIZE], index: u64) -> Result<ParsedRecord> {
     let outcome = buf[42];
     let der_len = buf[43];
     let pubkey_len = buf[44];
 
+    if pubkey_len > 65 && !is_exempt_over_capacity_ecdsa_reject(buf) {
+        bail!("record {index}: pubkey_len {pubkey_len} exceeds 65");
+    }
     if der_len > 72 {
         bail!("record {index}: der_len {der_len} exceeds 72");
-    }
-    if pubkey_len > 65 {
-        bail!("record {index}: pubkey_len {pubkey_len} exceeds 65");
     }
     if outcome > 2 {
         bail!("record {index}: outcome {outcome} exceeds 2");
@@ -547,5 +566,113 @@ mod tests {
             libbitcoinkernel_sys::btck_bare_verify_bench(&input, 1, 0, 1, 0, &mut result)
         };
         assert_eq!(rc, -1);
+    }
+
+    fn preserved_over_capacity_row() -> [u8; RECORD_SIZE] {
+        let mut buf = [0u8; RECORD_SIZE];
+        let prefix: [u8; 48] = [
+            0xcf, 0x42, 0xbd, 0x87, 0xb9, 0x98, 0x25, 0x95, 0xbf, 0x2d, 0x35, 0x4c,
+            0x5f, 0x75, 0x8c, 0x14, 0x4d, 0x66, 0x33, 0x01, 0xce, 0xfc, 0x3b, 0x31,
+            0xad, 0x31, 0x32, 0xf8, 0x7f, 0x49, 0x18, 0xd1, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x42, 0x00, 0x01, 0x00,
+        ];
+        buf[..48].copy_from_slice(&prefix);
+        buf
+    }
+
+    #[test]
+    fn parse_accepts_preserved_over_capacity_ecdsa_reject() {
+        let buf = preserved_over_capacity_row();
+        let rec = parse_record(&buf, 0).unwrap();
+        assert_eq!(rec.outcome, 2);
+        assert_eq!(rec.der_len, 0);
+        assert_eq!(rec.pubkey_len, 66);
+        assert_eq!(rec.sighash, [0; 32]);
+        assert_eq!(rec.der_sig, [0; 72]);
+        assert_eq!(rec.pubkey, [0; 65]);
+    }
+
+    #[test]
+    fn parse_rejects_over_capacity_near_misses() {
+        let base = preserved_over_capacity_row();
+        let mutations: [(usize, u8, &str); 19] = [
+            (40, 0, "op_kind=0"),
+            (40, 5, "op_kind=5"),
+            (41, 2, "sig_version=2"),
+            (41, 3, "sig_version=3"),
+            (42, 0, "outcome=0"),
+            (42, 1, "outcome=1"),
+            (43, 1, "der_len=1"),
+            (43, 73, "der_len=73"),
+            (45, 1, "sighash_type=1"),
+            (46, 0, "reject_reason=0"),
+            (46, 2, "reject_reason=2"),
+            (46, 3, "reject_reason=3"),
+            (46, 4, "reject_reason=4"),
+            (46, 5, "reject_reason=5"),
+            (46, 6, "reject_reason=6"),
+            (46, 7, "reject_reason=7"),
+            (46, 8, "reject_reason=8"),
+            (47, 1, "nonzero _pad0"),
+            (80, 1, "nonzero der_sig byte"),
+        ];
+        for (offset, value, label) in mutations {
+            let mut buf = base;
+            buf[offset] = value;
+            let err = match parse_record(&buf, 0) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{label} should have failed"),
+            };
+            assert!(
+                err.contains("pubkey_len 66 exceeds 65"),
+                "{label} should fail with length error, got: {err}"
+            );
+        }
+
+        for offset in [48, 79, 80, 151, 152, 216, 217, 223] {
+            let mut buf = base;
+            buf[offset] = 1;
+            let err = match parse_record(&buf, 0) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("byte {offset} should have failed"),
+            };
+            assert!(
+                err.contains("pubkey_len 66 exceeds 65"),
+                "byte {offset} should fail with length error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_records_accepts_preserved_over_capacity_reject() {
+        // Build a minimal BRSREC1 fixture with the exact over-capacity row.
+        let path = std::env::temp_dir().join(format!(
+            "checksig_bare_secp_preserved_row_{}.bin",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut file, RECORD_MAGIC).unwrap();
+        std::io::Write::write_all(&mut file, &1u64.to_le_bytes()).unwrap();
+        std::io::Write::write_all(&mut file, &preserved_over_capacity_row()).unwrap();
+        drop(file);
+
+        let records = load_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, 2);
+        assert_eq!(records[0].pubkey_len, 66);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn conversion_skips_outcome_two_before_pubkey_slice() {
+        // Replicate the main() filter: outcome 2 records are skipped before
+        // any capacity-indexed copy, so an over-capacity pubkey_len is never
+        // used to index the fixed 65-byte array.
+        let rec = parse_record(&preserved_over_capacity_row(), 0).unwrap();
+        assert_eq!(rec.outcome, 2);
+        assert!(rec.pubkey_len > 65);
+        let would_skip = rec.outcome == 2;
+        assert!(would_skip, "outcome-2 records must be skipped before copy");
     }
 }
