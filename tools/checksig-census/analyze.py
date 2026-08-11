@@ -1244,7 +1244,13 @@ def _launch_diagnostic_child(
 
 
 def _validate_replay_diagnostic(
-    path: Path, final: DiagnosticCheckpoint, ceiling: int
+    path: Path,
+    final: DiagnosticCheckpoint,
+    ceiling: int,
+    storage_backend: str,
+    txindex: bool,
+    blockfilterindex: bool,
+    data_dir: str,
 ) -> None:
     try:
         raw = json.loads(path.read_text())
@@ -1321,21 +1327,23 @@ def _validate_replay_diagnostic(
             f"DIAG-CUSTODY: stop_reason {raw['stop_reason']!r} != 'controller-request'"
         )
 
-    if not isinstance(raw["storage_backend"], str):
+    if raw["storage_backend"] != storage_backend:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: storage_backend must be a string, got {type(raw['storage_backend']).__name__}"
+            f"DIAG-CUSTODY: storage_backend {raw['storage_backend']!r} "
+            f"!= {storage_backend!r}"
         )
-    if not isinstance(raw["txindex"], bool):
+    if raw["txindex"] is not txindex:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: txindex must be a boolean, got {type(raw['txindex']).__name__}"
+            f"DIAG-CUSTODY: txindex {raw['txindex']!r} != {txindex!r}"
         )
-    if not isinstance(raw["blockfilterindex"], bool):
+    if raw["blockfilterindex"] is not blockfilterindex:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: blockfilterindex must be a boolean, got {type(raw['blockfilterindex']).__name__}"
+            f"DIAG-CUSTODY: blockfilterindex {raw['blockfilterindex']!r} "
+            f"!= {blockfilterindex!r}"
         )
-    if not isinstance(raw["data_dir"], str):
+    if raw["data_dir"] != data_dir:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: data_dir must be a string, got {type(raw['data_dir']).__name__}"
+            f"DIAG-CUSTODY: data_dir {raw['data_dir']!r} != {data_dir!r}"
         )
 
     elapsed = raw["elapsed_seconds"]
@@ -1424,6 +1432,10 @@ def _finalize_candidate(
     rest_url: str,
     ceiling: int,
     output_path: Path,
+    storage_backend: str,
+    txindex: bool,
+    blockfilterindex: bool,
+    data_dir: str,
 ) -> None:
     _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
     if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
@@ -1437,7 +1449,10 @@ def _finalize_candidate(
         raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
 
     stream_custody = _validate_terminal_streams(paths, final)
-    _validate_replay_diagnostic(paths["replay"], final, ceiling)
+    _validate_replay_diagnostic(
+        paths["replay"], final, ceiling, storage_backend, txindex,
+        blockfilterindex, data_dir,
+    )
     _validate_native_counters(paths["counters"], final)
     custody: dict[str, dict[str, object]] = {}
     for name in ("sidecar", "replay", "counters"):
@@ -1593,7 +1608,8 @@ def _run_diagnostic_scan(
         sidecar_fd = None
         _finalize_candidate(
             paths, row_count, row, cumulative_counts, first_heights, rest_url,
-            ceiling, output_path,
+            ceiling, output_path, storage_backend, txindex, blockfilterindex,
+            str(data_dir),
         )
     finally:
         if proc is not None and stderr_file is not None and not child_closed:

@@ -5245,7 +5245,14 @@ def _compute_context_ends(path: Path) -> list[int]:
     return ends
 
 
-def _build_meta(tmp: Path, stage: Path, ceiling: int, work_dir: Path) -> Path:
+def _build_meta(
+    tmp: Path,
+    stage: Path,
+    ceiling: int,
+    work_dir: Path,
+    *,
+    replay_overrides: dict[str, object] | None = None,
+) -> Path:
     ctx_ends = _compute_context_ends(stage / "BRS_CENSUS_CONTEXTS.bin")
     assert len(ctx_ends) == 11  # 10 rows + final sentinel
     rows = []
@@ -5282,6 +5289,8 @@ def _build_meta(tmp: Path, stage: Path, ceiling: int, work_dir: Path) -> Path:
         "data_dir": str(work_dir / "state"),
         "elapsed_seconds": 0.0,
     }
+    if replay_overrides:
+        replay.update(replay_overrides)
     meta = {"rows": rows, "replay": replay}
     meta_path = tmp / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
@@ -5409,7 +5418,9 @@ def test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url() -> No
             journal_rows=0,
             journal_end=0,
         )
-        _validate_replay_diagnostic(replay_path, final, 11)
+        _validate_replay_diagnostic(
+            replay_path, final, 11, 'fjall', False, False, str(tmp / 'state')
+        )
 
 
 def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
@@ -5451,11 +5462,129 @@ def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
         )
         _raises_with(
             AnalyzerError,
-            lambda: _validate_replay_diagnostic(replay_path, final, 11),
+            lambda: _validate_replay_diagnostic(
+                replay_path, final, 11, 'fjall', False, False, str(tmp / 'state')
+            ),
             "invented rest_url",
             "rest_url",
         )
 
+
+def test_find_cmodern_height_settings_mismatch_storage_backend() -> None:
+    '''A child reporting a different storage_backend must not be finalized.'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / 'work'
+        work_dir.mkdir()
+        output = tmp / 'candidate.json'
+        meta_path = _build_meta(
+            tmp, stage, 100, work_dir,
+            replay_overrides={'storage_backend': 'rocksdb'},
+        )
+        child = _make_fake_binary(tmp)
+        os.environ['FAKE_CENSUS_META'] = str(meta_path)
+        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child, '127.0.0.1:18443', 100, work_dir, output
+                ),
+                'mismatched storage_backend',
+                'storage_backend',
+            )
+            assert not output.exists(), 'candidate must not be published'
+        finally:
+            os.environ.pop('FAKE_CENSUS_META', None)
+            os.environ.pop('FAKE_CENSUS_STAGE', None)
+
+def test_find_cmodern_height_settings_mismatch_txindex() -> None:
+    '''A child reporting txindex=True when parent passed False must fail.'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / 'work'
+        work_dir.mkdir()
+        output = tmp / 'candidate.json'
+        meta_path = _build_meta(
+            tmp, stage, 100, work_dir,
+            replay_overrides={'txindex': True},
+        )
+        child = _make_fake_binary(tmp)
+        os.environ['FAKE_CENSUS_META'] = str(meta_path)
+        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child, '127.0.0.1:18443', 100, work_dir, output
+                ),
+                'mismatched txindex',
+                'txindex',
+            )
+            assert not output.exists(), 'candidate must not be published'
+        finally:
+            os.environ.pop('FAKE_CENSUS_META', None)
+            os.environ.pop('FAKE_CENSUS_STAGE', None)
+
+def test_find_cmodern_height_settings_mismatch_blockfilterindex() -> None:
+    '''A child reporting blockfilterindex=True when parent passed False must fail.'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / 'work'
+        work_dir.mkdir()
+        output = tmp / 'candidate.json'
+        meta_path = _build_meta(
+            tmp, stage, 100, work_dir,
+            replay_overrides={'blockfilterindex': True},
+        )
+        child = _make_fake_binary(tmp)
+        os.environ['FAKE_CENSUS_META'] = str(meta_path)
+        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child, '127.0.0.1:18443', 100, work_dir, output
+                ),
+                'mismatched blockfilterindex',
+                'blockfilterindex',
+            )
+            assert not output.exists(), 'candidate must not be published'
+        finally:
+            os.environ.pop('FAKE_CENSUS_META', None)
+            os.environ.pop('FAKE_CENSUS_STAGE', None)
+
+def test_find_cmodern_height_settings_mismatch_data_dir() -> None:
+    '''A child reporting a different data_dir must fail before publication.'''
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / 'work'
+        work_dir.mkdir()
+        output = tmp / 'candidate.json'
+        meta_path = _build_meta(
+            tmp, stage, 100, work_dir,
+            replay_overrides={'data_dir': str(tmp / 'other_state')},
+        )
+        child = _make_fake_binary(tmp)
+        os.environ['FAKE_CENSUS_META'] = str(meta_path)
+        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child, '127.0.0.1:18443', 100, work_dir, output
+                ),
+                'mismatched data_dir',
+                'data_dir',
+            )
+            assert not output.exists(), 'candidate must not be published'
+        finally:
+            os.environ.pop('FAKE_CENSUS_META', None)
+            os.environ.pop('FAKE_CENSUS_STAGE', None)
 
 def test_read_bounded_context_rows_zero_rows() -> None:
     """An empty committed prefix with start_row=0 and rows=0 must parse."""
@@ -5954,6 +6083,10 @@ def main() -> int:
         test_atomic_publish_rollback_fsyncs_after_unlink,
         test_atomic_publish_no_replace_collision,
         test_atomic_publish_cleans_temp_on_post_link_fsync_failure,
+        test_find_cmodern_height_settings_mismatch_storage_backend,
+        test_find_cmodern_height_settings_mismatch_txindex,
+        test_find_cmodern_height_settings_mismatch_blockfilterindex,
+        test_find_cmodern_height_settings_mismatch_data_dir,
     ]
     passed = 0
     failed = 0
