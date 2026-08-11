@@ -71,6 +71,8 @@ fn bitcoin_conf_zmq_keys_map_into_config_in_order() -> Result<()> {
 [regtest]
 -zmqpubrawtx=tcp://127.0.0.1:28334
 -zmqpubrawtxhwm=6
+-zmqpubsequence=tcp://127.0.0.1:28335
+-zmqpubsequencehwm=7
 ",
     )?;
 
@@ -87,6 +89,11 @@ fn bitcoin_conf_zmq_keys_map_into_config_in_order() -> Result<()> {
     assert_eq!(config.zmqpubhashblockhwm, Some(5));
     assert_eq!(config.zmqpubrawtx, vec!["tcp://127.0.0.1:28334".to_owned()]);
     assert_eq!(config.zmqpubrawtxhwm, Some(6));
+    assert_eq!(
+        config.zmqpubsequence,
+        vec!["tcp://127.0.0.1:28335".to_owned()]
+    );
+    assert_eq!(config.zmqpubsequencehwm, Some(7));
     Ok(())
 }
 

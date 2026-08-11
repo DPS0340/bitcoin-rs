@@ -137,9 +137,21 @@ keeps its ownership for retry.
 
 Still open around it: returning a disconnected block's transactions through one
 production admission pipeline shared by Electrum, P2P relay, and reorg handling;
-publishing a disconnect notification; and backfilling the filter index after a
-gap. Raw mempool insertion is not reconsideration because it cannot reconstruct
-fee, policy, conflict, and ancestry metadata.
+and backfilling the filter index after a gap. The `pubsequence` stream publishes
+block connect/disconnect notifications, but intentionally does not publish
+mempool `A`/`R` events: the current mempool counter and mutation reasons cannot
+yet guarantee the enforcer's required contiguous transaction event sequence.
+Raw mempool insertion is not reconsideration because it cannot reconstruct fee,
+policy, conflict, and ancestry metadata.
+
+### Sequence stream
+
+The Core-compatible `pubsequence` ZMQ stream is a unified block-event stream.
+Each event carries the block hash, one label (`C` for connect or `D` for
+disconnect), and a topic-local little-endian `u32` sequence counter. Reorg
+disconnects are emitted tip-first before connects on the replacement branch.
+This implementation deliberately omits mempool `A`/`R` events until the
+mempool has per-transaction sequence assignment and explicit removal reasons.
 
 ### Dispatch-bound parallelism
 

@@ -151,6 +151,10 @@ pub struct Config {
     pub zmqpubrawblockhwm: Option<u32>,
     /// Optional `rawtx` PUB socket high-water mark.
     pub zmqpubrawtxhwm: Option<u32>,
+    /// ZMQ `sequence` PUB bind endpoints.
+    pub zmqpubsequence: Vec<String>,
+    /// Optional `sequence` PUB socket high-water mark.
+    pub zmqpubsequencehwm: Option<u32>,
     /// Block height at or below which script verification is skipped during block apply.
     ///
     /// On mainnet the default is the hash-pinned assume-valid anchor
@@ -211,6 +215,8 @@ impl fmt::Debug for Config {
             .field("zmqpubhashtxhwm", &self.zmqpubhashtxhwm)
             .field("zmqpubrawblockhwm", &self.zmqpubrawblockhwm)
             .field("zmqpubrawtxhwm", &self.zmqpubrawtxhwm)
+            .field("zmqpubsequence", &self.zmqpubsequence)
+            .field("zmqpubsequencehwm", &self.zmqpubsequencehwm)
             .field("assume_valid_height", &self.assume_valid_height)
             .finish_non_exhaustive()
     }
@@ -259,6 +265,8 @@ impl Config {
             zmqpubhashtxhwm: None,
             zmqpubrawblockhwm: None,
             zmqpubrawtxhwm: None,
+            zmqpubsequence: Vec::new(),
+            zmqpubsequencehwm: None,
             assume_valid_height: network
                 .assume_valid_anchor()
                 .map_or(0, |(height, _)| height),
@@ -357,6 +365,7 @@ impl Config {
             ("zmqpubhashtxhwm", self.zmqpubhashtxhwm),
             ("zmqpubrawblockhwm", self.zmqpubrawblockhwm),
             ("zmqpubrawtxhwm", self.zmqpubrawtxhwm),
+            ("zmqpubsequencehwm", self.zmqpubsequencehwm),
         ] {
             if hwm.is_some_and(|value| value > 2_147_483_647) {
                 bail!("{name} exceeds libzmq SNDHWM range");
@@ -393,6 +402,12 @@ impl Config {
             &self.zmqpubrawtx,
             self.zmqpubrawtxhwm,
         );
+        push_zmq_publications(
+            &mut publications,
+            crate::zmq_publisher::ZmqTopic::Sequence,
+            &self.zmqpubsequence,
+            self.zmqpubsequencehwm,
+        );
         publications
     }
 
@@ -427,6 +442,7 @@ impl Config {
         Ok(config)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_layer(&mut self, layer: &ConfigLayer) {
         if let Some(network) = layer.network {
             self.network = network;
@@ -513,6 +529,9 @@ impl Config {
         if let Some(endpoints) = &layer.zmqpubrawtx {
             self.zmqpubrawtx.clone_from(endpoints);
         }
+        if let Some(endpoints) = &layer.zmqpubsequence {
+            self.zmqpubsequence.clone_from(endpoints);
+        }
         if let Some(hwm) = layer.zmqpubhashblockhwm {
             self.zmqpubhashblockhwm = Some(hwm);
         }
@@ -524,6 +543,9 @@ impl Config {
         }
         if let Some(hwm) = layer.zmqpubrawtxhwm {
             self.zmqpubrawtxhwm = Some(hwm);
+        }
+        if let Some(hwm) = layer.zmqpubsequencehwm {
+            self.zmqpubsequencehwm = Some(hwm);
         }
         if let Some(height) = layer.assume_valid_height {
             self.assume_valid_height = height;
@@ -624,6 +646,8 @@ pub(crate) struct ConfigLayer {
     pub(crate) zmqpubrawblock: Option<Vec<String>>,
     #[arg(long = "zmqpubrawtx", value_delimiter = ',')]
     pub(crate) zmqpubrawtx: Option<Vec<String>>,
+    #[arg(long = "zmqpubsequence", value_delimiter = ',')]
+    pub(crate) zmqpubsequence: Option<Vec<String>>,
     #[arg(long = "zmqpubhashblockhwm")]
     pub(crate) zmqpubhashblockhwm: Option<u32>,
     #[arg(long = "zmqpubhashtxhwm")]
@@ -632,6 +656,8 @@ pub(crate) struct ConfigLayer {
     pub(crate) zmqpubrawblockhwm: Option<u32>,
     #[arg(long = "zmqpubrawtxhwm")]
     pub(crate) zmqpubrawtxhwm: Option<u32>,
+    #[arg(long = "zmqpubsequencehwm")]
+    pub(crate) zmqpubsequencehwm: Option<u32>,
     #[arg(long = "assume-valid-height")]
     pub(crate) assume_valid_height: Option<u32>,
 }
@@ -708,6 +734,9 @@ impl ConfigLayer {
                 "BITCOIN_RS_ZMQPUBRAWTX" => {
                     layer.zmqpubrawtx = Some(parse_string_list(value));
                 }
+                "BITCOIN_RS_ZMQPUBSEQUENCE" => {
+                    layer.zmqpubsequence = Some(parse_string_list(value));
+                }
                 "BITCOIN_RS_ZMQPUBHASHBLOCKHWM" => {
                     layer.zmqpubhashblockhwm = Some(value.parse()?);
                 }
@@ -719,6 +748,9 @@ impl ConfigLayer {
                 }
                 "BITCOIN_RS_ZMQPUBRAWTXHWM" => {
                     layer.zmqpubrawtxhwm = Some(value.parse()?);
+                }
+                "BITCOIN_RS_ZMQPUBSEQUENCEHWM" => {
+                    layer.zmqpubsequencehwm = Some(value.parse()?);
                 }
                 "BITCOIN_RS_ASSUME_VALID_HEIGHT" => {
                     layer.assume_valid_height = Some(value.parse()?);

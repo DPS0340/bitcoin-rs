@@ -120,6 +120,8 @@ fn zmq_layers_parse_precedence_and_publication_order() -> Result<()> {
         r#"
 zmqpubhashblock = ["tcp://127.0.0.1:28332", "tcp://127.0.0.1:28333"]
 zmqpubhashblockhwm = 9
+zmqpubsequence = ["tcp://127.0.0.1:28338"]
+zmqpubsequencehwm = 13
 "#,
     )?;
     fs::write(
@@ -149,6 +151,10 @@ zmqpubhashblockhwm = 9
             "tcp://127.0.0.1:28337",
             "--zmqpubrawtxhwm",
             "12",
+            "--zmqpubsequence",
+            "tcp://127.0.0.1:28339",
+            "--zmqpubsequencehwm",
+            "14",
         ],
     )?;
 
@@ -166,7 +172,10 @@ zmqpubhashblockhwm = 9
         .map(|publication| publication.hwm)
         .collect();
 
-    assert_eq!(topics, ["hashblock", "hashblock", "hashtx", "rawtx"]);
+    assert_eq!(
+        topics,
+        ["hashblock", "hashblock", "hashtx", "rawtx", "sequence"]
+    );
     assert_eq!(
         endpoints,
         [
@@ -174,9 +183,10 @@ zmqpubhashblockhwm = 9
             "tcp://127.0.0.1:28333",
             "tcp://127.0.0.1:28336",
             "tcp://127.0.0.1:28337",
+            "tcp://127.0.0.1:28339",
         ]
     );
-    assert_eq!(hwms, [9, 9, 1_000, 12]);
+    assert_eq!(hwms, [9, 9, 1_000, 12, 14]);
     Ok(())
 }
 

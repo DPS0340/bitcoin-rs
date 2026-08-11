@@ -197,9 +197,10 @@ where
             continue;
         }
 
+        let mut disconnected = Vec::with_capacity(disconnect.len());
         for body in &disconnect {
             match crate::apply::disconnect_block_admitted(handles, &body.block, &transition) {
-                Ok(_) => {}
+                Ok(_) => disconnected.push(body.hash),
                 Err(
                     error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. }),
                 ) => {
@@ -245,6 +246,13 @@ where
             }
         }
         drop(transition);
+        if handles.zmq_publisher.wants_notifications() {
+            for hash in disconnected {
+                handles
+                    .zmq_publisher
+                    .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(hash));
+            }
+        }
         for body in &connect[..connected] {
             connected_body(body.hash);
         }

@@ -68,10 +68,12 @@ fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
         "zmqpubhashtx" => push_endpoint(&mut layer.zmqpubhashtx, value),
         "zmqpubrawblock" => push_endpoint(&mut layer.zmqpubrawblock, value),
         "zmqpubrawtx" => push_endpoint(&mut layer.zmqpubrawtx, value),
+        "zmqpubsequence" => push_endpoint(&mut layer.zmqpubsequence, value),
         "zmqpubhashblockhwm" => layer.zmqpubhashblockhwm = value.parse().ok(),
         "zmqpubhashtxhwm" => layer.zmqpubhashtxhwm = value.parse().ok(),
         "zmqpubrawblockhwm" => layer.zmqpubrawblockhwm = value.parse().ok(),
         "zmqpubrawtxhwm" => layer.zmqpubrawtxhwm = value.parse().ok(),
+        "zmqpubsequencehwm" => layer.zmqpubsequencehwm = value.parse().ok(),
         _ => {}
     }
     if layer.rpc_user.is_some() || layer.rpc_password.is_some() {
@@ -196,6 +198,9 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.zmqpubrawtx.is_some() {
             self.zmqpubrawtx.clone_from(&other.zmqpubrawtx);
         }
+        if other.zmqpubsequence.is_some() {
+            self.zmqpubsequence.clone_from(&other.zmqpubsequence);
+        }
         if other.zmqpubhashblockhwm.is_some() {
             self.zmqpubhashblockhwm = other.zmqpubhashblockhwm;
         }
@@ -207,6 +212,9 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.zmqpubrawtxhwm.is_some() {
             self.zmqpubrawtxhwm = other.zmqpubrawtxhwm;
+        }
+        if other.zmqpubsequencehwm.is_some() {
+            self.zmqpubsequencehwm = other.zmqpubsequencehwm;
         }
     }
 }

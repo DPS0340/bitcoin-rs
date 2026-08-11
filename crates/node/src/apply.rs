@@ -1044,10 +1044,21 @@ pub fn disconnect_block(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
 ) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
+    use bitcoin::hashes::Hash as _;
+
     let transition = handles
         .begin_chain_transition()
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
-    disconnect_block_admitted(handles, block, &transition)
+    let result = disconnect_block_admitted(handles, block, &transition);
+    drop(transition);
+    if result.is_ok() && handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
+                Hash256::from_le_bytes(&block.block_hash().to_byte_array()),
+            ));
+    }
+    result
 }
 
 /// Disconnects one block while the caller holds admission and `chain_transition`.
@@ -2315,6 +2326,9 @@ fn apply_block_admitted(
         // Best-effort ZMQ event emission. Failures must not propagate per the
         // ZmqPublisher contract; the trait's methods return `()`.
         handles.zmq_publisher.publish_hashblock(tip.hash);
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
         if wants_rawblock {
             handles.zmq_publisher.publish_rawblock(&block_bytes);
         }

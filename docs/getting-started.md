@@ -5,9 +5,10 @@ tell it worked before moving on.
 
 Before you start: this node reorganises off a losing branch, but several
 things around that still do not work. A disconnected block's transactions are
-dropped rather than returned to the mempool, no disconnect notification is
-published, and the filter index is not backfilled across a gap. Do not make it
-the node you depend on. See [README.md](README.md) for the rest of the gaps.
+dropped rather than returned to the mempool, and the filter index is not
+backfilled across a gap. ZMQ `pubsequence` publishes block connect/disconnect
+events but intentionally omits mempool `A`/`R` events. Do not make it the node
+you depend on. See [README.md](README.md) for the rest of the gaps.
 
 ## Prerequisites
 
