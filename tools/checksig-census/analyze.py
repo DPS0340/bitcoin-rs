@@ -2490,40 +2490,32 @@ def _count_context_records_disk(
                         f"CTX-OPERATIONS: duplicate record key in BRSREC1: {exc}"
                     ) from exc
 
-                if record_count != counters.record_count:
-                    raise AnalyzerError(
-                        f"CTX-OPERATIONS: BRSREC1 record count {record_count} != "
-                        f"counters.record_count {counters.record_count}"
-                    )
+                # ── Set-based discovery of the earliest per-record semantic failure.
+                #    The old streaming loop checked each record in stream order, then
+                #    within a record in this priority: orphan, then op_seq sequence,
+                #    then op/sig/context legality.  We preserve the same ordering by
+                #    selecting the globally earliest (stream_pos, category_priority)
+                #    candidate from three bounded LIMIT 1 queries.
+                record_failures: list[tuple[int, int, tuple[object, ...], str]] = []
 
                 orphan = conn.execute(
-                    "SELECT r.txid_le, r.input_index FROM records r "
+                    "SELECT r.txid_le, r.input_index, r.stream_pos FROM records r "
                     "LEFT JOIN contexts c ON c.txid_le=r.txid_le AND c.input_index=r.input_index "
                     "WHERE c.txid_le IS NULL ORDER BY r.stream_pos LIMIT 1"
                 ).fetchone()
                 if orphan is not None:
-                    txid_le, input_index = orphan
-                    raise AnalyzerError(
-                        "CTX-OPERATIONS: BRSREC1 record has no matching "
-                        f"context identity: txid={txid_le[::-1].hex()}, "
-                        f"input_index={input_index}"
-                    )
+                    record_failures.append((orphan[2], 0, orphan[:2], "orphan"))
 
                 sequence_error = conn.execute(
                     "WITH ordered AS ("
                     " SELECT txid_le, input_index, op_seq, stream_pos,"
                     " ROW_NUMBER() OVER (PARTITION BY txid_le, input_index ORDER BY stream_pos)-1 expected"
                     " FROM records"
-                    ") SELECT txid_le, input_index, expected, op_seq FROM ordered"
+                    ") SELECT txid_le, input_index, expected, op_seq, stream_pos FROM ordered"
                     " WHERE op_seq != expected ORDER BY stream_pos LIMIT 1"
                 ).fetchone()
                 if sequence_error is not None:
-                    txid_le, input_index, expected, actual = sequence_error
-                    raise AnalyzerError(
-                        "CTX-OPERATIONS: op_seq contiguity violation for "
-                        f"txid={txid_le[::-1].hex()}, input_index={input_index}: "
-                        f"expected {expected}, got {actual}"
-                    )
+                    record_failures.append((sequence_error[4], 1, sequence_error[:4], "sequence"))
 
                 invalid = conn.execute(
                     "WITH classified AS ("
@@ -2545,12 +2537,32 @@ def _count_context_records_disk(
                     " WHEN op_kind NOT IN (0,1,2,3,4,5) THEN 'unknown_op' END error_code"
                     " FROM records r JOIN contexts c"
                     " ON c.txid_le=r.txid_le AND c.input_index=r.input_index"
-                    ") SELECT txid_le,input_index,op_kind,sig_version,spend_context,error_code"
+                    ") SELECT txid_le,input_index,op_kind,sig_version,spend_context,error_code,stream_pos"
                     " FROM classified WHERE error_code IS NOT NULL"
                     " ORDER BY stream_pos LIMIT 1"
                 ).fetchone()
                 if invalid is not None:
-                    txid_le, input_index, op, sig, ctx_name, error_code = invalid
+                    record_failures.append((invalid[6], 2, invalid[:6], "invalid"))
+
+                if record_failures:
+                    record_failures.sort(key=lambda row: (row[0], row[1]))
+                    _, _, row, kind = record_failures[0]
+                    if kind == "orphan":
+                        txid_le, input_index = row
+                        raise AnalyzerError(
+                            "CTX-OPERATIONS: BRSREC1 record has no matching "
+                            f"context identity: txid={txid_le[::-1].hex()}, "
+                            f"input_index={input_index}"
+                        )
+                    if kind == "sequence":
+                        txid_le, input_index, expected, actual = row
+                        raise AnalyzerError(
+                            "CTX-OPERATIONS: op_seq contiguity violation for "
+                            f"txid={txid_le[::-1].hex()}, input_index={input_index}: "
+                            f"expected {expected}, got {actual}"
+                        )
+                    # kind == "invalid"
+                    txid_le, input_index, op, sig, ctx_name, error_code = row
                     identity = f"txid={txid_le[::-1].hex()}, input_index={input_index}"
                     sig_name = _sig_version_name(sig)
                     if error_code == "multisig_sig":
@@ -2584,6 +2596,12 @@ def _count_context_records_disk(
                     else:
                         message = f"unknown op_kind {op} for {identity}"
                     raise AnalyzerError(f"CTX-OPERATIONS: {message}")
+
+                if record_count != counters.record_count:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: BRSREC1 record count {record_count} != "
+                        f"counters.record_count {counters.record_count}"
+                    )
 
                 gap_count = conn.execute(
                     "SELECT COUNT(*) FROM ("

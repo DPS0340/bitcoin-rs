@@ -4838,6 +4838,110 @@ def test_classify_corpus_mixed_duplicate_before_malformed() -> None:
             raise AssertionError("expected AnalyzerError for duplicate record")
 
 
+def test_record_validation_earlier_illegal_precedes_later_orphan() -> None:
+    """Stream order wins when a later record is orphaned."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x70" * 32
+        orphan_txid = b"\x71" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [
+                _make_record_bytes(txid_le, 0, op_kind=3, sig_version=2),
+                _make_record_bytes(orphan_txid, 0),
+            ],
+            [_make_journal_bytes(txid_le, 0)],
+            "c150",
+        )
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            assert str(exc) == (
+                "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
+                "got TAPSCRIPT for "
+                f"txid={txid_le[::-1].hex()}, input_index=0"
+            )
+        else:
+            raise AssertionError("expected earlier illegal-record error")
+
+
+def test_record_validation_earlier_illegal_precedes_later_sequence_gap() -> None:
+    """Stream order wins when a later record has an op_seq gap."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x72" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [
+                _make_record_bytes(txid_le, 0, op_seq=0, op_kind=3, sig_version=2),
+                _make_record_bytes(txid_le, 0, op_seq=2),
+            ],
+            [_make_journal_bytes(txid_le, 0)],
+            "c150",
+        )
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            assert str(exc) == (
+                "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
+                "got TAPSCRIPT for "
+                f"txid={txid_le[::-1].hex()}, input_index=0"
+            )
+        else:
+            raise AssertionError("expected earlier illegal-record error")
+
+
+def test_record_validation_semantic_error_precedes_record_count_mismatch() -> None:
+    """Semantic validation precedes the aggregate record-count check."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x73" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [_make_record_bytes(txid_le, 0, op_kind=3, sig_version=2)],
+            [_make_journal_bytes(txid_le, 0)],
+            "c150",
+            counters_overrides={"record_count": 2},
+        )
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            assert str(exc) == (
+                "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
+                "got TAPSCRIPT for "
+                f"txid={txid_le[::-1].hex()}, input_index=0"
+            )
+        else:
+            raise AssertionError("expected semantic record error")
+
+
+def test_record_validation_same_record_orphan_precedence() -> None:
+    """Orphan wins over sequence and legality failures on one record."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        context_txid = b"\x74" * 32
+        orphan_txid = b"\x75" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(context_txid)],
+            [_make_record_bytes(orphan_txid, 0, op_seq=1, op_kind=3, sig_version=2)],
+            [_make_journal_bytes(context_txid, 0)],
+            "c150",
+        )
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            assert str(exc) == (
+                "CTX-OPERATIONS: BRSREC1 record has no matching context identity: "
+                f"txid={orphan_txid[::-1].hex()}, input_index=0"
+            )
+        else:
+            raise AssertionError("expected orphan record error")
+
+
 def test_count_context_records_spend_context_tally_sensitivity() -> None:
     """CHECKMULTISIG records with the same op/sig map to different context
     counters depending on the input's spend_context, proving the tally is
@@ -5170,6 +5274,10 @@ def main() -> int:
         test_classify_corpus_custody_contexts_from_same_open,
         test_classify_corpus_duplicate_context_key,
         test_classify_corpus_mixed_duplicate_before_malformed,
+        test_record_validation_earlier_illegal_precedes_later_orphan,
+        test_record_validation_earlier_illegal_precedes_later_sequence_gap,
+        test_record_validation_semantic_error_precedes_record_count_mismatch,
+        test_record_validation_same_record_orphan_precedence,
         test_count_context_records_spend_context_tally_sensitivity,
         test_classify_corpus_scratch_dir_rejects_non_directory,
         test_classify_corpus_scratch_dir_rejects_unwritable,
