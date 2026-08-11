@@ -431,6 +431,7 @@ impl Config {
         Ok(config)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_layer(&mut self, layer: &ConfigLayer) {
         if let Some(network) = layer.network {
             self.network = network;
