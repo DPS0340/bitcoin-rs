@@ -38,10 +38,13 @@ The REST gateway does not change the reported `getnetworkinfo` version. When
 using the unmodified `bip300301_enforcer`, pass
 `--bitcoin-core-skip-version-check`.
 
-bitcoin-rs also does not currently publish Bitcoin Core's `pubsequence` ZMQ
-topic. Normal enforcer mempool synchronization therefore requires an explicit
-`--node-zmq-addr-sequence` pointing at a compatible external publisher, or a
-no-mempool/bounded enforcer mode.
+bitcoin-rs publishes the Core-compatible `pubsequence` ZMQ topic with block
+connect (`C`) and disconnect (`D`) events. The configured endpoint is reported
+by `getzmqnotifications`, so the unmodified enforcer can discover it through
+its normal startup path rather than requiring an external publisher or an
+explicit `--node-zmq-addr-sequence`. Mempool `A`/`R` events remain intentionally
+absent until the mempool has per-transaction event sequencing and explicit
+removal reasons.
 
 REST is off by default. With REST disabled, `/rest/*` returns HTTP 404.
 Unknown REST routes also return 404; malformed header inputs and unsupported
