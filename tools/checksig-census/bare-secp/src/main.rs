@@ -56,7 +56,9 @@ const COUNTER_NAMES: [&str; 24] = [
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-fn record_to_bare_input(rec: &ParsedRecord) -> Result<Option<libbitcoinkernel_sys::btck_bare_input>> {
+fn record_to_bare_input(
+    rec: &ParsedRecord,
+) -> Result<Option<libbitcoinkernel_sys::btck_bare_input>> {
     // Outcome-2 records are pre-verification rejects and carry no sighash.
     // They must be skipped before any capacity-indexed public-key slice.
     if rec.outcome == 2 {
@@ -82,8 +84,7 @@ fn record_to_bare_input(rec: &ParsedRecord) -> Result<Option<libbitcoinkernel_sy
     };
     input.sighash.copy_from_slice(&rec.sighash);
     input.der_sig[..rec.der_len as usize].copy_from_slice(&rec.der_sig[..rec.der_len as usize]);
-    input.pubkey[..rec.pubkey_len as usize]
-        .copy_from_slice(&rec.pubkey[..rec.pubkey_len as usize]);
+    input.pubkey[..rec.pubkey_len as usize].copy_from_slice(&rec.pubkey[..rec.pubkey_len as usize]);
     Ok(Some(input))
 }
 
@@ -373,17 +374,39 @@ struct ParsedRecord {
 /// Native reason-1 records may preserve the original (>=66) pubkey_len only
 /// for outcome 2 with a null payload and unchanged padding.
 fn is_exempt_over_capacity_ecdsa_reject(buf: &[u8; RECORD_SIZE]) -> bool {
-    if !(1..=4).contains(&buf[40]) { return false; } // op_kind
-    if !(0..=1).contains(&buf[41]) { return false; } // sig_version
-    if buf[42] != 2 { return false; }                // outcome
-    if buf[43] != 0 { return false; }                // der_len
-    if buf[45] != 0 { return false; }                // sighash_type
-    if buf[46] != 1 { return false; }                // reject_reason
-    if buf[47] != 0 { return false; }                // _pad0
-    if buf[48..80] != [0; 32] { return false; }      // sighash
-    if buf[80..152] != [0; 72] { return false; }     // der_sig
-    if buf[152..217] != [0; 65] { return false; }    // pubkey
-    if buf[217..224] != [0; 7] { return false; }     // _pad1
+    if !(1..=4).contains(&buf[40]) {
+        return false;
+    } // op_kind
+    if !(0..=1).contains(&buf[41]) {
+        return false;
+    } // sig_version
+    if buf[42] != 2 {
+        return false;
+    } // outcome
+    if buf[43] != 0 {
+        return false;
+    } // der_len
+    if buf[45] != 0 {
+        return false;
+    } // sighash_type
+    if buf[46] != 1 {
+        return false;
+    } // reject_reason
+    if buf[47] != 0 {
+        return false;
+    } // _pad0
+    if buf[48..80] != [0; 32] {
+        return false;
+    } // sighash
+    if buf[80..152] != [0; 72] {
+        return false;
+    } // der_sig
+    if buf[152..217] != [0; 65] {
+        return false;
+    } // pubkey
+    if buf[217..224] != [0; 7] {
+        return false;
+    } // _pad1
     true
 }
 
@@ -588,10 +611,10 @@ mod tests {
     fn preserved_over_capacity_row() -> [u8; RECORD_SIZE] {
         let mut buf = [0u8; RECORD_SIZE];
         let prefix: [u8; 48] = [
-            0xcf, 0x42, 0xbd, 0x87, 0xb9, 0x98, 0x25, 0x95, 0xbf, 0x2d, 0x35, 0x4c,
-            0x5f, 0x75, 0x8c, 0x14, 0x4d, 0x66, 0x33, 0x01, 0xce, 0xfc, 0x3b, 0x31,
-            0xad, 0x31, 0x32, 0xf8, 0x7f, 0x49, 0x18, 0xd1, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x42, 0x00, 0x01, 0x00,
+            0xcf, 0x42, 0xbd, 0x87, 0xb9, 0x98, 0x25, 0x95, 0xbf, 0x2d, 0x35, 0x4c, 0x5f, 0x75,
+            0x8c, 0x14, 0x4d, 0x66, 0x33, 0x01, 0xce, 0xfc, 0x3b, 0x31, 0xad, 0x31, 0x32, 0xf8,
+            0x7f, 0x49, 0x18, 0xd1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+            0x02, 0x00, 0x42, 0x00, 0x01, 0x00,
         ];
         buf[..48].copy_from_slice(&prefix);
         buf
@@ -691,7 +714,10 @@ mod tests {
         assert_eq!(rec.outcome, 2);
         assert!(rec.pubkey_len > 65);
         let input = record_to_bare_input(&rec).unwrap();
-        assert!(input.is_none(), "outcome-2 record must be skipped before copy");
+        assert!(
+            input.is_none(),
+            "outcome-2 record must be skipped before copy"
+        );
     }
 
     #[test]
