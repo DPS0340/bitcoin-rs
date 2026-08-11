@@ -24,6 +24,8 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     config.txindex = true;
     config.zmqpubhashblock = vec!["inproc://rpc-wiring-zmq-pubhashblock".to_owned()];
     config.zmqpubhashblockhwm = Some(21);
+    config.zmqpubsequence = vec!["inproc://rpc-wiring-zmq-pubsequence".to_owned()];
+    config.zmqpubsequencehwm = Some(22);
     let state = NodeState::open(config)?;
 
     let chain_tip = state.chain_tip();
@@ -81,6 +83,11 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         "mempool must share identity"
     );
     assert!(
+        ctx.zmq_notifications()
+            .iter()
+            .any(|notification| notification.notification_type == "pubsequence")
+    );
+    assert!(
         Arc::ptr_eq(&ctx.blocks, &blocks),
         "blocks must share identity"
     );
@@ -129,9 +136,11 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         "banned must share identity"
     );
     let notifications = ctx.zmq_notifications();
-    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications.len(), 2);
     assert_eq!(notifications[0].notification_type.as_str(), "pubhashblock");
     assert_eq!(notifications[0].hwm, 21);
+    assert_eq!(notifications[1].notification_type.as_str(), "pubsequence");
+    assert_eq!(notifications[1].hwm, 22);
 
     Ok(())
 }

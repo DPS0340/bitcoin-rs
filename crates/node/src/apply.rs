@@ -1047,7 +1047,9 @@ pub fn disconnect_block(
     let transition = handles
         .begin_chain_transition()
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
-    disconnect_block_admitted(handles, block, &transition)
+    let result = disconnect_block_admitted(handles, block, &transition);
+    drop(transition);
+    result
 }
 
 /// Disconnects one block while the caller holds admission and `chain_transition`.
@@ -1203,6 +1205,14 @@ pub(crate) fn disconnect_block_admitted(
     handles
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
+
+    if handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
+                block_hash,
+            ));
+    }
 
     // The rollback finished in memory, so the marker moves to `RolledBack`.
     // It stays set: a checkpoint has not captured this yet.
@@ -2330,6 +2340,11 @@ fn apply_block_admitted(
         }
     }
     handles.applied_tip.store(Some(Arc::new(tip.clone())));
+    if handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
+    }
     if let Some(sampler) = &handles.g2_muhash_sampler
         && sampler.wants_height(height)
     {
@@ -6581,6 +6596,114 @@ mod consensus_rule_tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CompleteRejectingUndoStore {
+        inner: InMemoryUndoStore,
+    }
+
+    impl UndoStore for CompleteRejectingUndoStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.cancel_disconnect()
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker completion failure".to_owned(),
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    #[test]
+    fn disconnect_sequence_event_publishes_before_marker_completion_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut handles =
+            apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        handles.undo_store = Arc::new(CompleteRejectingUndoStore::default());
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(6)],
+        )?;
+        apply_block(&handles, &block)?;
+
+        let publisher = Arc::new(RecordingSequencePublisher::default());
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        handles = handles.with_zmq_publisher(publisher_handle);
+        publisher.events.lock().clear();
+        *publisher.next_sequence.lock() = 0;
+
+        let outcome = disconnect_block(&handles, &block);
+        assert!(
+            matches!(outcome, Err(crate::DisconnectError::MarkerStuck { .. })),
+            "marker completion failure must report MarkerStuck, got {outcome:?}"
+        );
+        assert_eq!(
+            publisher.events.lock().as_slice(),
+            &[(
+                Hash256::from_le_bytes(block.block_hash().as_byte_array()),
+                b'D',
+                0
+            )]
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load_full()
+                .as_deref()
+                .map(|tip| tip.height),
+            Some(0),
+            "the applied tip must already be rolled back on MarkerStuck"
+        );
+        Ok(())
+    }
+
     /// The ordering contract: undo is written before the UTXO commit and before
     /// every derived write, so a failure to record it must leave the node
     /// exactly as it was. Applying the block anyway would produce a chainstate
@@ -8675,6 +8798,183 @@ mod consensus_rule_tests {
             )),
             "the applied branch's coins must survive an aborted switch"
         );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSequencePublisher {
+        events: Mutex<Vec<(Hash256, u8, u32)>>,
+        next_sequence: Mutex<u32>,
+    }
+
+    impl crate::ZmqPublisher for RecordingSequencePublisher {
+        fn publish_hashblock(&self, _hash: Hash256) {}
+
+        fn publish_hashtx(&self, _txid: bitcoin::Txid) {}
+
+        fn publish_rawblock(&self, _bytes: &[u8]) {}
+
+        fn publish_rawtx(&self, _bytes: &[u8]) {}
+
+        fn publish_sequence(&self, event: crate::SequenceEvent) {
+            let (hash, label) = match event {
+                crate::SequenceEvent::Connected(hash) => (hash, b'C'),
+                crate::SequenceEvent::Disconnected(hash) => (hash, b'D'),
+            };
+            let mut next_sequence = self.next_sequence.lock();
+            self.events.lock().push((hash, label, *next_sequence));
+            *next_sequence += 1;
+        }
+    }
+
+    #[test]
+    fn reorg_sequence_events_disconnect_old_tip_before_connecting_new_branch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let publisher = Arc::new(RecordingSequencePublisher::default());
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo))
+            .with_zmq_publisher(publisher_handle);
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let old_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let old_one_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&old_one));
+        let old_one_tip = apply_block_with_serialized(&handles, &old_one, old_one_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((old_one_tip.height, old_one_tip.hash), old_one_raw.to_vec());
+
+        let old_two = mined_block_with_prev_hash_and_transactions(
+            old_one.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let old_two_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&old_two));
+        let old_two_tip = apply_block_with_serialized(&handles, &old_two, old_two_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((old_two_tip.height, old_two_tip.hash), old_two_raw.to_vec());
+        publisher.events.lock().clear();
+        *publisher.next_sequence.lock() = 0;
+
+        let new_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let new_two = mined_block_with_prev_hash_and_transactions(
+            new_one.block_hash(),
+            vec![coinbase_transaction(4)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut target = None;
+            for (height, block) in [(1_u32, &new_one), (2_u32, &new_two)] {
+                target = Some(tree.insert_header(block.header, NodeStatus::HeaderValid)?);
+                bodies.bodies.write().insert(
+                    (
+                        height,
+                        Hash256::from_le_bytes(block.block_hash().as_byte_array()),
+                    ),
+                    bitcoin::consensus::encode::serialize(block),
+                );
+            }
+            target.ok_or_else(|| anyhow::anyhow!("new branch has no target"))?
+        };
+
+        crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {})?;
+
+        let events = publisher.events.lock().clone();
+        assert_eq!(
+            events,
+            vec![
+                (
+                    Hash256::from_le_bytes(old_two.block_hash().as_byte_array()),
+                    b'D',
+                    0
+                ),
+                (
+                    Hash256::from_le_bytes(old_one.block_hash().as_byte_array()),
+                    b'D',
+                    1
+                ),
+                (
+                    Hash256::from_le_bytes(new_one.block_hash().as_byte_array()),
+                    b'C',
+                    2
+                ),
+                (
+                    Hash256::from_le_bytes(new_two.block_hash().as_byte_array()),
+                    b'C',
+                    3
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct AppliedTipVisiblePublisher {
+        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+        expected: Hash256,
+        seen: Mutex<Vec<Hash256>>,
+    }
+
+    impl crate::ZmqPublisher for AppliedTipVisiblePublisher {
+        fn publish_hashblock(&self, _hash: Hash256) {}
+
+        fn publish_hashtx(&self, _txid: bitcoin::Txid) {}
+
+        fn publish_rawblock(&self, _bytes: &[u8]) {}
+
+        fn publish_rawtx(&self, _bytes: &[u8]) {}
+
+        fn publish_sequence(&self, event: crate::SequenceEvent) {
+            if let crate::SequenceEvent::Connected(hash) = event {
+                assert_eq!(
+                    self.applied_tip.load_full().as_deref().map(|tip| tip.hash),
+                    Some(self.expected),
+                    "applied tip must be visible before publishing C"
+                );
+                self.seen.lock().push(hash);
+            }
+        }
+    }
+
+    #[test]
+    fn connected_sequence_event_observes_the_published_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(5)],
+        )?;
+        let expected = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let publisher = Arc::new(AppliedTipVisiblePublisher {
+            applied_tip: Arc::clone(&handles.applied_tip),
+            expected,
+            seen: Mutex::new(Vec::new()),
+        });
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        let handles = handles.with_zmq_publisher(publisher_handle);
+
+        apply_block(&handles, &block)?;
+
+        assert_eq!(*publisher.seen.lock(), vec![expected]);
         Ok(())
     }
 

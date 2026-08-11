@@ -53,8 +53,10 @@ Done:
 * A fatal disconnect closes apply admission and sets the process shutdown token.
   The durable marker prevents a restart on torn state.
 
-Still open: transaction reconsideration, disconnect notification, filter-index
-backfill, real crash replay, and the ignored live `g10_reorg_deep` gate.
+Still open: transaction reconsideration, filter-index backfill, real crash
+replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
+disconnect notifications through `pubsequence`, but mempool `A`/`R` events remain
+intentionally open.
 Transaction reconsideration requires one production admission pipeline shared
 by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
 the required fee, policy, conflict, and ancestry metadata.
@@ -153,7 +155,7 @@ Open:
 | Piece | Notes |
 |---|---|
 | Mempool reconsideration | Block transactions need the same production admission pipeline as Electrum and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
-| Disconnect notification | ZMQ publishes connects; disconnects are silent |
+| Mempool sequence events | Mempool `A`/`R` notifications remain intentionally absent until event sequencing and removal reasons are redesigned |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
 | Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
 | Un-ignore `g10_reorg_deep` | prove the full path against `bitcoind` regtest |
