@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn difficulty_uses_mainnet_pow_limit_for_regtest_and_mainnet_targets() {
+    fn difficulty_matches_core_for_mainnet_and_regtest_targets() {
         let ctx = Context::new();
         let mainnet = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x1d00_ffff));
         assert_eq!(mainnet.to_bits(), 1.0_f64.to_bits());
