@@ -24,7 +24,7 @@ const RECORD_ROW_SIZE: u64 = 224;
 const JOURNAL_ROW_SIZE: u64 = 56;
 
 /// Minimum size of a BRSCTX1 row in bytes (row_len field + fixed fields).
-const CONTEXT_ROW_MIN_SIZE: u64 = 56;
+const CONTEXT_ROW_MIN_SIZE: u64 = 52;
 
 /// Non-terminal checkpoint returned by the patched kernel census sinks.
 ///
@@ -215,6 +215,21 @@ mod tests {
             journal_end: 16 + JOURNAL_ROW_SIZE,
         };
         cp.validate_coherent().unwrap();
+    }
+
+    #[test]
+    fn validate_coherent_accepts_exact_context_row_minimum() {
+        let mut checkpoint = CensusCheckpoint {
+            context_rows: 1,
+            context_end: 16 + CONTEXT_ROW_MIN_SIZE,
+            record_end: 16,
+            journal_end: 16,
+            ..Default::default()
+        };
+        checkpoint.validate_coherent().unwrap();
+
+        checkpoint.context_end -= 1;
+        assert!(checkpoint.validate_coherent().is_err());
     }
 
     #[test]

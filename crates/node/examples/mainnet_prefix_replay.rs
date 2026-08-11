@@ -9,6 +9,8 @@ use std::ffi::OsString;
 use std::io::BufReader;
 #[cfg(feature = "checksig-census")]
 use std::io::{Read, Write};
+#[cfg(feature = "checksig-census")]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1092,12 +1094,140 @@ fn write_diagnostic_artifact(
     });
     let rendered =
         serde_json::to_string_pretty(&artifact).context("render diagnostic artifact JSON")?;
-    let tmp = output.with_extension("tmp");
-    std::fs::write(&tmp, rendered + "\n")
-        .with_context(|| format!("write temporary diagnostic artifact {}", tmp.display()))?;
-    std::fs::rename(&tmp, output)
-        .with_context(|| format!("rename diagnostic artifact to {}", output.display()))?;
+
+    ensure_diagnostic_output_absent(output)?;
+    let (mut temp, mut file) = DiagnosticTempOutput::create(output)?;
+    file.write_all(rendered.as_bytes())
+        .with_context(|| format!("write temporary diagnostic artifact {}", temp.path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("terminate temporary diagnostic artifact {}", temp.path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush temporary diagnostic artifact {}", temp.path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync temporary diagnostic artifact {}", temp.path.display()))?;
+    drop(file);
+
+    temp.publish(output)?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    OpenOptions::new()
+        .read(true)
+        .open(parent)
+        .with_context(|| format!("open diagnostic output directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync diagnostic output directory {}", parent.display()))?;
+
     Ok(())
+}
+
+#[cfg(feature = "checksig-census")]
+fn ensure_diagnostic_output_absent(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => bail!("refusing to replace existing diagnostic output {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect diagnostic output destination {}", path.display())),
+    }
+}
+
+#[cfg(feature = "checksig-census")]
+struct DiagnosticTempOutput {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(feature = "checksig-census")]
+impl DiagnosticTempOutput {
+    fn create(target: &Path) -> Result<(Self, std::fs::File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+        let file_name = target
+            .file_name()
+            .with_context(|| format!("diagnostic output path {} has no file name", target.display()))?;
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create diagnostic output directory {}", parent.display()))?;
+
+        for _ in 0..128 {
+            let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+            let mut temp_name = file_name.to_os_string();
+            temp_name.push(format!(".tmp.{}.{id}", std::process::id()));
+            let path = parent.join(&temp_name);
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok((Self { path, armed: true }, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("create temporary diagnostic artifact {}", path.display())
+                    });
+                }
+            }
+        }
+        bail!(
+            "could not reserve a temporary diagnostic artifact name beside {} after 128 attempts",
+            target.display()
+        )
+    }
+
+    fn publish(&mut self, target: &Path) -> Result<()> {
+        rename_noreplace(&self.path, target).with_context(|| {
+            format!(
+                "atomically publish {} without replacing {}",
+                self.path.display(),
+                target.display()
+            )
+        })?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "checksig-census")]
+impl Drop for DiagnosticTempOutput {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(feature = "checksig-census")]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        from,
+        rustix::fs::CWD,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(feature = "checksig-census")]
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
 }
 
 #[cfg(feature = "checksig-census")]
@@ -1118,6 +1248,7 @@ fn run_census_diagnostic(
 
     let mut prev_hash = None;
     let started = Instant::now();
+    let mut prev_checkpoint: Option<census_checkpoint::CensusCheckpoint> = None;
 
     for height in args.start_height..=args.stop_height {
         let (hash, raw) = fetch_rest_block(&mut client, height)
@@ -1132,6 +1263,9 @@ fn run_census_diagnostic(
         let block_hash = block.block_hash();
         apply_one_block(apply_handles, block, raw)?;
         let checkpoint = census_checkpoint::capture().context("census checkpoint")?;
+
+        update_prev_checkpoint(&mut prev_checkpoint, checkpoint, height)
+            .context("monotonicity check before checkpoint row")?;
 
         write_checkpoint_row(&mut stdout, height, block_hash, &checkpoint)
             .context("write checkpoint row")?;
@@ -1166,6 +1300,21 @@ fn run_census_diagnostic(
     bail!("safety ceiling exhausted without controller selection");
 }
 
+#[cfg(feature = "checksig-census")]
+fn update_prev_checkpoint(
+    prev: &mut Option<census_checkpoint::CensusCheckpoint>,
+    next: census_checkpoint::CensusCheckpoint,
+    height: u32,
+) -> Result<()> {
+    if let Some(prev) = prev.as_ref() {
+        if !census_checkpoint::is_monotonic(prev, &next) {
+            bail!("checkpoint at height {height} is not monotonic relative to the previous row");
+        }
+    }
+    *prev = Some(next);
+    Ok(())
+}
+
 
 fn print_usage() {
     println!(
@@ -1176,14 +1325,16 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "checksig-census")]
-    use std::io::Cursor;
+    use bitcoin::consensus::Encodable as _;
     use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
     use bitcoin_rs_primitives::Hash256;
     use std::io::Cursor;
 
     fn regtest_genesis_bytes() -> Vec<u8> {
-        serialize(&bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest))
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut bytes = Vec::new();
+        block.consensus_encode(&mut bytes).unwrap();
+        bytes
     }
 
     fn write_archive(magic: [u8; 4], payloads: &[&[u8]]) -> Vec<u8> {
@@ -1310,7 +1461,7 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("wrong magic"), "{err:?}");
+        assert!(format!("{err:?}").to_lowercase().contains("wrong magic"), "{err}");
     }
 
     #[test]
@@ -1489,7 +1640,7 @@ mod tests {
             abi_version: 1,
             struct_size: 56,
             context_rows: 1,
-            context_end: 16 + 100,
+            context_end: 16 + 52,
             record_rows: 2,
             record_end: 16 + 2 * 224,
             journal_rows: 3,
@@ -1510,8 +1661,9 @@ mod tests {
     #[test]
     fn diagnostic_artifact_records_actual_stop_and_controller_reason() {
         let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        args.output = Some(temp.path().to_path_buf());
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("diagnostic.json");
+        args.output = Some(output.clone());
         write_diagnostic_artifact(
             &args,
             11,
@@ -1519,7 +1671,7 @@ mod tests {
             Duration::from_secs(3),
         )
         .unwrap();
-        let content = std::fs::read_to_string(temp.path()).unwrap();
+        let content = std::fs::read_to_string(&output).unwrap();
         let artifact: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             artifact["schema"].as_str(),
@@ -1533,6 +1685,67 @@ mod tests {
         assert!(!content.contains("all-11-observed"));
     }
 
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn diagnostic_artifact_refuses_preexisting_destination() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("diagnostic.json");
+        std::fs::write(&output, b"already here").unwrap();
+        args.output = Some(output.clone());
+        let err = write_diagnostic_artifact(
+            &args,
+            11,
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("refusing to replace existing"), "{err}");
+        let content = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(content, "already here");
+    }
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn diagnostic_artifact_publishes_dot_tmp_destination_safely() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("diagnostic.json.tmp");
+        args.output = Some(output.clone());
+        write_diagnostic_artifact(
+            &args,
+            7,
+            "0000000000000000000000000000000000000000000000000000000000000007".into(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&output).unwrap();
+        let artifact: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(artifact["actual_stop_height"].as_u64(), Some(7));
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(entries.iter().any(|n| n.to_string_lossy() == "diagnostic.json.tmp"), "{entries:?}");
+    }
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn diagnostic_artifact_leaves_no_debris_on_failure() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        // /nonexistent is guaranteed to fail directory creation.
+        args.output = Some(PathBuf::from("/nonexistent/graveyard/diagnostic.json"));
+        let err = write_diagnostic_artifact(
+            &args,
+            11,
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("diagnostic output"), "{err}");
+    }
 
     #[cfg(feature = "checksig-census")]
     #[test]
@@ -1568,4 +1781,31 @@ mod tests {
         unsafe { std::env::remove_var("BRS_CENSUS_JOURNAL"); }
     }
 
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn checkpoint_monotonicity_rejects_decreasing_successor() {
+        let mut prev = None;
+        let first = census_checkpoint::CensusCheckpoint {
+            context_rows: 1,
+            context_end: 100,
+            record_rows: 1,
+            record_end: 100,
+            journal_rows: 1,
+            journal_end: 100,
+            ..Default::default()
+        };
+        update_prev_checkpoint(&mut prev, first, 0).unwrap();
+
+        let second = census_checkpoint::CensusCheckpoint {
+            context_rows: 0,
+            context_end: 100,
+            record_rows: 1,
+            record_end: 100,
+            journal_rows: 1,
+            journal_end: 100,
+            ..Default::default()
+        };
+        let err = update_prev_checkpoint(&mut prev, second, 1).unwrap_err();
+        assert!(err.to_string().contains("not monotonic"), "{err}");
+    }
 }
