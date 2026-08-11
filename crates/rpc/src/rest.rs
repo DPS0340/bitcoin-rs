@@ -29,6 +29,13 @@ pub struct Response {
 }
 
 /// Routes one REST request.
+///
+/// REST is deliberately distinct from unknown routes: a disabled gateway and
+/// a genuinely unknown path return 404, while malformed header parameters
+/// return 400. The enforcer uses 404 on `/rest/*` to diagnose a disabled
+/// gateway, so an unknown but well-formed block hash returns an empty 200
+/// response instead of a misleading 404. Header query parameters other than
+/// `count` are ignored, matching Core's cache-buster-friendly behavior.
 #[must_use]
 pub fn route(ctx: &Arc<Context>, path: &str, query: &str, enabled: bool) -> Response {
     if !enabled {
@@ -45,21 +52,21 @@ pub fn route(ctx: &Arc<Context>, path: &str, query: &str, enabled: bool) -> Resp
 
 fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let Some((hash_text, format)) = suffix.rsplit_once('.') else {
-        return not_found();
+        return bad_request_owned(format!("Invalid hash: {suffix}"));
     };
+    if !matches!(format, "json" | "hex" | "bin") {
+        return bad_request_owned(format!("Invalid hash: {suffix}"));
+    }
     let Ok(hash) = Hash256::from_str(hash_text) else {
-        return bad_request("invalid block hash");
+        return bad_request_owned(format!("Invalid hash: {suffix}"));
     };
     let count = match parse_count(query) {
         Ok(count) => count,
         Err(response) => return response,
     };
     let records = header_records(ctx, hash, count);
-    if records.is_empty() {
-        return not_found();
-    }
     let headers: Vec<Header> = records.iter().filter_map(decode_header).collect();
-    if headers.is_empty() {
+    if !records.is_empty() && headers.is_empty() {
         return not_found();
     }
     match format {
@@ -85,7 +92,7 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
                 body
             }),
         ),
-        _ => not_found(),
+        _ => unreachable!("header format checked above"),
     }
 }
 
@@ -112,16 +119,34 @@ fn parse_count(query: &str) -> Result<u32, Response> {
     if query.is_empty() {
         return Ok(DEFAULT_HEADER_COUNT);
     }
-    let Some(value) = query.strip_prefix("count=") else {
-        return Err(bad_request("invalid count"));
-    };
-    let Ok(value) = value.parse::<u32>() else {
-        return Err(bad_request("invalid count"));
-    };
-    if value == 0 {
-        return Err(bad_request("count must be positive"));
+    let mut count = None;
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            if pair == "count" {
+                return Err(invalid_count(pair));
+            }
+            continue;
+        };
+        if key == "count" {
+            count = Some(value);
+        }
     }
-    Ok(value.min(MAX_HEADER_COUNT))
+    let Some(value) = count else {
+        return Ok(DEFAULT_HEADER_COUNT);
+    };
+    let Ok(parsed) = value.parse::<u64>() else {
+        return Err(invalid_count(value));
+    };
+    if !(1..=u64::from(MAX_HEADER_COUNT)).contains(&parsed) {
+        return Err(invalid_count(value));
+    }
+    Ok(u32::try_from(parsed).unwrap_or(MAX_HEADER_COUNT))
+}
+
+fn invalid_count(value: &str) -> Response {
+    bad_request_owned(format!(
+        "Header count is invalid or out of acceptable range (1-2000): {value}"
+    ))
 }
 
 fn decode_header(record: &BlockRecord) -> Option<Header> {
@@ -183,6 +208,15 @@ fn bad_request(message: &'static str) -> Response {
     }
 }
 
+fn bad_request_owned(message: String) -> Response {
+    Response {
+        status: 400,
+        reason: "Bad Request",
+        content_type: "text/plain",
+        body: message.into_bytes(),
+    }
+}
+
 fn not_found() -> Response {
     not_found_with("not found")
 }
@@ -231,15 +265,16 @@ mod tests {
     #[test]
     fn route_rejects_unknown_formats_and_bad_hashes() {
         let ctx = Arc::new(Context::new());
+        let response = route(
+            &ctx,
+            "/rest/headers/0000000000000000000000000000000000000000000000000000000000000000.txt",
+            "",
+            true,
+        );
+        assert_eq!(response.status, 400);
         assert_eq!(
-            route(
-                &ctx,
-                "/rest/headers/0000000000000000000000000000000000000000000000000000000000000000.txt",
-                "",
-                true
-            )
-            .status,
-            404
+            String::from_utf8(response.body).expect("error body"),
+            "Invalid hash: 0000000000000000000000000000000000000000000000000000000000000000.txt"
         );
         assert_eq!(
             route(&ctx, "/rest/headers/not-a-hash.json", "", true).status,
@@ -248,12 +283,55 @@ mod tests {
     }
 
     #[test]
-    fn count_defaults_and_clamps() {
+    fn count_boundaries_and_errors() {
         assert_eq!(parse_count("").expect("default"), 5);
-        assert_eq!(parse_count("count=999999").expect("clamped"), 2_000);
+        assert_eq!(parse_count("count=1").expect("lower boundary"), 1);
+        assert_eq!(parse_count("count=2000").expect("upper boundary"), 2_000);
+        assert_eq!(
+            parse_count("count=2001").expect_err("above range").status,
+            400
+        );
         assert_eq!(parse_count("count=0").expect_err("zero count").status, 400);
+        assert_eq!(
+            parse_count("count=-1").expect_err("negative count").status,
+            400
+        );
         assert_eq!(parse_count("count=bad").expect_err("bad count").status, 400);
-        assert_eq!(parse_count("limit=5").expect_err("bad query").status, 400);
+        assert_eq!(
+            parse_count("count=18446744073709551616")
+                .expect_err("overflow count")
+                .status,
+            400
+        );
+        assert_eq!(parse_count("limit=5").expect("unknown query"), 5);
+        assert_eq!(parse_count("count=3&foo=1").expect("unknown query"), 3);
+        assert_eq!(parse_count("foo=1&count=3").expect("unknown query"), 3);
+    }
+
+    #[test]
+    fn unknown_hash_returns_empty_success_for_all_formats() {
+        let ctx = Arc::new(Context::new());
+        let hash = "0000000000000000000000000000000000000000000000000000000000000001";
+        for format in ["json", "hex", "bin"] {
+            let path = format!("/rest/headers/{hash}.{format}");
+            let response = route(&ctx, &path, "count=1", true);
+            assert_eq!(response.status, 200, "{format}");
+            assert!(
+                response.body.is_empty() || response.body == b"[]",
+                "{format}"
+            );
+        }
+        let with_unknown_param = route(
+            &ctx,
+            &format!("/rest/headers/{hash}.json"),
+            "count=3&foo=1",
+            true,
+        );
+        let without_count = route(&ctx, &format!("/rest/headers/{hash}.json"), "limit=5", true);
+        assert_eq!(with_unknown_param.status, 200);
+        assert_eq!(without_count.status, 200);
+        assert_eq!(with_unknown_param.body, b"[]");
+        assert_eq!(without_count.body, b"[]");
     }
 
     #[test]

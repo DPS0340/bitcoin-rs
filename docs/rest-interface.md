@@ -20,9 +20,15 @@ Currently implemented endpoints are:
 * `GET /rest/headers/{hash}.hex`
 * `GET /rest/headers/{hash}.bin`
 
-Header `count` defaults to 5 and is capped at 2000. Active-chain requests walk
-forward by height. A side-branch hash returns only its own header because the
-available block-tree accessors do not provide child traversal.
+Header `count` defaults to 5 and must be in the inclusive range 1–2000.
+Out-of-range, negative, non-numeric, and overflowing values return HTTP 400
+with Core's invalid-count message. Unknown query parameters are ignored, so
+cache-buster parameters do not affect the response.
+
+Active-chain requests walk forward by height. A side-branch hash returns only
+its own header because the available block-tree accessors do not provide child
+traversal. A well-formed but unknown block hash returns HTTP 200 with an empty
+JSON array (or an empty hex/binary body), matching Core.
 
 The REST gateway does not change the reported `getnetworkinfo` version. When
 using the unmodified `bip300301_enforcer`, pass
@@ -34,3 +40,7 @@ topic. Normal enforcer mempool synchronization therefore requires an explicit
 no-mempool/bounded enforcer mode.
 
 REST is off by default. With REST disabled, `/rest/*` returns HTTP 404.
+Unknown REST routes also return 404; malformed header inputs and unsupported
+header extensions return 400. This distinction is load-bearing for the
+enforcer: it treats a 404 on `/rest/*` as evidence that REST is not enabled,
+so an unknown block hash must not produce a misleading 404.

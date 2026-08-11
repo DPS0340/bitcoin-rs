@@ -667,7 +667,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
                 "BITCOIN_RS_STORAGE_BACKEND" => layer.storage_backend = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_BIND" => layer.rpc_bind = Some(value.parse()?),
-                "BITCOIN_RS_REST" => layer.rest = Some(value.parse()?),
+                "BITCOIN_RS_REST" => layer.rest = Some(parse_bool(value)?),
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),
