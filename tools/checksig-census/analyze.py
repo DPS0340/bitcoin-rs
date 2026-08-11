@@ -340,6 +340,26 @@ class Record:
             self.pubkey,
             _pad1,
         ) = unpacked
+        # Exact over-capacity ECDSA reject shape accepted by both BRSREC1 readers.
+        # Native reason-1 records may preserve the original (>=66) pubkey_len only
+        # for outcome 2 with a null payload and unchanged padding.
+        _is_exact_over_capacity_reject = (
+            self.outcome == 2
+            and self.reject_reason == 1
+            and 1 <= self.op_kind <= 4
+            and self.sig_version in (0, 1)
+            and self.der_len == 0
+            and self.sighash_type == 0
+            and _pad0 == 0
+            and _pad1 == b"\x00" * 7
+            and self.sighash == b"\x00" * 32
+            and self.der_sig == b"\x00" * 72
+            and self.pubkey == b"\x00" * 65
+        )
+        if self.pubkey_len > 65 and not _is_exact_over_capacity_reject:
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65"
+            )
         # ── Canonical field-range validation ──
         if self.op_kind > 5:
             raise AnalyzerError(
@@ -416,10 +436,6 @@ class Record:
             effective_der_len = 72
         else:
             effective_der_len = self.der_len
-        if self.pubkey_len > 65:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65"
-            )
         # ── Padding must be all-zero ──
         if _pad0 != 0:
             raise AnalyzerError("CTX-OPERATIONS: record _pad0 is not all-zero")
