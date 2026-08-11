@@ -22,6 +22,7 @@ import os
 import struct
 import sys
 import tempfile
+import stat
 from pathlib import Path
 
 # Make sibling modules importable when run directly
@@ -5546,6 +5547,101 @@ def test_diagnostic_helper_synthetic_all_types() -> None:
         assert totals["tapscript_checksigadd_checks"] == 1
 
 
+def test_diagnostic_op_seq_stream_order_rejects_one_before_zero() -> None:
+    """Encounter-order stream 1,0 for one identity must raise CTX-OPERATIONS.
+
+    A sorted-set implementation would accept this as {0,1}; strict row-number
+    semantics reject the first emitted row because its expected op_seq is 0.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xd1" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        records = [
+            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
+            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1),
+        ]
+        journal = [_make_journal_bytes(txid_le, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2)]
+        _make_brsctx1_file(tmp / "contexts.bin", [ctx_row])
+        _write_records_file(tmp / "records.bin", records)
+        _write_journal_file(tmp / "journal.bin", journal)
+        paths = {
+            "contexts": tmp / "contexts.bin",
+            "records": tmp / "records.bin",
+            "journal": tmp / "journal.bin",
+        }
+        row = DiagnosticCheckpoint(
+            height=1,
+            block_hash_le=bytes([1] * 32),
+            context_rows=1,
+            context_end=(paths["contexts"].stat().st_size),
+            record_rows=2,
+            record_end=(paths["records"].stat().st_size),
+            journal_rows=1,
+            journal_end=(paths["journal"].stat().st_size),
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: _read_diagnostic_streams(row, None, paths),
+            "misordered op_seq 1 before 0",
+            "CTX-OPERATIONS",
+        )
+
+
+def test_atomic_publish_rollback_fsyncs_after_unlink() -> None:
+    """First post-link directory fsync fails; rollback unlinks target then fsyncs.
+
+    The injected failure fires once, then rollback uses the real fsync on the
+    reopened parent directory. We assert unlink precedes the rollback fsync and
+    that neither target nor temp survive.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target = tmp / "out.json"
+        from analyze import _atomic_publish_no_replace
+        original_fsync = os.fsync
+        original_unlink = os.unlink
+
+        ops: list[str] = []
+        dir_fsync_count = 0
+
+        def instrumented_unlink(p, *, dir_fd=None):
+            ops.append(f"unlink:{p}")
+            if dir_fd is not None:
+                return original_unlink(p, dir_fd=dir_fd)
+            return original_unlink(p)
+
+        fsync_calls: list[tuple[bool, bool]] = []
+
+        def counting_fsync(fd):
+            nonlocal dir_fsync_count
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            after_unlink = len(ops) > 0
+            fsync_calls.append((is_dir, after_unlink))
+            if is_dir:
+                dir_fsync_count += 1
+                if dir_fsync_count == 1 and not after_unlink:
+                    raise OSError(5, "simulated post-link directory fsync error")
+            return original_fsync(fd)
+
+        try:
+            os.fsync = counting_fsync
+            os.unlink = instrumented_unlink
+            _raises(
+                OSError,
+                lambda: _atomic_publish_no_replace(target, b"candidate"),
+                "post-link fsync failure",
+            )
+        finally:
+            os.fsync = original_fsync
+            os.unlink = original_unlink
+        assert not target.exists()
+        assert not any(tmp.glob(".*out.json.tmp*"))
+        assert any("unlink" in op for op in ops), "target must be unlinked during rollback"
+        # fsync called after at least one unlink (rollback directory fsync).
+        assert any(after for (_, after) in fsync_calls if after), "rollback fsync must follow unlink"
+
+
 def test_atomic_publish_no_replace_collision() -> None:
     """os.link must fail atomically when the destination already exists."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -5769,6 +5865,8 @@ def main() -> int:
         test_read_bounded_context_rows_truncated_row,
         test_c150_helper_parity,
         test_diagnostic_helper_synthetic_all_types,
+        test_diagnostic_op_seq_stream_order_rejects_one_before_zero,
+        test_atomic_publish_rollback_fsyncs_after_unlink,
         test_atomic_publish_no_replace_collision,
         test_atomic_publish_cleans_temp_on_post_link_fsync_failure,
     ]

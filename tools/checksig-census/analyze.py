@@ -978,11 +978,18 @@ def _read_diagnostic_streams(
         records = [Record(raw) for raw in record_raws]
         record_counts, op_seqs = _diagnostic_record_counts(records, context_map)
 
-        by_identity: dict[tuple[bytes, int], list[int]] = {}
+        next_op_seq: dict[tuple[bytes, int], int] = {}
         record_sums: dict[tuple[bytes, int], list[int]] = {}
         for record in records:
             key = (record.spend_txid, record.input_index)
-            by_identity.setdefault(key, []).append(record.op_seq)
+            expected_op_seq = next_op_seq.get(key, 0)
+            if record.op_seq != expected_op_seq:
+                display_txid = record.spend_txid[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-OPERATIONS: op_seq contiguity violation for {display_txid}:{record.input_index}: "
+                    f"expected {expected_op_seq}, got {record.op_seq}"
+                )
+            next_op_seq[key] = expected_op_seq + 1
             sums = record_sums.setdefault(key, [0, 0, 0, 0])
             if record.op_kind in (1, 2):
                 sums[0] += 1
@@ -993,16 +1000,6 @@ def _read_diagnostic_streams(
                     sums[2] += 1
                 if record.outcome == 1:
                     sums[3] += 1
-
-        for (txid, idx), seqs in by_identity.items():
-            seqs.sort()
-            expected = list(range(len(seqs)))
-            if seqs != expected:
-                display_txid = txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: op_seq contiguity violation for {display_txid}:{idx}: "
-                    f"expected {expected}, got {seqs}"
-                )
 
         for entry in journal:
             actual = record_sums.get(entry.key, [0, 0, 0, 0])
@@ -1097,13 +1094,9 @@ def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
     _ATOMIC_PUBLISH_COUNTER += 1
     temp = parent / f".{path.name}.tmp.{os.getpid()}.{_ATOMIC_PUBLISH_COUNTER}"
     link_created = False
+    dir_fd: int | None = None
 
-    def _cleanup() -> None:
-        if link_created:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+    def _unlink_temp() -> None:
         try:
             temp.unlink()
         except FileNotFoundError:
@@ -1124,32 +1117,41 @@ def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
 
         dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
+            os.link(temp, path)
+        except FileExistsError as exc:
+            raise AnalyzerError(f"DIAG-OUTPUT: output already exists: {path}") from exc
+        except OSError as exc:
+            raise AnalyzerError(
+                f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
+            ) from exc
+        link_created = True
+        os.fsync(dir_fd)
+        _unlink_temp()
+        os.fsync(dir_fd)
+    except BaseException as publish_error:
+        rollback_error: BaseException | None = None
+        if link_created:
             try:
-                os.link(temp, path)
-            except FileExistsError as exc:
-                raise AnalyzerError(f"DIAG-OUTPUT: output already exists: {path}") from exc
-            except OSError as exc:
-                raise AnalyzerError(
-                    f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
-                ) from exc
-            link_created = True
-            os.fsync(dir_fd)
-        finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
-            try:
+                path.unlink()
+                if dir_fd is None:
+                    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
                 os.fsync(dir_fd)
-            except OSError:
-                pass
-            os.close(dir_fd)
-    except BaseException:
-        _cleanup()
+            except BaseException as exc:
+                rollback_error = exc
+        try:
+            _unlink_temp()
+        except BaseException as exc:
+            if rollback_error is None:
+                rollback_error = exc
+        if rollback_error is not None:
+            raise rollback_error from publish_error
         raise
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+        _unlink_temp()
 
     if not link_created:
-        _cleanup()
         raise AnalyzerError("DIAG-OUTPUT: publication did not create a link")
 
 
