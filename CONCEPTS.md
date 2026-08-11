@@ -49,6 +49,20 @@ Bitcoin Core's C++ consensus engine (`libbitcoinkernel`), compiled into `bitcoin
 ### bitcoinconsensus
 Removed historical script verification backend. Previously linked as an extracted C library for non-taproot script checks before being deleted in favor of `bitcoinkernel`. The library lacked complete-prevout and Taproot script-path verification capabilities required for current mainnet script validation (exposed by block 938344 during mainnet IBD).
 
+### Difficulty-1 target
+The network-independent reference target used by Bitcoin Core's difficulty
+calculation: compact nBits `0x1d00ffff`, rather than the selected network's
+PoW limit. Confusing the two makes every network report difficulty `1.0` at
+its easiest target. See
+`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
+
+### Float value/text parity
+The distinction between equal IEEE-754 values and equal serialized spellings.
+Core's UniValue uses `%.16g`, while the live RPC path's sonic-rs serializer
+uses shortest-round-trip formatting, so compatibility means preserving the
+value and operation order, not forcing JSON text to match. See
+`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
+
 ### Rust interpreter (portable posture)
 The pure-Rust script verification path maintained alongside the bitcoinkernel default. Enabled under `--no-default-features` without C++ build dependencies. Its non-Taproot path is a stub that accepts only a bare `OP_TRUE` spend with an empty scriptSig and witness, so it cannot validate ordinary spends either, and it has no Taproot script-path support. What it does verify is the Taproot key path, in full. It is retained for differential testing and lightweight non-production environments; a mainnet sync stops early on the first real spend.
 

@@ -2,8 +2,9 @@ use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use core::str::FromStr as _;
+use core::{fmt, fmt::Write as _};
 
-use bitcoin_rs_chain::NodeStatus;
+use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
@@ -14,13 +15,18 @@ use crate::handlers::{ensure_no_params, optional_bool, params_array, required_st
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let applied = ctx.applied_height();
+    let applied_tip = ctx.applied_tip.load_full();
+    let applied = applied_tip.as_ref().map_or(0, |tip| tip.height);
     let headers = ctx.height();
-    let difficulty = ctx.applied_tip.load_full().map_or(0.0, |tip| {
+    let (difficulty, time, mediantime) = applied_tip.as_ref().map_or((0.0, 0_u64, 0_u64), |tip| {
         let tree = ctx.block_tree.read();
-        tree.node(tip.tip_id)
-            .ok()
-            .map_or(0.0, |node| ctx.difficulty_for_bits(node.header.bits))
+        tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
+            (
+                ctx.difficulty_for_bits(node.header.bits),
+                u64::from(node.header.time),
+                u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+            )
+        })
     });
     let verification_progress = if headers > 0 {
         f64::from(applied) / f64::from(headers)
@@ -40,16 +46,21 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
         fold_block_records(&blocks, applied, None)
     };
     let prune_status = ctx.prune_status();
-    let bestblockhash = ctx.applied_hash().to_string_be();
-    let chainwork = ctx.chainwork_hex();
+    let bestblockhash = applied_tip
+        .as_ref()
+        .map_or_else(Hash256::default, |tip| tip.hash)
+        .to_string_be();
+    let chainwork = applied_tip
+        .as_deref()
+        .map_or_else(|| ctx.chainwork_hex(), chainwork_hex);
     let mut response = sonic_rs::Object::new();
     let _ = response.insert(&"chain", chain);
     let _ = response.insert(&"blocks", applied);
     let _ = response.insert(&"headers", headers);
     let _ = response.insert(&"bestblockhash", bestblockhash.as_str());
     let _ = response.insert(&"difficulty", json!(difficulty));
-    let _ = response.insert(&"time", 0_u64);
-    let _ = response.insert(&"mediantime", 0_u64);
+    let _ = response.insert(&"time", time);
+    let _ = response.insert(&"mediantime", mediantime);
     let _ = response.insert(&"verificationprogress", json!(verification_progress));
     let _ = response.insert(&"initialblockdownload", applied < headers);
     let _ = response.insert(&"chainwork", chainwork.as_str());
@@ -60,6 +71,15 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     }
     let _ = response.insert(&"warnings", "");
     Ok(Value::from(response))
+}
+
+fn chainwork_hex(tip: &TipSnapshot) -> String {
+    let bytes: [u8; 32] = tip.chainwork.to_be_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _: fmt::Result = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
@@ -941,9 +961,54 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+
+    fn context_with_tip(
+        network: bitcoin_rs_primitives::Network,
+        bits: u32,
+        times: &[u32],
+    ) -> Arc<Context> {
+        let mut context = Context::new();
+        context.chain_network = network;
+        let ctx = Arc::new(context);
+        let (tip_id, tip_hash) = {
+            let mut tree = ctx.block_tree.write();
+            let mut parent = None;
+            let mut previous_hash = BlockHash::all_zeros();
+            let mut tip_id = NodeId::new(0);
+            let mut tip_hash = Hash256::default();
+            for (index, time) in times.iter().copied().enumerate() {
+                let header = Header {
+                    version: Version::ONE,
+                    prev_blockhash: previous_hash,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: CompactTarget::from_consensus(bits),
+                    nonce: u32::try_from(index).unwrap_or(u32::MAX),
+                };
+                previous_hash = header.block_hash();
+                tip_id = tree
+                    .insert_node(parent, header, NodeStatus::Active)
+                    .unwrap_or(tip_id);
+                tip_hash = Hash256::from_le_bytes(previous_hash.as_byte_array());
+                parent = Some(tip_id);
+            }
+            (tip_id, tip_hash)
+        };
+        let tip = TipSnapshot {
+            tip_id,
+            height: u32::try_from(times.len().saturating_sub(1)).unwrap_or(u32::MAX),
+            chainwork: ChainWork::ZERO,
+            hash: tip_hash,
+        };
+        ctx.set_chain_tip(tip.clone());
+        ctx.set_applied_tip(tip);
+        ctx
+    }
 
     #[test]
     fn subsidy_at_height_genesis_is_50_btc() {
@@ -1266,6 +1331,90 @@ mod tests {
         assert_eq!(
             result.get("size_on_disk").and_then(JsonValueTrait::as_u64),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn difficulty_matches_core_for_mainnet_and_regtest_targets() {
+        let ctx = Context::new();
+        let mainnet = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x1d00_ffff));
+        assert_eq!(mainnet.to_bits(), 1.0_f64.to_bits());
+        let regtest = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x207f_ffff));
+        let expected = 4.656_542_373_906_924_7e-10_f64;
+        assert_eq!(regtest.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn getblockchaininfo_reports_tip_time_and_median_time_past() {
+        let ctx = context_with_tip(
+            bitcoin_rs_primitives::Network::Regtest,
+            0x207f_ffff,
+            &[100, 300, 200],
+        );
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("time").and_then(JsonValueTrait::as_u64),
+            Some(200)
+        );
+        assert_eq!(
+            result.get("mediantime").and_then(JsonValueTrait::as_u64),
+            Some(200)
+        );
+        let difficulty = result
+            .get("difficulty")
+            .and_then(JsonValueTrait::as_f64)
+            .unwrap_or_default();
+        assert_eq!(
+            difficulty.to_bits(),
+            4.656_542_373_906_924_7e-10_f64.to_bits()
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_uses_one_applied_tip_snapshot() {
+        use bitcoin_rs_chain::ChainWork;
+
+        let ctx = context_with_tip(
+            bitcoin_rs_primitives::Network::Regtest,
+            0x207f_ffff,
+            &[100, 300, 200],
+        );
+        let Some(applied) = ctx.applied_tip.load_full() else {
+            panic!("applied tip missing");
+        };
+        let applied_chainwork = ChainWork::from_be_bytes([1; 32]);
+        ctx.set_applied_tip(TipSnapshot {
+            chainwork: applied_chainwork,
+            ..(*applied).clone()
+        });
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: applied.tip_id,
+            height: 99,
+            chainwork: ChainWork::from_be_bytes([2; 32]),
+            hash: Hash256::from_le_bytes(&[9; 32]),
+        });
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        let expected_hash = applied.hash.to_string_be();
+        let expected_chainwork = "01".repeat(32);
+        assert_eq!(
+            result.get("blocks").and_then(JsonValueTrait::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            result.get("headers").and_then(JsonValueTrait::as_u64),
+            Some(99)
+        );
+        assert_eq!(
+            result.get("bestblockhash").and_then(JsonValueTrait::as_str),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            result.get("chainwork").and_then(JsonValueTrait::as_str),
+            Some(expected_chainwork.as_str())
         );
     }
 
