@@ -25,12 +25,14 @@ Out-of-range, negative, non-numeric, and overflowing values return HTTP 400
 with Core's invalid-count message. Unknown query parameters are ignored, so
 cache-buster parameters do not affect the response.
 
-Active-chain requests walk forward by height. A side-branch or orphaned hash
-returns HTTP 200 with an empty JSON array (or an empty hex/binary body), just
-like an unknown well-formed hash, because Core only walks hashes contained in
-its active chain. Cache-only records that are not yet represented in the tree
-use the existing singleton fallback because their active-chain membership
-cannot be established from the tree.
+Active-chain requests walk forward by height from the applied tip. A
+side-branch, orphaned, or header-only hash above the applied tip returns HTTP
+200 with an empty JSON array (or an empty hex/binary body), just like an
+unknown well-formed hash, because Core only walks hashes contained in its
+active chain. If no applied tip is published, tree-known hashes likewise
+return an empty response. Cache-only records that are not yet represented in
+the tree use the existing singleton fallback because their active-chain
+membership cannot be established from the tree.
 
 The REST gateway does not change the reported `getnetworkinfo` version. When
 using the unmodified `bip300301_enforcer`, pass

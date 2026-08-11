@@ -108,16 +108,16 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
             header: start_node.header,
         };
         let Some(tip) = applied_tip else {
-            return vec![start];
+            return Vec::new();
         };
         let Ok(tip_node) = tree.node(tip.tip_id) else {
-            return vec![start];
+            return Vec::new();
         };
         if tip_node.hash != tip.hash || tip_node.height != tip.height {
-            return vec![start];
+            return Vec::new();
         }
         let Some(active_start) = tree.node_at_height_from(tip.tip_id, start.height) else {
-            return vec![start];
+            return Vec::new();
         };
         if active_start != start_id {
             return Vec::new();
@@ -127,7 +127,7 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
             .saturating_add(count.saturating_sub(1))
             .min(tip_node.height);
         let Some(last_id) = tree.node_at_height_from(tip.tip_id, last_height) else {
-            return vec![start];
+            return Vec::new();
         };
         let mut records = Vec::with_capacity(usize::try_from(count).unwrap_or(usize::MAX));
         let mut cursor = last_id;
@@ -532,7 +532,7 @@ mod tests {
             bits,
             nonce: 3,
         };
-        let (applied_tip, applied_hash) = {
+        let applied_tip = {
             let mut tree = ctx.block_tree.write();
             let genesis_id = tree
                 .insert_node(None, genesis, NodeStatus::Active)
@@ -543,25 +543,19 @@ mod tests {
             let applied_tip = tree.tip().expect("applied tip").as_ref().clone();
             tree.insert_node(Some(applied_id), header_tip, NodeStatus::Active)
                 .expect("header tip");
-            (applied_tip, applied_id)
+            applied_tip
         };
         ctx.set_applied_tip(applied_tip);
-        let applied_hash = ctx
-            .block_tree
-            .read()
-            .node(applied_hash)
-            .expect("applied node")
-            .hash;
+        let header_tip_hash = Hash256::from_le_bytes(header_tip.block_hash().as_byte_array());
 
         let response = route(
             &ctx,
-            &format!("/rest/headers/{applied_hash}.json"),
+            &format!("/rest/headers/{header_tip_hash}.json"),
             "count=2000",
             true,
         );
         let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(1));
+        assert!(values.is_empty());
     }
 
     #[test]
@@ -727,6 +721,7 @@ mod tests {
             hash: broken_node.hash,
         };
         drop(tree);
+        ctx.set_applied_tip(tip.clone());
         ctx.set_chain_tip(tip);
 
         let path = format!("/rest/headers/{}.json", genesis.block_hash());
