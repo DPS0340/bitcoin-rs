@@ -30,15 +30,13 @@ checksig-census/
    - 39,815,149 bytes
    - SHA256 `16cbaf17feb16ad9b567b4680a5eaf449699037f9696ccb2366af3f48b756fa2`
 
-2. **REST bitcoind** on `127.0.0.1:18443` for Run A (mainnet_prefix_replay):
-   ```bash
-   bitcoind -datadir=~/bench-g14/core-datadir -rest=1 -rpcport=18443 -connect=0
-   ```
+2. **Authoritative block archive and manifest**: `/home/alpha/bench-g14/corpora/c150/`
+   - `blocks.dat` and `manifest.json` for file-bound C150 replay.
+   - Direct Core REST export (`bitcoind -datadir=... -rest=1`) can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence cannot certify a product corpus.
 
 3. **Python 3.12+** for the analyzer (stdlib only, no pip install).
 
 4. **taskset -c 0-31** for all timed runs (32 physical cores, no SMT siblings).
-
 ## Setup
 
 Before building, create a fresh instrumented `libbitcoinkernel-sys` copy.
@@ -139,16 +137,10 @@ python3 analyze.py classify-corpus \
   --contract c150
 ```
 
-The replay produces the authoritative `c150.counters.json`, `c150.contexts.bin`,
-`c150.journal.bin`, and `c150.records.bin` artifacts in one process. The strict
-classifier validates each stream's magic and framing, the exact native count
-equations, and every context, record, and journal join.
+The replay produces the authoritative `c150.counters.json` (24 fixed-order u64 counters + 3 counts), `c150.contexts.bin` (`BRSCTX1\0`), `c150.journal.bin` (`BRSJRN1\0`), and `c150.records.bin` (`BRSREC1\0`) artifacts in one process using same-open parse-stream custody. The strict classifier (`classify-corpus-v2`) validates each stream's magic and framing, the exact native count equations, strict `mainnet-prefix-replay-v2` inputs, and every context, record, and journal join.
 
-Expected: `ffi_verify_entries == 2,868,199`, all verdicts true, pre-taproot
-counters (`op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls`,
-`schnorr_verify_ok`, `schnorr_verify_fail`) zero.
-Any sink open, write, stream, or close failure forces a nonzero process exit.
-
+Expected: `context_count == 2,868,199`, `ffi_verify_entries == 2,868,199`, `eval_script_entries == 5,736,398` (exactly twice the ordinary total due to scriptSig + scriptPubKey passes per ordinary P2PKH check), all verdicts true, all 11 special context counters zero (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`), and all 13 complementary execution counters zero. Result: `all_passed: true` and `c150_passed: true`.
+Any sink open, write, stream, or close failure forces a nonzero process exit. Live REST streams or sampled evidence (such as `kernel_verify_spike`) cannot certify C150 or Cmodern product corpora.
 ### Run B — KSPIKE1 capture (counters + journal + records, run twice)
 
 ```bash
@@ -172,9 +164,7 @@ BRS_CENSUS_LABEL=kspike1 \
 "$CAPTURE" --corpus "$CORPUS" --output "$EXP/out/kspike1-repeat.summary.json"
 ```
 
-`BRS_CENSUS_CONTEXTS` is mandatory for authoritative Run A. It is optional for
-the separate KSPIKE1 diagnostic in Run B.
-
+`BRS_CENSUS_CONTEXTS` is mandatory for authoritative Run A. It is optional for the separate KSPIKE1 diagnostic in Run B. Sampled evidence cannot certify a product corpus.
 Expected: `ffi_verify_entries == 159,259`, all inputs verify successfully.
 
 ### Validate capture artifacts
@@ -286,22 +276,28 @@ done
 The analyzer extracts `us_per_input` from the `threads == 1` run in each JSON.
 The median across the three runs is `X`.
 
-### Validate census + cross-check
+### Validate census + cross-check (classify-corpus)
 
 ```bash
 REPO=/home/alpha/exp/bitcoin-rs
 EXP=$REPO/tools/checksig-census
+C150=/home/alpha/bench-g14/corpora/c150
 
 cd "$EXP"
-python3 analyze.py validate-census \
-  --counters out/census-0-150k.counters.json \
-  --journal out/census-0-150k.journal.bin \
-  --capture-journal out/kspike1.journal.bin \
-  --output out/validate-census.json
+python3 analyze.py classify-corpus \
+  --counters out/c150.counters.json \
+  --contexts out/c150.contexts.bin \
+  --records out/c150.records.bin \
+  --journal out/c150.journal.bin \
+  --replay out/c150.replay.json \
+  --corpus-manifest "$C150/manifest.json" \
+  --archive "$C150/blocks.dat" \
+  --output out/c150.classification.json \
+  --contract c150
 ```
 
-Checks INV-1 through INV-7, INV-10, INV-12 (census ∩ capture agreement),
-EXP-1 (expected input count), EXP-4 (attempts/check ratio).
+Checks INV-1 through INV-7, zero-input evidence precedence, `mainnet-prefix-replay-v2` framing, and exact C150 predicate semantics (`_c150_passed`).
+For legacy KSPIKE1 capture cross-checks, `python3 analyze.py validate-census` validates Run A/B counters and journal agreement (EXP-1 through EXP-4).
 
 ### Generate integrity JSON (INV-14 source-identity proof)
 
@@ -405,25 +401,41 @@ removable gain.
 
 ```
 out/
-├── census-0-150k.counters.json      Run A counters
-├── census-0-150k.journal.bin        Run A journal
-├── census-replay.json               Run A mainnet_prefix_replay output
-├── kspike1.counters.json            Run B counters (first)
+├── c150.counters.json               Run A 24-counter JSON (schema=1, label="c150")
+├── c150.contexts.bin                Run A context stream (magic BRSCTX1\0)
+├── c150.journal.bin                 Run A journal stream (magic BRSJRN1\0)
+├── c150.records.bin                 Run A record stream (magic BRSREC1\0)
+├── c150.replay.json                 Run A mainnet_prefix_replay v2 artifact
+├── c150.classification.json         Run A classify-corpus-v2 report
+├── kspike1.counters.json            Run B capture summary (first)
 ├── kspike1.journal.bin              Run B journal (first)
 ├── kspike1.records.bin              Run B records (first)
-├── kspike1.summary.json             Run B harness summary (first)
-├── kspike1-repeat.counters.json     Run B counters (second)
+├── kspike1-repeat.counters.json     Run B capture summary (second)
 ├── kspike1-repeat.journal.bin       Run B journal (second)
 ├── kspike1-repeat.records.bin       Run B records (second)
-├── kspike1-repeat.summary.json      Run B harness summary (second)
-├── kspike1.records.sorted.bin       sorted records (from validate-capture)
+├── kspike1.records.sorted.bin       Sorted records (from validate-capture)
 ├── bare-secp-{1,2,3}.json           Run C bare timing + INV-8/15
 ├── spike-control-{1,2,3}.json       Run D spike runs
-├── validate-capture.json            capture validation report
-├── validate-census.json             census validation report
+├── validate-capture.json            Capture validation report
 ├── integrity.json                   INV-14 source-identity proof
-└── verdict.json                     final OPEN/CLOSED/INVALID verdict
+└── verdict.json                     Final OPEN/CLOSED/INVALID verdict
 ```
+
+## Durability proofs and custody
+
+Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`) proves replay state stability across all three storage backends (`fjall`, `rocksdb`, `redb`). The harness operates on disposable reflink copies (`cp --reflink=always -a`). Original stores remain immutable and byte-identical before and after probes.
+
+- **Custody Summary**: `/home/alpha/bench-g14/corpora/c150/durability-sdd/custody-summary.json`
+- **Original Store Digests** (`sha256` over POSIX-sorted files):
+  - `fjall`: 50 files, 1,119,730,063 bytes, SHA256 `5ea0d8ef6f473a5809e06e6ebc9dc9cfc3a9ed8abe4d92488ca68ebce88d3409`
+  - `rocksdb`: 28 files, 1,000,273,901 bytes, SHA256 `97cec9bc615d040a518f71179ddadd27e7d91effe86cd46f3cdfe502b0f336d0`
+  - `redb`: 12 files, 1,317,885,356 bytes, SHA256 `ecd80f3ada801a66e26090bedfb346f5654c2a497dcc1a0da1c22aebd2d1af15`
+- **Proof Artifacts**:
+  - `proof-fjall.json`: size 1,224 B, SHA256 `7fd144699bf714c5b1d7b34b45b0a77790210710056c9f04b6e6f1a6a324bb9b`
+  - `proof-rocksdb.json`: size 1,226 B, SHA256 `f64786a191597cb1099e3f42e08a21de8dd08a1903dee547d51f2baa4e921a78`
+  - `proof-redb.json`: size 1,223 B, SHA256 `40a585ff8f1c146b7899f5d62a91d7ce487b9c43ac307d1a1f11e792519b917d`
+
+Every backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, checkpoint generation 2, two reopens, and exact invariant equality (`before == after`).
 
 ## Binary formats
 
