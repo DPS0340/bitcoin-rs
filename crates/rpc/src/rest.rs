@@ -65,29 +65,24 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
         Err(response) => return response,
     };
     let records = header_records(ctx, hash, count);
-    let headers: Vec<Header> = records.iter().filter_map(decode_header).collect();
-    if !records.is_empty() && headers.is_empty() {
-        return not_found();
-    }
     match format {
         "json" => {
             let values = records
                 .iter()
-                .zip(headers.iter())
                 .map(|(record, header)| header_json(record, header))
                 .collect::<Vec<_>>();
             json_response(Ok(Value::from(values)))
         }
         "hex" => {
-            let body = headers
+            let body = records
                 .iter()
-                .map(|header| serialize(header).to_lower_hex_string())
+                .map(|(_, header)| serialize(header).to_lower_hex_string())
                 .collect::<String>();
             text_response("text/plain", body.into_bytes())
         }
         "bin" => binary_response(
             "application/octet-stream",
-            &headers.iter().fold(Vec::new(), |mut body, header| {
+            &records.iter().fold(Vec::new(), |mut body, (_, header)| {
                 body.extend(serialize(header));
                 body
             }),
@@ -96,21 +91,36 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     }
 }
 
-fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<BlockRecord> {
+fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<(BlockRecord, Header)> {
     let Some(start) = ctx.block_by_hash(hash) else {
         return Vec::new();
     };
     let mut records = Vec::with_capacity(usize::try_from(count).unwrap_or(usize::MAX));
+    let Some(start_header) = decode_header(&start) else {
+        return records;
+    };
     let active_hash = ctx.block_by_height(start.height).map(|record| record.hash);
     if active_hash != Some(hash) {
-        records.push(start);
+        records.push((start, start_header));
         return records;
     }
-    for height in start.height..=start.height.saturating_add(count.saturating_sub(1)) {
+    let start_height = start.height;
+    let mut previous_hash = start.hash;
+    records.push((start, start_header));
+    for height in
+        start_height.saturating_add(1)..=start_height.saturating_add(count.saturating_sub(1))
+    {
         let Some(record) = ctx.block_by_height(height) else {
             break;
         };
-        records.push(record);
+        let Some(header) = decode_header(&record) else {
+            break;
+        };
+        if header.prev_blockhash.to_string() != previous_hash.to_string_be() {
+            break;
+        }
+        previous_hash = record.hash;
+        records.push((record, header));
     }
     records
 }
@@ -398,6 +408,45 @@ mod tests {
             CompactTarget::from_unprefixed_hex(bits_text).expect("bits round-trip"),
             bits
         );
+    }
+
+    #[test]
+    fn headers_truncate_when_linkage_breaks() {
+        use bitcoin::{Block, BlockHash, CompactTarget, TxMerkleNode, block::Version};
+
+        let ctx = Arc::new(Context::new());
+        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let genesis = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1,
+                bits,
+                nonce: 1,
+            },
+            txdata: Vec::new(),
+        };
+        let broken_child = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 2,
+                bits,
+                nonce: 2,
+            },
+            txdata: Vec::new(),
+        };
+        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        ctx.add_block(BlockRecord::from_block(1, &broken_child));
+
+        let path = format!("/rest/headers/{}.json", genesis.block_hash());
+        let response = route(&ctx, &path, "count=2", true);
+        assert_eq!(response.status, 200);
+        let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(0));
     }
 
     #[test]
