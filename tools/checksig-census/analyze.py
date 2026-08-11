@@ -1244,7 +1244,7 @@ def _launch_diagnostic_child(
 
 
 def _validate_replay_diagnostic(
-    path: Path, final: DiagnosticCheckpoint, ceiling: int, rest_url: str
+    path: Path, final: DiagnosticCheckpoint, ceiling: int
 ) -> None:
     try:
         raw = json.loads(path.read_text())
@@ -1252,25 +1252,106 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(f"DIAG-CUSTODY: invalid child replay JSON: {exc}") from exc
     if not isinstance(raw, dict):
         raise AnalyzerError("DIAG-CUSTODY: child replay JSON root is not an object")
-    required = {
-        "schema": "mainnet-prefix-replay-diagnostic-v1",
-        "non_certifying": True,
-        "block_source": "rest",
-        "rest_url": rest_url,
-        "start_height": 0,
-        "assume_valid_height": 0,
-        "window": 1,
-        "requested_stop_height_ceiling": ceiling,
-        "actual_stop_height": final.height,
-        "actual_stop_hash": final.block_hash_le[::-1].hex(),
-        "stop_reason": "controller-request",
-    }
-    for field, expected in required.items():
-        if raw.get(field) != expected:
-            raise AnalyzerError(
-                f"DIAG-CUSTODY: child replay {field} {raw.get(field)!r} != {expected!r}"
-            )
 
+    expected_keys = {
+        "schema",
+        "non_certifying",
+        "block_source",
+        "start_height",
+        "requested_stop_height_ceiling",
+        "actual_stop_height",
+        "actual_stop_hash",
+        "window",
+        "assume_valid_height",
+        "stop_reason",
+        "storage_backend",
+        "txindex",
+        "blockfilterindex",
+        "data_dir",
+        "elapsed_seconds",
+    }
+    _require_exact_keys(raw, expected_keys, "child replay")
+
+    if raw["schema"] != "mainnet-prefix-replay-diagnostic-v1":
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: child replay schema {raw['schema']!r} "
+            "!= 'mainnet-prefix-replay-diagnostic-v1'"
+        )
+    if raw["non_certifying"] is not True:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: child replay non_certifying {raw['non_certifying']!r} != True"
+        )
+    if raw["block_source"] != "rest":
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: child replay block_source {raw['block_source']!r} != 'rest'"
+        )
+    start_height = _require_u32(raw["start_height"], "start_height")
+    if start_height != 0:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: start_height {start_height} != 0"
+        )
+    requested = _require_u32(
+        raw["requested_stop_height_ceiling"], "requested_stop_height_ceiling"
+    )
+    if requested != ceiling:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: requested_stop_height_ceiling {requested} != {ceiling}"
+        )
+    actual = _require_u32(raw["actual_stop_height"], "actual_stop_height")
+    if actual != final.height:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: actual_stop_height {actual} != {final.height}"
+        )
+    actual_hash = _require_hex_str(raw["actual_stop_hash"], "actual_stop_hash", 64)
+    expected_hash = final.block_hash_le[::-1].hex()
+    if actual_hash != expected_hash:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: actual_stop_hash {actual_hash} != {expected_hash}"
+        )
+    window = _require_u32(raw["window"], "window")
+    if window != 1:
+        raise AnalyzerError(f"DIAG-CUSTODY: child replay window {window} != 1")
+    assume = _require_u32(raw["assume_valid_height"], "assume_valid_height")
+    if assume != 0:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: assume_valid_height {assume} != 0"
+        )
+    if raw["stop_reason"] != "controller-request":
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: stop_reason {raw['stop_reason']!r} != 'controller-request'"
+        )
+
+    if not isinstance(raw["storage_backend"], str):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: storage_backend must be a string, got {type(raw['storage_backend']).__name__}"
+        )
+    if not isinstance(raw["txindex"], bool):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: txindex must be a boolean, got {type(raw['txindex']).__name__}"
+        )
+    if not isinstance(raw["blockfilterindex"], bool):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: blockfilterindex must be a boolean, got {type(raw['blockfilterindex']).__name__}"
+        )
+    if not isinstance(raw["data_dir"], str):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: data_dir must be a string, got {type(raw['data_dir']).__name__}"
+        )
+
+    elapsed = raw["elapsed_seconds"]
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: elapsed_seconds must be a finite non-negative number, got {elapsed!r}"
+        )
+    elapsed_f = float(elapsed)
+    if math.isnan(elapsed_f) or math.isinf(elapsed_f):
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: elapsed_seconds must be finite, got {elapsed!r}"
+        )
+    if elapsed_f < 0.0:
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: elapsed_seconds must be non-negative, got {elapsed_f}"
+        )
 
 def _validate_native_counters(path: Path, final: DiagnosticCheckpoint) -> None:
     try:
@@ -1356,7 +1437,7 @@ def _finalize_candidate(
         raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
 
     stream_custody = _validate_terminal_streams(paths, final)
-    _validate_replay_diagnostic(paths["replay"], final, ceiling, rest_url)
+    _validate_replay_diagnostic(paths["replay"], final, ceiling)
     _validate_native_counters(paths["counters"], final)
     custody: dict[str, dict[str, object]] = {}
     for name in ("sidecar", "replay", "counters"):

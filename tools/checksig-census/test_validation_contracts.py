@@ -64,6 +64,7 @@ from analyze import (
     _count_context_records_disk,
     _run_diagnostic_scan,
     _validate_checkpoint_bounds,
+    _validate_replay_diagnostic,
     _read_brshgt1_row,
     _brshgt1_count,
     _diagnostic_counter_totals,
@@ -5244,7 +5245,7 @@ def _compute_context_ends(path: Path) -> list[int]:
     return ends
 
 
-def _build_meta(tmp: Path, stage: Path, rest_url: str, ceiling: int, work_dir: Path) -> Path:
+def _build_meta(tmp: Path, stage: Path, ceiling: int, work_dir: Path) -> Path:
     ctx_ends = _compute_context_ends(stage / "BRS_CENSUS_CONTEXTS.bin")
     assert len(ctx_ends) == 11  # 10 rows + final sentinel
     rows = []
@@ -5268,7 +5269,6 @@ def _build_meta(tmp: Path, stage: Path, rest_url: str, ceiling: int, work_dir: P
         "schema": "mainnet-prefix-replay-diagnostic-v1",
         "non_certifying": True,
         "block_source": "rest",
-        "rest_url": rest_url,
         "start_height": 0,
         "assume_valid_height": 0,
         "window": 1,
@@ -5296,7 +5296,7 @@ def test_find_cmodern_height_fake_child_success() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5328,7 +5328,7 @@ def test_find_cmodern_height_reaps_failed_child() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         bad = tmp / "bad_child.py"
         bad.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b\'NOTMAGIC!!\')\nsys.stdout.buffer.flush()\nsys.exit(1)\n")
         bad.chmod(0o755)
@@ -5356,7 +5356,7 @@ def test_find_cmodern_height_destination_race() -> None:
         work_dir.mkdir()
         output = tmp / "candidate.json"
         output.write_text("racer\n")
-        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5372,6 +5372,89 @@ def test_find_cmodern_height_destination_race() -> None:
             os.environ.pop("FAKE_CENSUS_STAGE", None)
         assert output.read_text() == "racer\n", "racer must survive the collision"
         assert not any(tmp.glob(".*candidate.json.tmp*")), "temp must be cleaned up"
+
+def test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url() -> None:
+    """An A1-shaped child replay without the invented rest_url field passes validation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        replay_path = tmp / "replay.json"
+        block_hash_le = bytes.fromhex(
+            "000000000000000000000000000000000000000000000000000000000000000a"
+        )
+        replay: dict[str, object] = {
+            "schema": "mainnet-prefix-replay-diagnostic-v1",
+            "non_certifying": True,
+            "block_source": "rest",
+            "start_height": 0,
+            "requested_stop_height_ceiling": 11,
+            "actual_stop_height": 10,
+            "actual_stop_hash": block_hash_le[::-1].hex(),
+            "window": 1,
+            "assume_valid_height": 0,
+            "stop_reason": "controller-request",
+            "storage_backend": "fjall",
+            "txindex": False,
+            "blockfilterindex": False,
+            "data_dir": str(tmp / "state"),
+            "elapsed_seconds": 1.5,
+        }
+        replay_path.write_text(json.dumps(replay, indent=2) + "\n")
+        final = DiagnosticCheckpoint(
+            height=10,
+            block_hash_le=block_hash_le,
+            context_rows=0,
+            context_end=0,
+            record_rows=0,
+            record_end=0,
+            journal_rows=0,
+            journal_end=0,
+        )
+        _validate_replay_diagnostic(replay_path, final, 11)
+
+
+def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
+    """The parent owns rest_url; it must not appear as an invented child field."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        replay_path = tmp / "replay.json"
+        block_hash_le = bytes.fromhex(
+            "000000000000000000000000000000000000000000000000000000000000000a"
+        )
+        replay: dict[str, object] = {
+            "schema": "mainnet-prefix-replay-diagnostic-v1",
+            "non_certifying": True,
+            "block_source": "rest",
+            "rest_url": "127.0.0.1:18443",
+            "start_height": 0,
+            "requested_stop_height_ceiling": 11,
+            "actual_stop_height": 10,
+            "actual_stop_hash": block_hash_le[::-1].hex(),
+            "window": 1,
+            "assume_valid_height": 0,
+            "stop_reason": "controller-request",
+            "storage_backend": "fjall",
+            "txindex": False,
+            "blockfilterindex": False,
+            "data_dir": str(tmp / "state"),
+            "elapsed_seconds": 1.5,
+        }
+        replay_path.write_text(json.dumps(replay, indent=2) + "\n")
+        final = DiagnosticCheckpoint(
+            height=10,
+            block_hash_le=block_hash_le,
+            context_rows=0,
+            context_end=0,
+            record_rows=0,
+            record_end=0,
+            journal_rows=0,
+            journal_end=0,
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: _validate_replay_diagnostic(replay_path, final, 11),
+            "invented rest_url",
+            "rest_url",
+        )
 
 
 def test_read_bounded_context_rows_zero_rows() -> None:
@@ -5859,6 +5942,8 @@ def main() -> int:
         test_find_cmodern_height_fake_child_success,
         test_find_cmodern_height_reaps_failed_child,
         test_find_cmodern_height_destination_race,
+        test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url,
+        test_validate_replay_diagnostic_rejects_invented_rest_url,
         test_read_bounded_context_rows_zero_rows,
         test_read_bounded_context_rows_exact_endpoint,
         test_read_bounded_context_rows_trailing_uncommitted,
