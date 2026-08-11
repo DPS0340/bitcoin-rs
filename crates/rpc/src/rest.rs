@@ -92,7 +92,7 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
                 body
             }),
         ),
-        _ => unreachable!("header format checked above"),
+        _ => bad_request_owned(format!("Invalid hash: {suffix}")),
     }
 }
 
