@@ -97,6 +97,7 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
 }
 
 fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord> {
+    let applied_tip = ctx.applied_tip.load_full();
     let tree = ctx.block_tree.read();
     if let Some(start_id) = tree.lookup(hash)
         && let Ok(start_node) = tree.node(start_id)
@@ -106,12 +107,15 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
             height: start_node.height,
             header: start_node.header,
         };
-        let Some(tip) = tree.tip() else {
+        let Some(tip) = applied_tip else {
             return vec![start];
         };
         let Ok(tip_node) = tree.node(tip.tip_id) else {
             return vec![start];
         };
+        if tip_node.hash != tip.hash || tip_node.height != tip.height {
+            return vec![start];
+        }
         let Some(active_start) = tree.node_at_height_from(tip.tip_id, start.height) else {
             return vec![start];
         };
@@ -159,16 +163,12 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
 }
 
 fn truncate_at_linkage_break(mut records: Vec<HeaderRecord>) -> Vec<HeaderRecord> {
-    let mut previous_hash = None;
-    records.retain(|record| {
-        let linked = previous_hash.is_none_or(|hash| {
-            Hash256::from_le_bytes(record.header.prev_blockhash.as_byte_array()) == hash
-        });
-        if linked {
-            previous_hash = Some(record.hash);
-        }
-        linked
-    });
+    let Some(break_index) = records.windows(2).position(|pair| {
+        Hash256::from_le_bytes(pair[1].header.prev_blockhash.as_byte_array()) != pair[0].hash
+    }) else {
+        return records;
+    };
+    records.truncate(break_index + 1);
     records
 }
 
@@ -327,6 +327,7 @@ mod tests {
             hash: tip_node.hash,
         };
         drop(tree);
+        ctx.set_applied_tip(tip.clone());
         ctx.set_chain_tip(tip);
         hashes
     }
@@ -492,6 +493,66 @@ mod tests {
             CompactTarget::from_unprefixed_hex(bits_text).expect("bits round-trip"),
             bits
         );
+    }
+
+    #[test]
+    fn headers_do_not_walk_past_applied_tip() {
+        let ctx = Arc::new(Context::new());
+        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let genesis = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1,
+            bits,
+            nonce: 1,
+        };
+        let applied = Header {
+            version: Version::ONE,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 2,
+            bits,
+            nonce: 2,
+        };
+        let header_tip = Header {
+            version: Version::ONE,
+            prev_blockhash: applied.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 3,
+            bits,
+            nonce: 3,
+        };
+        let (applied_tip, applied_hash) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis_id = tree
+                .insert_node(None, genesis, NodeStatus::Active)
+                .expect("genesis header");
+            let applied_id = tree
+                .insert_node(Some(genesis_id), applied, NodeStatus::Active)
+                .expect("applied header");
+            let applied_tip = tree.tip().expect("applied tip").as_ref().clone();
+            tree.insert_node(Some(applied_id), header_tip, NodeStatus::Active)
+                .expect("header tip");
+            (applied_tip, applied_id)
+        };
+        ctx.set_applied_tip(applied_tip);
+        let applied_hash = ctx
+            .block_tree
+            .read()
+            .node(applied_hash)
+            .expect("applied node")
+            .hash;
+
+        let response = route(
+            &ctx,
+            &format!("/rest/headers/{applied_hash}.json"),
+            "count=2000",
+            true,
+        );
+        let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(1));
     }
 
     #[test]
@@ -666,6 +727,67 @@ mod tests {
         let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(0));
+    }
+
+    #[test]
+    fn headers_truncate_the_tail_after_a_middle_linkage_break() {
+        let ctx = Arc::new(Context::new());
+        let bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let genesis = Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1,
+            bits,
+            nonce: 1,
+        };
+        let first = Header {
+            version: Version::ONE,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 2,
+            bits,
+            nonce: 2,
+        };
+        let middle = Header {
+            version: Version::ONE,
+            prev_blockhash: first.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 3,
+            bits,
+            nonce: 3,
+        };
+        let tail = Header {
+            version: Version::ONE,
+            prev_blockhash: middle.block_hash(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 4,
+            bits,
+            nonce: 4,
+        };
+        let hashes = publish_active_chain(&ctx, &[genesis, first, middle, tail]);
+        let middle_id = ctx
+            .block_tree
+            .read()
+            .lookup(hashes[2])
+            .expect("middle node");
+        ctx.block_tree
+            .write()
+            .node_mut(middle_id)
+            .expect("middle node")
+            .header
+            .prev_blockhash = BlockHash::all_zeros();
+
+        let response = route(
+            &ctx,
+            &format!("/rest/headers/{}.json", hashes[0]),
+            "count=2000",
+            true,
+        );
+        let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(0));
+        assert_eq!(values[1].get("height").and_then(Value::as_u64), Some(1));
     }
 
     #[test]
