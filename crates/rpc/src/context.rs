@@ -461,7 +461,7 @@ impl Context {
     /// `PoW` limit. Returns `0.0` on any conversion failure.
     #[must_use]
     pub fn difficulty_for_bits(&self, bits: bitcoin::CompactTarget) -> f64 {
-        let params = bitcoin::params::Params::new(bitcoin_network(self.chain_network));
+        let params = bitcoin::params::Params::new(bitcoin::Network::Bitcoin);
         let current_target = bitcoin::pow::Target::from_compact(bits);
         if current_target == bitcoin::pow::Target::ZERO {
             return 0.0;

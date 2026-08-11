@@ -16,12 +16,19 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     ensure_no_params(params)?;
     let applied = ctx.applied_height();
     let headers = ctx.height();
-    let difficulty = ctx.applied_tip.load_full().map_or(0.0, |tip| {
-        let tree = ctx.block_tree.read();
-        tree.node(tip.tip_id)
-            .ok()
-            .map_or(0.0, |node| ctx.difficulty_for_bits(node.header.bits))
-    });
+    let (difficulty, time, mediantime) =
+        ctx.applied_tip
+            .load_full()
+            .map_or((0.0, 0_u64, 0_u64), |tip| {
+                let tree = ctx.block_tree.read();
+                tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
+                    (
+                        ctx.difficulty_for_bits(node.header.bits),
+                        u64::from(node.header.time),
+                        u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+                    )
+                })
+            });
     let verification_progress = if headers > 0 {
         f64::from(applied) / f64::from(headers)
     } else {
@@ -48,8 +55,8 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let _ = response.insert(&"headers", headers);
     let _ = response.insert(&"bestblockhash", bestblockhash.as_str());
     let _ = response.insert(&"difficulty", json!(difficulty));
-    let _ = response.insert(&"time", 0_u64);
-    let _ = response.insert(&"mediantime", 0_u64);
+    let _ = response.insert(&"time", time);
+    let _ = response.insert(&"mediantime", mediantime);
     let _ = response.insert(&"verificationprogress", json!(verification_progress));
     let _ = response.insert(&"initialblockdownload", applied < headers);
     let _ = response.insert(&"chainwork", chainwork.as_str());
@@ -941,9 +948,54 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+
+    fn context_with_tip(
+        network: bitcoin_rs_primitives::Network,
+        bits: u32,
+        times: &[u32],
+    ) -> Arc<Context> {
+        let mut context = Context::new();
+        context.chain_network = network;
+        let ctx = Arc::new(context);
+        let (tip_id, tip_hash) = {
+            let mut tree = ctx.block_tree.write();
+            let mut parent = None;
+            let mut previous_hash = BlockHash::all_zeros();
+            let mut tip_id = NodeId::new(0);
+            let mut tip_hash = Hash256::default();
+            for (index, time) in times.iter().copied().enumerate() {
+                let header = Header {
+                    version: Version::ONE,
+                    prev_blockhash: previous_hash,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time,
+                    bits: CompactTarget::from_consensus(bits),
+                    nonce: u32::try_from(index).unwrap_or(u32::MAX),
+                };
+                previous_hash = header.block_hash();
+                tip_id = tree
+                    .insert_node(parent, header, NodeStatus::Active)
+                    .unwrap_or(tip_id);
+                tip_hash = Hash256::from_le_bytes(previous_hash.as_byte_array());
+                parent = Some(tip_id);
+            }
+            (tip_id, tip_hash)
+        };
+        let tip = TipSnapshot {
+            tip_id,
+            height: u32::try_from(times.len().saturating_sub(1)).unwrap_or(u32::MAX),
+            chainwork: ChainWork::ZERO,
+            hash: tip_hash,
+        };
+        ctx.set_chain_tip(tip.clone());
+        ctx.set_applied_tip(tip);
+        ctx
+    }
 
     #[test]
     fn subsidy_at_height_genesis_is_50_btc() {
@@ -1266,6 +1318,48 @@ mod tests {
         assert_eq!(
             result.get("size_on_disk").and_then(JsonValueTrait::as_u64),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn difficulty_uses_mainnet_pow_limit_for_regtest_and_mainnet_targets() {
+        let ctx = Context::new();
+        assert!(
+            (ctx.difficulty_for_bits(CompactTarget::from_consensus(0x1d00_ffff)) - 1.0).abs()
+                < f64::EPSILON
+        );
+        let regtest = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x207f_ffff));
+        assert!(
+            (regtest - 4.656_542_373_906_925e-10).abs() < 1e-24,
+            "unexpected regtest difficulty {regtest}"
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_reports_tip_time_and_median_time_past() {
+        let ctx = context_with_tip(
+            bitcoin_rs_primitives::Network::Regtest,
+            0x207f_ffff,
+            &[100, 300, 200],
+        );
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("time").and_then(JsonValueTrait::as_u64),
+            Some(200)
+        );
+        assert_eq!(
+            result.get("mediantime").and_then(JsonValueTrait::as_u64),
+            Some(200)
+        );
+        let difficulty = result
+            .get("difficulty")
+            .and_then(JsonValueTrait::as_f64)
+            .unwrap_or_default();
+        assert!(
+            (difficulty - 4.656_542_373_906_925e-10).abs() < 1e-24,
+            "unexpected difficulty {difficulty}"
         );
     }
 
