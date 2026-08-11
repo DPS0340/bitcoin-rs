@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from context import (
+    CONTEXT_MIN_ROW_SIZE,
     ClassifiedInput,
     ContextError,
     ContextInput,
@@ -38,6 +39,7 @@ from context import (
     iter_context_inputs,
     iter_legacy_context_inputs,
     read_context_inputs,
+    read_bounded_context_rows,
     VERIFY_P2SH,
     VERIFY_WITNESS,
     VERIFY_TAPROOT,
@@ -52,12 +54,24 @@ from analyze import (
     JOURNAL_STRUCT,
     RECORD_MAGIC,
     RECORD_STRUCT,
+    RECORD_SIZE,
     AnalyzerError,
     Counters,
     CONTEXT_COUNTER_NAMES,
     CONTEXT_COUNTER_DEFINITIONS,
     _c150_passed,
     _count_context_records_disk,
+    _run_diagnostic_scan,
+    _validate_checkpoint_bounds,
+    _read_brshgt1_row,
+    _brshgt1_count,
+    _diagnostic_counter_totals,
+    _read_diagnostic_streams,
+    cmd_find_cmodern_height,
+    DiagnosticCheckpoint,
+    HEADER_SIZE,
+    JOURNAL_SIZE,
+    MAINNET_GENESIS_HASH,
     check_counter_arithmetic,
     cmd_classify_corpus,
     extract_bare_mode0,
@@ -5108,6 +5122,469 @@ def test_count_context_records_disk_restores_env_on_failure() -> None:
                 os.environ.pop("TMPDIR", None)
 
 
+
+
+# ── Tests: Task 7A2 diagnostic scanner/controller ─────────────────────────────
+
+
+_FAKE_CENSUS_CHILD = """#!/usr/bin/env python3
+import json
+import os
+import struct
+import sys
+from pathlib import Path
+
+PREFACE = b"BRSHGT1\\x00" + struct.pack("<II", 1, 84)
+
+def main():
+    meta_path = Path(os.environ["FAKE_CENSUS_META"])
+    stage_dir = Path(os.environ["FAKE_CENSUS_STAGE"])
+    replay_path = Path(sys.argv[sys.argv.index("--output") + 1])
+    for name in ("BRS_CENSUS_CONTEXTS", "BRS_CENSUS_RECORDS", "BRS_CENSUS_JOURNAL"):
+        src = stage_dir / f"{name}.bin"
+        dst = Path(os.environ[name])
+        dst.write_bytes(src.read_bytes())
+    counters_path = Path(os.environ["BRS_CENSUS_COUNTERS"])
+    counters_path.write_bytes((stage_dir / "counters.json").read_bytes())
+    meta = json.loads(meta_path.read_text())
+    replay = meta["replay"]
+    replay_path.write_text(json.dumps(replay, indent=2) + "\\n")
+    sys.stdout.buffer.write(PREFACE)
+    sys.stdout.buffer.flush()
+    for row in meta["rows"]:
+        sys.stdout.buffer.write(
+            struct.pack("<I", row["height"]) +
+            bytes.fromhex(row["block_hash_le"]) +
+            struct.pack("<Q", row["context_rows"]) +
+            struct.pack("<Q", row["context_end"]) +
+            struct.pack("<Q", row["record_rows"]) +
+            struct.pack("<Q", row["record_end"]) +
+            struct.pack("<Q", row["journal_rows"]) +
+            struct.pack("<Q", row["journal_end"])
+        )
+        sys.stdout.buffer.flush()
+        control = sys.stdin.buffer.read(1)
+        if not control or control == b"\\x01":
+            break
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+"""
+
+def _make_fake_binary(tmp: Path) -> Path:
+    child = tmp / "fake_child.py"
+    child.write_text(_FAKE_CENSUS_CHILD)
+    child.chmod(0o755)
+    return child
+
+
+def _diagnostic_counters_dict(context_count: int, record_count: int, journal_count: int) -> dict[str, object]:
+    return _valid_counters_dict(record_count=record_count, journal_count=journal_count, context_count=context_count)
+
+
+def _write_diagnostic_stage(tmp: Path) -> Path:
+    stage = tmp / "stage"
+    stage.mkdir()
+    txids = [bytes([i]) * 32 for i in range(10)]
+    contexts = [
+        _p2sh_push_only(txids[0], flags=VERIFY_P2SH),
+        _native_w0(txids[1], flags=VERIFY_WITNESS),
+        _p2sh_wrapped_w0(txids[2], flags=VERIFY_P2SH | VERIFY_WITNESS),
+        _bare_p2pkh(txids[3]),
+        _p2sh_push_only(txids[4], flags=VERIFY_P2SH),
+        _native_w0(txids[5], flags=VERIFY_WITNESS),
+        _p2sh_wrapped_w0(txids[6], flags=VERIFY_P2SH | VERIFY_WITNESS),
+        _taproot_key_path(txids[7], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+        _taproot_script_path(txids[8], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+        _taproot_script_path(txids[9], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+    ]
+    records = [
+        _make_record_bytes(txids[0], 0, op_kind=1, sig_version=0, outcome=1),  # p2sh checksig
+        _make_record_bytes(txids[1], 0, op_kind=1, sig_version=1, outcome=1),  # native checksig
+        _make_record_bytes(txids[2], 0, op_kind=1, sig_version=1, outcome=1),  # wrapped checksig
+        _make_record_bytes(txids[3], 0, op_kind=3, sig_version=0, outcome=1),  # bare multisig
+        _make_record_bytes(txids[4], 0, op_kind=3, sig_version=0, outcome=1),  # p2sh multisig
+        _make_record_bytes(txids[5], 0, op_kind=3, sig_version=1, outcome=1),  # native multisig
+        _make_record_bytes(txids[6], 0, op_kind=3, sig_version=1, outcome=1),  # wrapped multisig
+        _make_record_bytes(txids[7], 0, op_kind=0, sig_version=3, outcome=1),  # taproot key
+        _make_record_bytes(txids[8], 0, op_kind=1, sig_version=2, outcome=1),  # tapscript schnorr
+        _make_record_bytes(txids[9], 0, op_kind=5, sig_version=2, outcome=1),  # tapscript checksigadd
+    ]
+    journals = [
+        _make_journal_bytes(txids[0], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[1], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[2], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[6], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+        _make_journal_bytes(txids[7], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+        _make_journal_bytes(txids[8], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+        _make_journal_bytes(txids[9], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+    ]
+    _make_brsctx1_file(stage / "BRS_CENSUS_CONTEXTS.bin", contexts)
+    _write_records_file(stage / "BRS_CENSUS_RECORDS.bin", records)
+    _write_journal_file(stage / "BRS_CENSUS_JOURNAL.bin", journals)
+    (stage / "counters.json").write_text(json.dumps(_diagnostic_counters_dict(10, 10, 10)))
+    return stage
+
+
+def _compute_context_ends(path: Path) -> list[int]:
+    data = path.read_bytes()
+    assert data[:8] == _BRSCTX1_MAGIC
+    count = struct.unpack("<Q", data[8:16])[0]
+    ends = [16]
+    cursor = 16
+    for _ in range(count):
+        row_len = struct.unpack("<I", data[cursor:cursor + 4])[0]
+        cursor += 4 + row_len
+        ends.append(cursor)
+    return ends
+
+
+def _build_meta(tmp: Path, stage: Path, rest_url: str, ceiling: int, work_dir: Path) -> Path:
+    ctx_ends = _compute_context_ends(stage / "BRS_CENSUS_CONTEXTS.bin")
+    assert len(ctx_ends) == 11  # 10 rows + final sentinel
+    rows = []
+    for h in range(10):
+        if h == 0:
+            block_hash = bytes.fromhex(MAINNET_GENESIS_HASH)[::-1]
+        else:
+            block_hash = bytes([h] * 32)
+        rows.append({
+            "height": h,
+            "block_hash_le": block_hash.hex(),
+            "context_rows": h + 1,
+            "context_end": ctx_ends[h + 1],
+            "record_rows": h + 1,
+            "record_end": HEADER_SIZE + (h + 1) * RECORD_SIZE,
+            "journal_rows": h + 1,
+            "journal_end": HEADER_SIZE + (h + 1) * JOURNAL_SIZE,
+        })
+    final = rows[-1]
+    replay = {
+        "schema": "mainnet-prefix-replay-diagnostic-v1",
+        "non_certifying": True,
+        "block_source": "rest",
+        "rest_url": rest_url,
+        "start_height": 0,
+        "assume_valid_height": 0,
+        "window": 1,
+        "requested_stop_height_ceiling": ceiling,
+        "actual_stop_height": final["height"],
+        "actual_stop_hash": bytes.fromhex(final["block_hash_le"])[::-1].hex(),
+        "stop_reason": "controller-request",
+        "storage_backend": "fjall",
+        "txindex": False,
+        "blockfilterindex": False,
+        "data_dir": str(work_dir / "state"),
+        "elapsed_seconds": 0.0,
+    }
+    meta = {"rows": rows, "replay": replay}
+    meta_path = tmp / "meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+    return meta_path
+
+
+def test_find_cmodern_height_fake_child_success() -> None:
+    """Fake child distributes all 11 types and the candidate H equals max first heights."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        candidate = json.loads(output.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v1"
+        assert candidate["non_certifying"] is True
+        assert candidate["certifying_replay_required"] is True
+        assert candidate["earliest_defensible_height_h"] == 9
+        first = candidate["first_occurrence_heights"]
+        assert set(first.keys()) == set(CONTEXT_COUNTER_NAMES)
+        assert all(first[n] is not None for n in CONTEXT_COUNTER_NAMES)
+        expected_h = max(first.values())
+        assert candidate["earliest_defensible_height_h"] == expected_h
+        assert candidate["final_stream_counts"]["context_rows"] == 10
+
+
+
+
+def test_find_cmodern_height_reaps_failed_child() -> None:
+    """A parser-failure child must be reaped and no candidate published."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        bad = tmp / "bad_child.py"
+        bad.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b\'NOTMAGIC!!\')\nsys.stdout.buffer.flush()\nsys.exit(1)\n")
+        bad.chmod(0o755)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(bad, "127.0.0.1:18443", 100, work_dir, output),
+                "bad child",
+                "DIAG-PROTO",
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        assert not output.exists(), "candidate must not be published on child failure"
+
+
+def test_find_cmodern_height_destination_race() -> None:
+    """A concurrent file at the destination must prevent replacement and leave it intact."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        output.write_text("racer\n")
+        meta_path = _build_meta(tmp, stage, "127.0.0.1:18443", 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output),
+                "destination race",
+                "DIAG-OUTPUT",
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        assert output.read_text() == "racer\n", "racer must survive the collision"
+        assert not any(tmp.glob(".*candidate.json.tmp*")), "temp must be cleaned up"
+
+
+def test_read_bounded_context_rows_zero_rows() -> None:
+    """An empty committed prefix with start_row=0 and rows=0 must parse."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _make_brsctx1_file(tmp / "ctx.bin", [])
+        fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
+        try:
+            rows = read_bounded_context_rows(
+                fd, start_offset=HEADER_SIZE, end_offset=HEADER_SIZE,
+                start_row=0, committed_rows=0,
+            )
+            assert rows == []
+        finally:
+            os.close(fd)
+
+
+def test_read_bounded_context_rows_exact_endpoint() -> None:
+    """One committed row whose end equals the file size parses."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        ctx = _bare_p2pkh(b"\xa1" * 32)
+        _make_brsctx1_file(tmp / "ctx.bin", [ctx])
+        fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
+        try:
+            rows = read_bounded_context_rows(
+                fd, start_offset=HEADER_SIZE,
+                end_offset=os.fstat(fd).st_size,
+                start_row=0, committed_rows=1,
+            )
+            assert len(rows) == 1
+            assert rows[0].identity.input_index == 0
+        finally:
+            os.close(fd)
+
+
+def test_read_bounded_context_rows_trailing_uncommitted() -> None:
+    """A file longer than the committed endpoint must not observe past it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        ctxs = [_bare_p2pkh(b"\xa1" * 32), _bare_p2pkh(b"\xa2" * 32)]
+        _make_brsctx1_file(tmp / "ctx.bin", ctxs)
+        fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
+        try:
+            first_row_end = _compute_context_ends(tmp / "ctx.bin")[1]
+            rows = read_bounded_context_rows(
+                fd, start_offset=HEADER_SIZE, end_offset=first_row_end,
+                start_row=0, committed_rows=1,
+            )
+            assert len(rows) == 1
+        finally:
+            os.close(fd)
+
+
+def test_read_bounded_context_rows_truncated_row() -> None:
+    """A row that crosses the committed endpoint fails."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        ctx = _bare_p2pkh(b"\xa1" * 32)
+        _make_brsctx1_file(tmp / "ctx.bin", [ctx])
+        fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
+        try:
+            _raises(
+                ContextError,
+                lambda: read_bounded_context_rows(
+                    fd, start_offset=HEADER_SIZE,
+                    end_offset=HEADER_SIZE + CONTEXT_MIN_ROW_SIZE - 1,
+                    start_row=0, committed_rows=1,
+                ),
+                "truncated committed row",
+            )
+        finally:
+            os.close(fd)
+
+
+def test_c150_helper_parity() -> None:
+    """_diagnostic_counter_totals matches the C150 strict counter shape."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid = b"\xc0" * 32
+        ctx_row = _bare_p2pkh(txid)
+        record = _make_record_bytes(txid, 0, op_kind=1, sig_version=0, outcome=1)
+        journal = [_make_journal_bytes(txid, 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1)]
+        _make_brsctx1_file(tmp / "contexts.bin", [ctx_row])
+        _write_records_file(tmp / "records.bin", [record])
+        _write_journal_file(tmp / "journal.bin", journal)
+        paths = {
+            "contexts": tmp / "contexts.bin",
+            "records": tmp / "records.bin",
+            "journal": tmp / "journal.bin",
+        }
+        row = DiagnosticCheckpoint(
+            height=1,
+            block_hash_le=bytes([1] * 32),
+            context_rows=1,
+            context_end=(paths["contexts"].stat().st_size),
+            record_rows=1,
+            record_end=(paths["records"].stat().st_size),
+            journal_rows=1,
+            journal_end=(paths["journal"].stat().st_size),
+        )
+        classified, r, j, ctx_map, record_counts = _read_diagnostic_streams(row, None, paths)
+        totals = _diagnostic_counter_totals(classified, r, ctx_map)
+        assert totals["bare_multisig_checks"] == 0
+        assert totals["p2sh_redeem_spends"] == 0
+        assert totals["taproot_key_path_spends"] == 0
+        assert totals["tapscript_spends"] == 0
+        assert totals["native_witness_v0_spends"] == 0
+        assert totals["p2sh_wrapped_witness_v0_spends"] == 0
+
+
+def test_diagnostic_helper_synthetic_all_types() -> None:
+    """A synthetic fixture with all spend contexts/record rules counts all 11 types."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        distinct = [bytes([0xd0 + i] * 32) for i in range(6)]
+        contexts = [
+            _bare_p2pkh(distinct[0]),
+            _p2sh_push_only(distinct[1], flags=VERIFY_P2SH),
+            _native_w0(distinct[2], flags=VERIFY_WITNESS),
+            _p2sh_wrapped_w0(distinct[3], flags=VERIFY_P2SH | VERIFY_WITNESS),
+            _taproot_key_path(distinct[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+            _taproot_script_path(distinct[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+        ]
+        records = [
+            _make_record_bytes(distinct[0], 0, op_kind=1, sig_version=0),
+            _make_record_bytes(distinct[1], 0, op_kind=1, sig_version=0),
+            _make_record_bytes(distinct[2], 0, op_kind=1, sig_version=1),
+            _make_record_bytes(distinct[3], 0, op_kind=1, sig_version=1),
+            _make_record_bytes(distinct[4], 0, op_kind=0, sig_version=3),
+            _make_record_bytes(distinct[5], 0, op_kind=1, sig_version=2),
+            _make_record_bytes(distinct[5], 0, op_kind=5, sig_version=2, op_seq=1),
+        ]
+        journal = [
+            _make_journal_bytes(distinct[0], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(distinct[1], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(distinct[2], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(distinct[3], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(distinct[4], 0, checksig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(distinct[5], 0, checksig_ops=1, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+        ]
+        _make_brsctx1_file(tmp / "contexts.bin", contexts)
+        _write_records_file(tmp / "records.bin", records)
+        _write_journal_file(tmp / "journal.bin", journal)
+        paths = {
+            "contexts": tmp / "contexts.bin",
+            "records": tmp / "records.bin",
+            "journal": tmp / "journal.bin",
+        }
+        row = DiagnosticCheckpoint(
+            height=1,
+            block_hash_le=bytes([1] * 32),
+            context_rows=6,
+            context_end=(paths["contexts"].stat().st_size),
+            record_rows=7,
+            record_end=(paths["records"].stat().st_size),
+            journal_rows=6,
+            journal_end=(paths["journal"].stat().st_size),
+        )
+        classified, r, j, ctx_map, record_counts = _read_diagnostic_streams(row, None, paths)
+        totals = _diagnostic_counter_totals(classified, r, ctx_map)
+        assert totals["p2sh_redeem_spends"] == 1
+        assert totals["native_witness_v0_spends"] == 1
+        assert totals["p2sh_wrapped_witness_v0_spends"] == 1
+        assert totals["bare_multisig_checks"] == 0
+        assert totals["p2sh_multisig_checks"] == 0
+        assert totals["native_witness_v0_multisig_checks"] == 0
+        assert totals["p2sh_wrapped_witness_v0_multisig_checks"] == 0
+        assert totals["taproot_key_path_spends"] == 1
+        assert totals["tapscript_spends"] == 1
+        assert totals["tapscript_schnorr_checks"] == 2
+        assert totals["tapscript_checksigadd_checks"] == 1
+
+
+def test_atomic_publish_no_replace_collision() -> None:
+    """os.link must fail atomically when the destination already exists."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target = tmp / "out.json"
+        target.write_text("racer\n")
+        from analyze import _atomic_publish_no_replace
+        _raises_with(
+            AnalyzerError,
+            lambda: _atomic_publish_no_replace(target, b"candidate"),
+            "output race",
+            "DIAG-OUTPUT",
+        )
+        assert target.read_text() == "racer\n"
+
+
+def test_atomic_publish_cleans_temp_on_post_link_fsync_failure() -> None:
+    """If directory fsync after the link fails, the output and temp are removed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target = tmp / "out.json"
+        from analyze import _atomic_publish_no_replace
+        original_fsync = os.fsync
+        def broken_fsync(fd):
+            if fd >= 0:
+                raise OSError(5, "simulated I/O error")
+            original_fsync(fd)
+        try:
+            os.fsync = broken_fsync
+            _raises(
+                OSError,
+                lambda: _atomic_publish_no_replace(target, b"candidate"),
+                "post-link fsync failure",
+            )
+        finally:
+            os.fsync = original_fsync
+        assert not target.exists()
+        assert not any(tmp.glob(".*out.json.tmp*")), "temp must be removed on failure"
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 
@@ -5283,6 +5760,17 @@ def main() -> int:
         test_classify_corpus_scratch_dir_rejects_unwritable,
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
+        test_find_cmodern_height_fake_child_success,
+        test_find_cmodern_height_reaps_failed_child,
+        test_find_cmodern_height_destination_race,
+        test_read_bounded_context_rows_zero_rows,
+        test_read_bounded_context_rows_exact_endpoint,
+        test_read_bounded_context_rows_trailing_uncommitted,
+        test_read_bounded_context_rows_truncated_row,
+        test_c150_helper_parity,
+        test_diagnostic_helper_synthetic_all_types,
+        test_atomic_publish_no_replace_collision,
+        test_atomic_publish_cleans_temp_on_post_link_fsync_failure,
     ]
     passed = 0
     failed = 0

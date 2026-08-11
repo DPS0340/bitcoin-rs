@@ -20,12 +20,14 @@ import re
 import sqlite3
 import statistics
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, NamedTuple
 
 from context import (
+    CONTEXT_MIN_ROW_SIZE,
     ClassifiedInput,
     ContextError,
     ContextInput,
@@ -33,6 +35,7 @@ from context import (
     SpendContext,
     classify_input,
     iter_context_inputs,
+    read_bounded_context_rows,
 )
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -469,6 +472,1078 @@ class JournalEntry:
     @property
     def key(self) -> tuple[bytes, int]:
         return (self.spend_txid, self.input_index)
+
+
+
+# ── Canonical BRSREC1 interpretation (shared by disk classifier and diagnostic scanner)
+
+
+# Each rule is a list of (op_kind, sig_version, spend_context) triples.
+# Used both by the diagnostic per-block loop and the set-based disk classifier.
+_RECORD_COUNTER_RULES: list[tuple[str, list[tuple[int, int, str]]]] = [
+    ("bare_multisig_checks", [(3, 0, "bare"), (4, 0, "bare")]),
+    ("p2sh_multisig_checks", [(3, 0, "p2sh"), (4, 0, "p2sh")]),
+    ("native_witness_v0_multisig_checks", [(3, 1, "native_witness_v0"), (4, 1, "native_witness_v0")]),
+    ("p2sh_wrapped_witness_v0_multisig_checks", [(3, 1, "p2sh_wrapped_witness_v0"), (4, 1, "p2sh_wrapped_witness_v0")]),
+    ("tapscript_schnorr_checks", [(5, 2, "tapscript"), (1, 2, "tapscript"), (2, 2, "tapscript")]),
+    ("tapscript_checksigadd_checks", [(5, 2, "tapscript")]),
+]
+
+
+def _record_matches_rule(
+    record: Record,
+    spend_context: str,
+    rule: list[tuple[int, int, str]],
+) -> bool:
+    """Test a BRSREC1 record against one counter rule."""
+    return (record.op_kind, record.sig_version, spend_context) in rule
+
+
+def _record_legality_error(record: Record, spend_context: str) -> str | None:
+    """Return the canonical CTX-OPERATIONS error code for a record, or None.
+
+    This must match the SQL CASE in ``_count_context_records_disk`` exactly;
+    it is the single source of truth for BRSREC1 op/sig/context legality.
+    """
+    op, sig, ctx = record.op_kind, record.sig_version, spend_context
+
+    if op in (3, 4):
+        if sig not in (0, 1):
+            return "multisig_sig"
+        if ctx == "bare" and sig != 0:
+            return "bare_multisig"
+        if ctx == "p2sh" and sig != 0:
+            return "p2sh_multisig"
+        if ctx == "native_witness_v0" and sig != 1:
+            return "native_multisig"
+        if ctx == "p2sh_wrapped_witness_v0" and sig != 1:
+            return "wrapped_multisig"
+        if ctx in ("taproot_key_path", "tapscript"):
+            return "taproot_multisig"
+
+    if op == 5:
+        if sig != 2:
+            return "checksigadd_sig"
+        if ctx != "tapscript":
+            return "checksigadd_context"
+
+    if op == 0:
+        if sig != 3:
+            return "keypath_sig"
+        if ctx != "taproot_key_path":
+            return "keypath_context"
+
+    if op in (1, 2):
+        if sig == 2 and ctx != "tapscript":
+            return "tapscript_checksig"
+        if sig == 1 and ctx not in ("native_witness_v0", "p2sh_wrapped_witness_v0"):
+            return "witness_checksig"
+        if sig == 0 and ctx not in ("bare", "p2sh"):
+            return "base_checksig"
+        if sig not in (0, 1, 2):
+            return "unknown_checksig"
+
+    if op not in (0, 1, 2, 3, 4, 5):
+        return "unknown_op"
+
+    return None
+
+
+def _diagnostic_spend_counts(classified: list[ClassifiedInput]) -> dict[str, int]:
+    """Derive the five spend-context counters from classified BRSCTX1 inputs."""
+    counts: dict[str, int] = {
+        "p2sh_redeem_spends": 0,
+        "native_witness_v0_spends": 0,
+        "p2sh_wrapped_witness_v0_spends": 0,
+        "taproot_key_path_spends": 0,
+        "tapscript_spends": 0,
+    }
+    for evidence in classified:
+        sc = evidence.spend_context.value
+        if sc == SpendContext.P2SH.value:
+            counts["p2sh_redeem_spends"] += 1
+        elif sc == SpendContext.NATIVE_WITNESS_V0.value:
+            counts["native_witness_v0_spends"] += 1
+        elif sc == SpendContext.P2SH_WRAPPED_WITNESS_V0.value:
+            counts["p2sh_wrapped_witness_v0_spends"] += 1
+        elif sc == SpendContext.TAPROOT_KEY_PATH.value:
+            counts["taproot_key_path_spends"] += 1
+        elif sc == SpendContext.TAPSCRIPT.value:
+            counts["tapscript_spends"] += 1
+    return counts
+
+
+def _diagnostic_record_counts(
+    records: list[Record],
+    context_map: dict[tuple[bytes, int], str],
+) -> tuple[dict[str, int], dict[tuple[bytes, int, int], int]]:
+    """Derive the six record-derived context counters from one block's records.
+
+    Returns (counts, op_seq_by_identity) so the caller can validate op_seq
+    contiguity and gap-free sequences.
+    """
+    counts: dict[str, int] = {
+        "bare_multisig_checks": 0,
+        "p2sh_multisig_checks": 0,
+        "native_witness_v0_multisig_checks": 0,
+        "p2sh_wrapped_witness_v0_multisig_checks": 0,
+        "tapscript_schnorr_checks": 0,
+        "tapscript_checksigadd_checks": 0,
+    }
+    op_seq_by_identity: dict[tuple[bytes, int, int], int] = {}
+
+    for record in records:
+        key = (record.spend_txid, record.input_index)
+        if key not in context_map:
+            display_txid = record.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: BRSREC1 record has no matching context identity: "
+                f"txid={display_txid}, input_index={record.input_index}"
+            )
+
+        ctx = context_map[key]
+        seq_key = (record.spend_txid, record.input_index, record.op_seq)
+        if seq_key in op_seq_by_identity:
+            display_txid = record.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: duplicate record key in BRSREC1: "
+                f"txid={display_txid}, input_index={record.input_index}, op_seq={record.op_seq}"
+            )
+        op_seq_by_identity[seq_key] = 1
+
+        error = _record_legality_error(record, ctx)
+        if error is not None:
+            sig_name = _sig_version_name(record.sig_version)
+            op_name = _op_kind_name(record.op_kind)
+            display_txid = record.spend_txid[::-1].hex()
+            identity = f"txid={display_txid}, input_index={record.input_index}"
+            message = _record_legality_message(error, op_name, sig_name, identity)
+            raise AnalyzerError(f"CTX-OPERATIONS: {message}")
+
+        for name, rule in _RECORD_COUNTER_RULES:
+            if _record_matches_rule(record, ctx, rule):
+                counts[name] += 1
+
+    return counts, op_seq_by_identity
+
+
+def _record_legality_message(error: str, op_name: str, sig_name: str, identity: str) -> str:
+    """Human-readable message for a BRSREC1 legality error code."""
+    if error == "multisig_sig":
+        return f"multisig record must have sig_version BASE or WITNESS_V0, got {sig_name} for {identity}"
+    if error == "bare_multisig":
+        return f"bare multisig record has sig_version {sig_name}, expected BASE for {identity}"
+    if error == "p2sh_multisig":
+        return f"P2SH multisig record has sig_version {sig_name}, expected BASE for {identity}"
+    if error == "native_multisig":
+        return f"native witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
+    if error == "wrapped_multisig":
+        return f"P2SH-wrapped witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
+    if error == "taproot_multisig":
+        return f"multisig record joined to a Taproot input {identity}"
+    if error == "checksigadd_sig":
+        return f"CHECKSIGADD record must have sig_version TAPSCRIPT, got {sig_name} for {identity}"
+    if error == "checksigadd_context":
+        return f"CHECKSIGADD record joined to a non-Tapscript input {identity}"
+    if error == "keypath_sig":
+        return f"key-path record must have sig_version TAPROOT, got {sig_name} for {identity}"
+    if error == "keypath_context":
+        return f"key-path record joined to a non-key-path input {identity}"
+    if error == "tapscript_checksig":
+        return f"Tapscript CHECKSIG record joined to a non-Tapscript input {identity}"
+    if error == "witness_checksig":
+        return f"WITNESS_V0 CHECKSIG record joined to a non-witness-v0 input {identity}"
+    if error == "base_checksig":
+        return f"BASE CHECKSIG record joined to a non-legacy input {identity}"
+    if error == "unknown_checksig":
+        return f"CHECKSIG record has unknown sig_version {sig_name} for {identity}"
+    if error == "unknown_op":
+        return f"unknown op_kind {op_name} for {identity}"
+    return f"unknown error code {error} for {identity}"
+
+
+def _diagnostic_counter_totals(
+    classified: list[ClassifiedInput],
+    records: list[Record],
+    context_map: dict[tuple[bytes, int], str],
+) -> dict[str, int]:
+    """Combine spend-context and record-derived counters into the 11 canonical values."""
+    spend_counts = _diagnostic_spend_counts(classified)
+    record_counts, _ = _diagnostic_record_counts(records, context_map)
+    return {**spend_counts, **record_counts}
+
+
+
+# ── Cmodern diagnostic checkpoint protocol
+
+
+DIAGNOSTIC_PREFACE_SIZE = 16
+DIAGNOSTIC_ROW_SIZE = 84
+DIAGNOSTIC_MAGIC = b"BRSHGT1\x00"
+DIAGNOSTIC_VERSION = 1
+
+BRSHGT1_HEADER_STRUCT = struct.Struct("<8sQ")
+BRSHGT1_ROW_STRUCT = struct.Struct("<I32sQQQQQQ")
+
+
+class DiagnosticCheckpoint(NamedTuple):
+    height: int
+    block_hash_le: bytes
+    context_rows: int
+    context_end: int
+    record_rows: int
+    record_end: int
+    journal_rows: int
+    journal_end: int
+
+
+def _read_exact_stream(stream: BinaryIO, length: int, field: str) -> bytes:
+    """Read exactly *length* bytes from the child protocol stream."""
+    data = stream.read(length)
+    if len(data) != length:
+        raise AnalyzerError(f"DIAG-PROTO: short {field}: expected {length} bytes, got {len(data)}")
+    return data
+
+
+def _read_diagnostic_preface(stream: BinaryIO) -> None:
+    """Validate the 16-byte preface on child stdout."""
+    preface = _read_exact_stream(stream, DIAGNOSTIC_PREFACE_SIZE, "preface")
+    magic = preface[:8]
+    version = struct.unpack_from("<I", preface, 8)[0]
+    row_size = struct.unpack_from("<I", preface, 12)[0]
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-PROTO: wrong preface magic {magic!r}")
+    if version != DIAGNOSTIC_VERSION:
+        raise AnalyzerError(f"DIAG-PROTO: unsupported protocol version {version}")
+    if row_size != DIAGNOSTIC_ROW_SIZE:
+        raise AnalyzerError(f"DIAG-PROTO: unsupported row size {row_size}, expected {DIAGNOSTIC_ROW_SIZE}")
+
+
+def _read_checkpoint_row(stream: BinaryIO) -> DiagnosticCheckpoint:
+    """Read one 84-byte BRSHGT1 row from the child protocol stream."""
+    raw = _read_exact_stream(stream, DIAGNOSTIC_ROW_SIZE, "checkpoint row")
+    (
+        height,
+        block_hash_le,
+        context_rows,
+        context_end,
+        record_rows,
+        record_end,
+        journal_rows,
+        journal_end,
+    ) = BRSHGT1_ROW_STRUCT.unpack(raw)
+    return DiagnosticCheckpoint(
+        height=height,
+        block_hash_le=block_hash_le,
+        context_rows=context_rows,
+        context_end=context_end,
+        record_rows=record_rows,
+        record_end=record_end,
+        journal_rows=journal_rows,
+        journal_end=journal_end,
+    )
+
+
+def _write_brshgt1_preface(fd: int) -> None:
+    """Write the 16-byte BRSHGT1 placeholder header."""
+    header = BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, 0)
+    written = os.write(fd, header)
+    if written != len(header):
+        raise AnalyzerError("DIAG-SIDECAR: short write of BRSHGT1 placeholder header")
+    os.fsync(fd)
+
+
+def _write_brshgt1_row(fd: int, row: DiagnosticCheckpoint) -> None:
+    """Append one 84-byte row and fsync the sidecar."""
+    raw = BRSHGT1_ROW_STRUCT.pack(*row)
+    written = os.write(fd, raw)
+    if written != len(raw):
+        raise AnalyzerError("DIAG-SIDECAR: short write of BRSHGT1 row")
+    os.fsync(fd)
+
+
+def _patch_brshgt1_count(sidecar_path: Path, count: int) -> None:
+    """Patch the row count in the sidecar header, fsync, then sync parent dir."""
+    fd = os.open(sidecar_path, os.O_RDWR)
+    try:
+        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-SIDECAR: cannot read header for count patch")
+        magic, _old = BRSHGT1_HEADER_STRUCT.unpack(header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError("DIAG-SIDECAR: wrong magic while patching count")
+        os.pwrite(fd, struct.pack("<Q", count), 8)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dir_fd = os.open(sidecar_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _brshgt1_count(sidecar_path: Path) -> int:
+    """Return the declared row count from a finalized BRSHGT1 sidecar."""
+    fd = os.open(sidecar_path, os.O_RDONLY)
+    try:
+        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-SIDECAR: short header")
+        magic, count = BRSHGT1_HEADER_STRUCT.unpack(header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError("DIAG-SIDECAR: wrong magic")
+        return count
+    finally:
+        os.close(fd)
+
+
+def _open_brshgt1_read_fd(sidecar_path: Path) -> int:
+    """Open a BRSHGT1 sidecar and validate its preface/header."""
+    fd = os.open(sidecar_path, os.O_RDONLY)
+    valid = False
+    try:
+        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-SIDECAR: short header")
+        magic, count = BRSHGT1_HEADER_STRUCT.unpack(header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError(f"DIAG-SIDECAR: wrong magic {magic!r}")
+        file_size = os.fstat(fd).st_size
+        expected = BRSHGT1_HEADER_STRUCT.size + count * DIAGNOSTIC_ROW_SIZE
+        if file_size != expected:
+            raise AnalyzerError(
+                f"DIAG-SIDECAR: size {file_size} != header {BRSHGT1_HEADER_STRUCT.size} + "
+                f"{count} x {DIAGNOSTIC_ROW_SIZE} = {expected}"
+            )
+        valid = True
+        return fd
+    finally:
+        if not valid:
+            os.close(fd)
+
+
+def _read_brshgt1_row(fd: int, row_number: int) -> DiagnosticCheckpoint:
+    """Read the Nth 84-byte row from a sidecar (1-indexed)."""
+    offset = BRSHGT1_HEADER_STRUCT.size + (row_number - 1) * DIAGNOSTIC_ROW_SIZE
+    raw = os.pread(fd, DIAGNOSTIC_ROW_SIZE, offset)
+    if len(raw) != DIAGNOSTIC_ROW_SIZE:
+        raise AnalyzerError(f"DIAG-SIDECAR: short row {row_number}")
+    (
+        height,
+        block_hash_le,
+        context_rows,
+        context_end,
+        record_rows,
+        record_end,
+        journal_rows,
+        journal_end,
+    ) = BRSHGT1_ROW_STRUCT.unpack(raw)
+    return DiagnosticCheckpoint(
+        height=height,
+        block_hash_le=block_hash_le,
+        context_rows=context_rows,
+        context_end=context_end,
+        record_rows=record_rows,
+        record_end=record_end,
+        journal_rows=journal_rows,
+        journal_end=journal_end,
+    )
+
+
+
+
+def _read_fixed_entries_slice(
+    fd: int,
+    start_offset: int,
+    end_offset: int,
+    start_row: int,
+    committed_rows: int,
+    entry_size: int,
+    name: str,
+) -> list[bytes]:
+    """Read a committed slice of fixed-size entries using pread."""
+    if start_row < 0 or committed_rows < start_row:
+        raise AnalyzerError(f"DIAG-PROTO: invalid {name} row range {start_row}..{committed_rows}")
+    if start_offset < HEADER_SIZE or end_offset < start_offset:
+        raise AnalyzerError(f"DIAG-PROTO: invalid {name} byte range {start_offset}..{end_offset}")
+    expected_start = HEADER_SIZE + start_row * entry_size
+    expected_end = HEADER_SIZE + committed_rows * entry_size
+    if start_offset != expected_start or end_offset != expected_end:
+        raise AnalyzerError(
+            f"DIAG-PROTO: {name} endpoint mismatch: "
+            f"expected {expected_start}..{expected_end}, got {start_offset}..{end_offset}"
+        )
+    file_size = os.fstat(fd).st_size
+    if end_offset > file_size:
+        raise AnalyzerError(
+            f"DIAG-PROTO: {name} endpoint {end_offset} exceeds file size {file_size}"
+        )
+    slice_size = end_offset - start_offset
+    if slice_size != (committed_rows - start_row) * entry_size:
+        raise AnalyzerError(f"DIAG-PROTO: {name} slice size {slice_size} does not match row delta")
+    raw = os.pread(fd, slice_size, start_offset)
+    if len(raw) != slice_size:
+        raise AnalyzerError(f"DIAG-PROTO: short pread for {name}")
+    return [
+        raw[i * entry_size : (i + 1) * entry_size]
+        for i in range(committed_rows - start_row)
+    ]
+
+
+def _read_diagnostic_streams(
+    row: DiagnosticCheckpoint,
+    prev: DiagnosticCheckpoint | None,
+    paths: dict[str, Path],
+) -> tuple[list[ClassifiedInput], list[Record], list[JournalEntry], dict[tuple[bytes, int], str], dict[str, int]]:
+    """Parse the three committed prefixes for one block.
+
+    Returns (classified, records, journal, context_map, record_counts).
+    """
+    ctx_fd = os.open(paths["contexts"], os.O_RDONLY)
+    rec_fd = os.open(paths["records"], os.O_RDONLY)
+    jrn_fd = os.open(paths["journal"], os.O_RDONLY)
+    try:
+        prev_ctx = prev.context_rows if prev is not None else 0
+        prev_ctx_end = prev.context_end if prev is not None else HEADER_SIZE
+        prev_rec = prev.record_rows if prev is not None else 0
+        prev_rec_end = prev.record_end if prev is not None else HEADER_SIZE
+        prev_jrn = prev.journal_rows if prev is not None else 0
+        prev_jrn_end = prev.journal_end if prev is not None else HEADER_SIZE
+
+        context_inputs = read_bounded_context_rows(
+            ctx_fd,
+            start_offset=prev_ctx_end,
+            end_offset=row.context_end,
+            start_row=prev_ctx,
+            committed_rows=row.context_rows,
+        )
+        classified: list[ClassifiedInput] = []
+        context_map: dict[tuple[bytes, int], str] = {}
+        for inp in context_inputs:
+            ci = classify_input(inp)
+            key = (inp.identity.txid_le, inp.identity.input_index)
+            if key in context_map:
+                display_txid = inp.identity.txid_le[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-EXECUTION: duplicate context execution identity "
+                    f"{display_txid}:{inp.identity.input_index}"
+                )
+            context_map[key] = ci.spend_context.value
+            classified.append(ci)
+
+        journal_raws = _read_fixed_entries_slice(
+            jrn_fd,
+            prev_jrn_end,
+            row.journal_end,
+            prev_jrn,
+            row.journal_rows,
+            JOURNAL_SIZE,
+            "journal",
+        )
+        journal = [JournalEntry(raw) for raw in journal_raws]
+        journal_keys: set[tuple[bytes, int]] = set()
+        for entry in journal:
+            if entry.verdict != 1:
+                display_txid = entry.spend_txid[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 for {display_txid}:{entry.input_index}"
+                )
+            key = (entry.spend_txid, entry.input_index)
+            if key in journal_keys:
+                display_txid = entry.spend_txid[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-EXECUTION: duplicate journal key in BRSJRN1: {display_txid}:{entry.input_index}"
+                )
+            journal_keys.add(key)
+
+        context_keys = set(context_map.keys())
+        if context_keys != journal_keys:
+            missing = journal_keys - context_keys
+            extra = context_keys - journal_keys
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: context/journal key-set mismatch: "
+                f"missing={len(missing)} extra={len(extra)}"
+            )
+
+        record_raws = _read_fixed_entries_slice(
+            rec_fd,
+            prev_rec_end,
+            row.record_end,
+            prev_rec,
+            row.record_rows,
+            RECORD_SIZE,
+            "records",
+        )
+        records = [Record(raw) for raw in record_raws]
+        record_counts, op_seqs = _diagnostic_record_counts(records, context_map)
+
+        by_identity: dict[tuple[bytes, int], list[int]] = {}
+        record_sums: dict[tuple[bytes, int], list[int]] = {}
+        for record in records:
+            key = (record.spend_txid, record.input_index)
+            by_identity.setdefault(key, []).append(record.op_seq)
+            sums = record_sums.setdefault(key, [0, 0, 0, 0])
+            if record.op_kind in (1, 2):
+                sums[0] += 1
+            elif record.op_kind in (3, 4):
+                sums[1] += 1
+            if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
+                if record.outcome != 2:
+                    sums[2] += 1
+                if record.outcome == 1:
+                    sums[3] += 1
+
+        for (txid, idx), seqs in by_identity.items():
+            seqs.sort()
+            expected = list(range(len(seqs)))
+            if seqs != expected:
+                display_txid = txid[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-OPERATIONS: op_seq contiguity violation for {display_txid}:{idx}: "
+                    f"expected {expected}, got {seqs}"
+                )
+
+        for entry in journal:
+            actual = record_sums.get(entry.key, [0, 0, 0, 0])
+            expected = [
+                entry.checksig_ops,
+                entry.checkmultisig_ops,
+                entry.ecdsa_verify_calls,
+                entry.ecdsa_verify_ok,
+            ]
+            if actual != expected:
+                display_txid = entry.spend_txid[::-1].hex()
+                raise AnalyzerError(
+                    f"CTX-OPERATIONS: journal/record totals mismatch for "
+                    f"{display_txid}:{entry.input_index}: expected {expected}, got {actual}"
+                )
+
+        return classified, records, journal, context_map, record_counts
+    finally:
+        os.close(ctx_fd)
+        os.close(rec_fd)
+        os.close(jrn_fd)
+
+
+def _validate_checkpoint_bounds(
+    row: DiagnosticCheckpoint,
+    prev: DiagnosticCheckpoint | None,
+    file_sizes: dict[str, int],
+) -> None:
+    """Validate checkpoint ordering, framing, hashes, and committed endpoints."""
+    if prev is None:
+        if row.height != 0:
+            raise AnalyzerError("DIAG-PROTO: first checkpoint row must have height 0")
+        genesis_le = bytes.fromhex(MAINNET_GENESIS_HASH)[::-1]
+        if row.block_hash_le != genesis_le:
+            raise AnalyzerError("DIAG-PROTO: height 0 checkpoint hash is not mainnet genesis")
+    else:
+        if row.height != prev.height + 1:
+            raise AnalyzerError(
+                f"DIAG-PROTO: height {row.height} does not follow {prev.height}"
+            )
+        if row.block_hash_le == prev.block_hash_le:
+            raise AnalyzerError(
+                f"DIAG-PROTO: checkpoint hash repeated at height {row.height}"
+            )
+
+    if row.block_hash_le == bytes(32):
+        raise AnalyzerError(f"DIAG-PROTO: zero block hash at height {row.height}")
+
+    for name in ("context", "record", "journal"):
+        end = getattr(row, f"{name}_end")
+        count = getattr(row, f"{name}_rows")
+        previous_end = getattr(prev, f"{name}_end", HEADER_SIZE) if prev else HEADER_SIZE
+        previous_count = getattr(prev, f"{name}_rows", 0) if prev else 0
+        if count < previous_count:
+            raise AnalyzerError(
+                f"DIAG-PROTO: {name}_rows decreased from {previous_count} to {count}"
+            )
+        if end < previous_end:
+            raise AnalyzerError(
+                f"DIAG-PROTO: {name}_end decreased from {previous_end} to {end}"
+            )
+        if end > file_sizes[name]:
+            raise AnalyzerError(
+                f"DIAG-PROTO: {name}_end {end} exceeds current file size {file_sizes[name]}"
+            )
+
+    expected_record_end = HEADER_SIZE + row.record_rows * RECORD_SIZE
+    if row.record_end != expected_record_end:
+        raise AnalyzerError(
+            f"DIAG-PROTO: record_end {row.record_end} != {expected_record_end}"
+        )
+    expected_journal_end = HEADER_SIZE + row.journal_rows * JOURNAL_SIZE
+    if row.journal_end != expected_journal_end:
+        raise AnalyzerError(
+            f"DIAG-PROTO: journal_end {row.journal_end} != {expected_journal_end}"
+        )
+    minimum_context_end = HEADER_SIZE + row.context_rows * CONTEXT_MIN_ROW_SIZE
+    if row.context_end < minimum_context_end:
+        raise AnalyzerError(
+            f"DIAG-PROTO: context_end {row.context_end} is below minimum {minimum_context_end}"
+        )
+
+
+_ATOMIC_PUBLISH_COUNTER = 0
+
+
+def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
+    """Fsync an exclusive sibling temp and hard-link it without replacement."""
+    parent = path.parent if str(path.parent) else Path(".")
+    parent.mkdir(parents=True, exist_ok=True)
+    global _ATOMIC_PUBLISH_COUNTER
+    _ATOMIC_PUBLISH_COUNTER += 1
+    temp = parent / f".{path.name}.tmp.{os.getpid()}.{_ATOMIC_PUBLISH_COUNTER}"
+    link_created = False
+
+    def _cleanup() -> None:
+        if link_created:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+    try:
+        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                if written == 0:
+                    raise AnalyzerError("DIAG-OUTPUT: zero-byte write to temporary file")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                os.link(temp, path)
+            except FileExistsError as exc:
+                raise AnalyzerError(f"DIAG-OUTPUT: output already exists: {path}") from exc
+            except OSError as exc:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
+                ) from exc
+            link_created = True
+            os.fsync(dir_fd)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            os.close(dir_fd)
+    except BaseException:
+        _cleanup()
+        raise
+
+    if not link_created:
+        _cleanup()
+        raise AnalyzerError("DIAG-OUTPUT: publication did not create a link")
+
+
+def _write_json_atomic(path: Path, content: dict[str, object]) -> None:
+    rendered = json.dumps(content, indent=2).encode("utf-8") + b"\n"
+    _atomic_publish_no_replace(path, rendered)
+
+
+def _close_stream(stream: BinaryIO | None) -> None:
+    if stream is None or stream.closed:
+        return
+    try:
+        stream.close()
+    except OSError:
+        return
+
+
+def _reap_child(
+    proc: subprocess.Popen, stderr_file: BinaryIO, *, timeout: float = 5.0
+) -> None:
+    """Close stdin, wait, kill only on timeout, then close remaining handles."""
+    _close_stream(proc.stdin)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise AnalyzerError("DIAG-PROTO: child did not exit after kill") from exc
+    finally:
+        _close_stream(proc.stdout)
+        _close_stream(proc.stderr)
+        _close_stream(stderr_file)
+
+
+def _launch_diagnostic_child(
+    binary: Path,
+    rest_url: str,
+    ceiling: int,
+    work_dir: Path,
+    replay_json: Path,
+    data_dir: Path,
+    stderr_path: Path,
+    counters_path: Path,
+    storage_backend: str,
+    txindex: bool,
+    blockfilterindex: bool,
+) -> tuple[subprocess.Popen, BinaryIO]:
+    env = os.environ.copy()
+    env.update({
+        "BRS_CENSUS_COUNTERS": str(counters_path),
+        "BRS_CENSUS_CONTEXTS": str(work_dir / "brsctx1.bin"),
+        "BRS_CENSUS_RECORDS": str(work_dir / "brsrec1.bin"),
+        "BRS_CENSUS_JOURNAL": str(work_dir / "brsjrn1.bin"),
+        "BRS_CENSUS_LABEL": "cmodern-diagnostic",
+    })
+    command = [
+        str(binary),
+        "--cmodern-diagnostic-protocol",
+        "--rest-url", rest_url,
+        "--start-height", "0",
+        "--assume-valid-height", "0",
+        "--window", "1",
+        "--stop-height", str(ceiling),
+        "--data-dir", str(data_dir),
+        "--output", str(replay_json),
+        "--storage-backend", storage_backend,
+    ]
+    if txindex:
+        command.append("--txindex")
+    if blockfilterindex:
+        command.append("--blockfilterindex")
+
+    stderr_file = stderr_path.open("xb")
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            env=env,
+            bufsize=0,
+            close_fds=True,
+        )
+    except OSError as exc:
+        stderr_file.close()
+        raise AnalyzerError(f"DIAG-SETUP: failed to launch child: {exc}") from exc
+    return proc, stderr_file
+
+
+def _validate_replay_diagnostic(
+    path: Path, final: DiagnosticCheckpoint, ceiling: int, rest_url: str
+) -> None:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalyzerError(f"DIAG-CUSTODY: invalid child replay JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AnalyzerError("DIAG-CUSTODY: child replay JSON root is not an object")
+    required = {
+        "schema": "mainnet-prefix-replay-diagnostic-v1",
+        "non_certifying": True,
+        "block_source": "rest",
+        "rest_url": rest_url,
+        "start_height": 0,
+        "assume_valid_height": 0,
+        "window": 1,
+        "requested_stop_height_ceiling": ceiling,
+        "actual_stop_height": final.height,
+        "actual_stop_hash": final.block_hash_le[::-1].hex(),
+        "stop_reason": "controller-request",
+    }
+    for field, expected in required.items():
+        if raw.get(field) != expected:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: child replay {field} {raw.get(field)!r} != {expected!r}"
+            )
+
+
+def _validate_native_counters(path: Path, final: DiagnosticCheckpoint) -> None:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AnalyzerError(f"DIAG-CUSTODY: invalid counters JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AnalyzerError("DIAG-CUSTODY: counters JSON root is not an object")
+    counters = Counters(raw)
+    expected = {
+        "context_count": final.context_rows,
+        "record_count": final.record_rows,
+        "journal_count": final.journal_rows,
+    }
+    for field, value in expected.items():
+        if getattr(counters, field) != value:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: counters {field} {getattr(counters, field)} != {value}"
+            )
+
+
+def _validate_terminal_streams(
+    paths: dict[str, Path], final: DiagnosticCheckpoint
+) -> dict[str, dict[str, object]]:
+    custody: dict[str, dict[str, object]] = {}
+    context_iter = iter_context_inputs(paths["contexts"])
+    for _ in context_iter:
+        continue
+    context_custody = context_iter.custody()
+    if context_custody["count"] != final.context_rows or context_custody["bytes"] != final.context_end:
+        raise AnalyzerError("DIAG-CUSTODY: terminal context header/checkpoint mismatch")
+    custody["contexts"] = {
+        "path": str(paths["contexts"]),
+        "bytes": context_custody["bytes"],
+        "sha256": format(context_custody["sha256"], "064x"),
+    }
+
+    record_iter, record_custody = iter_records_with_custody(paths["records"])
+    for _ in record_iter:
+        continue
+    record_count = (record_custody["bytes"] - HEADER_SIZE) // RECORD_SIZE
+    if record_count != final.record_rows or record_custody["bytes"] != final.record_end:
+        raise AnalyzerError("DIAG-CUSTODY: terminal record header/checkpoint mismatch")
+    custody["records"] = {
+        "path": str(paths["records"]),
+        "bytes": record_custody["bytes"],
+        "sha256": format(record_custody["sha256"], "064x"),
+    }
+
+    journal_iter, journal_custody = iter_journal_with_custody(paths["journal"])
+    for _ in journal_iter:
+        continue
+    journal_count = (journal_custody["bytes"] - HEADER_SIZE) // JOURNAL_SIZE
+    if journal_count != final.journal_rows or journal_custody["bytes"] != final.journal_end:
+        raise AnalyzerError("DIAG-CUSTODY: terminal journal header/checkpoint mismatch")
+    custody["journal"] = {
+        "path": str(paths["journal"]),
+        "bytes": journal_custody["bytes"],
+        "sha256": format(journal_custody["sha256"], "064x"),
+    }
+    return custody
+
+
+def _finalize_candidate(
+    paths: dict[str, Path],
+    sidecar_row_count: int,
+    final: DiagnosticCheckpoint,
+    cumulative_counts: dict[str, int],
+    first_heights: dict[str, int],
+    rest_url: str,
+    ceiling: int,
+    output_path: Path,
+) -> None:
+    _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
+    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
+        raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
+    sidecar_read_fd = _open_brshgt1_read_fd(paths["sidecar"])
+    try:
+        terminal_row = _read_brshgt1_row(sidecar_read_fd, sidecar_row_count)
+    finally:
+        os.close(sidecar_read_fd)
+    if terminal_row != final:
+        raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
+
+    stream_custody = _validate_terminal_streams(paths, final)
+    _validate_replay_diagnostic(paths["replay"], final, ceiling, rest_url)
+    _validate_native_counters(paths["counters"], final)
+    custody: dict[str, dict[str, object]] = {}
+    for name in ("sidecar", "replay", "counters"):
+        size, digest = _sha256_file(paths[name])
+        custody[name] = {
+            "path": str(paths[name]),
+            "bytes": size,
+            "sha256": digest,
+        }
+
+    candidate: dict[str, object] = {
+        "schema": "cmodern-candidate-diagnostic-v1",
+        "non_certifying": True,
+        "certifying_replay_required": True,
+        "network": "mainnet",
+        "block_source": "rest",
+        "rest_url": rest_url,
+        "start_height": 0,
+        "assume_valid_height": 0,
+        "window": 1,
+        "stop_height_ceiling": ceiling,
+        "earliest_defensible_height_h": final.height,
+        "block_hash_h": final.block_hash_le[::-1].hex(),
+        "first_occurrence_heights": {name: first_heights[name] for name in CONTEXT_COUNTER_NAMES},
+        "context_counts": {name: cumulative_counts[name] for name in CONTEXT_COUNTER_NAMES},
+        "context_counter_definitions": CONTEXT_COUNTER_DEFINITIONS,
+        "final_stream_counts": {
+            "context_rows": final.context_rows,
+            "record_rows": final.record_rows,
+            "journal_rows": final.journal_rows,
+        },
+        "final_stream_endpoints": {
+            "context_end": final.context_end,
+            "record_end": final.record_end,
+            "journal_end": final.journal_end,
+        },
+        "child_exit_status": 0,
+        "child_replay_schema": "mainnet-prefix-replay-diagnostic-v1",
+        "custody": {
+            "brshgt1_sidecar": custody["sidecar"],
+            "child_replay_json": custody["replay"],
+            "counters_json": custody["counters"],
+            "brsctx1": stream_custody["contexts"],
+            "brsrec1": stream_custody["records"],
+            "brsjrn1": stream_custody["journal"],
+        },
+    }
+    _write_json_atomic(output_path, candidate)
+
+
+def _send_control(proc: subprocess.Popen, control: bytes) -> None:
+    if proc.stdin is None:
+        raise AnalyzerError("DIAG-SETUP: child stdin is not piped")
+    try:
+        proc.stdin.write(control)
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise AnalyzerError(f"DIAG-PROTO: failed to send control byte: {exc}") from exc
+
+
+def _run_diagnostic_scan(
+    binary: Path,
+    rest_url: str,
+    ceiling: int,
+    work_dir: Path,
+    output_path: Path,
+    storage_backend: str = "fjall",
+    txindex: bool = False,
+    blockfilterindex: bool = False,
+) -> None:
+    paths = {
+        "contexts": work_dir / "brsctx1.bin",
+        "records": work_dir / "brsrec1.bin",
+        "journal": work_dir / "brsjrn1.bin",
+        "sidecar": work_dir / "brshgt1.bin",
+        "replay": work_dir / "replay_diagnostic.json",
+        "stderr": work_dir / "stderr.log",
+        "counters": work_dir / "counters.json",
+    }
+    data_dir = work_dir / "state"
+    data_dir.mkdir(exist_ok=False)
+    sidecar_fd: int | None = os.open(
+        paths["sidecar"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+    )
+    _write_brshgt1_preface(sidecar_fd)
+    proc: subprocess.Popen | None = None
+    stderr_file: BinaryIO | None = None
+    child_closed = False
+    try:
+        proc, stderr_file = _launch_diagnostic_child(
+            binary, rest_url, ceiling, work_dir, paths["replay"], data_dir,
+            paths["stderr"], paths["counters"], storage_backend, txindex,
+            blockfilterindex,
+        )
+        if proc.stdout is None:
+            raise AnalyzerError("DIAG-SETUP: child stdout is not piped")
+        _read_diagnostic_preface(proc.stdout)
+        previous: DiagnosticCheckpoint | None = None
+        cumulative_counts = {name: 0 for name in CONTEXT_COUNTER_NAMES}
+        first_heights: dict[str, int] = {}
+        row_count = 0
+
+        while True:
+            row = _read_checkpoint_row(proc.stdout)
+            file_sizes = {
+                "context": paths["contexts"].stat().st_size,
+                "record": paths["records"].stat().st_size,
+                "journal": paths["journal"].stat().st_size,
+            }
+            _validate_checkpoint_bounds(row, previous, file_sizes)
+            classified, _records, _journal, _context_map, record_counts = (
+                _read_diagnostic_streams(row, previous, paths)
+            )
+            block_counts = {**_diagnostic_spend_counts(classified), **record_counts}
+            for name in CONTEXT_COUNTER_NAMES:
+                cumulative_counts[name] += block_counts[name]
+                if block_counts[name] > 0 and name not in first_heights:
+                    first_heights[name] = row.height
+
+            _write_brshgt1_row(sidecar_fd, row)
+            row_count += 1
+            if len(first_heights) == len(CONTEXT_COUNTER_NAMES):
+                expected_h = max(first_heights.values())
+                if row.height != expected_h:
+                    raise AnalyzerError(
+                        f"DIAG-PROTO: current height {row.height} != derived H {expected_h}"
+                    )
+                _send_control(proc, b"\x01")
+                break
+            if row.height >= ceiling:
+                raise AnalyzerError(
+                    f"DIAG-PROTO: safety ceiling {ceiling} exhausted without all 11 types"
+                )
+            _send_control(proc, b"\x00")
+            previous = row
+
+        _close_stream(proc.stdin)
+        try:
+            exit_code = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired as exc:
+            raise AnalyzerError("DIAG-PROTO: child did not exit after STOP") from exc
+        if exit_code != 0:
+            raise AnalyzerError(f"DIAG-PROTO: child exited with status {exit_code}")
+        if proc.stdout.read(1) != b"":
+            raise AnalyzerError("DIAG-PROTO: trailing bytes after terminal checkpoint")
+        _close_stream(proc.stdout)
+        _close_stream(proc.stderr)
+        _close_stream(stderr_file)
+        child_closed = True
+
+        os.fsync(sidecar_fd)
+        os.close(sidecar_fd)
+        sidecar_fd = None
+        _finalize_candidate(
+            paths, row_count, row, cumulative_counts, first_heights, rest_url,
+            ceiling, output_path,
+        )
+    finally:
+        if proc is not None and stderr_file is not None and not child_closed:
+            _reap_child(proc, stderr_file)
+        if sidecar_fd is not None:
+            os.close(sidecar_fd)
+
+
+def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
+    binary = Path(args.binary)
+    work_dir = Path(args.work_dir)
+    output = Path(args.output)
+    if not binary.is_file():
+        raise AnalyzerError(f"DIAG-SETUP: binary not found: {binary}")
+    if not args.rest_url or ":" not in args.rest_url:
+        raise AnalyzerError(
+            f"DIAG-SETUP: invalid rest_url {args.rest_url!r}; expected host:port"
+        )
+    if not (0 <= args.stop_height <= 0xFFFFFFFF):
+        raise AnalyzerError(
+            f"DIAG-SETUP: stop-height must be a u32, got {args.stop_height}"
+        )
+    if work_dir.exists():
+        raise AnalyzerError(f"DIAG-SETUP: work directory already exists: {work_dir}")
+    if output.exists():
+        raise AnalyzerError(f"DIAG-SETUP: output already exists: {output}")
+    work_dir.mkdir(parents=True, exist_ok=False)
+    _run_diagnostic_scan(
+        binary, args.rest_url, args.stop_height, work_dir, output,
+        storage_backend=args.storage_backend, txindex=args.txindex,
+        blockfilterindex=args.blockfilterindex,
+    )
+    return 0
 
 
 # ── Binary parsing ──────────────────────────────────────────────────────────
@@ -2957,6 +4032,7 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
     return 1
 
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze.py",
@@ -3099,6 +4175,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional writable directory for the classifier database and SQLite temporary files",
     )
     cc.set_defaults(func=cmd_classify_corpus)
+
+    fc = sub.add_parser(
+        "find-cmodern-height",
+        help="launch a diagnostic replay to find the first mainnet height with all 11 special contexts",
+    )
+    fc.add_argument("--binary", required=True, help="feature-built mainnet_prefix_replay binary")
+    fc.add_argument("--rest-url", required=True, help="frozen REST URL (host:port)")
+    fc.add_argument("--stop-height", required=True, type=int, help="safety ceiling (inclusive u32)")
+    fc.add_argument("--work-dir", required=True, help="new work directory for BRS streams and scratch state")
+    fc.add_argument("--output", required=True, help="candidate output JSON path")
+    fc.add_argument("--storage-backend", default="fjall", help="storage backend for replay state")
+    fc.add_argument("--txindex", action="store_true", default=False, help="enable txindex")
+    fc.add_argument("--blockfilterindex", action="store_true", default=False, help="enable blockfilterindex")
+    fc.set_defaults(func=cmd_find_cmodern_height)
 
     return parser
 
