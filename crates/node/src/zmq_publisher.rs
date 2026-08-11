@@ -383,16 +383,20 @@ impl ZmqPublisher for SocketZmqPublisher {
     }
 
     fn publish_sequence(&self, event: SequenceEvent) {
-        let mut body = [0_u8; 33];
-        body[..32].copy_from_slice(&hash_body_from_hash(event.hash()));
-        body[32] = event.label();
-        self.publish(ZmqTopic::Sequence, &body);
+        self.publish(ZmqTopic::Sequence, &sequence_payload(event));
     }
 }
 
 pub(crate) fn hash_body_from_hash(hash: Hash256) -> [u8; 32] {
     let mut body = hash.to_le_bytes();
     body.reverse();
+    body
+}
+
+pub(crate) fn sequence_payload(event: SequenceEvent) -> [u8; 33] {
+    let mut body = [0_u8; 33];
+    body[..32].copy_from_slice(&hash_body_from_hash(event.hash()));
+    body[32] = event.label();
     body
 }
 
@@ -466,20 +470,20 @@ mod tests {
     fn sequence_event_payload_uses_core_hash_orientation_and_label() {
         let le = core::array::from_fn(|index| u8::try_from(index).unwrap_or_default());
         let hash = Hash256::from_le_bytes(&le);
-        let mut expected = [0_u8; 33];
-        expected[..32].copy_from_slice(hash_body_from_hash(hash).as_slice());
-        expected[32] = b'C';
         assert_eq!(
-            expected,
+            sequence_payload(SequenceEvent::Connected(hash)),
             [
                 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
                 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, b'C'
             ]
         );
-        expected[32] = b'D';
-        assert_eq!(expected[32], b'D');
-        assert_eq!(sequence_body(0x0102_0304), [0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(SequenceEvent::Disconnected(hash).label(), b'D');
+        assert_eq!(
+            sequence_payload(SequenceEvent::Disconnected(hash)),
+            [
+                31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+                10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, b'D'
+            ]
+        );
     }
 
     #[test]

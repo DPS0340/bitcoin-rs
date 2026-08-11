@@ -1044,20 +1044,11 @@ pub fn disconnect_block(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
 ) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
-    use bitcoin::hashes::Hash as _;
-
     let transition = handles
         .begin_chain_transition()
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
     let result = disconnect_block_admitted(handles, block, &transition);
     drop(transition);
-    if result.is_ok() && handles.zmq_publisher.wants_notifications() {
-        handles
-            .zmq_publisher
-            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
-                Hash256::from_le_bytes(&block.block_hash().to_byte_array()),
-            ));
-    }
     result
 }
 
@@ -1227,6 +1218,14 @@ pub(crate) fn disconnect_block_admitted(
                 source: Box::new(ApplyError::UndoPersistence(error)),
             })
         })?;
+
+    if handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Disconnected(
+                block_hash,
+            ));
+    }
 
     // The marker deliberately stays set here.
     //
@@ -8688,6 +8687,128 @@ mod consensus_rule_tests {
                 applied_block.txdata[0].compute_txid().as_byte_array()
             )),
             "the applied branch's coins must survive an aborted switch"
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSequencePublisher {
+        events: Mutex<Vec<(Hash256, u8, u32)>>,
+        next_sequence: Mutex<u32>,
+    }
+
+    impl crate::ZmqPublisher for RecordingSequencePublisher {
+        fn publish_hashblock(&self, _hash: Hash256) {}
+
+        fn publish_hashtx(&self, _txid: bitcoin::Txid) {}
+
+        fn publish_rawblock(&self, _bytes: &[u8]) {}
+
+        fn publish_rawtx(&self, _bytes: &[u8]) {}
+
+        fn publish_sequence(&self, event: crate::SequenceEvent) {
+            let (hash, label) = match event {
+                crate::SequenceEvent::Connected(hash) => (hash, b'C'),
+                crate::SequenceEvent::Disconnected(hash) => (hash, b'D'),
+            };
+            let mut next_sequence = self.next_sequence.lock();
+            self.events.lock().push((hash, label, *next_sequence));
+            *next_sequence += 1;
+        }
+    }
+
+    #[test]
+    fn reorg_sequence_events_disconnect_old_tip_before_connecting_new_branch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let publisher = Arc::new(RecordingSequencePublisher::default());
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo))
+            .with_zmq_publisher(publisher_handle);
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let old_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let old_one_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&old_one));
+        let old_one_tip = apply_block_with_serialized(&handles, &old_one, old_one_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((old_one_tip.height, old_one_tip.hash), old_one_raw.to_vec());
+
+        let old_two = mined_block_with_prev_hash_and_transactions(
+            old_one.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let old_two_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&old_two));
+        let old_two_tip = apply_block_with_serialized(&handles, &old_two, old_two_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((old_two_tip.height, old_two_tip.hash), old_two_raw.to_vec());
+        publisher.events.lock().clear();
+        *publisher.next_sequence.lock() = 0;
+
+        let new_one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        let new_two = mined_block_with_prev_hash_and_transactions(
+            new_one.block_hash(),
+            vec![coinbase_transaction(4)],
+        )?;
+        let target = {
+            let mut tree = handles.block_tree.write();
+            let mut target = None;
+            for (height, block) in [(1_u32, &new_one), (2_u32, &new_two)] {
+                target = Some(tree.insert_header(block.header, NodeStatus::HeaderValid)?);
+                bodies.bodies.write().insert(
+                    (
+                        height,
+                        Hash256::from_le_bytes(block.block_hash().as_byte_array()),
+                    ),
+                    bitcoin::consensus::encode::serialize(block),
+                );
+            }
+            target.ok_or_else(|| anyhow::anyhow!("new branch has no target"))?
+        };
+
+        crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {})?;
+
+        let events = publisher.events.lock().clone();
+        assert_eq!(
+            events,
+            vec![
+                (
+                    Hash256::from_le_bytes(old_two.block_hash().as_byte_array()),
+                    b'D',
+                    0
+                ),
+                (
+                    Hash256::from_le_bytes(old_one.block_hash().as_byte_array()),
+                    b'D',
+                    1
+                ),
+                (
+                    Hash256::from_le_bytes(new_one.block_hash().as_byte_array()),
+                    b'C',
+                    2
+                ),
+                (
+                    Hash256::from_le_bytes(new_two.block_hash().as_byte_array()),
+                    b'C',
+                    3
+                ),
+            ]
         );
         Ok(())
     }
