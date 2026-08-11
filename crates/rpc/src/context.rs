@@ -479,15 +479,7 @@ impl Context {
             difficulty /= 256.0;
             shift -= 1;
         }
-        // Core's numeric JSON formatting rounds this result to 16 significant
-        // digits. Use the adjacent representable value when the shortest
-        // Rust/serde representation would otherwise expose the lower rounding
-        // choice (notably regtest's 0x207fffff target).
-        if difficulty.to_bits() == 1.0_f64.to_bits() {
-            difficulty
-        } else {
-            f64::from_bits(difficulty.to_bits().saturating_add(1))
-        }
+        difficulty
     }
 
     /// Publishes a new best-chain tip and wakes getblocktemplate long polls.
