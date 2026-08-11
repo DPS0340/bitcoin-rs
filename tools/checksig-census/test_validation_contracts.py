@@ -77,6 +77,7 @@ from context import (
     classify_input,
     iter_context_inputs,
     iter_legacy_context_inputs,
+    parse_script,
     read_bounded_context_rows,
 )
 
@@ -1667,6 +1668,29 @@ def test_brsctx1_accepts_valid_file() -> None:
 # ── Tests: classify_input spend-context classification ───────────────────────
 
 
+def test_classify_input_block_177609_op_0_p2sh() -> None:
+    """The exact block-177609 OP_0 multisig spend classifies as P2SH."""
+    evidence = _ctx_input(
+        bytes.fromhex(
+            "1cc1ecdf5c05765df3d1f59fba24cd01c45464c329b0f0a25aa9883adfcf7f29"
+        )[::-1],
+        0,
+        verify_flags=VERIFY_P2SH,
+        prevout=bytes.fromhex("a9145c02c49641699863f909bf4bf3be8398d2e383f187"),
+        script_sig=bytes.fromhex(
+            "00483045022100beb926da7428fa009ac770576342ebd1960939e73584a5d0"
+            "f3229b58c41e906f022017c0d143077906afccf30caf21f5ece0bb30e3f7"
+            "08fd4a17f9d9ef9fe7cdc983014751210307ac6296168948c3f64ce22f51"
+            "f6e5424f936c846f1d01223b3d9864f4d955662103ac6ad514715bec8d5d"
+            "e1873b9bc873bb71773b51338b4d115f9938b6a029b7d152ae"
+        ),
+    )
+
+    classified = classify_input(evidence)
+
+    assert classified.spend_context == SpendContext.P2SH
+
+
 def test_classify_input_bare_p2pkh() -> None:
     """Bare P2PKH with no flags classifies as BARE."""
     txid_le = b"\x10" * 32
@@ -1836,6 +1860,101 @@ def test_classify_input_taproot_bad_control_block() -> None:
         lambda: classify_input(evidence),
         "P2TR script-path bad control block",
     )
+
+
+def test_classify_input_p2sh_op_reserved_scriptsig() -> None:
+    """P2SH with OP_RESERVED in scriptSig must raise ContextError."""
+    txid_le = b"\x1c" * 32
+    redeem = _multisig_redeem_script()
+    bad_script_sig = _push(redeem) + bytes([0x50])  # extra OP_RESERVED byte
+    evidence = _ctx_input(
+        txid_le,
+        0,
+        verify_flags=VERIFY_P2SH,
+        prevout=_p2sh_prevout(),
+        script_sig=bad_script_sig,
+    )
+    _raises(
+        ContextError, lambda: classify_input(evidence), "OP_RESERVED P2SH scriptSig"
+    )
+
+
+# ── Tests: parse_script Core stack semantics ─────────────────────────────────
+
+
+def test_parse_script_op_0_pushes_empty() -> None:
+    """OP_0 must push an empty byte vector, matching Core."""
+    elements = parse_script(bytes([0x00]))
+    assert len(elements) == 1
+    assert elements[0].opcode == 0x00
+    assert elements[0].pushed == b""
+
+
+def test_parse_script_op_1negate_pushes_negative_one() -> None:
+    """OP_1NEGATE must push the single-byte ScriptNum 0x81."""
+    elements = parse_script(bytes([0x4F]))
+    assert len(elements) == 1
+    assert elements[0].opcode == 0x4F
+    assert elements[0].pushed == b"\x81"
+
+
+def test_parse_script_small_integers_pushes_core_scriptnum() -> None:
+    """OP_1..OP_16 must push the single bytes 0x01..0x10."""
+    script = bytes(range(0x51, 0x61))
+    elements = parse_script(script)
+    assert len(elements) == 16
+    for i, element in enumerate(elements):
+        assert element.opcode == 0x51 + i
+        assert element.pushed == bytes([i + 1])
+
+
+def test_parse_script_pushdata4_success() -> None:
+    """OP_PUSHDATA4 must read a 4-byte little-endian length and payload."""
+    payload = b"payload"
+    length_le = struct.pack("<I", len(payload))
+    script = bytes([0x4E]) + length_le + payload + bytes([0x00])
+    elements = parse_script(script)
+    assert len(elements) == 2
+    assert elements[0].opcode == 0x4E
+    assert elements[0].pushed == payload
+    assert elements[1].opcode == 0x00
+    assert elements[1].pushed == b""
+
+
+def test_parse_script_pushdata4_truncated_length() -> None:
+    """OP_PUSHDATA4 with fewer than 4 length bytes must fail closed."""
+    _raises_with(
+        ContextError,
+        lambda: parse_script(bytes([0x4E, 0x01])),
+        "OP_PUSHDATA4 truncated length",
+        "OP_PUSHDATA4 length bytes missing",
+    )
+
+
+def test_parse_script_pushdata4_truncated_payload() -> None:
+    """OP_PUSHDATA4 with a declared payload beyond remaining bytes must fail closed."""
+    _raises_with(
+        ContextError,
+        lambda: parse_script(bytes([0x4E, 0x05, 0x00, 0x00, 0x00])),
+        "OP_PUSHDATA4 truncated payload",
+        "OP_PUSHDATA4 payload truncated",
+    )
+
+
+def test_parse_script_op_reserved_pushes_none() -> None:
+    """OP_RESERVED is not a data push and must leave pushed as None."""
+    elements = parse_script(bytes([0x50]))
+    assert len(elements) == 1
+    assert elements[0].opcode == 0x50
+    assert elements[0].pushed is None
+
+
+def test_parse_script_op_drop_pushes_none() -> None:
+    """OP_DROP is not a data push and must leave pushed as None."""
+    elements = parse_script(bytes([0x75]))
+    assert len(elements) == 1
+    assert elements[0].opcode == 0x75
+    assert elements[0].pushed is None
 
 
 # ── Tests: classify-corpus txid reversal mutation ────────────────────────────
@@ -6992,6 +7111,7 @@ def main() -> int:
         test_brsctx1_rejects_declared_count_mismatch,
         test_brsctx1_rejects_trailing_bytes,
         test_brsctx1_accepts_valid_file,
+        test_classify_input_block_177609_op_0_p2sh,
         test_classify_input_bare_p2pkh,
         test_classify_input_p2sh_without_flag,
         test_classify_input_p2sh_with_flag,
@@ -7008,6 +7128,15 @@ def main() -> int:
         test_classify_input_native_v0_with_scriptsig,
         test_classify_input_taproot_bad_key_path_sig,
         test_classify_input_taproot_bad_control_block,
+        test_classify_input_p2sh_op_reserved_scriptsig,
+        test_parse_script_op_0_pushes_empty,
+        test_parse_script_op_1negate_pushes_negative_one,
+        test_parse_script_small_integers_pushes_core_scriptnum,
+        test_parse_script_pushdata4_success,
+        test_parse_script_pushdata4_truncated_length,
+        test_parse_script_pushdata4_truncated_payload,
+        test_parse_script_op_reserved_pushes_none,
+        test_parse_script_op_drop_pushes_none,
         test_classify_corpus_txid_reversal_mutation,
         test_classify_corpus_all_spend_contexts,
         test_classify_corpus_c150_passes,

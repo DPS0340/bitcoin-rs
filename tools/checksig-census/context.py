@@ -559,7 +559,9 @@ def parse_script(script: bytes) -> tuple[ScriptElement, ...]:
         opcode = script[offset]
         offset += 1
         pushed: bytes | None = None
-        if 1 <= opcode <= 75:
+        if opcode == 0:
+            pushed = b""
+        elif 1 <= opcode <= 75:
             if offset + opcode > len(script):
                 raise ContextError(
                     f"script push opcode {opcode} truncated at byte {offset}"
@@ -584,6 +586,19 @@ def parse_script(script: bytes) -> tuple[ScriptElement, ...]:
                 raise ContextError("script OP_PUSHDATA2 payload truncated")
             pushed = script[offset : offset + length]
             offset += length
+        elif opcode == 78:
+            if offset + 4 > len(script):
+                raise ContextError("script OP_PUSHDATA4 length bytes missing")
+            length = struct.unpack_from("<I", script, offset)[0]
+            offset += 4
+            if offset + length > len(script):
+                raise ContextError("script OP_PUSHDATA4 payload truncated")
+            pushed = script[offset : offset + length]
+            offset += length
+        elif opcode == 79:
+            pushed = b"\x81"
+        elif 81 <= opcode <= 96:
+            pushed = bytes([opcode - 80])
         elements.append(ScriptElement(opcode=opcode, pushed=pushed))
     return tuple(elements)
 
