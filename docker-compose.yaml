@@ -8,12 +8,12 @@ services:
     image: bitcoin-rs:local
     restart: unless-stopped
     init: true
-    stop_grace_period: 30s
+    stop_grace_period: 5m
     environment:
       BITCOIN_RS_NETWORK: "${BITCOIN_RS_NETWORK:-mainnet}"
       BITCOIN_RS_STORAGE_BACKEND: fjall
       BITCOIN_RS_RPC_USER: "${BITCOIN_RS_RPC_USER:-bitcoin-rs}"
-      BITCOIN_RS_RPC_PASSWORD: "${BITCOIN_RS_RPC_PASSWORD:-bitcoin-rs}"
+      BITCOIN_RS_RPC_PASSWORD: "${BITCOIN_RS_RPC_PASSWORD:-password}"
       BITCOIN_RS_LOG_LEVEL: "${BITCOIN_RS_LOG_LEVEL:-info}"
     volumes:
       - bitcoin-rs-data:/data
@@ -38,3 +38,5 @@ services:
 
 volumes:
   bitcoin-rs-data:
+    # Prevent a network switch from opening an incompatible checkpoint.
+    name: "bitcoin-rs-${BITCOIN_RS_NETWORK:-mainnet}-data"

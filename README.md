@@ -39,10 +39,11 @@ backend selection, RPC authentication, and checking sync progress.
 ### Docker Compose
 
 The included Compose configuration builds the production `fjall` +
-`bitcoinkernel` profile, keeps chain state in a named volume, exposes P2P on
-port 8333, and binds RPC to the Docker host's loopback interface only.
+`bitcoinkernel` profile, keeps each network's chain state in a separate named
+volume, exposes P2P on port 8333, and binds RPC to the Docker host's loopback
+interface only.
 
-Set non-default RPC credentials in `.env`, then start the node:
+Set explicit RPC credentials in `.env`, then start the node:
 
 ```sh
 cp .env.example .env
@@ -52,18 +53,21 @@ docker compose up --build -d
 docker compose logs -f node
 ```
 
-Check sync progress through the host RPC port:
+Check sync progress inside the container. This uses the credentials already
+provided by Compose and does not evaluate `.env` as shell code:
 
 ```sh
-. ./.env
-curl --user "$BITCOIN_RS_RPC_USER:$BITCOIN_RS_RPC_PASSWORD" \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"1.0","id":"sync","method":"getblockchaininfo","params":[]}' \
-  http://127.0.0.1:8332/
+docker compose exec node sh -c \
+  'curl --user "$BITCOIN_RS_RPC_USER:$BITCOIN_RS_RPC_PASSWORD" \
+    -H "content-type: application/json" \
+    -d "{\"jsonrpc\":\"1.0\",\"id\":\"sync\",\"method\":\"getblockchaininfo\",\"params\":[]}" \
+    http://127.0.0.1:8332/'
 ```
 
 Stop the process without deleting its chain data with `docker compose down`.
-Deleting the named volume requires the explicit `docker compose down -v` form.
+Compose allows up to 5 minutes for the full clean checkpoint before forcing
+termination. Deleting the selected network's named volume requires the explicit
+`docker compose down -v` form.
 
 ## Measured performance
 
