@@ -698,11 +698,31 @@ class DiagnosticCheckpoint(NamedTuple):
 
 
 def _read_exact_stream(stream: BinaryIO, length: int, field: str) -> bytes:
-    """Read exactly *length* bytes from the child protocol stream."""
-    data = stream.read(length)
-    if len(data) != length:
-        raise AnalyzerError(f"DIAG-PROTO: short {field}: expected {length} bytes, got {len(data)}")
-    return data
+    """Read exactly *length* bytes from the child protocol stream.
+
+    Python's read(n) may return fewer than n bytes before EOF (e.g. when
+    the kernel has not yet delivered the rest of a pipe frame).  We
+    accumulate short reads into a single bounded buffer and only stop
+    at the exact requested length or at a true EOF (empty read).
+    """
+    if length < 0:
+        raise AnalyzerError(f"DIAG-PROTO: invalid read length {length} for {field}")
+    out = bytearray(length)
+    received = 0
+    while received < length:
+        chunk = stream.read(length - received)
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-PROTO: short {field}: expected {length} bytes, got {received}"
+            )
+        got = len(chunk)
+        if got > length - received:
+            raise AnalyzerError(
+                f"DIAG-PROTO: overlong {field}: expected {length - received} bytes, got {got}"
+            )
+        out[received : received + got] = chunk
+        received += got
+    return bytes(out)
 
 
 def _read_diagnostic_preface(stream: BinaryIO) -> None:

@@ -5134,9 +5134,19 @@ import json
 import os
 import struct
 import sys
+import time
 from pathlib import Path
 
 PREFACE = b"BRSHGT1\\x00" + struct.pack("<II", 1, 84)
+
+def write_frame(payload, split):
+    if os.environ.get("FAKE_CENSUS_FRAGMENTED") != "1":
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        return
+    os.write(sys.stdout.fileno(), payload[:split])
+    time.sleep(0.05)
+    os.write(sys.stdout.fileno(), payload[split:])
 
 def main():
     meta_path = Path(os.environ["FAKE_CENSUS_META"])
@@ -5151,10 +5161,9 @@ def main():
     meta = json.loads(meta_path.read_text())
     replay = meta["replay"]
     replay_path.write_text(json.dumps(replay, indent=2) + "\\n")
-    sys.stdout.buffer.write(PREFACE)
-    sys.stdout.buffer.flush()
+    write_frame(PREFACE, 3)
     for row in meta["rows"]:
-        sys.stdout.buffer.write(
+        payload = (
             struct.pack("<I", row["height"]) +
             bytes.fromhex(row["block_hash_le"]) +
             struct.pack("<Q", row["context_rows"]) +
@@ -5164,7 +5173,7 @@ def main():
             struct.pack("<Q", row["journal_rows"]) +
             struct.pack("<Q", row["journal_end"])
         )
-        sys.stdout.buffer.flush()
+        write_frame(payload, 7)
         control = sys.stdin.buffer.read(1)
         if not control or control == b"\\x01":
             break
@@ -5327,6 +5336,28 @@ def test_find_cmodern_height_fake_child_success() -> None:
         assert candidate["final_stream_counts"]["context_rows"] == 10
 
 
+def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
+    """Legal fragmented preface and 7 + 77 byte checkpoint writes are assembled."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        os.environ["FAKE_CENSUS_FRAGMENTED"] = "1"
+        try:
+            _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+            os.environ.pop("FAKE_CENSUS_FRAGMENTED", None)
+        candidate = json.loads(output.read_text())
+        assert candidate["earliest_defensible_height_h"] == 9
+        assert candidate["final_stream_counts"]["context_rows"] == 10
 
 
 def test_find_cmodern_height_reaps_failed_child() -> None:
@@ -6069,6 +6100,7 @@ def main() -> int:
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
         test_find_cmodern_height_fake_child_success,
+        test_find_cmodern_height_assembles_fragmented_child_frames,
         test_find_cmodern_height_reaps_failed_child,
         test_find_cmodern_height_destination_race,
         test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url,
