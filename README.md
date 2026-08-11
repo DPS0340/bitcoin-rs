@@ -36,6 +36,35 @@ That starts a mainnet node storing state in `.bitcoin-rs` and serving JSON-RPC
 on `127.0.0.1:8332`. See [docs/getting-started.md](docs/getting-started.md) for
 backend selection, RPC authentication, and checking sync progress.
 
+### Docker Compose
+
+The included Compose configuration builds the production `fjall` +
+`bitcoinkernel` profile, keeps chain state in a named volume, exposes P2P on
+port 8333, and binds RPC to the Docker host's loopback interface only.
+
+Set non-default RPC credentials in `.env`, then start the node:
+
+```sh
+cp .env.example .env
+# Edit .env and set BITCOIN_RS_RPC_PASSWORD before starting the node.
+
+docker compose up --build -d
+docker compose logs -f node
+```
+
+Check sync progress through the host RPC port:
+
+```sh
+. ./.env
+curl --user "$BITCOIN_RS_RPC_USER:$BITCOIN_RS_RPC_PASSWORD" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"1.0","id":"sync","method":"getblockchaininfo","params":[]}' \
+  http://127.0.0.1:8332/
+```
+
+Stop the process without deleting its chain data with `docker compose down`.
+Deleting the named volume requires the explicit `docker compose down -v` form.
+
 ## Measured performance
 
 Full verification replay of mainnet blocks 0 to 150,000 (1,718,407
