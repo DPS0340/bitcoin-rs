@@ -7,6 +7,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::ffi::OsString;
 use std::io::BufReader;
+#[cfg(feature = "checksig-census")]
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -21,6 +23,8 @@ use bitcoin_rs_node::Network;
 use bitcoin_rs_node::config::Config;
 use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
 use bitcoin_rs_node::corpus::CorpusManifest;
+#[cfg(feature = "checksig-census")]
+use bitcoin_rs_consensus::census_checkpoint;
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
@@ -323,6 +327,9 @@ fn main() -> Result<()> {
         bail!("mainnet prefix replay currently requires --start-height 0");
     }
 
+    #[cfg(feature = "checksig-census")]
+    validate_diagnostic_args(&args)?;
+
     let mut config = Config::default_for_network(Network::Mainnet);
     config.data_dir.clone_from(&args.data_dir);
     config.storage_backend.clone_from(&args.storage_backend);
@@ -355,6 +362,13 @@ fn main() -> Result<()> {
     // keeps its height-only shortcut semantics for every height.
     apply_handles.assume_valid_gate =
         Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));
+
+    #[cfg(feature = "checksig-census")]
+    if args.census_diagnostic {
+        run_census_diagnostic(&args, &apply_handles)?;
+        return Ok(());
+    }
+
     let ReplayTotals {
         start_hash,
         stop_hash,
@@ -534,6 +548,8 @@ struct Args {
     storage_backend: String,
     txindex: bool,
     blockfilterindex: bool,
+    #[cfg(feature = "checksig-census")]
+    census_diagnostic: bool,
 }
 
 impl Args {
@@ -554,6 +570,8 @@ impl Args {
             storage_backend: "fjall".to_owned(),
             txindex: false,
             blockfilterindex: false,
+            #[cfg(feature = "checksig-census")]
+            census_diagnostic: false,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -601,6 +619,12 @@ impl Args {
                 }
                 "--txindex" => parsed.txindex = true,
                 "--blockfilterindex" => parsed.blockfilterindex = true,
+                #[cfg(feature = "checksig-census")]
+                "--cmodern-diagnostic-protocol" => parsed.census_diagnostic = true,
+                #[cfg(not(feature = "checksig-census"))]
+                "--cmodern-diagnostic-protocol" => {
+                    bail!("--cmodern-diagnostic-protocol requires the checksig-census feature")
+                }
                 other => bail!("unknown argument: {other}"),
             }
         }
@@ -895,6 +919,254 @@ fn rss_high_water_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(feature = "checksig-census")]
+const DIAGNOSTIC_ROW_MAGIC: &[u8; 8] = b"BRSHGT1\0";
+#[cfg(feature = "checksig-census")]
+const DIAGNOSTIC_VERSION: u32 = 1;
+#[cfg(feature = "checksig-census")]
+const DIAGNOSTIC_ROW_SIZE: u32 = 84;
+
+#[cfg(feature = "checksig-census")]
+fn validate_diagnostic_args(args: &Args) -> Result<()> {
+    if !args.census_diagnostic {
+        return Ok(());
+    }
+    if args.rest_url.is_none() {
+        bail!("--cmodern-diagnostic-protocol requires --rest-url");
+    }
+    if args.blocks_file.is_some() || args.corpus_manifest.is_some() {
+        bail!("--cmodern-diagnostic-protocol cannot use --blocks-file or --corpus-manifest");
+    }
+    if args.start_height != 0 {
+        bail!("--cmodern-diagnostic-protocol requires --start-height 0");
+    }
+    if args.assume_valid_height != 0 {
+        bail!("--cmodern-diagnostic-protocol requires --assume-valid-height 0");
+    }
+    if args.window != 1 {
+        bail!("--cmodern-diagnostic-protocol requires --window 1");
+    }
+    if args.output.is_none() {
+        bail!("--cmodern-diagnostic-protocol requires --output because stdout is the binary protocol");
+    }
+    if args.validation_output.is_some() {
+        bail!("--cmodern-diagnostic-protocol does not support --validation-output");
+    }
+    for var in ["BRS_CENSUS_CONTEXTS", "BRS_CENSUS_RECORDS", "BRS_CENSUS_JOURNAL"] {
+        if std::env::var(var).is_err() {
+            bail!("--cmodern-diagnostic-protocol requires the {var} environment variable");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "checksig-census")]
+fn decode_and_validate_block(
+    height: u32,
+    hash_str: &str,
+    bytes: &[u8],
+    prev_hash: &mut Option<BlockHash>,
+    network: Network,
+) -> Result<Block> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let block = Block::consensus_decode(&mut cursor)
+        .with_context(|| format!("decode block bytes at height {height}"))?;
+    let consumed = cursor.position();
+    if consumed != u64::try_from(bytes.len()).expect("block length fits u64") {
+        bail!(
+            "block payload at height {height} has {} trailing bytes",
+            bytes.len() - usize::try_from(consumed).expect("decoded block length fits usize")
+        );
+    }
+    let actual_hash = block.block_hash();
+    if actual_hash.to_string() != hash_str {
+        bail!("block hash mismatch at height {height}: source {hash_str}, decoded {actual_hash}");
+    }
+    if height == 0 {
+        if block.header.prev_blockhash != BlockHash::from_byte_array([0; 32]) {
+            bail!(
+                "genesis block at height 0 has non-zero prev_blockhash {}",
+                block.header.prev_blockhash
+            );
+        }
+        if actual_hash.to_string() != network.genesis_block_hash().to_string_be() {
+            bail!(
+                "genesis block hash mismatch at height 0: expected {}, got {actual_hash}",
+                network.genesis_block_hash().to_string_be()
+            );
+        }
+    } else if let Some(prev) = prev_hash {
+        if block.header.prev_blockhash != *prev {
+            bail!(
+                "prev_blockhash mismatch at height {height}: expected {prev}, got {}",
+                block.header.prev_blockhash
+            );
+        }
+    }
+    *prev_hash = Some(actual_hash);
+    Ok(block)
+}
+
+#[cfg(feature = "checksig-census")]
+fn apply_one_block(
+    handles: &bitcoin_rs_node::apply::ApplyHandles,
+    block: Block,
+    raw: Vec<u8>,
+) -> Result<()> {
+    let mut blocks = vec![block];
+    let mut raw: Vec<bytes::Bytes> = vec![bytes::Bytes::from(raw)];
+    apply_window(handles, &mut blocks, &mut raw)
+}
+
+#[cfg(feature = "checksig-census")]
+fn write_diagnostic_preface(out: &mut impl Write) -> Result<()> {
+    out.write_all(DIAGNOSTIC_ROW_MAGIC)
+        .context("write diagnostic row magic")?;
+    out.write_all(&DIAGNOSTIC_VERSION.to_le_bytes())
+        .context("write diagnostic version")?;
+    out.write_all(&DIAGNOSTIC_ROW_SIZE.to_le_bytes())
+        .context("write diagnostic row size")?;
+    out.flush().context("flush diagnostic preface")?;
+    Ok(())
+}
+
+#[cfg(feature = "checksig-census")]
+fn write_checkpoint_row(
+    out: &mut impl Write,
+    height: u32,
+    hash: BlockHash,
+    checkpoint: &census_checkpoint::CensusCheckpoint,
+) -> Result<()> {
+    out.write_all(&height.to_le_bytes())
+        .context("write checkpoint height")?;
+    out.write_all(hash.as_byte_array())
+        .context("write checkpoint block hash")?;
+    out.write_all(&checkpoint.context_rows.to_le_bytes())
+        .context("write checkpoint context_rows")?;
+    out.write_all(&checkpoint.context_end.to_le_bytes())
+        .context("write checkpoint context_end")?;
+    out.write_all(&checkpoint.record_rows.to_le_bytes())
+        .context("write checkpoint record_rows")?;
+    out.write_all(&checkpoint.record_end.to_le_bytes())
+        .context("write checkpoint record_end")?;
+    out.write_all(&checkpoint.journal_rows.to_le_bytes())
+        .context("write checkpoint journal_rows")?;
+    out.write_all(&checkpoint.journal_end.to_le_bytes())
+        .context("write checkpoint journal_end")?;
+    Ok(())
+}
+
+#[cfg(feature = "checksig-census")]
+fn read_control_byte(stdin: &mut impl Read) -> Result<u8> {
+    let mut buf = [0_u8; 1];
+    stdin
+        .read_exact(&mut buf)
+        .context("controller closed stdin (EOF) or I/O error while reading control byte")?;
+    Ok(buf[0])
+}
+
+#[cfg(feature = "checksig-census")]
+fn write_diagnostic_artifact(
+    args: &Args,
+    actual_stop_height: u32,
+    actual_stop_hash: String,
+    elapsed: Duration,
+) -> Result<()> {
+    let output = args.output.as_deref().expect("validated --output");
+    let artifact = json!({
+        "schema": "mainnet-prefix-replay-diagnostic-v1",
+        "non_certifying": true,
+        "block_source": "rest",
+        "start_height": args.start_height,
+        "requested_stop_height_ceiling": args.stop_height,
+        "actual_stop_height": actual_stop_height,
+        "actual_stop_hash": actual_stop_hash,
+        "window": 1,
+        "assume_valid_height": 0,
+        "stop_reason": "controller-request",
+        "storage_backend": args.storage_backend,
+        "txindex": args.txindex,
+        "blockfilterindex": args.blockfilterindex,
+        "data_dir": args.data_dir,
+        "elapsed_seconds": elapsed.as_secs_f64(),
+    });
+    let rendered =
+        serde_json::to_string_pretty(&artifact).context("render diagnostic artifact JSON")?;
+    let tmp = output.with_extension("tmp");
+    std::fs::write(&tmp, rendered + "\n")
+        .with_context(|| format!("write temporary diagnostic artifact {}", tmp.display()))?;
+    std::fs::rename(&tmp, output)
+        .with_context(|| format!("rename diagnostic artifact to {}", output.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "checksig-census")]
+fn run_census_diagnostic(
+    args: &Args,
+    apply_handles: &bitcoin_rs_node::apply::ApplyHandles,
+) -> Result<()> {
+    let rest_url = args.rest_url.as_deref().expect("validated --rest-url");
+    let mut client =
+        CoreRestClient::connect(rest_url).map_err(|e: CoreRestError| anyhow::Error::from(e))?;
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+
+    write_diagnostic_preface(&mut stdout)?;
+
+    let mut prev_hash = None;
+    let started = Instant::now();
+
+    for height in args.start_height..=args.stop_height {
+        let (hash, raw) = fetch_rest_block(&mut client, height)
+            .map_err(|e: CoreRestError| anyhow::Error::from(e))?;
+        let block = decode_and_validate_block(
+            height,
+            &hash,
+            &raw,
+            &mut prev_hash,
+            apply_handles.network,
+        )?;
+        let block_hash = block.block_hash();
+        apply_one_block(apply_handles, block, raw)?;
+        let checkpoint = census_checkpoint::capture().context("census checkpoint")?;
+
+        write_checkpoint_row(&mut stdout, height, block_hash, &checkpoint)
+            .context("write checkpoint row")?;
+        stdout.flush().context("flush checkpoint row to stdout")?;
+
+        let control = read_control_byte(&mut stdin)?;
+        match control {
+            0x01 => {
+                let actual_stop_hash = block_hash.to_string();
+                census_checkpoint::flush().context("terminal flush after diagnostic stop")?;
+                write_diagnostic_artifact(
+                    args,
+                    height,
+                    actual_stop_hash,
+                    started.elapsed(),
+                )?;
+                return Ok(());
+            }
+            0x00 => {
+                if height == args.stop_height {
+                    census_checkpoint::flush()
+                        .context("terminal flush at safety ceiling")?;
+                    bail!("safety ceiling exhausted without controller selection");
+                }
+            }
+            b => bail!("invalid control byte 0x{b:02x} from controller"),
+        }
+    }
+
+    census_checkpoint::flush()
+        .context("terminal flush at safety ceiling")?;
+    bail!("safety ceiling exhausted without controller selection");
+}
+
+
 fn print_usage() {
     println!(
         "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex] [--blockfilterindex]"
@@ -904,9 +1176,11 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::encode::serialize;
+    #[cfg(feature = "checksig-census")]
+    use std::io::Cursor;
     use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
     use bitcoin_rs_primitives::Hash256;
+    use std::io::Cursor;
 
     fn regtest_genesis_bytes() -> Vec<u8> {
         serialize(&bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest))
@@ -1158,7 +1432,7 @@ mod tests {
         let payload = regtest_genesis_bytes();
         let archive = write_archive(Network::Mainnet.magic(), &[&payload[..]]);
         let manifest = {
-            let mut m = manifest_for_archive(Network::Mainnet, &archive, &[&payload[..]]);
+            let m = manifest_for_archive(Network::Mainnet, &archive, &[&payload[..]]);
             m
         };
 
@@ -1197,4 +1471,101 @@ mod tests {
         let err = prepare_file_inputs(&args).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("archive size"), "{err}");
     }
+
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn diagnostic_preface_and_row_encoding() {
+
+
+        let mut out: Vec<u8> = Vec::new();
+        write_diagnostic_preface(&mut out).unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[0..8], b"BRSHGT1\0");
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), DIAGNOSTIC_VERSION);
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), DIAGNOSTIC_ROW_SIZE);
+
+        let checkpoint = census_checkpoint::CensusCheckpoint {
+            abi_version: 1,
+            struct_size: 56,
+            context_rows: 1,
+            context_end: 16 + 100,
+            record_rows: 2,
+            record_end: 16 + 2 * 224,
+            journal_rows: 3,
+            journal_end: 16 + 3 * 56,
+        };
+        let hash = BlockHash::from_byte_array([0x42; 32]);
+        write_checkpoint_row(&mut out, 7, hash, &checkpoint).unwrap();
+
+        let row_start = 16;
+        assert_eq!(out.len(), row_start + 84);
+        assert_eq!(u32::from_le_bytes(out[row_start..row_start + 4].try_into().unwrap()), 7);
+        assert_eq!(&out[row_start + 4..row_start + 36], &[0x42; 32]);
+        let read_hash = <[u8; 32]>::try_from(&out[row_start + 4..row_start + 36]).unwrap();
+        assert_eq!(read_hash, [0x42; 32]);
+    }
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn diagnostic_artifact_records_actual_stop_and_controller_reason() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        args.output = Some(temp.path().to_path_buf());
+        write_diagnostic_artifact(
+            &args,
+            11,
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(temp.path()).unwrap();
+        let artifact: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            artifact["schema"].as_str(),
+            Some("mainnet-prefix-replay-diagnostic-v1")
+        );
+        assert_eq!(artifact["non_certifying"].as_bool(), Some(true));
+        assert_eq!(artifact["block_source"].as_str(), Some("rest"));
+        assert_eq!(artifact["actual_stop_height"].as_u64(), Some(11));
+        assert_eq!(artifact["requested_stop_height_ceiling"].as_u64(), Some(0));
+        assert_eq!(artifact["stop_reason"].as_str(), Some("controller-request"));
+        assert!(!content.contains("all-11-observed"));
+    }
+
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn read_control_byte_interprets_bytes() {
+        let mut zero = Cursor::new([0x00]);
+        assert_eq!(read_control_byte(&mut zero).unwrap(), 0x00);
+        let mut one = Cursor::new([0x01]);
+        assert_eq!(read_control_byte(&mut one).unwrap(), 0x01);
+        let mut empty: Cursor<&[u8]> = Cursor::new(&[]);
+        assert!(read_control_byte(&mut empty).is_err());
+    }
+
+    #[cfg(feature = "checksig-census")]
+    #[test]
+    fn validate_diagnostic_args_rejects_window_and_missing_env() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        args.census_diagnostic = true;
+        args.rest_url = Some("127.0.0.1:18443".into());
+        args.output = Some(PathBuf::from("/tmp/diagnostic.json"));
+        args.window = 2;
+        assert!(validate_diagnostic_args(&args).unwrap_err().to_string().contains("--window 1"));
+
+        args.window = 1;
+        // SAFETY: test-only environment mutation.
+        unsafe {
+            std::env::set_var("BRS_CENSUS_CONTEXTS", "/tmp/ctx");
+            std::env::set_var("BRS_CENSUS_RECORDS", "/tmp/rec");
+            std::env::set_var("BRS_CENSUS_JOURNAL", "/tmp/jrn");
+        }
+        validate_diagnostic_args(&args).unwrap();
+
+        // SAFETY: test-only environment mutation.
+        unsafe { std::env::remove_var("BRS_CENSUS_JOURNAL"); }
+    }
+
 }

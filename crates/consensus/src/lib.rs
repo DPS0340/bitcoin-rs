@@ -40,6 +40,9 @@ pub mod bip9;
 pub mod connect_block;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
+/// Non-terminal CHECKSIG census checkpoint ABI wrapper.
+#[cfg(feature = "checksig-census")]
+pub mod census_checkpoint;
 /// Portable Rust validator.
 pub mod rust_path;
 /// Private AVX2 SHA256d64 kernel for Merkle hashing.

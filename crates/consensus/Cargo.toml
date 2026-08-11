@@ -14,6 +14,7 @@ workspace = true
 [features]
 default = ["kernel"]
 kernel = ["dep:bitcoinkernel"]
+checksig-census = ["kernel"]
 rocksdb = []
 fjall = []
 redb = []
