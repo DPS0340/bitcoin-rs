@@ -56,6 +56,37 @@ const COUNTER_NAMES: [&str; 24] = [
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
+fn record_to_bare_input(rec: &ParsedRecord) -> Result<Option<libbitcoinkernel_sys::btck_bare_input>> {
+    // Outcome-2 records are pre-verification rejects and carry no sighash.
+    // They must be skipped before any capacity-indexed public-key slice.
+    if rec.outcome == 2 {
+        return Ok(None);
+    }
+    // parse_record already enforces these bounds for non-exempt records,
+    // but the helper keeps the slice contract self-contained.
+    if rec.der_len > 72 {
+        bail!("record: der_len {} exceeds 72", rec.der_len);
+    }
+    if rec.pubkey_len > 65 {
+        bail!("record: pubkey_len {} exceeds 65", rec.pubkey_len);
+    }
+
+    let mut input = libbitcoinkernel_sys::btck_bare_input {
+        sighash: [0u8; 32],
+        der_sig: [0u8; 72],
+        pubkey: [0u8; 65],
+        der_len: rec.der_len,
+        pubkey_len: rec.pubkey_len,
+        expected: rec.outcome, // 1=true, 0=false
+        pad: [0u8; 4],
+    };
+    input.sighash.copy_from_slice(&rec.sighash);
+    input.der_sig[..rec.der_len as usize].copy_from_slice(&rec.der_sig[..rec.der_len as usize]);
+    input.pubkey[..rec.pubkey_len as usize]
+        .copy_from_slice(&rec.pubkey[..rec.pubkey_len as usize]);
+    Ok(Some(input))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
 
@@ -70,24 +101,10 @@ fn main() -> Result<()> {
     let mut inputs: Vec<libbitcoinkernel_sys::btck_bare_input> = Vec::with_capacity(records.len());
     let mut rejected: u64 = 0;
     for rec in &records {
-        if rec.outcome == 2 {
-            rejected += 1;
-            continue;
+        match record_to_bare_input(rec)? {
+            None => rejected += 1,
+            Some(input) => inputs.push(input),
         }
-        let mut input = libbitcoinkernel_sys::btck_bare_input {
-            sighash: [0u8; 32],
-            der_sig: [0u8; 72],
-            pubkey: [0u8; 65],
-            der_len: rec.der_len,
-            pubkey_len: rec.pubkey_len,
-            expected: rec.outcome, // 1=true, 0=false
-            pad: [0u8; 4],
-        };
-        input.sighash.copy_from_slice(&rec.sighash);
-        input.der_sig[..rec.der_len as usize].copy_from_slice(&rec.der_sig[..rec.der_len as usize]);
-        input.pubkey[..rec.pubkey_len as usize]
-            .copy_from_slice(&rec.pubkey[..rec.pubkey_len as usize]);
-        inputs.push(input);
     }
     let expected_true_count: u64 = inputs.iter().filter(|inp| inp.expected == 1).count() as u64;
 
@@ -665,14 +682,27 @@ mod tests {
     }
 
     #[test]
-    fn conversion_skips_outcome_two_before_pubkey_slice() {
-        // Replicate the main() filter: outcome 2 records are skipped before
-        // any capacity-indexed copy, so an over-capacity pubkey_len is never
-        // used to index the fixed 65-byte array.
+    fn record_to_bare_input_skips_over_capacity_outcome_two() {
+        // The exact over-capacity reason-1 record is outcome 2, so the
+        // production helper must return None before any capacity-indexed
+        // public-key slice. Removing the outcome-2 guard would make this
+        // test panic because pubkey_len (66) exceeds the fixed 65-byte array.
         let rec = parse_record(&preserved_over_capacity_row(), 0).unwrap();
         assert_eq!(rec.outcome, 2);
         assert!(rec.pubkey_len > 65);
-        let would_skip = rec.outcome == 2;
-        assert!(would_skip, "outcome-2 records must be skipped before copy");
+        let input = record_to_bare_input(&rec).unwrap();
+        assert!(input.is_none(), "outcome-2 record must be skipped before copy");
+    }
+
+    #[test]
+    fn record_to_bare_input_accepts_ordinary_record() {
+        // Ordinary outcome-1 records are converted to a real FFI input.
+        let buf = valid_buf();
+        let rec = parse_record(&buf, 0).unwrap();
+        assert_eq!(rec.outcome, 1);
+        let input = record_to_bare_input(&rec).unwrap().unwrap();
+        assert_eq!(input.expected, 1);
+        assert_eq!(input.der_len, 72);
+        assert_eq!(input.pubkey_len, 65);
     }
 }
