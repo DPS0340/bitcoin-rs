@@ -54,6 +54,7 @@ fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
         "rpcuser" => layer.rpc_user = Some(value.to_owned()),
         "rpcpassword" => layer.rpc_password = Some(value.to_owned()),
         "rpccookiefile" => layer.rpc_cookie = Some(value.into()),
+        "rest" => layer.rest = parse_core_bool(value),
         "listen" if parse_core_bool(value).is_some_and(|listen| !listen) => {
             layer.p2p_listen = Some(Vec::new());
         }
@@ -138,6 +139,9 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.rpc_bind.is_some() {
             self.rpc_bind = other.rpc_bind;
+        }
+        if other.rest.is_some() {
+            self.rest = other.rest;
         }
         if other.rpc_auth.is_some() {
             self.rpc_auth.clone_from(&other.rpc_auth);

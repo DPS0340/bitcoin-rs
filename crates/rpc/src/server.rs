@@ -28,6 +28,8 @@ pub struct RpcServer {
     pub max_connections: usize,
     /// Idle read timeout for each connection.
     pub idle_timeout: Duration,
+    /// Whether Bitcoin Core-compatible REST routes are enabled.
+    pub rest_enabled: bool,
 }
 
 impl RpcServer {
@@ -38,6 +40,7 @@ impl RpcServer {
         handler: Arc<Handler>,
         max_connections: usize,
         idle_timeout: Duration,
+        rest_enabled: bool,
     ) -> io::Result<Self> {
         Ok(Self {
             listener: TcpListener::bind(address)?,
@@ -45,6 +48,7 @@ impl RpcServer {
             handler,
             max_connections,
             idle_timeout,
+            rest_enabled,
         })
     }
 
@@ -109,10 +113,13 @@ impl RpcServer {
 
         let auth = Arc::clone(&self.auth);
         let handler = Arc::clone(&self.handler);
+        let rest_enabled = self.rest_enabled;
         let active = Arc::clone(active);
         let idle_timeout = self.idle_timeout;
         thread::spawn(move || {
-            if let Err(error) = serve_connection(stream, &auth, &handler, idle_timeout) {
+            if let Err(error) =
+                serve_connection(stream, &auth, &handler, rest_enabled, idle_timeout)
+            {
                 debug!(%error, "rpc connection closed with error");
             }
             let mut count = active.lock();
@@ -126,6 +133,7 @@ fn serve_connection(
     stream: TcpStream,
     auth: &Auth,
     handler: &Handler,
+    rest_enabled: bool,
     idle_timeout: Duration,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(idle_timeout))?;
@@ -142,6 +150,21 @@ fn serve_connection(
                 return Err(error);
             }
         };
+        let keep_alive = request.keep_alive;
+
+        if request.method == "GET" {
+            let response = if request.path.starts_with("/rest/") {
+                let (path, query) = split_path_query(&request.path);
+                crate::rest::route(handler.context(), path, query, rest_enabled)
+            } else {
+                crate::rest::not_found_response()
+            };
+            write_response(reader.get_mut(), &response, keep_alive)?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
 
         if !auth.validate_header(request.authorization.as_deref()) {
             write_status(
@@ -154,7 +177,6 @@ fn serve_connection(
             return Ok(());
         }
 
-        let keep_alive = request.keep_alive;
         let response = handle_json(handler, &request.body);
         write_json(reader.get_mut(), 200, "OK", &response, keep_alive)?;
         if !keep_alive {
@@ -164,6 +186,8 @@ fn serve_connection(
 }
 
 struct HttpRequest {
+    method: String,
+    path: String,
     authorization: Option<String>,
     keep_alive: bool,
     body: Vec<u8>,
@@ -175,13 +199,33 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<HttpRequ
     if bytes == 0 {
         return Ok(None);
     }
-    if !request_line.ends_with("\r\n") || !request_line.starts_with("POST ") {
+    if !request_line.ends_with("\r\n") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid request line",
         ));
     }
 
+    let request_target = request_line.trim_end_matches(['\r', '\n']);
+    let mut request_parts = request_target.split_whitespace();
+    let Some(method) = request_parts.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid request line",
+        ));
+    };
+    let Some(path) = request_parts.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid request line",
+        ));
+    };
+    if !matches!(method, "POST" | "GET") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid request method",
+        ));
+    }
     let mut header_bytes = request_line.len();
     let mut content_length = None;
     let mut authorization = None;
@@ -224,15 +268,21 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<HttpRequ
         }
     }
 
-    let Some(content_length) = content_length else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing content-length",
-        ));
+    let content_length = match (method, content_length) {
+        ("GET", length) => length.unwrap_or(0),
+        (_, Some(length)) => length,
+        (_, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing content-length",
+            ));
+        }
     };
     let mut body = vec![0_u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(Some(HttpRequest {
+        method: method.to_owned(),
+        path: path.to_owned(),
         authorization,
         keep_alive,
         body,
@@ -291,6 +341,29 @@ fn write_status(
     stream.flush()
 }
 
+fn split_path_query(path: &str) -> (&str, &str) {
+    path.split_once('?')
+        .map_or((path, ""), |(path, query)| (path, query))
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    response: &crate::rest::Response,
+    keep_alive: bool,
+) -> io::Result<()> {
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
+        response.status,
+        response.reason,
+        response.content_type,
+        response.body.len()
+    )?;
+    stream.write_all(&response.body)?;
+    stream.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +382,7 @@ mod tests {
             handler,
             4,
             core::time::Duration::from_millis(500),
+            false,
         )?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
@@ -316,5 +390,17 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(150));
         shutdown.store(true, Ordering::Release);
         handle.join().expect("join serve thread")
+    }
+
+    #[test]
+    fn split_path_query_preserves_path_and_query() {
+        assert_eq!(
+            split_path_query("/rest/headers/hash.json?count=10"),
+            ("/rest/headers/hash.json", "count=10")
+        );
+        assert_eq!(
+            split_path_query("/rest/chaininfo.json"),
+            ("/rest/chaininfo.json", "")
+        );
     }
 }

@@ -19,6 +19,8 @@ pub mod context;
 pub mod error;
 /// Method dispatch and Core-compatible handlers.
 pub mod handlers;
+/// Bitcoin Core-compatible REST endpoints.
+pub mod rest;
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub mod server;
 

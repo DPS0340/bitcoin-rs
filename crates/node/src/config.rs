@@ -94,6 +94,8 @@ pub struct Config {
     pub storage_backend: String,
     /// JSON-RPC bind address.
     pub rpc_bind: SocketAddr,
+    /// Whether the Bitcoin Core-compatible REST gateway is enabled.
+    pub rest: bool,
     /// JSON-RPC authentication configuration.
     pub rpc_auth: Auth,
     /// Optional Electrum TCP bind address.
@@ -171,6 +173,7 @@ impl fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("storage_backend", &self.storage_backend)
             .field("rpc_bind", &self.rpc_bind)
+            .field("rest", &self.rest)
             .field("rpc_auth", &self.rpc_auth)
             .field("electrum_bind", &self.electrum_bind)
             .field("electrum_tls_cert", &self.electrum_tls_cert)
@@ -231,6 +234,7 @@ impl Config {
             data_dir: PathBuf::from(".bitcoin-rs"),
             storage_backend: DEFAULT_STORAGE_BACKEND.to_owned(),
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
+            rest: false,
             rpc_auth: Auth::default(),
             electrum_bind: None,
             electrum_tls_cert: None,
@@ -440,6 +444,9 @@ impl Config {
         if let Some(rpc_bind) = layer.rpc_bind {
             self.rpc_bind = rpc_bind;
         }
+        if let Some(rest) = layer.rest {
+            self.rest = rest;
+        }
         if let Some(auth) = &layer.rpc_auth {
             self.rpc_auth = auth.clone();
         }
@@ -566,6 +573,9 @@ pub(crate) struct ConfigLayer {
     pub(crate) storage_backend: Option<String>,
     #[arg(long = "rpc-bind")]
     pub(crate) rpc_bind: Option<SocketAddr>,
+    /// Enable the Bitcoin Core-compatible REST gateway.
+    #[arg(long)]
+    pub(crate) rest: Option<bool>,
     #[arg(skip)]
     pub(crate) rpc_auth: Option<Auth>,
     #[arg(long = "rpc-user")]
@@ -656,6 +666,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
                 "BITCOIN_RS_STORAGE_BACKEND" => layer.storage_backend = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_BIND" => layer.rpc_bind = Some(value.parse()?),
+                "BITCOIN_RS_REST" => layer.rest = Some(value.parse()?),
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),

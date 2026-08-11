@@ -2,6 +2,13 @@
 
 Shared domain vocabulary for this project: entities, named processes, and status concepts with project-specific meaning. Seeded with core domain vocabulary, then accretes as ce-compound processes learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
+## Node interfaces
+
+### REST gateway
+The optional, unauthenticated Bitcoin Core-compatible HTTP surface served on
+the existing JSON-RPC listener. It is enabled with `rest=1`; JSON-RPC requests
+on the same listener retain their configured authentication.
+
 ## Initial Block Download
 
 ### Initial Block Download (IBD)
