@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
 import statistics
@@ -2255,550 +2256,491 @@ def _count_context_records_disk(
     records_path: Path,
     journal_path: Path,
     counters: Counters,
+    scratch_dir: Path | None = None,
 ) -> tuple[dict[str, int], int, dict[str, dict[str, int]]]:
-    """Disk-backed streaming computation of context counters.
+    """Join the three native streams using bounded SQLite bulk loading.
 
-    Uses a temporary on-disk sqlite3 database to join BRSCTX1 contexts,
-    BRSJRN1 journal entries, and BRSREC1 records without materializing
-    any of the binary files in memory.
-
-    Returns ``(counts, context_count, custody)`` where *custody* maps
-    ``"contexts"``, ``"records"``, ``"journal"`` to ``{bytes, sha256}``
-    computed on the single open used for parsing.
+    Each evidence stream is parsed and hashed from one open. Rows are inserted
+    lazily, so memory is bounded by SQLite's executemany machinery rather than
+    the evidence size, and an already-seen duplicate is reported before a later
+    malformed row is requested from the iterator.
     """
     counts: dict[str, int] = {name: 0 for name in CONTEXT_COUNTER_NAMES}
+    chunk_size = 4096
 
-    with tempfile.TemporaryDirectory(prefix="classify-corpus-") as tmpdir:
-        db_path = Path(tmpdir) / "contexts.db"
-        conn = sqlite3.connect(str(db_path))
+    if scratch_dir is not None:
+        scratch_dir = Path(scratch_dir)
+        if not scratch_dir.is_dir():
+            raise AnalyzerError(
+                f"CTX-EXECUTION: scratch-dir is not a writable directory: {scratch_dir}"
+            )
         try:
-            conn.execute(
-                "CREATE TABLE contexts ("
-                "txid_le BLOB, input_index INTEGER, spend_context TEXT, "
-                "prevout BLOB, script_sig BLOB, witness_count INTEGER, "
-                "PRIMARY KEY(txid_le, input_index))"
-            )
-            conn.execute(
-                "CREATE TABLE journal ("
-                "txid_le BLOB, input_index INTEGER, verdict INTEGER, "
-                "checksig_ops INTEGER, checkmultisig_ops INTEGER, "
-                "ecdsa_verify_calls INTEGER, ecdsa_verify_ok INTEGER, "
-                "PRIMARY KEY(txid_le, input_index))"
-            )
-            conn.execute(
-                "CREATE TABLE record_keys ("
-                "txid_le BLOB, input_index INTEGER, op_seq INTEGER, "
-                "PRIMARY KEY(txid_le, input_index, op_seq))"
-            )
-            conn.execute(
-                "CREATE TABLE record_seq ("
-                "txid_le BLOB, input_index INTEGER, last_op_seq INTEGER, "
-                "PRIMARY KEY(txid_le, input_index))"
-            )
-            conn.execute(
-                "CREATE TABLE record_ecdsa ("
-                "txid_le BLOB, input_index INTEGER, calls INTEGER, ok INTEGER, "
-                "PRIMARY KEY(txid_le, input_index))"
-            )
+            with tempfile.NamedTemporaryFile(
+                prefix="classify-corpus-write-test-", dir=scratch_dir
+            ):
+                pass
+        except OSError as exc:
+            raise AnalyzerError(
+                f"CTX-EXECUTION: scratch-dir is not a writable directory: "
+                f"{scratch_dir}: {exc}"
+            ) from exc
 
-            # ── Stream BRSCTX1 → classify → INSERT ──
-            context_count = 0
-            context_iter = iter_context_inputs(contexts_path, dedup=False)
+    saved_sqlite_tmpdir = os.environ.get("SQLITE_TMPDIR")
+    saved_tmpdir = os.environ.get("TMPDIR")
+    if scratch_dir is not None:
+        os.environ["SQLITE_TMPDIR"] = str(scratch_dir)
+        os.environ["TMPDIR"] = str(scratch_dir)
+
+    conn: sqlite3.Connection | None = None
+
+    def insert_bounded(
+        sql: str, rows: Iterator[tuple[object, ...]]
+    ) -> int:
+        inserted = 0
+        exhausted = False
+        while not exhausted:
+            def next_chunk() -> Iterator[tuple[object, ...]]:
+                nonlocal exhausted, inserted
+                for _ in range(chunk_size):
+                    try:
+                        row = next(rows)
+                    except StopIteration:
+                        exhausted = True
+                        return
+                    inserted += 1
+                    yield row
+
+            conn.executemany(sql, next_chunk())
+        return inserted
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="classify-corpus-", dir=scratch_dir
+        ) as tmpdir:
+            db_path = Path(tmpdir) / "contexts.db"
+            conn = sqlite3.connect(str(db_path))
             try:
-                for evidence in context_iter:
-                    classified = classify_input(evidence)
-                    ctx = classified.spend_context
-                    conn.execute(
-                        "INSERT INTO contexts VALUES (?, ?, ?, ?, ?, ?)",
-                        (
+                if scratch_dir is not None:
+                    conn.execute("PRAGMA temp_store = FILE")
+                conn.execute(
+                    "CREATE TABLE contexts ("
+                    "txid_le BLOB NOT NULL, input_index INTEGER NOT NULL, "
+                    "spend_context TEXT NOT NULL, "
+                    "PRIMARY KEY(txid_le, input_index)"
+                    ") WITHOUT ROWID"
+                )
+                conn.execute(
+                    "CREATE TABLE journal ("
+                    "txid_le BLOB NOT NULL, input_index INTEGER NOT NULL, "
+                    "checksig_ops INTEGER NOT NULL, checkmultisig_ops INTEGER NOT NULL, "
+                    "ecdsa_verify_calls INTEGER NOT NULL, ecdsa_verify_ok INTEGER NOT NULL, "
+                    "PRIMARY KEY(txid_le, input_index)"
+                    ") WITHOUT ROWID"
+                )
+                conn.execute(
+                    "CREATE TABLE records ("
+                    "txid_le BLOB NOT NULL, input_index INTEGER NOT NULL, "
+                    "op_seq INTEGER NOT NULL, stream_pos INTEGER NOT NULL, "
+                    "op_kind INTEGER NOT NULL, sig_version INTEGER NOT NULL, "
+                    "outcome INTEGER NOT NULL, reject_reason INTEGER NOT NULL, "
+                    "PRIMARY KEY(txid_le, input_index, op_seq)"
+                    ") WITHOUT ROWID"
+                )
+                conn.execute("CREATE INDEX records_stream_pos ON records(stream_pos)")
+
+                context_iter = iter_context_inputs(contexts_path, dedup=False)
+
+                def context_rows() -> Iterator[tuple[object, ...]]:
+                    for evidence in context_iter:
+                        classified = classify_input(evidence)
+                        yield (
                             evidence.identity.txid_le,
                             evidence.identity.input_index,
-                            ctx.value,
-                            evidence.prevout_script_pubkey,
-                            evidence.script_sig,
-                            len(evidence.witness),
-                        ),
-                    )
-                    context_count += 1
-                contexts_custody = context_iter.custody()
-            except ContextError as exc:
-                raise AnalyzerError(
-                    f"CTX-RAW: BRSCTX1 stream failed: {exc}"
-                ) from exc
-            except sqlite3.IntegrityError as exc:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate context execution identity in BRSCTX1: {exc}"
-                ) from exc
-            # ── Stream BRSJRN1 → INSERT, verify all verdicts == 1 ──
-            journal_count = 0
-            journal_iter, journal_custody = iter_journal_with_custody(journal_path)
-            try:
-                for entry in journal_iter:
-                    if entry.verdict != 1:
-                        display_txid = entry.spend_txid[::-1].hex()
-                        raise AnalyzerError(
-                            f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 "
-                            f"for txid={display_txid}, input_index={entry.input_index}"
+                            classified.spend_context.value,
                         )
-                    conn.execute(
-                        "INSERT INTO journal VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
+
+                try:
+                    context_count = insert_bounded(
+                        "INSERT INTO contexts VALUES (?, ?, ?)", context_rows()
+                    )
+                    contexts_custody = context_iter.custody()
+                except ContextError as exc:
+                    raise AnalyzerError(f"CTX-RAW: BRSCTX1 stream failed: {exc}") from exc
+                except sqlite3.IntegrityError as exc:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: duplicate context execution identity in BRSCTX1: {exc}"
+                    ) from exc
+
+                journal_iter, journal_custody = iter_journal_with_custody(journal_path)
+
+                def journal_rows() -> Iterator[tuple[object, ...]]:
+                    for entry in journal_iter:
+                        if entry.verdict != 1:
+                            display_txid = entry.spend_txid[::-1].hex()
+                            raise AnalyzerError(
+                                f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 "
+                                f"for txid={display_txid}, input_index={entry.input_index}"
+                            )
+                        yield (
                             entry.spend_txid,
                             entry.input_index,
-                            entry.verdict,
                             entry.checksig_ops,
                             entry.checkmultisig_ops,
                             entry.ecdsa_verify_calls,
                             entry.ecdsa_verify_ok,
-                        ),
-                    )
-                    journal_count += 1
-            except sqlite3.IntegrityError as exc:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate journal key in BRSJRN1: {exc}"
-                ) from exc
-
-            # ── Count reconciliation: contexts == journal == ffi_verify_entries ──
-            if context_count != journal_count:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: context count {context_count} != "
-                    f"journal count {journal_count}"
-                )
-            if context_count != counters.ffi_verify_entries:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: context count {context_count} != "
-                    f"counters.ffi_verify_entries {counters.ffi_verify_entries}"
-                )
-            if journal_count != counters.ffi_verify_entries:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: journal count {journal_count} != "
-                    f"counters.ffi_verify_entries {counters.ffi_verify_entries}"
-                )
-            if context_count != counters.context_count:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: context count {context_count} != "
-                    f"counters.context_count {counters.context_count}"
-                )
-            if journal_count != counters.journal_count:
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: journal count {journal_count} != "
-                    f"counters.journal_count {counters.journal_count}"
-                )
-
-            # ── Key equality: contexts ↔ journal via EXCEPT both directions ──
-            except_ctx_not_in_journal = conn.execute(
-                "SELECT COUNT(*) FROM ("
-                "  SELECT txid_le, input_index FROM contexts "
-                "  EXCEPT "
-                "  SELECT txid_le, input_index FROM journal"
-                ")"
-            ).fetchone()[0]
-            if except_ctx_not_in_journal:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: {except_ctx_not_in_journal} context key(s) "
-                    f"not present in journal"
-                )
-            except_jrn_not_in_ctx = conn.execute(
-                "SELECT COUNT(*) FROM ("
-                "  SELECT txid_le, input_index FROM journal "
-                "  EXCEPT "
-                "  SELECT txid_le, input_index FROM contexts"
-                ")"
-            ).fetchone()[0]
-            if except_jrn_not_in_ctx:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: {except_jrn_not_in_ctx} journal key(s) "
-                    f"not present in contexts"
-                )
-
-            # ── Tally spend-context counts from the contexts table ──
-            ctx_rows = conn.execute(
-                "SELECT spend_context, COUNT(*) FROM contexts GROUP BY spend_context"
-            ).fetchall()
-            for ctx_name, cnt in ctx_rows:
-                ctx_enum = SpendContext(ctx_name)
-                if ctx_enum == SpendContext.P2SH:
-                    counts["p2sh_redeem_spends"] += cnt
-                elif ctx_enum == SpendContext.NATIVE_WITNESS_V0:
-                    counts["native_witness_v0_spends"] += cnt
-                elif ctx_enum == SpendContext.P2SH_WRAPPED_WITNESS_V0:
-                    counts["p2sh_wrapped_witness_v0_spends"] += cnt
-                elif ctx_enum == SpendContext.TAPROOT_KEY_PATH:
-                    counts["taproot_key_path_spends"] += cnt
-                elif ctx_enum == SpendContext.TAPSCRIPT:
-                    counts["tapscript_spends"] += cnt
-
-            # ── Global aggregate counters for reconciliation (running ints) ──
-            agg_ecdsa_calls = 0
-            agg_ecdsa_ok = 0
-            agg_ecdsa_fail = 0
-            agg_schnorr_calls = 0
-            agg_schnorr_ok = 0
-            agg_schnorr_fail = 0
-            agg_checkecdsa_entries = 0
-            agg_checkschnorr_entries = 0
-            # Eight reject counters (reject_reason 0..7; 8 = unknown/distinct)
-            agg_rejects = [0] * 9
-
-
-            # ── Stream BRSREC1 → insert key, look up context, tally op counts ──
-            record_streamed_count = 0
-            record_iter, record_custody = iter_records_with_custody(records_path)
-            try:
-                for record in record_iter:
-                    conn.execute(
-                        "INSERT INTO record_keys VALUES (?, ?, ?)",
-                        (record.spend_txid, record.input_index, record.op_seq),
-                    )
-                    row = conn.execute(
-                        "SELECT spend_context FROM contexts "
-                        "WHERE txid_le = ? AND input_index = ?",
-                        (record.spend_txid, record.input_index),
-                    ).fetchone()
-                    if row is None:
-                        display_txid = record.spend_txid[::-1].hex()
-                        raise AnalyzerError(
-                            f"CTX-OPERATIONS: BRSREC1 record has no matching "
-                            f"context identity: txid={display_txid}, "
-                            f"input_index={record.input_index}"
                         )
-                    ctx = SpendContext(row[0])
-                    op = record.op_kind
-                    sig = record.sig_version
-                    display_txid = record.spend_txid[::-1].hex()
-                    identity_str = f"txid={display_txid}, input_index={record.input_index}"
-                    # ── Per-key contiguous op_seq via SQLite record_seq ──
-                    conn.execute(
-                        "INSERT INTO record_seq (txid_le, input_index, last_op_seq) "
-                        "VALUES (?, ?, ?) "
-                        "ON CONFLICT(txid_le, input_index) DO UPDATE SET "
-                        "last_op_seq = excluded.last_op_seq "
-                        "WHERE record_seq.last_op_seq + 1 = excluded.last_op_seq",
-                        (record.spend_txid, record.input_index, record.op_seq),
+
+                try:
+                    journal_count = insert_bounded(
+                        "INSERT INTO journal VALUES (?, ?, ?, ?, ?, ?)", journal_rows()
                     )
-                    seq_row = conn.execute(
-                        "SELECT last_op_seq FROM record_seq "
-                        "WHERE txid_le = ? AND input_index = ?",
-                        (record.spend_txid, record.input_index),
-                    ).fetchone()
-                    if seq_row is None or seq_row[0] != record.op_seq:
-                        expected = (seq_row[0] + 1) if seq_row else 0
-                        raise AnalyzerError(
-                            f"CTX-OPERATIONS: op_seq contiguity violation for "
-                            f"txid={display_txid}, input_index={record.input_index}: "
-                            f"expected {expected}, got {record.op_seq}"
-                        )
-                    if op in (3, 4):
-                        if sig not in (0, 1):
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: multisig record must have "
-                                f"sig_version BASE or WITNESS_V0, "
-                                f"got {_sig_version_name(sig)} for {identity_str}"
-                            )
-                        if ctx == SpendContext.BARE:
-                            if sig != 0:
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: bare multisig record has "
-                                    f"sig_version {_sig_version_name(sig)}, "
-                                    f"expected BASE for {identity_str}"
-                                )
-                            counts["bare_multisig_checks"] += 1
-                        elif ctx == SpendContext.P2SH:
-                            if sig != 0:
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: P2SH multisig record has "
-                                    f"sig_version {_sig_version_name(sig)}, "
-                                    f"expected BASE for {identity_str}"
-                                )
-                            counts["p2sh_multisig_checks"] += 1
-                        elif ctx == SpendContext.NATIVE_WITNESS_V0:
-                            if sig != 1:
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: native witness-v0 multisig "
-                                    f"record has sig_version "
-                                    f"{_sig_version_name(sig)}, "
-                                    f"expected WITNESS_V0 for {identity_str}"
-                                )
-                            counts["native_witness_v0_multisig_checks"] += 1
-                        elif ctx == SpendContext.P2SH_WRAPPED_WITNESS_V0:
-                            if sig != 1:
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: P2SH-wrapped witness-v0 "
-                                    f"multisig record has sig_version "
-                                    f"{_sig_version_name(sig)}, "
-                                    f"expected WITNESS_V0 for {identity_str}"
-                                )
-                            counts["p2sh_wrapped_witness_v0_multisig_checks"] += 1
-                        elif ctx in (SpendContext.TAPROOT_KEY_PATH, SpendContext.TAPSCRIPT):
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: multisig record joined to a "
-                                f"Taproot input {identity_str}"
-                            )
-                        else:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: unknown spend context {ctx!r}"
-                            )
-                    elif op == 5:
-                        if sig != 2:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: CHECKSIGADD record must have "
-                                f"sig_version TAPSCRIPT, got "
-                                f"{_sig_version_name(sig)} for {identity_str}"
-                            )
-                        if ctx != SpendContext.TAPSCRIPT:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: CHECKSIGADD record joined to a "
-                                f"non-Tapscript input {identity_str}"
-                            )
-                        counts["tapscript_schnorr_checks"] += 1
-                        counts["tapscript_checksigadd_checks"] += 1
-                    elif op == 0:
-                        if sig != 3:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: key-path record must have "
-                                f"sig_version TAPROOT, got {_sig_version_name(sig)} "
-                                f"for {identity_str}"
-                            )
-                        if ctx != SpendContext.TAPROOT_KEY_PATH:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: key-path record joined to a "
-                                f"non-key-path input {identity_str}"
-                            )
-                    elif op in (1, 2):
-                        if sig == 2:
-                            if ctx != SpendContext.TAPSCRIPT:
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: Tapscript CHECKSIG record "
-                                    f"joined to a non-Tapscript input {identity_str}"
-                                )
-                            counts["tapscript_schnorr_checks"] += 1
-                        elif sig == 1:
-                            if ctx not in (
-                                SpendContext.NATIVE_WITNESS_V0,
-                                SpendContext.P2SH_WRAPPED_WITNESS_V0,
-                            ):
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: WITNESS_V0 CHECKSIG record "
-                                    f"joined to a non-witness-v0 input {identity_str}"
-                                )
-                        elif sig == 0:
-                            if ctx not in (SpendContext.BARE, SpendContext.P2SH):
-                                raise AnalyzerError(
-                                    f"CTX-OPERATIONS: BASE CHECKSIG record joined "
-                                    f"to a non-legacy input {identity_str}"
-                                )
-                        else:
-                            raise AnalyzerError(
-                                f"CTX-OPERATIONS: CHECKSIG record has unknown "
-                                f"sig_version {sig} for {identity_str}"
-                            )
-                    else:
-                        raise AnalyzerError(
-                            f"CTX-OPERATIONS: unknown op_kind {op} for {identity_str}"
-                        )
-                    record_streamed_count += 1
-                    # ── Global aggregate reconciliation ──
-                    outcome = record.outcome
-                    reject = record.reject_reason
-                    # ECDSA: op in (1,2,3,4) with sig in (0,1) → ECDSA verify
-                    is_ecdsa = op in (1, 2, 3, 4) and sig in (0, 1)
-                    is_schnorr = (op in (1, 2, 5) and sig == 2) or (op == 0 and sig == 3)
-                    # Native emission (instrumentation.diff): CheckECDSASignature
-                    # increments C_CHECKECDSA_ENTRIES on every entry; the bad-pubkey
-                    # (reject_reason 1), empty-sig (2), and missing-data (3) guards
-                    # return before C_ECDSA_VERIFY_CALLS. Only outcome 0/1 are
-                    # verify calls, with C_ECDSA_VERIFY_FAIL on outcome 0 (crypto
-                    # false) and C_ECDSA_VERIFY_OK on outcome 1.
-                    if is_ecdsa:
-                        agg_checkecdsa_entries += 1
-                        if outcome != 2:
-                            agg_ecdsa_calls += 1
-                            if outcome == 1:
-                                agg_ecdsa_ok += 1
-                            else:  # outcome == 0: verifier returned false
-                                agg_ecdsa_fail += 1
-                            # Per-key ECDSA verify-call tracking (verify calls
-                            # only; pre-verification rejects never reach the
-                            # verifier so they emit no record_ecdsa row).
-                            conn.execute(
-                                "INSERT INTO record_ecdsa (txid_le, input_index, calls, ok) "
-                                "VALUES (?, ?, 1, ?) "
-                                "ON CONFLICT(txid_le, input_index) DO UPDATE SET "
-                                "calls = calls + 1, ok = ok + excluded.ok",
-                                (record.spend_txid, record.input_index,
-                                 1 if outcome == 1 else 0),
-                            )
-                    # Native emission: CheckSchnorrSignature increments
-                    # C_CHECKSCHNORR_ENTRIES on entry (reject_reason 4..7 are rejects
-                    # inside it), but reject_reason 8 is a Tapscript empty-sig skip
-                    # emitted in EvalChecksigTapscript before the function is called,
-                    # so it is neither an entry nor a verify call. Verify calls are
-                    # outcome 0/1 with fail on outcome 0.
-                    if is_schnorr:
-                        if reject != 8:
-                            agg_checkschnorr_entries += 1
-                        if outcome != 2:
-                            agg_schnorr_calls += 1
-                            if outcome == 1:
-                                agg_schnorr_ok += 1
-                            else:  # outcome == 0
-                                agg_schnorr_fail += 1
-                    if outcome == 2 and reject <= 8:
-                        agg_rejects[reject] += 1
-
-            except sqlite3.IntegrityError as exc:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: duplicate record key in BRSREC1: {exc}"
-                ) from exc
-
-            if record_streamed_count != counters.record_count:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: BRSREC1 record count "
-                    f"{record_streamed_count} != counters.record_count "
-                    f"{counters.record_count}"
-                )
-            # ── Per-key op_seq contiguity proof via SQL ──
-            # For every (txid, input_index), count of record_keys must equal
-            # max(op_seq)+1 and min(op_seq) must be 0.
-            gap_count = conn.execute(
-                "SELECT COUNT(*) FROM ("
-                "  SELECT txid_le, input_index "
-                "  FROM record_keys "
-                "  GROUP BY txid_le, input_index "
-                "  HAVING COUNT(*) != MAX(op_seq) + 1 OR MIN(op_seq) != 0"
-                ")"
-            ).fetchone()[0]
-            if gap_count:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: op_seq contiguity proof failed: "
-                    f"{gap_count} key(s) with non-contiguous op_seq"
-                )
-            # Keys in record_ecdsa with mismatched journal values
-            ecdsa_mismatch = conn.execute(
-                "SELECT r.txid_le, r.input_index, r.calls, r.ok, "
-                "j.ecdsa_verify_calls, j.ecdsa_verify_ok "
-                "FROM record_ecdsa r "
-                "JOIN journal j "
-                "ON r.txid_le = j.txid_le AND r.input_index = j.input_index "
-                "WHERE r.calls != j.ecdsa_verify_calls "
-                "OR r.ok != j.ecdsa_verify_ok "
-                "LIMIT 1"
-            ).fetchone()
-            if ecdsa_mismatch is not None:
-                r_txid, r_idx, r_calls, r_ok, j_calls, j_ok = ecdsa_mismatch
-                display_txid = r_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: ECDSA mismatch for "
-                    f"txid={display_txid}, input_index={r_idx}: "
-                    f"records calls={r_calls} ok={r_ok}, "
-                    f"journal calls={j_calls} ok={j_ok}"
-                )
-            # Keys in journal with ecdsa but missing from record_ecdsa
-            jrn_only_ecdsa = conn.execute(
-                "SELECT j.txid_le, j.input_index, j.ecdsa_verify_calls, "
-                "j.ecdsa_verify_ok "
-                "FROM journal j "
-                "WHERE (j.ecdsa_verify_calls > 0 OR j.ecdsa_verify_ok > 0) "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM record_ecdsa r "
-                "  WHERE r.txid_le = j.txid_le AND r.input_index = j.input_index) "
-                "LIMIT 1"
-            ).fetchone()
-            if jrn_only_ecdsa is not None:
-                j_txid, j_idx, j_calls, j_ok = jrn_only_ecdsa
-                display_txid = j_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: journal has ECDSA calls for "
-                    f"txid={display_txid}, input_index={j_idx} "
-                    f"but no ECDSA records found"
-                )
-
-            # ── Journal-sum reconciliation: SUM(checksig_ops) and SUM(checkmultisig_ops) ──
-            sum_checksig = conn.execute(
-                "SELECT COALESCE(SUM(checksig_ops), 0) FROM journal"
-            ).fetchone()[0]
-            if sum_checksig != counters.op_checksig + counters.op_checksigverify:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: SUM(checksig_ops) {sum_checksig} != "
-                    f"op_checksig + op_checksigverify "
-                    f"{counters.op_checksig + counters.op_checksigverify}"
-                )
-            sum_checkmultisig = conn.execute(
-                "SELECT COALESCE(SUM(checkmultisig_ops), 0) FROM journal"
-            ).fetchone()[0]
-            if sum_checkmultisig != counters.op_checkmultisig + counters.op_checkmultisigverify:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: SUM(checkmultisig_ops) {sum_checkmultisig} != "
-                    f"op_checkmultisig + op_checkmultisigverify "
-                    f"{counters.op_checkmultisig + counters.op_checkmultisigverify}"
-                )
-            # ── Global ECDSA/Schnorr/reject aggregate reconciliation ──
-            if agg_ecdsa_calls != counters.ecdsa_verify_calls:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: ecdsa_verify_calls mismatch: "
-                    f"records={agg_ecdsa_calls}, counters={counters.ecdsa_verify_calls}"
-                )
-            if agg_ecdsa_ok != counters.ecdsa_verify_ok:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: ecdsa_verify_ok mismatch: "
-                    f"records={agg_ecdsa_ok}, counters={counters.ecdsa_verify_ok}"
-                )
-            if agg_ecdsa_fail != counters.ecdsa_verify_fail:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: ecdsa_verify_fail mismatch: "
-                    f"records={agg_ecdsa_fail}, counters={counters.ecdsa_verify_fail}"
-                )
-            if agg_schnorr_calls != counters.schnorr_verify_calls:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: schnorr_verify_calls mismatch: "
-                    f"records={agg_schnorr_calls}, counters={counters.schnorr_verify_calls}"
-                )
-            if agg_schnorr_ok != counters.schnorr_verify_ok:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: schnorr_verify_ok mismatch: "
-                    f"records={agg_schnorr_ok}, counters={counters.schnorr_verify_ok}"
-                )
-            if agg_schnorr_fail != counters.schnorr_verify_fail:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: schnorr_verify_fail mismatch: "
-                    f"records={agg_schnorr_fail}, counters={counters.schnorr_verify_fail}"
-                )
-            if agg_checkecdsa_entries != counters.checkecdsa_entries:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: checkecdsa_entries mismatch: "
-                    f"records={agg_checkecdsa_entries}, counters={counters.checkecdsa_entries}"
-                )
-            if agg_checkschnorr_entries != counters.checkschnorr_entries:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: checkschnorr_entries mismatch: "
-                    f"records={agg_checkschnorr_entries}, counters={counters.checkschnorr_entries}"
-                )
-            # Eight reject counters reconciliation
-            _reject_names = [
-                "checkecdsa_reject_pubkey",
-                "checkecdsa_reject_empty_sig",
-                "checkecdsa_reject_missing_data",
-            ]
-            # reject_reason 1..3 (1=bad pubkey, 2=empty sig, 3=missing data per
-            # instrumentation.diff) map to the three named ECDSA reject counters.
-            for i, name in enumerate(_reject_names):
-                if agg_rejects[i + 1] != getattr(counters, name):
+                except sqlite3.IntegrityError as exc:
                     raise AnalyzerError(
-                        f"CTX-OPERATIONS: {name} mismatch: "
-                        f"records={agg_rejects[i + 1]}, counters={getattr(counters, name)}"
+                        f"CTX-EXECUTION: duplicate journal key in BRSJRN1: {exc}"
+                    ) from exc
+
+                if context_count != journal_count:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: context count {context_count} != "
+                        f"journal count {journal_count}"
+                    )
+                if context_count != counters.ffi_verify_entries:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: context count {context_count} != "
+                        f"counters.ffi_verify_entries {counters.ffi_verify_entries}"
+                    )
+                if journal_count != counters.ffi_verify_entries:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: journal count {journal_count} != "
+                        f"counters.ffi_verify_entries {counters.ffi_verify_entries}"
+                    )
+                if context_count != counters.context_count:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: context count {context_count} != "
+                        f"counters.context_count {counters.context_count}"
+                    )
+                if journal_count != counters.journal_count:
+                    raise AnalyzerError(
+                        f"CTX-EXECUTION: journal count {journal_count} != "
+                        f"counters.journal_count {counters.journal_count}"
                     )
 
-            conn.commit()
-        finally:
-            conn.close()
+                missing_journal = conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    " SELECT txid_le, input_index FROM contexts"
+                    " EXCEPT SELECT txid_le, input_index FROM journal"
+                    ")"
+                ).fetchone()[0]
+                if missing_journal:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: {missing_journal} context key(s) not present in journal"
+                    )
+                missing_context = conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    " SELECT txid_le, input_index FROM journal"
+                    " EXCEPT SELECT txid_le, input_index FROM contexts"
+                    ")"
+                ).fetchone()[0]
+                if missing_context:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: {missing_context} journal key(s) not present in contexts"
+                    )
 
-    # Contexts custody comes from the same single-open parse stream.
-    custody_meta: dict[str, dict[str, int]] = {
+                spend_counts = dict(
+                    conn.execute(
+                        "SELECT spend_context, COUNT(*) FROM contexts GROUP BY spend_context"
+                    ).fetchall()
+                )
+                counts["p2sh_redeem_spends"] = spend_counts.get(SpendContext.P2SH.value, 0)
+                counts["native_witness_v0_spends"] = spend_counts.get(
+                    SpendContext.NATIVE_WITNESS_V0.value, 0
+                )
+                counts["p2sh_wrapped_witness_v0_spends"] = spend_counts.get(
+                    SpendContext.P2SH_WRAPPED_WITNESS_V0.value, 0
+                )
+                counts["taproot_key_path_spends"] = spend_counts.get(
+                    SpendContext.TAPROOT_KEY_PATH.value, 0
+                )
+                counts["tapscript_spends"] = spend_counts.get(
+                    SpendContext.TAPSCRIPT.value, 0
+                )
+
+                record_iter, record_custody = iter_records_with_custody(records_path)
+
+                def record_rows() -> Iterator[tuple[object, ...]]:
+                    for stream_pos, record in enumerate(record_iter):
+                        yield (
+                            record.spend_txid,
+                            record.input_index,
+                            record.op_seq,
+                            stream_pos,
+                            record.op_kind,
+                            record.sig_version,
+                            record.outcome,
+                            record.reject_reason,
+                        )
+
+                try:
+                    record_count = insert_bounded(
+                        "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        record_rows(),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: duplicate record key in BRSREC1: {exc}"
+                    ) from exc
+
+                if record_count != counters.record_count:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: BRSREC1 record count {record_count} != "
+                        f"counters.record_count {counters.record_count}"
+                    )
+
+                orphan = conn.execute(
+                    "SELECT r.txid_le, r.input_index FROM records r "
+                    "LEFT JOIN contexts c ON c.txid_le=r.txid_le AND c.input_index=r.input_index "
+                    "WHERE c.txid_le IS NULL ORDER BY r.stream_pos LIMIT 1"
+                ).fetchone()
+                if orphan is not None:
+                    txid_le, input_index = orphan
+                    raise AnalyzerError(
+                        "CTX-OPERATIONS: BRSREC1 record has no matching "
+                        f"context identity: txid={txid_le[::-1].hex()}, "
+                        f"input_index={input_index}"
+                    )
+
+                sequence_error = conn.execute(
+                    "WITH ordered AS ("
+                    " SELECT txid_le, input_index, op_seq, stream_pos,"
+                    " ROW_NUMBER() OVER (PARTITION BY txid_le, input_index ORDER BY stream_pos)-1 expected"
+                    " FROM records"
+                    ") SELECT txid_le, input_index, expected, op_seq FROM ordered"
+                    " WHERE op_seq != expected ORDER BY stream_pos LIMIT 1"
+                ).fetchone()
+                if sequence_error is not None:
+                    txid_le, input_index, expected, actual = sequence_error
+                    raise AnalyzerError(
+                        "CTX-OPERATIONS: op_seq contiguity violation for "
+                        f"txid={txid_le[::-1].hex()}, input_index={input_index}: "
+                        f"expected {expected}, got {actual}"
+                    )
+
+                invalid = conn.execute(
+                    "WITH classified AS ("
+                    " SELECT r.*, c.spend_context, CASE"
+                    " WHEN op_kind IN (3,4) AND sig_version NOT IN (0,1) THEN 'multisig_sig'"
+                    " WHEN op_kind IN (3,4) AND spend_context='bare' AND sig_version!=0 THEN 'bare_multisig'"
+                    " WHEN op_kind IN (3,4) AND spend_context='p2sh' AND sig_version!=0 THEN 'p2sh_multisig'"
+                    " WHEN op_kind IN (3,4) AND spend_context='native_witness_v0' AND sig_version!=1 THEN 'native_multisig'"
+                    " WHEN op_kind IN (3,4) AND spend_context='p2sh_wrapped_witness_v0' AND sig_version!=1 THEN 'wrapped_multisig'"
+                    " WHEN op_kind IN (3,4) AND spend_context IN ('taproot_key_path','tapscript') THEN 'taproot_multisig'"
+                    " WHEN op_kind=5 AND sig_version!=2 THEN 'checksigadd_sig'"
+                    " WHEN op_kind=5 AND spend_context!='tapscript' THEN 'checksigadd_context'"
+                    " WHEN op_kind=0 AND sig_version!=3 THEN 'keypath_sig'"
+                    " WHEN op_kind=0 AND spend_context!='taproot_key_path' THEN 'keypath_context'"
+                    " WHEN op_kind IN (1,2) AND sig_version=2 AND spend_context!='tapscript' THEN 'tapscript_checksig'"
+                    " WHEN op_kind IN (1,2) AND sig_version=1 AND spend_context NOT IN ('native_witness_v0','p2sh_wrapped_witness_v0') THEN 'witness_checksig'"
+                    " WHEN op_kind IN (1,2) AND sig_version=0 AND spend_context NOT IN ('bare','p2sh') THEN 'base_checksig'"
+                    " WHEN op_kind IN (1,2) AND sig_version NOT IN (0,1,2) THEN 'unknown_checksig'"
+                    " WHEN op_kind NOT IN (0,1,2,3,4,5) THEN 'unknown_op' END error_code"
+                    " FROM records r JOIN contexts c"
+                    " ON c.txid_le=r.txid_le AND c.input_index=r.input_index"
+                    ") SELECT txid_le,input_index,op_kind,sig_version,spend_context,error_code"
+                    " FROM classified WHERE error_code IS NOT NULL"
+                    " ORDER BY stream_pos LIMIT 1"
+                ).fetchone()
+                if invalid is not None:
+                    txid_le, input_index, op, sig, ctx_name, error_code = invalid
+                    identity = f"txid={txid_le[::-1].hex()}, input_index={input_index}"
+                    sig_name = _sig_version_name(sig)
+                    if error_code == "multisig_sig":
+                        message = f"multisig record must have sig_version BASE or WITNESS_V0, got {sig_name} for {identity}"
+                    elif error_code == "bare_multisig":
+                        message = f"bare multisig record has sig_version {sig_name}, expected BASE for {identity}"
+                    elif error_code == "p2sh_multisig":
+                        message = f"P2SH multisig record has sig_version {sig_name}, expected BASE for {identity}"
+                    elif error_code == "native_multisig":
+                        message = f"native witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
+                    elif error_code == "wrapped_multisig":
+                        message = f"P2SH-wrapped witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
+                    elif error_code == "taproot_multisig":
+                        message = f"multisig record joined to a Taproot input {identity}"
+                    elif error_code == "checksigadd_sig":
+                        message = f"CHECKSIGADD record must have sig_version TAPSCRIPT, got {sig_name} for {identity}"
+                    elif error_code == "checksigadd_context":
+                        message = f"CHECKSIGADD record joined to a non-Tapscript input {identity}"
+                    elif error_code == "keypath_sig":
+                        message = f"key-path record must have sig_version TAPROOT, got {sig_name} for {identity}"
+                    elif error_code == "keypath_context":
+                        message = f"key-path record joined to a non-key-path input {identity}"
+                    elif error_code == "tapscript_checksig":
+                        message = f"Tapscript CHECKSIG record joined to a non-Tapscript input {identity}"
+                    elif error_code == "witness_checksig":
+                        message = f"WITNESS_V0 CHECKSIG record joined to a non-witness-v0 input {identity}"
+                    elif error_code == "base_checksig":
+                        message = f"BASE CHECKSIG record joined to a non-legacy input {identity}"
+                    elif error_code == "unknown_checksig":
+                        message = f"CHECKSIG record has unknown sig_version {sig} for {identity}"
+                    else:
+                        message = f"unknown op_kind {op} for {identity}"
+                    raise AnalyzerError(f"CTX-OPERATIONS: {message}")
+
+                gap_count = conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    " SELECT txid_le, input_index FROM records"
+                    " GROUP BY txid_le, input_index"
+                    " HAVING COUNT(*) != MAX(op_seq)+1 OR MIN(op_seq) != 0"
+                    ")"
+                ).fetchone()[0]
+                if gap_count:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: op_seq contiguity proof failed: "
+                        f"{gap_count} key(s) with non-contiguous op_seq"
+                    )
+
+                record_tallies = conn.execute(
+                    "SELECT"
+                    " SUM(op_kind IN (3,4) AND spend_context='bare'),"
+                    " SUM(op_kind IN (3,4) AND spend_context='p2sh'),"
+                    " SUM(op_kind IN (3,4) AND spend_context='native_witness_v0'),"
+                    " SUM(op_kind IN (3,4) AND spend_context='p2sh_wrapped_witness_v0'),"
+                    " SUM((op_kind=5 OR (op_kind IN (1,2) AND sig_version=2)) AND spend_context='tapscript'),"
+                    " SUM(op_kind=5 AND spend_context='tapscript')"
+                    " FROM records JOIN contexts USING(txid_le,input_index)"
+                ).fetchone()
+                for name, value in zip(
+                    (
+                        "bare_multisig_checks", "p2sh_multisig_checks",
+                        "native_witness_v0_multisig_checks",
+                        "p2sh_wrapped_witness_v0_multisig_checks",
+                        "tapscript_schnorr_checks", "tapscript_checksigadd_checks",
+                    ),
+                    record_tallies,
+                ):
+                    counts[name] = value or 0
+
+                aggregate = conn.execute(
+                    "SELECT"
+                    " SUM(op_kind IN (1,2,3,4) AND sig_version IN (0,1) AND outcome!=2),"
+                    " SUM(op_kind IN (1,2,3,4) AND sig_version IN (0,1) AND outcome=1),"
+                    " SUM(op_kind IN (1,2,3,4) AND sig_version IN (0,1) AND outcome=0),"
+                    " SUM(((op_kind IN (1,2,5) AND sig_version=2) OR (op_kind=0 AND sig_version=3)) AND outcome!=2),"
+                    " SUM(((op_kind IN (1,2,5) AND sig_version=2) OR (op_kind=0 AND sig_version=3)) AND outcome=1),"
+                    " SUM(((op_kind IN (1,2,5) AND sig_version=2) OR (op_kind=0 AND sig_version=3)) AND outcome=0),"
+                    " SUM(op_kind IN (1,2,3,4) AND sig_version IN (0,1)),"
+                    " SUM(((op_kind IN (1,2,5) AND sig_version=2) OR (op_kind=0 AND sig_version=3)) AND reject_reason!=8),"
+                    " SUM(reject_reason=1), SUM(reject_reason=2), SUM(reject_reason=3)"
+                    " FROM records"
+                ).fetchone()
+                (
+                    agg_ecdsa_calls, agg_ecdsa_ok, agg_ecdsa_fail,
+                    agg_schnorr_calls, agg_schnorr_ok, agg_schnorr_fail,
+                    agg_checkecdsa_entries, agg_checkschnorr_entries,
+                    reject_pubkey, reject_empty_sig, reject_missing_data,
+                ) = (value or 0 for value in aggregate)
+
+                ecdsa_mismatch = conn.execute(
+                    "WITH e AS ("
+                    " SELECT txid_le,input_index,"
+                    " SUM(outcome!=2) calls,SUM(outcome=1) ok FROM records"
+                    " WHERE op_kind IN (1,2,3,4) AND sig_version IN (0,1)"
+                    " GROUP BY txid_le,input_index"
+                    ") SELECT e.txid_le,e.input_index,e.calls,e.ok,j.ecdsa_verify_calls,j.ecdsa_verify_ok"
+                    " FROM e JOIN journal j USING(txid_le,input_index)"
+                    " WHERE e.calls!=j.ecdsa_verify_calls OR e.ok!=j.ecdsa_verify_ok LIMIT 1"
+                ).fetchone()
+                if ecdsa_mismatch is not None:
+                    txid_le, input_index, r_calls, r_ok, j_calls, j_ok = ecdsa_mismatch
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: ECDSA mismatch for txid={txid_le[::-1].hex()}, "
+                        f"input_index={input_index}: records calls={r_calls} ok={r_ok}, "
+                        f"journal calls={j_calls} ok={j_ok}"
+                    )
+                journal_only_ecdsa = conn.execute(
+                    "WITH e AS ("
+                    " SELECT txid_le,input_index FROM records"
+                    " WHERE op_kind IN (1,2,3,4) AND sig_version IN (0,1)"
+                    " GROUP BY txid_le,input_index"
+                    ") SELECT j.txid_le,j.input_index,j.ecdsa_verify_calls,j.ecdsa_verify_ok"
+                    " FROM journal j LEFT JOIN e USING(txid_le,input_index)"
+                    " WHERE (j.ecdsa_verify_calls>0 OR j.ecdsa_verify_ok>0) AND e.txid_le IS NULL"
+                    " LIMIT 1"
+                ).fetchone()
+                if journal_only_ecdsa is not None:
+                    txid_le, input_index, _calls, _ok = journal_only_ecdsa
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: journal has ECDSA calls for "
+                        f"txid={txid_le[::-1].hex()}, input_index={input_index} "
+                        "but no ECDSA records found"
+                    )
+
+                sum_checksig, sum_checkmultisig = conn.execute(
+                    "SELECT COALESCE(SUM(checksig_ops),0),"
+                    " COALESCE(SUM(checkmultisig_ops),0) FROM journal"
+                ).fetchone()
+                if sum_checksig != counters.op_checksig + counters.op_checksigverify:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: SUM(checksig_ops) {sum_checksig} != "
+                        f"op_checksig + op_checksigverify "
+                        f"{counters.op_checksig + counters.op_checksigverify}"
+                    )
+                if sum_checkmultisig != counters.op_checkmultisig + counters.op_checkmultisigverify:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: SUM(checkmultisig_ops) {sum_checkmultisig} != "
+                        f"op_checkmultisig + op_checkmultisigverify "
+                        f"{counters.op_checkmultisig + counters.op_checkmultisigverify}"
+                    )
+
+                reconciliations = (
+                    ("ecdsa_verify_calls", agg_ecdsa_calls, counters.ecdsa_verify_calls),
+                    ("ecdsa_verify_ok", agg_ecdsa_ok, counters.ecdsa_verify_ok),
+                    ("ecdsa_verify_fail", agg_ecdsa_fail, counters.ecdsa_verify_fail),
+                    ("schnorr_verify_calls", agg_schnorr_calls, counters.schnorr_verify_calls),
+                    ("schnorr_verify_ok", agg_schnorr_ok, counters.schnorr_verify_ok),
+                    ("schnorr_verify_fail", agg_schnorr_fail, counters.schnorr_verify_fail),
+                    ("checkecdsa_entries", agg_checkecdsa_entries, counters.checkecdsa_entries),
+                    ("checkschnorr_entries", agg_checkschnorr_entries, counters.checkschnorr_entries),
+                )
+                for name, actual, expected in reconciliations:
+                    if actual != expected:
+                        raise AnalyzerError(
+                            f"CTX-OPERATIONS: {name} mismatch: records={actual}, counters={expected}"
+                        )
+                for name, actual in zip(
+                    (
+                        "checkecdsa_reject_pubkey",
+                        "checkecdsa_reject_empty_sig",
+                        "checkecdsa_reject_missing_data",
+                    ),
+                    (reject_pubkey, reject_empty_sig, reject_missing_data),
+                ):
+                    expected = getattr(counters, name)
+                    if actual != expected:
+                        raise AnalyzerError(
+                            f"CTX-OPERATIONS: {name} mismatch: records={actual}, counters={expected}"
+                        )
+                conn.commit()
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    finally:
+        if saved_sqlite_tmpdir is not None:
+            os.environ["SQLITE_TMPDIR"] = saved_sqlite_tmpdir
+        else:
+            os.environ.pop("SQLITE_TMPDIR", None)
+        if saved_tmpdir is not None:
+            os.environ["TMPDIR"] = saved_tmpdir
+        else:
+            os.environ.pop("TMPDIR", None)
+
+    return counts, context_count, {
         "contexts": contexts_custody,
         "records": record_custody,
         "journal": journal_custody,
     }
-    return counts, context_count, custody_meta
+
+
 def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
     """Exact C150 product predicate.
 
@@ -2875,7 +2817,8 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
 
     # ── Run disk-backed counter computation (returns custody for ctx/rec/jrn) ──
     counts, context_count, bin_custody = _count_context_records_disk(
-        contexts_path, records_path, journal_path, counters
+        contexts_path, records_path, journal_path, counters,
+        Path(args.scratch_dir) if getattr(args, "scratch_dir", None) else None,
     )
 
     # ── Assemble custody from parser-returned metadata ──
@@ -3131,6 +3074,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         type=int,
         help="optional cross-check: expected BRSCTX1 row count (BRSCTX1 file is authoritative)",
+    )
+    cc.add_argument(
+        "--scratch-dir",
+        default=None,
+        help="optional writable directory for the classifier database and SQLite temporary files",
     )
     cc.set_defaults(func=cmd_classify_corpus)
 

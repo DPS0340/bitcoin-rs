@@ -687,6 +687,7 @@ def _make_classify_args(
     replay_overrides: dict[str, object] | None = None,
     manifest_overrides: dict[str, object] | None = None,
     archive_blocks: list[bytes] | None = None,
+    scratch_dir: Path | None = None,
 ) -> argparse.Namespace:
     """Create all supporting files and return an argparse.Namespace for
     cmd_classify_corpus.
@@ -771,6 +772,7 @@ def _make_classify_args(
         output=str(tmp / "report.json"),
         contract=contract,
         input_count=input_count,
+        scratch_dir=str(scratch_dir) if scratch_dir else None,
     )
     return ns
 
@@ -4791,6 +4793,217 @@ def test_classify_corpus_custody_contexts_from_same_open() -> None:
         assert path.read_bytes() != a_bytes
 
 
+# ── Tests: Task 7B focused regressions ───────────────────────────────────────
+
+
+def test_classify_corpus_duplicate_context_key() -> None:
+    """Duplicate BRSCTX1 (same txid/input_index) raises CTX-EXECUTION."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x65" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        dup = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(tmp, [ctx_row, dup], [record], journal, "c150")
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "duplicate context key",
+            "CTX-EXECUTION",
+        )
+
+
+def test_classify_corpus_mixed_duplicate_before_malformed() -> None:
+    """A duplicate record in the same bounded chunk wins over a later malformed row."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x66" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0, op_seq=0)
+        duplicate = _make_record_bytes(txid_le, 0, op_seq=0)
+        malformed = _make_record_bytes(txid_le, 0, op_kind=6)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp, [ctx_row], [record, duplicate, malformed], journal, "c150"
+        )
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            msg = str(exc)
+            assert "CTX-OPERATIONS" in msg, msg
+            assert "duplicate record key" in msg, msg
+            assert "op_kind" not in msg, f"malformed row was parsed first: {msg}"
+        else:
+            raise AssertionError("expected AnalyzerError for duplicate record")
+
+
+def test_count_context_records_spend_context_tally_sensitivity() -> None:
+    """CHECKMULTISIG records with the same op/sig map to different context
+    counters depending on the input's spend_context, proving the tally is
+    sensitive to context classification."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_bare = b"\xb4" * 32
+        txid_p2sh = b"\xb5" * 32
+        contexts = [
+            _bare_p2pkh(txid_bare),
+            _p2sh_push_only(txid_p2sh, flags=VERIFY_P2SH),
+        ]
+        records = [
+            _make_record_bytes(txid_bare, 0, op_kind=3, sig_version=0),
+            _make_record_bytes(txid_p2sh, 0, op_kind=3, sig_version=0),
+        ]
+        journal = [
+            _make_journal_bytes(
+                txid_bare, 0,
+                checksig_ops=0, checkmultisig_ops=1,
+                ecdsa_verify_calls=1, ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txid_p2sh, 0,
+                checksig_ops=0, checkmultisig_ops=1,
+                ecdsa_verify_calls=1, ecdsa_verify_ok=1,
+            ),
+        ]
+        _make_brsctx1_file(tmp / "contexts.bin", contexts)
+        _write_records_file(tmp / "records.bin", records)
+        _write_journal_file(tmp / "journal.bin", journal)
+
+        counters = _make_valid_counters(
+            2, 2, 2,
+            op_checksig=0,
+            op_checkmultisig=2,
+            checkecdsa_entries=2,
+            ecdsa_from_checksig=0,
+            ecdsa_from_checkmultisig=2,
+            ecdsa_verify_calls=2,
+            ecdsa_verify_ok=2,
+            sighash_computed=2,
+        )
+        (tmp / "counters.json").write_text(json.dumps(counters))
+        counts, ctx_count, _ = _count_context_records_disk(
+            tmp / "contexts.bin",
+            tmp / "records.bin",
+            tmp / "journal.bin",
+            Counters(counters),
+        )
+        assert ctx_count == 2
+        assert counts["bare_multisig_checks"] == 1
+        assert counts["p2sh_multisig_checks"] == 1
+
+
+def test_classify_corpus_scratch_dir_rejects_non_directory() -> None:
+    """A scratch-dir argument that is not a directory is rejected clearly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x67" * 32
+        scratch = tmp / "not-a-dir"
+        scratch.write_text("file")
+        args = _make_classify_args(
+            tmp, [_bare_p2pkh(txid_le)], [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)], "c150",
+            scratch_dir=scratch,
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "scratch-dir rejects file",
+            "CTX-EXECUTION",
+            "scratch-dir is not a writable directory",
+        )
+
+
+def test_classify_corpus_scratch_dir_rejects_unwritable() -> None:
+    """An existing but unwritable scratch-dir is rejected clearly."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        scratch = tmp / "no-write"
+        scratch.mkdir(mode=0o555)
+        txid_le = b"\x68" * 32
+        args = _make_classify_args(
+            tmp, [_bare_p2pkh(txid_le)], [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)], "c150",
+            scratch_dir=scratch,
+        )
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: cmd_classify_corpus(args),
+                "scratch-dir rejects unwritable",
+                "CTX-EXECUTION",
+                "scratch-dir is not a writable directory",
+            )
+        finally:
+            scratch.chmod(0o755)
+
+
+def test_count_context_records_disk_scratch_dir_smoke() -> None:
+    """A valid scratch_dir is accepted and set-based counts remain correct."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        scratch = tmp / "scratch"
+        scratch.mkdir()
+        txid_le = b"\x69" * 32
+        ctx = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        _make_brsctx1_file(tmp / "contexts.bin", [ctx])
+        _write_records_file(tmp / "records.bin", [record])
+        _write_journal_file(tmp / "journal.bin", journal)
+
+        counters = _make_valid_counters(1, 1, 1)
+        (tmp / "counters.json").write_text(json.dumps(counters))
+        counts, ctx_count, _ = _count_context_records_disk(
+            tmp / "contexts.bin",
+            tmp / "records.bin",
+            tmp / "journal.bin",
+            Counters(counters),
+            scratch_dir=scratch,
+        )
+        assert ctx_count == 1
+        assert counts["bare_multisig_checks"] == 0
+
+
+def test_count_context_records_disk_restores_env_on_failure() -> None:
+    """A BRSCTX1 parse failure after SQLite setup still restores environment."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        scratch = tmp / "scratch"
+        scratch.mkdir()
+        (tmp / "contexts.bin").write_bytes(b"BADC0D1C" + struct.pack("<Q", 0))
+
+        counters = _make_valid_counters(0, 0, 0)
+        (tmp / "counters.json").write_text(json.dumps(counters))
+
+        original_sqlite = os.environ.get("SQLITE_TMPDIR")
+        original_tmp = os.environ.get("TMPDIR")
+        try:
+            os.environ["SQLITE_TMPDIR"] = "/tmp/original-sqlite"
+            os.environ["TMPDIR"] = "/tmp/original-tmp"
+            try:
+                _count_context_records_disk(
+                    tmp / "contexts.bin",
+                    tmp / "records.bin",
+                    tmp / "journal.bin",
+                    Counters(counters),
+                    scratch_dir=scratch,
+                )
+            except AnalyzerError:
+                pass
+            assert os.environ.get("SQLITE_TMPDIR") == "/tmp/original-sqlite"
+            assert os.environ.get("TMPDIR") == "/tmp/original-tmp"
+        finally:
+            if original_sqlite is not None:
+                os.environ["SQLITE_TMPDIR"] = original_sqlite
+            else:
+                os.environ.pop("SQLITE_TMPDIR", None)
+            if original_tmp is not None:
+                os.environ["TMPDIR"] = original_tmp
+            else:
+                os.environ.pop("TMPDIR", None)
+
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 
@@ -4955,6 +5168,13 @@ def main() -> int:
         test_classify_corpus_custody_journal_from_single_open,
         test_parse_counters_returns_custody,
         test_classify_corpus_custody_contexts_from_same_open,
+        test_classify_corpus_duplicate_context_key,
+        test_classify_corpus_mixed_duplicate_before_malformed,
+        test_count_context_records_spend_context_tally_sensitivity,
+        test_classify_corpus_scratch_dir_rejects_non_directory,
+        test_classify_corpus_scratch_dir_rejects_unwritable,
+        test_count_context_records_disk_scratch_dir_smoke,
+        test_count_context_records_disk_restores_env_on_failure,
     ]
     passed = 0
     failed = 0
