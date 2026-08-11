@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.14
 # pyright: strict
-"""Strict contract and end-to-end tests for the generic campaign runner."""
+"""Behavioral tests for the native exact-seven-pair campaign runner."""
 
 from __future__ import annotations
 
@@ -8,1082 +8,781 @@ import hashlib
 import json
 import os
 import stat
-import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import TypedDict, TypeIs
-from unittest import mock
+from typing import TypeIs
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 import runner
+from native_offline import AdapterKind, ContractError
 from runner import (
     ALL_CELLS,
-    Architecture,
-    Backend,
-    CellId,
-    ContractError,
-    Corpus,
-    Domain,
-    Role,
+    PAIR_COUNT,
+    Verdict,
     classify_wall_performance,
-    expand_command,
     load_config,
     parse_config,
-    parse_result,
     run_cell,
     schedule_for,
     validate_result,
 )
 
-_WORKSPACES: list[tempfile.TemporaryDirectory[str]] = []
+type JsonObject = dict[str, object]
+TARGET = ALL_CELLS[0]
+ZERO_HASH = "0" * 64
+GENESIS = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+STOP_HASH = "1" * 64
+COMMIT = "2" * 40
 
 
-class _ProgramJson(TypedDict):
-    binary_path: str
-    binary_sha256: str
-    commit: str
-    build: str
-    features: list[str]
-    mimalloc: bool
-    command: list[str]
-    exposes_full_validation_witness: bool
-    consensus_proof_hash: str
-
-
-class _CellIdJson(TypedDict):
-    domain: str
-    corpus: str
-    architecture: str
-    backend: str
-
-
-class _CellConfigJson(TypedDict):
-    cell: _CellIdJson
-    blocked_reason: str | None
-    candidate: _ProgramJson
-    core: _ProgramJson
-    corpus_path: str
-    corpus_sha256: str
-    manifest_path: str
-    manifest_sha256: str
-    affinity: list[int]
-
-
-class _CampaignConfigJson(TypedDict):
-    schema: str
-    schedule_seed: int
-    output_root: str
-    cells: list[_CellConfigJson]
-
-
-class _ArmJson(TypedDict):
-    command: list[str]
-    child_result: dict[str, object] | None
-    child_result_raw: object
-    error: str | None
-    pid: int | None
-    wall_ns: int | None
-    arm_dir: str
-    data_dir: str
-    result_path: str
-    stdout_path: str
-    stderr_path: str
-
-
-class _PairJson(TypedDict):
-    pair_index: int
-    candidate: _ArmJson
-    core: _ArmJson
-    valid: bool
-    correctness_match: bool | None
-
-
-class _ResultJson(TypedDict):
-    pairs: list[_PairJson]
-    scheduled_pairs: int
-    valid_pairs: int
-    verdict: str
-    _run_path: str
-    _config_path: str
-
-
-def _is_json_object(value: object) -> TypeIs[dict[str, object]]:
+def _is_object(value: object) -> TypeIs[JsonObject]:
     if not isinstance(value, dict):
         return False
     return all(isinstance(key, str) for key in value)  # pyright: ignore[reportUnknownVariableType]
 
 
-def _is_json_array(value: object) -> TypeIs[list[object]]:
-    return isinstance(value, list)
-
-
-def _is_integer(value: object) -> TypeIs[int]:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_optional_int(value: object) -> bool:
-    return value is None or _is_integer(value)
-
-
-def _is_arm_json(value: object) -> TypeIs[_ArmJson]:
-    if not _is_json_object(value):
-        return False
-    required = {
-        "command",
-        "child_result",
-        "child_result_raw",
-        "error",
-        "pid",
-        "wall_ns",
-        "arm_dir",
-        "data_dir",
-        "result_path",
-        "stdout_path",
-        "stderr_path",
-    }
-    if not required.issubset(value):
-        return False
-    child = value["child_result"]
-    error = value["error"]
-    command = value["command"]
-    return (
-        _is_json_array(command)
-        and bool(command)
-        and all(isinstance(argument, str) for argument in command)
-        and (child is None or _is_json_object(child))
-        and (error is None or isinstance(error, str))
-        and _is_optional_int(value["pid"])
-        and _is_optional_int(value["wall_ns"])
-        and all(
-            isinstance(value[key], str)
-            for key in (
-                "arm_dir",
-                "data_dir",
-                "result_path",
-                "stdout_path",
-                "stderr_path",
-            )
-        )
-    )
-
-
-def _is_pair_json(value: object) -> TypeIs[_PairJson]:
-    if not _is_json_object(value):
-        return False
-    required = {
-        "pair_index",
-        "candidate",
-        "core",
-        "valid",
-        "correctness_match",
-    }
-    if not required.issubset(value):
-        return False
-    return (
-        _is_integer(value["pair_index"])
-        and _is_arm_json(value["candidate"])
-        and _is_arm_json(value["core"])
-        and isinstance(value["valid"], bool)
-        and (
-            value["correctness_match"] is None
-            or isinstance(value["correctness_match"], bool)
-        )
-    )
-
-
-def _is_result_json(value: object) -> TypeIs[_ResultJson]:
-    if not _is_json_object(value):
-        return False
-    pairs = value.get("pairs")
-    return (
-        _is_json_array(pairs)
-        and all(_is_pair_json(pair) for pair in pairs)
-        and _is_integer(value.get("scheduled_pairs"))
-        and _is_integer(value.get("valid_pairs"))
-        and isinstance(value.get("verdict"), str)
-        and isinstance(value.get("_run_path"), str)
-        and isinstance(value.get("_config_path"), str)
-    )
-
-
-def _object(value: object) -> dict[str, object]:
-    if not _is_json_object(value):
+def _object(value: object) -> JsonObject:
+    if not _is_object(value):
         raise TypeError("expected JSON object")
     return value
 
 
-def _load_json_object(text: str) -> dict[str, object]:
-    value: object = json.loads(text)
-    return _object(value)
+def _is_array(value: object) -> TypeIs[list[object]]:
+    return isinstance(value, list)
 
 
-def _integer(value: object) -> int:
-    if not _is_integer(value):
-        raise TypeError("expected JSON integer")
+def _array(value: object) -> list[object]:
+    if not _is_array(value):
+        raise TypeError("expected JSON array")
     return value
 
 
-def _required_text(value: object) -> str:
-    if not isinstance(value, str):
-        raise TypeError("expected JSON string")
-    return value
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _cleanup_workspaces() -> None:
-    while _WORKSPACES:
-        _WORKSPACES.pop().cleanup()
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def tearDownModule() -> None:
-    _cleanup_workspaces()
+def _write_executable(path: Path, source: str) -> Path:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
-class _WorkspaceTestCase(unittest.TestCase):
+def _candidate_script(
+    workspace: Path,
+    *,
+    witness: int = 1,
+    stop_hash: str = STOP_HASH,
+    malformed: bool = False,
+    mutate_input: bool = False,
+    restore_swap_input: bool = False,
+    exit_code: int = 0,
+    sleep_seconds: float = 0.06,
+) -> Path:
+    source = f"""#!/usr/bin/env python3.14
+import hashlib
+import json
+import os
+import pathlib
+import sys
+import time
+
+args = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
+data_dir = pathlib.Path(args['--data-dir'])
+corpus = pathlib.Path(args['--blocks-file'])
+manifest = pathlib.Path(args['--corpus-manifest'])
+(data_dir / 'executed.txt').write_text(sys.argv[0], encoding='utf-8')
+(data_dir / 'affinity.json').write_text(
+    json.dumps(sorted(os.sched_getaffinity(0))), encoding='utf-8'
+)
+time.sleep({sleep_seconds!r})
+if {exit_code}:
+    raise SystemExit({exit_code})
+if {mutate_input!r}:
+    with open(corpus, 'ab') as stream:
+        stream.write(b'mutated')
+if {restore_swap_input!r}:
+    original = pathlib.Path({str(workspace / "blocks.dat")!r})
+    held = original.with_name('blocks.held')
+    original.rename(held)
+    original.write_bytes(b'substitute corpus')
+    try:
+        consumed = corpus.read_bytes()
+    finally:
+        original.unlink()
+        held.rename(original)
+    (data_dir / 'consumed.sha256').write_text(
+        hashlib.sha256(consumed).hexdigest(), encoding='ascii'
+    )
+output = pathlib.Path(args['--output'])
+if {malformed!r}:
+    output.write_text('{{bad json', encoding='utf-8')
+    raise SystemExit(0)
+record = {{
+    'schema': 'mainnet-prefix-replay-v2',
+    'measurement_target': 'mainnet-prefix-replay',
+    'git_head': '{COMMIT}',
+    'network': 'mainnet',
+    'network_magic': 'f9beb4d9',
+    'genesis_hash': '{GENESIS}',
+    'corpus_manifest': {{
+        'schema': 'bitcoin-rs-corpus-manifest',
+        'version': 1,
+        'path': str(manifest),
+        'bytes': manifest.stat().st_size,
+        'sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    }},
+    'archive': {{
+        'path': str(corpus),
+        'bytes': corpus.stat().st_size,
+        'sha256': hashlib.sha256(corpus.read_bytes()).hexdigest(),
+    }},
+    'start_height': 0,
+    'start_hash': '{GENESIS}',
+    'stop_height': 2,
+    'stop_hash': '{stop_hash}',
+    'assume_valid_height': 0,
+    'window': 1024,
+    'window_verify_success_total': {witness},
+    'checkpoint_generation': 1,
+    'storage_backend': 'fjall',
+    'txindex': False,
+    'blockfilterindex': False,
+    'block_count': 3,
+    'tx_count': 3,
+    'block_bytes': corpus.stat().st_size,
+    'elapsed_seconds': 0.01,
+    'blocks_per_second': 300.0,
+    'fetch_seconds': 0.001,
+    'decode_seconds': 0.001,
+    'stage_seconds': [{{'stage': 'apply', 'count': 3, 'sum_seconds': 0.01}}],
+    'rss_high_water_bytes': 1024,
+    'block_source': 'file',
+    'data_dir': str(data_dir),
+}}
+output.write_text(json.dumps(record), encoding='utf-8')
+"""
+    return _write_executable(workspace / "fake-candidate.py", source)
+
+
+def _core_script(
+    workspace: Path,
+    *,
+    full_validation: bool = True,
+    gap: bool = False,
+    final_hash: str = STOP_HASH,
+    exit_code: int = 0,
+    sleep_seconds: float = 0.06,
+) -> Path:
+    source = f"""#!/usr/bin/env python3.14
+import json
+import os
+import pathlib
+import sys
+import time
+
+time.sleep({sleep_seconds!r})
+if {exit_code}:
+    raise SystemExit({exit_code})
+args = dict(argument[1:].split('=', 1) for argument in sys.argv[1:])
+log = pathlib.Path(args['debuglogfile'])
+lines = ['2026-01-01T00:00:00Z Bitcoin Core version v31.1.0 (release build)']
+for name, value in args.items():
+    lines.append(f'2026-01-01T00:00:00Z Command-line arg: {{name}}="{{value}}"')
+if {full_validation!r}:
+    lines.append('2026-01-01T00:00:00Z Validating signatures for all blocks.')
+heights = [0, 2] if {gap!r} else [0, 1, 2]
+for height in heights:
+    block_hash = '{final_hash}' if height == 2 else format(height + 3, '064x')
+    lines.append(
+        f'2026-01-01T00:00:00Z UpdateTip: new best={{block_hash}} height={{height}} version=0x1'
+    )
+lines.append('2026-01-01T00:00:01Z Shutdown done')
+log.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')
+data_dir = pathlib.Path(args['datadir'])
+(data_dir / 'executed.txt').write_text(sys.argv[0], encoding='utf-8')
+(data_dir / 'affinity.json').write_text(
+    json.dumps(sorted(os.sched_getaffinity(0))), encoding='utf-8'
+)
+"""
+    return _write_executable(workspace / "fake-core.py", source)
+
+
+def _program(
+    binary: Path, adapter: AdapterKind, command: list[str], *, mimalloc: bool
+) -> JsonObject:
+    return {
+        "adapter": adapter.value,
+        "binary_path": str(binary),
+        "binary_sha256": _sha256(binary),
+        "commit": COMMIT,
+        "build": "synthetic release",
+        "features": ["synthetic"],
+        "mimalloc": mimalloc,
+        "command": command,
+    }
+
+
+def _state() -> JsonObject:
+    return {
+        "height": 2,
+        "bestblock": STOP_HASH,
+        "txouts": 3,
+        "total_amount_sat": 5_000_000_000,
+        "muhash": "3" * 64,
+        "utxo_hash_serialized_3": "4" * 64,
+    }
+
+
+def _proof(
+    corpus: Path,
+    manifest: Path,
+    candidate: JsonObject,
+    core: JsonObject,
+    *,
+    affinity: tuple[int, ...] = (0,),
+    candidate_identity: str | None = None,
+) -> JsonObject:
+    state = _state()
+    return {
+        "schema": "benchmark-campaign-cell-proof-v1",
+        "scope": "role_cell_product",
+        "cell": TARGET.key,
+        "inputs": {
+            "corpus_sha256": _sha256(corpus),
+            "corpus_bytes": corpus.stat().st_size,
+            "manifest_sha256": _sha256(manifest),
+            "manifest_bytes": manifest.stat().st_size,
+        },
+        "affinity": list(affinity),
+        "runtime_dispatch": "synthetic-scalar",
+        "expected_state": state,
+        "candidate": {
+            "program_identity_sha256": candidate_identity
+            if candidate_identity is not None
+            else _canonical_sha256(candidate),
+            "native_evidence_sha256": "5" * 64,
+            "validation_sha256": "6" * 64,
+            "durability_proof_sha256": "7" * 64,
+            "proof_tool_identity_sha256": "8" * 64,
+            "state": state,
+            "durability_ok": True,
+        },
+        "core": {
+            "program_identity_sha256": _canonical_sha256(core),
+            "native_evidence_sha256": "9" * 64,
+            "restart_log_sha256": "a" * 64,
+            "gettxoutsetinfo_sha256": "b" * 64,
+            "state": state,
+            "restart_count": 1,
+            "durability_ok": True,
+        },
+    }
+
+
+class CampaignFixture:
+    workspace: Path
+    corpus: Path
+    manifest: Path
+    proof: Path
+    config: Path
+    candidate: Path
+    core: Path
+
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        candidate_witness: int = 1,
+        candidate_hash: str = STOP_HASH,
+        candidate_malformed: bool = False,
+        mutate_input: bool = False,
+        restore_swap_input: bool = False,
+        candidate_exit: int = 0,
+        core_full_validation: bool = True,
+        core_gap: bool = False,
+        core_hash: str = STOP_HASH,
+        core_exit: int = 0,
+        bad_proof_identity: bool = False,
+        affinity: tuple[int, ...] = (0,),
+    ) -> None:
+        self.workspace = workspace
+        self.corpus = workspace / "blocks.dat"
+        self.manifest = workspace / "manifest.json"
+        self.corpus.write_bytes(b"synthetic framed blocks")
+        self.manifest.write_text('{"schema":"synthetic"}\n', encoding="utf-8")
+        self.candidate = _candidate_script(
+            workspace,
+            witness=candidate_witness,
+            stop_hash=candidate_hash,
+            malformed=candidate_malformed,
+            mutate_input=mutate_input,
+            restore_swap_input=restore_swap_input,
+            exit_code=candidate_exit,
+        )
+        self.core = _core_script(
+            workspace,
+            full_validation=core_full_validation,
+            gap=core_gap,
+            final_hash=core_hash,
+            exit_code=core_exit,
+        )
+        candidate_program = _program(
+            self.candidate,
+            AdapterKind.BITCOIN_RS_REPLAY,
+            [
+                str(self.candidate),
+                "--stop-height",
+                "2",
+                "--blocks-file",
+                "{corpus_path}",
+                "--corpus-manifest",
+                "{manifest_path}",
+                "--assume-valid-height",
+                "0",
+                "--storage-backend",
+                "fjall",
+                "--data-dir",
+                "{data_dir}",
+                "--output",
+                "{result_path}",
+            ],
+            mimalloc=True,
+        )
+        core_program = _program(
+            self.core,
+            AdapterKind.BITCOIN_CORE_LOADBLOCK,
+            [
+                str(self.core),
+                "-assumevalid=0",
+                "-blocksxor=0",
+                "-connect=0",
+                "-datadir={data_dir}",
+                "-debuglogfile={result_path}",
+                "-disablewallet=1",
+                "-dnsseed=0",
+                "-fixedseeds=0",
+                "-listen=0",
+                "-loadblock={corpus_path}",
+                "-server=1",
+                "-stopatheight=2",
+            ],
+            mimalloc=False,
+        )
+        proof = _proof(
+            self.corpus,
+            self.manifest,
+            candidate_program,
+            core_program,
+            affinity=affinity,
+            candidate_identity="f" * 64 if bad_proof_identity else None,
+        )
+        self.proof = workspace / "cell-proof.json"
+        self.proof.write_text(json.dumps(proof), encoding="utf-8")
+        cells: list[object] = []
+        for cell in ALL_CELLS:
+            ready = cell == TARGET
+            cells.append(
+                {
+                    "cell": {
+                        "domain": cell.domain.value,
+                        "corpus": cell.corpus.value,
+                        "architecture": cell.architecture.value,
+                        "backend": cell.backend.value,
+                    },
+                    "blocked_reason": None if ready else "not configured",
+                    "candidate": candidate_program,
+                    "core": core_program,
+                    "corpus_path": str(self.corpus),
+                    "corpus_sha256": _sha256(self.corpus),
+                    "manifest_path": str(self.manifest),
+                    "manifest_sha256": _sha256(self.manifest),
+                    "proof_path": str(self.proof) if ready else None,
+                    "proof_sha256": _sha256(self.proof) if ready else None,
+                    "affinity": list(affinity),
+                }
+            )
+        config: JsonObject = {
+            "schema": "benchmark-campaign-config-v2",
+            "schedule_seed": 42,
+            "output_root": str(workspace / "out"),
+            "cells": cells,
+        }
+        self.config = workspace / "config.json"
+        self.config.write_text(json.dumps(config), encoding="utf-8")
+
+    def run(self) -> tuple[runner.CellResult, Path]:
+        return run_cell(load_config(self.config), TARGET)
+
+
+class WorkspaceTestCase(unittest.TestCase):
+    _temporary: tempfile.TemporaryDirectory[str]
+    workspace: Path
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._temporary.name).resolve()
+
     def tearDown(self) -> None:
-        _cleanup_workspaces()
+        self._temporary.cleanup()
 
 
-class UniverseTests(unittest.TestCase):
-    def test_exactly_thirty_six_unique_cells(self) -> None:
+class UniverseAndScheduleTests(unittest.TestCase):
+    def test_exact_cell_universe(self) -> None:
         self.assertEqual(len(ALL_CELLS), 36)
         self.assertEqual(len(set(ALL_CELLS)), 36)
 
-    def test_cartesian_closure(self) -> None:
-        expected = {
-            (domain, corpus, arch, backend)
-            for domain in Domain
-            for corpus in Corpus
-            for arch in Architecture
-            for backend in Backend
-        }
-        actual = {
-            (cell.domain, cell.corpus, cell.architecture, cell.backend)
-            for cell in ALL_CELLS
-        }
-        self.assertEqual(expected, actual)
-
-
-class ScheduleTests(unittest.TestCase):
-    def test_seven_pairs_every_cell(self) -> None:
+    def test_every_schedule_has_seven_balanced_pairs(self) -> None:
         for cell in ALL_CELLS:
-            schedule = schedule_for(cell, 0)
-            self.assertEqual(len(schedule), 7)
-            for order in schedule:
-                self.assertEqual(frozenset(order), frozenset(Role))
+            schedule = schedule_for(cell, 42)
+            self.assertEqual(len(schedule), PAIR_COUNT)
+            self.assertTrue(all(set(pair) == set(runner.Role) for pair in schedule))
+            candidate_first = sum(pair[0] is runner.Role.CANDIDATE for pair in schedule)
+            self.assertIn(candidate_first, (3, 4))
 
-    def test_fixed_schedule_vectors(self) -> None:
-        core_first = (
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
+    def test_ratio_boundary_is_inclusive(self) -> None:
+        candidate, core, ratio, verdict = classify_wall_performance(
+            [10] * PAIR_COUNT, [20] * PAIR_COUNT
         )
-        candidate_first = (
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-            (Role.CORE, Role.CANDIDATE),
-            (Role.CANDIDATE, Role.CORE),
-        )
-        self.assertEqual(schedule_for(ALL_CELLS[0], 0), core_first)
-        self.assertEqual(schedule_for(ALL_CELLS[0], 1), candidate_first)
-        self.assertEqual(schedule_for(ALL_CELLS[2], 0), candidate_first)
-
-    def test_alternating_balance(self) -> None:
-        for cell in ALL_CELLS:
-            schedule = schedule_for(cell, 0)
-            first_candidate = sum(1 for order in schedule if order[0] is Role.CANDIDATE)
-            first_core = 7 - first_candidate
-            self.assertIn(first_candidate, (3, 4))
-            self.assertIn(first_core, (3, 4))
+        self.assertEqual((candidate, core, ratio, verdict), (10, 20, 2.0, Verdict.PASS))
 
 
-class PlaceholderTests(unittest.TestCase):
-    def test_exact_placeholders_only(self) -> None:
-        paths = {"arm_dir": "/a", "data_dir": "/a/d", "result_path": "/a/d/r.json"}
-        self.assertEqual(
-            expand_command(
-                ("{arm_dir}/bin", "--data", "{data_dir}", "--out", "{result_path}"),
-                paths,
-            ),
-            ("/a/bin", "--data", "/a/d", "--out", "/a/d/r.json"),
-        )
+class ConfigContractTests(WorkspaceTestCase):
+    def test_unknown_adapter_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        cells = _array(raw["cells"])
+        first = _object(cells[0])
+        candidate = _object(first["candidate"])
+        candidate["adapter"] = "wrapper"
+        with self.assertRaisesRegex(ContractError, "unsupported value"):
+            parse_config(raw)
 
-    def test_rejects_unknown_placeholder(self) -> None:
-        paths = {"arm_dir": "/a", "data_dir": "/a/d", "result_path": "/a/d/r.json"}
-        with self.assertRaises(ContractError):
-            expand_command(("{home}",), paths)
-
-    def test_rejects_attribute_access(self) -> None:
-        paths = {"arm_dir": "/a", "data_dir": "/a/d", "result_path": "/a/d/r.json"}
-        with self.assertRaises(ContractError):
-            expand_command(("{arm_dir.__class__}",), paths)
-
-    def test_rejects_format_spec(self) -> None:
-        paths = {"arm_dir": "/a", "data_dir": "/a/d", "result_path": "/a/d/r.json"}
-        with self.assertRaises(ContractError):
-            expand_command(("{arm_dir!r}",), paths)
-
-
-class JsonStrictnessTests(_WorkspaceTestCase):
-    def test_unknown_keys_rejected_in_config(self) -> None:
-        base = _minimal_config()
-        malformed: dict[str, object] = dict(base)
-        malformed["extra_field"] = "bad"
-        with self.assertRaises(ContractError):
-            parse_config(malformed)
-
-    def test_relative_output_root_rejected(self) -> None:
-        base = _minimal_config()
-        base["output_root"] = "."
-        with self.assertRaisesRegex(ContractError, "absolute normalized path"):
-            parse_config(base)
-
-    def test_output_root_alias_rejected(self) -> None:
-        base = _minimal_config()
-        with tempfile.TemporaryDirectory() as workspace:
-            real = Path(workspace) / "real"
-            alias = Path(workspace) / "alias"
-            real.mkdir()
-            alias.symlink_to(real, target_is_directory=True)
-            base["output_root"] = str(alias / "out")
-            with self.assertRaisesRegex(ContractError, "filesystem alias"):
-                parse_config(base)
-
-    def test_bool_as_int_rejected(self) -> None:
-        base = _minimal_config()
-        base["schedule_seed"] = True
-        with self.assertRaises(ContractError):
-            parse_config(base)
-
-    def test_hash_width_rejected(self) -> None:
-        base = _minimal_config()
-        base["cells"][0]["candidate"]["binary_sha256"] = "0" * 63
-        with self.assertRaises(ContractError):
-            parse_config(base)
-
-    def test_mixed_case_hash_rejected(self) -> None:
-        base = _minimal_config()
-        base["cells"][0]["candidate"]["binary_sha256"] = "A" * 64
-        with self.assertRaises(ContractError):
-            parse_config(base)
-
-    def test_nonempty_argv(self) -> None:
-        base = _minimal_config()
-        base["cells"][0]["candidate"]["command"] = []
-        with self.assertRaises(ContractError):
-            parse_config(base)
-
-    def test_malformed_child_result_rejected(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        child = result["pairs"][0]["candidate"]["child_result"]
-        if child is None:
-            self.fail("successful fake arm has no child result")
-        child["height"] = "not an int"
-        with self.assertRaises(ContractError):
-            parse_result(_schema_result(result))
-
-    def test_unknown_keys_in_child_result_rejected(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        child = result["pairs"][0]["candidate"]["child_result"]
-        if child is None:
-            self.fail("successful fake arm has no child result")
-        child["extra"] = 1
-        with self.assertRaises(ContractError):
-            parse_result(_schema_result(result))
-
-    def test_raw_child_evidence_must_match_parsed_child(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5)
-        raw = _object(result["pairs"][0]["candidate"]["child_result_raw"])
-        raw["height"] = _integer(raw.get("height")) + 1
-        with self.assertRaisesRegex(ContractError, "child_result_raw"):
-            parse_result(_schema_result(result))
-
-    def test_arm_guard_rejects_missing_optional_value_keys(self) -> None:
-        arm: dict[str, object] = {
-            "child_result_raw": None,
-            "error": None,
-            "pid": None,
-            "wall_ns": None,
-            "arm_dir": "/arm",
-            "data_dir": "/arm/data",
-            "result_path": "/arm/result",
-            "stdout_path": "/arm/stdout",
-            "stderr_path": "/arm/stderr",
-        }
-        self.assertFalse(_is_arm_json(arm))
-
-    def test_pair_guard_requires_correctness_key(self) -> None:
-        pair: dict[str, object] = {
-            "pair_index": 0,
-            "candidate": {},
-            "core": {},
-            "valid": False,
-        }
-        self.assertFalse(_is_pair_json(pair))
-
-
-class ExecutionTests(_WorkspaceTestCase):
-    def test_complete_seven_pair_run(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        self.assertEqual(len(result["pairs"]), 7)
-        self.assertEqual(result["scheduled_pairs"], 7)
-        self.assertEqual(result["valid_pairs"], 7)
-
-    def test_process_failure_invalidates_pair(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(
-            base, speed_ms=5, fail_pair_index=2, fail_role=Role.CANDIDATE
-        )
-        pair = result["pairs"][2]
-        self.assertFalse(pair["valid"])
-        self.assertEqual(result["valid_pairs"], 6)
-        self.assertEqual(result["verdict"], "fail_run")
-
-    def test_invalid_environment_pair(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(
-            base, speed_ms=5, invalid_env_pair_index=1, invalid_env_role=Role.CORE
-        )
-        self.assertEqual(result["verdict"], "invalid_env")
-
-    def test_false_source_capacity_invalidates_p2p_environment(self) -> None:
-        p2p_cell = next(
-            cell
-            for cell in ALL_CELLS
-            if cell.domain is Domain.P2P
-            and cell.corpus is Corpus.C150
-            and cell.architecture is Architecture.X86_64
-            and cell.backend is Backend.FJALL
-        )
-        result = _run_with_fake(
-            _minimal_config(),
-            cell=p2p_cell,
-            speed_ms=5,
-            source_capacity_ok=False,
-        )
-        self.assertEqual(result["verdict"], "invalid_env")
-
-    def test_false_offline_durability_fails_correctness(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5, durability_ok=False)
-        self.assertEqual(result["verdict"], "fail_correctness")
-
-    def test_rpc_durability_failure_dominates_invalid_environment(self) -> None:
-        rpc_cell = next(
-            cell
-            for cell in ALL_CELLS
-            if cell.domain is Domain.RPC
-            and cell.corpus is Corpus.C150
-            and cell.architecture is Architecture.X86_64
-            and cell.backend is Backend.FJALL
-        )
-        result = _run_with_fake(
-            _minimal_config(),
-            cell=rpc_cell,
-            speed_ms=5,
-            durability_ok=False,
-            source_capacity_ok=False,
-        )
-        self.assertEqual(result["verdict"], "fail_correctness")
-
-    def test_binary_hash_mismatch_fails_run(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5, binary_sha256="f" * 64)
-        self.assertEqual(result["verdict"], "fail_run")
-        self.assertIn(
-            "program binary hash mismatch",
-            _required_text(result["pairs"][0]["candidate"]["error"]),
-        )
-        validated = validate_result(
-            Path(result["_run_path"]), Path(result["_config_path"])
-        )
-        self.assertEqual(validated.verdict.value, "fail_run")
-
-    def test_relative_binary_path_fails_run(self) -> None:
-        result = _run_with_fake(
-            _minimal_config(), speed_ms=5, binary_path="fake-child.py"
-        )
-        self.assertEqual(result["verdict"], "fail_run")
-        self.assertIn(
-            "binary_path must be absolute",
-            _required_text(result["pairs"][0]["candidate"]["error"]),
-        )
-
-    def test_command_must_execute_bound_binary(self) -> None:
-        with self.assertRaisesRegex(ContractError, "bound binary_path"):
-            _run_with_fake(
-                _minimal_config(),
-                speed_ms=5,
-                command_binary_path="/different/program",
-            )
-
-    def test_post_exit_binary_mutation_fails_run(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5, mutate_binary=True)
-        self.assertEqual(result["verdict"], "fail_run")
-        errors: list[str] = []
-        for pair in result["pairs"]:
-            for arm in (pair["candidate"], pair["core"]):
-                error = arm["error"]
-                if error is not None:
-                    errors.append(error)
-        self.assertTrue(
-            any("program custody changed during execution" in error for error in errors)
-        )
-
-    def test_private_custody_copy_is_the_executed_program(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5)
-        run_dir = Path(result["_run_path"]).parent
-        candidate_command = result["pairs"][0]["candidate"]["command"]
-        self.assertEqual(
-            Path(candidate_command[3]),
-            run_dir / "programs" / "candidate" / "fake-child.py",
-        )
-
-    def test_source_mutation_cannot_change_custodied_run(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5, mutate_source=True)
-        self.assertEqual(result["valid_pairs"], 7)
-        validated = validate_result(
-            Path(result["_run_path"]), Path(result["_config_path"])
-        )
-        self.assertEqual(validated.valid_pairs, 7)
-
-    def test_configured_corpus_hash_must_match(self) -> None:
-        with self.assertRaisesRegex(ContractError, "corpus_path hash mismatch"):
-            _run_with_fake(_minimal_config(), speed_ms=5, corpus_sha256="f" * 64)
-
-    def test_input_mutation_fails_run(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5, mutate_input=True)
-        self.assertEqual(result["verdict"], "fail_run")
-        errors = [
-            _required_text(arm["error"])
-            for pair in result["pairs"]
-            for arm in (pair["candidate"], pair["core"])
-            if arm["error"] is not None
+    def test_adapter_requires_every_exact_placeholder(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        first = _object(_array(raw["cells"])[0])
+        candidate = _object(first["candidate"])
+        command = _array(candidate["command"])
+        candidate["command"] = [
+            value for value in command if value != "{manifest_path}"
         ]
-        self.assertTrue(
-            any("corpus_path changed during campaign" in error for error in errors)
-        )
+        with self.assertRaisesRegex(ContractError, "must use exactly"):
+            parse_config(raw)
 
-    def test_log_durability_work_is_outside_wall_measurement(self) -> None:
-        clock_calls = 0
-        fsync_calls = 0
-        fsyncs_at_start = 0
-        real_sleep = time.sleep
+    def test_timed_candidate_has_no_validation_output(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        campaign = load_config(fixture.config)
+        self.assertNotIn("--validation-output", campaign.cells[0].candidate.command)
 
-        def monotonic_ns() -> int:
-            nonlocal clock_calls, fsyncs_at_start
-            arm_index, boundary = divmod(clock_calls, 2)
-            clock_calls += 1
-            if boundary == 0:
-                fsyncs_at_start = fsync_calls
-                return arm_index * 2_000_000
-            self.assertEqual(fsync_calls, fsyncs_at_start)
-            return arm_index * 2_000_000 + 1_000_000
+    def test_validation_output_is_rejected_before_timing(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        first = _object(_array(raw["cells"])[0])
+        candidate = _object(first["candidate"])
+        command = _array(candidate["command"])
+        candidate["command"] = [*command, "--validation-output", "/tmp/validation"]
+        proof = _object(json.loads(fixture.proof.read_text(encoding="utf-8")))
+        proof_candidate = _object(proof["candidate"])
+        proof_candidate["program_identity_sha256"] = _canonical_sha256(candidate)
+        fixture.proof.write_text(json.dumps(proof), encoding="utf-8")
+        first["proof_sha256"] = _sha256(fixture.proof)
+        fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "must not include"):
+            fixture.run()
 
-        def delayed_fsync(_descriptor: int) -> None:
-            nonlocal fsync_calls
-            fsync_calls += 1
-            real_sleep(0.001)
+    def test_ready_cell_requires_proof(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        first = _object(_array(raw["cells"])[0])
+        first["proof_path"] = None
+        first["proof_sha256"] = None
+        with self.assertRaisesRegex(ContractError, "requires a proof"):
+            parse_config(raw)
+
+    def test_proof_must_bind_exact_program_identity(self) -> None:
+        fixture = CampaignFixture(self.workspace, bad_proof_identity=True)
+        with self.assertRaisesRegex(ContractError, "candidate identity"):
+            fixture.run()
+
+
+class NativeExecutionTests(WorkspaceTestCase):
+    def test_complete_seven_pair_run_and_round_trip(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        result, result_path = fixture.run()
+        self.assertEqual(result.scheduled_pairs, PAIR_COUNT)
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        self.assertTrue(all(pair.correctness_match for pair in result.pairs))
+        self.assertEqual(result.proof_scope, "role_cell_product")
+        validated = validate_result(result_path, fixture.config)
+        self.assertEqual(validated, result)
+        for pair in result.pairs:
+            for arm in (pair.candidate, pair.core):
+                self.assertGreater(arm.wall_ns or 0, 0)
+                self.assertGreater(arm.peak_rss_bytes or 0, 0)
+                executed = Path(arm.data_dir, "executed.txt").read_text(
+                    encoding="utf-8"
+                )
+                self.assertEqual(executed, arm.command[0])
+                self.assertRegex(executed, r"\A/proc/self/fd/[0-9]+\Z")
+
+    def test_run_closes_all_pinned_descriptors(self) -> None:
+        before = len(tuple(Path("/proc/self/fd").iterdir()))
+        CampaignFixture(self.workspace).run()
+        after = len(tuple(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
+
+    def test_core_prepare_exception_closes_candidate_descriptor(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        original_prepare = runner._prepare_program  # pyright: ignore[reportPrivateUsage]
+        candidate_descriptor: int | None = None
+
+        def fail_core_prepare(
+            program: runner.ProgramIdentity, role: runner.Role, run_dir: Path
+        ) -> runner.ProgramCustody:
+            nonlocal candidate_descriptor
+            if role is runner.Role.CORE:
+                raise OSError("core preparation failed")
+            custody = original_prepare(program, role, run_dir)
+            if isinstance(custody, runner.PreparedProgram):
+                candidate_descriptor = custody.descriptor
+            return custody
 
         with (
-            mock.patch.object(runner.time, "monotonic_ns", monotonic_ns),
-            mock.patch.object(runner.os, "fsync", delayed_fsync),
+            patch.object(runner, "_prepare_program", fail_core_prepare),
+            self.assertRaisesRegex(OSError, "core preparation failed"),
         ):
-            result = _run_with_fake(_minimal_config(), speed_ms=5)
+            fixture.run()
+        self.assertIsNotNone(candidate_descriptor)
+        with self.assertRaises(OSError):
+            os.fstat(candidate_descriptor or -1)
 
-        walls = [
-            arm["wall_ns"]
-            for pair in result["pairs"]
-            for arm in (pair["candidate"], pair["core"])
+    def test_path_taskset_interposition_is_ignored(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        fake_bin = self.workspace / "fake-bin"
+        fake_bin.mkdir()
+        marker = self.workspace / "taskset-ran"
+        _write_executable(
+            fake_bin / "taskset",
+            f"#!/bin/sh\nprintf ran > {marker}\nexit 99\n",
+        )
+        with patch.dict(os.environ, {"PATH": f"{fake_bin}:{os.environ['PATH']}"}):
+            result, _path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        self.assertFalse(marker.exists())
+
+    def test_child_affinity_is_applied_without_a_launcher(self) -> None:
+        parent_affinity = os.sched_getaffinity(0)
+        affinity = (max(parent_affinity),)
+        result, _path = CampaignFixture(self.workspace, affinity=affinity).run()
+        self.assertEqual(os.sched_getaffinity(0), parent_affinity)
+        for pair in result.pairs:
+            for arm in (pair.candidate, pair.core):
+                observed = json.loads(
+                    Path(arm.data_dir, "affinity.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(observed, list(affinity))
+
+    def test_unavailable_child_affinity_fails_the_run(self) -> None:
+        unavailable = max(os.sched_getaffinity(0)) + 1
+        result, _path = CampaignFixture(self.workspace, affinity=(unavailable,)).run()
+        self.assertEqual(result.valid_pairs, 0)
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
+    def test_spawn_failure_restores_parent_affinity(self) -> None:
+        parent_affinity = os.sched_getaffinity(0)
+        affinity = (min(parent_affinity),)
+        fixture = CampaignFixture(self.workspace, affinity=affinity)
+        with patch.object(
+            runner.subprocess, "Popen", side_effect=OSError("spawn failed")
+        ):
+            result, _path = fixture.run()
+        self.assertEqual(os.sched_getaffinity(0), parent_affinity)
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
+    def test_restore_swap_consumes_pinned_corpus_before_detection(self) -> None:
+        fixture = CampaignFixture(self.workspace, restore_swap_input=True)
+        expected = _sha256(fixture.corpus)
+        result, result_path = fixture.run()
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+        consumed = [
+            path.read_text(encoding="ascii")
+            for pair in result.pairs
+            if (path := Path(pair.candidate.data_dir, "consumed.sha256")).is_file()
         ]
-        self.assertEqual(walls, [1_000_000] * 14)
-        self.assertEqual(clock_calls, 28)
-        self.assertGreaterEqual(fsync_calls, 28)
+        self.assertTrue(consumed)
+        self.assertEqual(set(consumed), {expected})
+        self.assertEqual(validate_result(result_path, fixture.config), result)
 
-    def test_new_result_directory_hierarchy_is_fsynced(self) -> None:
-        synced: list[Path] = []
-        fsync_directory = runner._fsync_directory  # pyright: ignore[reportPrivateUsage]
+    def test_zero_candidate_witness_fails_correctness(self) -> None:
+        result, _path = CampaignFixture(self.workspace, candidate_witness=0).run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
 
-        def record_fsync(path: Path) -> None:
-            synced.append(path)
-            fsync_directory(path)
+    def test_wrong_candidate_tip_fails_correctness(self) -> None:
+        result, _path = CampaignFixture(self.workspace, candidate_hash="c" * 64).run()
+        self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
 
-        with mock.patch.object(runner, "_fsync_directory", record_fsync):
-            result = _run_with_fake(_minimal_config(), speed_ms=5)
+    def test_core_without_full_validation_marker_fails_correctness(self) -> None:
+        result, _path = CampaignFixture(
+            self.workspace, core_full_validation=False
+        ).run()
+        self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
 
-        run_dir = Path(result["_run_path"]).parent
-        output_root = run_dir.parent
-        self.assertIn(output_root.parent, synced)
-        self.assertIn(output_root, synced)
-        self.assertIn(run_dir, synced)
+    def test_core_update_tip_gap_fails_correctness(self) -> None:
+        result, _path = CampaignFixture(self.workspace, core_gap=True).run()
+        self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
 
-    def test_observation_failure_kills_and_reaps_child(self) -> None:
-        with mock.patch.object(
-            runner,
-            "_read_starttime",
-            side_effect=ContractError("synthetic observation failure"),
+    def test_native_process_failure_is_not_replaced(self) -> None:
+        result, _path = CampaignFixture(self.workspace, candidate_exit=7).run()
+        self.assertEqual(result.scheduled_pairs, PAIR_COUNT)
+        self.assertEqual(result.valid_pairs, 0)
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
+    def test_malformed_native_evidence_fails_run(self) -> None:
+        result, _path = CampaignFixture(self.workspace, candidate_malformed=True).run()
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
+    def test_input_mutation_fails_run(self) -> None:
+        result, _path = CampaignFixture(self.workspace, mutate_input=True).run()
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
+    def test_native_parsing_happens_after_wait4(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        wait_completed = False
+        original_wait = runner._wait_and_measure  # pyright: ignore[reportPrivateUsage]
+        original_parse = runner._parse_native_result  # pyright: ignore[reportPrivateUsage]
+
+        def observed_wait(
+            process: runner.subprocess.Popen[bytes],
+        ) -> tuple[int, int, int, int, int, int]:
+            nonlocal wait_completed
+            result = original_wait(process)
+            wait_completed = True
+            return result
+
+        def guarded_parse(
+            config: runner.CellConfig,
+            proof: runner.CellProof,
+            role: runner.Role,
+            command: tuple[str, ...],
+            data_dir: Path,
+            result_path: Path,
+            inputs: runner.InputCustody,
+            paths: dict[str, str],
+        ) -> runner.NativeArmResult:
+            self.assertTrue(wait_completed)
+            return original_parse(
+                config, proof, role, command, data_dir, result_path, inputs, paths
+            )
+
+        with (
+            patch.object(runner, "_wait_and_measure", observed_wait),
+            patch.object(runner, "_parse_native_result", guarded_parse),
         ):
-            result = _run_with_fake(_minimal_config(), speed_ms=100)
+            fixture.run()
 
-        for pair in result["pairs"]:
-            for arm in (pair["candidate"], pair["core"]):
-                self.assertIn(
-                    "synthetic observation failure", _required_text(arm["error"])
-                )
-                pid = arm["pid"]
-                if pid is None:
-                    self.fail("launched arm has no PID")
-                with self.assertRaises(ChildProcessError):
-                    os.waitpid(pid, os.WNOHANG)
 
-    def test_zombie_rss_race_retries_until_wait4_reaps(self) -> None:
-        process = subprocess.Popen(
-            [sys.executable, "-c", "pass"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        try:
-            os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
-            starttime = runner._read_starttime(  # pyright: ignore[reportPrivateUsage]
-                process.pid
-            )
-            self.assertIsNone(
-                runner._sample_rss(  # pyright: ignore[reportPrivateUsage]
-                    process.pid, starttime
-                )
-            )
-        finally:
-            process.wait()
+class EvidenceCustodyTests(WorkspaceTestCase):
+    def test_role_executable_descriptor_must_not_change(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        pair = _object(_array(raw["pairs"])[0])
+        candidate = _object(pair["candidate"])
+        command = _array(candidate["command"])
+        command[0] = "/proc/self/fd/999"
+        result_path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "descriptor changed"):
+            validate_result(result_path, fixture.config)
 
-    def test_invalid_pair_not_replaced(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(
-            base, speed_ms=5, fail_pair_index=0, fail_role=Role.CORE
-        )
-        self.assertEqual(len(result["pairs"]), 7)
-        self.assertEqual(result["scheduled_pairs"], 7)
-        self.assertEqual(result["valid_pairs"], 6)
+    def test_reused_executable_and_input_descriptor_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        pair = _object(_array(raw["pairs"])[0])
+        candidate = _object(pair["candidate"])
+        command = _array(candidate["command"])
+        corpus_index = command.index("--blocks-file") + 1
+        command[0] = command[corpus_index]
+        result_path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "reuses.*descriptor"):
+            validate_result(result_path, fixture.config)
 
-    def test_state_mismatch_fails_correctness(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5, mismatch_pair_index=3)
-        pair = result["pairs"][3]
-        self.assertTrue(pair["valid"])
-        self.assertFalse(pair["correctness_match"])
-        self.assertEqual(result["verdict"], "fail_correctness")
+    def test_repeated_validation_closes_program_snapshots(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        before = len(tuple(Path("/proc/self/fd").iterdir()))
+        for _ in range(3):
+            validate_result(result_path, fixture.config)
+        after = len(tuple(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
 
-    def test_blocked_cell_refused(self) -> None:
-        base = _minimal_config()
-        base["cells"][0]["blocked_reason"] = "cmodern aarch64 unsupported"
-        config = _write_config(base)
+    def test_result_file_must_remain_in_its_configured_run_directory(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        copied = self.workspace / "copied" / "custody-result.json"
+        copied.parent.mkdir()
+        copied.write_bytes(result_path.read_bytes())
+        with self.assertRaisesRegex(ContractError, "output_root"):
+            validate_result(copied, fixture.config)
+
+    def test_tampered_native_evidence_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        result, result_path = fixture.run()
+        Path(result.pairs[0].candidate.result_path).write_text("{}", encoding="utf-8")
         with self.assertRaises(ContractError):
-            run_cell(load_config(config), ALL_CELLS[0])
+            validate_result(result_path, fixture.config)
 
-    def test_ratio_boundary_at_two_zero(self) -> None:
-        candidate, core, ratio, verdict = classify_wall_performance(
-            [100] * 7, [200] * 7
-        )
-        self.assertEqual((candidate, core, ratio), (100, 200, 2.0))
-        self.assertEqual(verdict.value, "pass")
+    def test_tampered_proof_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        fixture.proof.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "proof_path hash mismatch"):
+            validate_result(result_path, fixture.config)
 
-    def test_ratio_fails_perf(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, candidate_ms=200, core_ms=100)
-        self.assertEqual(result["verdict"], "fail_perf")
+    def test_post_wait_parse_latency_is_not_in_arm_wall(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        original_parse = runner._parse_native_result  # pyright: ignore[reportPrivateUsage]
 
-    def test_output_tamper_detected(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        result["valid_pairs"] = 0
-        with self.assertRaises(ContractError):
-            parse_result(_schema_result(result))
-
-    def test_path_freshness(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        paths: set[str] = set()
-        for pair in result["pairs"]:
-            for arm_name in ("candidate", "core"):
-                arm = pair[arm_name]
-                for key in (
-                    "arm_dir",
-                    "data_dir",
-                    "result_path",
-                    "stdout_path",
-                    "stderr_path",
-                ):
-                    path = arm[key]
-                    self.assertNotIn(path, paths)
-                    paths.add(path)
-                    self.assertTrue(Path(path).exists())
-
-    def test_path_alias_tamper_detected(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5)
-        arm = result["pairs"][0]["candidate"]
-        arm["stdout_path"] = arm["stdout_path"].replace("/stdout.log", "/./stdout.log")
-        with self.assertRaisesRegex(ContractError, "normalized path"):
-            parse_result(_schema_result(result))
-
-    def test_arm_artifacts_must_remain_contained(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5)
-        arm = result["pairs"][0]["candidate"]
-        arm["stdout_path"] = str(Path(arm["arm_dir"]).parent / "outside.log")
-        with self.assertRaisesRegex(ContractError, "outside arm_dir"):
-            parse_result(_schema_result(result))
-
-    def test_cli_subprocess_run_and_validate(self) -> None:
-        base = _minimal_config()
-        prepared = _run_with_fake(base, speed_ms=5)
-        config_path = prepared["_config_path"]
-        runner = Path(__file__).with_name("runner.py")
-        run_proc = subprocess.run(
-            [
-                sys.executable,
-                str(runner),
-                "run",
-                "--config",
-                config_path,
-                "--cell",
-                ALL_CELLS[0].key,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        run_obj = _load_json_object(run_proc.stdout)
-        result_path = _required_text(run_obj.get("result"))
-        val_proc = subprocess.run(
-            [
-                sys.executable,
-                str(runner),
-                "validate",
-                "--result",
-                result_path,
-                "--config",
-                config_path,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        val_obj = _load_json_object(val_proc.stdout)
-        self.assertEqual(_required_text(val_obj.get("cell")), ALL_CELLS[0].key)
-
-        missing_config = subprocess.run(
-            [
-                sys.executable,
-                str(runner),
-                "validate",
-                "--result",
-                result_path,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(missing_config.returncode, 2)
-        self.assertIn("--config", missing_config.stderr)
-
-    def test_cli_plan_and_help(self) -> None:
-        base = _minimal_config()
-        with tempfile.TemporaryDirectory() as workspace:
-            config_path = Path(workspace) / "config.json"
-            config_path.write_text(json.dumps(base))
-            runner = Path(__file__).with_name("runner.py")
-            plan_proc = subprocess.run(
-                [sys.executable, str(runner), "plan", "--config", str(config_path)],
-                check=True,
-                capture_output=True,
-                text=True,
+        def slow_parse(
+            config: runner.CellConfig,
+            proof: runner.CellProof,
+            role: runner.Role,
+            command: tuple[str, ...],
+            data_dir: Path,
+            result_path: Path,
+            inputs: runner.InputCustody,
+            paths: dict[str, str],
+        ) -> runner.NativeArmResult:
+            time.sleep(0.03)
+            return original_parse(
+                config, proof, role, command, data_dir, result_path, inputs, paths
             )
-            plan = _load_json_object(plan_proc.stdout)
-            cells = plan.get("cells")
-            if not _is_json_array(cells):
-                self.fail("plan cells must be a JSON array")
-            self.assertEqual(len(cells), 36)
-            for op in ("plan", "run", "validate"):
-                proc = subprocess.run(
-                    [sys.executable, str(runner), op, "--help"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertIn("usage:", proc.stdout.lower())
 
-
-class IdentityBindingTests(_WorkspaceTestCase):
-    def test_identity_hash_bound_to_result(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        config = _write_config(base)
-        validated = validate_result(Path(result["_run_path"]), config)
-        self.assertEqual(validated.cell_config.cell, ALL_CELLS[0])
-
-    def test_changed_config_rejected(self) -> None:
-        base = _minimal_config()
-        result = _run_with_fake(base, speed_ms=5)
-        base["schedule_seed"] = base["schedule_seed"] + 1
-        config = _write_config(base)
-        with self.assertRaises(ContractError):
-            validate_result(Path(result["_run_path"]), config)
-
-    def test_tampered_program_custody_rejected(self) -> None:
-        result = _run_with_fake(_minimal_config(), speed_ms=5)
-        command = result["pairs"][0]["candidate"]["command"]
-        with Path(command[3]).open("ab") as executable:
-            executable.write(b"tampered")
-        with self.assertRaisesRegex(ContractError, "program custody candidate"):
-            validate_result(Path(result["_run_path"]), Path(result["_config_path"]))
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _minimal_config() -> _CampaignConfigJson:
-    cells: list[_CellConfigJson] = []
-    for cell in ALL_CELLS:
-        cells.append(
-            {
-                "cell": {
-                    "domain": cell.domain.value,
-                    "corpus": cell.corpus.value,
-                    "architecture": cell.architecture.value,
-                    "backend": cell.backend.value,
-                },
-                "blocked_reason": None,
-                "candidate": _program_identity("candidate"),
-                "core": _program_identity("core"),
-                "corpus_path": "/fake/corpus",
-                "corpus_sha256": "0" * 64,
-                "manifest_path": "/fake/manifest",
-                "manifest_sha256": "0" * 64,
-                "affinity": [0, 1, 2, 3],
-            }
-        )
-    return {
-        "schema": "benchmark-campaign-config-v1",
-        "schedule_seed": 42,
-        "output_root": str(
-            Path(tempfile.gettempdir()).resolve() / "benchmark-campaign-unused-output"
-        ),
-        "cells": cells,
-    }
-
-
-def _program_identity(role: str) -> _ProgramJson:
-    return {
-        "binary_path": f"/fake/{role}",
-        "binary_sha256": "0" * 64,
-        "commit": "abc123",
-        "build": f"{role}-build",
-        "features": ["kernel"],
-        "mimalloc": False,
-        "command": ["{arm_dir}/bin", "--data", "{data_dir}", "--out", "{result_path}"],
-        "exposes_full_validation_witness": True,
-        "consensus_proof_hash": "0" * 64,
-    }
-
-
-def _write_config(base: _CampaignConfigJson) -> Path:
-    handle, path = tempfile.mkstemp(suffix=".json")
-    os.close(handle)
-    Path(path).write_text(json.dumps(base))
-    return Path(path)
-
-
-def _fake_child_script(
-    workspace: Path,
-    *,
-    candidate_ms: int,
-    core_ms: int,
-    fail_pair_index: int | None,
-    fail_role: Role | None,
-    mismatch_pair_index: int | None,
-    invalid_env_pair_index: int | None,
-    invalid_env_role: Role | None,
-    durability_ok: bool,
-    source_capacity_ok: bool,
-    mutate_binary: bool,
-    mutate_input: bool,
-    mutate_source: bool,
-    speed_ms: int | None,
-) -> Path:
-    script = workspace / "fake-child.py"
-    pairs = [
-        {
-            "height": 150000,
-            "bestblock": "0" * 64,
-            "txouts": 1127181,
-            "total_amount_sat": 749989998999999,
-            "muhash": "383a0b41ac28ddf6ac91723b41527fa64c0b54451cee5f2c4b3823ef92117116",
-            "full_validation_witness": 1,
-            "durability_ok": durability_ok,
-            "source_capacity_ok": source_capacity_ok,
-            "environment_valid": True,
-            "environment_reason": None,
-        }
-        for _ in range(7)
-    ]
-
-    code = (
-        "#!/usr/bin/env python3\n"
-        "import json, os, sys, time\n"
-        "role = os.environ['ROLE']\n"
-        f"pairs = {pairs!r}\n"
-        f"candidate_ms = {candidate_ms}\n"
-        f"core_ms = {core_ms}\n"
-        f"fail_pair_index = {fail_pair_index}\n"
-        f"fail_role = {fail_role.value if fail_role else None!r}\n"
-        f"mismatch_pair_index = {mismatch_pair_index}\n"
-        f"invalid_env_pair_index = {invalid_env_pair_index}\n"
-        f"invalid_env_role = {invalid_env_role.value if invalid_env_role else None!r}\n"
-        f"mutate_binary = {mutate_binary!r}\n"
-        f"mutate_input = {mutate_input!r}\n"
-        f"mutate_source = {mutate_source!r}\n"
-        f"speed_ms = {speed_ms}\n"
-        "pair = int(os.environ['PAIR_INDEX'])\n"
-        "result_path = sys.argv[sys.argv.index('--out') + 1]\n"
-        "if fail_pair_index == pair and fail_role == role:\n"
-        "    sys.exit(1)\n"
-        "if mutate_binary:\n"
-        "    with open(__file__, 'a') as executable:\n"
-        "        executable.write('\\n# mutated during execution\\n')\n"
-        "if mutate_input:\n"
-        "    input_path = sys.argv[sys.argv.index('--corpus') + 1]\n"
-        "    with open(input_path, 'ab') as corpus:\n"
-        "        corpus.write(b'mutated')\n"
-        "if mutate_source:\n"
-        "    source_path = sys.argv[sys.argv.index('--source-binary') + 1]\n"
-        "    with open(source_path, 'ab') as source:\n"
-        "        source.write(b'mutated source')\n"
-        "ms = candidate_ms if role == 'candidate' else core_ms\n"
-        "if speed_ms is not None:\n"
-        "    ms = speed_ms\n"
-        "time.sleep(max(ms, 50) / 1000.0)\n"
-        "record = dict(pairs[pair])\n"
-        "if mismatch_pair_index == pair and role == 'candidate':\n"
-        "    record['height'] = 150001\n"
-        "if invalid_env_pair_index == pair and invalid_env_role == role:\n"
-        "    record['environment_valid'] = False\n"
-        "    record['environment_reason'] = 'synthetic invalid env'\n"
-        "record['schema'] = 'benchmark-campaign-child-v1'\n"
-        "record['role'] = role\n"
-        "record['consensus_proof_hash'] = '0' * 64\n"
-        "with open(result_path, 'w') as f:\n"
-        "    json.dump(record, f)\n"
-    )
-    script.write_text(code)
-    script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    return script
-
-
-def _run_with_fake(
-    base: _CampaignConfigJson,
-    *,
-    cell: CellId = ALL_CELLS[0],
-    speed_ms: int | None = None,
-    candidate_ms: int = 10,
-    core_ms: int = 10,
-    fail_pair_index: int | None = None,
-    fail_role: Role | None = None,
-    mismatch_pair_index: int | None = None,
-    invalid_env_pair_index: int | None = None,
-    invalid_env_role: Role | None = None,
-    durability_ok: bool = True,
-    source_capacity_ok: bool = True,
-    binary_sha256: str | None = None,
-    binary_path: str | None = None,
-    command_binary_path: str | None = None,
-    mutate_binary: bool = False,
-    mutate_input: bool = False,
-    mutate_source: bool = False,
-    corpus_sha256: str | None = None,
-) -> _ResultJson:
-    workspace_context = tempfile.TemporaryDirectory()
-    _WORKSPACES.append(workspace_context)
-    workspace = Path(workspace_context.name)
-    corpus_path = workspace / "corpus.dat"
-    manifest_path = workspace / "manifest.json"
-    corpus_path.write_bytes(b"hash-bound corpus")
-    manifest_path.write_bytes(b"hash-bound manifest")
-    script = _fake_child_script(
-        workspace,
-        candidate_ms=candidate_ms,
-        core_ms=core_ms,
-        fail_pair_index=fail_pair_index,
-        fail_role=fail_role,
-        mismatch_pair_index=mismatch_pair_index,
-        invalid_env_pair_index=invalid_env_pair_index,
-        invalid_env_role=invalid_env_role,
-        durability_ok=durability_ok,
-        source_capacity_ok=source_capacity_ok,
-        mutate_binary=mutate_binary,
-        mutate_input=mutate_input,
-        mutate_source=mutate_source,
-        speed_ms=speed_ms,
-    )
-    observed_sha256 = hashlib.sha256(script.read_bytes()).hexdigest()
-    observed_corpus_sha256 = hashlib.sha256(corpus_path.read_bytes()).hexdigest()
-    observed_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    configured_binary = str(script) if binary_path is None else binary_path
-    configured_command = (
-        configured_binary if command_binary_path is None else command_binary_path
-    )
-    for configured_cell in base["cells"]:
-        configured_cell["corpus_path"] = str(corpus_path)
-        configured_cell["corpus_sha256"] = (
-            observed_corpus_sha256 if corpus_sha256 is None else corpus_sha256
-        )
-        configured_cell["manifest_path"] = str(manifest_path)
-        configured_cell["manifest_sha256"] = observed_manifest_sha256
-        for program in (configured_cell["candidate"], configured_cell["core"]):
-            program["binary_path"] = configured_binary
-            program["binary_sha256"] = (
-                observed_sha256 if binary_sha256 is None else binary_sha256
-            )
-            program["command"] = [
-                configured_command,
-                "--source-binary",
-                str(script),
-                "--corpus",
-                str(corpus_path),
-                "--data",
-                "{data_dir}",
-                "--out",
-                "{result_path}",
-            ]
-    output_root = workspace / "out"
-    base["output_root"] = str(output_root)
-    config_path = workspace / "config.json"
-    config_path.write_text(json.dumps(base))
-    _result, result_path = run_cell(load_config(config_path), cell)
-    obj = _load_json_object(result_path.read_text(encoding="utf-8"))
-    obj["_run_path"] = str(result_path)
-    obj["_config_path"] = str(config_path)
-    if not _is_result_json(obj):
-        raise TypeError("runner emitted an invalid test result")
-    return obj
-
-
-def _schema_result(result: _ResultJson) -> dict[str, object]:
-    value: dict[str, object] = dict(result)
-    value.pop("_run_path")
-    value.pop("_config_path")
-    return value
+        started = time.monotonic()
+        with patch.object(runner, "_parse_native_result", slow_parse):
+            result, _path = fixture.run()
+        elapsed = time.monotonic() - started
+        walls = [
+            arm.wall_ns or 0
+            for pair in result.pairs
+            for arm in (pair.candidate, pair.core)
+        ]
+        self.assertGreater(elapsed, 0.42)
+        self.assertLess(max(walls), 500_000_000)
 
 
 if __name__ == "__main__":
-    raise SystemExit(unittest.main())
+    unittest.main()

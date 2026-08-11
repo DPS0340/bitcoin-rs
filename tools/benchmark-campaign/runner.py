@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pyright: strict
-"""Strict, generic exact-seven-pair benchmark campaign runner."""
+"""Strict exact-seven-pair benchmark campaign runner."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import stat
 import statistics
@@ -25,18 +24,33 @@ from enum import Enum
 from pathlib import Path
 from typing import BinaryIO, NoReturn, TypeIs
 
-CONFIG_SCHEMA = "benchmark-campaign-config-v1"
-RESULT_SCHEMA = "benchmark-campaign-result-v1"
-CHILD_SCHEMA = "benchmark-campaign-child-v1"
+from native_offline import (
+    ADAPTER_PLACEHOLDERS,
+    PROOF_SCOPE,
+    AdapterKind,
+    CandidateExpectation,
+    CellProof,
+    CertifiedState,
+    ContractError,
+    NativeArmResult,
+    ProofExpectation,
+    arm_result_from_json,
+    arm_result_json,
+    core_expectation,
+    parse_candidate_file,
+    parse_cell_proof,
+    parse_core_file,
+    state_from_json,
+    state_json,
+)
+
+CONFIG_SCHEMA = "benchmark-campaign-config-v2"
+RESULT_SCHEMA = "benchmark-campaign-result-v2"
 PAIR_COUNT = 7
 ARM_COUNT = PAIR_COUNT * 2
 PERFORMANCE_GATE = 2.0
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
-_ALLOWED_PLACEHOLDERS = frozenset({"arm_dir", "data_dir", "result_path"})
-
-
-class ContractError(ValueError):
-    """Untrusted campaign data violates the executable contract."""
+_FD_PATH_RE = re.compile(r"/proc/self/fd/([0-9]+)\Z")
 
 
 class Domain(str, Enum):
@@ -92,6 +106,7 @@ class CellId:
 
 @dataclass(frozen=True)
 class ProgramIdentity:
+    adapter: AdapterKind
     binary_path: str
     binary_sha256: str
     commit: str
@@ -99,8 +114,6 @@ class ProgramIdentity:
     features: tuple[str, ...]
     mimalloc: bool
     command: tuple[str, ...]
-    exposes_full_validation_witness: bool
-    consensus_proof_hash: str
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,7 @@ class PreparedProgram:
     identity: ProgramIdentity
     path: Path
     fingerprint: tuple[int, int, int, int, int, int]
+    descriptor: int
 
 
 @dataclass(frozen=True)
@@ -130,12 +144,14 @@ class PreparedPrograms:
 class FileCustody:
     path: Path
     fingerprint: tuple[int, int, int, int, int, int]
+    descriptor: int
 
 
 @dataclass(frozen=True)
 class InputCustody:
     corpus: FileCustody
     manifest: FileCustody
+    proof: FileCustody
 
 
 @dataclass(frozen=True)
@@ -148,6 +164,8 @@ class CellConfig:
     corpus_sha256: str
     manifest_path: str
     manifest_sha256: str
+    proof_path: str | None
+    proof_sha256: str | None
     affinity: tuple[int, ...]
 
     @property
@@ -161,22 +179,6 @@ class CampaignConfig:
     output_root: str
     cells: tuple[CellConfig, ...]
     canonical_sha256: str
-
-
-@dataclass(frozen=True)
-class ChildResult:
-    role: Role
-    height: int
-    bestblock: str
-    txouts: int
-    total_amount_sat: int
-    muhash: str
-    full_validation_witness: int
-    consensus_proof_hash: str
-    durability_ok: bool | None
-    source_capacity_ok: bool | None
-    environment_valid: bool
-    environment_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -197,14 +199,13 @@ class ArmObservation:
     cpu_system_ns: int | None
     peak_rss_bytes: int | None
     exit_code: int | None
-    child_result: ChildResult | None
-    child_result_raw: object | None
+    arm_result: NativeArmResult | None
     error: str | None
 
     @property
     def run_valid(self) -> bool:
         return (
-            self.error is None and self.exit_code == 0 and self.child_result is not None
+            self.error is None and self.exit_code == 0 and self.arm_result is not None
         )
 
 
@@ -222,6 +223,9 @@ class PairResult:
 class CellResult:
     config_sha256: str
     cell_config: CellConfig
+    proof_sha256: str
+    proof_scope: str
+    certified_state: CertifiedState
     schedule_seed: int
     pairs: tuple[PairResult, ...]
     scheduled_pairs: int
@@ -300,10 +304,6 @@ def _optional_uint(value: object, field: str) -> int | None:
     return None if value is None else _uint(value, field)
 
 
-def _optional_bool(value: object, field: str) -> bool | None:
-    return None if value is None else _boolean(value, field)
-
-
 def _optional_text(value: object, field: str) -> str | None:
     return None if value is None else _text(value, field)
 
@@ -370,48 +370,71 @@ def _snapshot_file(path_text: str, expected_sha256: str, field: str) -> FileCust
     if not path.is_absolute():
         raise ContractError(f"{field} must be absolute")
     try:
-        with path.open("rb") as stream:
-            before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                raise ContractError(f"{field} must be a regular file")
-            observed_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
-            after = os.fstat(stream.fileno())
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
     except OSError as error:
-        raise ContractError(f"cannot hash {field} {path}: {error}") from error
-    if _fingerprint(before) != _fingerprint(after):
-        raise ContractError(f"{field} changed while it was hashed")
-    if observed_sha256 != expected_sha256:
-        raise ContractError(
-            f"{field} hash mismatch for {path}: "
-            f"expected {expected_sha256}, got {observed_sha256}"
-        )
-    return FileCustody(path, _fingerprint(after))
+        raise ContractError(f"cannot open {field} {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ContractError(f"{field} must be a regular file")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            observed_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = os.fstat(descriptor)
+        if _fingerprint(before) != _fingerprint(after):
+            raise ContractError(f"{field} changed while it was hashed")
+        if observed_sha256 != expected_sha256:
+            raise ContractError(
+                f"{field} hash mismatch for {path}: "
+                f"expected {expected_sha256}, got {observed_sha256}"
+            )
+        return FileCustody(path, _fingerprint(after), descriptor)
+    except (OSError, ContractError):
+        os.close(descriptor)
+        raise
 
 
 def _snapshot_inputs(config: CellConfig) -> InputCustody:
-    return InputCustody(
-        corpus=_snapshot_file(config.corpus_path, config.corpus_sha256, "corpus_path"),
-        manifest=_snapshot_file(
+    if config.proof_path is None or config.proof_sha256 is None:
+        raise ContractError("ready cell requires a cell proof")
+    opened: list[FileCustody] = []
+    try:
+        corpus = _snapshot_file(config.corpus_path, config.corpus_sha256, "corpus_path")
+        opened.append(corpus)
+        manifest = _snapshot_file(
             config.manifest_path, config.manifest_sha256, "manifest_path"
-        ),
-    )
+        )
+        opened.append(manifest)
+        proof = _snapshot_file(config.proof_path, config.proof_sha256, "proof_path")
+        return InputCustody(corpus=corpus, manifest=manifest, proof=proof)
+    except (OSError, ContractError):
+        for custody in reversed(opened):
+            os.close(custody.descriptor)
+        raise
 
 
 def _verify_file_unchanged(custody: FileCustody, field: str) -> None:
     try:
-        current = custody.path.stat()
+        current_path = custody.path.stat()
+        current_descriptor = os.fstat(custody.descriptor)
     except OSError as error:
-        raise ContractError(f"cannot stat {field} {custody.path}: {error}") from error
+        raise ContractError(f"cannot verify {field} {custody.path}: {error}") from error
     if (
-        not stat.S_ISREG(current.st_mode)
-        or _fingerprint(current) != custody.fingerprint
+        not stat.S_ISREG(current_path.st_mode)
+        or _fingerprint(current_path) != custody.fingerprint
+        or _fingerprint(current_descriptor) != custody.fingerprint
     ):
         raise ContractError(f"{field} changed during campaign execution")
+
+
+def _close_inputs(custody: InputCustody) -> None:
+    for item in (custody.corpus, custody.manifest, custody.proof):
+        os.close(item.descriptor)
 
 
 def _verify_inputs_unchanged(custody: InputCustody) -> None:
     _verify_file_unchanged(custody.corpus, "corpus_path")
     _verify_file_unchanged(custody.manifest, "manifest_path")
+    _verify_file_unchanged(custody.proof, "proof_path")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -477,6 +500,7 @@ def _prepare_program(
     destination = _custody_program_path(run_dir, role, program)
     _mkdir_durable(destination.parent)
     source_path = Path(program.binary_path)
+    descriptor: int | None = None
     if not source_path.is_absolute():
         return FailedProgram(
             program, destination, "program binary_path must be absolute"
@@ -509,9 +533,16 @@ def _prepare_program(
                 copied_status = os.fstat(copied.fileno())
                 if copied_status.st_size != bytes_written:
                     raise ContractError("program custody copy has the wrong size")
+                descriptor = os.open(
+                    f"/proc/self/fd/{copied.fileno()}", os.O_RDONLY | os.O_CLOEXEC
+                )
         _fsync_directory(destination.parent)
-        return PreparedProgram(program, destination, _fingerprint(copied_status))
+        return PreparedProgram(
+            program, destination, _fingerprint(copied_status), descriptor
+        )
     except (OSError, ContractError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
         cleanup_errors: list[str] = []
         try:
             destination.unlink()
@@ -530,27 +561,39 @@ def _prepare_program(
 
 
 def _prepare_programs(config: CellConfig, run_dir: Path) -> PreparedPrograms:
-    return PreparedPrograms(
-        candidate=_prepare_program(config.candidate, Role.CANDIDATE, run_dir),
-        core=_prepare_program(config.core, Role.CORE, run_dir),
-    )
+    candidate = _prepare_program(config.candidate, Role.CANDIDATE, run_dir)
+    try:
+        core = _prepare_program(config.core, Role.CORE, run_dir)
+    except BaseException:
+        if isinstance(candidate, PreparedProgram):
+            os.close(candidate.descriptor)
+        raise
+    return PreparedPrograms(candidate=candidate, core=core)
 
 
 def _verify_program_custody(custody: ProgramCustody) -> PreparedProgram:
     if isinstance(custody, FailedProgram):
         raise ContractError(custody.error)
     try:
-        current = custody.path.stat()
+        current_path = custody.path.stat()
+        current_descriptor = os.fstat(custody.descriptor)
     except OSError as error:
         raise ContractError(
-            f"cannot stat program custody {custody.path}: {error}"
+            f"cannot verify program custody {custody.path}: {error}"
         ) from error
     if (
-        not stat.S_ISREG(current.st_mode)
-        or _fingerprint(current) != custody.fingerprint
+        not stat.S_ISREG(current_path.st_mode)
+        or _fingerprint(current_path) != custody.fingerprint
+        or _fingerprint(current_descriptor) != custody.fingerprint
     ):
         raise ContractError("program custody changed during execution")
     return custody
+
+
+def _close_programs(programs: PreparedPrograms) -> None:
+    for custody in (programs.candidate, programs.core):
+        if isinstance(custody, PreparedProgram):
+            os.close(custody.descriptor)
 
 
 def _load_json(path: Path, field: str) -> object:
@@ -584,13 +627,17 @@ def _cell_id_json(cell: CellId) -> dict[str, str]:
     }
 
 
-def _validate_command(command: object, field: str) -> tuple[str, ...]:
+def _validate_command(
+    command: object, field: str, adapter: AdapterKind
+) -> tuple[str, ...]:
     values = _array(command, field)
     if not values:
         raise ContractError(f"{field} must contain at least one argv element")
     result = tuple(
         _text(value, f"{field}[{index}]") for index, value in enumerate(values)
     )
+    allowed = ADAPTER_PLACEHOLDERS[adapter]
+    seen: set[str] = set()
     formatter = string.Formatter()
     for index, argument in enumerate(result):
         try:
@@ -602,41 +649,44 @@ def _validate_command(command: object, field: str) -> tuple[str, ...]:
         for _literal, name, format_spec, conversion in pieces:
             if name is None:
                 continue
-            if name not in _ALLOWED_PLACEHOLDERS or format_spec or conversion:
+            if name not in allowed or format_spec or conversion:
                 raise ContractError(
                     f"{field}[{index}] contains unsafe placeholder {name!r}"
                 )
+            seen.add(name)
+    if seen != set(allowed):
+        raise ContractError(
+            f"{field} must use exactly the {adapter.value} placeholders; "
+            f"missing={sorted(allowed - seen)}"
+        )
     return result
 
 
-def expand_command(command: tuple[str, ...], paths: dict[str, str]) -> tuple[str, ...]:
-    if frozenset(paths) != _ALLOWED_PLACEHOLDERS:
+def expand_command(
+    command: tuple[str, ...], paths: dict[str, str], adapter: AdapterKind
+) -> tuple[str, ...]:
+    allowed = ADAPTER_PLACEHOLDERS[adapter]
+    if frozenset(paths) != allowed:
         raise ContractError(
-            "placeholder expansion requires exactly arm_dir, data_dir, and result_path"
+            f"placeholder expansion for {adapter.value} requires {sorted(allowed)}"
         )
-    validated = _validate_command(list(command), "command")
+    validated = _validate_command(list(command), "command", adapter)
     return tuple(argument.format_map(paths) for argument in validated)
+
+
+def _descriptor_path(descriptor: int) -> str:
+    return f"/proc/self/fd/{descriptor}"
 
 
 def _execution_command(
     program: ProgramIdentity,
-    affinity: tuple[int, ...],
     paths: dict[str, str],
-    executable_path: Path,
+    executable_path: str,
 ) -> tuple[str, ...]:
-    expanded = expand_command(program.command, paths)
+    expanded = expand_command(program.command, paths, program.adapter)
     if expanded[0] != program.binary_path:
         raise ContractError("program command must execute its bound binary_path")
-    taskset = shutil.which("taskset")
-    if taskset is None:
-        raise ContractError("taskset is required to bind child CPU affinity")
-    return (
-        taskset,
-        "--cpu-list",
-        ",".join(str(cpu) for cpu in affinity),
-        str(executable_path),
-        *expanded[1:],
-    )
+    return (executable_path, *expanded[1:])
 
 
 def _program_from_json(value: object, field: str) -> ProgramIdentity:
@@ -645,6 +695,7 @@ def _program_from_json(value: object, field: str) -> ProgramIdentity:
         field,
         frozenset(
             {
+                "adapter",
                 "binary_path",
                 "binary_sha256",
                 "commit",
@@ -652,11 +703,10 @@ def _program_from_json(value: object, field: str) -> ProgramIdentity:
                 "features",
                 "mimalloc",
                 "command",
-                "exposes_full_validation_witness",
-                "consensus_proof_hash",
             }
         ),
     )
+    adapter = AdapterKind(_enum(AdapterKind, item["adapter"], f"{field}.adapter").value)
     features_raw = _array(item["features"], f"{field}.features")
     features = tuple(
         _text(value, f"{field}.features[{index}]")
@@ -665,25 +715,20 @@ def _program_from_json(value: object, field: str) -> ProgramIdentity:
     if len(set(features)) != len(features):
         raise ContractError(f"{field}.features must be unique")
     return ProgramIdentity(
+        adapter=adapter,
         binary_path=_text(item["binary_path"], f"{field}.binary_path"),
         binary_sha256=_hash(item["binary_sha256"], f"{field}.binary_sha256"),
         commit=_text(item["commit"], f"{field}.commit"),
         build=_text(item["build"], f"{field}.build"),
         features=features,
         mimalloc=_boolean(item["mimalloc"], f"{field}.mimalloc"),
-        command=_validate_command(item["command"], f"{field}.command"),
-        exposes_full_validation_witness=_boolean(
-            item["exposes_full_validation_witness"],
-            f"{field}.exposes_full_validation_witness",
-        ),
-        consensus_proof_hash=_hash(
-            item["consensus_proof_hash"], f"{field}.consensus_proof_hash"
-        ),
+        command=_validate_command(item["command"], f"{field}.command", adapter),
     )
 
 
 def _program_json(program: ProgramIdentity) -> dict[str, object]:
     return {
+        "adapter": program.adapter.value,
         "binary_path": program.binary_path,
         "binary_sha256": program.binary_sha256,
         "commit": program.commit,
@@ -691,9 +736,11 @@ def _program_json(program: ProgramIdentity) -> dict[str, object]:
         "features": list(program.features),
         "mimalloc": program.mimalloc,
         "command": list(program.command),
-        "exposes_full_validation_witness": program.exposes_full_validation_witness,
-        "consensus_proof_hash": program.consensus_proof_hash,
     }
+
+
+def _program_identity_sha256(program: ProgramIdentity) -> str:
+    return _sha256_json(_program_json(program))
 
 
 def _cell_config_from_json(value: object, field: str) -> CellConfig:
@@ -710,6 +757,8 @@ def _cell_config_from_json(value: object, field: str) -> CellConfig:
                 "corpus_sha256",
                 "manifest_path",
                 "manifest_sha256",
+                "proof_path",
+                "proof_sha256",
                 "affinity",
             }
         ),
@@ -722,19 +771,58 @@ def _cell_config_from_json(value: object, field: str) -> CellConfig:
     )
     if not affinity or len(set(affinity)) != len(affinity):
         raise ContractError(f"{field}.affinity must be nonempty and unique")
-    corpus_path = _text(item["corpus_path"], f"{field}.corpus_path")
-    manifest_path = _text(item["manifest_path"], f"{field}.manifest_path")
-    if not Path(corpus_path).is_absolute() or not Path(manifest_path).is_absolute():
-        raise ContractError(f"{field} corpus and manifest paths must be absolute")
+    cell = _cell_id_from_json(item["cell"], f"{field}.cell")
+    candidate = _program_from_json(item["candidate"], f"{field}.candidate")
+    core = _program_from_json(item["core"], f"{field}.core")
+    if candidate.adapter is not AdapterKind.BITCOIN_RS_REPLAY:
+        raise ContractError(f"{field}.candidate must use the bitcoin-rs replay adapter")
+    if core.adapter is not AdapterKind.BITCOIN_CORE_LOADBLOCK:
+        raise ContractError(f"{field}.core must use the Bitcoin Core adapter")
+    corpus_path = str(
+        _canonical_absolute_path(
+            _text(item["corpus_path"], f"{field}.corpus_path"),
+            f"{field}.corpus_path",
+        )
+    )
+    manifest_path = str(
+        _canonical_absolute_path(
+            _text(item["manifest_path"], f"{field}.manifest_path"),
+            f"{field}.manifest_path",
+        )
+    )
+    proof_path_raw = _optional_text(item["proof_path"], f"{field}.proof_path")
+    proof_sha256_raw = item["proof_sha256"]
+    proof_path = (
+        None
+        if proof_path_raw is None
+        else str(_canonical_absolute_path(proof_path_raw, f"{field}.proof_path"))
+    )
+    proof_sha256 = (
+        None
+        if proof_sha256_raw is None
+        else _hash(proof_sha256_raw, f"{field}.proof_sha256")
+    )
+    if (proof_path is None) != (proof_sha256 is None):
+        raise ContractError(
+            f"{field} proof_path and proof_sha256 must be both set or null"
+        )
+    if reason is None and cell.domain is not Domain.OFFLINE:
+        raise ContractError(
+            f"{field} native adapters currently support only offline cells"
+        )
+    if reason is None and proof_path is None:
+        raise ContractError(f"{field} ready offline cell requires a proof")
     return CellConfig(
-        cell=_cell_id_from_json(item["cell"], f"{field}.cell"),
+        cell=cell,
         blocked_reason=reason,
-        candidate=_program_from_json(item["candidate"], f"{field}.candidate"),
-        core=_program_from_json(item["core"], f"{field}.core"),
+        candidate=candidate,
+        core=core,
         corpus_path=corpus_path,
         corpus_sha256=_hash(item["corpus_sha256"], f"{field}.corpus_sha256"),
         manifest_path=manifest_path,
         manifest_sha256=_hash(item["manifest_sha256"], f"{field}.manifest_sha256"),
+        proof_path=proof_path,
+        proof_sha256=proof_sha256,
         affinity=affinity,
     )
 
@@ -749,6 +837,8 @@ def _cell_config_json(config: CellConfig) -> dict[str, object]:
         "corpus_sha256": config.corpus_sha256,
         "manifest_path": config.manifest_path,
         "manifest_sha256": config.manifest_sha256,
+        "proof_path": config.proof_path,
+        "proof_sha256": config.proof_sha256,
         "affinity": list(config.affinity),
     }
 
@@ -828,111 +918,108 @@ def classify_wall_performance(
     return candidate_median, core_median, ratio, verdict
 
 
-def _child_from_json(
-    value: object, field: str, role: Role, program: ProgramIdentity, domain: Domain
-) -> ChildResult:
-    item = _object(
-        value,
-        field,
-        frozenset(
-            {
-                "schema",
-                "role",
-                "height",
-                "bestblock",
-                "txouts",
-                "total_amount_sat",
-                "muhash",
-                "full_validation_witness",
-                "consensus_proof_hash",
-                "durability_ok",
-                "source_capacity_ok",
-                "environment_valid",
-                "environment_reason",
-            }
+def _load_cell_proof(config: CellConfig, inputs: InputCustody) -> CellProof:
+    if config.proof_path is None or config.proof_sha256 is None:
+        raise ContractError("ready cell requires a cell proof")
+    proof = parse_cell_proof(
+        Path(_descriptor_path(inputs.proof.descriptor)),
+        config.proof_sha256,
+        ProofExpectation(
+            cell_key=config.cell.key,
+            corpus_sha256=config.corpus_sha256,
+            corpus_bytes=inputs.corpus.fingerprint[3],
+            manifest_sha256=config.manifest_sha256,
+            manifest_bytes=inputs.manifest.fingerprint[3],
+            affinity=config.affinity,
+            candidate_program_sha256=_program_identity_sha256(config.candidate),
+            core_program_sha256=_program_identity_sha256(config.core),
         ),
     )
-    if _text(item["schema"], f"{field}.schema") != CHILD_SCHEMA:
-        raise ContractError(f"{field}.schema must be {CHILD_SCHEMA!r}")
-    parsed_role = Role(_enum(Role, item["role"], f"{field}.role").value)
-    if parsed_role is not role:
-        raise ContractError(f"{field}.role does not match scheduled role")
-    witness = _uint(item["full_validation_witness"], f"{field}.full_validation_witness")
-    if program.exposes_full_validation_witness and witness == 0:
-        raise ContractError(
-            f"{field}.full_validation_witness must be nonzero for this build"
-        )
-    proof = _hash(item["consensus_proof_hash"], f"{field}.consensus_proof_hash")
-    if proof != program.consensus_proof_hash:
-        raise ContractError(
-            f"{field}.consensus_proof_hash does not match configured build"
-        )
-    durability = _optional_bool(item["durability_ok"], f"{field}.durability_ok")
-    capacity = _optional_bool(item["source_capacity_ok"], f"{field}.source_capacity_ok")
-    if domain in (Domain.OFFLINE, Domain.RPC) and durability is None:
-        raise ContractError(f"{field}.durability_ok is required for {domain.value}")
-    if domain in (Domain.P2P, Domain.RPC) and capacity is None:
-        raise ContractError(
-            f"{field}.source_capacity_ok is required for {domain.value}"
-        )
-    environment_valid = _boolean(
-        item["environment_valid"], f"{field}.environment_valid"
-    )
-    environment_reason = _optional_text(
-        item["environment_reason"], f"{field}.environment_reason"
-    )
-    if environment_valid == (environment_reason is not None):
-        raise ContractError(
-            f"{field}.environment_reason must be nonempty exactly when environment is invalid"
-        )
-    return ChildResult(
-        role=parsed_role,
-        height=_uint(item["height"], f"{field}.height"),
-        bestblock=_hash(item["bestblock"], f"{field}.bestblock"),
-        txouts=_uint(item["txouts"], f"{field}.txouts"),
-        total_amount_sat=_uint(item["total_amount_sat"], f"{field}.total_amount_sat"),
-        muhash=_hash(item["muhash"], f"{field}.muhash"),
-        full_validation_witness=witness,
-        consensus_proof_hash=proof,
-        durability_ok=durability,
-        source_capacity_ok=capacity,
-        environment_valid=environment_valid,
-        environment_reason=environment_reason,
-    )
+    _verify_inputs_unchanged(inputs)
+    return proof
 
 
-def _child_json(child: ChildResult) -> dict[str, object]:
-    return {
-        "schema": CHILD_SCHEMA,
-        "role": child.role.value,
-        "height": child.height,
-        "bestblock": child.bestblock,
-        "txouts": child.txouts,
-        "total_amount_sat": child.total_amount_sat,
-        "muhash": child.muhash,
-        "full_validation_witness": child.full_validation_witness,
-        "consensus_proof_hash": child.consensus_proof_hash,
-        "durability_ok": child.durability_ok,
-        "source_capacity_ok": child.source_capacity_ok,
-        "environment_valid": child.environment_valid,
-        "environment_reason": child.environment_reason,
+def _verify_command_semantics(
+    config: CellConfig,
+    proof: CellProof,
+    role: Role,
+    command: tuple[str, ...],
+    paths: dict[str, str],
+) -> None:
+    arguments = command[1:]
+    if role is Role.CORE:
+        options = dict(core_expectation(proof.state, arguments).expected_args)
+        required = {
+            "assumevalid": "0",
+            "blocksxor": "0",
+            "connect": "0",
+            "datadir": paths["data_dir"],
+            "debuglogfile": paths["result_path"],
+            "disablewallet": "1",
+            "dnsseed": "0",
+            "fixedseeds": "0",
+            "listen": "0",
+            "loadblock": paths["corpus_path"],
+            "server": "1",
+            "stopatheight": str(proof.state.height),
+        }
+        if options != required:
+            raise ContractError(
+                "Core command must exactly match the offline proof contract"
+            )
+        return
+    if len(arguments) % 2 != 0:
+        raise ContractError("candidate command options must be flag/value pairs")
+    options = dict(zip(arguments[::2], arguments[1::2], strict=True))
+    if len(options) != len(arguments) // 2:
+        raise ContractError("candidate command options must not repeat")
+    required = {
+        "--stop-height": str(proof.state.height),
+        "--blocks-file": paths["corpus_path"],
+        "--corpus-manifest": paths["manifest_path"],
+        "--assume-valid-height": "0",
+        "--storage-backend": config.cell.backend.value,
+        "--data-dir": paths["data_dir"],
+        "--output": paths["result_path"],
     }
+    if options != required:
+        raise ContractError(
+            "candidate timed command must not include, omit, or alter offline proof options"
+        )
 
 
-def _state_equal(left: ChildResult, right: ChildResult) -> bool:
-    return (
-        left.height,
-        left.bestblock,
-        left.txouts,
-        left.total_amount_sat,
-        left.muhash,
-    ) == (
-        right.height,
-        right.bestblock,
-        right.txouts,
-        right.total_amount_sat,
-        right.muhash,
-    )
+def _parse_native_result(
+    config: CellConfig,
+    proof: CellProof,
+    role: Role,
+    command: tuple[str, ...],
+    data_dir: Path,
+    result_path: Path,
+    inputs: InputCustody,
+    paths: dict[str, str],
+) -> NativeArmResult:
+    program = config.candidate if role is Role.CANDIDATE else config.core
+    if role is Role.CANDIDATE:
+        if program.adapter is not AdapterKind.BITCOIN_RS_REPLAY:
+            raise ContractError("candidate uses the wrong native adapter")
+        return parse_candidate_file(
+            result_path,
+            CandidateExpectation(
+                state=proof.state,
+                data_dir=str(data_dir),
+                corpus_path=paths["corpus_path"],
+                corpus_sha256=config.corpus_sha256,
+                corpus_bytes=inputs.corpus.fingerprint[3],
+                manifest_path=paths["manifest_path"],
+                manifest_sha256=config.manifest_sha256,
+                manifest_bytes=inputs.manifest.fingerprint[3],
+                backend=config.cell.backend.value,
+                commit=program.commit,
+            ),
+        )
+    if program.adapter is not AdapterKind.BITCOIN_CORE_LOADBLOCK:
+        raise ContractError("Core uses the wrong native adapter")
+    return parse_core_file(result_path, core_expectation(proof.state, command[1:]))
 
 
 def _read_starttime(pid: int) -> int:
@@ -1025,6 +1112,7 @@ def _wait_and_measure(
 
 def _run_arm(
     config: CellConfig,
+    proof: CellProof,
     role: Role,
     pair_index: int,
     order_index: int,
@@ -1036,30 +1124,32 @@ def _run_arm(
     arm_dir = run_dir / f"pair-{pair_index}-{order_index}-{role.value}"
     arm_dir.mkdir(mode=0o700)
     data_dir = arm_dir / "data"
-    result_path = arm_dir / "child-result.json"
+    result_path = arm_dir / (
+        "replay.json"
+        if program.adapter is AdapterKind.BITCOIN_RS_REPLAY
+        else "debug.log"
+    )
     stdout_path = arm_dir / "stdout.log"
     stderr_path = arm_dir / "stderr.log"
     if data_dir.exists() or result_path.exists():
         raise ContractError("fresh arm paths unexpectedly already exist")
     data_dir.mkdir(mode=0o700)
-    command = _execution_command(
-        program,
-        config.affinity,
-        {
-            "arm_dir": str(arm_dir),
-            "data_dir": str(data_dir),
-            "result_path": str(result_path),
-        },
-        program_custody.path,
-    )
-    child_environment = os.environ.copy()
-    child_environment.update(
-        {
-            "ROLE": role.value,
-            "PAIR_INDEX": str(pair_index),
-            "ORDER_INDEX": str(order_index),
-        }
-    )
+    paths = {
+        "data_dir": str(data_dir),
+        "corpus_path": _descriptor_path(inputs.corpus.descriptor),
+        "result_path": str(result_path),
+    }
+    inherited_descriptors = [inputs.corpus.descriptor]
+    if program.adapter is AdapterKind.BITCOIN_RS_REPLAY:
+        paths["manifest_path"] = _descriptor_path(inputs.manifest.descriptor)
+        inherited_descriptors.append(inputs.manifest.descriptor)
+    if isinstance(program_custody, PreparedProgram):
+        executable_path = _descriptor_path(program_custody.descriptor)
+        inherited_descriptors.append(program_custody.descriptor)
+    else:
+        executable_path = str(program_custody.path)
+    command = _execution_command(program, paths, executable_path)
+    _verify_command_semantics(config, proof, role, command, paths)
     pid: int | None = None
     pid_starttime: int | None = None
     wall_ns: int | None = None
@@ -1067,24 +1157,40 @@ def _run_arm(
     cpu_system_ns: int | None = None
     peak_rss_bytes: int | None = None
     exit_code: int | None = None
-    raw: object | None = None
-    child: ChildResult | None = None
+    arm_result: NativeArmResult | None = None
     error_text: str | None = None
     started: int | None = None
     try:
         _verify_inputs_unchanged(inputs)
         _verify_program_custody(program_custody)
         with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-            started = time.monotonic_ns()
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                shell=False,
-                close_fds=True,
-                env=child_environment,
-            )
+            previous_affinity = os.sched_getaffinity(0)
+            os.sched_setaffinity(0, config.affinity)
+            process: subprocess.Popen[bytes] | None = None
+            try:
+                started = time.monotonic_ns()
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                    close_fds=True,
+                    pass_fds=tuple(inherited_descriptors),
+                    env=os.environ.copy(),
+                )
+            finally:
+                try:
+                    os.sched_setaffinity(0, previous_affinity)
+                except OSError as restore_error:
+                    if process is not None:
+                        process.kill()
+                        process.wait()
+                    raise ContractError(
+                        "cannot restore runner CPU affinity"
+                    ) from restore_error
+            if process is None:
+                raise AssertionError("native process did not start")
             pid = process.pid
             (
                 pid_starttime,
@@ -1102,25 +1208,18 @@ def _run_arm(
             stderr.flush()
             os.fsync(stderr.fileno())
         if exit_code != 0:
-            error_text = f"child exited with status {exit_code}"
+            error_text = f"native process exited with status {exit_code}"
         elif not result_path.is_file():
-            error_text = "child did not create its result JSON"
+            error_text = "native process did not create its evidence file"
         else:
-            raw = _load_json(
-                result_path, f"pair {pair_index} {role.value} child result"
-            )
-            child = _child_from_json(
-                raw, "child_result", role, program, config.cell.domain
+            _fsync_file(result_path)
+            arm_result = _parse_native_result(
+                config, proof, role, command, data_dir, result_path, inputs, paths
             )
     except (OSError, ContractError, subprocess.SubprocessError) as error:
         if started is not None and wall_ns is None:
             wall_ns = time.monotonic_ns() - started
         error_text = str(error)
-        if result_path.is_file():
-            try:
-                raw = _load_json(result_path, "failed child result")
-            except ContractError:
-                raw = result_path.read_text(encoding="utf-8", errors="replace")
     try:
         _persist_arm_evidence(arm_dir, (stdout_path, stderr_path, result_path))
     except OSError as evidence_error:
@@ -1143,14 +1242,17 @@ def _run_arm(
         cpu_system_ns=cpu_system_ns,
         peak_rss_bytes=peak_rss_bytes,
         exit_code=exit_code,
-        child_result=child,
-        child_result_raw=raw,
+        arm_result=arm_result,
         error=error_text,
     )
 
 
 def _derive(
-    config_sha256: str, config: CellConfig, seed: int, pairs: tuple[PairResult, ...]
+    config_sha256: str,
+    config: CellConfig,
+    proof: CellProof,
+    seed: int,
+    pairs: tuple[PairResult, ...],
 ) -> CellResult:
     scheduled = len(pairs)
     valid_pairs = sum(pair.valid for pair in pairs)
@@ -1158,31 +1260,15 @@ def _derive(
     core_median: int | None = None
     ratio: float | None = None
     performance_verdict: Verdict | None = None
-    source_invalid = any(
-        config.cell.domain in (Domain.P2P, Domain.RPC)
-        and arm.child_result is not None
-        and arm.child_result.source_capacity_ok is False
-        for pair in pairs
-        for arm in (pair.candidate, pair.core)
-    )
-    environment_invalid = source_invalid or any(
-        arm.child_result is not None and not arm.child_result.environment_valid
+    environment_invalid = any(
+        arm.arm_result is not None and not arm.arm_result.environment_valid
         for pair in pairs
         for arm in (pair.candidate, pair.core)
     )
     run_failed = any(
         not arm.run_valid for pair in pairs for arm in (pair.candidate, pair.core)
     )
-    durability_failed = any(
-        config.cell.domain in (Domain.OFFLINE, Domain.RPC)
-        and arm.child_result is not None
-        and arm.child_result.durability_ok is False
-        for pair in pairs
-        for arm in (pair.candidate, pair.core)
-    )
-    correctness_failed = durability_failed or any(
-        pair.correctness_match is False for pair in pairs
-    )
+    correctness_failed = any(pair.correctness_match is False for pair in pairs)
     timed = scheduled == PAIR_COUNT and valid_pairs == PAIR_COUNT
     if timed:
         candidate_walls = [pair.candidate.wall_ns for pair in pairs]
@@ -1208,6 +1294,9 @@ def _derive(
     return CellResult(
         config_sha256=config_sha256,
         cell_config=config,
+        proof_sha256=proof.sha256,
+        proof_scope=proof.scope,
+        certified_state=proof.state,
         schedule_seed=seed,
         pairs=pairs,
         scheduled_pairs=scheduled,
@@ -1234,11 +1323,16 @@ def _make_pair(
     valid = candidate.run_valid and core.run_valid
     correctness: bool | None = None
     if valid:
-        candidate_result = candidate.child_result
-        core_result = core.child_result
+        candidate_result = candidate.arm_result
+        core_result = core.arm_result
         if candidate_result is None or core_result is None:
-            raise AssertionError("valid pair must contain both child results")
-        correctness = _state_equal(candidate_result, core_result)
+            raise AssertionError("valid pair must contain both native arm results")
+        correctness = (
+            candidate_result.correctness_ok
+            and core_result.correctness_ok
+            and candidate_result.height == core_result.height
+            and candidate_result.bestblock == core_result.bestblock
+        )
     return PairResult(pair_index, order, candidate, core, valid, correctness)
 
 
@@ -1250,53 +1344,68 @@ def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
     if not config.ready:
         raise ContractError(f"cell {cell.key} is blocked: {config.blocked_reason}")
     inputs = _snapshot_inputs(config)
-    root = Path(campaign.output_root)
-    _mkdir_durable(root)
-    run_dir = Path(tempfile.mkdtemp(prefix=f"{cell.key.replace('/', '-')}-", dir=root))
-    _fsync_directory(root)
-    programs = _prepare_programs(config, run_dir)
-    schedule = schedule_for(cell, campaign.schedule_seed)
-    pairs: list[PairResult] = []
-    seen_paths: set[str] = set()
-    for pair_index, order in enumerate(schedule):
-        observations: tuple[ArmObservation, ArmObservation] = (
-            _run_arm(
-                config,
-                order[0],
-                pair_index,
-                0,
-                run_dir,
-                inputs,
-                programs.candidate if order[0] is Role.CANDIDATE else programs.core,
-            ),
-            _run_arm(
-                config,
-                order[1],
-                pair_index,
-                1,
-                run_dir,
-                inputs,
-                programs.candidate if order[1] is Role.CANDIDATE else programs.core,
-            ),
+    programs: PreparedPrograms | None = None
+    try:
+        proof = _load_cell_proof(config, inputs)
+        root = Path(campaign.output_root)
+        _mkdir_durable(root)
+        run_dir = Path(
+            tempfile.mkdtemp(prefix=f"{cell.key.replace('/', '-')}-", dir=root)
         )
-        for observation in observations:
-            paths = {
-                observation.arm_dir,
-                observation.data_dir,
-                observation.result_path,
-                observation.stdout_path,
-                observation.stderr_path,
-            }
-            if seen_paths & paths or len(paths) != 5:
-                raise ContractError("arm paths must be unique and never reused")
-            seen_paths.update(paths)
-        pairs.append(_make_pair(pair_index, order, observations))
-    result = _derive(
-        campaign.canonical_sha256, config, campaign.schedule_seed, tuple(pairs)
-    )
-    result_path = run_dir / "custody-result.json"
-    _atomic_write_json(result_path, _result_json(result))
-    return result, result_path
+        _fsync_directory(root)
+        programs = _prepare_programs(config, run_dir)
+        schedule = schedule_for(cell, campaign.schedule_seed)
+        pairs: list[PairResult] = []
+        seen_paths: set[str] = set()
+        for pair_index, order in enumerate(schedule):
+            observations: tuple[ArmObservation, ArmObservation] = (
+                _run_arm(
+                    config,
+                    proof,
+                    order[0],
+                    pair_index,
+                    0,
+                    run_dir,
+                    inputs,
+                    programs.candidate if order[0] is Role.CANDIDATE else programs.core,
+                ),
+                _run_arm(
+                    config,
+                    proof,
+                    order[1],
+                    pair_index,
+                    1,
+                    run_dir,
+                    inputs,
+                    programs.candidate if order[1] is Role.CANDIDATE else programs.core,
+                ),
+            )
+            for observation in observations:
+                paths = {
+                    observation.arm_dir,
+                    observation.data_dir,
+                    observation.result_path,
+                    observation.stdout_path,
+                    observation.stderr_path,
+                }
+                if seen_paths & paths or len(paths) != 5:
+                    raise ContractError("arm paths must be unique and never reused")
+                seen_paths.update(paths)
+            pairs.append(_make_pair(pair_index, order, observations))
+        result = _derive(
+            campaign.canonical_sha256,
+            config,
+            proof,
+            campaign.schedule_seed,
+            tuple(pairs),
+        )
+        result_path = run_dir / "custody-result.json"
+        _atomic_write_json(result_path, _result_json(result))
+        return result, result_path
+    finally:
+        if programs is not None:
+            _close_programs(programs)
+        _close_inputs(inputs)
 
 
 def _arm_json(arm: ArmObservation) -> dict[str, object]:
@@ -1317,10 +1426,9 @@ def _arm_json(arm: ArmObservation) -> dict[str, object]:
         "cpu_system_ns": arm.cpu_system_ns,
         "peak_rss_bytes": arm.peak_rss_bytes,
         "exit_code": arm.exit_code,
-        "child_result": None
-        if arm.child_result is None
-        else _child_json(arm.child_result),
-        "child_result_raw": arm.child_result_raw,
+        "arm_result": (
+            None if arm.arm_result is None else arm_result_json(arm.arm_result)
+        ),
         "error": arm.error,
     }
 
@@ -1341,6 +1449,9 @@ def _result_json(result: CellResult) -> dict[str, object]:
         "schema": RESULT_SCHEMA,
         "config_sha256": result.config_sha256,
         "cell_config": _cell_config_json(result.cell_config),
+        "proof_sha256": result.proof_sha256,
+        "proof_scope": result.proof_scope,
+        "certified_state": state_json(result.certified_state),
         "schedule_seed": result.schedule_seed,
         "pairs": [_pair_json(pair) for pair in result.pairs],
         "scheduled_pairs": result.scheduled_pairs,
@@ -1352,7 +1463,7 @@ def _result_json(result: CellResult) -> dict[str, object]:
     }
 
 
-def _arm_from_json(value: object, field: str, config: CellConfig) -> ArmObservation:
+def _arm_from_json(value: object, field: str) -> ArmObservation:
     item = _object(
         value,
         field,
@@ -1374,35 +1485,17 @@ def _arm_from_json(value: object, field: str, config: CellConfig) -> ArmObservat
                 "cpu_system_ns",
                 "peak_rss_bytes",
                 "exit_code",
-                "child_result",
-                "child_result_raw",
+                "arm_result",
                 "error",
             }
         ),
     )
-    role = Role(_enum(Role, item["role"], f"{field}.role").value)
-    program = config.candidate if role is Role.CANDIDATE else config.core
-    child = (
-        None
-        if item["child_result"] is None
-        else _child_from_json(
-            item["child_result"],
-            f"{field}.child_result",
-            role,
-            program,
-            config.cell.domain,
-        )
-    )
-    raw_child = item["child_result_raw"]
-    if child is not None and raw_child != _child_json(child):
-        raise ContractError(f"{field}.child_result_raw does not match child_result")
     command = tuple(
         _text(arg, f"{field}.command[{index}]")
         for index, arg in enumerate(_array(item["command"], f"{field}.command"))
     )
     if not command:
         raise ContractError(f"{field}.command must be nonempty")
-    error = _optional_text(item["error"], f"{field}.error")
     exit_code_value = item["exit_code"]
     exit_code = None
     if exit_code_value is not None:
@@ -1410,7 +1503,7 @@ def _arm_from_json(value: object, field: str, config: CellConfig) -> ArmObservat
             raise ContractError(f"{field}.exit_code must be an integer or null")
         exit_code = exit_code_value
     return ArmObservation(
-        role=role,
+        role=Role(_enum(Role, item["role"], f"{field}.role").value),
         pair_index=_uint(item["pair_index"], f"{field}.pair_index"),
         order_index=_uint(item["order_index"], f"{field}.order_index"),
         command=command,
@@ -1428,14 +1521,79 @@ def _arm_from_json(value: object, field: str, config: CellConfig) -> ArmObservat
             item["peak_rss_bytes"], f"{field}.peak_rss_bytes"
         ),
         exit_code=exit_code,
-        child_result=child,
-        child_result_raw=raw_child,
-        error=error,
+        arm_result=(
+            None
+            if item["arm_result"] is None
+            else arm_result_from_json(item["arm_result"], f"{field}.arm_result")
+        ),
+        error=_optional_text(item["error"], f"{field}.error"),
     )
+
+
+def _verify_recorded_evidence(
+    observation: ArmObservation,
+    config: CellConfig,
+    proof: CellProof,
+    inputs: InputCustody,
+    paths: dict[str, str],
+) -> None:
+    if observation.arm_result is None:
+        return
+    observed = _parse_native_result(
+        config,
+        proof,
+        observation.role,
+        observation.command,
+        Path(observation.data_dir),
+        Path(observation.result_path),
+        inputs,
+        paths,
+    )
+    if observed != observation.arm_result:
+        raise ContractError("recorded arm result does not match native evidence bytes")
 
 
 def _canonical_recorded_path(value: str, field: str) -> Path:
     return _canonical_absolute_path(value, field)
+
+
+def _recorded_descriptor_path(value: object, field: str) -> str:
+    path = _text(value, field)
+    match = _FD_PATH_RE.fullmatch(path)
+    if match is None or int(match.group(1)) < 3:
+        raise ContractError(f"{field} must be a historical inherited descriptor path")
+    return path
+
+
+def _recorded_command_paths(
+    observation: ArmObservation, program: ProgramIdentity, proof: CellProof
+) -> dict[str, str]:
+    arguments = observation.command[1:]
+    paths = {
+        "data_dir": observation.data_dir,
+        "result_path": observation.result_path,
+    }
+    if program.adapter is AdapterKind.BITCOIN_RS_REPLAY:
+        if len(arguments) % 2 != 0:
+            raise ContractError("recorded candidate command has incomplete options")
+        options = dict(zip(arguments[::2], arguments[1::2], strict=True))
+        paths["corpus_path"] = _recorded_descriptor_path(
+            options.get("--blocks-file"), "recorded candidate corpus path"
+        )
+        paths["manifest_path"] = _recorded_descriptor_path(
+            options.get("--corpus-manifest"), "recorded candidate manifest path"
+        )
+    else:
+        options = dict(core_expectation(proof.state, arguments).expected_args)
+        paths["corpus_path"] = _recorded_descriptor_path(
+            options.get("loadblock"), "recorded Core corpus path"
+        )
+    descriptor_paths = [paths["corpus_path"]]
+    if "manifest_path" in paths:
+        descriptor_paths.append(paths["manifest_path"])
+    if len(set(descriptor_paths)) != len(descriptor_paths):
+        raise ContractError("recorded input descriptors must be distinct")
+    return paths
 
 
 def parse_result(value: object) -> CellResult:
@@ -1447,6 +1605,9 @@ def parse_result(value: object) -> CellResult:
                 "schema",
                 "config_sha256",
                 "cell_config",
+                "proof_sha256",
+                "proof_scope",
+                "certified_state",
                 "schedule_seed",
                 "pairs",
                 "scheduled_pairs",
@@ -1461,6 +1622,20 @@ def parse_result(value: object) -> CellResult:
     if _text(item["schema"], "result.schema") != RESULT_SCHEMA:
         raise ContractError(f"result.schema must be {RESULT_SCHEMA!r}")
     config = _cell_config_from_json(item["cell_config"], "result.cell_config")
+    inputs = _snapshot_inputs(config)
+    try:
+        proof = _load_cell_proof(config, inputs)
+    finally:
+        _close_inputs(inputs)
+    if _hash(item["proof_sha256"], "result.proof_sha256") != proof.sha256:
+        raise ContractError("result proof hash was tampered")
+    if _text(item["proof_scope"], "result.proof_scope") != PROOF_SCOPE:
+        raise ContractError("result proof scope was tampered")
+    if (
+        state_from_json(item["certified_state"], "result.certified_state")
+        != proof.state
+    ):
+        raise ContractError("result certified state was tampered")
     seed = _uint(item["schedule_seed"], "result.schedule_seed")
     pair_values = _array(item["pairs"], "result.pairs")
     if len(pair_values) != PAIR_COUNT:
@@ -1469,6 +1644,7 @@ def parse_result(value: object) -> CellResult:
     parsed_pairs: list[PairResult] = []
     all_paths: set[Path] = set()
     run_dir: Path | None = None
+    role_executable_descriptors: dict[Role, str] = {}
     for index, value_pair in enumerate(pair_values):
         pair = _object(
             value_pair,
@@ -1498,9 +1674,9 @@ def parse_result(value: object) -> CellResult:
                 f"result.pairs[{index}].order does not match deterministic schedule"
             )
         candidate = _arm_from_json(
-            pair["candidate"], f"result.pairs[{index}].candidate", config
+            pair["candidate"], f"result.pairs[{index}].candidate"
         )
-        core = _arm_from_json(pair["core"], f"result.pairs[{index}].core", config)
+        core = _arm_from_json(pair["core"], f"result.pairs[{index}].core")
         observations = (candidate, core)
         for observation in observations:
             expected_order = order.index(observation.role)
@@ -1533,10 +1709,18 @@ def parse_result(value: object) -> CellResult:
                     observation.stderr_path, f"{field}.stderr_path"
                 ),
             }
+            expected_program = (
+                config.candidate if observation.role is Role.CANDIDATE else config.core
+            )
+            expected_result_name = (
+                "replay.json"
+                if expected_program.adapter is AdapterKind.BITCOIN_RS_REPLAY
+                else "debug.log"
+            )
             expected_paths = {
                 arm_dir,
                 arm_dir / "data",
-                arm_dir / "child-result.json",
+                arm_dir / expected_result_name,
                 arm_dir / "stdout.log",
                 arm_dir / "stderr.log",
             }
@@ -1545,26 +1729,66 @@ def parse_result(value: object) -> CellResult:
             if all_paths & paths:
                 raise ContractError("result reuses an arm path")
             all_paths.update(paths)
-            expected_program = (
-                config.candidate if observation.role is Role.CANDIDATE else config.core
-            )
             executable_path = _custody_program_path(
                 run_dir, observation.role, expected_program
             )
+            command_paths = _recorded_command_paths(
+                observation, expected_program, proof
+            )
+            program_preparation_failed = (
+                observation.error is not None
+                and observation.pid is None
+                and observation.pid_starttime is None
+                and observation.wall_ns is None
+                and observation.cpu_user_ns is None
+                and observation.cpu_system_ns is None
+                and observation.peak_rss_bytes is None
+                and observation.exit_code is None
+                and observation.arm_result is None
+                and observation.command[0] == str(executable_path)
+            )
+            if observation.command[0] == str(executable_path):
+                if not program_preparation_failed:
+                    raise ContractError(
+                        f"{field}.command[0] uses unpinned program custody"
+                    )
+                recorded_executable = str(executable_path)
+            else:
+                recorded_executable = _recorded_descriptor_path(
+                    observation.command[0], f"{field}.command[0]"
+                )
+                prior_descriptor = role_executable_descriptors.setdefault(
+                    observation.role, recorded_executable
+                )
+                if prior_descriptor != recorded_executable:
+                    raise ContractError(
+                        f"recorded {observation.role.value} executable descriptor changed"
+                    )
+                if any(
+                    role is not observation.role and descriptor == recorded_executable
+                    for role, descriptor in role_executable_descriptors.items()
+                ):
+                    raise ContractError(
+                        "candidate and Core executable descriptors must be distinct"
+                    )
+            if recorded_executable in {
+                command_paths["corpus_path"],
+                command_paths.get("manifest_path"),
+            }:
+                raise ContractError(
+                    f"{field}.command reuses its executable descriptor as input"
+                )
             expanded = _execution_command(
-                expected_program,
-                config.affinity,
-                {
-                    "arm_dir": observation.arm_dir,
-                    "data_dir": observation.data_dir,
-                    "result_path": observation.result_path,
-                },
-                executable_path,
+                expected_program, command_paths, recorded_executable
             )
             if observation.command != expanded:
                 raise ContractError(
                     "recorded command does not match bound identity and paths"
                 )
+            _verify_command_semantics(
+                config, proof, observation.role, expanded, command_paths
+            )
+            _verify_recorded_evidence(observation, config, proof, inputs, command_paths)
         derived_pair = _make_pair(index, order, observations)
         if (
             _boolean(pair["valid"], f"result.pairs[{index}].valid")
@@ -1591,11 +1815,12 @@ def parse_result(value: object) -> CellResult:
             for pair in parsed_pairs
         ]
         if executable_path.is_file():
-            _snapshot_file(
+            custody = _snapshot_file(
                 str(executable_path),
                 program.binary_sha256,
                 f"result program custody {role.value}",
             )
+            os.close(custody.descriptor)
             continue
         preparation_failed = all(
             arm.error is not None
@@ -1606,7 +1831,7 @@ def parse_result(value: object) -> CellResult:
             and arm.cpu_system_ns is None
             and arm.peak_rss_bytes is None
             and arm.exit_code is None
-            and arm.child_result is None
+            and arm.arm_result is None
             for arm in role_arms
         )
         if not preparation_failed:
@@ -1614,6 +1839,7 @@ def parse_result(value: object) -> CellResult:
     derived = _derive(
         _hash(item["config_sha256"], "result.config_sha256"),
         config,
+        proof,
         seed,
         tuple(parsed_pairs),
     )
@@ -1652,13 +1878,23 @@ def parse_result(value: object) -> CellResult:
 
 
 def validate_result(path: Path, config_path: Path) -> CellResult:
-    result = parse_result(_load_json(path, "result"))
     campaign = load_config(config_path)
+    result_path = _canonical_absolute_path(str(path), "result path")
+    output_root = Path(campaign.output_root)
+    if (
+        result_path.name != "custody-result.json"
+        or result_path.parent.parent != output_root
+    ):
+        raise ContractError("result path must be output_root/<run>/custody-result.json")
+    result = parse_result(_load_json(result_path, "result"))
     if campaign.canonical_sha256 != result.config_sha256:
         raise ContractError("result config hash does not match supplied config")
     matches = [cell for cell in campaign.cells if cell.cell == result.cell_config.cell]
     if len(matches) != 1 or matches[0] != result.cell_config:
         raise ContractError("result cell identity does not match supplied config")
+    recorded_run_dir = Path(result.pairs[0].candidate.arm_dir).parent
+    if result_path.parent != recorded_run_dir:
+        raise ContractError("result path does not match its recorded campaign run")
     return result
 
 
