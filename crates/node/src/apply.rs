@@ -2325,9 +2325,6 @@ fn apply_block_admitted(
         // Best-effort ZMQ event emission. Failures must not propagate per the
         // ZmqPublisher contract; the trait's methods return `()`.
         handles.zmq_publisher.publish_hashblock(tip.hash);
-        handles
-            .zmq_publisher
-            .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
         if wants_rawblock {
             handles.zmq_publisher.publish_rawblock(&block_bytes);
         }
@@ -2343,6 +2340,11 @@ fn apply_block_admitted(
         }
     }
     handles.applied_tip.store(Some(Arc::new(tip.clone())));
+    if handles.zmq_publisher.wants_notifications() {
+        handles
+            .zmq_publisher
+            .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
+    }
     if let Some(sampler) = &handles.g2_muhash_sampler
         && sampler.wants_height(height)
     {
@@ -8810,6 +8812,61 @@ mod consensus_rule_tests {
                 ),
             ]
         );
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct AppliedTipVisiblePublisher {
+        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+        expected: Hash256,
+        seen: Mutex<Vec<Hash256>>,
+    }
+
+    impl crate::ZmqPublisher for AppliedTipVisiblePublisher {
+        fn publish_hashblock(&self, _hash: Hash256) {}
+
+        fn publish_hashtx(&self, _txid: bitcoin::Txid) {}
+
+        fn publish_rawblock(&self, _bytes: &[u8]) {}
+
+        fn publish_rawtx(&self, _bytes: &[u8]) {}
+
+        fn publish_sequence(&self, event: crate::SequenceEvent) {
+            if let crate::SequenceEvent::Connected(hash) = event {
+                assert_eq!(
+                    self.applied_tip.load_full().as_deref().map(|tip| tip.hash),
+                    Some(self.expected),
+                    "applied tip must be visible before publishing C"
+                );
+                self.seen.lock().push(hash);
+            }
+        }
+    }
+
+    #[test]
+    fn connected_sequence_event_observes_the_published_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(5)],
+        )?;
+        let expected = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let publisher = Arc::new(AppliedTipVisiblePublisher {
+            applied_tip: Arc::clone(&handles.applied_tip),
+            expected,
+            seen: Mutex::new(Vec::new()),
+        });
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        let handles = handles.with_zmq_publisher(publisher_handle);
+
+        apply_block(&handles, &block)?;
+
+        assert_eq!(*publisher.seen.lock(), vec![expected]);
         Ok(())
     }
 

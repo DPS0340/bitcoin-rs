@@ -155,7 +155,7 @@ Open:
 | Piece | Notes |
 |---|---|
 | Mempool reconsideration | Block transactions need the same production admission pipeline as Electrum and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
-| Disconnect notification | ZMQ `pubsequence` publishes connects and disconnects; mempool `A`/`R` events remain intentionally absent until event sequencing and removal reasons are redesigned |
+| Mempool sequence events | Mempool `A`/`R` notifications remain intentionally absent until event sequencing and removal reasons are redesigned |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
 | Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
 | Un-ignore `g10_reorg_deep` | prove the full path against `bitcoind` regtest |
