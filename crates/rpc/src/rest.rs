@@ -60,17 +60,17 @@ pub fn route(ctx: &Arc<Context>, path: &str, query: &str, enabled: bool) -> Resp
 
 fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
     let Some((hash_text, format)) = suffix.rsplit_once('.') else {
-        return bad_request_owned(format!("Invalid hash: {suffix}"));
+        return not_found_with("output format not found");
     };
     if !matches!(format, "json" | "hex" | "bin") {
-        return bad_request_owned(format!("Invalid hash: {suffix}"));
+        return bad_request_owned(format!("Invalid hash: {hash_text}"));
     }
     let count = match parse_count(query) {
         Ok(count) => count,
         Err(response) => return response,
     };
     let Ok(hash) = Hash256::from_str(hash_text) else {
-        return bad_request_owned(format!("Invalid hash: {suffix}"));
+        return bad_request_owned(format!("Invalid hash: {hash_text}"));
     };
     let records = header_records(ctx, hash, count);
     match format {
@@ -92,7 +92,7 @@ fn route_headers(ctx: &Arc<Context>, suffix: &str, query: &str) -> Response {
                 body
             }),
         ),
-        _ => bad_request_owned(format!("Invalid hash: {suffix}")),
+        _ => bad_request_owned(format!("Invalid hash: {hash_text}")),
     }
 }
 
@@ -120,7 +120,7 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
             return vec![start];
         };
         if active_start != start_id {
-            return vec![start];
+            return Vec::new();
         }
         let last_height = start
             .height
@@ -149,6 +149,9 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
         return truncate_at_linkage_break(records);
     }
 
+    // Cache-only records predate tree publication, so their active-chain
+    // membership cannot be established here; preserve the singleton fallback
+    // for those records rather than turning a usable header into a 404.
     let Some(record) = ctx.block_by_hash(hash) else {
         return Vec::new();
     };
@@ -179,9 +182,6 @@ fn parse_count(query: &str) -> Result<u32, Response> {
     let mut count = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
-            if pair == "count" {
-                return Err(invalid_count(pair));
-            }
             continue;
         };
         if key == "count" {
@@ -362,11 +362,19 @@ mod tests {
         assert_eq!(response.status, 400);
         assert_eq!(
             String::from_utf8(response.body).expect("error body"),
-            "Invalid hash: 0000000000000000000000000000000000000000000000000000000000000000.txt"
+            "Invalid hash: 0000000000000000000000000000000000000000000000000000000000000000"
         );
+        let response = route(&ctx, "/rest/headers/not-a-hash.json", "", true);
+        assert_eq!(response.status, 400);
         assert_eq!(
-            route(&ctx, "/rest/headers/not-a-hash.json", "", true).status,
-            400
+            String::from_utf8(response.body).expect("error body"),
+            "Invalid hash: not-a-hash"
+        );
+        let response = route(&ctx, "/rest/headers/not-a-hash", "", true);
+        assert_eq!(response.status, 404);
+        assert_eq!(
+            String::from_utf8(response.body).expect("error body"),
+            "output format not found"
         );
         let response = route(&ctx, "/rest/headers/not-a-hash.json", "count=0", true);
         assert_eq!(response.status, 400);
@@ -398,6 +406,7 @@ mod tests {
             400
         );
         assert_eq!(parse_count("limit=5").expect("unknown query"), 5);
+        assert_eq!(parse_count("count").expect("bare query key"), 5);
         assert_eq!(parse_count("count=3&foo=1").expect("unknown query"), 3);
         assert_eq!(parse_count("foo=1&count=3").expect("unknown query"), 3);
     }
@@ -603,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn headers_side_branch_returns_only_requested_header() {
+    fn headers_side_branch_returns_empty() {
         let ctx = Arc::new(Context::new());
         let bits = CompactTarget::from_consensus(0x1d00_ffff);
         let genesis = Header {
@@ -656,8 +665,7 @@ mod tests {
             true,
         );
         let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].get("height").and_then(Value::as_u64), Some(1));
+        assert!(values.is_empty());
     }
 
     #[test]
