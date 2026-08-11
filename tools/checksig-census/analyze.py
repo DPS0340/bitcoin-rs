@@ -579,8 +579,15 @@ def _diagnostic_record_counts(
 ) -> tuple[dict[str, int], dict[tuple[bytes, int, int], int]]:
     """Derive the six record-derived context counters from one block's records.
 
-    Returns (counts, op_seq_by_identity) so the caller can validate op_seq
-    contiguity and gap-free sequences.
+    Validates each record in stream order, checking:
+      1. the record's context identity exists (orphan),
+      2. the (txid, input_index, op_seq) key is not a duplicate,
+      3. the per-identity op_seq matches the next expected value,
+      4. the (op_kind, sig_version, spend_context) triple is legal,
+    before incrementing the relevant context counter.
+
+    Returns (counts, op_seq_by_identity) where op_seq_by_identity is the
+    set of exact record keys seen during the stream.
     """
     counts: dict[str, int] = {
         "bare_multisig_checks": 0,
@@ -591,6 +598,7 @@ def _diagnostic_record_counts(
         "tapscript_checksigadd_checks": 0,
     }
     op_seq_by_identity: dict[tuple[bytes, int, int], int] = {}
+    next_op_seq: dict[tuple[bytes, int], int] = {}
 
     for record in records:
         key = (record.spend_txid, record.input_index)
@@ -602,6 +610,7 @@ def _diagnostic_record_counts(
             )
 
         ctx = context_map[key]
+
         seq_key = (record.spend_txid, record.input_index, record.op_seq)
         if seq_key in op_seq_by_identity:
             display_txid = record.spend_txid[::-1].hex()
@@ -611,6 +620,14 @@ def _diagnostic_record_counts(
             )
         op_seq_by_identity[seq_key] = 1
 
+        expected_op_seq = next_op_seq.get(key, 0)
+        if record.op_seq != expected_op_seq:
+            display_txid = record.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: op_seq contiguity violation for {display_txid}:{record.input_index}: "
+                f"expected {expected_op_seq}, got {record.op_seq}"
+            )
+
         error = _record_legality_error(record, ctx)
         if error is not None:
             sig_name = _sig_version_name(record.sig_version)
@@ -619,6 +636,8 @@ def _diagnostic_record_counts(
             identity = f"txid={display_txid}, input_index={record.input_index}"
             message = _record_legality_message(error, op_name, sig_name, identity)
             raise AnalyzerError(f"CTX-OPERATIONS: {message}")
+
+        next_op_seq[key] = record.op_seq + 1
 
         for name, rule in _RECORD_COUNTER_RULES:
             if _record_matches_rule(record, ctx, rule):
@@ -996,25 +1015,16 @@ def _read_diagnostic_streams(
             "records",
         )
         records = [Record(raw) for raw in record_raws]
-        record_counts, op_seqs = _diagnostic_record_counts(records, context_map)
+        record_counts, _ = _diagnostic_record_counts(records, context_map)
 
-        next_op_seq: dict[tuple[bytes, int], int] = {}
+        # Record-level orphan/duplicate/sequence/legality checks are now
+        # performed inside _diagnostic_record_counts.  This loop only
+        # derives the per-key ECDSA verify calls/ok needed for the
+        # diagnostic journal reconciliation.
         record_sums: dict[tuple[bytes, int], list[int]] = {}
         for record in records:
             key = (record.spend_txid, record.input_index)
-            expected_op_seq = next_op_seq.get(key, 0)
-            if record.op_seq != expected_op_seq:
-                display_txid = record.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: op_seq contiguity violation for {display_txid}:{record.input_index}: "
-                    f"expected {expected_op_seq}, got {record.op_seq}"
-                )
-            next_op_seq[key] = expected_op_seq + 1
             sums = record_sums.setdefault(key, [0, 0, 0, 0])
-            if record.op_kind in (1, 2):
-                sums[0] += 1
-            elif record.op_kind in (3, 4):
-                sums[1] += 1
             if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
                 if record.outcome != 2:
                     sums[2] += 1

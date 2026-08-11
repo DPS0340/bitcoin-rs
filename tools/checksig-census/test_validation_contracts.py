@@ -5935,6 +5935,124 @@ def test_diagnostic_op_seq_stream_order_rejects_one_before_zero() -> None:
             "misordered op_seq 1 before 0",
             "CTX-OPERATIONS",
         )
+def _diagnostic_stage(
+    tmp: Path,
+    contexts: list[ContextInput],
+    records: list[bytes],
+    journal: list[bytes],
+) -> tuple[DiagnosticCheckpoint, dict[str, Path]]:
+    """Write a BRSCTX1/BRSREC1/BRSJRN1 triple and a matching checkpoint."""
+    _make_brsctx1_file(tmp / "contexts.bin", contexts)
+    _write_records_file(tmp / "records.bin", records)
+    _write_journal_file(tmp / "journal.bin", journal)
+    paths = {
+        "contexts": tmp / "contexts.bin",
+        "records": tmp / "records.bin",
+        "journal": tmp / "journal.bin",
+    }
+    return (
+        DiagnosticCheckpoint(
+            height=1,
+            block_hash_le=bytes([1] * 32),
+            context_rows=len(contexts),
+            context_end=paths["contexts"].stat().st_size,
+            record_rows=len(records),
+            record_end=paths["records"].stat().st_size,
+            journal_rows=len(journal),
+            journal_end=paths["journal"].stat().st_size,
+        ),
+        paths,
+    )
+
+
+def test_diagnostic_first_record_op_seq_with_illegal_reports_sequence() -> None:
+    """An out-of-order op_seq on the first record beats the same record's legality error."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xd2" * 32
+        ctx = _bare_p2pkh(txid_le)
+        records = [
+            _make_record_bytes(txid_le, 0, op_kind=3, sig_version=2, op_seq=1, outcome=1),
+        ]
+        journal = [_make_journal_bytes(txid_le, 0)]
+        row, paths = _diagnostic_stage(tmp, [ctx], records, journal)
+        _raises_with(
+            AnalyzerError,
+            lambda: _read_diagnostic_streams(row, None, paths),
+            "first-record op_seq=1 plus illegal op",
+            "CTX-OPERATIONS",
+            "op_seq contiguity violation",
+            "expected 0, got 1",
+        )
+
+
+def test_diagnostic_earlier_sequence_beats_later_illegal() -> None:
+    """A sequence error on an earlier record wins over a later illegal record."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_a = b"\xd3" * 32
+        txid_b = b"\xd4" * 32
+        contexts = [_bare_p2pkh(txid_a), _bare_p2pkh(txid_b)]
+        records = [
+            _make_record_bytes(txid_a, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
+            _make_record_bytes(txid_b, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
+        ]
+        journal = [_make_journal_bytes(txid_a, 0), _make_journal_bytes(txid_b, 0)]
+        row, paths = _diagnostic_stage(tmp, contexts, records, journal)
+        _raises_with(
+            AnalyzerError,
+            lambda: _read_diagnostic_streams(row, None, paths),
+            "earlier sequence beats later illegal",
+            "CTX-OPERATIONS",
+            "op_seq contiguity violation",
+            "expected 0, got 1",
+        )
+
+
+def test_diagnostic_earlier_illegal_beats_later_sequence() -> None:
+    """An illegal record on an earlier record wins over a later sequence error."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_a = b"\xd5" * 32
+        txid_b = b"\xd6" * 32
+        contexts = [_bare_p2pkh(txid_a), _bare_p2pkh(txid_b)]
+        records = [
+            _make_record_bytes(txid_a, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
+            _make_record_bytes(txid_b, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
+        ]
+        journal = [_make_journal_bytes(txid_a, 0), _make_journal_bytes(txid_b, 0)]
+        row, paths = _diagnostic_stage(tmp, contexts, records, journal)
+        _raises_with(
+            AnalyzerError,
+            lambda: _read_diagnostic_streams(row, None, paths),
+            "earlier illegal beats later sequence",
+            "CTX-OPERATIONS",
+            "multisig record must have sig_version BASE or WITNESS_V0",
+            "TAPSCRIPT",
+        )
+
+
+def test_diagnostic_duplicate_key_retains_precedence() -> None:
+    """A duplicate record key is reported before that record's sequence or legality failure."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xd7" * 32
+        ctx = _bare_p2pkh(txid_le)
+        records = [
+            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1),
+            _make_record_bytes(txid_le, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
+        ]
+        journal = [_make_journal_bytes(txid_le, 0)]
+        row, paths = _diagnostic_stage(tmp, [ctx], records, journal)
+        _raises_with(
+            AnalyzerError,
+            lambda: _read_diagnostic_streams(row, None, paths),
+            "duplicate key retains precedence",
+            "CTX-OPERATIONS",
+            "duplicate record key in BRSREC1",
+            f"txid={txid_le[::-1].hex()}",
+            "op_seq=0",
+        )
 
 
 def test_atomic_publish_rollback_fsyncs_after_unlink() -> None:
@@ -6220,6 +6338,10 @@ def main() -> int:
         test_diagnostic_multisig_short_circuit_zero_ecdsa_records,
         test_diagnostic_helper_synthetic_all_types,
         test_diagnostic_op_seq_stream_order_rejects_one_before_zero,
+        test_diagnostic_first_record_op_seq_with_illegal_reports_sequence,
+        test_diagnostic_earlier_sequence_beats_later_illegal,
+        test_diagnostic_earlier_illegal_beats_later_sequence,
+        test_diagnostic_duplicate_key_retains_precedence,
         test_atomic_publish_rollback_fsyncs_after_unlink,
         test_atomic_publish_no_replace_collision,
         test_atomic_publish_cleans_temp_on_post_link_fsync_failure,
