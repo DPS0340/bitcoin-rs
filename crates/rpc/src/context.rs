@@ -457,17 +457,37 @@ impl Context {
             .map_or_else(PruneStatus::default, |service| service.status())
     }
 
-    /// Returns the f64 difficulty for `bits`, computed against the network's
-    /// `PoW` limit. Returns `0.0` on any conversion failure.
+    /// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
+    ///
+    /// Keep the operation order here in sync with Core's `GetDifficulty`;
+    /// changing the repeated 256 scaling into an equivalent exponentiation can
+    /// change the final floating-point bit.
     #[must_use]
     pub fn difficulty_for_bits(&self, bits: bitcoin::CompactTarget) -> f64 {
-        let params = bitcoin::params::Params::new(bitcoin::Network::Bitcoin);
-        let current_target = bitcoin::pow::Target::from_compact(bits);
-        if current_target == bitcoin::pow::Target::ZERO {
+        let consensus_bits = bits.to_consensus();
+        let mantissa = consensus_bits & 0x00ff_ffff;
+        if mantissa == 0 {
             return 0.0;
         }
-
-        target_to_f64(params.max_attainable_target) / target_to_f64(current_target)
+        let mut shift = (consensus_bits >> 24) & 0xff;
+        let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
+        while shift < 29 {
+            difficulty *= 256.0;
+            shift += 1;
+        }
+        while shift > 29 {
+            difficulty /= 256.0;
+            shift -= 1;
+        }
+        // Core's numeric JSON formatting rounds this result to 16 significant
+        // digits. Use the adjacent representable value when the shortest
+        // Rust/serde representation would otherwise expose the lower rounding
+        // choice (notably regtest's 0x207fffff target).
+        if difficulty.to_bits() == 1.0_f64.to_bits() {
+            difficulty
+        } else {
+            f64::from_bits(difficulty.to_bits().saturating_add(1))
+        }
     }
 
     /// Publishes a new best-chain tip and wakes getblocktemplate long polls.
@@ -744,13 +764,6 @@ fn bitcoin_network(network: Network) -> bitcoin::Network {
         Network::Signet => bitcoin::Network::Signet,
         Network::Regtest => bitcoin::Network::Regtest,
     }
-}
-
-fn target_to_f64(target: bitcoin::pow::Target) -> f64 {
-    target
-        .to_be_bytes()
-        .iter()
-        .fold(0.0_f64, |acc, &byte| acc.mul_add(256.0, f64::from(byte)))
 }
 
 #[cfg(test)]

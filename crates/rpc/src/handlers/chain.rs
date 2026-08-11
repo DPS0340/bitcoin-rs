@@ -1324,14 +1324,15 @@ mod tests {
     #[test]
     fn difficulty_uses_mainnet_pow_limit_for_regtest_and_mainnet_targets() {
         let ctx = Context::new();
-        assert!(
-            (ctx.difficulty_for_bits(CompactTarget::from_consensus(0x1d00_ffff)) - 1.0).abs()
-                < f64::EPSILON
-        );
+        let mainnet = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x1d00_ffff));
+        assert_eq!(mainnet.to_bits(), 1.0_f64.to_bits());
         let regtest = ctx.difficulty_for_bits(CompactTarget::from_consensus(0x207f_ffff));
-        assert!(
-            (regtest - 4.656_542_373_906_925e-10).abs() < 1e-24,
-            "unexpected regtest difficulty {regtest}"
+        let expected = 4.656_542_373_906_925e-10_f64;
+        assert_eq!(regtest.to_bits(), expected.to_bits());
+        assert_eq!(
+            serde_json::to_string(&regtest)
+                .unwrap_or_else(|err| panic!("difficulty serialization failed: {err}")),
+            "4.656542373906925e-10"
         );
     }
 
@@ -1357,9 +1358,9 @@ mod tests {
             .get("difficulty")
             .and_then(JsonValueTrait::as_f64)
             .unwrap_or_default();
-        assert!(
-            (difficulty - 4.656_542_373_906_925e-10).abs() < 1e-24,
-            "unexpected difficulty {difficulty}"
+        assert_eq!(
+            difficulty.to_bits(),
+            4.656_542_373_906_925e-10_f64.to_bits()
         );
     }
 
