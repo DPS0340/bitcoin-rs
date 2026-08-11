@@ -29,6 +29,12 @@ impl Handler {
         Self { ctx }
     }
 
+    /// Returns the shared context used by the handlers.
+    #[must_use]
+    pub fn context(&self) -> &Arc<Context> {
+        &self.ctx
+    }
+
     /// Dispatches one Bitcoin Core-compatible JSON-RPC method.
     pub fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {

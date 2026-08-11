@@ -7,6 +7,8 @@ This page maps it to what you might want.
 
 - [getting-started.md](getting-started.md) walks from a clone to a syncing
   node.
+- [rest-interface.md](rest-interface.md) documents the optional Core-compatible
+  REST gateway and enforcer integration.
 - [../CONCEPTS.md](../CONCEPTS.md) is the project glossary. Read a term here
   before assuming it means what it means elsewhere in Bitcoin.
 - [../README.md](../README.md) covers the defaults and the measured benchmark.

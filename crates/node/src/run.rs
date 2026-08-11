@@ -626,6 +626,7 @@ pub fn run(mut config: Config) -> Result<()> {
         rpc_handler,
         RPC_MAX_CONNECTIONS,
         RPC_IDLE_TIMEOUT,
+        state.config().rest,
     )?;
     let rpc_local_addr = rpc_server.local_addr()?;
     tracing::info!(addr = %rpc_local_addr, "rpc listener bound");
