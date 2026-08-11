@@ -59,7 +59,7 @@ if [ -e "$EXP/libbitcoinkernel-sys-0.3.0" ]; then
 fi
 
 cp -a "$PRISTINE" "$EXP/libbitcoinkernel-sys-0.3.0"
-patch -p2 -d "$EXP/libbitcoinkernel-sys-0.3.0" < "$EXP/instrumentation.diff"
+patch --fuzz=0 -p1 -d "$EXP/libbitcoinkernel-sys-0.3.0" < "$EXP/instrumentation.diff"
 ```
 
 ## Build
@@ -103,28 +103,50 @@ Binaries produced:
 
 ## Run sequence
 
-### Run A — full census (0..150k, counters + journal only)
+### Run A — authoritative C150 cumulative evidence
 
 ```bash
 REPO=/home/alpha/exp/bitcoin-rs
 EXP=$REPO/tools/checksig-census
+C150=/home/alpha/bench-g14/corpora/c150
 
 mkdir -p "$EXP/out"
 
-BRS_CENSUS_COUNTERS=$EXP/out/census-0-150k.counters.json \
-BRS_CENSUS_JOURNAL=$EXP/out/census-0-150k.journal.bin \
-BRS_CENSUS_LABEL=census-0-150k \
+BRS_CENSUS_COUNTERS=$EXP/out/c150.counters.json \
+BRS_CENSUS_CONTEXTS=$EXP/out/c150.contexts.bin \
+BRS_CENSUS_JOURNAL=$EXP/out/c150.journal.bin \
+BRS_CENSUS_RECORDS=$EXP/out/c150.records.bin \
+BRS_CENSUS_LABEL=c150 \
 taskset -c 0-31 \
 "$EXP/target/release/examples/mainnet_prefix_replay" \
   --stop-height 150000 \
-  --rest-url 127.0.0.1:18443 \
+  --blocks-file "$C150/blocks.dat" \
+  --corpus-manifest "$C150/manifest.json" \
   --assume-valid-height 0 \
-  --data-dir "$EXP/out/census-datadir" \
-  --output "$EXP/out/census-replay.json"
+  --data-dir "$EXP/out/c150-datadir" \
+  --output "$EXP/out/c150.replay.json"
+
+cd "$EXP"
+python3 analyze.py classify-corpus \
+  --counters out/c150.counters.json \
+  --contexts out/c150.contexts.bin \
+  --records out/c150.records.bin \
+  --journal out/c150.journal.bin \
+  --replay out/c150.replay.json \
+  --corpus-manifest "$C150/manifest.json" \
+  --archive "$C150/blocks.dat" \
+  --output out/c150.classification.json \
+  --contract c150
 ```
 
+The replay produces the authoritative `c150.counters.json`, `c150.contexts.bin`,
+`c150.journal.bin`, and `c150.records.bin` artifacts in one process. The strict
+classifier validates each stream's magic and framing, the exact native count
+equations, and every context, record, and journal join.
+
 Expected: `ffi_verify_entries == 2,868,199`, all verdicts true, pre-taproot
-counters (`op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls`) zero.
+counters (`op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls`,
+`schnorr_verify_ok`, `schnorr_verify_fail`) zero.
 Any sink open, write, stream, or close failure forces a nonzero process exit.
 
 ### Run B — KSPIKE1 capture (counters + journal + records, run twice)
@@ -149,6 +171,9 @@ BRS_CENSUS_RECORDS=$EXP/out/kspike1-repeat.records.bin \
 BRS_CENSUS_LABEL=kspike1 \
 "$CAPTURE" --corpus "$CORPUS" --output "$EXP/out/kspike1-repeat.summary.json"
 ```
+
+`BRS_CENSUS_CONTEXTS` is mandatory for authoritative Run A. It is optional for
+the separate KSPIKE1 diagnostic in Run B.
 
 Expected: `ffi_verify_entries == 159,259`, all inputs verify successfully.
 
@@ -196,7 +221,7 @@ spike inputs. Each file also contains:
 - `inv_8` (native correctness: `mismatches == 0`, `ok_count == expected_true_count`,
   `expected_true_count` equal to the capture count, `ok_equals_count_outcome_1 == true`,
   and `passed == true`);
-- `inv_15` (exactly the 22 named post-timing counters, each integer zero,
+- `inv_15` (exactly the 24 named post-timing counters, each integer zero,
   plus `all_counters_zero == true` and `passed == true`);
 - `rust_secp_diagnostic` — a 2-record parser incompatibility between Rust
   secp256k1 0.31.1/libsecp 0.6.0 and the native tree (Bitcoin Core 31.99.0
@@ -374,7 +399,7 @@ removable gain.
 | Full census `ffi_verify_entries` | 2,868,199 |
 | KSPIKE1 `ffi_verify_entries` | 159,259 |
 | KSPIKE1 corpus SHA256 | `16cbaf17feb16ad9b567b4680a5eaf449699037f9696ccb2366af3f48b756fa2` |
-| Pre-taproot counters | `op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls` all zero |
+| Pre-taproot counters | `op_checksigadd`, `checkschnorr_entries`, `schnorr_verify_calls`, `schnorr_verify_ok`, `schnorr_verify_fail` all zero |
 
 ## Output artifacts
 
@@ -407,13 +432,24 @@ magic + u64 count.
 
 **Records** (magic `BRSREC1\0`, 224 bytes each):
 spend_txid[32], input_index u32, op_seq u32, op_kind u8, sig_version u8,
-outcome u8 (0=false, 1=true, 2=pre-secp reject), der_len u8, pubkey_len u8,
-sighash_type u8, reject_reason u8, pad u8, sighash[32], der_sig[72],
-pubkey[65], pad[7].
+outcome u8 (0=false, 1=true, 2=pre-verification reject), der_len u8,
+pubkey_len u8, sighash_type u8, reject_reason u8, pad u8, sighash[32],
+der_sig[72], pubkey[65], pad[7]. Reject reasons are: 0 none; 1 invalid
+ECDSA pubkey; 2 empty ECDSA signature; 3 missing ECDSA transaction data;
+4 invalid Schnorr signature size; 5 explicit-default Schnorr hash type;
+6 missing Schnorr transaction data; 7 Schnorr sighash failure; 8 empty
+Tapscript Schnorr signature skipped before `CheckSchnorrSignature`.
 
 **Journal** (magic `BRSJRN1\0`, 56 bytes each):
 spend_txid[32], input_index u32, checksig_ops u32, checkmultisig_ops u32,
 ecdsa_verify_calls u32, ecdsa_verify_ok u32, verdict u8, pad[3].
 
-**Counters JSON**: schema=1, label, 22 named u64 counters, record_count,
-journal_count.
+**Contexts** (magic `BRSCTX1\0`, variable-length rows):
+row_len u32; spend_txid_le[32]; input_index u32; verify_flags u32;
+prevout_script_len u32; script_sig_len u32; witness_count u32;
+exact prevout scriptPubKey bytes; exact scriptSig bytes;
+for each witness item u32 item_len + exact item bytes.
+`row_len` counts the bytes after the `row_len` field itself.
+
+**Counters JSON**: schema=1, label, 24 named u64 counters, record_count,
+journal_count, context_count.

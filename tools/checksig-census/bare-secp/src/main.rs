@@ -27,7 +27,7 @@ const SUMMARY_SCHEMA: u32 = 1;
 /// Record size must match the native CensusRecord (224 bytes).
 const RECORD_SIZE: usize = 224;
 /// Counter names in the exact order defined by the census contract.
-const COUNTER_NAMES: [&str; 22] = [
+const COUNTER_NAMES: [&str; 24] = [
     "verify_script_calls",
     "ffi_verify_entries",
     "ffi_verify_true",
@@ -50,6 +50,8 @@ const COUNTER_NAMES: [&str; 22] = [
     "sighash_midstate_hit",
     "checkschnorr_entries",
     "schnorr_verify_calls",
+    "schnorr_verify_ok",
+    "schnorr_verify_fail",
 ];
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -64,7 +66,7 @@ fn main() -> Result<()> {
     }
 
     // Convert records to btck_bare_input array.
-    // Only records with outcome != 2 (pre-secp reject) have valid sighash/der/pubkey.
+    // Only records with outcome != 2 (pre-verification reject) have a verification sighash.
     let mut inputs: Vec<libbitcoinkernel_sys::btck_bare_input> = Vec::with_capacity(records.len());
     let mut rejected: u64 = 0;
     for rec in &records {
@@ -124,9 +126,9 @@ fn main() -> Result<()> {
     }
 
     // Verify counters stayed zero.
-    let mut counters = [0u64; 22];
+    let mut counters = [0u64; 24];
     unsafe {
-        libbitcoinkernel_sys::btck_census_snapshot(counters.as_mut_ptr(), 22);
+        libbitcoinkernel_sys::btck_census_snapshot(counters.as_mut_ptr(), 24);
     }
     let counters_nonzero: u64 = counters.iter().map(|&v| v.min(1)).sum();
     if counters_nonzero != 0 {
