@@ -16,6 +16,42 @@ const DEFAULT_RPC_USER: &str = "bitcoin-rs";
 const DEFAULT_RPC_PASSWORD: &str = "bitcoin-rs";
 const DEFAULT_DBCACHE_MB: u64 = 450;
 const DEFAULT_ZMQ_HWM: u32 = 1_000;
+const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
+const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
+
+/// A complete built-in node network profile.
+///
+/// Unlike [`Network`], which selects consensus rules, a preset also selects
+/// P2P bootstrap behavior. Low-level settings in the same or a later
+/// configuration layer may explicitly override the preset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum NetworkSelection {
+    /// Bitcoin mainnet.
+    Mainnet,
+    /// Legacy Bitcoin testnet.
+    Testnet3,
+    /// Bitcoin testnet4.
+    Testnet4,
+    /// Bitcoin signet.
+    Signet,
+    /// Local regression-test network.
+    Regtest,
+    /// ecash drynet4: mainnet consensus history on a distinct P2P network.
+    Drynet4,
+}
+
+impl NetworkSelection {
+    const fn consensus_network(self) -> Network {
+        match self {
+            Self::Mainnet | Self::Drynet4 => Network::Mainnet,
+            Self::Testnet3 => Network::Testnet3,
+            Self::Testnet4 => Network::Testnet4,
+            Self::Signet => Network::Signet,
+            Self::Regtest => Network::Regtest,
+        }
+    }
+}
 
 /// RPC authentication configuration before it is converted into the RPC crate's runtime policy.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -462,18 +498,18 @@ impl Config {
             crate::bitcoin_conf_compat::apply_file(&mut config, path)?;
         }
         if let Some(layer) = &toml_layer {
-            config.apply_layer(layer);
+            config.apply_layer(layer)?;
         }
-        config.apply_layer(&env_layer);
-        config.apply_layer(cli);
+        config.apply_layer(&env_layer)?;
+        config.apply_layer(cli)?;
         config.validate()?;
         Ok(config)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_layer(&mut self, layer: &ConfigLayer) {
+    fn apply_layer(&mut self, layer: &ConfigLayer) -> Result<()> {
         if let Some(network) = layer.network {
-            self.network = network;
+            self.apply_network_selection(network)?;
         }
         if let Some(p2p_magic) = layer.p2p_magic {
             self.p2p_magic = Some(p2p_magic);
@@ -584,6 +620,24 @@ impl Config {
         if let Some(height) = layer.assume_valid_height {
             self.assume_valid_height = height;
         }
+        Ok(())
+    }
+
+    fn apply_network_selection(&mut self, selection: NetworkSelection) -> Result<()> {
+        let network = selection.consensus_network();
+        self.network = network;
+        self.p2p_magic = None;
+        self.rpc_bind = SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port()));
+        self.p2p_listen = vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))];
+        self.dns_seeds_enabled = true;
+        self.connect.clear();
+
+        if selection == NetworkSelection::Drynet4 {
+            self.p2p_magic = Some(DRYNET4_P2P_MAGIC);
+            self.dns_seeds_enabled = false;
+            self.connect = vec![parse_connect_addr(DRYNET4_CONNECT).map_err(anyhow::Error::msg)?];
+        }
+        Ok(())
     }
 
     fn apply_g14_utxo_commit_layer(&mut self, layer: &ConfigLayer) {
@@ -613,9 +667,9 @@ pub(crate) struct ConfigLayer {
     pub(crate) config: Option<PathBuf>,
     #[arg(long = "bitcoin-conf")]
     pub(crate) bitcoin_conf: Option<PathBuf>,
-    #[arg(long, value_parser = parse_network)]
-    #[serde(deserialize_with = "deserialize_optional_network")]
-    pub(crate) network: Option<Network>,
+    /// Select the Bitcoin or fork network, including its P2P bootstrap profile.
+    #[arg(long, value_parser = parse_network_selection)]
+    pub(crate) network: Option<NetworkSelection>,
     /// Override the four P2P message-start bytes for a fork network.
     #[arg(long = "p2p-magic", value_parser = parse_p2p_magic)]
     #[serde(deserialize_with = "deserialize_optional_p2p_magic")]
@@ -708,8 +762,8 @@ pub(crate) struct ConfigLayer {
 }
 
 impl ConfigLayer {
-    pub(crate) fn apply_to(&self, config: &mut Config) {
-        config.apply_layer(self);
+    pub(crate) fn apply_to(&self, config: &mut Config) -> Result<()> {
+        config.apply_layer(self)
     }
 
     fn from_env<E, K, V>(env: E) -> Result<Self>
@@ -723,7 +777,7 @@ impl ConfigLayer {
             let key = key.as_ref();
             let value = value.as_ref();
             match key {
-                "BITCOIN_RS_NETWORK" => layer.network = Some(parse_network(value)?),
+                "BITCOIN_RS_NETWORK" => layer.network = Some(parse_network_selection(value)?),
                 "BITCOIN_RS_P2P_MAGIC" => layer.p2p_magic = Some(parse_p2p_magic(value)?),
                 "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
                 "BITCOIN_RS_STORAGE_BACKEND" => layer.storage_backend = Some(value.to_owned()),
@@ -830,10 +884,14 @@ fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
 }
 
 fn effective_network(toml: Option<&ConfigLayer>, env: &ConfigLayer, cli: &ConfigLayer) -> Network {
-    cli.network
-        .or(env.network)
-        .or_else(|| toml.and_then(|layer| layer.network))
+    layer_network(cli)
+        .or_else(|| layer_network(env))
+        .or_else(|| toml.and_then(layer_network))
         .unwrap_or(Network::Mainnet)
+}
+
+fn layer_network(layer: &ConfigLayer) -> Option<Network> {
+    layer.network.map(NetworkSelection::consensus_network)
 }
 
 fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
@@ -913,6 +971,18 @@ fn parse_network(value: &str) -> anyhow::Result<Network> {
         "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
         other => bail!("unsupported network {other}"),
+    }
+}
+
+fn parse_network_selection(value: &str) -> anyhow::Result<NetworkSelection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "main" | "mainnet" | "bitcoin" => Ok(NetworkSelection::Mainnet),
+        "test" | "testnet" | "testnet3" => Ok(NetworkSelection::Testnet3),
+        "testnet4" => Ok(NetworkSelection::Testnet4),
+        "signet" => Ok(NetworkSelection::Signet),
+        "regtest" => Ok(NetworkSelection::Regtest),
+        "drynet4" => Ok(NetworkSelection::Drynet4),
+        other => bail!("unknown network {other}"),
     }
 }
 

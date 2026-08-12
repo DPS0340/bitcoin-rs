@@ -122,6 +122,56 @@ fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
 }
 
 #[test]
+fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_NETWORK", "drynet4")],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert_eq!(config.network, Network::Mainnet);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
+    assert_eq!(config.connect.len(), 1);
+    assert_eq!(config.connect[0].port(), 8_533);
+    assert!(!config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
+fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [
+            ("BITCOIN_RS_NETWORK", "drynet4"),
+            ("BITCOIN_RS_CONNECT", "127.0.0.1:8333"),
+        ],
+        ["bitcoin-rs-node", "--p2p-magic", "01020304"],
+    )?;
+
+    assert_eq!(config.p2p_magic(), [1, 2, 3, 4]);
+    assert_eq!(config.connect, vec!["127.0.0.1:8333".parse()?]);
+    Ok(())
+}
+
+#[test]
+fn standard_network_uses_builtin_defaults() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_NETWORK", "testnet4")],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert_eq!(config.network, Network::Testnet4);
+    assert_eq!(config.p2p_magic(), Network::Testnet4.magic());
+    assert!(config.connect.is_empty());
+    assert!(config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
 fn p2p_magic_override_requires_an_explicit_peer() {
     let result = Config::from_layered_sources(
         None,
