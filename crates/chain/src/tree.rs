@@ -627,6 +627,52 @@ impl BlockTree {
     /// chain-transition witness. Equal-work valid tips retain insertion order, matching
     /// normal tip publication.
     pub fn invalidate_subtree(&mut self, root: NodeId) -> Result<Vec<Hash256>, ChainError> {
+        let (invalid, best) = self.invalidation_plan(root)?;
+
+        // Demote the previous active tip to Stale if it is not the new best and is not
+        // about to be marked invalid.
+        if let Some(old_tip) = self.tip_id() {
+            if let Some(best) = best {
+                if best != old_tip {
+                    let old_index = old_tip
+                        .index()
+                        .ok_or(ChainError::UnknownNode { id: old_tip })?;
+                    if !invalid[old_index] {
+                        self.node_mut_without_index_invalidation(old_tip)?.status =
+                            NodeStatus::Stale;
+                    }
+                }
+            }
+        }
+
+        // Wipe the published tip and active index before republishing.
+        self.tip.store(None);
+        self.active_by_height.clear_tainted();
+
+        // Mark the subtree invalid and collect the hashes in deterministic slab order.
+        let mut hashes = Vec::with_capacity(invalid.iter().filter(|&&b| b).count());
+        for (index, node) in &mut self.nodes {
+            if invalid[index] {
+                node.status = NodeStatus::Invalid;
+                hashes.push(node.hash);
+            }
+        }
+
+        // Republish the best valid tip (if any), which also rebuilds the active index.
+        if let Some(best) = best {
+            self.publish_tip_if_best(best)?;
+        }
+
+        Ok(hashes)
+    }
+
+    /// Returns the tip that would become active after invalidating `root` and
+    /// its descendants, without changing the tree.
+    pub fn tip_after_invalidation(&self, root: NodeId) -> Result<Option<NodeId>, ChainError> {
+        self.invalidation_plan(root).map(|(_, best)| best)
+    }
+
+    fn invalidation_plan(&self, root: NodeId) -> Result<(Vec<bool>, Option<NodeId>), ChainError> {
         let root_index = root.index().ok_or(ChainError::UnknownNode { id: root })?;
         self.node(root)?;
 
@@ -680,41 +726,7 @@ impl BlockTree {
             })
             .transpose()?;
 
-        // Demote the previous active tip to Stale if it is not the new best and is not
-        // about to be marked invalid.
-        if let Some(old_tip) = self.tip_id() {
-            if let Some(best) = best {
-                if best != old_tip {
-                    let old_index = old_tip
-                        .index()
-                        .ok_or(ChainError::UnknownNode { id: old_tip })?;
-                    if !invalid[old_index] {
-                        self.node_mut_without_index_invalidation(old_tip)?.status =
-                            NodeStatus::Stale;
-                    }
-                }
-            }
-        }
-
-        // Wipe the published tip and active index before republishing.
-        self.tip.store(None);
-        self.active_by_height.clear_tainted();
-
-        // Mark the subtree invalid and collect the hashes in deterministic slab order.
-        let mut hashes = Vec::with_capacity(invalid.iter().filter(|&&b| b).count());
-        for (index, node) in &mut self.nodes {
-            if invalid[index] {
-                node.status = NodeStatus::Invalid;
-                hashes.push(node.hash);
-            }
-        }
-
-        // Republish the best valid tip (if any), which also rebuilds the active index.
-        if let Some(best) = best {
-            self.publish_tip_if_best(best)?;
-        }
-
-        Ok(hashes)
+        Ok((invalid, best))
     }
     /// Returns all ancestors from `start` down to the root, including `start`.
     pub fn ancestor_chain(&self, start: NodeId) -> Result<Vec<NodeId>, ChainError> {
@@ -1906,6 +1918,11 @@ mod tests {
         // The side chain is the active tip because it is longer.
         assert_eq!(tree.tip_id(), Some(side_ids[2]));
         assert_eq!(tree.active_by_height.get(1), Some(side_ids[0]));
+
+        // Previewing the invalidation selects a2 without mutating status or tip.
+        assert_eq!(tree.tip_after_invalidation(side_ids[0])?, Some(a2_id));
+        assert_eq!(tree.tip_id(), Some(side_ids[2]));
+        assert_eq!(tree.node(side_ids[0])?.status, NodeStatus::HeaderValid);
 
         // Invalidate the side root (b1). This must mark b1..b3 invalid and reselect a2.
         let invalid_hashes = tree.invalidate_subtree(side_ids[0])?;

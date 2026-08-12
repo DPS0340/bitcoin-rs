@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use bitcoin_rs_rpc::auth::constant_time_eq;
 use bitcoin_rs_rpc::{Auth, Context, Handler, RpcServer};
-use sonic_rs::JsonValueTrait;
 use sonic_rs::json;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 #[test]
 fn basic_auth_accepts_and_rejects_requests() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,6 +23,104 @@ fn basic_auth_accepts_and_rejects_requests() -> Result<(), Box<dyn std::error::E
 
     let rejected = request(address, "YWxpY2U6YmFk", body)?;
     assert!(rejected.starts_with("HTTP/1.1 401 Unauthorized"));
+    Ok(())
+}
+
+#[test]
+fn json_rpc_2_error_is_http_200_without_result() -> Result<(), Box<dyn std::error::Error>> {
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let body = r#"{"jsonrpc":"2.0","method":"missing","params":[],"id":7}"#;
+    let response = request(address, "YWxpY2U6c2VjcmV0", body)?;
+    let payload = response.split_once("\r\n\r\n").ok_or("missing body")?.1;
+    let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(value.get("jsonrpc").and_then(|v| v.as_str()), Some("2.0"));
+    assert!(value.get("error").is_some());
+    assert!(value.get("result").is_none());
+    Ok(())
+}
+
+#[test]
+fn legacy_error_has_core_envelope_and_http_error() -> Result<(), Box<dyn std::error::Error>> {
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let body = r#"{"method":"missing","params":[],"id":7}"#;
+    let response = request(address, "YWxpY2U6c2VjcmV0", body)?;
+    let payload = response.split_once("\r\n\r\n").ok_or("missing body")?.1;
+    let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
+
+    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+    assert!(value.get("jsonrpc").is_none());
+    assert!(value.get("error").is_some());
+    assert!(value.get("result").is_some_and(|v| v.is_null()));
+    Ok(())
+}
+
+#[test]
+fn json_rpc_2_notification_returns_http_204() -> Result<(), Box<dyn std::error::Error>> {
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let body = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[]}"#;
+    let response = request(address, "YWxpY2U6c2VjcmV0", body)?;
+
+    assert!(response.starts_with("HTTP/1.1 204 No Content"));
+    assert!(response.ends_with("\r\n\r\n"));
+    Ok(())
+}
+
+#[test]
+fn json_rpc_2_batch_returns_an_array_and_excludes_notifications()
+-> Result<(), Box<dyn std::error::Error>> {
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let body = r#"[
+        {"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1},
+        {"jsonrpc":"2.0","method":"getblockcount","params":[]},
+        {"jsonrpc":"2.0","method":"missing","params":[],"id":2}
+    ]"#;
+    let response = request(address, "YWxpY2U6c2VjcmV0", body)?;
+    let payload = response.split_once("\r\n\r\n").ok_or("missing body")?.1;
+    let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
+    let rows = value.as_array().ok_or("batch response must be an array")?;
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].get("result").is_some());
+    assert!(rows[1].get("error").is_some());
+    Ok(())
+}
+
+#[test]
+fn notification_only_batch_returns_http_204() -> Result<(), Box<dyn std::error::Error>> {
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let body = r#"[
+        {"jsonrpc":"2.0","method":"getblockcount","params":[]},
+        {"jsonrpc":"2.0","method":"getblockchaininfo","params":[]}
+    ]"#;
+    let response = request(address, "YWxpY2U6c2VjcmV0", body)?;
+
+    assert!(response.starts_with("HTTP/1.1 204 No Content"));
+    assert!(response.ends_with("\r\n\r\n"));
+    Ok(())
+}
+
+#[test]
+fn malformed_json_uses_core_legacy_parse_error_envelope() -> Result<(), Box<dyn std::error::Error>>
+{
+    let address = spawn(Auth::basic("alice", "secret"))?;
+    let response = request(address, "YWxpY2U6c2VjcmV0", "{")?;
+    let payload = response.split_once("\r\n\r\n").ok_or("missing body")?.1;
+    let value: sonic_rs::Value = sonic_rs::from_str(payload)?;
+
+    assert!(response.starts_with("HTTP/1.1 500 Internal Server Error"));
+    assert!(value.get("jsonrpc").is_none());
+    assert!(value.get("result").is_some_and(|v| v.is_null()));
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(|code| code.as_i64()),
+        Some(-32_700)
+    );
+    assert!(value.get("id").is_some_and(|id| id.is_null()));
     Ok(())
 }
 

@@ -54,3 +54,8 @@ returns HTTP 400 with `Invalid hash: <hash>`. This distinction is load-bearing
 for the enforcer: it treats a 404 on `/rest/*` as evidence that REST is not
 enabled, so an unknown or non-active block hash must not produce a misleading
 404.
+
+The checked-in default Compose stack supplies the REST, `pubsequence`,
+version-check bypass, and drynet4 network settings required to run the
+unmodified enforcer in block-only mode. It deliberately omits `--enable-mempool`
+until `pubsequence` also provides transaction `A`/`R` events.

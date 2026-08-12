@@ -97,6 +97,97 @@ fn cli_can_override_socket_and_vector_fields() -> Result<()> {
 }
 
 #[test]
+fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
+    let peer = "127.0.0.1:8333".to_owned();
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        [
+            "bitcoin-rs-node",
+            "--p2p-magic",
+            "eca5d434",
+            "--dns-seeds-enabled",
+            "false",
+            "--connect",
+            "127.0.0.1:8333",
+        ],
+    )?;
+
+    assert_eq!(config.network, Network::Mainnet);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x34]);
+    assert_eq!(config.connect, vec![peer]);
+    assert!(!config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
+fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_NETWORK", "drynet4")],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert_eq!(config.network, Network::Mainnet);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
+    assert_eq!(config.connect, vec!["drynet4.drivechain.dev:8533"]);
+    assert!(!config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
+fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [
+            ("BITCOIN_RS_NETWORK", "drynet4"),
+            ("BITCOIN_RS_CONNECT", "127.0.0.1:8333"),
+        ],
+        ["bitcoin-rs-node", "--p2p-magic", "01020304"],
+    )?;
+
+    assert_eq!(config.p2p_magic(), [1, 2, 3, 4]);
+    assert_eq!(config.connect, vec!["127.0.0.1:8333"]);
+    Ok(())
+}
+
+#[test]
+fn standard_network_uses_builtin_defaults() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_NETWORK", "testnet4")],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert_eq!(config.network, Network::Testnet4);
+    assert_eq!(config.p2p_magic(), Network::Testnet4.magic());
+    assert!(config.connect.is_empty());
+    assert!(config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
+fn p2p_magic_override_requires_an_explicit_peer() {
+    let result = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        [
+            "bitcoin-rs-node",
+            "--p2p-magic",
+            "eca5d434",
+            "--dns-seeds-enabled",
+            "false",
+        ],
+    );
+    assert!(result.is_err_and(|error| error.to_string().contains("at least one --connect peer")));
+}
+
+#[test]
 fn electrum_bind_requires_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
     config.electrum_bind = Some("127.0.0.1:50001".parse()?);
@@ -106,6 +197,23 @@ fn electrum_bind_requires_txindex() -> Result<()> {
         Ok(()) => panic!("electrum_bind without txindex unexpectedly validated"),
         Err(error) => assert_eq!(error.to_string(), "electrum_bind requires txindex"),
     }
+    Ok(())
+}
+
+#[test]
+fn empty_electrum_bind_disables_the_optional_service() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [
+            ("BITCOIN_RS_TXINDEX", "false"),
+            ("BITCOIN_RS_ELECTRUM_BIND", ""),
+        ],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert!(!config.txindex);
+    assert_eq!(config.electrum_bind, None);
     Ok(())
 }
 
@@ -376,13 +484,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
             "127.0.0.1:8333,10.0.0.2:8333",
         ],
     )?;
-    assert_eq!(
-        cli_config.connect,
-        vec![
-            "127.0.0.1:8333".parse::<SocketAddr>()?,
-            "10.0.0.2:8333".parse::<SocketAddr>()?,
-        ]
-    );
+    assert_eq!(cli_config.connect, vec!["127.0.0.1:8333", "10.0.0.2:8333"]);
 
     let env_config = Config::from_layered_sources(
         None,
@@ -390,10 +492,15 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
         [("BITCOIN_RS_CONNECT", "192.0.2.5:8333")],
         ["bitcoin-rs-node"],
     )?;
-    assert_eq!(
-        env_config.connect,
-        vec!["192.0.2.5:8333".parse::<SocketAddr>()?]
-    );
+    assert_eq!(env_config.connect, vec!["192.0.2.5:8333"]);
+
+    let hostname_config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_CONNECT", "localhost:18444")],
+        ["bitcoin-rs-node"],
+    )?;
+    assert_eq!(hostname_config.connect, vec!["localhost:18444"]);
 
     let default_config = Config::from_layered_sources(
         None,

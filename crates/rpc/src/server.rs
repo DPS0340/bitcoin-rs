@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use sonic_rs::{JsonValueTrait as _, Value, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
 use tracing::{debug, warn};
 
 use crate::auth::Auth;
@@ -144,8 +144,9 @@ fn serve_connection(
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(error) => {
+                let rpc_error = RpcError::InvalidRequest("malformed http request");
                 let response =
-                    RpcError::InvalidRequest("malformed http request").response(&Value::new_null());
+                    JsonRpcVersion::Legacy.error_response(&rpc_error, &Value::new_null());
                 write_json(reader.get_mut(), 400, "Bad Request", &response, false)?;
                 return Err(error);
             }
@@ -178,7 +179,17 @@ fn serve_connection(
         }
 
         let response = handle_json(handler, &request.body);
-        write_json(reader.get_mut(), 200, "OK", &response, keep_alive)?;
+        if let Some(body) = response.body.as_ref() {
+            write_json(
+                reader.get_mut(),
+                response.status,
+                response.reason,
+                body,
+                keep_alive,
+            )?;
+        } else {
+            write_status(reader.get_mut(), 204, "No Content", b"", keep_alive)?;
+        }
         if !keep_alive {
             return Ok(());
         }
@@ -289,24 +300,180 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<HttpRequ
     }))
 }
 
-fn handle_json(handler: &Handler, body: &[u8]) -> Value {
+struct JsonResponse {
+    status: u16,
+    reason: &'static str,
+    body: Option<Value>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JsonRpcVersion {
+    Legacy,
+    V2,
+}
+
+impl JsonRpcVersion {
+    fn from_request(request: &Value) -> Self {
+        if request.get("jsonrpc").and_then(Value::as_str) == Some("2.0") {
+            Self::V2
+        } else {
+            Self::Legacy
+        }
+    }
+
+    fn success_response(self, result: &Value, id: &Value) -> Value {
+        match self {
+            Self::Legacy => json!({"result": result, "error": null, "id": id}),
+            Self::V2 => json!({"jsonrpc": "2.0", "result": result, "id": id}),
+        }
+    }
+
+    fn error_response(self, error: &RpcError, id: &Value) -> Value {
+        match self {
+            Self::Legacy => json!({
+                "result": null,
+                "error": {"code": error.code(), "message": error.to_string()},
+                "id": id
+            }),
+            Self::V2 => json!({
+                "jsonrpc": "2.0",
+                "error": {"code": error.code(), "message": error.to_string()},
+                "id": id
+            }),
+        }
+    }
+
+    const fn error_status(self) -> u16 {
+        match self {
+            Self::Legacy => 500,
+            Self::V2 => 200,
+        }
+    }
+}
+
+enum CallResponse {
+    Reply {
+        body: Value,
+        version: JsonRpcVersion,
+        is_error: bool,
+    },
+    Notification,
+}
+
+impl CallResponse {
+    fn reply(body: Value, version: JsonRpcVersion, is_error: bool) -> Self {
+        Self::Reply {
+            body,
+            version,
+            is_error,
+        }
+    }
+
+    const fn http_status(&self) -> u16 {
+        match self {
+            Self::Reply {
+                version,
+                is_error: true,
+                ..
+            } => version.error_status(),
+            Self::Reply { .. } | Self::Notification => 200,
+        }
+    }
+}
+
+fn handle_json(handler: &Handler, body: &[u8]) -> JsonResponse {
     let body = match core::str::from_utf8(body) {
         Ok(body) => body,
-        Err(error) => return RpcError::from(error).response(&Value::new_null()),
+        Err(error) => {
+            return legacy_error_response(&RpcError::from(error), &Value::new_null());
+        }
     };
     let request = match sonic_rs::from_str::<Value>(body) {
         Ok(request) => request,
-        Err(error) => return RpcError::from(error).response(&Value::new_null()),
+        Err(error) => {
+            return legacy_error_response(&RpcError::from(error), &Value::new_null());
+        }
     };
+
+    if let Some(requests) = request.as_array() {
+        if requests.is_empty() {
+            return legacy_error_response(
+                &RpcError::InvalidRequest("batch must not be empty"),
+                &Value::new_null(),
+            );
+        }
+        let mut responses = Vec::with_capacity(requests.len());
+        let mut status = 200;
+        for request in requests {
+            let response = handle_single_json(handler, request);
+            status = status.max(response.http_status());
+            if let CallResponse::Reply { body, .. } = response {
+                responses.push(body);
+            }
+        }
+        if responses.is_empty() {
+            return no_content_response();
+        }
+        return JsonResponse {
+            status,
+            reason: reason_for_status(status),
+            body: Some(json!(responses)),
+        };
+    }
+
+    let response = handle_single_json(handler, &request);
+    let status = response.http_status();
+    match response {
+        CallResponse::Reply { body, .. } => JsonResponse {
+            status,
+            reason: reason_for_status(status),
+            body: Some(body),
+        },
+        CallResponse::Notification => no_content_response(),
+    }
+}
+
+fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
     let id = request.get("id").cloned().unwrap_or_else(Value::new_null);
+    let version = JsonRpcVersion::from_request(request);
     let Some(method) = request.get("method").and_then(Value::as_str) else {
-        return RpcError::InvalidRequest("method is required").response(&id);
+        let error = RpcError::InvalidRequest("method is required");
+        return CallResponse::reply(version.error_response(&error, &id), version, true);
     };
     let null_params = Value::new_null();
     let params = request.get("params").unwrap_or(&null_params);
-    match handler.dispatch(method, params) {
-        Ok(result) => json!({"jsonrpc": "2.0", "result": result, "error": null, "id": id}),
-        Err(error) => error.response(&id),
+    let result = handler.dispatch(method, params);
+    if version == JsonRpcVersion::V2 && request.get("id").is_none() {
+        return CallResponse::Notification;
+    }
+    match result {
+        Ok(result) => CallResponse::reply(version.success_response(&result, &id), version, false),
+        Err(error) => CallResponse::reply(version.error_response(&error, &id), version, true),
+    }
+}
+
+fn legacy_error_response(error: &RpcError, id: &Value) -> JsonResponse {
+    let version = JsonRpcVersion::Legacy;
+    JsonResponse {
+        status: version.error_status(),
+        reason: reason_for_status(version.error_status()),
+        body: Some(version.error_response(error, id)),
+    }
+}
+
+const fn reason_for_status(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        _ => "Internal Server Error",
+    }
+}
+
+const fn no_content_response() -> JsonResponse {
+    JsonResponse {
+        status: 204,
+        reason: "No Content",
+        body: None,
     }
 }
 
@@ -402,5 +569,81 @@ mod tests {
             split_path_query("/rest/chaininfo.json"),
             ("/rest/chaininfo.json", "")
         );
+    }
+
+    #[test]
+    fn json_rpc_2_success_omits_null_error_for_jsonrpsee_clients() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#,
+        );
+        let response = response.body.expect("JSON-RPC response body");
+
+        assert_eq!(response.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert!(response.get("result").is_some());
+        assert!(response.get("error").is_none());
+    }
+
+    #[test]
+    fn bitcoin_core_1_success_keeps_null_error() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockchaininfo","params":[]}"#,
+        );
+        let response = response.body.expect("JSON-RPC response body");
+
+        assert!(response.get("jsonrpc").is_none());
+        assert!(response.get("result").is_some());
+        assert!(response.get("error").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn json_rpc_2_error_omits_result_and_uses_http_200() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"2.0","id":7,"method":"missing","params":[]}"#,
+        );
+        let status = response.status;
+        let body = response.body.expect("JSON-RPC response body");
+
+        assert_eq!(status, 200);
+        assert!(body.get("result").is_none());
+        assert!(body.get("error").is_some_and(Value::is_object));
+        assert_eq!(body.get("id").and_then(Value::as_i64), Some(7));
+    }
+
+    #[test]
+    fn json_rpc_2_notification_has_no_response_body() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"2.0","method":"getblockcount","params":[]}"#,
+        );
+
+        assert!(response.body.is_none());
+    }
+
+    #[test]
+    fn json_rpc_batch_excludes_notifications() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"getblockcount","params":[]},
+                {"jsonrpc":"2.0","method":"getblockcount","params":[]},
+                {"jsonrpc":"2.0","id":2,"method":"missing","params":[]}
+            ]"#,
+        );
+        let status = response.status;
+        let body = response.body.expect("JSON-RPC batch response body");
+        let rows = body.as_array().expect("batch response array");
+
+        assert_eq!(status, 200);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].get("result").is_some());
+        assert!(rows[1].get("error").is_some());
     }
 }

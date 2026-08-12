@@ -37,7 +37,10 @@ The mainnet consensus checkpoint (height 938343, block `00000000000000000000cceb
 The standard node operational configuration tuned for mainnet sync: `fjall` storage backend, multi-peer block download active (outbound peer target 8, pending block budget 128, 16 in-flight requests per peer), hash-pinned assume-valid active on mainnet (height 938343), 450 MiB database cache (`dbcache`, matching Bitcoin Core parity), with secondary indexes (`txindex`, `blockfilterindex`), pruning, and `utreexo` stateless validation disabled by default.
 
 ### Container deployment posture
-The checked-in Docker Compose specialization of the optimized default posture. The image compiles only the production `fjall` storage and `bitcoinkernel` verifier features and runs as an unprivileged user. Compose publishes P2P on the configured host port, keeps JSON-RPC on the host loopback interface, requires an explicit non-empty RPC password, and gives every selected Bitcoin network its own named data volume so incompatible checkpoints are never reused across a network switch. Shutdown allows up to 5 minutes because the bounded subsystem drain is followed by an unbounded, synchronous full-UTXO clean checkpoint; this is an operational SIGKILL guard, not a checkpoint-duration guarantee.
+The checked-in Docker Compose specialization of the optimized default posture. The image compiles only the production `fjall` storage and `bitcoinkernel` verifier features and runs as an unprivileged user. The BIP300/301 integration Compose publishes P2P on the configured host port, keeps JSON-RPC on the host loopback interface, leaves `txindex` and the optional Electrum service disabled, supplies local-development RPC credential fallbacks that deployments should override, and namespaces node and enforcer data by `BITCOIN_RS_NETWORK` so incompatible P2P networks never reuse runtime state. Shutdown allows up to 5 minutes because the bounded subsystem drain is followed by an unbounded, synchronous full-UTXO clean checkpoint; this is an operational SIGKILL guard, not a checkpoint-duration guarantee.
+
+### Node network selection
+The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically supplies consensus rules and P2P bootstrap identity while preserving later, low-level overrides. Standard Bitcoin names use their matching consensus `Network`, message start, and DNS bootstrap. `drynet4` uses mainnet consensus history with message start `eca5d404`, disables Bitcoin DNS seeds, and connects to `drynet4.drivechain.dev:8533`. Compose passes the same selection to bitcoin-rs and the BIP300/301 enforcer and uses it to namespace their data directories. The internal consensus `Network` remains `mainnet` for drynet4.
 
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
@@ -176,6 +179,20 @@ disconnect), and a topic-local little-endian `u32` sequence counter. Reorg
 disconnects are emitted tip-first before connects on the replacement branch.
 This implementation deliberately omits mempool `A`/`R` events until the
 mempool has per-transaction sequence assignment and explicit removal reasons.
+
+### Chain control
+
+Consensus-affecting RPCs do not mutate the RPC context's block-tree handle
+directly. They delegate through the node-owned `ChainControl` boundary so the
+same apply-admission and chain-transition locks protect RPC-triggered and
+sync-triggered reorganizations. `invalidateblock` marks the named subtree
+invalid, republishes the best remaining header tip, and moves applied
+chainstate to it through the normal disconnect path. Before changing header
+status it previews the replacement tip and loads every body required by the
+complete disconnect/connect plan. The same chain-transition witness remains
+held from that preflight through header invalidation and branch switching, so
+another apply or reorg cannot enter between them; successful disconnects emit
+the same `pubsequence` `D` events as an organic reorg.
 
 ### Dispatch-bound parallelism
 

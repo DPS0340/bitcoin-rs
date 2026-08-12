@@ -9,7 +9,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::{BlockRecord, Context};
+use crate::context::{BlockRecord, ChainControlError, Context};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -585,6 +585,22 @@ pub(crate) fn pruneblockchain(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         .prune_to_height(requested_height)
         .map_err(|err| RpcError::Internal(err.to_string()))?;
     Ok(json!(result.pruneheight))
+}
+
+pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let hash = parse_hash(required_str(params, 0, "block hash is required")?)?;
+    let control = ctx
+        .chain_control
+        .as_ref()
+        .ok_or(RpcError::MethodDisabled("invalidateblock is unavailable"))?;
+    match control.invalidate_block(hash) {
+        Ok(()) => Ok(json!(null)),
+        Err(ChainControlError::UnknownBlock) => Err(RpcError::NotFound("block not found")),
+        Err(ChainControlError::Genesis) => Err(RpcError::InvalidParams(
+            "cannot invalidate the genesis block",
+        )),
+        Err(ChainControlError::Failed(message)) => Err(RpcError::Internal(message)),
+    }
 }
 
 pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
