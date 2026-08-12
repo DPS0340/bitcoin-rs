@@ -602,6 +602,8 @@ class NativeExecutionTests(WorkspaceTestCase):
 
     def test_spawn_failure_restores_parent_affinity(self) -> None:
         parent_affinity = os.sched_getaffinity(0)
+        if len(parent_affinity) < 2:
+            self.skipTest("affinity restoration needs a strict CPU subset")
         affinity = (min(parent_affinity),)
         fixture = CampaignFixture(self.workspace, affinity=affinity)
         with patch.object(
@@ -705,6 +707,22 @@ class EvidenceCustodyTests(WorkspaceTestCase):
         command[0] = "/proc/self/fd/999"
         result_path.write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaisesRegex(ContractError, "descriptor changed"):
+            validate_result(result_path, fixture.config)
+
+    def test_candidate_and_core_executable_descriptors_must_differ(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        pairs = _array(raw["pairs"])
+        first_pair = _object(pairs[0])
+        candidate = _object(first_pair["candidate"])
+        candidate_descriptor = _array(candidate["command"])[0]
+        for pair_value in pairs:
+            pair = _object(pair_value)
+            core = _object(pair["core"])
+            _array(core["command"])[0] = candidate_descriptor
+        result_path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "must be distinct"):
             validate_result(result_path, fixture.config)
 
     def test_reused_executable_and_input_descriptor_is_rejected(self) -> None:
