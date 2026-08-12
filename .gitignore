@@ -15,7 +15,7 @@ core.*
 /tmp/
 /.bitcoin-rs/
 /data/
-/.env
+.env
 
 # Re-include project plan tracked in-repo (global ~/.gitignore drops PLAN.md).
 !PLAN.md
