@@ -484,10 +484,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
             "127.0.0.1:8333,10.0.0.2:8333",
         ],
     )?;
-    assert_eq!(
-        cli_config.connect,
-        vec!["127.0.0.1:8333", "10.0.0.2:8333"]
-    );
+    assert_eq!(cli_config.connect, vec!["127.0.0.1:8333", "10.0.0.2:8333"]);
 
     let env_config = Config::from_layered_sources(
         None,
@@ -495,10 +492,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
         [("BITCOIN_RS_CONNECT", "192.0.2.5:8333")],
         ["bitcoin-rs-node"],
     )?;
-    assert_eq!(
-        env_config.connect,
-        vec!["192.0.2.5:8333"]
-    );
+    assert_eq!(env_config.connect, vec!["192.0.2.5:8333"]);
 
     let hostname_config = Config::from_layered_sources(
         None,

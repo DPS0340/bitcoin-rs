@@ -10,7 +10,8 @@ pub fn apply_file(config: &mut Config, path: &Path) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read bitcoin.conf {}", path.display()))?;
     let layer = parse_for_network(&text, config.network);
-    layer.apply_to(config)
+    layer.apply_to(config);
+    Ok(())
 }
 
 fn parse_for_network(text: &str, network: Network) -> ConfigLayer {

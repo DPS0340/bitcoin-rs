@@ -501,18 +501,18 @@ impl Config {
             crate::bitcoin_conf_compat::apply_file(&mut config, path)?;
         }
         if let Some(layer) = &toml_layer {
-            config.apply_layer(layer)?;
+            config.apply_layer(layer);
         }
-        config.apply_layer(&env_layer)?;
-        config.apply_layer(cli)?;
+        config.apply_layer(&env_layer);
+        config.apply_layer(cli);
         config.validate()?;
         Ok(config)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_layer(&mut self, layer: &ConfigLayer) -> Result<()> {
+    fn apply_layer(&mut self, layer: &ConfigLayer) {
         if let Some(network) = layer.network {
-            self.apply_network_selection(network)?;
+            self.apply_network_selection(network);
         }
         if let Some(p2p_magic) = layer.p2p_magic {
             self.p2p_magic = Some(p2p_magic);
@@ -623,10 +623,9 @@ impl Config {
         if let Some(height) = layer.assume_valid_height {
             self.assume_valid_height = height;
         }
-        Ok(())
     }
 
-    fn apply_network_selection(&mut self, selection: NetworkSelection) -> Result<()> {
+    fn apply_network_selection(&mut self, selection: NetworkSelection) {
         let network = selection.consensus_network();
         self.network = network;
         self.p2p_magic = None;
@@ -640,7 +639,6 @@ impl Config {
             self.dns_seeds_enabled = false;
             self.connect = vec![DRYNET4_CONNECT.to_owned()];
         }
-        Ok(())
     }
 
     fn apply_g14_utxo_commit_layer(&mut self, layer: &ConfigLayer) {
@@ -765,8 +763,8 @@ pub(crate) struct ConfigLayer {
 }
 
 impl ConfigLayer {
-    pub(crate) fn apply_to(&self, config: &mut Config) -> Result<()> {
-        config.apply_layer(self)
+    pub(crate) fn apply_to(&self, config: &mut Config) {
+        config.apply_layer(self);
     }
 
     fn from_env<E, K, V>(env: E) -> Result<Self>
