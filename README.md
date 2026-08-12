@@ -38,10 +38,9 @@ backend selection, RPC authentication, and checking sync progress.
 
 ### Docker Compose
 
-The included Compose configuration builds the production `fjall` +
-`bitcoinkernel` profile, keeps each network's chain state in a separate named
-volume, exposes P2P on port 8333, and binds RPC to the Docker host's loopback
-interface only.
+The enforcer integration Compose configuration builds the production `fjall` +
+`bitcoinkernel` profile, stores node and enforcer data under `data/`, exposes
+P2P, and binds RPC to the Docker host's loopback interface only.
 
 Set explicit RPC credentials in `.env`, then start the node:
 
@@ -49,25 +48,25 @@ Set explicit RPC credentials in `.env`, then start the node:
 cp .env.example .env
 # Edit .env and set BITCOIN_RS_RPC_PASSWORD before starting the node.
 
-docker compose up --build -d
-docker compose logs -f node
+docker compose -f tools/enforcer/docker-compose.yaml up --build -d
+docker compose -f tools/enforcer/docker-compose.yaml logs -f node
 ```
 
 Check sync progress inside the container. This uses the credentials already
 provided by Compose and does not evaluate `.env` as shell code:
 
 ```sh
-docker compose exec node sh -c \
+docker compose -f tools/enforcer/docker-compose.yaml exec node sh -c \
   'curl --user "$BITCOIN_RS_RPC_USER:$BITCOIN_RS_RPC_PASSWORD" \
     -H "content-type: application/json" \
     -d "{\"jsonrpc\":\"1.0\",\"id\":\"sync\",\"method\":\"getblockchaininfo\",\"params\":[]}" \
     http://127.0.0.1:8332/'
 ```
 
-Stop the process without deleting its chain data with `docker compose down`.
+Stop the process without deleting its chain data with
+`docker compose -f tools/enforcer/docker-compose.yaml down`.
 Compose allows up to 5 minutes for the full clean checkpoint before forcing
-termination. Deleting the selected network's named volume requires the explicit
-`docker compose down -v` form.
+termination. Chain data remains under `data/` until it is explicitly removed.
 
 ## Measured performance
 

@@ -8981,6 +8981,198 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    #[test]
+    fn invalidate_block_missing_disconnect_body_mutates_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let applied = apply_block_with_serialized(&handles, &block, raw)?;
+        bodies
+            .bodies
+            .write()
+            .remove(&(applied.height, applied.hash));
+        handles.blocks.write().clear();
+
+        let header_tip_before = handles.chain_tip.load_full();
+        let applied_tip_before = handles.applied_tip.load_full();
+        let utxo_len_before = utxo.len();
+        let outcome = crate::reorg::invalidate_block(&handles, applied.hash);
+
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::MissingBody { .. })),
+            "missing disconnect data must abort invalidation, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.block_tree.read().node(applied.tip_id)?.status,
+            NodeStatus::Active,
+            "preflight failure must leave the requested header valid and active"
+        );
+        assert_eq!(handles.chain_tip.load_full(), header_tip_before);
+        assert_eq!(handles.applied_tip.load_full(), applied_tip_before);
+        assert_eq!(utxo.len(), utxo_len_before);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_block_rejects_unknown_and_genesis_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles
+            .applied_tip
+            .store(Some(Arc::new(genesis_tip.clone())));
+        let header_tip_before = handles.chain_tip.load_full();
+
+        let unknown = Hash256::from_le_bytes(&[0x5a; 32]);
+        assert!(matches!(
+            crate::reorg::invalidate_block(&handles, unknown),
+            Err(crate::reorg::ReorgError::UnknownBlock(hash)) if hash == unknown
+        ));
+        assert!(matches!(
+            crate::reorg::invalidate_block(&handles, genesis_hash),
+            Err(crate::reorg::ReorgError::CannotInvalidateGenesis)
+        ));
+        assert_eq!(handles.chain_tip.load_full(), header_tip_before);
+        assert_eq!(
+            handles.applied_tip.load_full().as_deref(),
+            Some(&genesis_tip)
+        );
+        assert_eq!(
+            handles.block_tree.read().node(genesis_tip.tip_id)?.status,
+            NodeStatus::Active
+        );
+        Ok(())
+    }
+
+    struct BlockingBodyStore {
+        body: Vec<u8>,
+        entered: std::sync::Barrier,
+        release: std::sync::Barrier,
+        block_once: AtomicBool,
+    }
+
+    impl crate::apply::PruneBodyStore for BlockingBodyStore {
+        fn load_block_body(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, StorageError> {
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(Some(self.body.clone()))
+        }
+
+        fn persist_block_body(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+            _body: &[u8],
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        fn sync(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalidate_block_holds_chain_transition_through_preflight_and_disconnect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let applied = apply_block_with_serialized(&handles, &block, raw.clone())?;
+        handles.blocks.write().clear();
+
+        let store = Arc::new(BlockingBodyStore {
+            body: raw.to_vec(),
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+            block_once: AtomicBool::new(true),
+        });
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = store.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let worker_handles = handles.clone();
+        let contender_handles = handles.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let invalidator =
+                scope.spawn(move || crate::reorg::invalidate_block(&worker_handles, applied.hash));
+            store.entered.wait();
+
+            let contender = scope.spawn(move || {
+                let _ = started_tx.send(());
+                let transition = contender_handles.begin_chain_transition();
+                let acquired = transition.is_ok();
+                let _ = acquired_tx.send(acquired);
+                drop(transition);
+                if acquired {
+                    Ok(())
+                } else {
+                    Err(ApplyError::Shutdown)
+                }
+            });
+            started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+            assert!(
+                matches!(
+                    acquired_rx.recv_timeout(std::time::Duration::from_millis(100)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a competing transition entered while invalidation was preloading"
+            );
+
+            store.release.wait();
+            invalidator
+                .join()
+                .map_err(|_| std::io::Error::other("invalidation worker panicked"))??;
+            assert!(acquired_rx.recv_timeout(std::time::Duration::from_secs(5))?);
+            contender
+                .join()
+                .map_err(|_| std::io::Error::other("transition contender panicked"))??;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(genesis_hash)
+        );
+        assert_eq!(
+            handles.block_tree.read().node(applied.tip_id)?.status,
+            NodeStatus::Invalid
+        );
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct AppliedTipVisiblePublisher {
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,

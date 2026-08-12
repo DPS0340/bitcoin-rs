@@ -39,7 +39,10 @@ Done:
   `applied_tip`. Its ordering claims are mutation-verified.
 * Node-owned `invalidateblock` control, which invalidates the named header
   subtree and uses the normal branch-switch/disconnect path rather than
-  mutating chainstate in the RPC crate.
+  mutating chainstate in the RPC crate. It previews the replacement tip and
+  preloads the complete disconnect/connect plan before changing header status;
+  one chain-transition witness then spans header invalidation and all
+  chainstate mutation.
 * `switch_to_branch` (`crates/node/src/reorg.rs`), called by sync when the
   best-work header branch outweighs the applied branch. It loads all
   disconnect bodies and the contiguous target prefix that fits in bounded
@@ -152,7 +155,7 @@ Done:
 | Branch switching | `switch_to_branch` recomputes the complete ordered `plan_reorg` result under the transition guard and mutates only when it equals the optimistic plan. A shorter branch is eligible when its accumulated work is greater. A permanent connect failure invalidates its subtree and selects the best valid tip. |
 | Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix available from bounded staging, durable storage, or the applied body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
 | Fatal lifecycle | `Fatal` and `MarkerStuck` close apply admission while the transition lock is held; sync sets the shared process shutdown token |
-| RPC invalidation | `invalidateblock` delegates through `ChainControl`; unknown blocks map to Core not-found, genesis is refused, and a successful active-tip rollback emits `pubsequence D` |
+| RPC invalidation | `invalidateblock` delegates through `ChainControl`; unknown blocks map to Core not-found, genesis is refused, required bodies are preflighted before header mutation, one transition witness spans invalidation and branch switching, and a successful active-tip rollback emits `pubsequence D` |
 
 Open:
 

@@ -14,8 +14,7 @@ heap-profile-*
 core.*
 /tmp/
 /.bitcoin-rs/
-/bitcoin-data/
-/enforcer-data/
+/data/
 /.env
 
 # Re-include project plan tracked in-repo (global ~/.gitignore drops PLAN.md).

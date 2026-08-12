@@ -27,20 +27,53 @@ pub fn invalidate_block(
     let transition = handles
         .begin_chain_transition()
         .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
-    let target = {
-        let mut tree = handles.block_tree.write();
-        let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
-        if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
-            return Err(ReorgError::CannotInvalidateGenesis);
-        }
-        tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
-        let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
-        handles.chain_tip.store(Some(tip.clone()));
-        handles.assume_valid_gate.evaluate(&tree);
-        tip.tip_id
-    };
-    drop(transition);
-    switch_to_branch(handles, target, |_| None, |_| {})
+
+    loop {
+        let (root, target) = {
+            let tree = handles.block_tree.read();
+            let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
+            if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
+                return Err(ReorgError::CannotInvalidateGenesis);
+            }
+            let target = tree
+                .tip_after_invalidation(root)
+                .map_err(ReorgError::Plan)?
+                .ok_or(ReorgError::NoValidTip)?;
+            (root, target)
+        };
+
+        let plan = current_reorg_plan(handles, target)?;
+        let (disconnect, connect) = if let Some(plan) = plan.as_ref() {
+            let mut no_staged_body = |_| None;
+            (
+                load_branch_bodies(handles, &plan.disconnect, &mut no_staged_body)?,
+                load_branch_bodies(handles, &plan.connect, &mut no_staged_body)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let published_target = {
+            let mut tree = handles.block_tree.write();
+            let current_root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
+            let current_target = tree
+                .tip_after_invalidation(current_root)
+                .map_err(ReorgError::Plan)?
+                .ok_or(ReorgError::NoValidTip)?;
+            if current_root != root || current_target != target {
+                continue;
+            }
+            tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
+            let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
+            handles.chain_tip.store(Some(tip.clone()));
+            handles.assume_valid_gate.evaluate(&tree);
+            tip.tip_id
+        };
+        debug_assert_eq!(published_target, target);
+
+        let (_, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &transition);
+        return outcome;
+    }
 }
 
 /// Why a branch switch stopped, and what the chain looks like now.
@@ -231,65 +264,75 @@ where
             continue;
         }
 
-        for body in &disconnect {
-            match crate::apply::disconnect_block_admitted(handles, &body.block, &transition) {
-                Ok(_) => {}
-                Err(
-                    error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. }),
-                ) => {
-                    handles.admission.close_permanently();
-                    return Err(ReorgError::Fatal(Box::new(error)));
-                }
-                Err(error) => {
-                    return Err(ReorgError::Refused {
-                        stopped_at: body.height,
-                        source: Box::new(error),
-                    });
-                }
-            }
-        }
-
-        let mut connected = 0_usize;
-        let mut failure = None;
-        for body in &connect {
-            match crate::apply::apply_block_with_serialized_admitted(
-                handles,
-                &body.block,
-                body.serialized.clone(),
-                &transition,
-            ) {
-                Ok(_) => connected += 1,
-                Err(source) => {
-                    let invalidated = if is_permanent_invalid(&source) {
-                        let mut tree = handles.block_tree.write();
-                        tree.lookup(body.hash)
-                            .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    failure = Some(ReorgError::ConnectFailed {
-                        hash: body.hash,
-                        stopped_at: body.height.saturating_sub(1),
-                        source: Box::new(source),
-                        invalidated,
-                    });
-                    break;
-                }
-            }
-        }
+        let (connected, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &transition);
         drop(transition);
         for body in &connect[..connected] {
             connected_body(body.hash);
         }
-        if let Some(error) = failure {
-            return Err(error);
-        }
+        outcome?;
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
         }
         return Ok(());
     }
+}
+
+fn execute_loaded_plan(
+    handles: &ApplyHandles,
+    disconnect: &[LoadedBranchBody],
+    connect: &[LoadedBranchBody],
+    transition: &crate::apply::ChainTransition<'_>,
+) -> (usize, core::result::Result<(), ReorgError>) {
+    for body in disconnect {
+        match crate::apply::disconnect_block_admitted(handles, &body.block, transition) {
+            Ok(_) => {}
+            Err(error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. })) => {
+                handles.admission.close_permanently();
+                return (0, Err(ReorgError::Fatal(Box::new(error))));
+            }
+            Err(error) => {
+                return (
+                    0,
+                    Err(ReorgError::Refused {
+                        stopped_at: body.height,
+                        source: Box::new(error),
+                    }),
+                );
+            }
+        }
+    }
+
+    let mut connected = 0_usize;
+    for body in connect {
+        match crate::apply::apply_block_with_serialized_admitted(
+            handles,
+            &body.block,
+            body.serialized.clone(),
+            transition,
+        ) {
+            Ok(_) => connected += 1,
+            Err(source) => {
+                let invalidated = if is_permanent_invalid(&source) {
+                    let mut tree = handles.block_tree.write();
+                    tree.lookup(body.hash)
+                        .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                return (
+                    connected,
+                    Err(ReorgError::ConnectFailed {
+                        hash: body.hash,
+                        stopped_at: body.height.saturating_sub(1),
+                        source: Box::new(source),
+                        invalidated,
+                    }),
+                );
+            }
+        }
+    }
+    (connected, Ok(()))
 }
 
 fn current_reorg_plan(

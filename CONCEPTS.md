@@ -184,8 +184,12 @@ directly. They delegate through the node-owned `ChainControl` boundary so the
 same apply-admission and chain-transition locks protect RPC-triggered and
 sync-triggered reorganizations. `invalidateblock` marks the named subtree
 invalid, republishes the best remaining header tip, and moves applied
-chainstate to it through the normal disconnect path; successful disconnects
-therefore emit the same `pubsequence` `D` events as an organic reorg.
+chainstate to it through the normal disconnect path. Before changing header
+status it previews the replacement tip and loads every body required by the
+complete disconnect/connect plan. The same chain-transition witness remains
+held from that preflight through header invalidation and branch switching, so
+another apply or reorg cannot enter between them; successful disconnects emit
+the same `pubsequence` `D` events as an organic reorg.
 
 ### Dispatch-bound parallelism
 
