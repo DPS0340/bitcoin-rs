@@ -97,6 +97,48 @@ fn cli_can_override_socket_and_vector_fields() -> Result<()> {
 }
 
 #[test]
+fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
+    let peer: SocketAddr = "127.0.0.1:8333".parse()?;
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        [
+            "bitcoin-rs-node",
+            "--p2p-magic",
+            "eca5d434",
+            "--dns-seeds-enabled",
+            "false",
+            "--connect",
+            "127.0.0.1:8333",
+        ],
+    )?;
+
+    assert_eq!(config.network, Network::Mainnet);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x34]);
+    assert_eq!(config.connect, vec![peer]);
+    assert!(!config.dns_seeds_enabled);
+    Ok(())
+}
+
+#[test]
+fn p2p_magic_override_requires_an_explicit_peer() {
+    let result = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        [
+            "bitcoin-rs-node",
+            "--p2p-magic",
+            "eca5d434",
+            "--dns-seeds-enabled",
+            "false",
+        ],
+    );
+    assert!(result.is_err_and(|error| error.to_string().contains("at least one --connect peer")));
+}
+
+#[test]
 fn electrum_bind_requires_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
     config.electrum_bind = Some("127.0.0.1:50001".parse()?);

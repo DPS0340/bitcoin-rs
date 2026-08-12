@@ -18,12 +18,46 @@ use bitcoin_rs_storage::StorageError;
 use crate::apply::ApplyHandles;
 use crate::{ApplyError, DisconnectError};
 
+/// Invalidates `hash` and its descendants, then moves applied chainstate to the
+/// best remaining valid tip.
+pub fn invalidate_block(
+    handles: &ApplyHandles,
+    hash: Hash256,
+) -> core::result::Result<(), ReorgError> {
+    let transition = handles
+        .begin_chain_transition()
+        .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+    let target = {
+        let mut tree = handles.block_tree.write();
+        let root = tree.lookup(hash).ok_or(ReorgError::UnknownBlock(hash))?;
+        if tree.node(root).map_err(ReorgError::Plan)?.height == 0 {
+            return Err(ReorgError::CannotInvalidateGenesis);
+        }
+        tree.invalidate_subtree(root).map_err(ReorgError::Plan)?;
+        let tip = tree.tip().ok_or(ReorgError::NoValidTip)?;
+        handles.chain_tip.store(Some(tip.clone()));
+        handles.assume_valid_gate.evaluate(&tree);
+        tip.tip_id
+    };
+    drop(transition);
+    switch_to_branch(handles, target, |_| None, |_| {})
+}
+
 /// Why a branch switch stopped, and what the chain looks like now.
 ///
 /// Four outcomes rather than one error type, because the caller must act
 /// differently for each and the difference is exactly how much damage there is.
 #[derive(Debug, thiserror::Error)]
 pub enum ReorgError {
+    /// The requested block hash is unknown.
+    #[error("unknown block {0}")]
+    UnknownBlock(Hash256),
+    /// The genesis block cannot be invalidated.
+    #[error("cannot invalidate the genesis block")]
+    CannotInvalidateGenesis,
+    /// Invalidation unexpectedly left no valid chain tip.
+    #[error("invalidation left no valid chain tip")]
+    NoValidTip,
     /// Planning failed: the two tips share no ancestor, or a node is unknown.
     ///
     /// Nothing was touched.

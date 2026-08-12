@@ -88,6 +88,8 @@ pub struct Config {
     /// Bitcoin network selected for consensus and default ports.
     #[serde(deserialize_with = "deserialize_network")]
     pub network: Network,
+    /// Optional P2P message-start override for fork networks sharing this chain's genesis.
+    pub p2p_magic: Option<[u8; 4]>,
     /// Node data directory.
     pub data_dir: PathBuf,
     /// Storage backend name: `rocksdb`, `fjall`, `redb`, or `mdbx`.
@@ -174,6 +176,7 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("network", &self.network)
+            .field("p2p_magic", &self.p2p_magic)
             .field("data_dir", &self.data_dir)
             .field("storage_backend", &self.storage_backend)
             .field("rpc_bind", &self.rpc_bind)
@@ -237,6 +240,7 @@ impl Config {
     pub fn default_for_network(network: Network) -> Self {
         Self {
             network,
+            p2p_magic: None,
             data_dir: PathBuf::from(".bitcoin-rs"),
             storage_backend: DEFAULT_STORAGE_BACKEND.to_owned(),
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
@@ -327,6 +331,20 @@ impl Config {
 
     /// Validates backend names and simple cross-field constraints.
     pub fn validate(&self) -> Result<()> {
+        if self.p2p_magic.is_some() {
+            ensure!(
+                self.network == Network::Mainnet,
+                "P2P magic overrides currently require --network mainnet"
+            );
+            ensure!(
+                !self.connect.is_empty(),
+                "P2P magic overrides require at least one --connect peer"
+            );
+            ensure!(
+                !self.dns_seeds_enabled,
+                "P2P magic overrides require --dns-seeds-enabled=false"
+            );
+        }
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
@@ -376,6 +394,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Returns the effective P2P message-start bytes.
+    #[must_use]
+    pub fn p2p_magic(&self) -> [u8; 4] {
+        self.p2p_magic.unwrap_or_else(|| self.network.magic())
     }
 
     /// Returns active ZMQ publications in Core notification order.
@@ -450,6 +474,9 @@ impl Config {
     fn apply_layer(&mut self, layer: &ConfigLayer) {
         if let Some(network) = layer.network {
             self.network = network;
+        }
+        if let Some(p2p_magic) = layer.p2p_magic {
+            self.p2p_magic = Some(p2p_magic);
         }
         if let Some(data_dir) = &layer.data_dir {
             self.data_dir.clone_from(data_dir);
@@ -589,6 +616,10 @@ pub(crate) struct ConfigLayer {
     #[arg(long, value_parser = parse_network)]
     #[serde(deserialize_with = "deserialize_optional_network")]
     pub(crate) network: Option<Network>,
+    /// Override the four P2P message-start bytes for a fork network.
+    #[arg(long = "p2p-magic", value_parser = parse_p2p_magic)]
+    #[serde(deserialize_with = "deserialize_optional_p2p_magic")]
+    pub(crate) p2p_magic: Option<[u8; 4]>,
     #[arg(long = "data-dir")]
     pub(crate) data_dir: Option<PathBuf>,
     #[arg(long = "storage-backend")]
@@ -689,6 +720,7 @@ impl ConfigLayer {
             let value = value.as_ref();
             match key {
                 "BITCOIN_RS_NETWORK" => layer.network = Some(parse_network(value)?),
+                "BITCOIN_RS_P2P_MAGIC" => layer.p2p_magic = Some(parse_p2p_magic(value)?),
                 "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
                 "BITCOIN_RS_STORAGE_BACKEND" => layer.storage_backend = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_BIND" => layer.rpc_bind = Some(value.parse()?),
@@ -839,6 +871,20 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_p2p_magic(value: &str) -> Result<[u8; 4]> {
+    let value = value.trim();
+    ensure!(
+        value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "p2p magic must be exactly eight hexadecimal characters"
+    );
+    let mut magic = [0_u8; 4];
+    for (index, slot) in magic.iter_mut().enumerate() {
+        let start = index * 2;
+        *slot = u8::from_str_radix(&value[start..start + 2], 16)?;
+    }
+    Ok(magic)
+}
+
 fn parse_network(value: &str) -> anyhow::Result<Network> {
     match value.trim().to_ascii_lowercase().as_str() {
         "main" | "mainnet" | "bitcoin" => Ok(Network::Mainnet),
@@ -867,6 +913,19 @@ where
     let raw = Option::<String>::deserialize(deserializer)?;
     raw.as_deref()
         .map(parse_network)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_p2p_magic<'de, D>(
+    deserializer: D,
+) -> core::result::Result<Option<[u8; 4]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    raw.as_deref()
+        .map(parse_p2p_magic)
         .transpose()
         .map_err(serde::de::Error::custom)
 }

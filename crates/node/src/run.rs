@@ -66,6 +66,28 @@ type P2pChainQuery = Arc<dyn bitcoin_rs_p2p::ChainQuery>;
 type OutboundConnectionHandle =
     std::thread::JoinHandle<core::result::Result<(), bitcoin_rs_p2p::PeerError>>;
 
+#[derive(Clone)]
+struct RpcChainControl {
+    handles: crate::apply::ApplyHandles,
+}
+
+impl bitcoin_rs_rpc::ChainControl for RpcChainControl {
+    fn invalidate_block(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> core::result::Result<(), bitcoin_rs_rpc::ChainControlError> {
+        crate::reorg::invalidate_block(&self.handles, hash).map_err(|error| match error {
+            crate::reorg::ReorgError::UnknownBlock(_) => {
+                bitcoin_rs_rpc::ChainControlError::UnknownBlock
+            }
+            crate::reorg::ReorgError::CannotInvalidateGenesis => {
+                bitcoin_rs_rpc::ChainControlError::Genesis
+            }
+            other => bitcoin_rs_rpc::ChainControlError::Failed(other.to_string()),
+        })
+    }
+}
+
 /// Bounds rapid DNS retries while the initial outbound pool is still empty.
 #[derive(Default)]
 struct DnsBootstrapRefill {
@@ -174,7 +196,7 @@ fn spawn_p2p_listeners(
 ) -> anyhow::Result<Vec<std::thread::JoinHandle<Result<(), bitcoin_rs_p2p::listener::ListenerError>>>>
 {
     let mut handles = Vec::with_capacity(config.p2p_listen.len());
-    let magic = bitcoin::p2p::Magic::from_bytes(config.network.magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(config.p2p_magic());
     for addr in &config.p2p_listen {
         let listener_addr = *addr;
         let listener_shutdown = std::sync::Arc::clone(shutdown);
@@ -260,7 +282,7 @@ fn spawn_p2p_outbound_drain(
     >,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let outbound_rx = state.p2p_outbound_receiver();
-    let magic = bitcoin::p2p::Magic::from_bytes(state.config().network.magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(state.config().p2p_magic());
     let outbound_registry = state.peers();
     let outbound_peer_outbound = state.peer_outbound();
     let outbound_banned = state.banned_subnets();
@@ -618,6 +640,9 @@ pub fn run(mut config: Config) -> Result<()> {
     if let Some(prune_service) = state.prune_service() {
         rpc_context = rpc_context.with_prune_service(prune_service);
     }
+    rpc_context = rpc_context.with_chain_control(Arc::new(RpcChainControl {
+        handles: state.apply_handles(),
+    }));
     rpc_context = rpc_context.with_zmq_notifications(state.active_zmq_notifications());
     let rpc_handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::new(rpc_context)));
     let rpc_server = bitcoin_rs_rpc::RpcServer::bind(
