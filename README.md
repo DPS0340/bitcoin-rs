@@ -141,7 +141,7 @@ The defaults target mainnet initial block download.
 | multi-peer download | on: 8 outbound peers, 128-block pending budget, 16 blocks in flight per peer |
 | transaction index | off |
 | block filter index | off |
-| pruning | off |
+| pruning | on: 550 MiB target, retaining at least the latest 288 blocks |
 | utreexo | off |
 
 Mainnet also skips historical script verification up to height 938343, block

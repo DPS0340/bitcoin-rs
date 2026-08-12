@@ -509,6 +509,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
         ["bitcoin-rs-node"],
     )?;
     assert!(default_config.connect.is_empty());
+    assert_eq!(default_config.prune_target_mb, 550);
     Ok(())
 }
 

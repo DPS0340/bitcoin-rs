@@ -520,7 +520,7 @@ fn load_pruneheight<S: KvStore>(store: &S) -> Result<Option<u32>> {
     Ok(Some(u32::from_be_bytes(encoded)))
 }
 
-/// Storage-backed implementation of RPC manual pruning.
+/// Storage-backed implementation shared by automatic and RPC manual pruning.
 pub struct NodePruneService<S: KvStore> {
     store: Arc<S>,
     block_files: Arc<FlatFileBlockStore>,
@@ -536,7 +536,7 @@ pub struct NodePruneService<S: KvStore> {
 }
 
 impl<S: KvStore> NodePruneService<S> {
-    /// Creates a manual pruning service over the chainstate store and RPC block cache.
+    /// Creates a pruning service over the chainstate store and RPC block cache.
     pub(crate) fn new(
         store: Arc<S>,
         block_files: Arc<FlatFileBlockStore>,
@@ -576,10 +576,10 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
 
         let mut pruned_txids = Vec::new();
-        for record in blocks
-            .iter()
-            .filter(|record| record.height < updated_pruneheight)
-        {
+        let previous_pruneheight = pruneheight.unwrap_or(0);
+        for record in blocks.iter().filter(|record| {
+            record.height >= previous_pruneheight && record.height < updated_pruneheight
+        }) {
             if record.tx_count == 0 {
                 continue;
             }
@@ -636,7 +636,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         }
 
         for record in blocks.iter_mut() {
-            if record.height < updated_pruneheight {
+            if record.height >= previous_pruneheight && record.height < updated_pruneheight {
                 record.block_hex = String::new();
             }
         }
@@ -1312,7 +1312,7 @@ impl NodeState {
         Arc::clone(&self.filter_index)
     }
 
-    /// Returns the manual pruning service when pruning is enabled.
+    /// Returns the pruning service when pruning is enabled.
     #[must_use]
     pub fn prune_service(&self) -> Option<Arc<dyn PruneService>> {
         self.prune_service.as_ref().map(Arc::clone)

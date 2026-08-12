@@ -290,7 +290,7 @@ impl Config {
             p2p_listen: vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))],
             dns_seeds_enabled: true,
             connect: Vec::new(),
-            prune_target_mb: 0,
+            prune_target_mb: 550,
             utreexo_mode: false,
             txindex: false,
             blockfilterindex: false,

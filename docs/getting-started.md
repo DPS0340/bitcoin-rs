@@ -77,7 +77,7 @@ Defaults worth knowing:
 | `--rpc-bind` | `127.0.0.1:8332` on mainnet, the network's Core port otherwise |
 | `--rpc-user` / `--rpc-password` | `bitcoin-rs` / `bitcoin-rs` |
 | `--dbcache-mb` | 450 |
-| `--prune-target-mb` | 0, meaning no pruning |
+| `--prune-target-mb` | 550; set to 0 to disable pruning |
 | `--txindex` | off |
 | `--blockfilterindex` | off |
 

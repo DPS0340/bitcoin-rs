@@ -623,7 +623,7 @@ pub fn run(mut config: Config) -> Result<()> {
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
     let sync = state.sync();
     let peer_registered = sync.peer_registration_handle();
-    let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
+    let mut loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let rpc_auth = Arc::new(build_rpc_auth(&state.config().rpc_auth)?);
     let mut rpc_context = bitcoin_rs_rpc::Context::from_handles(
         state.chain_tip(),
@@ -647,6 +647,8 @@ pub fn run(mut config: Config) -> Result<()> {
     );
     rpc_context = rpc_context.with_block_body_source(block_body_source);
     if let Some(prune_service) = state.prune_service() {
+        loop_handle =
+            loop_handle.with_auto_pruning(Arc::clone(&prune_service), state.applied_tip());
         rpc_context = rpc_context.with_prune_service(prune_service);
     }
     rpc_context = rpc_context.with_chain_control(Arc::new(RpcChainControl {
