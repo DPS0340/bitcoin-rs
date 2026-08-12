@@ -321,7 +321,7 @@ impl JsonRpcVersion {
         }
     }
 
-    fn success_response(self, result: Value, id: &Value) -> Value {
+    fn success_response(self, result: &Value, id: &Value) -> Value {
         match self {
             Self::Legacy => json!({"result": result, "error": null, "id": id}),
             Self::V2 => json!({"jsonrpc": "2.0", "result": result, "id": id}),
@@ -384,18 +384,22 @@ impl CallResponse {
 fn handle_json(handler: &Handler, body: &[u8]) -> JsonResponse {
     let body = match core::str::from_utf8(body) {
         Ok(body) => body,
-        Err(error) => return legacy_error_response(RpcError::from(error), Value::new_null()),
+        Err(error) => {
+            return legacy_error_response(&RpcError::from(error), &Value::new_null());
+        }
     };
     let request = match sonic_rs::from_str::<Value>(body) {
         Ok(request) => request,
-        Err(error) => return legacy_error_response(RpcError::from(error), Value::new_null()),
+        Err(error) => {
+            return legacy_error_response(&RpcError::from(error), &Value::new_null());
+        }
     };
 
     if let Some(requests) = request.as_array() {
         if requests.is_empty() {
             return legacy_error_response(
-                RpcError::InvalidRequest("batch must not be empty"),
-                Value::new_null(),
+                &RpcError::InvalidRequest("batch must not be empty"),
+                &Value::new_null(),
             );
         }
         let mut responses = Vec::with_capacity(requests.len());
@@ -443,17 +447,17 @@ fn handle_single_json(handler: &Handler, request: &Value) -> CallResponse {
         return CallResponse::Notification;
     }
     match result {
-        Ok(result) => CallResponse::reply(version.success_response(result, &id), version, false),
+        Ok(result) => CallResponse::reply(version.success_response(&result, &id), version, false),
         Err(error) => CallResponse::reply(version.error_response(&error, &id), version, true),
     }
 }
 
-fn legacy_error_response(error: RpcError, id: Value) -> JsonResponse {
+fn legacy_error_response(error: &RpcError, id: &Value) -> JsonResponse {
     let version = JsonRpcVersion::Legacy;
     JsonResponse {
         status: version.error_status(),
         reason: reason_for_status(version.error_status()),
-        body: Some(version.error_response(&error, &id)),
+        body: Some(version.error_response(error, id)),
     }
 }
 
