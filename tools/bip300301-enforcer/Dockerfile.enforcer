@@ -4,7 +4,7 @@ ARG RUST_VERSION=1.95
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
 ARG ENFORCER_REPOSITORY=https://github.com/LayerTwo-Labs/bip300301_enforcer.git
-ARG ENFORCER_REVISION=3d3b3d19ad90c33836f0a62e5e596875f0b49dc1
+ARG ENFORCER_REVISION=master
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
