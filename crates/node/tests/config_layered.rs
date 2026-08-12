@@ -437,6 +437,16 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
         vec!["192.0.2.5:8333".parse::<SocketAddr>()?]
     );
 
+    let hostname_config = Config::from_layered_sources(
+        None,
+        None,
+        [("BITCOIN_RS_CONNECT", "localhost:18444")],
+        ["bitcoin-rs-node"],
+    )?;
+    assert_eq!(hostname_config.connect.len(), 1);
+    assert_eq!(hostname_config.connect[0].port(), 18_444);
+    assert!(hostname_config.connect[0].ip().is_loopback());
+
     let default_config = Config::from_layered_sources(
         None,
         None,

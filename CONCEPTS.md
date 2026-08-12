@@ -177,6 +177,16 @@ disconnects are emitted tip-first before connects on the replacement branch.
 This implementation deliberately omits mempool `A`/`R` events until the
 mempool has per-transaction sequence assignment and explicit removal reasons.
 
+### Chain control
+
+Consensus-affecting RPCs do not mutate the RPC context's block-tree handle
+directly. They delegate through the node-owned `ChainControl` boundary so the
+same apply-admission and chain-transition locks protect RPC-triggered and
+sync-triggered reorganizations. `invalidateblock` marks the named subtree
+invalid, republishes the best remaining header tip, and moves applied
+chainstate to it through the normal disconnect path; successful disconnects
+therefore emit the same `pubsequence` `D` events as an organic reorg.
+
 ### Dispatch-bound parallelism
 
 A stage that is parallel in shape but serial in effect because each dispatch is

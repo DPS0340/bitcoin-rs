@@ -588,17 +588,17 @@ pub(crate) fn pruneblockchain(ctx: &Arc<Context>, params: &Value) -> Result<Valu
 }
 
 pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    let hash = parse_hash(required_str(params, 0)?)?;
+    let hash = parse_hash(required_str(params, 0, "block hash is required")?)?;
     let control = ctx
         .chain_control
         .as_ref()
         .ok_or(RpcError::MethodDisabled("invalidateblock is unavailable"))?;
     match control.invalidate_block(hash) {
-        Ok(()) => Ok(Value::Null),
+        Ok(()) => Ok(json!(null)),
         Err(ChainControlError::UnknownBlock) => Err(RpcError::NotFound("block not found")),
-        Err(ChainControlError::Genesis) => {
-            Err(RpcError::InvalidParams("cannot invalidate the genesis block"))
-        }
+        Err(ChainControlError::Genesis) => Err(RpcError::InvalidParams(
+            "cannot invalidate the genesis block",
+        )),
         Err(ChainControlError::Failed(message)) => Err(RpcError::Internal(message)),
     }
 }

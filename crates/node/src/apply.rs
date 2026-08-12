@@ -8923,6 +8923,64 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    #[test]
+    fn invalidate_block_disconnects_active_tip_and_emits_sequence_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let publisher = Arc::new(RecordingSequencePublisher::default());
+        let publisher_handle: Arc<dyn crate::ZmqPublisher> = publisher.clone();
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo))
+            .with_zmq_publisher(publisher_handle);
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let one = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let one_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&one));
+        let one_tip = apply_block_with_serialized(&handles, &one, one_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((one_tip.height, one_tip.hash), one_raw.to_vec());
+
+        let two = mined_block_with_prev_hash_and_transactions(
+            one.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let two_raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&two));
+        let two_tip = apply_block_with_serialized(&handles, &two, two_raw.clone())?;
+        bodies
+            .bodies
+            .write()
+            .insert((two_tip.height, two_tip.hash), two_raw.to_vec());
+        publisher.events.lock().clear();
+        *publisher.next_sequence.lock() = 0;
+
+        crate::reorg::invalidate_block(&handles, two_tip.hash)?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(one_tip.hash)
+        );
+        let tree = handles.block_tree.read();
+        let invalid_id = tree.lookup(two_tip.hash).ok_or("missing invalidated tip")?;
+        assert_eq!(tree.node(invalid_id)?.status, NodeStatus::Invalid);
+        drop(tree);
+        assert_eq!(
+            publisher.events.lock().as_slice(),
+            &[(two_tip.hash, b'D', 0)]
+        );
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct AppliedTipVisiblePublisher {
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,

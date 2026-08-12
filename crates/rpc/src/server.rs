@@ -304,8 +304,10 @@ fn handle_json(handler: &Handler, body: &[u8]) -> Value {
     };
     let null_params = Value::new_null();
     let params = request.get("params").unwrap_or(&null_params);
+    let is_json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
     match handler.dispatch(method, params) {
-        Ok(result) => json!({"jsonrpc": "2.0", "result": result, "error": null, "id": id}),
+        Ok(result) if is_json_rpc_2 => json!({"jsonrpc": "2.0", "result": result, "id": id}),
+        Ok(result) => json!({"result": result, "error": null, "id": id}),
         Err(error) => error.response(&id),
     }
 }
@@ -402,5 +404,31 @@ mod tests {
             split_path_query("/rest/chaininfo.json"),
             ("/rest/chaininfo.json", "")
         );
+    }
+
+    #[test]
+    fn json_rpc_2_success_omits_null_error_for_jsonrpsee_clients() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}"#,
+        );
+
+        assert_eq!(response.get("jsonrpc").and_then(Value::as_str), Some("2.0"));
+        assert!(response.get("result").is_some());
+        assert!(response.get("error").is_none());
+    }
+
+    #[test]
+    fn bitcoin_core_1_success_keeps_null_error() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        let response = handle_json(
+            &handler,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockchaininfo","params":[]}"#,
+        );
+
+        assert!(response.get("jsonrpc").is_none());
+        assert!(response.get("result").is_some());
+        assert!(response.get("error").is_some_and(Value::is_null));
     }
 }

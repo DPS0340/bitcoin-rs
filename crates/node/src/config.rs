@@ -1,6 +1,6 @@
 use core::fmt;
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -647,7 +647,11 @@ pub(crate) struct ConfigLayer {
     pub(crate) p2p_listen: Option<Vec<SocketAddr>>,
     #[arg(long = "dns-seeds-enabled")]
     pub(crate) dns_seeds_enabled: Option<bool>,
-    #[arg(long = "connect", value_delimiter = ',')]
+    #[arg(
+        long = "connect",
+        value_delimiter = ',',
+        value_parser = parse_connect_addr
+    )]
     pub(crate) connect: Option<Vec<SocketAddr>>,
     #[arg(long = "prune-target-mb")]
     pub(crate) prune_target_mb: Option<u64>,
@@ -736,7 +740,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_DNS_SEEDS_ENABLED" => {
                     layer.dns_seeds_enabled = Some(parse_bool(value)?);
                 }
-                "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_socket_list(value)?),
+                "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_connect_list(value)?),
                 "BITCOIN_RS_PRUNE_TARGET_MB" => layer.prune_target_mb = Some(value.parse()?),
                 "BITCOIN_RS_UTREEXO_MODE" => layer.utreexo_mode = Some(parse_bool(value)?),
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
@@ -837,6 +841,22 @@ fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
         .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(|part| Ok(part.trim().parse()?))
+        .collect()
+}
+
+fn parse_connect_addr(value: &str) -> std::result::Result<SocketAddr, String> {
+    value
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve connect peer `{value}`: {error}"))?
+        .next()
+        .ok_or_else(|| format!("connect peer `{value}` resolved to no addresses"))
+}
+
+fn parse_connect_list(value: &str) -> Result<Vec<SocketAddr>> {
+    value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| parse_connect_addr(part.trim()).map_err(anyhow::Error::msg))
         .collect()
 }
 

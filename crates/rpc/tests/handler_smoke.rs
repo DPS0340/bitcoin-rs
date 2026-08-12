@@ -4,6 +4,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash as _;
@@ -14,7 +15,7 @@ use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockRecord, Context, Handler, RpcError};
+use bitcoin_rs_rpc::{BlockRecord, ChainControl, ChainControlError, Context, Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use parking_lot::{Mutex, RwLock};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
@@ -127,6 +128,53 @@ fn getblockhash_zero_returns_mainnet_genesis_on_fresh_context()
         .to_string();
     assert_eq!(actual, expected);
     Ok(())
+}
+
+#[derive(Debug)]
+struct RecordingChainControl {
+    called: Arc<AtomicBool>,
+    result: Result<(), ChainControlError>,
+}
+
+impl ChainControl for RecordingChainControl {
+    fn invalidate_block(&self, _hash: Hash256) -> Result<(), ChainControlError> {
+        self.called.store(true, Ordering::Release);
+        self.result.clone()
+    }
+}
+
+#[test]
+fn invalidateblock_delegates_to_node_control_and_returns_null() -> Result<(), RpcError> {
+    let called = Arc::new(AtomicBool::new(false));
+    let ctx = Context::new().with_chain_control(Arc::new(RecordingChainControl {
+        called: Arc::clone(&called),
+        result: Ok(()),
+    }));
+    let handler = Handler::new(Arc::new(ctx));
+    let hash = Hash256::from_le_bytes(&[7_u8; 32]).to_string_be();
+
+    assert!(
+        handler
+            .dispatch("invalidateblock", &json!([hash]))?
+            .is_null()
+    );
+    assert!(called.load(Ordering::Acquire));
+    Ok(())
+}
+
+#[test]
+fn invalidateblock_maps_unknown_block_to_core_not_found() {
+    let ctx = Context::new().with_chain_control(Arc::new(RecordingChainControl {
+        called: Arc::new(AtomicBool::new(false)),
+        result: Err(ChainControlError::UnknownBlock),
+    }));
+    let handler = Handler::new(Arc::new(ctx));
+    let hash = Hash256::from_le_bytes(&[8_u8; 32]).to_string_be();
+
+    let error = handler
+        .dispatch("invalidateblock", &json!([hash]))
+        .expect_err("unknown block must fail");
+    assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
 }
 
 #[test]
