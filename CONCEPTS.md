@@ -32,6 +32,13 @@ The standard node operational configuration tuned for mainnet sync: `fjall` stor
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
 
+## Benchmark campaign tooling
+
+### Native benchmark custody
+The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
+
+Programs and inputs stay role-bound for the full cell; CPU affinity is inherited by the child and restored for the runner; later validation recomputes the verdict from the custody artifacts. It proves internal consistency, not a cryptographic signature.
+
 ## Consensus validation
 
 ### bitcoinkernel
