@@ -32,6 +32,11 @@ names select their matching consensus network, built-in message start, and DNS
 bootstrap. Compose uses the same `BITCOIN_RS_NETWORK` for bitcoin-rs and the
 BIP300/301 enforcer and includes it in both host data paths.
 
+Fixed-peer hostnames remain unresolved in configuration and are resolved by
+the P2P bootstrap worker on each retry. A transient resolver failure therefore
+does not reject otherwise valid configuration or prevent the node from
+starting, and all addresses returned for an endpoint remain eligible to dial.
+
 ## Guardrails
 
 - A raw P2P magic override still requires mainnet consensus, a fixed peer, and

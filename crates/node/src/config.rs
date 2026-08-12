@@ -1,6 +1,6 @@
 use core::fmt;
 use std::ffi::OsString;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -116,7 +116,8 @@ pub struct ZmqPublication {
     pub hwm: u32,
 }
 
-/// Fully resolved node configuration.
+/// Fully merged node configuration. Fixed-peer hostnames are intentionally
+/// resolved later by the P2P bootstrap worker.
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -144,9 +145,11 @@ pub struct Config {
     pub p2p_listen: Vec<SocketAddr>,
     /// Whether DNS seeds are used for peer bootstrap.
     pub dns_seeds_enabled: bool,
-    /// Fixed outbound peers to connect to. When non-empty, DNS seed bootstrap is
-    /// disabled and the node dials only these addresses (Bitcoin Core `-connect`).
-    pub connect: Vec<SocketAddr>,
+    /// Fixed outbound peer endpoints to connect to. Hostnames remain unresolved
+    /// until the P2P dial path so transient DNS failures do not prevent startup.
+    /// When non-empty, DNS seed bootstrap is disabled and the node dials only
+    /// these endpoints (Bitcoin Core `-connect`).
+    pub connect: Vec<String>,
     /// Pruning target in MiB. Zero disables pruning.
     pub prune_target_mb: u64,
     /// Whether utreexo mode is enabled.
@@ -635,7 +638,7 @@ impl Config {
         if selection == NetworkSelection::Drynet4 {
             self.p2p_magic = Some(DRYNET4_P2P_MAGIC);
             self.dns_seeds_enabled = false;
-            self.connect = vec![parse_connect_addr(DRYNET4_CONNECT).map_err(anyhow::Error::msg)?];
+            self.connect = vec![DRYNET4_CONNECT.to_owned()];
         }
         Ok(())
     }
@@ -704,9 +707,9 @@ pub(crate) struct ConfigLayer {
     #[arg(
         long = "connect",
         value_delimiter = ',',
-        value_parser = parse_connect_addr
+        value_parser = parse_connect_endpoint
     )]
-    pub(crate) connect: Option<Vec<SocketAddr>>,
+    pub(crate) connect: Option<Vec<String>>,
     #[arg(long = "prune-target-mb")]
     pub(crate) prune_target_mb: Option<u64>,
     #[arg(long = "utreexo-mode")]
@@ -905,19 +908,27 @@ fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
         .collect()
 }
 
-fn parse_connect_addr(value: &str) -> std::result::Result<SocketAddr, String> {
-    value
-        .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve connect peer `{value}`: {error}"))?
-        .next()
-        .ok_or_else(|| format!("connect peer `{value}` resolved to no addresses"))
+fn parse_connect_endpoint(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(value.to_owned());
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(format!("connect peer `{value}` must include a port"));
+    };
+    if host.is_empty() {
+        return Err(format!("connect peer `{value}` has an empty hostname"));
+    }
+    port.parse::<u16>()
+        .map_err(|error| format!("connect peer `{value}` has an invalid port: {error}"))?;
+    Ok(value.to_owned())
 }
 
-fn parse_connect_list(value: &str) -> Result<Vec<SocketAddr>> {
+fn parse_connect_list(value: &str) -> Result<Vec<String>> {
     value
         .split(',')
         .filter(|part| !part.trim().is_empty())
-        .map(|part| parse_connect_addr(part.trim()).map_err(anyhow::Error::msg))
+        .map(|part| parse_connect_endpoint(part.trim()).map_err(anyhow::Error::msg))
         .collect()
 }
 

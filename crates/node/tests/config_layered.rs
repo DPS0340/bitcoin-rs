@@ -98,7 +98,7 @@ fn cli_can_override_socket_and_vector_fields() -> Result<()> {
 
 #[test]
 fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
-    let peer: SocketAddr = "127.0.0.1:8333".parse()?;
+    let peer = "127.0.0.1:8333".to_owned();
     let config = Config::from_layered_sources(
         None,
         None,
@@ -132,8 +132,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
 
     assert_eq!(config.network, Network::Mainnet);
     assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
-    assert_eq!(config.connect.len(), 1);
-    assert_eq!(config.connect[0].port(), 8_533);
+    assert_eq!(config.connect, vec!["drynet4.drivechain.dev:8533"]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
 }
@@ -151,7 +150,7 @@ fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<(
     )?;
 
     assert_eq!(config.p2p_magic(), [1, 2, 3, 4]);
-    assert_eq!(config.connect, vec!["127.0.0.1:8333".parse()?]);
+    assert_eq!(config.connect, vec!["127.0.0.1:8333"]);
     Ok(())
 }
 
@@ -487,10 +486,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(
         cli_config.connect,
-        vec![
-            "127.0.0.1:8333".parse::<SocketAddr>()?,
-            "10.0.0.2:8333".parse::<SocketAddr>()?,
-        ]
+        vec!["127.0.0.1:8333", "10.0.0.2:8333"]
     );
 
     let env_config = Config::from_layered_sources(
@@ -501,7 +497,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(
         env_config.connect,
-        vec!["192.0.2.5:8333".parse::<SocketAddr>()?]
+        vec!["192.0.2.5:8333"]
     );
 
     let hostname_config = Config::from_layered_sources(
@@ -510,9 +506,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
         [("BITCOIN_RS_CONNECT", "localhost:18444")],
         ["bitcoin-rs-node"],
     )?;
-    assert_eq!(hostname_config.connect.len(), 1);
-    assert_eq!(hostname_config.connect[0].port(), 18_444);
-    assert!(hostname_config.connect[0].ip().is_loopback());
+    assert_eq!(hostname_config.connect, vec!["localhost:18444"]);
 
     let default_config = Config::from_layered_sources(
         None,

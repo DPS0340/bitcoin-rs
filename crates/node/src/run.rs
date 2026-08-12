@@ -1,7 +1,7 @@
 //! Top-level orchestration: wire subsystems, spin the event loop, drain.
 
 use crate as bitcoin_rs_node;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -546,15 +546,24 @@ fn spawn_fixed_peer_bootstrap(
             .name("bitcoin-rs-fixed-peer-bootstrap".to_owned())
             .spawn(move || {
                 while !bootstrap_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    for addr in &connect {
-                        if peer_outbound.read().contains_key(addr)
-                            || peers.read().iter().any(|peer| peer.addr == *addr)
-                        {
-                            continue;
-                        }
-                        if outbound_tx.try_send(*addr).is_err() {
-                            // Queue full or closed; retry on the next tick.
-                            break;
+                    'endpoints: for endpoint in &connect {
+                        let addresses = match endpoint.as_str().to_socket_addrs() {
+                            Ok(addresses) => addresses,
+                            Err(error) => {
+                                tracing::warn!(endpoint, %error, "fixed peer resolution failed");
+                                continue;
+                            }
+                        };
+                        for addr in addresses {
+                            if peer_outbound.read().contains_key(&addr)
+                                || peers.read().iter().any(|peer| peer.addr == addr)
+                            {
+                                continue;
+                            }
+                            if outbound_tx.try_send(addr).is_err() {
+                                // Queue full or closed; retry on the next tick.
+                                break 'endpoints;
+                            }
                         }
                     }
                     if wait_for_shutdown(&bootstrap_shutdown, Duration::from_secs(2)) {
@@ -909,7 +918,7 @@ mod tests {
         // below is exercised — with an empty `connect`, `bootstrap_worker`
         // would be `None` and the cleanup-ordering assertion could not catch a
         // regression that moves `?` back onto `write_clean_checkpoint`.
-        config.connect = vec![SocketAddr::from(([127, 0, 0, 1], 1))];
+        config.connect = vec!["127.0.0.1:1".to_owned()];
 
         let state = crate::state::NodeState::open(config.clone())?;
         state.apply_block(&bitcoin::blockdata::constants::genesis_block(
