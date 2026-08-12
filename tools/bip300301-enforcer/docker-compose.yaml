@@ -16,6 +16,8 @@ services:
       BITCOIN_RS_RPC_PASSWORD: "${BITCOIN_RS_RPC_PASSWORD:-password}"
       BITCOIN_RS_LOG_LEVEL: "${BITCOIN_RS_LOG_LEVEL:-info}"
       BITCOIN_RS_REST: "true"
+      BITCOIN_RS_TXINDEX: "${BITCOIN_RS_TXINDEX:-false}"
+      BITCOIN_RS_ELECTRUM_BIND: "${BITCOIN_RS_ELECTRUM_BIND:-}"
       BITCOIN_RS_ZMQPUBSEQUENCE: tcp://0.0.0.0:29000
     volumes:
       - ../../data/bitcoin-rs/${BITCOIN_RS_NETWORK:-drynet4}:/data

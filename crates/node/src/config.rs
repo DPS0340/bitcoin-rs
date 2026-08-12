@@ -786,6 +786,9 @@ impl ConfigLayer {
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),
+                "BITCOIN_RS_ELECTRUM_BIND" if value.trim().is_empty() => {
+                    layer.clear_electrum_bind = true;
+                }
                 "BITCOIN_RS_ELECTRUM_BIND" => layer.electrum_bind = Some(value.parse()?),
                 "BITCOIN_RS_ELECTRUM_TLS_CERT" => {
                     layer.electrum_tls_cert = Some(PathBuf::from(value));

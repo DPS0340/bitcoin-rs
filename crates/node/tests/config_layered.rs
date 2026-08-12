@@ -202,6 +202,23 @@ fn electrum_bind_requires_txindex() -> Result<()> {
 }
 
 #[test]
+fn empty_electrum_bind_disables_the_optional_service() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        [
+            ("BITCOIN_RS_TXINDEX", "false"),
+            ("BITCOIN_RS_ELECTRUM_BIND", ""),
+        ],
+        ["bitcoin-rs-node"],
+    )?;
+
+    assert!(!config.txindex);
+    assert_eq!(config.electrum_bind, None);
+    Ok(())
+}
+
+#[test]
 fn zmq_layers_parse_precedence_and_publication_order() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let toml_path = temp.path().join("node.toml");
