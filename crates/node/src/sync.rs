@@ -412,11 +412,12 @@ impl BlockSync {
             }
 
             let mut tree = self.handles.block_tree.write();
-            let acceptance = bitcoin_rs_chain::accept_headers(
+            let acceptance = bitcoin_rs_chain::accept_headers_with_difficulty_reset(
                 &mut tree,
                 &headers,
                 self.handles.network,
                 bitcoin_rs_chain::current_unix_seconds(),
+                self.handles.difficulty_reset_height,
             );
             match acceptance {
                 Ok(node_ids) => {

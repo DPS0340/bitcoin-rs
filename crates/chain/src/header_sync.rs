@@ -40,6 +40,17 @@ pub fn accept_headers(
     network: Network,
     now_secs: u32,
 ) -> Result<Vec<NodeId>, ChainError> {
+    accept_headers_with_difficulty_reset(tree, headers, network, now_secs, None)
+}
+
+/// Accepts headers with an optional one-time reset to the network PoW limit.
+pub fn accept_headers_with_difficulty_reset(
+    tree: &mut BlockTree,
+    headers: &[BlockHeader],
+    network: Network,
+    now_secs: u32,
+    difficulty_reset_height: Option<u32>,
+) -> Result<Vec<NodeId>, ChainError> {
     let mut accepted = Vec::with_capacity(headers.len());
     for header in headers {
         let hash = hash_from_header(header);
@@ -49,7 +60,7 @@ pub fn accept_headers(
         }
         validate_pow(header, hash, network)?;
         validate_empty_tree_root(tree, header, hash, network)?;
-        validate_candidate_nbits(tree, header, network)?;
+        validate_candidate_nbits(tree, header, network, difficulty_reset_height)?;
         validate_header_timestamp(tree, header, hash, now_secs)?;
         let id = tree.insert_header_with_hash(*header, hash, NodeStatus::HeaderValid)?;
         accepted.push(id);
@@ -143,6 +154,18 @@ pub fn validate_header_nbits(
     header: &BlockHeader,
     network: Network,
 ) -> Result<(), ChainError> {
+    validate_header_nbits_with_difficulty_reset(tree, parent_id, header, network, None)
+}
+
+/// Validates contextual difficulty with an optional one-time reset to the
+/// selected network's proof-of-work limit.
+pub fn validate_header_nbits_with_difficulty_reset(
+    tree: &BlockTree,
+    parent_id: NodeId,
+    header: &BlockHeader,
+    network: Network,
+    difficulty_reset_height: Option<u32>,
+) -> Result<(), ChainError> {
     let parent = tree.node(parent_id)?;
     let height = parent
         .height
@@ -151,7 +174,14 @@ pub fn validate_header_nbits(
     let retarget_interval = network.retarget_interval();
     let is_retarget = retarget_interval != 0 && height.is_multiple_of(retarget_interval);
     let expected = if is_retarget {
-        expected_retarget_bits(network, tree, parent_id, height, retarget_interval)?
+        expected_retarget_bits(
+            network,
+            tree,
+            parent_id,
+            height,
+            retarget_interval,
+            difficulty_reset_height,
+        )?
     } else {
         expected_non_retarget_bits(network, tree, parent_id, header, retarget_interval)?
     };
@@ -162,6 +192,7 @@ fn validate_candidate_nbits(
     tree: &BlockTree,
     header: &BlockHeader,
     network: Network,
+    difficulty_reset_height: Option<u32>,
 ) -> Result<(), ChainError> {
     if tree.is_empty() {
         return Ok(());
@@ -171,7 +202,13 @@ fn validate_candidate_nbits(
     let parent_id = tree
         .lookup(prev_hash)
         .ok_or(ChainError::MissingParent { prev_hash })?;
-    validate_header_nbits(tree, parent_id, header, network)
+    validate_header_nbits_with_difficulty_reset(
+        tree,
+        parent_id,
+        header,
+        network,
+        difficulty_reset_height,
+    )
 }
 
 fn validate_pow(
@@ -245,7 +282,11 @@ fn expected_retarget_bits(
     parent_id: NodeId,
     height: u32,
     retarget_interval: u32,
+    difficulty_reset_height: Option<u32>,
 ) -> Result<CompactTarget, ChainError> {
+    if difficulty_reset_height == Some(height) {
+        return Ok(pow_limit_bits(network));
+    }
     let prev_node = tree.node(parent_id)?;
     if network.pow_no_retargeting() {
         return Ok(prev_node.header.bits);

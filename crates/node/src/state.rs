@@ -919,6 +919,7 @@ impl NodeState {
         let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
             network: config.network,
             genesis: config.network.genesis_block_hash(),
+            difficulty_reset_height: config.difficulty_reset_height,
         };
         let checkpoint_load =
             crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
@@ -1096,6 +1097,7 @@ impl NodeState {
         let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
+            difficulty_reset_height: config.difficulty_reset_height,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
             block_tree: Arc::clone(&block_tree),
@@ -1228,6 +1230,7 @@ impl NodeState {
             crate::checkpoint::HeaderCheckpointConfig {
                 network: self.config.network,
                 genesis: self.config.network.genesis_block_hash(),
+                difficulty_reset_height: self.config.difficulty_reset_height,
             },
             &self.block_tree,
             &self.utxo,

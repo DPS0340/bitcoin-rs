@@ -229,7 +229,7 @@ metrics-exporter-prometheus = { version = ">=0.18, <0.19", default-features = fa
 quanta                      = { version = ">=0.12.6, <0.13", default-features = false }
 
 # --- Signals + TLS ------------------------------------------------------------
-signal-hook = { version = ">=0.4.4, <0.5", default-features = false }
+ctrlc = { version = ">=3.5.2, <4", default-features = false, features = ["termination"] }
 # rustls 0.23: default = [aws_lc_rs, logging, prefer-post-quantum, std, tls12].
 # Switch to the `ring` provider so we keep one TLS stack consistent with the
 # project's "no aws-lc-sys C build" preference; keep `logging` and `tls12`.

@@ -100,35 +100,93 @@ pub fn read_message<R: Read>(
     reader: &mut R,
     expected_magic: Magic,
 ) -> Result<(Message, bytes::Bytes), PeerError> {
-    let mut header = [0u8; HEADER_LEN];
-    reader.read_exact(&mut header)?;
+    MessageReader::default().read_message(reader, expected_magic)
+}
 
-    let actual_magic = Magic::from_bytes([header[0], header[1], header[2], header[3]]);
-    if actual_magic != expected_magic {
-        return Err(PeerError::WrongNetwork {
-            expected: expected_magic,
-            actual: actual_magic,
-        });
+/// Incremental Bitcoin v1 frame reader that retains partial data across I/O timeouts.
+#[derive(Debug, Default)]
+pub struct MessageReader {
+    buffered: bytes::BytesMut,
+}
+
+impl MessageReader {
+    /// Reads and validates the next message without discarding a partial frame on timeout.
+    pub fn read_message<R: Read>(
+        &mut self,
+        reader: &mut R,
+        expected_magic: Magic,
+    ) -> Result<(Message, bytes::Bytes), PeerError> {
+        loop {
+            if let Some(message) = self.decode_buffered(expected_magic)? {
+                return Ok(message);
+            }
+
+            let mut chunk = [0_u8; 64 * 1024];
+            let needed = self.bytes_needed_for_current_frame();
+            let read_len = needed.min(chunk.len());
+            let read = reader.read(&mut chunk[..read_len])?;
+            if read == 0 {
+                return Err(PeerError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            self.buffered.extend_from_slice(&chunk[..read]);
+        }
     }
 
-    let command = read_command(&header[4..16])?;
-    let payload_len_u32 = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
-    let payload_len =
-        usize::try_from(payload_len_u32).map_err(|_| PeerError::PayloadTooLarge(usize::MAX))?;
-    if payload_len > MAX_MESSAGE_PAYLOAD {
-        return Err(PeerError::PayloadTooLarge(payload_len));
+    fn bytes_needed_for_current_frame(&self) -> usize {
+        if self.buffered.len() < HEADER_LEN {
+            return HEADER_LEN - self.buffered.len();
+        }
+
+        let header = &self.buffered[..HEADER_LEN];
+        let payload_len = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        let frame_len =
+            HEADER_LEN.saturating_add(usize::try_from(payload_len).unwrap_or(usize::MAX));
+        frame_len.saturating_sub(self.buffered.len()).max(1)
     }
 
-    let mut expected = [0u8; 4];
-    expected.copy_from_slice(&header[20..24]);
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload)?;
-    if checksum(&payload) != expected {
-        return Err(PeerError::BadChecksum);
-    }
+    fn decode_buffered(
+        &mut self,
+        expected_magic: Magic,
+    ) -> Result<Option<(Message, bytes::Bytes)>, PeerError> {
+        if self.buffered.len() < HEADER_LEN {
+            return Ok(None);
+        }
 
-    let message = decode_payload(&command, &payload)?;
-    Ok((message, bytes::Bytes::from(payload)))
+        let header = &self.buffered[..HEADER_LEN];
+
+        let actual_magic = Magic::from_bytes([header[0], header[1], header[2], header[3]]);
+        if actual_magic != expected_magic {
+            return Err(PeerError::WrongNetwork {
+                expected: expected_magic,
+                actual: actual_magic,
+            });
+        }
+
+        let command = read_command(&header[4..16])?;
+        let payload_len_u32 = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+        let payload_len =
+            usize::try_from(payload_len_u32).map_err(|_| PeerError::PayloadTooLarge(usize::MAX))?;
+        if payload_len > MAX_MESSAGE_PAYLOAD {
+            return Err(PeerError::PayloadTooLarge(payload_len));
+        }
+        let frame_len = HEADER_LEN.saturating_add(payload_len);
+        if self.buffered.len() < frame_len {
+            return Ok(None);
+        }
+
+        let mut expected = [0u8; 4];
+        expected.copy_from_slice(&header[20..24]);
+        let frame = self.buffered.split_to(frame_len).freeze();
+        let payload = frame.slice(HEADER_LEN..);
+        if checksum(&payload) != expected {
+            return Err(PeerError::BadChecksum);
+        }
+
+        let message = decode_payload(&command, &payload)?;
+        Ok(Some((message, payload)))
+    }
 }
 
 /// Encode only a message payload.
@@ -368,7 +426,8 @@ mod tests {
     use bitcoin::p2p::message::NetworkMessage;
 
     use super::{
-        HEADER_LEN, MAX_MESSAGE_PAYLOAD, PeerError, encode_payload, read_message, write_message,
+        HEADER_LEN, MAX_MESSAGE_PAYLOAD, MessageReader, PeerError, encode_payload, read_message,
+        write_message,
     };
 
     /// Serves exactly one v1 wire header and fails on any read beyond it.
@@ -389,6 +448,27 @@ mod tests {
                 return Err(std::io::Error::other("read past 24-byte header"));
             }
             Ok(n)
+        }
+    }
+
+    struct TimeoutReader {
+        wire: Cursor<Vec<u8>>,
+        timeout_offsets: Vec<usize>,
+    }
+
+    impl Read for TimeoutReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let position = usize::try_from(self.wire.position())
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if self.timeout_offsets.first() == Some(&position) {
+                self.timeout_offsets.remove(0);
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+
+            let limit = self.timeout_offsets.first().map_or(buf.len(), |offset| {
+                offset.saturating_sub(position).min(buf.len())
+            });
+            self.wire.read(&mut buf[..limit])
         }
     }
 
@@ -427,6 +507,32 @@ mod tests {
         assert_eq!(raw.as_ref(), payload.as_slice());
         assert_eq!(decoded_block.block_hash(), expected_hash);
 
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_reader_resumes_partial_header_and_payload_after_timeouts()
+    -> Result<(), PeerError> {
+        let message = NetworkMessage::Ping(42);
+        let mut wire = Vec::new();
+        write_message(&mut wire, Magic::REGTEST, &message)?;
+        let mut source = TimeoutReader {
+            wire: Cursor::new(wire),
+            timeout_offsets: vec![7, HEADER_LEN + 3],
+        };
+        let mut reader = MessageReader::default();
+
+        for expected_offset in [7_u64, u64::try_from(HEADER_LEN + 3).unwrap_or(u64::MAX)] {
+            let Err(PeerError::Io(error)) = reader.read_message(&mut source, Magic::REGTEST) else {
+                return Err(PeerError::Protocol("expected injected read timeout"));
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(source.wire.position(), expected_offset);
+        }
+
+        let (decoded, raw) = reader.read_message(&mut source, Magic::REGTEST)?;
+        assert!(matches!(decoded, NetworkMessage::Ping(42)));
+        assert_eq!(raw.as_ref(), 42_u64.to_le_bytes());
         Ok(())
     }
 

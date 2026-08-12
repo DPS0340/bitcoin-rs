@@ -3,7 +3,7 @@ use std::path::Path;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::{Encodable, encode::deserialize};
-use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot, accept_headers};
+use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_coinstats::{
     CoinStats, CoinStatsAccumulator, CoinStatsListener, scan_coin_stats,
     stats::COIN_STATS_ENCODED_LEN,
@@ -57,6 +57,7 @@ const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
 pub(crate) struct HeaderCheckpointConfig {
     pub(crate) network: Network,
     pub(crate) genesis: Hash256,
+    pub(crate) difficulty_reset_height: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,11 +281,12 @@ pub(crate) fn read_headers<R: Read + Seek>(
         reader.read_exact(&mut encoded)?;
         let header: Header = deserialize(&encoded)
             .map_err(|error| HeaderCheckpointError::Codec(error.to_string()))?;
-        let ids = accept_headers(
+        let ids = bitcoin_rs_chain::accept_headers_with_difficulty_reset(
             &mut tree,
             core::slice::from_ref(&header),
             config.network,
             bitcoin_rs_chain::current_unix_seconds(),
+            config.difficulty_reset_height,
         )?;
         let id = ids[0];
         let node = tree.node(id)?;
@@ -1817,6 +1819,7 @@ mod tests {
         let wrong_network = HeaderCheckpointConfig {
             network: Network::Testnet3,
             genesis: Network::Testnet3.genesis_block_hash(),
+            difficulty_reset_height: None,
         };
         assert!(
             read_headers(
@@ -1829,6 +1832,7 @@ mod tests {
         let configured_genesis_mismatch = HeaderCheckpointConfig {
             network: NETWORK,
             genesis: Hash256::from_le_bytes(&[0x22; 32]),
+            difficulty_reset_height: None,
         };
         assert!(matches!(
             read_headers(
@@ -2334,6 +2338,7 @@ mod tests {
         let wrong = HeaderCheckpointConfig {
             network: Network::Testnet3,
             genesis: Network::Testnet3.genesis_block_hash(),
+            difficulty_reset_height: None,
         };
         assert!(load_checkpoint(dir.path(), wrong).is_err());
         Ok(())
@@ -2776,6 +2781,7 @@ mod tests {
         HeaderCheckpointConfig {
             network: NETWORK,
             genesis: NETWORK.genesis_block_hash(),
+            difficulty_reset_height: None,
         }
     }
 

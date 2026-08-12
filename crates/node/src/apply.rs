@@ -741,6 +741,8 @@ impl AssumeValidGate {
 pub struct ApplyHandles {
     /// Network consensus parameters.
     pub network: Network,
+    /// Optional fork height whose retarget is reset to the network PoW limit.
+    pub difficulty_reset_height: Option<u32>,
     /// Shared best-chain tip handle.
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Shared best-applied-block tip handle.
@@ -823,6 +825,7 @@ impl ApplyHandles {
     ) -> Self {
         Self {
             network,
+            difficulty_reset_height: None,
             chain_tip,
             applied_tip,
             block_tree,
@@ -3346,11 +3349,12 @@ fn check_pow_limit_and_continuity(
             bitcoin_rs_chain::ChainError::MissingParent { prev_hash },
         ));
     };
-    bitcoin_rs_chain::header_sync::validate_header_nbits(
+    bitcoin_rs_chain::header_sync::validate_header_nbits_with_difficulty_reset(
         &tree,
         parent_id,
         &block.header,
         handles.network,
+        handles.difficulty_reset_height,
     )
     .map_err(apply_nbits_error)
 }

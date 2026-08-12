@@ -5,7 +5,9 @@ use bitcoin::{
     hashes::Hash as _,
     pow::CompactTarget,
 };
-use bitcoin_rs_chain::header_sync::validate_header_nbits;
+use bitcoin_rs_chain::header_sync::{
+    validate_header_nbits, validate_header_nbits_with_difficulty_reset,
+};
 use bitcoin_rs_chain::{
     BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
 };
@@ -153,6 +155,41 @@ fn rejects_retarget_header_that_keeps_parent_bits_when_timespan_clamps()
         expected, actual,
         "clamped retarget calculation must differ from parent nBits"
     );
+    Ok(())
+}
+
+#[test]
+fn accepts_configured_pow_limit_reset_at_retarget_boundary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut tree = BlockTree::new();
+    let inherited_bits = CompactTarget::from_consensus(0x1c00_ffff);
+    let reset_bits = CompactTarget::from_consensus(0x1d00_ffff);
+    let reset_height = Network::Mainnet.retarget_interval();
+    let mut prev_hash = BlockHash::all_zeros();
+    let mut parent = None;
+    let mut parent_id = None;
+
+    for height in 0..reset_height {
+        let header = raw_header_with(prev_hash, height, height, inherited_bits);
+        let id = tree.insert_node(parent, header, NodeStatus::HeaderValid)?;
+        prev_hash = header.block_hash();
+        parent = Some(id);
+        parent_id = Some(id);
+    }
+
+    let parent_id = parent_id.ok_or("missing reset parent")?;
+    let child = raw_header_with(prev_hash, reset_height, reset_height, reset_bits);
+    assert!(
+        validate_header_nbits(&tree, parent_id, &child, Network::Mainnet).is_err(),
+        "ordinary mainnet must retain its calculated retarget"
+    );
+    validate_header_nbits_with_difficulty_reset(
+        &tree,
+        parent_id,
+        &child,
+        Network::Mainnet,
+        Some(reset_height),
+    )?;
     Ok(())
 }
 

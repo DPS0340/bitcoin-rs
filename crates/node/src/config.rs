@@ -18,6 +18,7 @@ const DEFAULT_DBCACHE_MB: u64 = 450;
 const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
+const DRYNET4_DIFFICULTY_RESET_HEIGHT: u32 = 961_632;
 
 /// A complete built-in node network selection.
 ///
@@ -127,6 +128,9 @@ pub struct Config {
     pub network: Network,
     /// Optional P2P message-start override for fork networks sharing this chain's genesis.
     pub p2p_magic: Option<[u8; 4]>,
+    /// Optional fork height whose retarget is reset to the network PoW limit.
+    #[serde(skip)]
+    pub(crate) difficulty_reset_height: Option<u32>,
     /// Node data directory.
     pub data_dir: PathBuf,
     /// Storage backend name: `rocksdb`, `fjall`, `redb`, or `mdbx`.
@@ -216,6 +220,7 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("network", &self.network)
             .field("p2p_magic", &self.p2p_magic)
+            .field("difficulty_reset_height", &self.difficulty_reset_height)
             .field("data_dir", &self.data_dir)
             .field("storage_backend", &self.storage_backend)
             .field("rpc_bind", &self.rpc_bind)
@@ -280,6 +285,7 @@ impl Config {
         Self {
             network,
             p2p_magic: None,
+            difficulty_reset_height: None,
             data_dir: PathBuf::from(".bitcoin-rs"),
             storage_backend: DEFAULT_STORAGE_BACKEND.to_owned(),
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
@@ -439,6 +445,12 @@ impl Config {
     #[must_use]
     pub fn p2p_magic(&self) -> [u8; 4] {
         self.p2p_magic.unwrap_or_else(|| self.network.magic())
+    }
+
+    /// Returns the selected fork's one-time difficulty reset height, if any.
+    #[must_use]
+    pub const fn difficulty_reset_height(&self) -> Option<u32> {
+        self.difficulty_reset_height
     }
 
     /// Returns active ZMQ publications in Core notification order.
@@ -629,6 +641,7 @@ impl Config {
         let network = selection.consensus_network();
         self.network = network;
         self.p2p_magic = None;
+        self.difficulty_reset_height = None;
         self.rpc_bind = SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port()));
         self.p2p_listen = vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))];
         self.dns_seeds_enabled = true;
@@ -636,6 +649,7 @@ impl Config {
 
         if selection == NetworkSelection::Drynet4 {
             self.p2p_magic = Some(DRYNET4_P2P_MAGIC);
+            self.difficulty_reset_height = Some(DRYNET4_DIFFICULTY_RESET_HEIGHT);
             self.dns_seeds_enabled = false;
             self.connect = vec![DRYNET4_CONNECT.to_owned()];
         }

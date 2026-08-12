@@ -132,6 +132,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
 
     assert_eq!(config.network, Network::Mainnet);
     assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
+    assert_eq!(config.difficulty_reset_height(), Some(961_632));
     assert_eq!(config.connect, vec!["drynet4.drivechain.dev:8533"]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
@@ -164,6 +165,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Testnet4);
+    assert_eq!(config.difficulty_reset_height(), None);
     assert_eq!(config.p2p_magic(), Network::Testnet4.magic());
     assert!(config.connect.is_empty());
     assert!(config.dns_seeds_enabled);

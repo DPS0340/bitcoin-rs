@@ -8,7 +8,7 @@ services:
     image: bitcoin-rs:local
     restart: unless-stopped
     init: true
-    stop_grace_period: 5m
+    stop_grace_period: 1m
     environment:
       BITCOIN_RS_NETWORK: "${BITCOIN_RS_NETWORK:-drynet4}"
       BITCOIN_RS_STORAGE_BACKEND: fjall

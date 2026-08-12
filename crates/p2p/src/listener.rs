@@ -552,6 +552,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     const IDLE_DISCONNECT: Duration = Duration::from_mins(1);
 
     let mut last_inbound = Instant::now();
+    let mut message_reader = crate::wire::MessageReader::default();
 
     loop {
         if peer.state == PeerState::Disconnecting {
@@ -568,7 +569,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
             return Ok(());
         }
 
-        let read_result = crate::wire::read_message(&mut peer.stream, peer.magic);
+        let read_result = message_reader.read_message(&mut peer.stream, peer.magic);
         if lease.is_cancelled() {
             tracing::debug!(peer_addr = %peer_addr, "p2p peer lease revoked during read; closing");
             return Ok(());
