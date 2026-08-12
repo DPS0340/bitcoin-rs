@@ -19,14 +19,14 @@ const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
 
-/// A complete built-in node network profile.
+/// A complete built-in node network selection.
 ///
-/// Unlike [`Network`], which selects consensus rules, a preset also selects
-/// P2P bootstrap behavior. Low-level settings in the same or a later
-/// configuration layer may explicitly override the preset.
+/// Unlike [`Network`], which selects consensus rules, this also selects P2P
+/// bootstrap behavior. Low-level settings in the same or a later configuration
+/// layer may explicitly override the network-derived defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum NetworkSelection {
+pub(crate) enum NetworkSelection {
     /// Bitcoin mainnet.
     Mainnet,
     /// Legacy Bitcoin testnet.
@@ -992,19 +992,6 @@ where
 {
     let raw = String::deserialize(deserializer)?;
     parse_network(&raw).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_network<'de, D>(
-    deserializer: D,
-) -> core::result::Result<Option<Network>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    raw.as_deref()
-        .map(parse_network)
-        .transpose()
-        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_optional_p2p_magic<'de, D>(
