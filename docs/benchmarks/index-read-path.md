@@ -7,10 +7,24 @@ G14 Electrum `get_history` p95 <= 30 ms budget.
 
 Harness: `crates/index/benches/history_resolve.rs` and
 `crates/electrum/benches/electrum_methods.rs`. Both are Criterion, both hold the
-`before_scan` and `after_positions` arms of a refactor set in one group over one
-fixture, and at this commit **both arms call the same code** — the paired shape
-exists so the optimization has somewhere to land, and so the identical-arm
-spread measures the harness noise floor directly.
+`before_scan` and `after_fast` arms of a refactor set in one group over one
+fixture. At the **baseline** commit both arms called the same code, which is
+what the noise-floor section below measures; both harnesses now run genuinely
+different paths in each arm.
+
+In `history_resolve.rs` the arms call different functions — the retained `*_scan`
+reference against the position-backed resolver. In `electrum_methods.rs` both
+arms enter the same `dispatch`, and the arms are separated by giving each its own
+`IndexHandle` over a block source that either serves ranged reads or declines
+them. Same rows, same block files, same request.
+
+> **Harness correction, 2026-08-13 (second).** Between the resolver rewrite
+> landing and this revision, the two `electrum_methods.rs` arms were *literally
+> the same call* — one `IndexHandle`, invoked twice. Every Electrum figure
+> published in that window was an absolute cost labelled as a paired arm, and the
+> section that reported it said as much, but the harness should not have been
+> shipped in that shape. Caught in review of PR #80. The Electrum tables below are
+> the re-measurement with the arms actually separated.
 
 ## Fixture shape
 
@@ -110,7 +124,11 @@ this path.
 
 ## Harness noise floor
 
-Both arms are the same code, so their spread is noise. It is not uniform:
+Measured at the baseline commit, when both arms of every group were the same
+code and their spread was therefore pure noise. Both harnesses now run different
+code in each arm, so this table cannot be re-derived from a current run — it is
+retained as the calibration the ratios below are judged against. It is not
+uniform:
 
 | Group | Identical-arm spread |
 |---|---|
@@ -126,9 +144,17 @@ fixture-order and cache effects dominate. The 64-height `subscribe` and
 throttle mid-group.
 
 **Consequence for the refactor sets:** `get_history` and the index resolvers at
->= 8 heights can resolve the 1.05x gate today. `subscribe` and `get_balance` at
-64 heights cannot — a win claimed there needs a quiet host, more samples, or
-both, and must not be quoted from this harness as it stands.
+>= 8 heights could resolve the 1.05x gate at baseline. `subscribe` and
+`get_balance` at 64 heights could not — a win claimed there would have needed a
+quiet host, more samples, or both.
+
+That constraint is no longer binding, and the reason is worth stating rather than
+quietly dropping: those two groups were noisy because each iteration ran >70 ms,
+long enough for this host to throttle mid-group. The `after` arm now runs in
+under a millisecond, so the group finishes before throttling starts. The measured
+ratios there are 71.6x and 76.5x — three orders of magnitude past a noise floor
+that was never worse than 2.4x, so the conclusion does not depend on the floor
+having improved.
 
 ## Landed: lazy txid in the unspent-output resolvers
 
@@ -270,31 +296,57 @@ height, 106.38 at eight, 836.17 at sixty-four, dead linear. That floor is the
 `load_range` open/`fstat`/seek/read sequence, measured independently at 12.00 µs.
 Removing it needs a batch read, not a cheaper resolver.
 
-**End-to-end through Electrum `dispatch`**, over the same flat-file store. Both
-arms call the same entry point, so these are absolute costs rather than a paired
-comparison:
+**End-to-end through Electrum `dispatch`**, over the same flat-file store,
+**paired arms in one run**. `before_scan` is a handle whose block source declines
+ranged reads, so the resolvers take the whole-block fallback; `after_fast` is a
+handle over the identical rows and block files whose source serves them.
 
-| Method | 1 height | 8 heights | 64 heights |
-|---|---:|---:|---:|
-| `blockchain.scripthash.get_history` | 15.46 µs | 112.48 µs | **881.02 µs** |
-| `blockchain.scripthash.subscribe` | 15.69 µs | 110.15 µs | 861.48 µs |
-| `blockchain.scripthash.get_balance` | 15.57 µs | 114.39 µs | 901.32 µs |
-| `blockchain.scripthash.listunspent` | 16.54 µs | 121.84 µs | 958.23 µs |
+| Method | Heights | `before_scan` | `after_fast` | Ratio |
+|---|---:|---:|---:|---:|
+| `get_history` | 1 | 1.0198 ms | 15.99 µs | **63.8x** |
+| `get_history` | 8 | 8.3475 ms | 115.94 µs | **72.0x** |
+| `get_history` | 64 | 67.621 ms | 919.56 µs | **73.5x** |
+| `subscribe` | 64 | 67.337 ms | 880.63 µs | **76.5x** |
+| `get_balance` | 64 | 67.505 ms | 942.47 µs | **71.6x** |
+| `listunspent` | 64 | 68.872 ms | 997.20 µs | **69.1x** |
 
-Dispatch adds about 45 µs of JSON parsing and rendering over the 836.17 µs the
-resolver costs at 64 heights, so the scan-path equivalent is roughly 65.7 ms.
-**`get_history` on this fixture went from about 2.2x over the 30 ms G14 budget to
-about 34x under it, a ~75x improvement.** Still a synthetic fixture on a laptop,
-and still not the gate.
+Every group clears the 1.05x gate by two orders of magnitude, and the ratio is
+stable at 62-77x across all twelve.
+
+**`get_history` on this fixture went from 2.3x over the 30 ms G14 budget to 33x
+under it.** Still a synthetic fixture on a laptop, and still not the gate.
+
+Two cross-checks that the fixture is measuring what it claims:
+
+- The `after_fast` arm tracks the index-resolver bench almost exactly — 919.56 µs
+  end to end against 836.17 µs for `resolve_script_history` alone at 64 heights.
+  Dispatch overhead is the ~83 µs difference, which is JSON parameter parsing and
+  rendering 64 entries.
+- The `before_scan` arm collapses the four methods onto one number (67.3-68.9 ms
+  at 64 heights) where the pre-optimization baseline had them spread from 72 to
+  265 ms. That is the lazy-txid change landing: `get_balance` and `listunspent`
+  used to pay a double-SHA256 over every transaction in every block, and no
+  longer do. They now cost what `get_history` costs, because all four are doing
+  the same block scan.
 
 The 64-height `subscribe` and `get_balance` groups, previously unusable at
-2.0-2.4x identical-arm spread, now agree within 0.5%: the work got cheap enough
-that host thermal noise no longer dominates them.
+2.0-2.4x identical-arm spread, are now stable: the `after` arm got cheap enough
+that host thermal noise no longer dominates the group.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 11 tests. Every
+**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 12 tests. Every
 assertion runs **twice** — once against a source that can serve ranges and once
 against one that declines — so the position path and the scan fallback are both
-checked against the same `_scan` oracle. Beyond the shared fixtures:
+checked against the same `_scan` oracle.
+
+**One of the twelve tests the read shape, not the result**, and it exists because
+the other eleven cannot catch the most likely regression. Equivalence is measured
+*against scanning*, so deleting the position path entirely leaves all eleven
+green. `the_position_path_reads_ranges_and_never_whole_blocks` counts the calls
+its source serves and asserts that the position path loads zero whole blocks and
+at least one range, and that a source declining ranges is the mirror image.
+Raised in review of PR #80.
+
+Beyond the shared fixtures:
 
 - `stale_positions_from_a_superseded_block_fall_back_to_scanning` indexes block
   A and serves block B at the same height.

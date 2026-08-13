@@ -14,6 +14,7 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use bitcoin::hashes::Hash as _;
@@ -40,16 +41,26 @@ const BASE_HEIGHT: u32 = 100;
 struct FixtureSource {
     blocks: HashMap<u32, Block>,
     sliceable: bool,
+    /// Whole-block reads served. The position path must never need one.
+    full_loads: Cell<usize>,
+    /// Ranged reads served.
+    range_loads: Cell<usize>,
 }
 
 impl FixtureSource {
     fn new(blocks: HashMap<u32, Block>, sliceable: bool) -> Self {
-        Self { blocks, sliceable }
+        Self {
+            blocks,
+            sliceable,
+            full_loads: Cell::new(0),
+            range_loads: Cell::new(0),
+        }
     }
 }
 
 impl BlockSource for FixtureSource {
     fn block_at_height(&self, height: u32) -> Option<Block> {
+        self.full_loads.set(self.full_loads.get() + 1);
         self.blocks.get(&height).cloned()
     }
 
@@ -57,6 +68,7 @@ impl BlockSource for FixtureSource {
         if !self.sliceable {
             return None;
         }
+        self.range_loads.set(self.range_loads.get() + 1);
         let bytes = bitcoin::consensus::encode::serialize(self.blocks.get(&height)?);
         let start = usize::try_from(offset).ok()?;
         let end = start.checked_add(usize::try_from(len).ok()?)?;
@@ -189,6 +201,68 @@ fn assert_resolvers_agree_on(
             "resolve_transaction diverged from its reference on the {path} path"
         );
     }
+}
+
+/// The equivalence assertions above cannot catch a resolver that quietly stops
+/// using positions: deleting the fast path entirely leaves every one of them
+/// green, because scanning is what they compare against. This is the test that
+/// fails when that happens.
+///
+/// It asserts the read *shape*, not the result — on the position path a whole
+/// block must never be loaded, and on the fallback path a range must never be
+/// requested.
+#[test]
+fn the_position_path_reads_ranges_and_never_whole_blocks() {
+    let target = script(0x5c, 22);
+    let mut blocks = Vec::new();
+    for offset in 0..4_u32 {
+        let seed = u8::try_from(offset).unwrap_or(0);
+        blocks.push((
+            BASE_HEIGHT + offset,
+            Block {
+                header: header(),
+                txdata: vec![
+                    tx_with_outputs(0x40 + seed, vec![out(script(0x77, 22), 11)]),
+                    tx_with_outputs(0x50 + seed, vec![out(target.clone(), 12)]),
+                ],
+            },
+        ));
+    }
+    let (indexer, blocks) = index_blocks(blocks);
+    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+
+    let positioned = FixtureSource::new(blocks.clone(), true);
+    let history = indexer
+        .resolve_script_history(scripthash, &positioned)
+        .expect("fast resolver");
+    assert_eq!(history.len(), 4, "fixture must resolve one entry per height");
+    assert_eq!(
+        positioned.full_loads.get(),
+        0,
+        "the position path loaded a whole block; the fast path is not being taken"
+    );
+    assert!(
+        positioned.range_loads.get() > 0,
+        "the position path served no ranged read"
+    );
+
+    let scanning = FixtureSource::new(blocks, false);
+    assert_eq!(
+        indexer
+            .resolve_script_history(scripthash, &scanning)
+            .expect("fallback resolver"),
+        history,
+        "the fallback must resolve what the position path resolved"
+    );
+    assert!(
+        scanning.full_loads.get() > 0,
+        "the fallback path served no whole-block read"
+    );
+    assert_eq!(
+        scanning.range_loads.get(),
+        0,
+        "a source that declines ranges must never record one"
+    );
 }
 
 #[test]

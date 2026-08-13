@@ -276,10 +276,11 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
 
 /// Emits the paired `before`/`after` arms for one fixture.
 ///
-/// Both arms currently call the same resolver: this is the baseline commit, and
-/// the groups exist so sets A, B and C have somewhere to land. Repoint the
-/// `after_*` closures — never the `before_*` ones — when the position-backed
-/// path arrives.
+/// The `before_*` arms call the retained `*_scan` references, which read and
+/// fully deserialize a whole block per row; the `after_*` arms call the
+/// position-backed resolvers. Same fixture, same store, one run, so the spread
+/// between them is the win rather than a comparison against a stored baseline.
+/// Repoint the `after_*` closures — never the `before_*` ones.
 fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     let Fixture {
         indexer,

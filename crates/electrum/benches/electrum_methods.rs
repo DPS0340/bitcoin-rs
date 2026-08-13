@@ -11,7 +11,9 @@
 //! iterating.
 //!
 //! Every group holds **both arms** of a refactor set over one identical
-//! fixture. At the baseline commit both arms call the same path.
+//! fixture: `before_scan` runs against a block source that declines ranged
+//! reads, `after_fast` against one that serves them. Same index, same block
+//! files, same request — only the read strategy differs.
 // PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
 #![allow(missing_docs)]
 // A benchmark fixture that fails to build has no meaningful degraded mode: a
@@ -36,7 +38,7 @@ use bitcoin_rs_storage::RocksDbStore;
 use bitcoin_rs_storage::block_file::{BlockFilePosition, FlatFileBlockStore};
 use criterion::{Criterion, criterion_group, criterion_main};
 use hashbrown::HashMap;
-use sonic_rs::{JsonContainerTrait as _, Value, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
 
 /// Filler transactions per fixture block (~250 KB serialized).
 const TXS_PER_BLOCK: usize = 2_200;
@@ -47,10 +49,18 @@ const BASE_HEIGHT: u32 = 100;
 /// `FlatFilePruneBodyStore`: a position lookup, then `load` for a whole body or
 /// `load_range` for a slice. Both pay the real open/`fstat`/seek/read sequence,
 /// so the reported cost is one a node can actually see.
+///
+/// `sliceable` is what separates the two benchmark arms. With it off the source
+/// declines every ranged read, which is how a backend that cannot slice — and
+/// any un-reindexed database — actually behaves, and the resolvers fall back to
+/// loading and decoding whole blocks. Both arms share the same index rows and
+/// the same block files, so the spread between them is the read strategy and
+/// nothing else.
 #[derive(Clone)]
 struct FlatFileBlockSource {
     files: Arc<FlatFileBlockStore>,
     positions: Arc<HashMap<u32, (BlockFilePosition, [u8; 32])>>,
+    sliceable: bool,
 }
 
 impl core::fmt::Debug for FlatFileBlockSource {
@@ -68,6 +78,9 @@ impl BlockSource for FlatFileBlockSource {
     }
 
     fn block_bytes_at_height(&self, height: u32, offset: u32, len: u32) -> Option<Vec<u8>> {
+        if !self.sliceable {
+            return None;
+        }
         let (position, hash) = self.positions.get(&height)?;
         self.files
             .load_range(*position, height, *hash, offset, len)
@@ -170,12 +183,39 @@ fn empty_header() -> block::Header {
     }
 }
 
+/// Extracts `(height, tx_hash)` per history entry, in the order returned.
+fn history_entries(history: &Value) -> Vec<(i64, String)> {
+    history
+        .as_array()
+        .expect("history is an array")
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .get("height")
+                    .and_then(Value::as_i64)
+                    .expect("entry carries a height"),
+                entry
+                    .get("tx_hash")
+                    .and_then(Value::as_str)
+                    .expect("entry carries a tx_hash")
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
 struct Fixture {
     // Held for their `Drop`: the RocksDB and block-file directories must outlive
-    // the handle.
+    // the handles.
     _dir: tempfile::TempDir,
     _blocks_dir: tempfile::TempDir,
-    index: IndexHandle,
+    /// Handle whose source declines ranged reads, forcing the whole-block scan
+    /// fallback. The `before` arm.
+    scan_index: IndexHandle,
+    /// Handle whose source serves ranged reads, so the resolvers read only the
+    /// transactions a row's positions name. The `after` arm.
+    fast_index: IndexHandle,
     mempool: MempoolHandle,
     /// `[scripthash_hex]` params, pre-parsed once so the benchmark measures
     /// dispatch rather than `sonic_rs` fixture construction.
@@ -228,36 +268,63 @@ fn build_fixture(heights: u32) -> Fixture {
         positions.insert(height, (position, hash));
     }
 
-    let source = FlatFileBlockSource {
-        files,
-        positions: Arc::new(positions),
+    // One indexer and one set of block files behind both handles: the arms must
+    // differ only in whether ranged reads are available.
+    let indexer = Arc::new(indexer);
+    let positions = Arc::new(positions);
+    let handle_for = |sliceable: bool| {
+        let source = FlatFileBlockSource {
+            files: Arc::clone(&files),
+            positions: Arc::clone(&positions),
+            sliceable,
+        };
+        let reader = Arc::new(IndexerHistoryReader::new(Arc::clone(&indexer), source));
+        IndexHandle::from_store(Arc::clone(&store)).with_history_reader(reader)
     };
-    let reader = Arc::new(IndexerHistoryReader::new(Arc::new(indexer), source));
-    let handle = IndexHandle::from_store(store).with_history_reader(reader);
+    let scan_index = handle_for(false);
+    let fast_index = handle_for(true);
 
     let hex = bitcoin_rs_electrum::methods::scripthash_hex(target);
     let params = json!([hex]);
     let mempool = MempoolHandle::default();
 
     // A fixture that resolves nothing would benchmark JSON plumbing over an
-    // empty result and report a meaningless speedup. Prove it resolves first.
-    let history = dispatch(
-        "blockchain.scripthash.get_history",
-        &handle,
-        &mempool,
-        &params,
-    )
-    .expect("fixture history dispatch succeeds");
+    // empty result and report a meaningless speedup. Prove both arms resolve,
+    // and that they agree: a "speedup" between arms that return different
+    // answers is not a speedup.
+    let expected = usize::try_from(heights).unwrap_or(0);
+    let mut resolved = Vec::new();
+    for handle in [&scan_index, &fast_index] {
+        let history = dispatch(
+            "blockchain.scripthash.get_history",
+            handle,
+            &mempool,
+            &params,
+        )
+        .expect("fixture history dispatch succeeds");
+        let entries = history_entries(&history);
+        assert_eq!(
+            entries.len(),
+            expected,
+            "fixture must return exactly one history entry per height"
+        );
+        resolved.push(entries);
+    }
+    // Compared field by field in array order, not as rendered JSON: entry order
+    // is contractual (`combined_history` sorts by `(height, txid)`, and clients
+    // hash the sequence) but the key order `sonic_rs` emits within an object is
+    // not, and it does vary between renderings of equal values.
     assert_eq!(
-        history.as_array().map(sonic_rs::Array::len),
-        Some(usize::try_from(heights).unwrap_or(0)),
-        "fixture must return exactly one history entry per height"
+        resolved.first(),
+        resolved.last(),
+        "the scan and position arms must resolve identical history"
     );
 
     Fixture {
         _dir: dir,
         _blocks_dir: blocks_dir,
-        index: handle,
+        scan_index,
+        fast_index,
         mempool,
         params,
     }
@@ -265,12 +332,15 @@ fn build_fixture(heights: u32) -> Fixture {
 
 /// Emits the paired `before`/`after` arms for one Electrum method.
 ///
-/// Both arms call the same dispatch entry point; what differs is the resolver
-/// underneath, which `dispatch` selects. The spread therefore reports the win
-/// once a set lands under it, and the harness noise floor before that.
+/// Both arms enter through the same `dispatch` and carry the same rows; what
+/// differs is whether the block source can serve a range. `before_scan` cannot,
+/// so the resolvers load and decode whole blocks; `after_fast` can, so they read
+/// only the transactions the row's positions name. The spread between the two
+/// is the win, measured in one run over one fixture.
 fn bench_method(c: &mut Criterion, method: &'static str, label: &str, fixture: &Fixture) {
     let Fixture {
-        index,
+        scan_index,
+        fast_index,
         mempool,
         params,
         ..
@@ -280,14 +350,14 @@ fn bench_method(c: &mut Criterion, method: &'static str, label: &str, fixture: &
     group.bench_function("before_scan", |b| {
         b.iter(|| {
             black_box(
-                dispatch(black_box(method), index, mempool, params).expect("dispatch succeeds"),
+                dispatch(black_box(method), scan_index, mempool, params).expect("dispatch succeeds"),
             )
         });
     });
     group.bench_function("after_fast", |b| {
         b.iter(|| {
             black_box(
-                dispatch(black_box(method), index, mempool, params).expect("dispatch succeeds"),
+                dispatch(black_box(method), fast_index, mempool, params).expect("dispatch succeeds"),
             )
         });
     });
