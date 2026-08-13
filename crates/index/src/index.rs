@@ -28,6 +28,17 @@ pub enum IndexError {
         /// Actual header length observed by the visitor.
         len: usize,
     },
+    /// A transaction's byte range in the block does not fit the `u32` that
+    /// [`crate::types::TxPosition`] stores.
+    ///
+    /// Unreachable for any consensus-valid block — a block is capped far below
+    /// 4 GiB — but the arithmetic is checked rather than wrapped, and the
+    /// failure is an addressing limit, not a malformed header.
+    #[error("transaction byte range does not fit u32 at block offset {offset}")]
+    UnaddressablePosition {
+        /// Block byte offset reached when the range stopped fitting.
+        offset: u64,
+    },
 }
 
 /// Counts of rows written by a confirmed block ingest.
@@ -527,14 +538,20 @@ impl<S: KvStore> Indexer<S> {
     /// exist is going to be written with positions. Writing it for a populated
     /// legacy index would claim positions that are not there.
     pub fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
-        if let Some(found) = self.read_format_version()? {
-            return Ok(if found == INDEX_FORMAT_VERSION {
-                IndexFormat::Current
-            } else {
-                IndexFormat::Legacy { found: Some(found) }
-            });
+        match self.read_format_version()? {
+            Some(FormatMarker::Version(found)) => {
+                return Ok(if found == INDEX_FORMAT_VERSION {
+                    IndexFormat::Current
+                } else {
+                    IndexFormat::Legacy { found: Some(found) }
+                });
+            }
+            Some(FormatMarker::Unreadable { len }) => {
+                return Ok(IndexFormat::UnreadableMarker { len });
+            }
+            None => {}
         }
-        if self.header_count()? > 0 {
+        if self.has_any_header()? {
             return Ok(IndexFormat::Legacy { found: None });
         }
         let mut batch = self.store.new_batch();
@@ -547,7 +564,7 @@ impl<S: KvStore> Indexer<S> {
         Ok(IndexFormat::Current)
     }
 
-    fn read_format_version(&self) -> Result<Option<u32>, IndexError> {
+    fn read_format_version(&self) -> Result<Option<FormatMarker>, IndexError> {
         let Some(bytes) = self
             .store
             .get(ColumnFamily::UtxoMeta, INDEX_FORMAT_VERSION_KEY)?
@@ -555,10 +572,24 @@ impl<S: KvStore> Indexer<S> {
             return Ok(None);
         };
         let Ok(encoded) = <[u8; 4]>::try_from(bytes.as_slice()) else {
-            // A marker we cannot parse is not a version we can trust.
-            return Ok(Some(0));
+            // Reported as its own outcome rather than folded into version 0: an
+            // operator told "your index is at version 0" deletes and re-syncs,
+            // which is the wrong response to bytes that should be a `u32` and
+            // are not.
+            return Ok(Some(FormatMarker::Unreadable { len: bytes.len() }));
         };
-        Ok(Some(u32::from_le_bytes(encoded)))
+        Ok(Some(FormatMarker::Version(u32::from_le_bytes(encoded))))
+    }
+
+    /// True when the header column family holds at least one row.
+    ///
+    /// Deliberately not `header_count`: a legacy index takes this branch on
+    /// every single start, and counting reads every row in the column family
+    /// and allocates an 80-byte array per row — roughly a million of each at
+    /// mainnet height — to answer a question that is only ever yes or no.
+    fn has_any_header(&self) -> Result<bool, IndexError> {
+        let mut rows = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
+        Ok(rows.next().transpose()?.is_some())
     }
 
     const FLUSH_THRESHOLD_ROWS: usize = 500_000;
@@ -871,20 +902,24 @@ fn pending_rows_for_decoded_block(
     // transaction starts after the header and the count, and each subsequent one
     // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
     // pins this against the byte offsets the zero-copy path measures directly.
-    let mut offset = u32::try_from(
-        crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size(),
-    )
-    .map_err(|_| IndexError::InvalidHeaderLength { len: usize::MAX })?;
+    let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
+    let mut offset =
+        u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
+            offset: u64::try_from(prologue).unwrap_or(u64::MAX),
+        })?;
 
     for (tx, txid) in block.txdata.iter().zip(txids) {
-        let byte_len =
-            u32::try_from(tx.total_size()).map_err(|_| IndexError::InvalidHeaderLength {
-                len: tx.total_size(),
-            })?;
+        let byte_len = u32::try_from(tx.total_size()).map_err(|_| {
+            IndexError::UnaddressablePosition {
+                offset: u64::from(offset),
+            }
+        })?;
         let position = crate::types::TxPosition::new(offset, byte_len);
         offset = offset
             .checked_add(byte_len)
-            .ok_or(IndexError::InvalidHeaderLength { len: usize::MAX })?;
+            .ok_or_else(|| IndexError::UnaddressablePosition {
+                offset: u64::from(offset),
+            })?;
 
         rows.txid_rows.push(PositionedRow {
             row: TxidRow::row(txid, height),
@@ -1442,6 +1477,26 @@ pub enum IndexFormat {
     Legacy {
         /// The version marker found, or `None` when the index carries none.
         found: Option<u32>,
+    },
+    /// A version marker exists but is not the 4 little-endian bytes of a `u32`.
+    ///
+    /// Resolvers scan, exactly as for [`Self::Legacy`], but the operator
+    /// response differs: this is damaged metadata, not an old index, and
+    /// deleting the directory would discard the evidence of whatever wrote it.
+    UnreadableMarker {
+        /// Byte length of the marker value that failed to decode.
+        len: usize,
+    },
+}
+
+/// What the format-version marker key holds, when it is present at all.
+enum FormatMarker {
+    /// Four little-endian bytes that decoded to this version.
+    Version(u32),
+    /// Present, but not a 4-byte little-endian `u32`.
+    Unreadable {
+        /// Byte length of the value found.
+        len: usize,
     },
 }
 

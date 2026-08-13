@@ -302,8 +302,15 @@ fn a_populated_index_without_a_marker_is_legacy() {
     );
 }
 
+/// None of these may be trusted as current, and an unreadable marker must be
+/// distinguishable from a genuine version 0.
+///
+/// Both take the scan path, so the distinction is not behavioural — it is
+/// diagnostic. Reporting damaged bytes as "version 0" sends the operator to
+/// delete the index directory, which destroys the only evidence of whatever
+/// wrote them.
 #[test]
-fn an_unreadable_or_older_marker_is_legacy() {
+fn an_older_marker_is_legacy_and_an_unreadable_one_is_reported_as_such() {
     let store = Arc::new(MemoryStore::default());
     let indexer = Indexer::new(Arc::clone(&store));
 
@@ -313,9 +320,9 @@ fn an_unreadable_or_older_marker_is_legacy() {
             99_u32.to_le_bytes().to_vec(),
             IndexFormat::Legacy { found: Some(99) },
         ),
-        // A marker we cannot parse is not a version we can trust.
-        (vec![1_u8], IndexFormat::Legacy { found: Some(0) }),
-        (vec![1_u8; 9], IndexFormat::Legacy { found: Some(0) }),
+        (vec![1_u8], IndexFormat::UnreadableMarker { len: 1 }),
+        (vec![1_u8; 9], IndexFormat::UnreadableMarker { len: 9 }),
+        (Vec::new(), IndexFormat::UnreadableMarker { len: 0 }),
     ] {
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::UtxoMeta, b"index:format_version", &bytes);

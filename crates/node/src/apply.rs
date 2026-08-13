@@ -515,6 +515,25 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
         }
         Ok(Self { index, files })
     }
+
+    /// Resolves the flat-file position of a block body, or `None` when the
+    /// block is unknown or its index row is not a decodable position.
+    ///
+    /// Every read path starts here, so it is written once rather than three
+    /// times: divergence between the whole-body, ranged, and metadata lookups
+    /// would surface as one of them silently disagreeing about which blocks
+    /// exist.
+    fn body_position(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<BlockFilePosition>, StorageError> {
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+            return Ok(None);
+        };
+        Ok(BlockFilePosition::decode(&encoded))
+    }
 }
 
 impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
@@ -565,11 +584,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
-            return Ok(None);
-        };
-        let Some(position) = BlockFilePosition::decode(&encoded) else {
+        let Some(position) = self.body_position(height, hash)? else {
             return Ok(None);
         };
         self.files.load(position, height, *hash.as_byte_array())
@@ -582,11 +597,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         offset: u32,
         len: u32,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
-            return Ok(None);
-        };
-        let Some(position) = BlockFilePosition::decode(&encoded) else {
+        let Some(position) = self.body_position(height, hash)? else {
             return Ok(None);
         };
         self.files
@@ -598,11 +609,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<(usize, usize)>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
-            return Ok(None);
-        };
-        let Some(position) = BlockFilePosition::decode(&encoded) else {
+        let Some(position) = self.body_position(height, hash)? else {
             return Ok(None);
         };
         let Some(prefix) = self.files.load_prefix(

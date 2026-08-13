@@ -490,10 +490,25 @@ impl BlockBodySource for StoredBlockBodySource {
         offset: u32,
         len: u32,
     ) -> Option<Vec<u8>> {
-        self.store
-            .load_block_body_range(height, hash, offset, len)
-            .ok()
-            .flatten()
+        // `None` is overloaded here: it means both "this store cannot slice"
+        // and "the read failed". Callers must treat either as a reason to fall
+        // back to the whole body, so the return type stays — but this is the
+        // hot path for every Electrum history call now, and an I/O error that
+        // silently degrades into a full block scan is exactly the failure that
+        // would otherwise show up only as unexplained latency.
+        match self.store.load_block_body_range(height, hash, offset, len) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    height,
+                    offset,
+                    len,
+                    "ranged block body read failed; falling back to the whole body"
+                );
+                None
+            }
+        }
     }
 
     fn block_body_metadata(
@@ -867,6 +882,21 @@ fn report_index_format(config: &Config, indexer: &dyn bitcoin_rs_index::IndexerL
                  transaction lookups will scan whole blocks. Results stay correct. \
                  To rebuild in the current format, stop the node, delete the \
                  named directory, and restart to re-sync the index."
+            );
+        }
+        Ok(bitcoin_rs_index::IndexFormat::UnreadableMarker { len }) => {
+            // Deliberately does not tell the operator to delete anything. The
+            // rows themselves may be fine; what is damaged is the marker, and a
+            // re-sync would erase the only evidence of how that happened.
+            tracing::warn!(
+                marker_len = len,
+                expected_len = core::mem::size_of::<u32>(),
+                txindex_dir = %config.data_dir.join("txindex").display(),
+                "txindex format marker is not a readable version; treating the \
+                 index as legacy, so history and transaction lookups will scan \
+                 whole blocks. Results stay correct. Report this rather than \
+                 deleting the directory: the marker is damaged metadata, not an \
+                 old index."
             );
         }
         Err(error) => {
