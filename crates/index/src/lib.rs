@@ -5,13 +5,18 @@
 pub mod index;
 /// Unconfirmed transaction row writing over the workspace key-value store.
 pub mod mempool;
+/// Process-local health, watermark observation, and query/mutation gate for `TxIndex`.
+pub mod runtime;
 /// Electrum scripthash status hashing.
 pub mod status;
 /// Stable electrs-shaped row types.
 pub mod types;
 
-pub use index::{BlockSource, IndexError, IndexRowCounts, Indexer, IndexerLike};
+pub use index::{
+    BlockSource, IndexConnect, IndexError, IndexRowCounts, IndexWatermark, Indexer, IndexerLike,
+};
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
+pub use runtime::{IndexRuntimeSnapshot, IndexWorkerHealth, TxIndexRuntime};
 pub use status::{HistoryEntry, HistoryHeight, StatusHash, compute_status_hash};
 pub use types::{
     HASH_PREFIX_LEN, HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefix, HashPrefixRow, HeaderRow,

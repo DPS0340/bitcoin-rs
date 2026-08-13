@@ -118,7 +118,7 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first shows which steps need atomicity. The index rollback is one disk batch. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after UTXO undo. TxIndex is not part of this authoritative commit: it reconciles independently after the tip publication. Naming the commit point first shows which authoritative steps need atomicity. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first authoritative mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
 ### Refusing default (trait participation)
 A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
@@ -174,7 +174,7 @@ policy, conflict, and ancestry metadata.
 ### Backfillable derived state
 
 State that is a deterministic projection of the authoritative applied chain and
-can own its progress outside block application. The planned #77 proof is
+can own its progress outside block application. The #77 proof is
 TxIndex: core retains the applied tip, anchored ancestry, and exact block
 bodies; a TxIndex worker owns its rows and `(height, hash)` watermark. This is a
 boundary and recovery contract, not a generic consumer trait. Filter indexes,
@@ -184,7 +184,7 @@ what source data they require before adopting it. See
 
 ### TxIndex watermark
 
-The planned #77 durable statement of exactly which applied-chain block the
+The #77 durable statement of exactly which applied-chain block the
 TxIndex rows represent: `(height, block_hash)`. Row additions or deletions and
 the terminal watermark commit in one TxIndex DB batch. A row count is not a
 watermark. TxIndex may durably lead the core checkpoint restored after a crash,
@@ -198,7 +198,7 @@ block as already removed.
 
 ### Reconciliation attempt target
 
-One captured `applied_tip` used to anchor ancestry reads during a planned
+One captured `applied_tip` used to anchor ancestry reads during a
 TxIndex reconciliation pass. It prevents a worker from mixing heights from
 different live tips, but it does not pin or retain the branch. If its forward
 ancestry disappears and core has published a different tip, the worker abandons
@@ -208,7 +208,7 @@ a source failure rather than an ordinary retry.
 
 ### TxIndex completeness gate
 
-The planned #77 read boundary that prevents asynchronous index lag from being
+The #77 read boundary that prevents asynchronous index lag from being
 reported as an authoritative negative. A complete TxIndex query requires a
 healthy worker and a committed watermark equal to the captured applied tip,
 excludes worker mutation for the logical query, and verifies before returning
@@ -218,7 +218,7 @@ readiness and partial-history policy are separate concerns.
 
 ### Coalesced index wake
 
-The planned #77 capacity-one, payload-free notification sent after a successful
+The #77 capacity-one, payload-free notification sent after a successful
 runtime `applied_tip` publication. It means only "reconcile again"; it carries
 no ordering or recovery truth. Duplicate wakes may coalesce because startup
 always reconciles and a worker compares its watermark with a fresh applied tip
@@ -313,7 +313,7 @@ is splitting the sequential path into a prepare half and a commit half so the
 preparation happens once.
 
 ### Disconnect marker phase
-The durable record that a block disconnect started, and how far it got. Armed and flushed BEFORE the first mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. Armed above the index rollback too, because that rollback commits a delete batch, so a crash between the two would leave the index rolled back while the UTXO set and tip still name the block. It carries a phase because two different callers clear it and they know different things. `InFlight` means mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse a startup. The refusal path has a third operation, `cancel_disconnect`, because an index rollback that failed touched nothing and must clear unconditionally — routing it through the checkpoint's guarded clear would no-op on an `InFlight` marker and strand a false poison on an undamaged node. What this does not close: the UTXO set and tip live behind periodic checkpoints while the index persists immediately, so a crash after a clean disconnect but before the next checkpoint still restores a tip whose index rows are gone. Closing that needs a replay path this node does not have.
+The durable record that an authoritative block disconnect started, and how far it got. It is armed and flushed BEFORE the first UTXO mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. TxIndex is outside its coverage and recovers from its own durable watermark. `InFlight` means authoritative mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse startup. The marker detects torn authoritative chainstate; it does not coordinate or repair derived indexes.
 
 ### Count-and-byte bound
 A window sized by whichever of two caps binds first. A count alone is wrong wherever item size varies by orders of magnitude: early-chain blocks average 4.6 KB, so 1024 of them is 5 MB, while at the tip the same 1024 is 2 GB. A byte cap alone is wrong in the other direction, letting a window hold tens of thousands of tiny items. Taking the minimum makes the batch large exactly where items are small and per-batch overhead dominates, and small where items are large and it does not. The script window uses it, and the same shape is owed by the sync staging budget, whose count is still sized for tip-scale blocks. One item larger than the whole byte cap still goes through alone: refusing it would stall the chain rather than process it.

@@ -43,6 +43,12 @@ pub enum ElectrumError {
     /// TLS failed while accepting a session.
     #[error("tls error: {0}")]
     Tls(#[from] rustls::Error),
+    /// The asynchronous `TxIndex` is lagging, failed, or raced a chain transition.
+    #[error("TxIndex is unavailable or catching up")]
+    TxIndexUnavailable,
+    /// A complete `TxIndex` read failed.
+    #[error("TxIndex lookup failed: {0}")]
+    TxIndex(#[from] bitcoin_rs_index::IndexError),
 }
 
 impl ElectrumError {
@@ -56,7 +62,9 @@ impl ElectrumError {
             | Self::TransactionDecode(_)
             | Self::Io(_)
             | Self::Json(_)
-            | Self::Tls(_) => 1,
+            | Self::Tls(_)
+            | Self::TxIndexUnavailable
+            | Self::TxIndex(_) => 1,
         }
     }
 }
@@ -70,20 +78,26 @@ impl ElectrumError {
 pub trait ConfirmedHistoryReader: Send + Sync + core::fmt::Debug {
     /// Returns confirmed history records for `scripthash`, in iteration order
     /// of the index. Empty [`Vec`] on missing data.
-    fn confirmed_history(&self, scripthash: ScriptHash) -> Vec<HistoryRecord>;
+    fn confirmed_history(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<HistoryRecord>, ElectrumError>;
     /// Returns confirmed unspent-output records for `scripthash`.
     ///
     /// Resolves the lossy 8-byte prefix to full `(txid, vout, value_sats)`
     /// triples via the wrapped `BlockSource` and filters out outpoints with
     /// any matching spending row. Empty [`Vec`] on missing data.
-    fn unspent_outputs(&self, _scripthash: ScriptHash) -> Vec<HistoryRecord> {
-        Vec::new()
+    fn unspent_outputs(
+        &self,
+        _scripthash: ScriptHash,
+    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
+        Ok(Vec::new())
     }
     /// Returns the lowercase-hex serialized confirmed transaction for `txid`,
     /// resolved via the underlying index + `BlockSource`. `None` if not found.
-    fn transaction_hex(&self, txid: bitcoin::Txid) -> Option<String> {
+    fn transaction_hex(&self, txid: bitcoin::Txid) -> Result<Option<String>, ElectrumError> {
         let _ = txid;
-        None
+        Ok(None)
     }
     /// Returns the Bitcoin block at `height` (active chain), or `None` if not
     /// available via the underlying `BlockSource`.
@@ -96,9 +110,9 @@ pub trait ConfirmedHistoryReader: Send + Sync + core::fmt::Debug {
     ///
     /// Default returns `None` so existing implementors retain the previous
     /// behavior; production readers should override to enable real fee derivation.
-    fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Option<u64> {
+    fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Result<Option<u64>, ElectrumError> {
         let _ = op;
-        None
+        Ok(None)
     }
 }
 
@@ -110,6 +124,8 @@ where
 {
     indexer: Arc<bitcoin_rs_index::Indexer<S>>,
     block_source: B,
+    runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
+    applied_tip: Option<Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>>,
 }
 
 impl<S, B> IndexerHistoryReader<S, B>
@@ -123,7 +139,47 @@ where
         Self {
             indexer,
             block_source,
+            runtime: None,
+            applied_tip: None,
         }
+    }
+
+    /// Adds the production completeness boundary for asynchronous `TxIndex` reads.
+    #[must_use]
+    pub fn with_completeness(
+        mut self,
+        runtime: Arc<bitcoin_rs_index::TxIndexRuntime>,
+        applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self.applied_tip = Some(applied_tip);
+        self
+    }
+
+    fn complete_query<T>(
+        &self,
+        query: impl FnOnce() -> Result<T, bitcoin_rs_index::IndexError>,
+    ) -> Result<T, ElectrumError> {
+        let (Some(runtime), Some(applied_tip)) = (&self.runtime, &self.applied_tip) else {
+            return query().map_err(ElectrumError::from);
+        };
+        let _gate = runtime.read_gate();
+        let start_tip = applied_tip
+            .load_full()
+            .ok_or(ElectrumError::TxIndexUnavailable)?;
+        let state = runtime.snapshot();
+        if state.health != bitcoin_rs_index::IndexWorkerHealth::Healthy
+            || !state.watermark.is_some_and(|watermark| {
+                watermark.height == start_tip.height && watermark.hash == start_tip.hash
+            })
+        {
+            return Err(ElectrumError::TxIndexUnavailable);
+        }
+        let result = query()?;
+        if applied_tip.load_full().as_deref() != Some(start_tip.as_ref()) {
+            return Err(ElectrumError::TxIndexUnavailable);
+        }
+        Ok(result)
     }
 }
 
@@ -143,15 +199,15 @@ where
     S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
     B: bitcoin_rs_index::BlockSource + Send + Sync + 'static,
 {
-    fn confirmed_history(&self, scripthash: ScriptHash) -> Vec<HistoryRecord> {
-        let Ok(entries) = self
-            .indexer
-            .resolve_script_history(scripthash, &self.block_source)
-        else {
-            return Vec::new();
-        };
-
-        entries
+    fn confirmed_history(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
+        let entries = self.complete_query(|| {
+            self.indexer
+                .resolve_script_history(scripthash, &self.block_source)
+        })?;
+        Ok(entries
             .into_iter()
             .map(|entry| {
                 let height = match entry.height {
@@ -171,56 +227,45 @@ where
                     spent: false,
                 }
             })
-            .collect()
+            .collect())
     }
-    fn transaction_hex(&self, txid: bitcoin::Txid) -> Option<String> {
-        let tx = self
-            .indexer
-            .resolve_transaction(txid, &self.block_source)
-            .ok()
-            .flatten()?;
-        Some(serialize(&tx).to_lower_hex_string())
+    fn transaction_hex(&self, txid: bitcoin::Txid) -> Result<Option<String>, ElectrumError> {
+        let tx =
+            self.complete_query(|| self.indexer.resolve_transaction(txid, &self.block_source))?;
+        Ok(tx.map(|tx| serialize(&tx).to_lower_hex_string()))
     }
 
     fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {
         self.block_source.block_at_height(height)
     }
 
-    fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Option<u64> {
-        self.indexer
-            .resolve_outpoint_value(*op, &self.block_source)
-            .ok()
-            .flatten()
+    fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Result<Option<u64>, ElectrumError> {
+        self.complete_query(|| self.indexer.resolve_outpoint_value(*op, &self.block_source))
     }
 
-    fn unspent_outputs(&self, scripthash: ScriptHash) -> Vec<HistoryRecord> {
-        let Ok(outputs) = self
-            .indexer
-            .resolve_unspent_outputs_with_height(scripthash, &self.block_source)
-        else {
-            return Vec::new();
-        };
-
-        let mut records = Vec::with_capacity(outputs.len());
-        for (txid, vout, value, height) in outputs {
-            let outpoint = bitcoin::OutPoint { txid, vout };
-            let spent = self
+    fn unspent_outputs(&self, scripthash: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+        self.complete_query(|| {
+            let outputs = self
                 .indexer
-                .iter_spending_rows(&outpoint)
-                .is_ok_and(|rows| !rows.is_empty());
-            if spent {
-                continue;
+                .resolve_unspent_outputs_with_height(scripthash, &self.block_source)?;
+            let mut records = Vec::with_capacity(outputs.len());
+            for (txid, vout, value, height) in outputs {
+                let outpoint = bitcoin::OutPoint { txid, vout };
+                let spent = !self.indexer.iter_spending_rows(&outpoint)?.is_empty();
+                if spent {
+                    continue;
+                }
+                let height_i64 = i64::from(height);
+                records.push(HistoryRecord {
+                    txid,
+                    height: height_i64,
+                    value,
+                    vout,
+                    spent: false,
+                });
             }
-            let height_i64 = i64::from(height);
-            records.push(HistoryRecord {
-                txid,
-                height: height_i64,
-                value,
-                vout,
-                spent: false,
-            });
-        }
-        records
+            Ok(records)
+        })
     }
 }
 
@@ -353,7 +398,15 @@ impl IndexHandle {
         headers[index] = header;
     }
 
+    #[cfg(test)]
     fn confirmed_history(&self, scripthash: ScriptHash) -> Vec<HistoryRecord> {
+        self.try_confirmed_history(scripthash).unwrap_or_default()
+    }
+
+    fn try_confirmed_history(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
         let reader = self.state.reader.read().clone();
         if let Some(reader) = reader {
             return reader.confirmed_history(scripthash);
@@ -367,16 +420,19 @@ impl IndexHandle {
             .cloned()
             .unwrap_or_default();
         records.sort_by_key(|record| (record.height, record.txid));
-        records
+        Ok(records)
     }
 
-    pub(crate) fn unspent_outputs(&self, scripthash: ScriptHash) -> Vec<HistoryRecord> {
+    fn try_unspent_outputs(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
         let reader = self.state.reader.read().clone();
         if let Some(reader) = reader {
             return reader.unspent_outputs(scripthash);
         }
 
-        Vec::new()
+        Ok(Vec::new())
     }
 
     /// Returns the lowercase-hex serialized confirmed transaction for `txid`.
@@ -385,16 +441,21 @@ impl IndexHandle {
     /// otherwise falls back to the synthetic in-memory transactions map.
     #[must_use]
     pub fn transaction_hex(&self, txid: &Txid) -> Option<String> {
+        self.try_transaction_hex(txid).ok().flatten()
+    }
+
+    fn try_transaction_hex(&self, txid: &Txid) -> Result<Option<String>, ElectrumError> {
         if let Some(reader) = self.state.reader.read().clone()
-            && let Some(hex) = reader.transaction_hex(*txid)
+            && let Some(hex) = reader.transaction_hex(*txid)?
         {
-            return Some(hex);
+            return Ok(Some(hex));
         }
-        self.state
+        Ok(self
+            .state
             .transactions
             .read()
             .get(txid)
-            .map(|bytes| bytes.as_slice().to_lower_hex_string())
+            .map(|bytes| bytes.as_slice().to_lower_hex_string()))
     }
 
     /// Returns the Bitcoin block at `height` via the attached `ConfirmedHistoryReader`'s
@@ -408,7 +469,14 @@ impl IndexHandle {
     /// or `None` if no reader is attached or the prevout is not indexed.
     #[must_use]
     pub fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Option<u64> {
-        self.state.reader.read().clone()?.outpoint_value(op)
+        self.try_outpoint_value(op).ok().flatten()
+    }
+
+    fn try_outpoint_value(&self, op: &bitcoin::OutPoint) -> Result<Option<u64>, ElectrumError> {
+        let Some(reader) = self.state.reader.read().clone() else {
+            return Ok(None);
+        };
+        reader.outpoint_value(op)
     }
 
     fn headers(&self) -> Vec<[u8; 80]> {
@@ -677,7 +745,7 @@ pub(crate) fn scripthash_get_history(
 ) -> Result<Value, ElectrumError> {
     let scripthash = parse_scripthash_param(params)?;
     let mut rows = Vec::new();
-    for record in combined_history(index, mempool, scripthash) {
+    for record in combined_history(index, mempool, scripthash)? {
         rows.push(json!({"tx_hash": record.txid.to_string(), "height": record.height}));
     }
     Ok(json!(rows))
@@ -691,10 +759,10 @@ pub(crate) fn scripthash_get_balance(
     let scripthash = parse_scripthash_param(params)?;
     let spends = mempool.mempool_spends();
     let mut confirmed = 0_u64;
-    let reader_records = index.unspent_outputs(scripthash);
+    let reader_records = index.try_unspent_outputs(scripthash)?;
     if reader_records.is_empty() {
         // Fallback: synthetic confirmed_history path.
-        for record in index.confirmed_history(scripthash) {
+        for record in index.try_confirmed_history(scripthash)? {
             let spent_by_mempool = spends.contains(&OutPoint {
                 txid: record.txid,
                 vout: record.vout,
@@ -727,7 +795,7 @@ pub(crate) fn scripthash_subscribe(
     params: &Value,
 ) -> Result<Value, ElectrumError> {
     let scripthash = parse_scripthash_param(params)?;
-    Ok(status_json(index, mempool, scripthash))
+    status_json(index, mempool, scripthash)
 }
 pub(crate) fn scripthash_unsubscribe(
     _index: &IndexHandle,
@@ -750,9 +818,9 @@ pub(crate) fn scripthash_listunspent(
     let spends = mempool.mempool_spends();
     let mut rows = Vec::new();
     // Prefer reader-backed (real index) data when set.
-    let reader_records = index.unspent_outputs(scripthash);
+    let reader_records = index.try_unspent_outputs(scripthash)?;
     let confirmed_iter: Box<dyn Iterator<Item = HistoryRecord>> = if reader_records.is_empty() {
-        Box::new(index.confirmed_history(scripthash).into_iter())
+        Box::new(index.try_confirmed_history(scripthash)?.into_iter())
     } else {
         Box::new(reader_records.into_iter())
     };
@@ -790,9 +858,9 @@ pub(crate) fn transaction_get(
 ) -> Result<Value, ElectrumError> {
     let params = params_array(params)?;
     let txid = parse_txid(params.first(), "blockchain.transaction.get txid")?;
-    let hex = index
-        .transaction_hex(&txid)
-        .or_else(|| mempool.get_transaction_hex(&txid))
+    let hex = mempool
+        .get_transaction_hex(&txid)
+        .or(index.try_transaction_hex(&txid)?)
         .ok_or(ElectrumError::InvalidParams("transaction not found"))?;
     if params
         .get(1)
@@ -1084,11 +1152,15 @@ pub(crate) fn headers_subscribe(
 }
 
 /// Computes the current Electrum status value for `scripthash`.
-pub fn status_json(index: &IndexHandle, mempool: &MempoolHandle, scripthash: ScriptHash) -> Value {
-    match status_string(index, mempool, scripthash) {
+pub fn status_json(
+    index: &IndexHandle,
+    mempool: &MempoolHandle,
+    scripthash: ScriptHash,
+) -> Result<Value, ElectrumError> {
+    Ok(match try_status_string(index, mempool, scripthash)? {
         Some(status) => json!(status.as_str()),
         None => Value::new_null(),
-    }
+    })
 }
 
 /// Computes the current Electrum status hash string for `scripthash`.
@@ -1096,12 +1168,20 @@ pub fn status_string(
     index: &IndexHandle,
     mempool: &MempoolHandle,
     scripthash: ScriptHash,
-) -> Option<CompactString> {
-    let entries = combined_history(index, mempool, scripthash)
+) -> Result<Option<CompactString>, ElectrumError> {
+    try_status_string(index, mempool, scripthash)
+}
+
+fn try_status_string(
+    index: &IndexHandle,
+    mempool: &MempoolHandle,
+    scripthash: ScriptHash,
+) -> Result<Option<CompactString>, ElectrumError> {
+    let entries = combined_history(index, mempool, scripthash)?
         .into_iter()
         .filter_map(|record| history_entry(record).ok())
         .collect::<Vec<_>>();
-    compute_status_hash(&entries).map(|hash| hash.to_compact_string())
+    Ok(compute_status_hash(&entries).map(|hash| hash.to_compact_string()))
 }
 
 fn history_entry(record: HistoryRecord) -> Result<HistoryEntry, ElectrumError> {
@@ -1122,11 +1202,11 @@ fn combined_history(
     index: &IndexHandle,
     mempool: &MempoolHandle,
     scripthash: ScriptHash,
-) -> Vec<HistoryRecord> {
-    let mut records = index.confirmed_history(scripthash);
+) -> Result<Vec<HistoryRecord>, ElectrumError> {
+    let mut records = index.try_confirmed_history(scripthash)?;
     records.extend(mempool.mempool_history(scripthash));
     records.sort_by_key(|record| (record.height, record.txid));
-    records
+    Ok(records)
 }
 
 /// Parses the first parameter as an Electrum scripthash.
@@ -1282,19 +1362,19 @@ mod history_reader_tests {
     struct StubReader;
 
     impl ConfirmedHistoryReader for StubReader {
-        fn confirmed_history(&self, _: ScriptHash) -> Vec<HistoryRecord> {
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
             use bitcoin::hashes::Hash as _;
 
             let mut hash = [0_u8; 32];
             hash[0] = 0xff;
             let txid = bitcoin::Txid::from_byte_array(hash);
-            vec![HistoryRecord {
+            Ok(vec![HistoryRecord {
                 txid,
                 height: 7,
                 value: 0,
                 vout: 0,
                 spent: false,
-            }]
+            }])
         }
     }
 
@@ -1302,23 +1382,23 @@ mod history_reader_tests {
     struct StubReaderUnspent;
 
     impl ConfirmedHistoryReader for StubReaderUnspent {
-        fn confirmed_history(&self, _: ScriptHash) -> Vec<HistoryRecord> {
-            Vec::new()
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(Vec::new())
         }
 
-        fn unspent_outputs(&self, _: ScriptHash) -> Vec<HistoryRecord> {
+        fn unspent_outputs(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
             use bitcoin::hashes::Hash as _;
 
             let mut hash = [0_u8; 32];
             hash[0] = 0xfe;
             let txid = bitcoin::Txid::from_byte_array(hash);
-            vec![HistoryRecord {
+            Ok(vec![HistoryRecord {
                 txid,
                 height: 0,
                 value: 100_000,
                 vout: 0,
                 spent: false,
-            }]
+            }])
         }
     }
 
@@ -1326,12 +1406,12 @@ mod history_reader_tests {
     struct StubReaderTxHex;
 
     impl ConfirmedHistoryReader for StubReaderTxHex {
-        fn confirmed_history(&self, _: ScriptHash) -> Vec<HistoryRecord> {
-            Vec::new()
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(Vec::new())
         }
 
-        fn transaction_hex(&self, _: bitcoin::Txid) -> Option<String> {
-            Some("deadbeef".to_owned())
+        fn transaction_hex(&self, _: bitcoin::Txid) -> Result<Option<String>, ElectrumError> {
+            Ok(Some("deadbeef".to_owned()))
         }
     }
 
@@ -1413,8 +1493,8 @@ mod id_from_pos_tests {
     struct StubReader;
 
     impl ConfirmedHistoryReader for StubReader {
-        fn confirmed_history(&self, _: ScriptHash) -> Vec<HistoryRecord> {
-            Vec::new()
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(Vec::new())
         }
 
         fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {
@@ -1474,8 +1554,8 @@ mod merkle_proof_tests {
     struct StubReaderRegtestGenesis;
 
     impl ConfirmedHistoryReader for StubReaderRegtestGenesis {
-        fn confirmed_history(&self, _: ScriptHash) -> Vec<HistoryRecord> {
-            Vec::new()
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(Vec::new())
         }
 
         fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {

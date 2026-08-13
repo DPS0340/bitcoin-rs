@@ -59,11 +59,10 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
             return super::tx_render::tx_to_value(tx);
         }
     }
-    if let Some(indexer) = &ctx.indexer {
-        let tx = indexer
-            .lock()
-            .resolve_transaction(txid, ctx.as_ref())
-            .map_err(|error| RpcError::Internal(format!("txindex lookup failed: {error}")))?;
+    if ctx.indexer.is_some() {
+        let tx = ctx
+            .complete_tx_index_query(|indexer| indexer.resolve_transaction(txid, ctx.as_ref()))
+            .map_err(|error| RpcError::Internal(error.to_string()))?;
         if let Some(tx) = tx {
             if !verbose {
                 return Ok(json!(serialize(&tx).to_lower_hex_string()));

@@ -49,6 +49,8 @@ pub mod signal;
 pub mod state;
 /// Block download orchestrator.
 pub mod sync;
+/// Asynchronous `TxIndex` bootstrap and authoritative-chain reconciliation.
+pub mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
 /// Prevout lookups across a window of consecutive blocks.

@@ -1,5 +1,7 @@
 use std::ops::ControlFlow;
 
+use bitcoin::hashes::Hash as _;
+use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::{ColumnFamily, KvStore, StorageError, WriteBatch as _};
 use bitcoin_slices::{Visit as _, Visitor, bsl};
 use thiserror::Error;
@@ -28,6 +30,102 @@ pub enum IndexError {
         /// Actual header length observed by the visitor.
         len: usize,
     },
+    /// A worker-only atomic transition was requested from an indexer that does not implement it.
+    #[error("this indexer does not support atomic watermark transitions")]
+    UnsupportedWatermarkTransition,
+    /// The durable watermark bytes do not use the supported codec.
+    #[error("invalid TxIndex watermark encoding")]
+    InvalidWatermark,
+    /// A transition did not begin at the durable watermark it expected.
+    #[error("TxIndex watermark mismatch: expected {expected:?}, found {actual:?}")]
+    WatermarkMismatch {
+        /// Watermark the caller reconciled from.
+        expected: Option<IndexWatermark>,
+        /// Watermark found in the store.
+        actual: Option<IndexWatermark>,
+    },
+    /// A block body did not match the height/hash selected by reconciliation.
+    #[error("block body identity mismatch at height {height}: expected {expected}, found {actual}")]
+    BlockIdentityMismatch {
+        /// Expected height.
+        height: u32,
+        /// Expected block hash.
+        expected: Hash256,
+        /// Decoded block hash.
+        actual: Hash256,
+    },
+    /// The decoded block's Merkle root does not match its transactions.
+    #[error("block body has an invalid Merkle root at height {height} ({hash})")]
+    InvalidMerkleRoot {
+        /// Block height.
+        height: u32,
+        /// Block hash.
+        hash: Hash256,
+    },
+    /// A forward transition does not extend the durable watermark.
+    #[error("block at height {height} does not extend TxIndex watermark {watermark:?}")]
+    NonContiguousConnect {
+        /// Candidate height.
+        height: u32,
+        /// Existing durable watermark.
+        watermark: Option<IndexWatermark>,
+    },
+    /// The watermark names a block whose identity row is absent.
+    #[error("TxIndex watermark block identity row is missing at height {height} ({hash})")]
+    MissingWatermarkIdentity {
+        /// Watermark height.
+        height: u32,
+        /// Watermark hash.
+        hash: Hash256,
+    },
+}
+
+const WATERMARK_KEY: &[u8] = b"txindex/watermark";
+const WATERMARK_VERSION: u8 = 1;
+const WATERMARK_LEN: usize = 1 + 4 + 32;
+
+/// Exact durable point represented by all committed `TxIndex` rows.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct IndexWatermark {
+    /// Applied-chain height represented by the index.
+    pub height: u32,
+    /// Full block identity at `height`.
+    pub hash: Hash256,
+}
+
+/// One exact forward transition included in an atomic `TxIndex` batch.
+#[derive(Copy, Clone)]
+pub struct IndexConnect<'a> {
+    /// Decoded and identity-checked block body.
+    pub block: &'a bitcoin::Block,
+    /// Height of `block` on the captured target ancestry.
+    pub height: u32,
+    /// Full expected header hash from that ancestry.
+    pub hash: Hash256,
+}
+
+impl IndexWatermark {
+    fn encode(self) -> [u8; WATERMARK_LEN] {
+        let mut bytes = [0_u8; WATERMARK_LEN];
+        bytes[0] = WATERMARK_VERSION;
+        bytes[1..5].copy_from_slice(&self.height.to_be_bytes());
+        bytes[5..].copy_from_slice(self.hash.as_byte_array());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, IndexError> {
+        if bytes.len() != WATERMARK_LEN || bytes.first() != Some(&WATERMARK_VERSION) {
+            return Err(IndexError::InvalidWatermark);
+        }
+        let mut height = [0_u8; 4];
+        height.copy_from_slice(&bytes[1..5]);
+        let mut hash = [0_u8; 32];
+        hash.copy_from_slice(&bytes[5..]);
+        Ok(Self {
+            height: u32::from_be_bytes(height),
+            hash: Hash256::from_le_bytes(&hash),
+        })
+    }
 }
 
 /// Counts of rows written by a confirmed block ingest.
@@ -70,6 +168,150 @@ impl<S: KvStore> Indexer<S> {
     /// Returns the row counts from the last successful ingest.
     pub const fn last_counts(&self) -> IndexRowCounts {
         self.last_counts
+    }
+
+    /// Loads the exact durable `TxIndex` watermark, or `None` for an empty v2 index.
+    pub fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+        self.store
+            .get(ColumnFamily::UtxoMeta, WATERMARK_KEY)?
+            .map(|bytes| IndexWatermark::decode(&bytes))
+            .transpose()
+    }
+
+    /// Atomically connects one exact block and advances the durable watermark.
+    pub fn connect_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        expected_hash: Hash256,
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.connect_blocks_atomic(&[IndexConnect {
+            block,
+            height,
+            hash: expected_hash,
+        }])
+    }
+
+    /// Atomically connects a non-empty contiguous block slice and advances the
+    /// watermark to its terminal block.
+    pub fn connect_blocks_atomic(
+        &mut self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        let Some(first) = blocks.first() else {
+            return Ok(IndexRowCounts::default());
+        };
+        let current = self.watermark()?;
+        let mut expected_height = match current {
+            None => 0,
+            Some(watermark) => watermark.height.saturating_add(1),
+        };
+        let mut expected_parent = current.map(|watermark| watermark.hash);
+        let mut rows = PendingRows::default();
+        for transition in blocks {
+            validate_block_identity(transition.block, transition.height, transition.hash)?;
+            let contiguous = transition.height == expected_height
+                && match expected_parent {
+                    None => transition.height == 0,
+                    Some(parent) => {
+                        Hash256::from_le_bytes(
+                            transition.block.header.prev_blockhash.as_byte_array(),
+                        ) == parent
+                    }
+                };
+            if !contiguous {
+                return Err(IndexError::NonContiguousConnect {
+                    height: transition.height,
+                    watermark: current,
+                });
+            }
+            let txids: Vec<_> = transition
+                .block
+                .txdata
+                .iter()
+                .map(bitcoin::Transaction::compute_txid)
+                .collect();
+            rows.append(pending_rows_for_decoded_block(
+                transition.block,
+                transition.height,
+                &txids,
+            )?);
+            expected_height = expected_height.saturating_add(1);
+            expected_parent = Some(transition.hash);
+        }
+        let terminal = blocks.last().unwrap_or(first);
+        rows.sort();
+        let counts = rows.counts();
+        let watermark = IndexWatermark {
+            height: terminal.height,
+            hash: terminal.hash,
+        };
+        let mut batch = self.store.new_batch();
+        put_rows(&mut batch, &rows);
+        batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &watermark.encode());
+        self.store.write(batch)?;
+        self.last_counts = counts;
+        Ok(counts)
+    }
+
+    /// Atomically removes the durable watermark block and retreats to its parent.
+    ///
+    /// Unlike the legacy idempotent rollback, absence of the watermark block's
+    /// header identity is an inconsistency and leaves both rows and watermark unchanged.
+    pub fn rollback_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        validate_block_identity(block, watermark.height, watermark.hash)?;
+        let actual = self.watermark()?;
+        if actual != Some(watermark) {
+            return Err(IndexError::WatermarkMismatch {
+                expected: Some(watermark),
+                actual,
+            });
+        }
+        if watermark.height == 0 {
+            return Err(IndexError::NonContiguousConnect {
+                height: 0,
+                watermark: Some(watermark),
+            });
+        }
+
+        let txids: Vec<_> = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect();
+        let mut rows = pending_rows_for_decoded_block(block, watermark.height, &txids)?;
+        rows.sort();
+        let counts = rows.counts();
+        let identity_present = match rows.header_rows.first() {
+            Some(header) => self
+                .store
+                .get(ColumnFamily::BlockHeaders, header)?
+                .is_some(),
+            None => false,
+        };
+        if !identity_present {
+            return Err(IndexError::MissingWatermarkIdentity {
+                height: watermark.height,
+                hash: watermark.hash,
+            });
+        }
+
+        let parent = IndexWatermark {
+            height: watermark.height - 1,
+            hash: Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()),
+        };
+        let mut batch = self.store.new_batch();
+        delete_rows(&mut batch, &rows);
+        batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &parent.encode());
+        self.store.write(batch)?;
+        self.last_counts = counts;
+        Ok(counts)
     }
 
     /// Iterates every persisted block header in the `BlockHeaders` column family.
@@ -657,6 +899,58 @@ impl<S: KvStore> Indexer<S> {
     }
 }
 
+fn validate_block_identity(
+    block: &bitcoin::Block,
+    height: u32,
+    expected_hash: Hash256,
+) -> Result<(), IndexError> {
+    let actual = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    if actual != expected_hash {
+        return Err(IndexError::BlockIdentityMismatch {
+            height,
+            expected: expected_hash,
+            actual,
+        });
+    }
+    if !block.check_merkle_root() {
+        return Err(IndexError::InvalidMerkleRoot {
+            height,
+            hash: actual,
+        });
+    }
+    Ok(())
+}
+
+fn put_rows<B: bitcoin_rs_storage::WriteBatch>(batch: &mut B, rows: &PendingRows) {
+    for row in &rows.txid_rows {
+        batch.put(ColumnFamily::TxConfirmed, row.as_bytes(), &[]);
+    }
+    for row in &rows.funding_rows {
+        batch.put(ColumnFamily::Funding, row.as_bytes(), &[]);
+    }
+    for row in &rows.spending_rows {
+        batch.put(ColumnFamily::Spending, row.as_bytes(), &[]);
+    }
+    for row in &rows.header_rows {
+        batch.put(ColumnFamily::BlockHeaders, row, &[]);
+    }
+}
+
+fn delete_rows<B: bitcoin_rs_storage::WriteBatch>(batch: &mut B, rows: &PendingRows) {
+    for row in &rows.txid_rows {
+        batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
+    }
+    for row in &rows.funding_rows {
+        batch.delete(ColumnFamily::Funding, row.as_bytes());
+    }
+    for row in &rows.spending_rows {
+        batch.delete(ColumnFamily::Spending, row.as_bytes());
+    }
+    for row in &rows.header_rows {
+        batch.delete(ColumnFamily::BlockHeaders, row);
+    }
+}
+
 fn pending_rows_for_block(
     block: &[u8],
     height: u32,
@@ -879,11 +1173,189 @@ fn collect_prefix_rows(
     Ok(rows)
 }
 
+#[cfg(all(test, feature = "fjall"))]
+mod watermark_tests {
+    use std::sync::Arc;
+
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore, WriteBatch as _};
+
+    use super::{IndexConnect, IndexError, IndexWatermark, Indexer};
+
+    fn child_of(parent: &bitcoin::Block) -> bitcoin::Block {
+        let mut child = parent.clone();
+        child.header.prev_blockhash = parent.block_hash();
+        child.header.time = child.header.time.saturating_add(1);
+        child.header.nonce = child.header.nonce.wrapping_add(1);
+        child
+    }
+
+    #[test]
+    fn atomic_connect_publishes_rows_and_exact_watermark() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(Arc::clone(&store));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+
+        indexer.connect_block_atomic(&genesis, 0, hash)?;
+
+        assert_eq!(
+            indexer.watermark()?,
+            Some(IndexWatermark { height: 0, hash })
+        );
+        assert!(
+            store
+                .get(ColumnFamily::BlockHeaders, &serialize(&genesis.header))?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_multi_block_connect_publishes_only_terminal_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let child = child_of(&genesis);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let child_hash = Hash256::from_le_bytes(child.block_hash().as_byte_array());
+
+        indexer.connect_blocks_atomic(&[
+            IndexConnect {
+                block: &genesis,
+                height: 0,
+                hash: genesis_hash,
+            },
+            IndexConnect {
+                block: &child,
+                height: 1,
+                hash: child_hash,
+            },
+        ])?;
+
+        assert_eq!(
+            indexer.watermark()?,
+            Some(IndexWatermark {
+                height: 1,
+                hash: child_hash,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_rollback_refuses_missing_identity_without_moving_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(Arc::clone(&store));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        indexer.connect_block_atomic(&genesis, 0, genesis_hash)?;
+        let child = child_of(&genesis);
+        let child_hash = Hash256::from_le_bytes(child.block_hash().as_byte_array());
+        let watermark = IndexWatermark {
+            height: 1,
+            hash: child_hash,
+        };
+        indexer.connect_block_atomic(&child, 1, child_hash)?;
+
+        let mut batch = store.new_batch();
+        batch.delete(ColumnFamily::BlockHeaders, &serialize(&child.header));
+        store.write(batch)?;
+
+        let error = indexer
+            .rollback_block_atomic(&child, watermark)
+            .expect_err("missing identity must refuse strict rollback");
+        assert!(matches!(error, IndexError::MissingWatermarkIdentity { .. }));
+        assert_eq!(indexer.watermark()?, Some(watermark));
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_connect_rejects_wrong_hash_without_creating_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let wrong_hash = Hash256::from_le_bytes(&[0x55; 32]);
+
+        let error = indexer
+            .connect_block_atomic(&genesis, 0, wrong_hash)
+            .expect_err("wrong block identity must fail");
+
+        assert!(matches!(error, IndexError::BlockIdentityMismatch { .. }));
+        assert_eq!(indexer.watermark()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_connect_rejects_invalid_merkle_without_creating_watermark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let mut genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        genesis.txdata[0].output[0].value = bitcoin::Amount::from_sat(1);
+        let header_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+
+        let error = indexer
+            .connect_block_atomic(&genesis, 0, header_hash)
+            .expect_err("invalid Merkle identity must fail");
+
+        assert!(matches!(error, IndexError::InvalidMerkleRoot { .. }));
+        assert_eq!(indexer.watermark()?, None);
+        Ok(())
+    }
+}
+
 /// Storage-agnostic block-ingest interface.
 ///
 /// Use this trait when consumers must hold the indexer behind a trait
 /// object (e.g. when the storage backend is selected at runtime).
 pub trait IndexerLike: Send + Sync {
+    /// Loads the exact durable watermark owned by an asynchronous index worker.
+    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Atomically connects one exact block and advances the durable watermark.
+    fn connect_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        expected_hash: Hash256,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = (block, height, expected_hash);
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Atomically connects a contiguous slice and publishes only its terminal watermark.
+    fn connect_blocks_atomic(
+        &mut self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = blocks;
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Atomically rolls back the exact watermark block and retreats to its parent.
+    fn rollback_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = (block, watermark);
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
     /// Walks `block` once and writes index rows. See `Indexer::ingest_block`.
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError>;
 
@@ -1012,6 +1484,34 @@ pub trait BlockSource {
 }
 
 impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
+    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+        Self::watermark(self)
+    }
+
+    fn connect_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        height: u32,
+        expected_hash: Hash256,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::connect_block_atomic(self, block, height, expected_hash)
+    }
+
+    fn connect_blocks_atomic(
+        &mut self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::connect_blocks_atomic(self, blocks)
+    }
+
+    fn rollback_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block_atomic(self, block, watermark)
+    }
+
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_block(self, block, height)
     }

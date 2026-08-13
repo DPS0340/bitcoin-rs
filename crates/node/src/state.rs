@@ -182,8 +182,8 @@ pub enum ApplyError {
     /// The supplied block body does not match its own header.
     ///
     /// The header hash commits to the merkle root, not to the transactions the
-    /// caller handed over. A body swapped under a matching header would roll
-    /// the index back over the wrong rows.
+    /// caller handed over. A body swapped under a matching header would restore
+    /// authoritative state from the wrong transactions.
     #[error("block {hash} body does not match its header merkle root")]
     DisconnectBodyMismatch {
         /// Block whose body was rejected.
@@ -203,9 +203,6 @@ pub enum ApplyError {
     /// disconnected.
     #[error("coinstats rewind: {0}")]
     CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
-    /// Rolling the transaction index back failed.
-    #[error("index rollback: {0}")]
-    IndexRollback(#[source] bitcoin_rs_index::IndexError),
 }
 
 /// The outcome of a refused or failed block disconnect.
@@ -696,6 +693,8 @@ impl TxIndexStorage {
         blocks: Arc<RwLock<Vec<bitcoin_rs_rpc::BlockRecord>>>,
         block_body_source: Arc<dyn BlockBodySource>,
         block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
+        runtime: Arc<bitcoin_rs_index::TxIndexRuntime>,
+        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     ) -> Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> {
         let block_source = crate::NodeBlockSource::new(blocks)
             .with_block_body_source(block_body_source)
@@ -704,34 +703,34 @@ impl TxIndexStorage {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
-                    indexer,
-                    block_source,
-                ))
+                Arc::new(
+                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
+                        .with_completeness(runtime, applied_tip),
+                )
             }
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
-                    indexer,
-                    block_source,
-                ))
+                Arc::new(
+                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
+                        .with_completeness(runtime, applied_tip),
+                )
             }
             #[cfg(feature = "redb")]
             Self::Redb(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
-                    indexer,
-                    block_source,
-                ))
+                Arc::new(
+                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
+                        .with_completeness(runtime, applied_tip),
+                )
             }
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
-                    indexer,
-                    block_source,
-                ))
+                Arc::new(
+                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
+                        .with_completeness(runtime, applied_tip),
+                )
             }
         }
     }
@@ -770,7 +769,14 @@ fn open_tx_index(config: &Config) -> Result<Option<(TxIndexHandle, TxIndexStorag
         return Ok(None);
     }
 
-    let txindex_dir = config.data_dir.join("txindex");
+    let legacy_txindex_dir = config.data_dir.join("txindex");
+    if legacy_txindex_dir.exists() {
+        tracing::warn!(
+            path = %legacy_txindex_dir.display(),
+            "legacy cursorless TxIndex left untouched; bootstrapping txindex-v2"
+        );
+    }
+    let txindex_dir = config.data_dir.join("txindex-v2");
     std::fs::create_dir_all(&txindex_dir)
         .with_context(|| format!("create txindex_dir {}", txindex_dir.display()))?;
     match config.storage_backend.as_str() {
@@ -876,6 +882,9 @@ pub struct NodeState {
     coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
     tx_index: Option<TxIndexHandle>,
     tx_index_storage: Option<Arc<TxIndexStorage>>,
+    tx_index_runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
+    tx_index_wake_rx: Mutex<Option<Receiver<()>>>,
+    tx_index_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     filter_index: FilterIndexHandle,
     prune_service: Option<Arc<dyn PruneService>>,
     zmq_publisher: Arc<dyn crate::ZmqPublisher>,
@@ -970,22 +979,19 @@ impl NodeState {
             // node has no reindex. An instruction the operator cannot follow is
             // worse than none.
             //
-            // Remove all durable views. A torn disconnect can roll the
-            // transaction index back while the UTXO checkpoint and tip still
-            // name the block. Keeping an older checkpoint can restore that
-            // stale chainstate beside the rolled-back index. The marker lives
-            // in the chainstate store, so removing it clears the marker too.
+            // Remove authoritative and directly coupled durable views. TxIndex
+            // is excluded: its independent watermark reconciles after the
+            // authoritative chain is rebuilt.
             bail!(
                 "refusing to start: a disconnect of block {hash} at height {height} never \
-                 completed, so the UTXO set, the transaction index, and the chain tip may \
+                 completed, so the UTXO set and the chain tip may \
                  disagree. The node cannot repair this in place, because it cannot tell \
                  which of those commits landed before the disconnect stopped. Remove \
-                 or quarantine {chainstate}, {checkpoints}, {txindex}, and {filters}, then resync.",
+                 or quarantine {chainstate}, {checkpoints}, and {filters}, then resync.",
                 hash = marker.hash,
                 height = marker.height,
                 chainstate = config.data_dir.join("chainstate").display(),
                 checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
-                txindex = config.data_dir.join("txindex").display(),
                 filters = config.data_dir.join("filters").display(),
             );
         }
@@ -1094,14 +1100,23 @@ impl NodeState {
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let tx_index_runtime = tx_index
+            .as_ref()
+            .map(|_| Arc::new(bitcoin_rs_index::TxIndexRuntime::new()));
+        let (tx_index_wake, tx_index_wake_rx) = if tx_index.is_some() {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
+            tx_index_wake,
             block_tree: Arc::clone(&block_tree),
             utxo: Arc::clone(&utxo),
             coin_stats: Arc::clone(&coin_stats),
-            tx_index: tx_index.as_ref().map(Arc::clone),
             filter_index: Arc::clone(&filter_index),
             mempool: Arc::clone(&mempool),
             blocks: Arc::clone(&blocks),
@@ -1164,6 +1179,9 @@ impl NodeState {
             coin_stats,
             tx_index,
             tx_index_storage,
+            tx_index_runtime,
+            tx_index_wake_rx: Mutex::new(tx_index_wake_rx),
+            tx_index_worker: Mutex::new(None),
             filter_index,
             prune_service,
             zmq_publisher,
@@ -1278,11 +1296,58 @@ impl NodeState {
         self.tx_index.as_ref().map(Arc::clone)
     }
 
+    /// Returns process-local `TxIndex` health, watermark, and query gate state.
+    #[must_use]
+    pub fn tx_index_runtime(&self) -> Option<Arc<bitcoin_rs_index::TxIndexRuntime>> {
+        self.tx_index_runtime.as_ref().map(Arc::clone)
+    }
+
+    /// Starts the asynchronous `TxIndex` worker once, after startup recovery completes.
+    pub(crate) fn start_tx_index_worker(&self) -> anyhow::Result<()> {
+        let (Some(indexer), Some(runtime)) = (&self.tx_index, &self.tx_index_runtime) else {
+            return Ok(());
+        };
+        if self.tx_index_worker.lock().is_some() {
+            return Ok(());
+        }
+        let wake_rx = self
+            .tx_index_wake_rx
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("TxIndex worker receiver is unavailable"))?;
+        let worker = crate::txindex_worker::TxIndexWorker::new(
+            Arc::clone(indexer),
+            Arc::clone(runtime),
+            Arc::clone(&self.applied_tip),
+            Arc::clone(&self.block_tree),
+            Arc::clone(&self.block_body_store),
+            wake_rx,
+            Arc::clone(&self.apply_handles.shutdown),
+        );
+        let handle = std::thread::Builder::new()
+            .name("bitcoin-rs-txindex".into())
+            .spawn(move || worker.run())?;
+        *self.tx_index_worker.lock() = Some(handle);
+        Ok(())
+    }
+
+    /// Joins the `TxIndex` worker after the process-wide shutdown flag is set.
+    pub(crate) fn join_tx_index_worker(&self) {
+        let Some(handle) = self.tx_index_worker.lock().take() else {
+            return;
+        };
+        if handle.join().is_ok() {
+            tracing::info!("TxIndex worker exited");
+        } else {
+            tracing::error!("TxIndex worker panicked");
+        }
+    }
+
     /// Builds an Electrum `IndexHandle` backed by the live txindex store.
     ///
-    /// The handle observes the same `KvStore` the writer side ingests into via
-    /// `apply_block`, so `blockchain.block.headers` returns real data once IBD
-    /// is underway.
+    /// The handle observes the same `KvStore` owned by the asynchronous worker,
+    /// so `blockchain.block.headers` returns real data once reconciliation is
+    /// underway.
     #[must_use]
     pub fn electrum_index_handle(&self) -> Option<bitcoin_rs_electrum::IndexHandle> {
         self.tx_index_storage
@@ -1297,12 +1362,15 @@ impl NodeState {
     pub fn electrum_history_reader(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
-        self.tx_index_storage.as_ref().map(|storage| {
-            storage.electrum_history_reader(
+        self.tx_index_storage.as_ref().and_then(|storage| {
+            let runtime = self.tx_index_runtime.as_ref()?;
+            Some(storage.electrum_history_reader(
                 self.blocks(),
                 self.block_body_source(),
                 self.block_tree(),
-            )
+                Arc::clone(runtime),
+                self.applied_tip(),
+            ))
         })
     }
 
@@ -1598,7 +1666,7 @@ mod tests {
 
         assert!(state.tx_index().is_none(), "txindex disabled by default");
         assert!(
-            !state.data_dir().join("txindex").exists(),
+            !state.data_dir().join("txindex-v2").exists(),
             "disabled txindex must not create storage"
         );
         Ok(())
@@ -1617,7 +1685,7 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&a, &b), "tx_index handle stable across calls");
         assert!(
-            state.data_dir().join("txindex").exists(),
+            state.data_dir().join("txindex-v2").exists(),
             "enabled txindex must create storage"
         );
         Ok(())
@@ -1880,21 +1948,25 @@ mod tests {
     }
 
     #[test]
-    fn apply_handles_follow_txindex_availability() -> anyhow::Result<()> {
+    fn txindex_runtime_and_wakeup_follow_configuration() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("without-txindex");
         config.p2p_listen.clear();
         config.txindex = false;
         let state = NodeState::open(config)?;
-        assert!(state.apply_handles().tx_index.is_none());
+        assert!(state.tx_index().is_none());
+        assert!(state.tx_index_runtime().is_none());
+        assert!(state.apply_handles().tx_index_wake.is_none());
 
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("with-txindex");
         config.p2p_listen.clear();
         config.txindex = true;
         let state = NodeState::open(config)?;
-        assert!(state.apply_handles().tx_index.is_some());
+        assert!(state.tx_index().is_some());
+        assert!(state.tx_index_runtime().is_some());
+        assert!(state.apply_handles().tx_index_wake.is_some());
         Ok(())
     }
 
@@ -2609,7 +2681,7 @@ mod tests {
             Err(error) => error,
         };
         let message = error.to_string();
-        for store in ["chainstate", "chainstate-checkpoints", "txindex", "filters"] {
+        for store in ["chainstate", "chainstate-checkpoints", "filters"] {
             let path = data_dir.join(store);
             assert!(
                 message.contains(&path.display().to_string()),

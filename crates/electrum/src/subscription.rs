@@ -25,10 +25,10 @@ impl SessionSubscriptions {
         index: &IndexHandle,
         mempool: &MempoolHandle,
         scripthash: ScriptHash,
-    ) -> Value {
-        let status = status_string(index, mempool, scripthash);
+    ) -> Result<Value, ElectrumError> {
+        let status = status_string(index, mempool, scripthash)?;
         self.scripthashes.insert(scripthash, status.clone());
-        status_value(status)
+        Ok(status_value(status))
     }
 
     /// Removes the subscription for `scripthash`. Returns `true` if the
@@ -52,7 +52,7 @@ impl SessionSubscriptions {
     ) -> Result<Vec<Value>, ElectrumError> {
         let mut notifications = Vec::new();
         for (scripthash, old_status) in &mut self.scripthashes {
-            let new_status = status_string(index, mempool, *scripthash);
+            let new_status = status_string(index, mempool, *scripthash)?;
             if *old_status != new_status {
                 old_status.clone_from(&new_status);
                 notifications.push(json!({
@@ -92,20 +92,21 @@ mod unsubscribe_tests {
     use bitcoin_rs_index::ScriptHash;
 
     use super::SessionSubscriptions;
-    use crate::methods::{IndexHandle, MempoolHandle};
+    use crate::methods::{ElectrumError, IndexHandle, MempoolHandle};
 
     #[test]
-    fn unsubscribe_scripthash_removes_existing_subscription() {
+    fn unsubscribe_scripthash_removes_existing_subscription() -> Result<(), ElectrumError> {
         let mut subs = SessionSubscriptions::new();
         let index = IndexHandle::new();
         let mempool = MempoolHandle::default();
         let sh = ScriptHash::from_byte_array([0xab_u8; 32]);
 
-        let _status = subs.subscribe_scripthash(&index, &mempool, sh);
+        let _status = subs.subscribe_scripthash(&index, &mempool, sh)?;
 
         assert!(subs.unsubscribe_scripthash(sh));
         assert!(!subs.unsubscribe_scripthash(sh));
         assert_eq!(subs.len(), 0);
+        Ok(())
     }
 
     #[test]

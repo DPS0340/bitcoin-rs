@@ -1,10 +1,30 @@
 # Issue #77: asynchronous TxIndex reconciliation
 
-Status: FINAL DESIGN (implementation not started), 2026-08-13.
+Status: IMPLEMENTED (correctness implementation and tests; dedicated IBD
+performance capture remains to be recorded), 2026-08-13.
 
 Scope: `crates/node`, `crates/index`, and the TxIndex-dependent RPC/Electrum
 read paths. This plan changes only TxIndex; it does not redesign `BlockSync`,
 UTXO application, checkpoints, pruning, or the filter index.
+
+Implementation record:
+
+* `crates/index` stores a versioned `(height, hash)` watermark and commits
+  bounded contiguous forward-row batches or one strict rollback together with
+  the terminal watermark.
+* `crates/node` owns the capacity-one wake, startup reconciliation, captured-tip
+  ancestry walk, retained-body loading, worker health, and clean join.
+* Authoritative connect/disconnect and `BlockSync` contain no TxIndex row
+  mutation or batching.
+* RPC and Electrum complete reads use the shared read/write gate and reject lag,
+  failure, or an applied-tip race as unavailable.
+* The old cursorless `txindex` directory is preserved; new state bootstraps in
+  `txindex-v2`.
+* The sync-pipeline benchmark no longer has a synchronous TxIndex mode and now
+  includes paired `sync_pipeline_apply_only_proxy{,_txindex_detached}` cases
+  that exclude store-open setup from apply-path timing.
+  A dedicated long IBD/replay capture of worker catch-up remains an operational
+  measurement task, not an unresolved correctness dependency.
 
 ## 1. Outcome
 
@@ -37,9 +57,10 @@ BlockSync / apply / reorg
               rows + durable watermark
 ```
 
-## 2. Current seam to replace
+## 2. Replaced seam
 
-Today `ApplyHandles::tx_index` couples TxIndex to authoritative mutation:
+Before this implementation, `ApplyHandles::tx_index` coupled TxIndex to
+authoritative mutation:
 
 * `apply_block` writes TxIndex rows synchronously after body persistence.
 * `disconnect_block` rolls TxIndex rows back before UTXO undo and the

@@ -14,7 +14,6 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
     BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
@@ -570,7 +569,6 @@ fn apply_handles_with_coin_stats_and_utxo(
         block_tree,
         Arc::clone(&utxo),
         Arc::clone(&coin_stats),
-        Some(noop_tx_index()),
         noop_filter_index(),
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
         Arc::new(RwLock::new(Vec::new())),
@@ -578,27 +576,6 @@ fn apply_handles_with_coin_stats_and_utxo(
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),
     );
     (handles, coin_stats, utxo)
-}
-
-struct NoopIndexer;
-
-impl IndexerLike for NoopIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
-    }
-
-    fn resolve_outpoint_value(
-        &self,
-        _outpoint: bitcoin::OutPoint,
-        _source: &dyn BlockSource,
-    ) -> Result<Option<u64>, IndexError> {
-        Ok(None)
-    }
-}
-
-fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-    let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-    Arc::new(Mutex::new(indexer))
 }
 
 struct NoopFilterIndex;

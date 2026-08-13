@@ -13,8 +13,20 @@ use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
+use thiserror::Error;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
+
+/// Failure of a query that requires a complete asynchronous `TxIndex` view.
+#[derive(Debug, Error)]
+pub enum TxIndexQueryError {
+    /// The worker is absent, lagging, failed, or raced an applied-tip transition.
+    #[error("TxIndex is unavailable or catching up")]
+    Unavailable,
+    /// The underlying index read failed.
+    #[error("TxIndex lookup failed: {0}")]
+    Index(#[source] bitcoin_rs_index::IndexError),
+}
 
 /// Block data made available to RPC handlers without forcing storage I/O.
 #[derive(Clone, Debug)]
@@ -300,6 +312,8 @@ pub struct Context {
     /// Optional shared confirmed-block indexer used to resolve prevout values for fee statistics.
     /// `None` for embedded/test callers without txindex.
     pub indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
+    /// Process-local completeness and query/mutation gate for asynchronous `TxIndex`.
+    pub tx_index_runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
@@ -375,6 +389,7 @@ impl Context {
             coin_stats,
             filter_index: noop_filter_index(),
             indexer: None,
+            tx_index_runtime: None,
             prune_service: None,
             chain_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
@@ -431,6 +446,7 @@ impl Context {
             coin_stats,
             filter_index,
             indexer,
+            tx_index_runtime: None,
             network,
             chain_network,
             peers,
@@ -454,6 +470,53 @@ impl Context {
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
         self
+    }
+
+    /// Attaches asynchronous `TxIndex` health, watermark, and query-gate state.
+    #[must_use]
+    pub fn with_tx_index_runtime(
+        mut self,
+        runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
+    ) -> Self {
+        self.tx_index_runtime = runtime;
+        self
+    }
+
+    /// Runs a complete `TxIndex` lookup without allowing lag or concurrent mutation
+    /// to become an authoritative negative result.
+    pub fn complete_tx_index_query<T>(
+        &self,
+        query: impl FnOnce(
+            &dyn bitcoin_rs_index::IndexerLike,
+        ) -> Result<T, bitcoin_rs_index::IndexError>,
+    ) -> Result<T, TxIndexQueryError> {
+        let indexer = self
+            .indexer
+            .as_ref()
+            .ok_or(TxIndexQueryError::Unavailable)?;
+        let Some(runtime) = &self.tx_index_runtime else {
+            // Embedded/test callers predate the asynchronous worker. Production
+            // wiring always supplies a runtime when TxIndex is enabled.
+            return query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index);
+        };
+        let _gate = runtime.read_gate();
+        let start_tip = self
+            .applied_tip
+            .load_full()
+            .ok_or(TxIndexQueryError::Unavailable)?;
+        let state = runtime.snapshot();
+        if state.health != bitcoin_rs_index::IndexWorkerHealth::Healthy
+            || !state.watermark.is_some_and(|watermark| {
+                watermark.height == start_tip.height && watermark.hash == start_tip.hash
+            })
+        {
+            return Err(TxIndexQueryError::Unavailable);
+        }
+        let result = query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index)?;
+        if self.applied_tip.load_full().as_deref() != Some(start_tip.as_ref()) {
+            return Err(TxIndexQueryError::Unavailable);
+        }
+        Ok(result)
     }
 
     /// Attaches the node-owned pruning mutator used by `pruneblockchain`.
@@ -795,6 +858,124 @@ fn bitcoin_network(network: Network) -> bitcoin::Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct EmptyIndexer;
+
+    impl bitcoin_rs_index::IndexerLike for EmptyIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<bitcoin_rs_index::IndexRowCounts, bitcoin_rs_index::IndexError> {
+            Ok(bitcoin_rs_index::IndexRowCounts::default())
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn bitcoin_rs_index::BlockSource,
+        ) -> Result<Option<u64>, bitcoin_rs_index::IndexError> {
+            Ok(None)
+        }
+    }
+
+    fn txindex_query_context(
+        tip: TipSnapshot,
+        watermark: bitcoin_rs_index::IndexWatermark,
+    ) -> Context {
+        let mut ctx = Context::new();
+        ctx.indexer = Some(Arc::new(Mutex::new(Box::new(EmptyIndexer))));
+        ctx.set_applied_tip(tip);
+        let runtime = Arc::new(bitcoin_rs_index::TxIndexRuntime::new());
+        runtime.publish_healthy(Some(watermark));
+        ctx.with_tx_index_runtime(Some(runtime))
+    }
+
+    #[test]
+    fn complete_txindex_query_allows_exact_healthy_watermark() {
+        let hash = Hash256::from_le_bytes(&[7; 32]);
+        let tip = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(1),
+            height: 12,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash,
+        };
+        let ctx = txindex_query_context(tip, bitcoin_rs_index::IndexWatermark { height: 12, hash });
+
+        let answer = ctx.complete_tx_index_query(|_| Ok(42));
+
+        assert_eq!(answer.expect("complete query"), 42);
+    }
+
+    #[test]
+    fn complete_txindex_query_rejects_lag_instead_of_returning_negative() {
+        let tip_hash = Hash256::from_le_bytes(&[8; 32]);
+        let watermark_hash = Hash256::from_le_bytes(&[9; 32]);
+        let tip = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(1),
+            height: 12,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash: tip_hash,
+        };
+        let ctx = txindex_query_context(
+            tip,
+            bitcoin_rs_index::IndexWatermark {
+                height: 11,
+                hash: watermark_hash,
+            },
+        );
+
+        let answer = ctx.complete_tx_index_query(|_| Ok(Option::<u64>::None));
+
+        assert!(matches!(answer, Err(TxIndexQueryError::Unavailable)));
+    }
+
+    #[test]
+    fn complete_txindex_query_discards_result_when_applied_tip_moves() {
+        let hash = Hash256::from_le_bytes(&[10; 32]);
+        let tip = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(1),
+            height: 12,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash,
+        };
+        let ctx = txindex_query_context(tip, bitcoin_rs_index::IndexWatermark { height: 12, hash });
+        let replacement = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(2),
+            height: 13,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash: Hash256::from_le_bytes(&[11; 32]),
+        };
+
+        let answer = ctx.complete_tx_index_query(|_| {
+            ctx.set_applied_tip(replacement);
+            Ok(Option::<u64>::None)
+        });
+
+        assert!(matches!(answer, Err(TxIndexQueryError::Unavailable)));
+    }
+
+    #[test]
+    fn complete_txindex_query_rejects_failed_worker() {
+        let hash = Hash256::from_le_bytes(&[12; 32]);
+        let tip = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(1),
+            height: 12,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash,
+        };
+        let mut ctx =
+            txindex_query_context(tip, bitcoin_rs_index::IndexWatermark { height: 12, hash });
+        let runtime = Arc::new(bitcoin_rs_index::TxIndexRuntime::new());
+        runtime.publish_healthy(Some(bitcoin_rs_index::IndexWatermark { height: 12, hash }));
+        runtime.publish_failed("injected failure");
+        ctx = ctx.with_tx_index_runtime(Some(runtime));
+
+        let answer = ctx.complete_tx_index_query(|_| Ok(Option::<u64>::None));
+
+        assert!(matches!(answer, Err(TxIndexQueryError::Unavailable)));
+    }
 
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]

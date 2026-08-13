@@ -21,7 +21,7 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
+use bitcoin_rs_index::BlockSource;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
     BlockSync, Config, Network, NoOpZmqPublisher,
@@ -38,9 +38,6 @@ use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use tempfile::TempDir;
-
-type TxIndexHandle = Arc<Mutex<Box<dyn IndexerLike>>>;
-type TxIndexFixture = (Option<TxIndexHandle>, Option<TempDir>);
 
 const PROXY_BLOCKS: u32 = 32;
 const SYNC_PROXY_BLOCKS: u32 = 128;
@@ -82,6 +79,13 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+    });
+
+    c.bench_function("sync_pipeline_apply_only_proxy", |b| {
+        b.iter_custom(|iterations| measure_apply_only(iterations, &blocks, false));
+    });
+    c.bench_function("sync_pipeline_apply_only_proxy_txindex_detached", |b| {
+        b.iter_custom(|iterations| measure_apply_only(iterations, &blocks, true));
     });
 
     #[cfg(feature = "rocksdb")]
@@ -163,17 +167,7 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
         "deterministic_initial_sync_proxy_deep_headers_pure_128_blocks",
         |b| {
             b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_indexed_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Noop).prebuild_run(),
+                || SyncFixture::new().prebuild_run(),
                 |fixture| black_box(fixture.run()),
                 BatchSize::SmallInput,
             );
@@ -183,7 +177,7 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
         "deterministic_initial_sync_proxy_deep_headers_received_scan_128_blocks",
         |b| {
             b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_unsolicited(),
+                || SyncFixture::new().prebuild_unsolicited(),
                 |fixture| black_box(fixture.request_after_unsolicited_received()),
                 BatchSize::SmallInput,
             );
@@ -193,7 +187,7 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
         "deterministic_initial_sync_proxy_deep_headers_reverse_scan_overflow_128_blocks",
         |b| {
             b.iter_batched(
-                || SyncFixture::new_reverse_scan_overflow(TxIndexMode::Disabled),
+                SyncFixture::new_reverse_scan_overflow,
                 |fixture| black_box(fixture.run_reverse_scan_overflow()),
                 BatchSize::SmallInput,
             );
@@ -203,7 +197,7 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
         "deterministic_initial_sync_proxy_in_order_inbound_128_blocks",
         |b| {
             b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_in_order(),
+                || SyncFixture::new().prebuild_in_order(),
                 |fixture| black_box(fixture.run_in_order_inbound()),
                 BatchSize::SmallInput,
             );
@@ -212,7 +206,7 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
     bench_production_state_sync(c);
     c.bench_function("deterministic_initial_sync_proxy_many_peers_512", |b| {
         b.iter_batched(
-            || SyncFixture::new_with_peers(TxIndexMode::Disabled, SYNC_PROXY_PEERS),
+            || SyncFixture::new_with_peers(SYNC_PROXY_PEERS),
             |fixture| black_box(fixture.run_many_peer_tick()),
             BatchSize::SmallInput,
         );
@@ -222,25 +216,10 @@ fn deterministic_initial_sync_proxy(c: &mut Criterion) {
         |b| {
             b.iter_batched(
                 || {
-                    SyncFixture::new_with_block_count(
-                        TxIndexMode::Disabled,
-                        1,
-                        SYNC_OVERSIZED_BURST_BLOCKS,
-                    )
-                    .prebuild_oversized_burst()
+                    SyncFixture::new_with_block_count(1, SYNC_OVERSIZED_BURST_BLOCKS)
+                        .prebuild_oversized_burst()
                 },
                 |fixture| black_box(fixture.run_oversized_inbound_burst()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "rocksdb")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_txindex_rocksdb_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::RocksDb).prebuild_run(),
-                |fixture| black_box(fixture.run()),
                 BatchSize::SmallInput,
             );
         },
@@ -416,6 +395,37 @@ fn open_regtest_state() -> (TempDir, NodeState) {
     (dir, state)
 }
 
+fn open_txindexed_regtest_state() -> (TempDir, NodeState) {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let mut config = Config::default_for_network(Network::Regtest);
+    config.data_dir = dir.path().join("node");
+    config.p2p_listen.clear();
+    config.txindex = true;
+    let state = NodeState::open(config)
+        .unwrap_or_else(|error| panic!("open txindexed node state failed: {error}"));
+    (dir, state)
+}
+
+fn measure_apply_only(iterations: u64, blocks: &[Block], txindex: bool) -> std::time::Duration {
+    let mut measured = std::time::Duration::ZERO;
+    for _ in 0..iterations {
+        let (_dir, state) = if txindex {
+            open_txindexed_regtest_state()
+        } else {
+            open_regtest_state()
+        };
+        let started = Instant::now();
+        for block in blocks {
+            state
+                .apply_block(black_box(block))
+                .unwrap_or_else(|error| panic!("apply-only proxy failed: {error}"));
+        }
+        measured = measured.saturating_add(started.elapsed());
+        black_box(state.applied_tip().load_full());
+    }
+    measured
+}
+
 fn open_regtest_filter_state() -> (TempDir, NodeState) {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
     let mut config = Config::default_for_network(Network::Regtest);
@@ -455,31 +465,18 @@ struct SyncFixture {
     /// path so the timed region measures only the channel handoff plus `tick`.
     prebuilt_inbound: Vec<bitcoin_rs_p2p::InboundBlock>,
     received_scan_expected: Vec<BlockHash>,
-    _tx_index_dir: Option<TempDir>,
-}
-
-#[derive(Clone, Copy)]
-enum TxIndexMode {
-    Disabled,
-    Noop,
-    #[cfg(feature = "rocksdb")]
-    RocksDb,
 }
 
 impl SyncFixture {
-    fn new(tx_index_mode: TxIndexMode) -> Self {
-        Self::new_with_peers(tx_index_mode, 1)
+    fn new() -> Self {
+        Self::new_with_peers(1)
     }
 
-    fn new_with_peers(tx_index_mode: TxIndexMode, peer_count: usize) -> Self {
-        Self::new_with_block_count(tx_index_mode, peer_count, SYNC_PROXY_BLOCKS)
+    fn new_with_peers(peer_count: usize) -> Self {
+        Self::new_with_block_count(peer_count, SYNC_PROXY_BLOCKS)
     }
 
-    fn new_with_block_count(
-        tx_index_mode: TxIndexMode,
-        peer_count: usize,
-        block_count: u32,
-    ) -> Self {
+    fn new_with_block_count(peer_count: usize, block_count: u32) -> Self {
         let mut tree = BlockTree::new();
         let (blocks, received_scan_expected) = populate_sync_header_chain(&mut tree, block_count);
 
@@ -494,12 +491,10 @@ impl SyncFixture {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-        let (tx_index, tx_index_dir) = tx_index_for_mode(tx_index_mode);
         let handles = apply_handles(
             Arc::clone(&chain_tip),
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
-            tx_index,
         );
         let sync = BlockSync::new(
             handles,
@@ -521,7 +516,6 @@ impl SyncFixture {
             blocks,
             prebuilt_inbound: Vec::new(),
             received_scan_expected,
-            _tx_index_dir: tx_index_dir,
         }
     }
 
@@ -568,9 +562,8 @@ impl SyncFixture {
         self
     }
 
-    fn new_reverse_scan_overflow(tx_index_mode: TxIndexMode) -> Self {
-        let mut fixture =
-            Self::new_with_block_count(tx_index_mode, 0, SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS);
+    fn new_reverse_scan_overflow() -> Self {
+        let mut fixture = Self::new_with_block_count(0, SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS);
         // The bench stages 128 received blocks and still needs to request the
         // full 128-block pending window, so the received-block budget must
         // cover both the staged blocks and the new requests.
@@ -1065,7 +1058,6 @@ fn apply_handles(
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     block_tree: Arc<RwLock<BlockTree>>,
-    tx_index: Option<Arc<Mutex<Box<dyn IndexerLike>>>>,
 ) -> ApplyHandles {
     let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
     let mut utxo = UtxoSet::new();
@@ -1078,53 +1070,12 @@ fn apply_handles(
         block_tree,
         utxo,
         coin_stats,
-        tx_index,
         noop_filter_index(),
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
         Arc::new(RwLock::new(Vec::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
         Arc::new(NoOpZmqPublisher),
     )
-}
-
-fn tx_index_for_mode(mode: TxIndexMode) -> TxIndexFixture {
-    match mode {
-        TxIndexMode::Disabled => (None, None),
-        TxIndexMode::Noop => (Some(noop_tx_index()), None),
-        #[cfg(feature = "rocksdb")]
-        TxIndexMode::RocksDb => {
-            let dir = tempfile::tempdir()
-                .unwrap_or_else(|error| panic!("txindex tempdir failed: {error}"));
-            let store = Arc::new(
-                bitcoin_rs_storage::RocksDbStore::open(dir.path())
-                    .unwrap_or_else(|error| panic!("txindex rocksdb open failed: {error}")),
-            );
-            let indexer: Box<dyn IndexerLike> =
-                Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            (Some(Arc::new(Mutex::new(indexer))), Some(dir))
-        }
-    }
-}
-
-struct NoopIndexer;
-
-impl IndexerLike for NoopIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
-    }
-
-    fn resolve_outpoint_value(
-        &self,
-        _outpoint: bitcoin::OutPoint,
-        _source: &dyn BlockSource,
-    ) -> Result<Option<u64>, IndexError> {
-        Ok(None)
-    }
-}
-
-fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-    let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-    Arc::new(Mutex::new(indexer))
 }
 
 struct NoopFilterIndex;

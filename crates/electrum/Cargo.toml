@@ -20,6 +20,7 @@ mdbx = ["bitcoin-rs-storage/mdbx"]
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
+bitcoin-rs-chain.workspace = true
 bitcoin-rs-index.workspace = true
 bitcoin-rs-storage.workspace = true
 bitcoin-rs-mempool.workspace = true

@@ -813,9 +813,6 @@ impl BlockSync {
             return (0, 0);
         };
         let started = Instant::now();
-        if let Some(tx_index) = &self.handles.tx_index {
-            tx_index.lock().begin_batch();
-        }
         let (drained, expected_len) = self
             .drain_cached_expected_blocks(staged_count)
             .unwrap_or_else(|| {
@@ -912,12 +909,6 @@ impl BlockSync {
             self.advance_expected_apply_cache(&applied_hashes, failed_hash.is_some());
             metrics::histogram!("node.sync.apply_buffered_blocks_seconds")
                 .record(started.elapsed().as_secs_f64());
-        }
-        #[allow(clippy::significant_drop_in_scrutinee)]
-        if let Some(tx_index) = &self.handles.tx_index {
-            if let Err(error) = tx_index.lock().end_batch() {
-                tracing::warn!(%error, "block sync: tx_index batch flush failed");
-            }
         }
         (applied, failed)
     }
@@ -1681,7 +1672,6 @@ mod tests {
     };
     use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
     use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-    use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
     use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource};
     use bitcoin_rs_primitives::Hash256;
@@ -7377,46 +7367,12 @@ mod tests {
             Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
                 bitcoin_rs_coinstats::CoinStats::default(),
             )),
-            Some(noop_tx_index()),
             noop_filter_index(),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
-    }
-
-    struct NoopIndexer;
-
-    impl IndexerLike for NoopIndexer {
-        fn ingest_block(
-            &mut self,
-            _block: &[u8],
-            _height: u32,
-        ) -> Result<IndexRowCounts, IndexError> {
-            Ok(IndexRowCounts::default())
-        }
-
-        fn rollback_block(
-            &mut self,
-            _block: &bitcoin::Block,
-            _height: u32,
-        ) -> Result<IndexRowCounts, IndexError> {
-            Ok(IndexRowCounts::default())
-        }
-
-        fn resolve_outpoint_value(
-            &self,
-            _outpoint: bitcoin::OutPoint,
-            _source: &dyn BlockSource,
-        ) -> Result<Option<u64>, IndexError> {
-            Ok(None)
-        }
-    }
-
-    fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-        let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-        Arc::new(Mutex::new(indexer))
     }
 
     struct NoopFilterIndex;
