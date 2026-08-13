@@ -219,6 +219,132 @@ impl HeaderRow {
     }
 }
 
+/// Serialized byte length of one [`TxPosition`].
+pub const TX_POSITION_SIZE: usize = 8;
+
+/// Byte position of one transaction within its block's serialized body.
+///
+/// Both fields are little-endian byte arrays rather than `u32` so the type has
+/// alignment 1 and can be read in place from an arbitrary row-value slice.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+)]
+#[repr(C)]
+pub struct TxPosition {
+    /// Byte offset of the transaction from the start of the serialized block.
+    offset: [u8; 4],
+    /// Consensus-serialized byte length of the transaction.
+    len: [u8; 4],
+}
+
+/// Ordered numerically, so sorting a position list puts it in block order.
+///
+/// Deriving `Ord` would compare the little-endian byte arrays lexicographically,
+/// least-significant byte first — offset 256 would sort before offset 1. The
+/// stored order is what a reader emits entries in, and it has to match the order
+/// a full block scan produces, so this cannot be left to the derive.
+impl Ord for TxPosition {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.offset()
+            .cmp(&other.offset())
+            .then_with(|| self.byte_len().cmp(&other.byte_len()))
+    }
+}
+
+impl PartialOrd for TxPosition {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl TxPosition {
+    /// Creates a position from a native-endian offset and length.
+    #[must_use]
+    pub const fn new(offset: u32, byte_len: u32) -> Self {
+        Self {
+            offset: offset.to_le_bytes(),
+            len: byte_len.to_le_bytes(),
+        }
+    }
+
+    /// Returns the native-endian byte offset within the serialized block.
+    #[must_use]
+    pub const fn offset(self) -> u32 {
+        u32::from_le_bytes(self.offset)
+    }
+
+    /// Returns the native-endian serialized transaction length.
+    #[must_use]
+    pub const fn byte_len(self) -> u32 {
+        u32::from_le_bytes(self.len)
+    }
+
+    /// Returns the exclusive end offset, or `None` on overflow.
+    #[must_use]
+    pub const fn end(self) -> Option<u32> {
+        self.offset().checked_add(self.byte_len())
+    }
+}
+
+/// Codec for the row value carrying a row's transaction byte positions.
+///
+/// Layout: a packed `TxPosition[n]`, `n >= 1`. A row exists only because at
+/// least one transaction produced it, so an **empty** value never means "this
+/// block has no matching transactions" — it means the row predates this format.
+/// Readers must treat empty and malformed values identically: no usable
+/// positions, scan the block.
+///
+/// # Staleness
+///
+/// Funding and txid keys are an 8-byte prefix plus a height and carry no block
+/// identity, so a replacement block at the same height derives the same keys
+/// (see the *Identity-bearing key* concept). A row left behind by a superseded
+/// block therefore points into a different block's body.
+///
+/// The value carries no block tag to detect that. Instead **the reader must
+/// fall back to a full block scan the moment any single position fails to
+/// resolve to a transaction matching what it is looking for.** Stale offsets
+/// land at arbitrary points in a different block's bytes and essentially never
+/// decode to a matching transaction, so they trigger the fallback. The same
+/// fallback fires on an 8-byte prefix collision between two distinct
+/// scripthashes, which is correct and costs a scan once per 2^64 pairs.
+///
+/// This is the one invariant that keeps a partial result from being reported as
+/// a complete one. A reader that skips a failed position and keeps the rest
+/// silently under-reports history.
+pub struct TxPositionValue;
+
+impl TxPositionValue {
+    /// Encodes positions into a row value.
+    #[must_use]
+    pub fn encode(positions: &[TxPosition]) -> Vec<u8> {
+        positions.as_bytes().to_vec()
+    }
+
+    /// Decodes a row value into its positions.
+    ///
+    /// Returns `None` for an empty value (a row predating this format) and for a
+    /// malformed one, which mean the same thing to a reader.
+    #[must_use]
+    pub fn decode(value: &[u8]) -> Option<&[TxPosition]> {
+        if value.is_empty() {
+            return None;
+        }
+        <[TxPosition]>::ref_from_bytes(value).ok()
+    }
+}
+
 fn txid_prefix(txid_bytes: &[u8]) -> HashPrefix {
     let mut prefix = [0_u8; HASH_PREFIX_LEN];
     prefix.copy_from_slice(&txid_bytes[..HASH_PREFIX_LEN]);
