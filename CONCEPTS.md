@@ -171,6 +171,60 @@ yet guarantee the enforcer's required contiguous transaction event sequence.
 Raw mempool insertion is not reconsideration because it cannot reconstruct fee,
 policy, conflict, and ancestry metadata.
 
+### Backfillable derived state
+
+State that is a deterministic projection of the authoritative applied chain and
+can own its progress outside block application. The planned #77 proof is
+TxIndex: core retains the applied tip, anchored ancestry, and exact block
+bodies; a TxIndex worker owns its rows and `(height, hash)` watermark. This is a
+boundary and recovery contract, not a generic consumer trait. Filter indexes,
+Utreexo, and other consumers must separately prove how they move backward and
+what source data they require before adopting it. See
+`docs/plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md`.
+
+### TxIndex watermark
+
+The planned #77 durable statement of exactly which applied-chain block the
+TxIndex rows represent: `(height, block_hash)`. Row additions or deletions and
+the terminal watermark commit in one TxIndex DB batch. A row count is not a
+watermark. TxIndex may durably lead the core checkpoint restored after a crash,
+but only because it can identity-check the watermark block body, delete that
+block's rows, and atomically retreat to its parent. This consumer-ahead rule is
+TxIndex-specific. A watermark above the reconciliation target retreats before
+any same-height ancestry comparison. If the watermark's expected header
+identity row is absent, the index is inconsistent: rollback must leave both
+rows and watermark unchanged and fail the worker rather than treating the
+block as already removed.
+
+### Reconciliation attempt target
+
+One captured `applied_tip` used to anchor ancestry reads during a planned
+TxIndex reconciliation pass. It prevents a worker from mixing heights from
+different live tips, but it does not pin or retain the branch. If its forward
+ancestry disappears and core has published a different tip, the worker abandons
+the attempt and captures a fresh target. If the same published target cannot be
+resolved, or the durable watermark body needed for rollback is missing, that is
+a source failure rather than an ordinary retry.
+
+### TxIndex completeness gate
+
+The planned #77 read boundary that prevents asynchronous index lag from being
+reported as an authoritative negative. A complete TxIndex query requires a
+healthy worker and a committed watermark equal to the captured applied tip,
+excludes worker mutation for the logical query, and verifies before returning
+that the applied tip did not move. Lag, failure, or concurrent chain movement
+returns unavailable (or a bounded retry), not "not found." Rich Electrum
+readiness and partial-history policy are separate concerns.
+
+### Coalesced index wake
+
+The planned #77 capacity-one, payload-free notification sent after a successful
+runtime `applied_tip` publication. It means only "reconcile again"; it carries
+no ordering or recovery truth. Duplicate wakes may coalesce because startup
+always reconciles and a worker compares its watermark with a fresh applied tip
+before sleeping. It is not a chain event, WAL record, event cursor, or sequence
+stream.
+
 ### Sequence stream
 
 The Core-compatible `pubsequence` ZMQ stream is a unified block-event stream.

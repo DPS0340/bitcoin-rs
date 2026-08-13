@@ -67,6 +67,28 @@ Transaction reconsideration requires one production admission pipeline shared
 by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
 the required fee, policy, conflict, and ancestry metadata.
 
+## Planned TxIndex successor boundary (#77)
+
+This document describes the currently implemented synchronous TxIndex
+participation in connect and disconnect. Issue #77 deliberately replaces only
+that derived-state portion; it does not replace `switch_to_branch`, UTXO undo,
+the disconnect marker, or the authoritative `applied_tip` commit point.
+
+The frozen design is
+[`docs/plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md`](../../plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md).
+TxIndex will own an atomic `(height, hash)` watermark and reconcile its rows
+from exact retained block bodies in a separate worker. After that design lands,
+core disconnect will no longer roll TxIndex back and the disconnect marker will
+no longer cover TxIndex mutation. TxIndex may durably lead the core checkpoint
+restored after a crash and will rewind itself; this rule is TxIndex-specific and
+must not be generalized to UTXO state, coinstats, or future consumers whose
+backward transition cannot be reconstructed from retained bodies.
+
+Until #77 is implemented, the disconnect ordering and marker coverage below
+remain the production truth. Update this document's status, disconnect order,
+and completed-work table in the implementation change rather than treating the
+plan as current behavior.
+
 ## Why it matters
 
 A Bitcoin full node that cannot disconnect a block cannot follow the most-work
