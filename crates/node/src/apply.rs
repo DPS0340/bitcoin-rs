@@ -461,6 +461,20 @@ pub(crate) trait PruneBodyStore: Send + Sync {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError>;
 
+    /// Loads `len` body bytes starting `offset` bytes into the serialized block.
+    ///
+    /// Defaults to `Ok(None)`, meaning "this store cannot slice"; callers fall
+    /// back to [`Self::load_block_body`]. Never a short read.
+    fn load_block_body_range(
+        &self,
+        _height: u32,
+        _hash: bitcoin_rs_primitives::Hash256,
+        _offset: u32,
+        _len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+
     fn block_body_metadata(
         &self,
         height: u32,
@@ -559,6 +573,24 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
             return Ok(None);
         };
         self.files.load(position, height, *hash.as_byte_array())
+    }
+
+    fn load_block_body_range(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        offset: u32,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+            return Ok(None);
+        };
+        let Some(position) = BlockFilePosition::decode(&encoded) else {
+            return Ok(None);
+        };
+        self.files
+            .load_range(position, height, *hash.as_byte_array(), offset, len)
     }
 
     fn block_body_metadata(
