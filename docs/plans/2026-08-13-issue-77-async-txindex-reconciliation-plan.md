@@ -130,7 +130,9 @@ or a new generic column family for it. Store the watermark-based schema
 directly at `data_dir/txindex`. This format has not been released, so there is
 no legacy migration, detection, parallel versioned directory, or progress
 inference. A newly created store starts empty and follows the normal bootstrap
-path. General rebuild and pruning policy remain outside #77.
+path. General rebuild and pruning policy remain outside #77. As a temporary
+safety boundary, configuration rejects TxIndex with a nonzero prune target
+until pruning can retain every body required after the TxIndex watermark.
 
 ### 4.2 Exact source access
 
@@ -164,7 +166,9 @@ while the worker scans. The captured target is not a retention promise:
 
 * If forward ancestry or a forward body becomes unavailable and a fresh
   `applied_tip` differs from the captured target, abandon the attempt and retry
-  against the fresh target.
+  against the fresh target after a short bounded exponential backoff. Repeated
+  stale targets remain retries rather than source failures; the backoff prevents
+  a moving tip from turning unavailable bodies into a hot spin.
 * If the same authoritative target remains published but its ancestry or body
   cannot be resolved, report a source/invariant failure and stop the worker.
 
@@ -314,21 +318,30 @@ For every query whose negative result assumes complete confirmed history:
 2. Capture the applied tip.
 3. Require a healthy worker and a committed watermark equal to that tip.
 4. Execute the complete logical query while holding the read gate.
-5. Re-read the applied tip before returning.
-6. If it changed, discard the result and return `TxIndex unavailable/catching
+5. Re-read the applied tip before returning and require the same publication
+   identity, not merely an equal `(height, hash)` value. Every publication uses
+   a fresh `Arc`, making pointer identity a unique process-local publication
+   token while the query retains its starting `Arc`.
+6. If the identity changed, discard the result and return `TxIndex unavailable/catching
    up` (or perform a small bounded retry); do not return a negative result.
 
 The worker takes the write side of this gate only while publishing a TxIndex DB
-transition and its cached watermark. Body loading and row construction should
-remain outside it. This closes query/index mutation races without blocking
-core apply. It also closes an `A -> B -> A` tip ABA during a query because the
-worker cannot mutate the index while the read gate is held.
+transition and its cached watermark. Body loading, identity validation, row
+construction, sorting, and deduplication remain outside it through prepared
+connect/rollback transitions; commit rechecks the starting watermark under the
+gate before writing. This closes query/index mutation races without blocking
+core apply. Publication-identity validation closes an `A -> B -> A` tip ABA;
+the read gate independently prevents the worker from mutating TxIndex during
+the query.
 
 Apply the gate to RPC transaction/prevout reads and Electrum confirmed history,
 transaction, and unspent reads. Change read interfaces that currently collapse
 storage/unavailable errors into empty vectors or `None`; unavailable must be
 distinguishable from an authoritative empty result. `getindexinfo` should use
 the TxIndex watermark and worker health rather than core header/applied heights.
+Electrum history and unspent scans are bounded while holding the gate, lossy
+spending-prefix candidates are exact-resolved against block inputs, and a
+broadcast resolves all prevouts inside one completeness boundary.
 
 Electrum-specific waiting policy, partial-history service, protocol messaging,
 and service startup policy remain outside #77.
@@ -463,7 +476,7 @@ Issue #77 does not implement:
 
 ## 8. Completion criteria
 
-#77 is complete when:
+Issue #77 is complete when:
 
 1. no TxIndex row mutation or flush remains on authoritative block connect,
    disconnect, or `BlockSync` batching paths;

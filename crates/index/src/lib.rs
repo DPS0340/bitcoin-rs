@@ -14,6 +14,7 @@ pub mod types;
 
 pub use index::{
     BlockSource, IndexConnect, IndexError, IndexRowCounts, IndexWatermark, Indexer, IndexerLike,
+    PreparedIndexConnect, PreparedIndexRollback,
 };
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use runtime::{IndexRuntimeSnapshot, IndexWorkerHealth, TxIndexRuntime};

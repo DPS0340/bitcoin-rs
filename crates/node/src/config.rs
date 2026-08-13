@@ -394,6 +394,9 @@ impl Config {
         if self.electrum_bind.is_some() && !self.txindex {
             bail!("electrum_bind requires txindex");
         }
+        if self.txindex && self.prune_target_mb > 0 {
+            bail!("txindex currently requires pruning to be disabled");
+        }
         match (&self.g2_muhash_samples, self.g2_muhash_tip_height) {
             (Some(_), Some(0)) => bail!("g2_muhash_tip_height must be greater than zero"),
             (Some(_), None) => bail!("g2_muhash_samples requires g2_muhash_tip_height"),

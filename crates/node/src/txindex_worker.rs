@@ -18,6 +18,7 @@ use crate::apply::PruneBodyStore;
 type TxIndexHandle = Arc<Mutex<Box<dyn IndexerLike>>>;
 const FORWARD_BATCH_MAX_ROWS: usize = 250_000;
 const FORWARD_BATCH_MAX_ROW_BYTES: usize = 8 * 1024 * 1024;
+const STALE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(64);
 
 /// All shared inputs owned by the dedicated `TxIndex` worker thread.
 pub(crate) struct TxIndexWorker {
@@ -81,6 +82,7 @@ impl TxIndexWorker {
     }
 
     fn reconcile(&self) -> Result<()> {
+        let mut stale_retries = 0_u32;
         loop {
             if self.shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -89,7 +91,11 @@ impl TxIndexWorker {
                 return Ok(());
             };
             match self.reconcile_attempt(&target) {
-                Ok(()) | Err(AttemptError::Retry) => {}
+                Ok(()) => stale_retries = 0,
+                Err(AttemptError::Retry) => {
+                    std::thread::sleep(stale_retry_backoff(stale_retries));
+                    stale_retries = stale_retries.saturating_add(1);
+                }
                 Err(AttemptError::Fatal(error)) => return Err(error),
             }
             let watermark = self.indexer.lock().watermark()?;
@@ -134,11 +140,16 @@ impl TxIndexWorker {
                         current.hash
                     ))
                 })?;
+            let prepared = self
+                .indexer
+                .lock()
+                .prepare_rollback_block(&block, current)
+                .map_err(fatal)?;
             {
                 let _gate = self.runtime.write_gate();
                 self.indexer
                     .lock()
-                    .rollback_block_atomic(&block, current)
+                    .commit_prepared_rollback(&prepared)
                     .map_err(fatal)?;
                 watermark = self.indexer.lock().watermark().map_err(fatal)?;
                 self.runtime.publish_healthy(watermark);
@@ -186,9 +197,14 @@ impl TxIndexWorker {
                 hash: *hash,
             })
             .collect::<Vec<_>>();
+        let prepared = self
+            .indexer
+            .lock()
+            .prepare_connect_blocks(&transitions)?
+            .ok_or_else(|| anyhow!("non-empty TxIndex batch produced no prepared transition"))?;
         let _gate = self.runtime.write_gate();
         let mut indexer = self.indexer.lock();
-        indexer.connect_blocks_atomic(&transitions)?;
+        indexer.commit_prepared_connect(&prepared)?;
         let watermark = indexer.watermark()?;
         drop(indexer);
         self.runtime.publish_healthy(watermark);
@@ -228,6 +244,10 @@ impl TxIndexWorker {
 
 fn fatal(error: impl Into<anyhow::Error>) -> AttemptError {
     AttemptError::Fatal(error.into())
+}
+
+fn stale_retry_backoff(consecutive_retries: u32) -> Duration {
+    Duration::from_millis(1_u64 << consecutive_retries.min(6)).min(STALE_RETRY_MAX_BACKOFF)
 }
 
 fn estimated_index_work(block: &bitcoin::Block) -> (usize, usize) {
@@ -491,5 +511,12 @@ mod tests {
             "optional index failure must not request core shutdown"
         );
         Ok(())
+    }
+
+    #[test]
+    fn stale_retry_backoff_is_bounded() {
+        assert_eq!(stale_retry_backoff(0), Duration::from_millis(1));
+        assert_eq!(stale_retry_backoff(3), Duration::from_millis(8));
+        assert_eq!(stale_retry_backoff(32), STALE_RETRY_MAX_BACKOFF);
     }
 }

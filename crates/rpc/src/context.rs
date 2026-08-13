@@ -513,7 +513,13 @@ impl Context {
             return Err(TxIndexQueryError::Unavailable);
         }
         let result = query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index)?;
-        if self.applied_tip.load_full().as_deref() != Some(start_tip.as_ref()) {
+        let Some(end_tip) = self.applied_tip.load_full() else {
+            return Err(TxIndexQueryError::Unavailable);
+        };
+        // `set_applied_tip` and the node apply path publish a fresh Arc for every
+        // transition. Pointer identity is therefore the publication generation:
+        // unlike value equality, it detects an A -> B -> A transition.
+        if !Arc::ptr_eq(&start_tip, &end_tip) {
             return Err(TxIndexQueryError::Unavailable);
         }
         Ok(result)
@@ -950,6 +956,35 @@ mod tests {
 
         let answer = ctx.complete_tx_index_query(|_| {
             ctx.set_applied_tip(replacement);
+            Ok(Option::<u64>::None)
+        });
+
+        assert!(matches!(answer, Err(TxIndexQueryError::Unavailable)));
+    }
+
+    #[test]
+    fn complete_txindex_query_discards_result_after_tip_aba() {
+        let hash = Hash256::from_le_bytes(&[13; 32]);
+        let original = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(1),
+            height: 12,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash,
+        };
+        let ctx = txindex_query_context(
+            original.clone(),
+            bitcoin_rs_index::IndexWatermark { height: 12, hash },
+        );
+        let replacement = TipSnapshot {
+            tip_id: bitcoin_rs_chain::NodeId::new(2),
+            height: 13,
+            chainwork: bitcoin_rs_chain::ChainWork::default(),
+            hash: Hash256::from_le_bytes(&[14; 32]),
+        };
+
+        let answer = ctx.complete_tx_index_query(|_| {
+            ctx.set_applied_tip(replacement);
+            ctx.set_applied_tip(original);
             Ok(Option::<u64>::None)
         });
 

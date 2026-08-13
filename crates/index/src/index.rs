@@ -4,6 +4,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::{ColumnFamily, KvStore, StorageError, WriteBatch as _};
 use bitcoin_slices::{Visit as _, Visitor, bsl};
+use hashbrown::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::debug;
 use zerocopy::IntoBytes;
@@ -61,6 +62,20 @@ pub enum IndexError {
         height: u32,
         /// Block hash.
         hash: Hash256,
+    },
+    /// A bounded complete query exceeded the work its caller permits.
+    #[error("{resource} query exceeds the limit of {limit} rows")]
+    QueryLimitExceeded {
+        /// Logical row or result kind that crossed the bound.
+        resource: &'static str,
+        /// Maximum number of rows or results permitted.
+        limit: usize,
+    },
+    /// A complete query could not exact-resolve an indexed candidate height.
+    #[error("indexed block body is unavailable at height {height}")]
+    QueryBlockUnavailable {
+        /// Indexed candidate height whose active-chain body was unavailable.
+        height: u32,
     },
     /// A forward transition does not extend the durable watermark.
     #[error("block at height {height} does not extend TxIndex watermark {watermark:?}")]
@@ -141,6 +156,22 @@ pub struct IndexRowCounts {
     pub headers: usize,
 }
 
+/// Fully validated `TxIndex` rows ready for one atomic forward commit.
+///
+/// Construction is CPU-only and may run before the query/mutation write gate.
+pub struct PreparedIndexConnect {
+    expected_watermark: Option<IndexWatermark>,
+    terminal_watermark: IndexWatermark,
+    rows: PendingRows,
+}
+
+/// Fully validated `TxIndex` rows ready for one atomic rollback commit.
+pub struct PreparedIndexRollback {
+    watermark: IndexWatermark,
+    parent: IndexWatermark,
+    rows: PendingRows,
+}
+
 /// Electrs-shaped block indexer backed by a workspace [`KvStore`].
 pub struct Indexer<S: KvStore> {
     store: std::sync::Arc<S>,
@@ -198,9 +229,20 @@ impl<S: KvStore> Indexer<S> {
         &mut self,
         blocks: &[IndexConnect<'_>],
     ) -> Result<IndexRowCounts, IndexError> {
-        self.flush()?;
-        let Some(first) = blocks.first() else {
+        let prepared = self.prepare_connect_blocks(blocks)?;
+        let Some(prepared) = prepared else {
             return Ok(IndexRowCounts::default());
+        };
+        self.commit_prepared_connect(&prepared)
+    }
+
+    /// Validates a contiguous block slice and constructs all rows without writing.
+    pub fn prepare_connect_blocks(
+        &self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
+        let Some(first) = blocks.first() else {
+            return Ok(None);
         };
         let current = self.watermark()?;
         let mut expected_height = match current {
@@ -242,14 +284,37 @@ impl<S: KvStore> Indexer<S> {
         }
         let terminal = blocks.last().unwrap_or(first);
         rows.sort();
-        let counts = rows.counts();
-        let watermark = IndexWatermark {
-            height: terminal.height,
-            hash: terminal.hash,
-        };
+        Ok(Some(PreparedIndexConnect {
+            expected_watermark: current,
+            terminal_watermark: IndexWatermark {
+                height: terminal.height,
+                hash: terminal.hash,
+            },
+            rows,
+        }))
+    }
+
+    /// Atomically commits preconstructed rows after rechecking their starting watermark.
+    pub fn commit_prepared_connect(
+        &mut self,
+        prepared: &PreparedIndexConnect,
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        let actual = self.watermark()?;
+        if actual != prepared.expected_watermark {
+            return Err(IndexError::WatermarkMismatch {
+                expected: prepared.expected_watermark,
+                actual,
+            });
+        }
+        let counts = prepared.rows.counts();
         let mut batch = self.store.new_batch();
-        put_rows(&mut batch, &rows);
-        batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &watermark.encode());
+        put_rows(&mut batch, &prepared.rows);
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            WATERMARK_KEY,
+            &prepared.terminal_watermark.encode(),
+        );
         self.store.write(batch)?;
         self.last_counts = counts;
         Ok(counts)
@@ -264,7 +329,16 @@ impl<S: KvStore> Indexer<S> {
         block: &bitcoin::Block,
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
-        self.flush()?;
+        let prepared = self.prepare_rollback_block(block, watermark)?;
+        self.commit_prepared_rollback(&prepared)
+    }
+
+    /// Validates and constructs rollback rows without mutating storage.
+    pub fn prepare_rollback_block(
+        &self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<PreparedIndexRollback, IndexError> {
         validate_block_identity(block, watermark.height, watermark.hash)?;
         let actual = self.watermark()?;
         if actual != Some(watermark) {
@@ -287,8 +361,32 @@ impl<S: KvStore> Indexer<S> {
             .collect();
         let mut rows = pending_rows_for_decoded_block(block, watermark.height, &txids)?;
         rows.sort();
-        let counts = rows.counts();
-        let identity_present = match rows.header_rows.first() {
+        let parent = IndexWatermark {
+            height: watermark.height - 1,
+            hash: Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()),
+        };
+        Ok(PreparedIndexRollback {
+            watermark,
+            parent,
+            rows,
+        })
+    }
+
+    /// Atomically commits a preconstructed rollback after rechecking its watermark.
+    pub fn commit_prepared_rollback(
+        &mut self,
+        prepared: &PreparedIndexRollback,
+    ) -> Result<IndexRowCounts, IndexError> {
+        self.flush()?;
+        let actual = self.watermark()?;
+        if actual != Some(prepared.watermark) {
+            return Err(IndexError::WatermarkMismatch {
+                expected: Some(prepared.watermark),
+                actual,
+            });
+        }
+        let counts = prepared.rows.counts();
+        let identity_present = match prepared.rows.header_rows.first() {
             Some(header) => self
                 .store
                 .get(ColumnFamily::BlockHeaders, header)?
@@ -297,18 +395,17 @@ impl<S: KvStore> Indexer<S> {
         };
         if !identity_present {
             return Err(IndexError::MissingWatermarkIdentity {
-                height: watermark.height,
-                hash: watermark.hash,
+                height: prepared.watermark.height,
+                hash: prepared.watermark.hash,
             });
         }
-
-        let parent = IndexWatermark {
-            height: watermark.height - 1,
-            hash: Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()),
-        };
         let mut batch = self.store.new_batch();
-        delete_rows(&mut batch, &rows);
-        batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &parent.encode());
+        delete_rows(&mut batch, &prepared.rows);
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            WATERMARK_KEY,
+            &prepared.parent.encode(),
+        );
         self.store.write(batch)?;
         self.last_counts = counts;
         Ok(counts)
@@ -412,7 +509,33 @@ impl<S: KvStore> Indexer<S> {
         scripthash: crate::ScriptHash,
         source: &B,
     ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
-        let rows = self.iter_funding_rows(scripthash)?;
+        self.resolve_script_history_inner(scripthash, source, None)
+    }
+
+    /// Resolves script history while bounding funding rows and matched entries.
+    pub fn resolve_script_history_limited<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+        limit: usize,
+    ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
+        self.resolve_script_history_inner(scripthash, source, Some(limit))
+    }
+
+    fn resolve_script_history_inner<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
+        let rows = match limit {
+            Some(limit) => {
+                let prefix = ScriptHashRow::scan_prefix(scripthash);
+                let iter = self.store.iter_prefix(ColumnFamily::Funding, &prefix)?;
+                collect_prefix_rows_limited(iter, limit, "funding-row")?
+            }
+            None => self.iter_funding_rows(scripthash)?,
+        };
         let mut entries = Vec::new();
         let mut last_height: Option<u32> = None;
         let mut cached_block: Option<bitcoin::Block> = None;
@@ -423,6 +546,9 @@ impl<S: KvStore> Indexer<S> {
                 last_height = Some(height);
             }
             let Some(block) = cached_block.as_ref() else {
+                if limit.is_some() {
+                    return Err(IndexError::QueryBlockUnavailable { height });
+                }
                 continue;
             };
             for tx in &block.txdata {
@@ -436,6 +562,14 @@ impl<S: KvStore> Indexer<S> {
                     }
                 }
                 if matched {
+                    if let Some(limit) = limit
+                        && entries.len() >= limit
+                    {
+                        return Err(IndexError::QueryLimitExceeded {
+                            resource: "history-entry",
+                            limit,
+                        });
+                    }
                     entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
                 }
             }
@@ -497,7 +631,34 @@ impl<S: KvStore> Indexer<S> {
         scripthash: crate::ScriptHash,
         source: &B,
     ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
-        let rows = self.iter_funding_rows(scripthash)?;
+        self.resolve_unspent_outputs_with_height_inner(scripthash, source, None)
+    }
+
+    /// Resolves confirmed unspent-output candidates while bounding funding rows
+    /// and matching outputs inspected by one complete reader.
+    pub fn resolve_unspent_outputs_with_height_limited<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+        limit: usize,
+    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+        self.resolve_unspent_outputs_with_height_inner(scripthash, source, Some(limit))
+    }
+
+    fn resolve_unspent_outputs_with_height_inner<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+        limit: Option<usize>,
+    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+        let rows = match limit {
+            Some(limit) => {
+                let prefix = ScriptHashRow::scan_prefix(scripthash);
+                let iter = self.store.iter_prefix(ColumnFamily::Funding, &prefix)?;
+                collect_prefix_rows_limited(iter, limit, "funding-row")?
+            }
+            None => self.iter_funding_rows(scripthash)?,
+        };
         let mut outputs = Vec::new();
         let mut last_height: Option<u32> = None;
         let mut cached_block: Option<bitcoin::Block> = None;
@@ -508,6 +669,9 @@ impl<S: KvStore> Indexer<S> {
                 last_height = Some(height);
             }
             let Some(block) = cached_block.as_ref() else {
+                if limit.is_some() {
+                    return Err(IndexError::QueryBlockUnavailable { height });
+                }
                 continue;
             };
             for tx in &block.txdata {
@@ -521,6 +685,14 @@ impl<S: KvStore> Indexer<S> {
                     let Ok(vout) = u32::try_from(vout_idx) else {
                         continue;
                     };
+                    if let Some(limit) = limit
+                        && outputs.len() >= limit
+                    {
+                        return Err(IndexError::QueryLimitExceeded {
+                            resource: "unspent-output",
+                            limit,
+                        });
+                    }
                     outputs.push((txid, vout, output.value.to_sat(), height));
                 }
             }
@@ -540,6 +712,89 @@ impl<S: KvStore> Indexer<S> {
         let prefix = SpendingPrefixRow::scan_prefix(outpoint);
         let iter = self.store.iter_prefix(ColumnFamily::Spending, &prefix)?;
         collect_prefix_rows(iter)
+    }
+
+    /// Returns whether the spending index has any row for `outpoint` without
+    /// allocating and decoding the complete matching prefix.
+    pub fn has_spending_rows(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, IndexError> {
+        let prefix = SpendingPrefixRow::scan_prefix(outpoint);
+        let mut iter = self.store.iter_prefix(ColumnFamily::Spending, &prefix)?;
+        iter.next()
+            .transpose()
+            .map(|entry| entry.is_some())
+            .map_err(Into::into)
+    }
+
+    /// Exact-resolves lossy spending-prefix candidates against their blocks.
+    pub fn is_outpoint_spent<B: BlockSource>(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        source: &B,
+    ) -> Result<bool, IndexError> {
+        let rows = self.iter_spending_rows(outpoint)?;
+        let mut last_height = None;
+        let mut cached_block: Option<bitcoin::Block> = None;
+        for row in rows {
+            let height = row.height();
+            if last_height != Some(height) {
+                cached_block = source.block_at_height(height);
+                last_height = Some(height);
+            }
+            if cached_block.as_ref().is_some_and(|block| {
+                block
+                    .txdata
+                    .iter()
+                    .flat_map(|tx| &tx.input)
+                    .any(|input| input.previous_output == *outpoint)
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Filters funding candidates by exact-resolving all lossy spending rows in
+    /// one pass over each candidate spending block.
+    pub fn filter_unspent_outputs_with_height<B: BlockSource>(
+        &self,
+        outputs: Vec<(bitcoin::Txid, u32, u64, u32)>,
+        source: &B,
+    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+        let mut candidate_heights = HashSet::new();
+        for (txid, vout, _, _) in &outputs {
+            let outpoint = bitcoin::OutPoint {
+                txid: *txid,
+                vout: *vout,
+            };
+            candidate_heights.extend(
+                self.iter_spending_rows(&outpoint)?
+                    .into_iter()
+                    .map(crate::HashPrefixRow::height),
+            );
+        }
+
+        let mut spent = HashSet::new();
+        for height in candidate_heights {
+            let block = source
+                .block_at_height(height)
+                .ok_or(IndexError::QueryBlockUnavailable { height })?;
+            spent.extend(
+                block
+                    .txdata
+                    .iter()
+                    .flat_map(|tx| &tx.input)
+                    .map(|input| input.previous_output),
+            );
+        }
+        Ok(outputs
+            .into_iter()
+            .filter(|(txid, vout, _, _)| {
+                !spent.contains(&bitcoin::OutPoint {
+                    txid: *txid,
+                    vout: *vout,
+                })
+            })
+            .collect())
     }
 
     /// Iterates confirmed transaction-id rows matching `txid`.
@@ -610,6 +865,50 @@ impl<S: KvStore> Indexer<S> {
             return Ok(None);
         };
         Ok(tx.output.get(vout_idx).map(|output| output.value.to_sat()))
+    }
+
+    /// Resolves multiple outpoint values while loading and scanning each
+    /// candidate block at most once.
+    pub fn resolve_outpoint_values<B: BlockSource + ?Sized>(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+        source: &B,
+    ) -> Result<Vec<Option<u64>>, IndexError> {
+        let wanted = outpoints
+            .iter()
+            .map(|outpoint| outpoint.txid)
+            .collect::<HashSet<_>>();
+        let mut candidate_heights = HashSet::new();
+        for txid in &wanted {
+            candidate_heights.extend(
+                self.iter_txid_rows(txid)?
+                    .into_iter()
+                    .map(crate::HashPrefixRow::height),
+            );
+        }
+        let mut transactions = HashMap::with_capacity(wanted.len());
+        for height in candidate_heights {
+            let block = source
+                .block_at_height(height)
+                .ok_or(IndexError::QueryBlockUnavailable { height })?;
+            for tx in block.txdata {
+                let txid = tx.compute_txid();
+                if wanted.contains(&txid) {
+                    transactions.entry(txid).or_insert(tx);
+                }
+            }
+        }
+        Ok(outpoints
+            .iter()
+            .map(|outpoint| {
+                let vout = usize::try_from(outpoint.vout).ok()?;
+                transactions
+                    .get(&outpoint.txid)?
+                    .output
+                    .get(vout)
+                    .map(|output| output.value.to_sat())
+            })
+            .collect())
     }
 
     /// Resolves a transaction by txid and returns it alongside the block
@@ -1160,10 +1459,21 @@ enum TxidSource<'a> {
 fn collect_prefix_rows(
     iter: bitcoin_rs_storage::KvIter<'_>,
 ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
+    collect_prefix_rows_limited(iter, usize::MAX, "prefix-row")
+}
+
+fn collect_prefix_rows_limited(
+    iter: bitcoin_rs_storage::KvIter<'_>,
+    limit: usize,
+    resource: &'static str,
+) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
     let mut rows = Vec::new();
     for entry in iter {
         let (key, _value) = entry?;
         if key.len() == crate::HASH_PREFIX_ROW_SIZE {
+            if rows.len() >= limit {
+                return Err(IndexError::QueryLimitExceeded { resource, limit });
+            }
             rows.push(
                 zerocopy::FromBytes::read_from_bytes(&key[..])
                     .map_err(|_| IndexError::InvalidHeaderLength { len: key.len() })?,
@@ -1181,8 +1491,17 @@ mod watermark_tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_primitives::Hash256;
     use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore, WriteBatch as _};
+    use zerocopy::IntoBytes as _;
 
-    use super::{IndexConnect, IndexError, IndexWatermark, Indexer};
+    use super::{BlockSource, IndexConnect, IndexError, IndexWatermark, Indexer};
+
+    struct OneBlockSource(bitcoin::Block);
+
+    impl BlockSource for OneBlockSource {
+        fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {
+            (height == 0).then(|| self.0.clone())
+        }
+    }
 
     fn child_of(parent: &bitcoin::Block) -> bitcoin::Block {
         let mut child = parent.clone();
@@ -1216,6 +1535,35 @@ mod watermark_tests {
     }
 
     #[test]
+    fn limited_unspent_resolution_refuses_excess_funding_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let output = genesis
+            .txdata
+            .first()
+            .and_then(|tx| tx.output.first())
+            .ok_or_else(|| std::io::Error::other("genesis output missing"))?;
+        let scripthash = crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
+        indexer.ingest_block(&serialize(&genesis), 0)?;
+
+        assert!(matches!(
+            indexer.resolve_unspent_outputs_with_height_limited(
+                scripthash,
+                &OneBlockSource(genesis),
+                0
+            ),
+            Err(IndexError::QueryLimitExceeded {
+                resource: "funding-row",
+                limit: 0
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn atomic_multi_block_connect_publishes_only_terminal_watermark()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
@@ -1245,6 +1593,83 @@ mod watermark_tests {
                 height: 1,
                 hash: child_hash,
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_connect_does_not_publish_until_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let prepared = indexer
+            .prepare_connect_blocks(&[IndexConnect {
+                block: &genesis,
+                height: 0,
+                hash,
+            }])?
+            .ok_or_else(|| std::io::Error::other("missing prepared transition"))?;
+
+        assert_eq!(indexer.watermark()?, None);
+        indexer.commit_prepared_connect(&prepared)?;
+        assert_eq!(
+            indexer.watermark()?,
+            Some(IndexWatermark { height: 0, hash })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spending_prefix_collision_is_not_reported_as_spent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let indexer = Indexer::new(Arc::clone(&store));
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x77; 32]),
+            vout: 3,
+        };
+        let row = crate::SpendingPrefixRow::row(&outpoint, 0);
+        store.put(ColumnFamily::Spending, row.as_bytes(), &[])?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+
+        assert!(indexer.has_spending_rows(&outpoint)?);
+        assert!(!indexer.is_outpoint_spent(&outpoint, &OneBlockSource(genesis))?);
+        let outputs = vec![(outpoint.txid, outpoint.vout, 42, 0)];
+        assert_eq!(
+            indexer.filter_unspent_outputs_with_height(
+                outputs.clone(),
+                &OneBlockSource(bitcoin::blockdata::constants::genesis_block(
+                    bitcoin::Network::Regtest
+                ))
+            )?,
+            outputs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_outpoint_values_preserve_order_and_missing_entries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let mut indexer = Indexer::new(store);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let txid = genesis
+            .txdata
+            .first()
+            .ok_or_else(|| std::io::Error::other("genesis transaction missing"))?
+            .compute_txid();
+        indexer.ingest_block(&serialize(&genesis), 0)?;
+        let present = bitcoin::OutPoint { txid, vout: 0 };
+        let missing = bitcoin::OutPoint { txid, vout: 99 };
+
+        assert_eq!(
+            indexer
+                .resolve_outpoint_values(&[present, missing, present], &OneBlockSource(genesis))?,
+            vec![Some(5_000_000_000), None, Some(5_000_000_000)]
         );
         Ok(())
     }
@@ -1346,6 +1771,24 @@ pub trait IndexerLike: Send + Sync {
         Err(IndexError::UnsupportedWatermarkTransition)
     }
 
+    /// Constructs a forward transition without mutating storage.
+    fn prepare_connect_blocks(
+        &self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
+        let _ = blocks;
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Commits rows produced by [`IndexerLike::prepare_connect_blocks`].
+    fn commit_prepared_connect(
+        &mut self,
+        prepared: &PreparedIndexConnect,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = prepared;
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
     /// Atomically rolls back the exact watermark block and retreats to its parent.
     fn rollback_block_atomic(
         &mut self,
@@ -1353,6 +1796,25 @@ pub trait IndexerLike: Send + Sync {
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = (block, watermark);
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Constructs a rollback transition without mutating storage.
+    fn prepare_rollback_block(
+        &self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<PreparedIndexRollback, IndexError> {
+        let _ = (block, watermark);
+        Err(IndexError::UnsupportedWatermarkTransition)
+    }
+
+    /// Commits rows produced by [`IndexerLike::prepare_rollback_block`].
+    fn commit_prepared_rollback(
+        &mut self,
+        prepared: &PreparedIndexRollback,
+    ) -> Result<IndexRowCounts, IndexError> {
+        let _ = prepared;
         Err(IndexError::UnsupportedWatermarkTransition)
     }
 
@@ -1504,12 +1966,41 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         Self::connect_blocks_atomic(self, blocks)
     }
 
+    fn prepare_connect_blocks(
+        &self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
+        Self::prepare_connect_blocks(self, blocks)
+    }
+
+    fn commit_prepared_connect(
+        &mut self,
+        prepared: &PreparedIndexConnect,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::commit_prepared_connect(self, prepared)
+    }
+
     fn rollback_block_atomic(
         &mut self,
         block: &bitcoin::Block,
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block_atomic(self, block, watermark)
+    }
+
+    fn prepare_rollback_block(
+        &self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<PreparedIndexRollback, IndexError> {
+        Self::prepare_rollback_block(self, block, watermark)
+    }
+
+    fn commit_prepared_rollback(
+        &mut self,
+        prepared: &PreparedIndexRollback,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::commit_prepared_rollback(self, prepared)
     }
 
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {
@@ -2055,6 +2546,45 @@ mod tests {
         let outputs = indexer.resolve_unspent_outputs_with_height(scripthash, &source)?;
 
         assert_eq!(outputs, vec![(txid, 0, value, 0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn limited_unspent_resolution_refuses_excess_funding_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let output = block
+            .txdata
+            .first()
+            .and_then(|tx| tx.output.first())
+            .ok_or_else(|| std::io::Error::other("genesis output missing"))?;
+        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
+        let (_dir, mut indexer) = indexer()?;
+        indexer.ingest_block(&serialize(&block), 0)?;
+        let source = FakeSource {
+            block,
+            target_height: 0,
+        };
+
+        assert!(matches!(
+            indexer.resolve_unspent_outputs_with_height_limited(scripthash, &source, 0),
+            Err(IndexError::QueryLimitExceeded {
+                resource: "funding-row",
+                limit: 0
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn has_spending_rows_checks_only_existence() -> Result<(), Box<dyn std::error::Error>> {
+        let outpoint = spent_outpoint(2, 3);
+        let candidate = tx(outpoint, ScriptBuf::from_bytes(vec![0x51, 0x02]));
+        let (_dir, mut indexer) = indexer()?;
+
+        assert!(!indexer.has_spending_rows(&outpoint)?);
+        indexer.ingest_block(&serialize(&block(vec![candidate])), HEIGHT)?;
+        assert!(indexer.has_spending_rows(&outpoint)?);
         Ok(())
     }
 

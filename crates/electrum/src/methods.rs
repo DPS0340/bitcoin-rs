@@ -9,7 +9,7 @@ use bitcoin_rs_index::{HistoryEntry, HistoryHeight, ScriptHash, compute_status_h
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_storage::{ColumnFamily, KvIter, KvStore, StorageError};
 use compact_str::{CompactString, ToCompactString};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 use thiserror::Error;
@@ -17,6 +17,8 @@ use thiserror::Error;
 const PROTOCOL_VERSION: &str = "1.4";
 const SERVER_VERSION: &str = concat!("bitcoin-rs-electrum/", env!("CARGO_PKG_VERSION"));
 const MAX_HEADERS: usize = 2_016;
+const MAX_COMPLETE_HISTORY_ROWS: usize = 4_096;
+const MAX_COMPLETE_UNSPENT_ROWS: usize = 4_096;
 const DEFAULT_RELAY_FEE_BTC_PER_KVB: f64 = 0.00001;
 
 /// Error returned by Electrum method and session handling.
@@ -48,7 +50,26 @@ pub enum ElectrumError {
     TxIndexUnavailable,
     /// A complete `TxIndex` read failed.
     #[error("TxIndex lookup failed: {0}")]
-    TxIndex(#[from] bitcoin_rs_index::IndexError),
+    TxIndex(bitcoin_rs_index::IndexError),
+    /// A complete query exceeded its bounded work budget.
+    #[error("TxIndex query too large: {resource} limit is {limit}")]
+    QueryTooLarge {
+        /// Logical resource whose limit was exceeded.
+        resource: &'static str,
+        /// Configured maximum work or result count.
+        limit: usize,
+    },
+}
+
+impl From<bitcoin_rs_index::IndexError> for ElectrumError {
+    fn from(error: bitcoin_rs_index::IndexError) -> Self {
+        match error {
+            bitcoin_rs_index::IndexError::QueryLimitExceeded { resource, limit } => {
+                Self::QueryTooLarge { resource, limit }
+            }
+            error => Self::TxIndex(error),
+        }
+    }
 }
 
 impl ElectrumError {
@@ -64,6 +85,7 @@ impl ElectrumError {
             | Self::Json(_)
             | Self::Tls(_)
             | Self::TxIndexUnavailable
+            | Self::QueryTooLarge { .. }
             | Self::TxIndex(_) => 1,
         }
     }
@@ -86,12 +108,13 @@ pub trait ConfirmedHistoryReader: Send + Sync + core::fmt::Debug {
     ///
     /// Resolves the lossy 8-byte prefix to full `(txid, vout, value_sats)`
     /// triples via the wrapped `BlockSource` and filters out outpoints with
-    /// any matching spending row. Empty [`Vec`] on missing data.
+    /// any matching spending row. `None` means this reader does not implement
+    /// the lookup; `Some(Vec::new())` is an authoritative empty result.
     fn unspent_outputs(
         &self,
         _scripthash: ScriptHash,
-    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
-        Ok(Vec::new())
+    ) -> Result<Option<Vec<HistoryRecord>>, ElectrumError> {
+        Ok(None)
     }
     /// Returns the lowercase-hex serialized confirmed transaction for `txid`,
     /// resolved via the underlying index + `BlockSource`. `None` if not found.
@@ -113,6 +136,16 @@ pub trait ConfirmedHistoryReader: Send + Sync + core::fmt::Debug {
     fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Result<Option<u64>, ElectrumError> {
         let _ = op;
         Ok(None)
+    }
+    /// Resolves multiple prevout values under one reader consistency boundary.
+    fn outpoint_values(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+    ) -> Result<Vec<Option<u64>>, ElectrumError> {
+        outpoints
+            .iter()
+            .map(|outpoint| self.outpoint_value(outpoint))
+            .collect()
     }
 }
 
@@ -176,7 +209,13 @@ where
             return Err(ElectrumError::TxIndexUnavailable);
         }
         let result = query()?;
-        if applied_tip.load_full().as_deref() != Some(start_tip.as_ref()) {
+        let Some(end_tip) = applied_tip.load_full() else {
+            return Err(ElectrumError::TxIndexUnavailable);
+        };
+        // Every applied-tip publication installs a fresh Arc. Pointer identity
+        // therefore acts as a unique publication token and detects A -> B -> A
+        // even when the terminal TipSnapshot value equals the starting value.
+        if !Arc::ptr_eq(&start_tip, &end_tip) {
             return Err(ElectrumError::TxIndexUnavailable);
         }
         Ok(result)
@@ -204,8 +243,11 @@ where
         scripthash: ScriptHash,
     ) -> Result<Vec<HistoryRecord>, ElectrumError> {
         let entries = self.complete_query(|| {
-            self.indexer
-                .resolve_script_history(scripthash, &self.block_source)
+            self.indexer.resolve_script_history_limited(
+                scripthash,
+                &self.block_source,
+                MAX_COMPLETE_HISTORY_ROWS,
+            )
         })?;
         Ok(entries
             .into_iter()
@@ -243,18 +285,31 @@ where
         self.complete_query(|| self.indexer.resolve_outpoint_value(*op, &self.block_source))
     }
 
-    fn unspent_outputs(&self, scripthash: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+    fn outpoint_values(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+    ) -> Result<Vec<Option<u64>>, ElectrumError> {
         self.complete_query(|| {
+            self.indexer
+                .resolve_outpoint_values(outpoints, &self.block_source)
+        })
+    }
+
+    fn unspent_outputs(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Option<Vec<HistoryRecord>>, ElectrumError> {
+        self.complete_query(|| {
+            let outputs = self.indexer.resolve_unspent_outputs_with_height_limited(
+                scripthash,
+                &self.block_source,
+                MAX_COMPLETE_UNSPENT_ROWS,
+            )?;
             let outputs = self
                 .indexer
-                .resolve_unspent_outputs_with_height(scripthash, &self.block_source)?;
+                .filter_unspent_outputs_with_height(outputs, &self.block_source)?;
             let mut records = Vec::with_capacity(outputs.len());
             for (txid, vout, value, height) in outputs {
-                let outpoint = bitcoin::OutPoint { txid, vout };
-                let spent = !self.indexer.iter_spending_rows(&outpoint)?.is_empty();
-                if spent {
-                    continue;
-                }
                 let height_i64 = i64::from(height);
                 records.push(HistoryRecord {
                     txid,
@@ -264,8 +319,61 @@ where
                     spent: false,
                 });
             }
-            Ok(records)
+            Ok(Some(records))
         })
+    }
+}
+
+#[cfg(all(test, feature = "fjall"))]
+mod completeness_tests {
+    use super::*;
+    use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+    use bitcoin_rs_index::{IndexWatermark, Indexer, TxIndexRuntime};
+    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_storage::FjallStore;
+
+    #[derive(Debug)]
+    struct EmptyBlockSource;
+
+    impl bitcoin_rs_index::BlockSource for EmptyBlockSource {
+        fn block_at_height(&self, _height: u32) -> Option<bitcoin::Block> {
+            None
+        }
+    }
+
+    #[test]
+    fn complete_query_discards_result_after_tip_aba() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(FjallStore::open(dir.path())?);
+        let hash = Hash256::from_le_bytes(&[0x31; 32]);
+        let original = TipSnapshot {
+            tip_id: NodeId::new(1),
+            height: 12,
+            chainwork: ChainWork::default(),
+            hash,
+        };
+        let applied_tip = Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(
+            original.clone(),
+        ))));
+        let runtime = Arc::new(TxIndexRuntime::new());
+        runtime.publish_healthy(Some(IndexWatermark { height: 12, hash }));
+        let reader = IndexerHistoryReader::new(Arc::new(Indexer::new(store)), EmptyBlockSource)
+            .with_completeness(Arc::clone(&runtime), Arc::clone(&applied_tip));
+        let replacement = TipSnapshot {
+            tip_id: NodeId::new(2),
+            height: 13,
+            chainwork: ChainWork::default(),
+            hash: Hash256::from_le_bytes(&[0x32; 32]),
+        };
+
+        let result = reader.complete_query(|| {
+            applied_tip.store(Some(Arc::new(replacement)));
+            applied_tip.store(Some(Arc::new(original)));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(ElectrumError::TxIndexUnavailable)));
+        Ok(())
     }
 }
 
@@ -426,21 +534,17 @@ impl IndexHandle {
     fn try_unspent_outputs(
         &self,
         scripthash: ScriptHash,
-    ) -> Result<Vec<HistoryRecord>, ElectrumError> {
+    ) -> Result<Option<Vec<HistoryRecord>>, ElectrumError> {
         let reader = self.state.reader.read().clone();
         if let Some(reader) = reader {
             return reader.unspent_outputs(scripthash);
         }
 
-        Ok(Vec::new())
+        Ok(None)
     }
 
-    /// Returns the lowercase-hex serialized confirmed transaction for `txid`.
-    ///
-    /// Prefers a reader-backed lookup when one is attached via `with_history_reader`;
-    /// otherwise falls back to the synthetic in-memory transactions map.
-    #[must_use]
-    pub fn transaction_hex(&self, txid: &Txid) -> Option<String> {
+    #[cfg(test)]
+    fn transaction_hex(&self, txid: &Txid) -> Option<String> {
         self.try_transaction_hex(txid).ok().flatten()
     }
 
@@ -465,18 +569,27 @@ impl IndexHandle {
         self.state.reader.read().clone()?.block_at_height(height)
     }
 
-    /// Returns the satoshi value at `op` via the attached `ConfirmedHistoryReader`,
-    /// or `None` if no reader is attached or the prevout is not indexed.
-    #[must_use]
-    pub fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Option<u64> {
+    #[cfg(test)]
+    fn outpoint_value(&self, op: &bitcoin::OutPoint) -> Option<u64> {
         self.try_outpoint_value(op).ok().flatten()
     }
 
+    #[cfg(test)]
     fn try_outpoint_value(&self, op: &bitcoin::OutPoint) -> Result<Option<u64>, ElectrumError> {
         let Some(reader) = self.state.reader.read().clone() else {
             return Ok(None);
         };
         reader.outpoint_value(op)
+    }
+
+    fn try_outpoint_values(
+        &self,
+        outpoints: &[bitcoin::OutPoint],
+    ) -> Result<Vec<Option<u64>>, ElectrumError> {
+        let Some(reader) = self.state.reader.read().clone() else {
+            return Ok(vec![None; outpoints.len()]);
+        };
+        reader.outpoint_values(outpoints)
     }
 
     fn headers(&self) -> Vec<[u8; 80]> {
@@ -589,7 +702,7 @@ impl MempoolHandle {
         records
     }
 
-    fn mempool_spends(&self) -> Vec<OutPoint> {
+    fn mempool_spends(&self) -> HashSet<OutPoint> {
         let pool = self.pool.read();
         pool.entries
             .iter()
@@ -759,8 +872,17 @@ pub(crate) fn scripthash_get_balance(
     let scripthash = parse_scripthash_param(params)?;
     let spends = mempool.mempool_spends();
     let mut confirmed = 0_u64;
-    let reader_records = index.try_unspent_outputs(scripthash)?;
-    if reader_records.is_empty() {
+    if let Some(reader_records) = index.try_unspent_outputs(scripthash)? {
+        for record in reader_records {
+            let spent_by_mempool = spends.contains(&OutPoint {
+                txid: record.txid,
+                vout: record.vout,
+            });
+            if !spent_by_mempool {
+                confirmed = confirmed.saturating_add(record.value);
+            }
+        }
+    } else {
         // Fallback: synthetic confirmed_history path.
         for record in index.try_confirmed_history(scripthash)? {
             let spent_by_mempool = spends.contains(&OutPoint {
@@ -768,16 +890,6 @@ pub(crate) fn scripthash_get_balance(
                 vout: record.vout,
             });
             if !record.spent && !spent_by_mempool {
-                confirmed = confirmed.saturating_add(record.value);
-            }
-        }
-    } else {
-        for record in reader_records {
-            let spent_by_mempool = spends.contains(&OutPoint {
-                txid: record.txid,
-                vout: record.vout,
-            });
-            if !spent_by_mempool {
                 confirmed = confirmed.saturating_add(record.value);
             }
         }
@@ -818,12 +930,12 @@ pub(crate) fn scripthash_listunspent(
     let spends = mempool.mempool_spends();
     let mut rows = Vec::new();
     // Prefer reader-backed (real index) data when set.
-    let reader_records = index.try_unspent_outputs(scripthash)?;
-    let confirmed_iter: Box<dyn Iterator<Item = HistoryRecord>> = if reader_records.is_empty() {
-        Box::new(index.try_confirmed_history(scripthash)?.into_iter())
-    } else {
-        Box::new(reader_records.into_iter())
-    };
+    let confirmed_iter: Box<dyn Iterator<Item = HistoryRecord>> =
+        if let Some(reader_records) = index.try_unspent_outputs(scripthash)? {
+            Box::new(reader_records.into_iter())
+        } else {
+            Box::new(index.try_confirmed_history(scripthash)?.into_iter())
+        };
     for record in confirmed_iter {
         if record.spent
             || spends.contains(&OutPoint {
@@ -1016,10 +1128,16 @@ pub(crate) fn transaction_broadcast(
     // Derive real fee = sum_in - sum_out when every prevout resolves via index.
     // Otherwise fall back to the vsize placeholder.
     let placeholder_fee = u64::try_from(tx.vsize()).unwrap_or(u64::MAX);
+    let outpoints = tx
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    let values = index.try_outpoint_values(&outpoints)?;
     let mut sum_in: u64 = 0;
     let mut all_resolved = true;
-    for input in &tx.input {
-        if let Some(value) = index.outpoint_value(&input.previous_output) {
+    for value in values {
+        if let Some(value) = value {
             sum_in = sum_in.saturating_add(value);
         } else {
             all_resolved = false;
@@ -1357,6 +1475,7 @@ mod blockchain_relayfee_tests {
 mod history_reader_tests {
     use super::*;
     use alloc::sync::Arc;
+    use bitcoin::hashes::Hash as _;
 
     #[derive(Debug)]
     struct StubReader;
@@ -1386,19 +1505,57 @@ mod history_reader_tests {
             Ok(Vec::new())
         }
 
-        fn unspent_outputs(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+        fn unspent_outputs(
+            &self,
+            _: ScriptHash,
+        ) -> Result<Option<Vec<HistoryRecord>>, ElectrumError> {
             use bitcoin::hashes::Hash as _;
 
             let mut hash = [0_u8; 32];
             hash[0] = 0xfe;
             let txid = bitcoin::Txid::from_byte_array(hash);
-            Ok(vec![HistoryRecord {
+            Ok(Some(vec![HistoryRecord {
                 txid,
                 height: 0,
                 value: 100_000,
                 vout: 0,
                 spent: false,
+            }]))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubReaderAuthoritativeEmpty;
+
+    impl ConfirmedHistoryReader for StubReaderAuthoritativeEmpty {
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(vec![HistoryRecord {
+                txid: bitcoin::Txid::from_byte_array([0xfd; 32]),
+                height: 7,
+                value: 0,
+                vout: 0,
+                spent: false,
             }])
+        }
+
+        fn unspent_outputs(
+            &self,
+            _: ScriptHash,
+        ) -> Result<Option<Vec<HistoryRecord>>, ElectrumError> {
+            Ok(Some(Vec::new()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubReaderUnavailablePrevout;
+
+    impl ConfirmedHistoryReader for StubReaderUnavailablePrevout {
+        fn confirmed_history(&self, _: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
+            Ok(Vec::new())
+        }
+
+        fn outpoint_value(&self, _: &OutPoint) -> Result<Option<u64>, ElectrumError> {
+            Err(ElectrumError::TxIndexUnavailable)
         }
     }
 
@@ -1481,6 +1638,43 @@ mod history_reader_tests {
             .unwrap_or_else(|| panic!("expected array"));
 
         assert_eq!(rows.len(), 1, "expected one row: {result:?}");
+    }
+
+    #[test]
+    fn authoritative_empty_unspent_result_does_not_fall_back_to_history() {
+        let handle = IndexHandle::new().with_history_reader(Arc::new(StubReaderAuthoritativeEmpty));
+        let scripthash = [0xcc_u8; 32].to_lower_hex_string();
+        let params = json!([scripthash]);
+
+        let result = scripthash_listunspent(&handle, &MempoolHandle::default(), &params)
+            .unwrap_or_else(|err| panic!("listunspent failed: {err}"));
+
+        assert!(result.as_array().is_some_and(sonic_rs::Array::is_empty));
+    }
+
+    #[test]
+    fn transaction_broadcast_preserves_prevout_lookup_errors() {
+        let index = IndexHandle::new().with_history_reader(Arc::new(StubReaderUnavailablePrevout));
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([0xaa; 32]), 0),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let params = json!([serialize(&tx).to_lower_hex_string()]);
+
+        assert!(matches!(
+            transaction_broadcast(&index, &MempoolHandle::default(), &params),
+            Err(ElectrumError::TxIndexUnavailable)
+        ));
     }
 }
 

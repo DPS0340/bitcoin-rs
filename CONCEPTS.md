@@ -194,7 +194,9 @@ TxIndex-specific. A watermark above the reconciliation target retreats before
 any same-height ancestry comparison. If the watermark's expected header
 identity row is absent, the index is inconsistent: rollback must leave both
 rows and watermark unchanged and fail the worker rather than treating the
-block as already removed.
+block as already removed. Until pruning retains every body newer than the
+TxIndex watermark, configuration rejects enabling TxIndex and pruning together;
+otherwise bootstrap or catch-up could lose a required source body permanently.
 
 ### Reconciliation attempt target
 
@@ -212,9 +214,19 @@ The #77 read boundary that prevents asynchronous index lag from being
 reported as an authoritative negative. A complete TxIndex query requires a
 healthy worker and a committed watermark equal to the captured applied tip,
 excludes worker mutation for the logical query, and verifies before returning
-that the applied tip did not move. Lag, failure, or concurrent chain movement
+that the applied-tip publication identity did not change. Each publication uses
+a fresh `Arc`, so pointer identity is a unique process-local token that also
+detects an `A -> B -> A` value ABA. The query retains its starting `Arc`, which
+prevents that address from being reused before the final comparison. Lag,
+failure, or concurrent chain movement
 returns unavailable (or a bounded retry), not "not found." Rich Electrum
-readiness and partial-history policy are separate concerns.
+readiness and partial-history policy are separate concerns. Electrum unspent
+queries distinguish reader absence from an authoritative empty result and cap
+the history/funding/output work performed while holding this gate. Lossy
+spending-prefix matches are candidates, not proof: complete unspent reads scan
+the referenced block inputs for the full outpoint. Worker connect and rollback
+row construction happens in prepared transitions outside the write gate; the
+commit rechecks its starting watermark before the atomic write.
 
 ### Coalesced index wake
 

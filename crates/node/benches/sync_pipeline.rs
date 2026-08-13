@@ -421,7 +421,20 @@ fn measure_apply_only(iterations: u64, blocks: &[Block], txindex: bool) -> std::
                 .unwrap_or_else(|error| panic!("apply-only proxy failed: {error}"));
         }
         measured = measured.saturating_add(started.elapsed());
-        black_box(state.applied_tip().load_full());
+        let tip = state
+            .applied_tip()
+            .load_full()
+            .unwrap_or_else(|| panic!("apply-only proxy did not publish a tip"));
+        let expected_hash = blocks
+            .last()
+            .unwrap_or_else(|| panic!("apply-only proxy requires at least one block"))
+            .block_hash();
+        assert_eq!(
+            tip.hash,
+            Hash256::from_le_bytes(expected_hash.as_byte_array()),
+            "apply-only proxy published the wrong final tip"
+        );
+        black_box(tip);
     }
     measured
 }

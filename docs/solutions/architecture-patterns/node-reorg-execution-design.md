@@ -83,7 +83,25 @@ restored after a crash and will rewind itself; this rule is TxIndex-specific and
 must not be generalized to UTXO state, coinstats, or future consumers whose
 backward transition cannot be reconstructed from retained bodies. Complete RPC
 and Electrum reads are gated on a healthy watermark exactly equal to the
-current applied tip.
+current applied tip. They retain the starting applied-tip `Arc` and require the
+same publication identity at return; because every publication allocates a
+fresh `Arc`, this rejects `A -> B -> A` value ABA as well as an ordinary tip
+move. A disappearing captured target is retried with bounded
+exponential backoff: repeated stale targets do not prove the current source is
+broken, but immediate retries can hot-spin while the authoritative tip moves.
+Electrum's unspent read distinguishes an unsupported reader from an
+authoritative empty result and bounds complete-query work while holding the
+read gate. Both forward and rollback workers prepare identity-checked, sorted,
+deduplicated rows before taking the write gate; only watermark revalidation,
+the atomic DB write, and runtime publication remain inside it. Electrum
+exact-resolves lossy spending-prefix candidates against block inputs, batches
+broadcast prevout reads under one gate, uses set membership for mempool spends,
+and caps per-session scripthash subscriptions.
+Because reconciliation currently depends on exact retained block bodies, node
+configuration temporarily rejects `txindex` together with a nonzero prune
+target. Supporting both requires the pruner to retain bodies through the
+TxIndex watermark (or an equivalent rebuild source), not merely the core durable
+tip.
 
 ## Why it matters
 
