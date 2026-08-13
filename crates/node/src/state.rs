@@ -769,14 +769,7 @@ fn open_tx_index(config: &Config) -> Result<Option<(TxIndexHandle, TxIndexStorag
         return Ok(None);
     }
 
-    let legacy_txindex_dir = config.data_dir.join("txindex");
-    if legacy_txindex_dir.exists() {
-        tracing::warn!(
-            path = %legacy_txindex_dir.display(),
-            "legacy cursorless TxIndex left untouched; bootstrapping txindex-v2"
-        );
-    }
-    let txindex_dir = config.data_dir.join("txindex-v2");
+    let txindex_dir = config.data_dir.join("txindex");
     std::fs::create_dir_all(&txindex_dir)
         .with_context(|| format!("create txindex_dir {}", txindex_dir.display()))?;
     match config.storage_backend.as_str() {
@@ -1666,7 +1659,7 @@ mod tests {
 
         assert!(state.tx_index().is_none(), "txindex disabled by default");
         assert!(
-            !state.data_dir().join("txindex-v2").exists(),
+            !state.data_dir().join("txindex").exists(),
             "disabled txindex must not create storage"
         );
         Ok(())
@@ -1685,7 +1678,7 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&a, &b), "tx_index handle stable across calls");
         assert!(
-            state.data_dir().join("txindex-v2").exists(),
+            state.data_dir().join("txindex").exists(),
             "enabled txindex must create storage"
         );
         Ok(())

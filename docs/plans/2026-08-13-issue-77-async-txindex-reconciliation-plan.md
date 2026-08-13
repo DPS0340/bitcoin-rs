@@ -18,8 +18,8 @@ Implementation record:
   mutation or batching.
 * RPC and Electrum complete reads use the shared read/write gate and reject lag,
   failure, or an applied-tip race as unavailable.
-* The old cursorless `txindex` directory is preserved; new state bootstraps in
-  `txindex-v2`.
+* The watermark-based index is the initial unreleased `txindex` format; no
+  legacy migration or parallel versioned directory is required.
 * The sync-pipeline benchmark no longer has a synchronous TxIndex mode and now
   includes paired `sync_pipeline_apply_only_proxy{,_txindex_detached}` cases
   that exclude store-open setup from apply-path timing.
@@ -126,15 +126,11 @@ cursor, event epoch, sequence, or event journal. On restart, the durable
 watermark and the current applied tip determine the work.
 
 The cursor codec is TxIndex-private. Do not add a shared index metadata schema
-or a new generic column family for it. Because existing TxIndex databases have
-rows but no trustworthy watermark, they must never be treated as caught up.
-Follow `docs/policies/db-migration.md`: use an explicit clean TxIndex schema
-cutover at `data_dir/txindex-v2`; leave the cursorless `data_dir/txindex`
-untouched rather than infer progress, delete it, or perform an in-place
-migration. The new store therefore starts empty and follows the normal
-bootstrap path. Log the ignored legacy path once when it exists. This is only
-the compatibility step required to introduce the watermark; general rebuild
-and pruning policy remain outside #77.
+or a new generic column family for it. Store the watermark-based schema
+directly at `data_dir/txindex`. This format has not been released, so there is
+no legacy migration, detection, parallel versioned directory, or progress
+inference. A newly created store starts empty and follows the normal bootstrap
+path. General rebuild and pruning policy remain outside #77.
 
 ### 4.2 Exact source access
 
@@ -347,7 +343,7 @@ and service startup policy remain outside #77.
   mutations and the terminal watermark to one caller-owned write batch.
 * Preserve the header identity guard and reject body/hash mismatches before
   mutation.
-* Make a clean, non-destructive schema cutover for cursorless TxIndex stores.
+* Use the watermark-based schema as the initial `txindex` storage format.
 
 Gate: backend tests prove atomic rows+watermark behavior for every enabled
 storage backend before worker integration.
@@ -411,7 +407,7 @@ phases do not depend on a benchmark win.
 * Core checkpoint at 100 plus durable TxIndex watermark at 105 restarts,
   rewinds 105 to 100, and converges to the current branch.
 * Cursor corruption and unknown codec fail the worker without affecting core.
-* A cursorless legacy store is never reported as caught up.
+* An empty store has no watermark and bootstraps from genesis.
 
 ### Bootstrap and reconciliation
 
