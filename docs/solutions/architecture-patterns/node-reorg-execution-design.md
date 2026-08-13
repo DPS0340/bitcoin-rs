@@ -93,7 +93,10 @@ Electrum's unspent read distinguishes an unsupported reader from an
 authoritative empty result and bounds complete-query work. Forward and rollback
 each expose one identity-checked atomic transition; there is no process-local
 watermark copy, prepared transition, or reader/writer gate. Worker health is
-observability only, while the DB watermark is the sole durable progress state. Electrum
+observability only, while the DB watermark is the sole durable progress state.
+The `TxIndexWriter` object moves into the worker thread; RPC and Electrum use
+independent `TxIndexReader` views over the same store, so worker row construction
+does not contend on a shared object mutex. Electrum
 exact-resolves lossy spending-prefix candidates against block inputs, batches
 broadcast prevout reads under one completeness boundary, uses set membership for mempool spends,
 and caps per-session scripthash subscriptions.
@@ -225,6 +228,6 @@ normal shutdown path.
    the durable boundary for disconnect. Keep `InFlight` until rollback completes,
    keep `RolledBack` until a clean checkpoint is durable, and refuse to clear an
    incomplete operation.
-3. **A trait default that returns success is a silent-corruption path.** When a
-   consumer must participate in rollback, make the default refuse. See
-   `IndexError::UnsupportedRollback`.
+3. **A trait default that returns success is a silent-corruption path.** Methods
+   required for a durable transition are mandatory on `TxIndexWriter`; read-only
+   consumers receive a separate `TxIndexReader` that cannot mutate state.

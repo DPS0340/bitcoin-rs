@@ -35,7 +35,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::Config;
 
-type TxIndexHandle = Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>;
+type TxIndexHandle = Box<dyn bitcoin_rs_index::TxIndexWriter>;
 type FilterIndexHandle = Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>;
 
 struct DisabledFilterIndex;
@@ -661,8 +661,8 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
 /// Concrete txindex store handles retained per backend.
 ///
 /// Mirrors `NodeStorage` but for the txindex sub-database. Kept alongside the
-/// erased `Arc<Mutex<Box<dyn IndexerLike>>>` so the Electrum `IndexHandle` can
-/// observe the live `KvStore` for header reads.
+/// erased writer handle so read services can open independent views of the
+/// live `KvStore`.
 enum TxIndexStorage {
     #[cfg(feature = "rocksdb")]
     RocksDb(Arc<bitcoin_rs_storage::RocksDbStore>),
@@ -675,6 +675,19 @@ enum TxIndexStorage {
 }
 
 impl TxIndexStorage {
+    fn rpc_reader(&self) -> Arc<dyn bitcoin_rs_index::TxIndexReader> {
+        match self {
+            #[cfg(feature = "rocksdb")]
+            Self::RocksDb(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
+            #[cfg(feature = "fjall")]
+            Self::Fjall(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
+            #[cfg(feature = "redb")]
+            Self::Redb(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
+            #[cfg(feature = "mdbx")]
+            Self::Mdbx(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
+        }
+    }
+
     fn electrum_index_handle(&self) -> bitcoin_rs_electrum::IndexHandle {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -777,48 +790,36 @@ fn open_tx_index(config: &Config) -> Result<Option<(TxIndexHandle, TxIndexStorag
             let store = Arc::new(
                 bitcoin_rs_storage::RocksDbStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
+            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((
-                Arc::new(Mutex::new(indexer)),
-                TxIndexStorage::RocksDb(store),
-            )))
+            Ok(Some((indexer, TxIndexStorage::RocksDb(store))))
         }
         #[cfg(feature = "fjall")]
         "fjall" => {
             let store = Arc::new(
                 bitcoin_rs_storage::FjallStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
+            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((
-                Arc::new(Mutex::new(indexer)),
-                TxIndexStorage::Fjall(store),
-            )))
+            Ok(Some((indexer, TxIndexStorage::Fjall(store))))
         }
         #[cfg(feature = "redb")]
         "redb" => {
             let store = Arc::new(
                 bitcoin_rs_storage::RedbStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
+            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((
-                Arc::new(Mutex::new(indexer)),
-                TxIndexStorage::Redb(store),
-            )))
+            Ok(Some((indexer, TxIndexStorage::Redb(store))))
         }
         #[cfg(feature = "mdbx")]
         "mdbx" => {
             let store = Arc::new(
                 bitcoin_rs_storage::MdbxStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
+            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((
-                Arc::new(Mutex::new(indexer)),
-                TxIndexStorage::Mdbx(store),
-            )))
+            Ok(Some((indexer, TxIndexStorage::Mdbx(store))))
         }
         other => bail!("unsupported storage backend for txindex: {other}"),
     }
@@ -872,7 +873,7 @@ pub struct NodeState {
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
-    tx_index: Option<TxIndexHandle>,
+    tx_index: Mutex<Option<TxIndexHandle>>,
     tx_index_storage: Option<Arc<TxIndexStorage>>,
     tx_index_runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
     tx_index_wake_rx: Mutex<Option<Receiver<()>>>,
@@ -1169,7 +1170,7 @@ impl NodeState {
             block_body_store,
             utxo,
             coin_stats,
-            tx_index,
+            tx_index: Mutex::new(tx_index),
             tx_index_storage,
             tx_index_runtime,
             tx_index_wake_rx: Mutex::new(tx_index_wake_rx),
@@ -1282,10 +1283,12 @@ impl NodeState {
         Arc::clone(&self.coin_stats)
     }
 
-    /// Returns the shared block indexer handle, when txindex is enabled.
+    /// Returns an immutable TxIndex view that does not share the worker mutex.
     #[must_use]
-    pub fn tx_index(&self) -> Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>> {
-        self.tx_index.as_ref().map(Arc::clone)
+    pub fn tx_index_reader(&self) -> Option<Arc<dyn bitcoin_rs_index::TxIndexReader>> {
+        self.tx_index_storage
+            .as_ref()
+            .map(|storage| storage.rpc_reader())
     }
 
     /// Returns process-local `TxIndex` worker health.
@@ -1296,7 +1299,7 @@ impl NodeState {
 
     /// Starts the asynchronous `TxIndex` worker once, after startup recovery completes.
     pub(crate) fn start_tx_index_worker(&self) -> anyhow::Result<()> {
-        let (Some(indexer), Some(runtime)) = (&self.tx_index, &self.tx_index_runtime) else {
+        let Some(runtime) = &self.tx_index_runtime else {
             return Ok(());
         };
         if self.tx_index_worker.lock().is_some() {
@@ -1307,8 +1310,13 @@ impl NodeState {
             .lock()
             .take()
             .ok_or_else(|| anyhow::anyhow!("TxIndex worker receiver is unavailable"))?;
+        let indexer = self
+            .tx_index
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("TxIndex writer is unavailable"))?;
         let worker = crate::txindex_worker::TxIndexWorker::new(
-            Arc::clone(indexer),
+            indexer,
             Arc::clone(runtime),
             Arc::clone(&self.applied_tip),
             Arc::clone(&self.block_tree),
@@ -1654,7 +1662,10 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
 
-        assert!(state.tx_index().is_none(), "txindex disabled by default");
+        assert!(
+            state.tx_index_reader().is_none(),
+            "txindex disabled by default"
+        );
         assert!(
             !state.data_dir().join("txindex").exists(),
             "disabled txindex must not create storage"
@@ -1670,10 +1681,13 @@ mod tests {
         config.p2p_listen.clear();
         config.txindex = true;
         let state = NodeState::open(config)?;
-        let (Some(a), Some(b)) = (state.tx_index(), state.tx_index()) else {
+        let (Some(a), Some(b)) = (state.tx_index_reader(), state.tx_index_reader()) else {
             panic!("txindex handle missing when enabled");
         };
-        assert!(Arc::ptr_eq(&a, &b), "tx_index handle stable across calls");
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "readers must be independent views over the same store"
+        );
         assert!(
             state.data_dir().join("txindex").exists(),
             "enabled txindex must create storage"
@@ -1945,7 +1959,7 @@ mod tests {
         config.p2p_listen.clear();
         config.txindex = false;
         let state = NodeState::open(config)?;
-        assert!(state.tx_index().is_none());
+        assert!(state.tx_index_reader().is_none());
         assert!(state.tx_index_runtime().is_none());
         assert!(state.apply_handles().tx_index_wake.is_none());
 
@@ -1954,7 +1968,7 @@ mod tests {
         config.p2p_listen.clear();
         config.txindex = true;
         let state = NodeState::open(config)?;
-        assert!(state.tx_index().is_some());
+        assert!(state.tx_index_reader().is_some());
         assert!(state.tx_index_runtime().is_some());
         assert!(state.apply_handles().tx_index_wake.is_some());
         Ok(())

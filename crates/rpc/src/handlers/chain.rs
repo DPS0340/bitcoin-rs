@@ -769,7 +769,7 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         let watermark = ctx
             .indexer
             .as_ref()
-            .and_then(|indexer| indexer.lock().watermark().ok().flatten());
+            .and_then(|indexer| indexer.watermark().ok().flatten());
         let txindex_synced = ctx.applied_tip.load_full().as_deref().is_some_and(|tip| {
             watermark.is_some_and(|watermark| {
                 watermark.height == tip.height && watermark.hash == tip.hash

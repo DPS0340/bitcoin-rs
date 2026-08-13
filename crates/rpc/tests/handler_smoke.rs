@@ -11,13 +11,13 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
+use bitcoin_rs_index::{BlockSource, IndexError, TxIndexReader};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::{BlockRecord, ChainControl, ChainControlError, Context, Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
 #[test]
@@ -392,10 +392,10 @@ fn getindexinfo_returns_available_indexes() -> Result<(), Box<dyn std::error::Er
 fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut ctx = Context::new();
-    let indexer: Box<dyn IndexerLike> = Box::new(FakeIndexer {
+    let indexer: Arc<dyn TxIndexReader> = Arc::new(FakeIndexer {
         values: HashMap::new(),
     });
-    ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+    ctx.indexer = Some(indexer);
     let handler = Handler::new(Arc::new(ctx));
 
     let result = handler.dispatch("getindexinfo", &json!(["txindex"]))?;
@@ -594,9 +594,17 @@ struct FakeIndexer {
     values: HashMap<OutPoint, u64>,
 }
 
-impl IndexerLike for FakeIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
+impl TxIndexReader for FakeIndexer {
+    fn watermark(&self) -> Result<Option<bitcoin_rs_index::IndexWatermark>, IndexError> {
+        Ok(None)
+    }
+
+    fn resolve_transaction(
+        &self,
+        _txid: Txid,
+        _source: &dyn BlockSource,
+    ) -> Result<Option<Transaction>, IndexError> {
+        Ok(None)
     }
 
     fn resolve_outpoint_value(
@@ -617,8 +625,8 @@ fn fee_stats_context(
     let block = fee_block(low_tx.clone(), high_tx.clone());
     let mut ctx = Context::new();
     if let Some(values) = values {
-        let indexer: Box<dyn IndexerLike> = Box::new(FakeIndexer { values });
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        let indexer: Arc<dyn TxIndexReader> = Arc::new(FakeIndexer { values });
+        ctx.indexer = Some(indexer);
     }
     ctx.add_block(BlockRecord::from_block(7, &block));
     (Arc::new(ctx), low_tx, high_tx)

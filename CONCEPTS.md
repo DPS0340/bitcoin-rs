@@ -120,8 +120,12 @@ The failure mode where a parallelism constant is tuned while the benchmark harne
 ### Commit point (multi-store mutation)
 The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after UTXO undo. TxIndex is not part of this authoritative commit: it reconciles independently after the tip publication. Naming the commit point first shows which authoritative steps need atomicity. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first authoritative mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
-### Refusing default (trait participation)
-A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
+### Required invariant method (trait participation)
+A trait method whose default returns success lets an implementation that never
+opted in be mistaken for one that did. Methods required for correctness have no
+permissive default. `TxIndexWriter` therefore requires atomic connect and
+rollback implementations, while the separate `TxIndexReader` exposes no
+mutation methods. A writer cannot compile while silently omitting rollback.
 
 ### Undo record
 
@@ -224,6 +228,9 @@ partial-history policy are separate concerns. Lossy spending-prefix matches
 are candidates, not proof: complete unspent reads scan the referenced block
 inputs for the full outpoint. Worker connect and rollback each use one atomic
 transition API, with rows and terminal watermark written in the same DB batch.
+The writer object is moved into the worker thread and has no shared mutex. RPC
+and Electrum construct independent immutable readers over the same store, so
+row construction cannot block queries through an object-level lock.
 
 ### Coalesced index wake
 

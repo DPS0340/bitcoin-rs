@@ -284,10 +284,9 @@ mod tests {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::hex::DisplayHex as _;
-    use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
+    use bitcoin_rs_index::{BlockSource, IndexError, TxIndexReader};
     use bitcoin_rs_mempool::MempoolEntry;
     use bitcoin_rs_primitives::Hash256;
-    use parking_lot::Mutex;
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
     use super::getrawtransaction;
@@ -326,13 +325,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         struct FailingIndexer;
 
-        impl IndexerLike for FailingIndexer {
-            fn ingest_block(
-                &mut self,
-                _block: &[u8],
-                _height: u32,
-            ) -> Result<IndexRowCounts, IndexError> {
-                Ok(IndexRowCounts::default())
+        impl TxIndexReader for FailingIndexer {
+            fn watermark(&self) -> Result<Option<bitcoin_rs_index::IndexWatermark>, IndexError> {
+                Ok(None)
             }
 
             fn resolve_transaction(
@@ -353,8 +348,7 @@ mod tests {
         }
 
         let mut ctx = Context::new();
-        let indexer: Box<dyn IndexerLike> = Box::new(FailingIndexer);
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        ctx.indexer = Some(Arc::new(FailingIndexer));
         let ctx = Arc::new(ctx);
         let genesis = genesis_block(bitcoin::Network::Regtest);
         let coinbase = genesis
@@ -405,13 +399,9 @@ mod tests {
             tx: bitcoin::Transaction,
         }
 
-        impl IndexerLike for StaticIndexer {
-            fn ingest_block(
-                &mut self,
-                _block: &[u8],
-                _height: u32,
-            ) -> Result<IndexRowCounts, IndexError> {
-                Ok(IndexRowCounts::default())
+        impl TxIndexReader for StaticIndexer {
+            fn watermark(&self) -> Result<Option<bitcoin_rs_index::IndexWatermark>, IndexError> {
+                Ok(None)
             }
 
             fn resolve_transaction(
@@ -437,10 +427,9 @@ mod tests {
         };
         let txid = coinbase.compute_txid();
         let mut ctx = Context::new();
-        let indexer: Box<dyn IndexerLike> = Box::new(StaticIndexer {
+        ctx.indexer = Some(Arc::new(StaticIndexer {
             tx: coinbase.clone(),
-        });
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        }));
         let ctx = Arc::new(ctx);
 
         assert!(

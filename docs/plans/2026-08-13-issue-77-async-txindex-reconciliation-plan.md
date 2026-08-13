@@ -361,8 +361,9 @@ storage backend before worker integration.
 * Add captured-tip ancestry and exact body access in `crates/node`.
 * Implement empty-watermark bootstrap and reconciliation as TxIndex-specific
   code, not a generic registry or trait framework.
-* Add worker health, committed-watermark observation, bounded wake, and clean
-  shutdown/join handling.
+* Add worker health, bounded wake, and clean shutdown/join handling. Move the
+  writer into the worker thread and give query services independent readers
+  over the same store.
 * Start the worker only after checkpoint restoration and block-body storage are
   available.
 
@@ -388,7 +389,8 @@ and no authoritative path waits for or propagates that failure.
 * Wire the TxIndex-specific completeness boundary into RPC and Electrum
   confirmed-data readers.
 * Preserve “not found” only when the query ran against a healthy, complete
-  watermark; expose lag/failure as unavailable.
+  durable watermark; expose lag as unavailable. Worker health is reported
+  separately and is not a completeness condition.
 * Report the real watermark and synced status from `getindexinfo`.
 
 Gate: race tests prove lag, concurrent advance, reorg, and worker failure never

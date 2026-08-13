@@ -13,7 +13,8 @@ pub mod status;
 pub mod types;
 
 pub use index::{
-    BlockSource, IndexConnect, IndexError, IndexRowCounts, IndexWatermark, Indexer, IndexerLike,
+    BlockSource, IndexConnect, IndexError, IndexRowCounts, IndexWatermark, Indexer, TxIndexReader,
+    TxIndexWriter,
 };
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use runtime::{IndexWorkerHealth, TxIndexRuntime};

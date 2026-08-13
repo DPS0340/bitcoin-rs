@@ -45,7 +45,7 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let p2p_outbound = Some(state.p2p_outbound_sender());
     let banned = state.banned_subnets();
     let added_nodes = Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let Some(tx_index) = state.tx_index() else {
+    let Some(tx_index) = state.tx_index_reader() else {
         panic!("txindex handle missing when enabled");
     };
     let ctx = Context::from_handles(
@@ -153,6 +153,6 @@ fn rpc_context_omits_indexer_when_node_txindex_is_disabled() -> Result<()> {
     config.txindex = false;
     let state = NodeState::open(config)?;
 
-    assert!(state.tx_index().is_none());
+    assert!(state.tx_index_reader().is_none());
     Ok(())
 }

@@ -9,14 +9,14 @@ use arc_swap::ArcSwapOption;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
-use bitcoin_rs_index::{IndexConnect, IndexerLike, TxIndexRuntime};
+use bitcoin_rs_index::{IndexConnect, TxIndexRuntime, TxIndexWriter};
 use bitcoin_rs_primitives::Hash256;
 use crossbeam_channel::Receiver;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::apply::PruneBodyStore;
 
-type TxIndexHandle = Arc<Mutex<Box<dyn IndexerLike>>>;
+type TxIndexHandle = Box<dyn TxIndexWriter>;
 const FORWARD_BATCH_MAX_ROWS: usize = 250_000;
 const FORWARD_BATCH_MAX_ROW_BYTES: usize = 8 * 1024 * 1024;
 const FORWARD_BATCH_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
@@ -60,15 +60,15 @@ impl TxIndexWorker {
         }
     }
 
-    pub(crate) fn run(self) {
+    pub(crate) fn run(mut self) {
         if let Err(error) = self.run_inner() {
             tracing::error!(%error, "TxIndex worker stopped");
             self.runtime.publish_failed(error.to_string());
         }
     }
 
-    fn run_inner(&self) -> Result<()> {
-        self.indexer.lock().watermark()?;
+    fn run_inner(&mut self) -> Result<()> {
+        self.indexer.watermark()?;
         self.runtime.publish_healthy();
         self.reconcile()?;
 
@@ -82,7 +82,7 @@ impl TxIndexWorker {
         Ok(())
     }
 
-    fn reconcile(&self) -> Result<()> {
+    fn reconcile(&mut self) -> Result<()> {
         let mut stale_retries = 0_u32;
         loop {
             if self.shutdown.load(Ordering::Acquire) {
@@ -99,7 +99,7 @@ impl TxIndexWorker {
                 }
                 Err(AttemptError::Fatal(error)) => return Err(error),
             }
-            let watermark = self.indexer.lock().watermark()?;
+            let watermark = self.indexer.watermark()?;
             let fresh = self.applied_tip.load_full();
             if fresh.as_deref().is_some_and(|tip| {
                 watermark.is_some_and(|watermark| {
@@ -111,8 +111,11 @@ impl TxIndexWorker {
         }
     }
 
-    fn reconcile_attempt(&self, target: &TipSnapshot) -> core::result::Result<(), AttemptError> {
-        let mut watermark = self.indexer.lock().watermark().map_err(fatal)?;
+    fn reconcile_attempt(
+        &mut self,
+        target: &TipSnapshot,
+    ) -> core::result::Result<(), AttemptError> {
+        let mut watermark = self.indexer.watermark().map_err(fatal)?;
 
         while let Some(current) = watermark {
             let on_target = if current.height > target.height {
@@ -142,7 +145,6 @@ impl TxIndexWorker {
                     ))
                 })?;
             self.indexer
-                .lock()
                 .rollback_block_atomic(&block, current)
                 .map_err(fatal)?;
             watermark = Some(bitcoin_rs_index::IndexWatermark {
@@ -191,7 +193,7 @@ impl TxIndexWorker {
         Ok(())
     }
 
-    fn commit_forward_batch(&self, batch: &[(bitcoin::Block, u32, Hash256)]) -> Result<()> {
+    fn commit_forward_batch(&mut self, batch: &[(bitcoin::Block, u32, Hash256)]) -> Result<()> {
         let transitions = batch
             .iter()
             .map(|(block, height, hash)| IndexConnect {
@@ -203,7 +205,7 @@ impl TxIndexWorker {
         // The source bodies must reach stable storage before an independently
         // durable TxIndex watermark can claim them.
         self.body_store.sync()?;
-        self.indexer.lock().connect_blocks_atomic(&transitions)?;
+        self.indexer.connect_blocks_atomic(&transitions)?;
         Ok(())
     }
 
@@ -287,6 +289,7 @@ mod tests {
     use bitcoin_rs_storage::{FjallStore, StorageError};
     use crossbeam_channel::bounded;
     use hashbrown::HashMap;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -369,7 +372,7 @@ mod tests {
     fn empty_index_bootstraps_to_captured_tip() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(FjallStore::open(dir.path())?);
-        let indexer: TxIndexHandle = Arc::new(Mutex::new(Box::new(Indexer::new(store))));
+        let indexer: TxIndexHandle = Box::new(Indexer::new(Arc::clone(&store)));
         let bodies = Arc::new(MapBodyStore::default());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let child = child_block(&genesis, 1);
@@ -383,16 +386,10 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
-        worker(
-            indexer.clone(),
-            applied_tip,
-            Arc::new(RwLock::new(tree)),
-            bodies,
-        )
-        .reconcile()?;
+        worker(indexer, applied_tip, Arc::new(RwLock::new(tree)), bodies).reconcile()?;
 
         assert_eq!(
-            indexer.lock().watermark()?,
+            Indexer::new(store).watermark()?,
             Some(IndexWatermark {
                 height: 1,
                 hash: child_hash,
@@ -405,7 +402,7 @@ mod tests {
     fn consumer_ahead_rolls_back_to_shorter_authoritative_tip() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(FjallStore::open(dir.path())?);
-        let mut concrete = Indexer::new(store);
+        let mut concrete = Indexer::new(Arc::clone(&store));
         let bodies = Arc::new(MapBodyStore::default());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let child = child_block(&genesis, 2);
@@ -413,7 +410,7 @@ mod tests {
         let child_hash = bodies.insert(1, &child);
         concrete.connect_block_atomic(&genesis, 0, genesis_hash)?;
         concrete.connect_block_atomic(&child, 1, child_hash)?;
-        let indexer: TxIndexHandle = Arc::new(Mutex::new(Box::new(concrete)));
+        let indexer: TxIndexHandle = Box::new(concrete);
 
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_header(genesis.header, NodeStatus::Active)?;
@@ -422,16 +419,10 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
-        worker(
-            indexer.clone(),
-            applied_tip,
-            Arc::new(RwLock::new(tree)),
-            bodies,
-        )
-        .reconcile()?;
+        worker(indexer, applied_tip, Arc::new(RwLock::new(tree)), bodies).reconcile()?;
 
         assert_eq!(
-            indexer.lock().watermark()?,
+            Indexer::new(store).watermark()?,
             Some(IndexWatermark {
                 height: 0,
                 hash: genesis_hash,
@@ -444,7 +435,7 @@ mod tests {
     fn stale_fork_rolls_back_then_connects_authoritative_suffix() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(FjallStore::open(dir.path())?);
-        let mut concrete = Indexer::new(store);
+        let mut concrete = Indexer::new(Arc::clone(&store));
         let bodies = Arc::new(MapBodyStore::default());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let stale = child_block(&genesis, 3);
@@ -454,7 +445,7 @@ mod tests {
         let active_hash = bodies.insert(1, &active);
         concrete.connect_block_atomic(&genesis, 0, genesis_hash)?;
         concrete.connect_block_atomic(&stale, 1, stale_hash)?;
-        let indexer: TxIndexHandle = Arc::new(Mutex::new(Box::new(concrete)));
+        let indexer: TxIndexHandle = Box::new(concrete);
 
         let mut tree = BlockTree::new();
         tree.insert_header(genesis.header, NodeStatus::Active)?;
@@ -464,16 +455,10 @@ mod tests {
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
-        worker(
-            indexer.clone(),
-            applied_tip,
-            Arc::new(RwLock::new(tree)),
-            bodies,
-        )
-        .reconcile()?;
+        worker(indexer, applied_tip, Arc::new(RwLock::new(tree)), bodies).reconcile()?;
 
         assert_eq!(
-            indexer.lock().watermark()?,
+            Indexer::new(store).watermark()?,
             Some(IndexWatermark {
                 height: 1,
                 hash: active_hash,
@@ -486,7 +471,7 @@ mod tests {
     fn missing_body_for_unchanged_authoritative_target_fails_only_worker() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(FjallStore::open(dir.path())?);
-        let indexer: TxIndexHandle = Arc::new(Mutex::new(Box::new(Indexer::new(store))));
+        let indexer: TxIndexHandle = Box::new(Indexer::new(store));
         let bodies = Arc::new(MapBodyStore::default());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let mut tree = BlockTree::new();

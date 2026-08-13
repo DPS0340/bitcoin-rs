@@ -99,12 +99,12 @@ mod tests {
             .with_block_body_source(state.block_body_source())
             .with_block_tree(state.block_tree());
         let tx_index = state
-            .tx_index()
+            .tx_index_reader()
             .ok_or_else(|| anyhow::anyhow!("txindex missing after enabled open"))?;
         state.start_tx_index_worker()?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let ready = tx_index.lock().watermark()?.is_some_and(|watermark| {
+            let ready = tx_index.watermark()?.is_some_and(|watermark| {
                 watermark.height == tip.height && watermark.hash == tip.hash
             });
             if ready {
@@ -115,7 +115,7 @@ mod tests {
             }
             std::thread::yield_now();
         }
-        let resolved = tx_index.lock().resolve_transaction(txid, &source)?;
+        let resolved = tx_index.resolve_transaction(txid, &source)?;
         assert_eq!(
             resolved.as_ref().map(bitcoin::Transaction::compute_txid),
             Some(txid),

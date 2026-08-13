@@ -22,18 +22,12 @@ pub enum IndexError {
     /// `bitcoin_slices` rejected the serialized block.
     #[error("invalid serialized block: {0:?}")]
     BlockParse(bitcoin_slices::Error),
-    /// This indexer cannot undo a block, so a reorg cannot be made consistent.
-    #[error("this indexer does not support block disconnect")]
-    UnsupportedRollback,
     /// A block header did not have the consensus 80-byte length.
     #[error("invalid block header length {len}")]
     InvalidHeaderLength {
         /// Actual header length observed by the visitor.
         len: usize,
     },
-    /// A worker-only atomic transition was requested from an indexer that does not implement it.
-    #[error("this indexer does not support atomic watermark transitions")]
-    UnsupportedWatermarkTransition,
     /// Legacy buffered ingestion was mixed with the durable worker transition API.
     #[error("cannot run an atomic TxIndex transition with buffered legacy rows")]
     PendingLegacyRows,
@@ -1648,146 +1642,18 @@ mod watermark_tests {
     }
 }
 
-/// Storage-agnostic block-ingest interface.
-///
-/// Use this trait when consumers must hold the indexer behind a trait
-/// object (e.g. when the storage backend is selected at runtime).
-pub trait IndexerLike: Send + Sync {
-    /// Loads the exact durable watermark owned by an asynchronous index worker.
-    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Atomically connects one exact block and advances the durable watermark.
-    fn connect_block_atomic(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        expected_hash: Hash256,
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = (block, height, expected_hash);
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Atomically connects a contiguous slice and publishes only its terminal watermark.
-    fn connect_blocks_atomic(
-        &mut self,
-        blocks: &[IndexConnect<'_>],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = blocks;
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Atomically rolls back the exact watermark block and retreats to its parent.
-    fn rollback_block_atomic(
-        &mut self,
-        block: &bitcoin::Block,
-        watermark: IndexWatermark,
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = (block, watermark);
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Walks `block` once and writes index rows. See `Indexer::ingest_block`.
-    fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError>;
-
-    /// Walks `block` once and writes index rows, reusing precomputed transaction IDs when supported.
-    ///
-    /// The default implementation preserves existing implementations by ignoring `txids` and
-    /// delegating to [`IndexerLike::ingest_block`].
-    fn ingest_block_with_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = txids;
-        self.ingest_block(block, height)
-    }
-
-    /// Walks `block` once and writes index rows, trusting caller-verified transaction IDs when
-    /// supported.
-    ///
-    /// The default implementation preserves existing implementations by validating through
-    /// [`IndexerLike::ingest_block_with_txids`].
-    fn ingest_block_with_verified_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        self.ingest_block_with_txids(block, height, txids)
-    }
-
-    /// Walks a decoded block and writes rows, trusting caller-verified transaction IDs when
-    /// supported.
-    ///
-    /// The default implementation preserves existing implementations by validating through
-    /// [`IndexerLike::ingest_block_with_verified_txids`].
-    fn ingest_decoded_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        serialized_block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = block;
-        self.ingest_block_with_verified_txids(serialized_block, height, txids)
-    }
-
-    /// Deletes every index row that ingesting `block` at `height` would have written.
-    ///
-    /// The inverse of the ingest methods above. The default returns
-    /// [`IndexError::UnsupportedRollback`] rather than succeeding: an
-    /// implementation that silently reports a successful rollback while
-    /// deleting nothing would let the node advance its tip believing the index
-    /// is consistent, and the Electrum server would then serve transactions
-    /// that are no longer in the chain. Failing loudly is the only safe
-    /// default. Concrete indexers that persist rows override this.
-    fn rollback_block(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = (block, height);
-        Err(IndexError::UnsupportedRollback)
-    }
-
-    /// Same as [`IndexerLike::rollback_block`] but reuses caller-verified
-    /// transaction IDs when supported.
-    ///
-    /// The default implementation preserves existing implementations by
-    /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
-    fn rollback_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = txids;
-        self.rollback_block(block, height)
-    }
-
-    /// Begins a batch of block ingests; rows are not flushed until [`IndexerLike::end_batch`].
-    fn begin_batch(&mut self) {}
-
-    /// Ends a batch of block ingests, flushing any accumulated rows.
-    fn end_batch(&mut self) -> Result<(), IndexError> {
-        Ok(())
-    }
+/// Read-only `TxIndex` interface used by RPC complete queries.
+pub trait TxIndexReader: Send + Sync {
+    /// Loads the exact durable watermark from the TxIndex store.
+    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
 
     /// Resolves a confirmed transaction by txid via `source`.
     ///
-    /// Default implementations may return `Ok(None)` when the concrete indexer
-    /// does not support transaction lookup.
     fn resolve_transaction(
         &self,
         txid: bitcoin::Txid,
         source: &dyn BlockSource,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
-        let _ = (txid, source);
-        Ok(None)
-    }
+    ) -> Result<Option<bitcoin::Transaction>, IndexError>;
 
     /// Resolves the satoshi value of the transaction output at `outpoint` via
     /// `source`. Returns `Ok(None)` when the transaction is not indexed or the
@@ -1803,6 +1669,25 @@ pub trait IndexerLike: Send + Sync {
     ) -> Result<Option<u64>, IndexError>;
 }
 
+/// Mutation-only interface owned by the asynchronous TxIndex worker.
+pub trait TxIndexWriter: Send + Sync {
+    /// Loads the exact durable watermark from the TxIndex store.
+    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
+
+    /// Atomically connects a contiguous slice and publishes its terminal watermark.
+    fn connect_blocks_atomic(
+        &mut self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<IndexRowCounts, IndexError>;
+
+    /// Atomically rolls back the exact watermark block and retreats to its parent.
+    fn rollback_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<IndexRowCounts, IndexError>;
+}
+
 /// Provides block lookups for resolving lossy index prefixes to full identities.
 ///
 /// The index column families store 8-byte prefixes of txids/scripthashes/outpoints.
@@ -1815,90 +1700,9 @@ pub trait BlockSource {
     fn block_at_height(&self, height: u32) -> Option<bitcoin::Block>;
 }
 
-impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
+impl<S: KvStore + Send + Sync + 'static> TxIndexReader for Indexer<S> {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
         Self::watermark(self)
-    }
-
-    fn connect_block_atomic(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        expected_hash: Hash256,
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::connect_block_atomic(self, block, height, expected_hash)
-    }
-
-    fn connect_blocks_atomic(
-        &mut self,
-        blocks: &[IndexConnect<'_>],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::connect_blocks_atomic(self, blocks)
-    }
-
-    fn rollback_block_atomic(
-        &mut self,
-        block: &bitcoin::Block,
-        watermark: IndexWatermark,
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::rollback_block_atomic(self, block, watermark)
-    }
-
-    fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_block(self, block, height)
-    }
-
-    fn ingest_block_with_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_block_with_txids(self, block, height, txids)
-    }
-
-    fn ingest_block_with_verified_txids(
-        &mut self,
-        block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_block_with_verified_txids(self, block, height, txids)
-    }
-
-    fn ingest_decoded_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        serialized_block: &[u8],
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
-    }
-
-    fn rollback_block(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::rollback_block(self, block, height)
-    }
-
-    fn rollback_block_with_verified_txids(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-        txids: &[bitcoin::Txid],
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::rollback_block_with_verified_txids(self, block, height, txids)
-    }
-
-    fn begin_batch(&mut self) {
-        Self::begin_batch(self);
-    }
-
-    fn end_batch(&mut self) -> Result<(), IndexError> {
-        Self::end_batch(self)
     }
 
     fn resolve_transaction(
@@ -1915,6 +1719,27 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         source: &dyn BlockSource,
     ) -> Result<Option<u64>, IndexError> {
         Self::resolve_outpoint_value(self, outpoint, source)
+    }
+}
+
+impl<S: KvStore + Send + Sync + 'static> TxIndexWriter for Indexer<S> {
+    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+        Self::watermark(self)
+    }
+
+    fn connect_blocks_atomic(
+        &mut self,
+        blocks: &[IndexConnect<'_>],
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::connect_blocks_atomic(self, blocks)
+    }
+
+    fn rollback_block_atomic(
+        &mut self,
+        block: &bitcoin::Block,
+        watermark: IndexWatermark,
+    ) -> Result<IndexRowCounts, IndexError> {
+        Self::rollback_block_atomic(self, block, watermark)
     }
 }
 
@@ -2315,7 +2140,7 @@ mod tests {
             block,
             target_height: 0,
         };
-        let dyn_indexer: &dyn super::IndexerLike = &indexer;
+        let dyn_indexer: &dyn super::TxIndexReader = &indexer;
         let dyn_source: &dyn super::BlockSource = &source;
         let outpoint = bitcoin::OutPoint { txid, vout: 0 };
         let value = dyn_indexer.resolve_outpoint_value(outpoint, dyn_source)?;
@@ -2661,47 +2486,6 @@ mod tests {
             "a failed rollback must leave every row in place"
         );
         Ok(())
-    }
-
-    /// An indexer that persists nothing and does not override the rollback
-    /// default. It must refuse rather than report a successful no-op, or the
-    /// node would advance its tip believing a stale index is consistent.
-    struct RollbackUnawareIndexer;
-
-    impl super::IndexerLike for RollbackUnawareIndexer {
-        fn ingest_block(
-            &mut self,
-            _block: &[u8],
-            _height: u32,
-        ) -> Result<super::IndexRowCounts, super::IndexError> {
-            Ok(super::IndexRowCounts::default())
-        }
-
-        fn resolve_transaction(
-            &self,
-            _txid: Txid,
-            _source: &dyn BlockSource,
-        ) -> Result<Option<Transaction>, super::IndexError> {
-            Ok(None)
-        }
-
-        fn resolve_outpoint_value(
-            &self,
-            _outpoint: OutPoint,
-            _source: &dyn BlockSource,
-        ) -> Result<Option<u64>, super::IndexError> {
-            Ok(None)
-        }
-    }
-
-    #[test]
-    fn the_rollback_default_refuses_rather_than_silently_succeeding() {
-        let mut indexer = RollbackUnawareIndexer;
-        let candidate = rollback_fixture_block();
-        assert!(matches!(
-            super::IndexerLike::rollback_block(&mut indexer, &candidate, HEIGHT),
-            Err(super::IndexError::UnsupportedRollback)
-        ));
     }
 
     /// A repeated rollback must not delete a replacement block's rows.

@@ -12,7 +12,7 @@ use bitcoin_rs_primitives::{Hash256, Network};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use thiserror::Error;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
@@ -309,10 +309,10 @@ pub struct Context {
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
     pub chain_control: Option<Arc<dyn ChainControl>>,
-    /// Optional shared confirmed-block indexer used to resolve prevout values for fee statistics.
+    /// Optional immutable confirmed-block index reader used by complete queries.
     /// `None` for embedded/test callers without txindex.
-    pub indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
-    /// Process-local completeness and query/mutation gate for asynchronous `TxIndex`.
+    pub indexer: Option<Arc<dyn bitcoin_rs_index::TxIndexReader>>,
+    /// Process-local asynchronous `TxIndex` worker status.
     pub tx_index_runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
@@ -433,7 +433,7 @@ impl Context {
         p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
         banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
         added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
-        indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
+        indexer: Option<Arc<dyn bitcoin_rs_index::TxIndexReader>>,
     ) -> Self {
         let (mining_sender, mining_notifications) = unbounded();
         Self {
@@ -487,7 +487,7 @@ impl Context {
     pub fn complete_tx_index_query<T>(
         &self,
         query: impl FnOnce(
-            &dyn bitcoin_rs_index::IndexerLike,
+            &dyn bitcoin_rs_index::TxIndexReader,
         ) -> Result<T, bitcoin_rs_index::IndexError>,
     ) -> Result<T, TxIndexQueryError> {
         let indexer = self
@@ -497,13 +497,12 @@ impl Context {
         let Some(_runtime) = &self.tx_index_runtime else {
             // Embedded/test callers predate the asynchronous worker. Production
             // wiring always supplies a runtime when TxIndex is enabled.
-            return query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index);
+            return query(indexer.as_ref()).map_err(TxIndexQueryError::Index);
         };
         let start_tip = self
             .applied_tip
             .load_full()
             .ok_or(TxIndexQueryError::Unavailable)?;
-        let indexer = indexer.lock();
         if !indexer
             .watermark()
             .map_err(TxIndexQueryError::Index)?
@@ -514,7 +513,6 @@ impl Context {
             return Err(TxIndexQueryError::Unavailable);
         }
         let result = query(indexer.as_ref()).map_err(TxIndexQueryError::Index)?;
-        drop(indexer);
         let Some(end_tip) = self.applied_tip.load_full() else {
             return Err(TxIndexQueryError::Unavailable);
         };
@@ -870,7 +868,7 @@ mod tests {
     #[derive(Debug)]
     struct EmptyIndexer(Option<bitcoin_rs_index::IndexWatermark>);
 
-    impl bitcoin_rs_index::IndexerLike for EmptyIndexer {
+    impl bitcoin_rs_index::TxIndexReader for EmptyIndexer {
         fn watermark(
             &self,
         ) -> Result<Option<bitcoin_rs_index::IndexWatermark>, bitcoin_rs_index::IndexError>
@@ -878,12 +876,12 @@ mod tests {
             Ok(self.0)
         }
 
-        fn ingest_block(
-            &mut self,
-            _block: &[u8],
-            _height: u32,
-        ) -> Result<bitcoin_rs_index::IndexRowCounts, bitcoin_rs_index::IndexError> {
-            Ok(bitcoin_rs_index::IndexRowCounts::default())
+        fn resolve_transaction(
+            &self,
+            _txid: bitcoin::Txid,
+            _source: &dyn bitcoin_rs_index::BlockSource,
+        ) -> Result<Option<bitcoin::Transaction>, bitcoin_rs_index::IndexError> {
+            Ok(None)
         }
 
         fn resolve_outpoint_value(
@@ -900,9 +898,7 @@ mod tests {
         watermark: bitcoin_rs_index::IndexWatermark,
     ) -> Context {
         let mut ctx = Context::new();
-        ctx.indexer = Some(Arc::new(Mutex::new(Box::new(EmptyIndexer(Some(
-            watermark,
-        ))))));
+        ctx.indexer = Some(Arc::new(EmptyIndexer(Some(watermark))));
         ctx.set_applied_tip(tip);
         let runtime = Arc::new(bitcoin_rs_index::TxIndexRuntime::new());
         runtime.publish_healthy();

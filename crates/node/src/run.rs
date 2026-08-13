@@ -644,7 +644,7 @@ pub fn run(mut config: Config) -> Result<()> {
         Some(state.p2p_outbound_sender()),
         Arc::clone(&banned),
         Arc::new(parking_lot::RwLock::new(Vec::new())),
-        state.tx_index(),
+        state.tx_index_reader(),
     );
     rpc_context = rpc_context.with_tx_index_runtime(state.tx_index_runtime());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
