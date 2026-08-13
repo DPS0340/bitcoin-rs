@@ -208,25 +208,22 @@ the attempt and captures a fresh target. If the same published target cannot be
 resolved, or the durable watermark body needed for rollback is missing, that is
 a source failure rather than an ordinary retry.
 
-### TxIndex completeness gate
+### TxIndex completeness boundary
 
 The #77 read boundary that prevents asynchronous index lag from being
-reported as an authoritative negative. A complete TxIndex query requires a
-healthy worker and a committed watermark equal to the captured applied tip,
-excludes worker mutation for the logical query, and verifies before returning
-that the applied-tip publication identity did not change. Each publication uses
-a fresh `Arc`, so pointer identity is a unique process-local token that also
-detects an `A -> B -> A` value ABA. The query retains its starting `Arc`, which
-prevents that address from being reused before the final comparison. Lag,
-failure, or concurrent chain movement
-returns unavailable (or a bounded retry), not "not found." Rich Electrum
-readiness and partial-history policy are separate concerns. Electrum unspent
-queries distinguish reader absence from an authoritative empty result and cap
-the history/funding/output work performed while holding this gate. Lossy
-spending-prefix matches are candidates, not proof: complete unspent reads scan
-the referenced block inputs for the full outpoint. Worker connect and rollback
-row construction happens in prepared transitions outside the write gate; the
-commit rechecks its starting watermark before the atomic write.
+reported as an authoritative negative. A complete TxIndex query captures the
+applied tip, reads the durable DB watermark directly and requires it to match,
+then verifies before returning that the applied-tip publication identity did
+not change. Each publication uses a fresh `Arc`, so pointer identity is a
+unique process-local token that also detects an `A -> B -> A` value ABA. The
+query retains its starting `Arc`, which prevents that address from being reused
+before the final comparison. Lag or concurrent chain movement returns
+unavailable (or a bounded retry), not "not found." Worker health is operational
+status only, not a second copy of durable progress. Rich Electrum readiness and
+partial-history policy are separate concerns. Lossy spending-prefix matches
+are candidates, not proof: complete unspent reads scan the referenced block
+inputs for the full outpoint. Worker connect and rollback each use one atomic
+transition API, with rows and terminal watermark written in the same DB batch.
 
 ### Coalesced index wake
 

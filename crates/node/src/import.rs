@@ -104,12 +104,8 @@ mod tests {
         state.start_tx_index_worker()?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let ready = state.tx_index_runtime().is_some_and(|runtime| {
-                let snapshot = runtime.snapshot();
-                snapshot.health == bitcoin_rs_index::IndexWorkerHealth::Healthy
-                    && snapshot.watermark.is_some_and(|watermark| {
-                        watermark.height == tip.height && watermark.hash == tip.hash
-                    })
+            let ready = tx_index.lock().watermark()?.is_some_and(|watermark| {
+                watermark.height == tip.height && watermark.hash == tip.hash
             });
             if ready {
                 break;

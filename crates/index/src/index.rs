@@ -34,6 +34,9 @@ pub enum IndexError {
     /// A worker-only atomic transition was requested from an indexer that does not implement it.
     #[error("this indexer does not support atomic watermark transitions")]
     UnsupportedWatermarkTransition,
+    /// Legacy buffered ingestion was mixed with the durable worker transition API.
+    #[error("cannot run an atomic TxIndex transition with buffered legacy rows")]
+    PendingLegacyRows,
     /// The durable watermark bytes do not use the supported codec.
     #[error("invalid TxIndex watermark encoding")]
     InvalidWatermark,
@@ -156,22 +159,6 @@ pub struct IndexRowCounts {
     pub headers: usize,
 }
 
-/// Fully validated `TxIndex` rows ready for one atomic forward commit.
-///
-/// Construction is CPU-only and may run before the query/mutation write gate.
-pub struct PreparedIndexConnect {
-    expected_watermark: Option<IndexWatermark>,
-    terminal_watermark: IndexWatermark,
-    rows: PendingRows,
-}
-
-/// Fully validated `TxIndex` rows ready for one atomic rollback commit.
-pub struct PreparedIndexRollback {
-    watermark: IndexWatermark,
-    parent: IndexWatermark,
-    rows: PendingRows,
-}
-
 /// Electrs-shaped block indexer backed by a workspace [`KvStore`].
 pub struct Indexer<S: KvStore> {
     store: std::sync::Arc<S>,
@@ -229,21 +216,10 @@ impl<S: KvStore> Indexer<S> {
         &mut self,
         blocks: &[IndexConnect<'_>],
     ) -> Result<IndexRowCounts, IndexError> {
-        let prepared = self.prepare_connect_blocks(blocks)?;
-        let Some(prepared) = prepared else {
+        let Some(first) = blocks.first() else {
             return Ok(IndexRowCounts::default());
         };
-        self.commit_prepared_connect(&prepared)
-    }
-
-    /// Validates a contiguous block slice and constructs all rows without writing.
-    pub fn prepare_connect_blocks(
-        &self,
-        blocks: &[IndexConnect<'_>],
-    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
-        let Some(first) = blocks.first() else {
-            return Ok(None);
-        };
+        self.ensure_atomic_transition_ready()?;
         let current = self.watermark()?;
         let mut expected_height = match current {
             None => 0,
@@ -284,36 +260,17 @@ impl<S: KvStore> Indexer<S> {
         }
         let terminal = blocks.last().unwrap_or(first);
         rows.sort();
-        Ok(Some(PreparedIndexConnect {
-            expected_watermark: current,
-            terminal_watermark: IndexWatermark {
-                height: terminal.height,
-                hash: terminal.hash,
-            },
-            rows,
-        }))
-    }
-
-    /// Atomically commits preconstructed rows after rechecking their starting watermark.
-    pub fn commit_prepared_connect(
-        &mut self,
-        prepared: &PreparedIndexConnect,
-    ) -> Result<IndexRowCounts, IndexError> {
-        self.flush()?;
-        let actual = self.watermark()?;
-        if actual != prepared.expected_watermark {
-            return Err(IndexError::WatermarkMismatch {
-                expected: prepared.expected_watermark,
-                actual,
-            });
-        }
-        let counts = prepared.rows.counts();
+        let counts = rows.counts();
         let mut batch = self.store.new_batch();
-        put_rows(&mut batch, &prepared.rows);
+        put_rows(&mut batch, &rows);
         batch.put(
             ColumnFamily::UtxoMeta,
             WATERMARK_KEY,
-            &prepared.terminal_watermark.encode(),
+            &IndexWatermark {
+                height: terminal.height,
+                hash: terminal.hash,
+            }
+            .encode(),
         );
         self.store.write(batch)?;
         self.last_counts = counts;
@@ -329,16 +286,7 @@ impl<S: KvStore> Indexer<S> {
         block: &bitcoin::Block,
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
-        let prepared = self.prepare_rollback_block(block, watermark)?;
-        self.commit_prepared_rollback(&prepared)
-    }
-
-    /// Validates and constructs rollback rows without mutating storage.
-    pub fn prepare_rollback_block(
-        &self,
-        block: &bitcoin::Block,
-        watermark: IndexWatermark,
-    ) -> Result<PreparedIndexRollback, IndexError> {
+        self.ensure_atomic_transition_ready()?;
         validate_block_identity(block, watermark.height, watermark.hash)?;
         let actual = self.watermark()?;
         if actual != Some(watermark) {
@@ -365,28 +313,8 @@ impl<S: KvStore> Indexer<S> {
             height: watermark.height - 1,
             hash: Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()),
         };
-        Ok(PreparedIndexRollback {
-            watermark,
-            parent,
-            rows,
-        })
-    }
-
-    /// Atomically commits a preconstructed rollback after rechecking its watermark.
-    pub fn commit_prepared_rollback(
-        &mut self,
-        prepared: &PreparedIndexRollback,
-    ) -> Result<IndexRowCounts, IndexError> {
-        self.flush()?;
-        let actual = self.watermark()?;
-        if actual != Some(prepared.watermark) {
-            return Err(IndexError::WatermarkMismatch {
-                expected: Some(prepared.watermark),
-                actual,
-            });
-        }
-        let counts = prepared.rows.counts();
-        let identity_present = match prepared.rows.header_rows.first() {
+        let counts = rows.counts();
+        let identity_present = match rows.header_rows.first() {
             Some(header) => self
                 .store
                 .get(ColumnFamily::BlockHeaders, header)?
@@ -395,17 +323,13 @@ impl<S: KvStore> Indexer<S> {
         };
         if !identity_present {
             return Err(IndexError::MissingWatermarkIdentity {
-                height: prepared.watermark.height,
-                hash: prepared.watermark.hash,
+                height: watermark.height,
+                hash: watermark.hash,
             });
         }
         let mut batch = self.store.new_batch();
-        delete_rows(&mut batch, &prepared.rows);
-        batch.put(
-            ColumnFamily::UtxoMeta,
-            WATERMARK_KEY,
-            &prepared.parent.encode(),
-        );
+        delete_rows(&mut batch, &rows);
+        batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &parent.encode());
         self.store.write(batch)?;
         self.last_counts = counts;
         Ok(counts)
@@ -1151,6 +1075,13 @@ impl<S: KvStore> Indexer<S> {
         Ok(block_counts)
     }
 
+    fn ensure_atomic_transition_ready(&self) -> Result<(), IndexError> {
+        if self.batch_depth != 0 || self.pending_rows.total() != 0 {
+            return Err(IndexError::PendingLegacyRows);
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<IndexRowCounts, IndexError> {
         self.pending_rows.sort();
         let counts = self.pending_rows.counts();
@@ -1598,30 +1529,6 @@ mod watermark_tests {
     }
 
     #[test]
-    fn prepared_connect_does_not_publish_until_commit() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let store = Arc::new(FjallStore::open(dir.path())?);
-        let mut indexer = Indexer::new(store);
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
-        let prepared = indexer
-            .prepare_connect_blocks(&[IndexConnect {
-                block: &genesis,
-                height: 0,
-                hash,
-            }])?
-            .ok_or_else(|| std::io::Error::other("missing prepared transition"))?;
-
-        assert_eq!(indexer.watermark()?, None);
-        indexer.commit_prepared_connect(&prepared)?;
-        assert_eq!(
-            indexer.watermark()?,
-            Some(IndexWatermark { height: 0, hash })
-        );
-        Ok(())
-    }
-
-    #[test]
     fn spending_prefix_collision_is_not_reported_as_spent() -> Result<(), Box<dyn std::error::Error>>
     {
         let dir = tempfile::tempdir()?;
@@ -1771,24 +1678,6 @@ pub trait IndexerLike: Send + Sync {
         Err(IndexError::UnsupportedWatermarkTransition)
     }
 
-    /// Constructs a forward transition without mutating storage.
-    fn prepare_connect_blocks(
-        &self,
-        blocks: &[IndexConnect<'_>],
-    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
-        let _ = blocks;
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Commits rows produced by [`IndexerLike::prepare_connect_blocks`].
-    fn commit_prepared_connect(
-        &mut self,
-        prepared: &PreparedIndexConnect,
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = prepared;
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
     /// Atomically rolls back the exact watermark block and retreats to its parent.
     fn rollback_block_atomic(
         &mut self,
@@ -1796,25 +1685,6 @@ pub trait IndexerLike: Send + Sync {
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = (block, watermark);
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Constructs a rollback transition without mutating storage.
-    fn prepare_rollback_block(
-        &self,
-        block: &bitcoin::Block,
-        watermark: IndexWatermark,
-    ) -> Result<PreparedIndexRollback, IndexError> {
-        let _ = (block, watermark);
-        Err(IndexError::UnsupportedWatermarkTransition)
-    }
-
-    /// Commits rows produced by [`IndexerLike::prepare_rollback_block`].
-    fn commit_prepared_rollback(
-        &mut self,
-        prepared: &PreparedIndexRollback,
-    ) -> Result<IndexRowCounts, IndexError> {
-        let _ = prepared;
         Err(IndexError::UnsupportedWatermarkTransition)
     }
 
@@ -1966,41 +1836,12 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         Self::connect_blocks_atomic(self, blocks)
     }
 
-    fn prepare_connect_blocks(
-        &self,
-        blocks: &[IndexConnect<'_>],
-    ) -> Result<Option<PreparedIndexConnect>, IndexError> {
-        Self::prepare_connect_blocks(self, blocks)
-    }
-
-    fn commit_prepared_connect(
-        &mut self,
-        prepared: &PreparedIndexConnect,
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::commit_prepared_connect(self, prepared)
-    }
-
     fn rollback_block_atomic(
         &mut self,
         block: &bitcoin::Block,
         watermark: IndexWatermark,
     ) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block_atomic(self, block, watermark)
-    }
-
-    fn prepare_rollback_block(
-        &self,
-        block: &bitcoin::Block,
-        watermark: IndexWatermark,
-    ) -> Result<PreparedIndexRollback, IndexError> {
-        Self::prepare_rollback_block(self, block, watermark)
-    }
-
-    fn commit_prepared_rollback(
-        &mut self,
-        prepared: &PreparedIndexRollback,
-    ) -> Result<IndexRowCounts, IndexError> {
-        Self::commit_prepared_rollback(self, prepared)
     }
 
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {

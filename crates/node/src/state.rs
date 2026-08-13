@@ -693,7 +693,6 @@ impl TxIndexStorage {
         blocks: Arc<RwLock<Vec<bitcoin_rs_rpc::BlockRecord>>>,
         block_body_source: Arc<dyn BlockBodySource>,
         block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
-        runtime: Arc<bitcoin_rs_index::TxIndexRuntime>,
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     ) -> Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> {
         let block_source = crate::NodeBlockSource::new(blocks)
@@ -705,7 +704,7 @@ impl TxIndexStorage {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
                 Arc::new(
                     bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(runtime, applied_tip),
+                        .with_completeness(applied_tip),
                 )
             }
             #[cfg(feature = "fjall")]
@@ -713,7 +712,7 @@ impl TxIndexStorage {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
                 Arc::new(
                     bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(runtime, applied_tip),
+                        .with_completeness(applied_tip),
                 )
             }
             #[cfg(feature = "redb")]
@@ -721,7 +720,7 @@ impl TxIndexStorage {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
                 Arc::new(
                     bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(runtime, applied_tip),
+                        .with_completeness(applied_tip),
                 )
             }
             #[cfg(feature = "mdbx")]
@@ -729,7 +728,7 @@ impl TxIndexStorage {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
                 Arc::new(
                     bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(runtime, applied_tip),
+                        .with_completeness(applied_tip),
                 )
             }
         }
@@ -1289,7 +1288,7 @@ impl NodeState {
         self.tx_index.as_ref().map(Arc::clone)
     }
 
-    /// Returns process-local `TxIndex` health, watermark, and query gate state.
+    /// Returns process-local `TxIndex` worker health.
     #[must_use]
     pub fn tx_index_runtime(&self) -> Option<Arc<bitcoin_rs_index::TxIndexRuntime>> {
         self.tx_index_runtime.as_ref().map(Arc::clone)
@@ -1356,12 +1355,10 @@ impl NodeState {
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
         self.tx_index_storage.as_ref().and_then(|storage| {
-            let runtime = self.tx_index_runtime.as_ref()?;
             Some(storage.electrum_history_reader(
                 self.blocks(),
                 self.block_body_source(),
                 self.block_tree(),
-                Arc::clone(runtime),
                 self.applied_tip(),
             ))
         })

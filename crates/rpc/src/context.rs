@@ -472,7 +472,7 @@ impl Context {
         self
     }
 
-    /// Attaches asynchronous `TxIndex` health, watermark, and query-gate state.
+    /// Attaches asynchronous `TxIndex` worker status.
     #[must_use]
     pub fn with_tx_index_runtime(
         mut self,
@@ -494,25 +494,27 @@ impl Context {
             .indexer
             .as_ref()
             .ok_or(TxIndexQueryError::Unavailable)?;
-        let Some(runtime) = &self.tx_index_runtime else {
+        let Some(_runtime) = &self.tx_index_runtime else {
             // Embedded/test callers predate the asynchronous worker. Production
             // wiring always supplies a runtime when TxIndex is enabled.
             return query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index);
         };
-        let _gate = runtime.read_gate();
         let start_tip = self
             .applied_tip
             .load_full()
             .ok_or(TxIndexQueryError::Unavailable)?;
-        let state = runtime.snapshot();
-        if state.health != bitcoin_rs_index::IndexWorkerHealth::Healthy
-            || !state.watermark.is_some_and(|watermark| {
+        let indexer = indexer.lock();
+        if !indexer
+            .watermark()
+            .map_err(TxIndexQueryError::Index)?
+            .is_some_and(|watermark| {
                 watermark.height == start_tip.height && watermark.hash == start_tip.hash
             })
         {
             return Err(TxIndexQueryError::Unavailable);
         }
-        let result = query(indexer.lock().as_ref()).map_err(TxIndexQueryError::Index)?;
+        let result = query(indexer.as_ref()).map_err(TxIndexQueryError::Index)?;
+        drop(indexer);
         let Some(end_tip) = self.applied_tip.load_full() else {
             return Err(TxIndexQueryError::Unavailable);
         };
@@ -866,9 +868,16 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    struct EmptyIndexer;
+    struct EmptyIndexer(Option<bitcoin_rs_index::IndexWatermark>);
 
     impl bitcoin_rs_index::IndexerLike for EmptyIndexer {
+        fn watermark(
+            &self,
+        ) -> Result<Option<bitcoin_rs_index::IndexWatermark>, bitcoin_rs_index::IndexError>
+        {
+            Ok(self.0)
+        }
+
         fn ingest_block(
             &mut self,
             _block: &[u8],
@@ -891,15 +900,17 @@ mod tests {
         watermark: bitcoin_rs_index::IndexWatermark,
     ) -> Context {
         let mut ctx = Context::new();
-        ctx.indexer = Some(Arc::new(Mutex::new(Box::new(EmptyIndexer))));
+        ctx.indexer = Some(Arc::new(Mutex::new(Box::new(EmptyIndexer(Some(
+            watermark,
+        ))))));
         ctx.set_applied_tip(tip);
         let runtime = Arc::new(bitcoin_rs_index::TxIndexRuntime::new());
-        runtime.publish_healthy(Some(watermark));
+        runtime.publish_healthy();
         ctx.with_tx_index_runtime(Some(runtime))
     }
 
     #[test]
-    fn complete_txindex_query_allows_exact_healthy_watermark() {
+    fn complete_txindex_query_allows_exact_durable_watermark() {
         let hash = Hash256::from_le_bytes(&[7; 32]);
         let tip = TipSnapshot {
             tip_id: bitcoin_rs_chain::NodeId::new(1),
@@ -992,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_txindex_query_rejects_failed_worker() {
+    fn complete_txindex_query_uses_durable_watermark_after_worker_failure() {
         let hash = Hash256::from_le_bytes(&[12; 32]);
         let tip = TipSnapshot {
             tip_id: bitcoin_rs_chain::NodeId::new(1),
@@ -1003,13 +1014,13 @@ mod tests {
         let mut ctx =
             txindex_query_context(tip, bitcoin_rs_index::IndexWatermark { height: 12, hash });
         let runtime = Arc::new(bitcoin_rs_index::TxIndexRuntime::new());
-        runtime.publish_healthy(Some(bitcoin_rs_index::IndexWatermark { height: 12, hash }));
+        runtime.publish_healthy();
         runtime.publish_failed("injected failure");
         ctx = ctx.with_tx_index_runtime(Some(runtime));
 
         let answer = ctx.complete_tx_index_query(|_| Ok(Option::<u64>::None));
 
-        assert!(matches!(answer, Err(TxIndexQueryError::Unavailable)));
+        assert_eq!(answer.expect("durable watermark is authoritative"), None);
     }
 
     #[test]

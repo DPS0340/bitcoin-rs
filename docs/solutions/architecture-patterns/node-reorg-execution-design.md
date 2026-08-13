@@ -82,20 +82,20 @@ mutation. TxIndex may durably lead the core checkpoint
 restored after a crash and will rewind itself; this rule is TxIndex-specific and
 must not be generalized to UTXO state, coinstats, or future consumers whose
 backward transition cannot be reconstructed from retained bodies. Complete RPC
-and Electrum reads are gated on a healthy watermark exactly equal to the
-current applied tip. They retain the starting applied-tip `Arc` and require the
+and Electrum reads compare the durable DB watermark directly with the captured
+applied tip. They retain the starting applied-tip `Arc` and require the
 same publication identity at return; because every publication allocates a
 fresh `Arc`, this rejects `A -> B -> A` value ABA as well as an ordinary tip
 move. A disappearing captured target is retried with bounded
 exponential backoff: repeated stale targets do not prove the current source is
 broken, but immediate retries can hot-spin while the authoritative tip moves.
 Electrum's unspent read distinguishes an unsupported reader from an
-authoritative empty result and bounds complete-query work while holding the
-read gate. Both forward and rollback workers prepare identity-checked, sorted,
-deduplicated rows before taking the write gate; only watermark revalidation,
-the atomic DB write, and runtime publication remain inside it. Electrum
+authoritative empty result and bounds complete-query work. Forward and rollback
+each expose one identity-checked atomic transition; there is no process-local
+watermark copy, prepared transition, or reader/writer gate. Worker health is
+observability only, while the DB watermark is the sole durable progress state. Electrum
 exact-resolves lossy spending-prefix candidates against block inputs, batches
-broadcast prevout reads under one gate, uses set membership for mempool spends,
+broadcast prevout reads under one completeness boundary, uses set membership for mempool spends,
 and caps per-session scripthash subscriptions.
 Because reconciliation currently depends on exact retained block bodies, node
 configuration temporarily rejects `txindex` together with a nonzero prune

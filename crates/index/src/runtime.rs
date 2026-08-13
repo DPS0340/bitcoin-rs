@@ -1,6 +1,4 @@
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-use crate::IndexWatermark;
+use parking_lot::RwLock;
 
 /// Process-local worker health. It is never persisted as lifecycle state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,29 +11,15 @@ pub enum IndexWorkerHealth {
     Failed(String),
 }
 
-/// One coherent observation of the worker and its last committed watermark.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IndexRuntimeSnapshot {
-    /// Ephemeral worker health.
-    pub health: IndexWorkerHealth,
-    /// Last watermark published after a successful atomic DB transition.
-    pub watermark: Option<IndexWatermark>,
-}
-
-/// Shared process-local boundary between the `TxIndex` worker and complete readers.
+/// Process-local worker status. Durable index progress lives only in the DB watermark.
 pub struct TxIndexRuntime {
-    state: RwLock<IndexRuntimeSnapshot>,
-    gate: RwLock<()>,
+    health: RwLock<IndexWorkerHealth>,
 }
 
 impl Default for TxIndexRuntime {
     fn default() -> Self {
         Self {
-            state: RwLock::new(IndexRuntimeSnapshot {
-                health: IndexWorkerHealth::Starting,
-                watermark: None,
-            }),
-            gate: RwLock::new(()),
+            health: RwLock::new(IndexWorkerHealth::Starting),
         }
     }
 }
@@ -47,41 +31,27 @@ impl TxIndexRuntime {
         Self::default()
     }
 
-    /// Prevents worker publication while one complete logical query runs.
-    pub fn read_gate(&self) -> RwLockReadGuard<'_, ()> {
-        self.gate.read()
-    }
-
-    /// Excludes complete queries while one DB transition and watermark publication commit.
-    pub fn write_gate(&self) -> RwLockWriteGuard<'_, ()> {
-        self.gate.write()
-    }
-
-    /// Returns one coherent state observation.
+    /// Returns the worker's current process-local health.
     #[must_use]
-    pub fn snapshot(&self) -> IndexRuntimeSnapshot {
-        self.state.read().clone()
+    pub fn health(&self) -> IndexWorkerHealth {
+        self.health.read().clone()
     }
 
-    /// Publishes the durable watermark loaded or committed by an operational worker.
-    pub fn publish_healthy(&self, watermark: Option<IndexWatermark>) {
-        *self.state.write() = IndexRuntimeSnapshot {
-            health: IndexWorkerHealth::Healthy,
-            watermark,
-        };
+    /// Marks the worker operational after it has loaded the durable watermark.
+    pub fn publish_healthy(&self) {
+        *self.health.write() = IndexWorkerHealth::Healthy;
     }
 
     /// Makes complete queries unavailable after the worker stops.
     pub fn publish_failed(&self, error: impl Into<String>) {
-        let mut state = self.state.write();
-        state.health = IndexWorkerHealth::Failed(error.into());
+        *self.health.write() = IndexWorkerHealth::Failed(error.into());
     }
 }
 
 impl core::fmt::Debug for TxIndexRuntime {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TxIndexRuntime")
-            .field("state", &self.snapshot())
+            .field("health", &self.health())
             .finish_non_exhaustive()
     }
 }

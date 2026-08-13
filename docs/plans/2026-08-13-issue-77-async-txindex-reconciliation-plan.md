@@ -16,8 +16,8 @@ Implementation record:
   ancestry walk, retained-body loading, worker health, and clean join.
 * Authoritative connect/disconnect and `BlockSync` contain no TxIndex row
   mutation or batching.
-* RPC and Electrum complete reads use the shared read/write gate and reject lag,
-  failure, or an applied-tip race as unavailable.
+* RPC and Electrum complete reads compare the DB watermark directly with a
+  captured applied-tip publication and reject lag or a tip race as unavailable.
 * The watermark-based index is the initial unreleased `txindex` format; no
   legacy migration or parallel versioned directory is required.
 * The sync-pipeline benchmark no longer has a synchronous TxIndex mode and now
@@ -36,8 +36,9 @@ The concrete result is that TxIndex work no longer runs in block connect or
 disconnect. A dedicated worker owns a durable `(height, block_hash)` watermark,
 pulls exact retained block bodies, and converges the index to a captured
 authoritative applied tip. Core publishes only a coalesced wake after an
-applied-tip transition. A TxIndex failure makes complete TxIndex queries
-unavailable; it does not fail block application or stop chain sync.
+applied-tip transition. A TxIndex failure stops further progress while core
+continues; complete queries remain valid only while the durable watermark still
+equals the current applied tip.
 
 This plan documents reusable invariants, not a generic consumer framework.
 
@@ -92,9 +93,9 @@ The implementation is complete only if all of these statements are true.
 6. A captured tip is the stable target of one reconciliation attempt, not a
    pinned chain snapshot. Issue #77 adds no header/body retention solely for
    the worker.
-7. A complete-negative TxIndex query is permitted only against an observed
-   healthy worker whose watermark equals the applied tip for the entire query
-   validation boundary.
+7. A complete-negative TxIndex query is permitted only when the durable DB
+   watermark equals a captured applied tip and that publication identity remains
+   unchanged for the entire query validation boundary.
 8. TxIndex storage, body-read, and worker failures never fail authoritative
    block application, reorg, or chain sync.
 
@@ -115,9 +116,7 @@ The process owns only ephemeral observations:
 
 ```text
 worker health / last error
-cached committed watermark
 capacity-1 wake channel
-query/mutation synchronization gate
 shutdown state
 ```
 
@@ -300,11 +299,12 @@ Classify worker outcomes rather than treating every missing lookup alike:
 | TxIndex DB read/write or cursor decode fails | worker failed |
 | Wake channel closes during shutdown | normal worker exit |
 
-A failed worker retains its last durable watermark and exposes an unavailable
-status to complete queries. It does not request node shutdown and does not
-change the authoritative applied tip.
+A failed worker retains its last durable watermark. Complete queries may still
+use it while it exactly equals the current applied tip; later tip movement makes
+them unavailable. The failure does not request node shutdown or change the
+authoritative applied tip.
 
-### 4.8 Minimal query completeness gate
+### 4.8 Minimal query completeness boundary
 
 Moving TxIndex off apply makes normal states such as `core=100, txindex=97`
 possible. A query must not translate that lag into “transaction/history does
@@ -313,33 +313,28 @@ readiness policy.
 
 For every query whose negative result assumes complete confirmed history:
 
-1. Enter a TxIndex read gate that excludes worker row mutation/commit but still
-   permits concurrent readers.
-2. Capture the applied tip.
-3. Require a healthy worker and a committed watermark equal to that tip.
-4. Execute the complete logical query while holding the read gate.
-5. Re-read the applied tip before returning and require the same publication
+1. Capture the applied tip.
+2. Read the durable TxIndex DB watermark and require it to equal that tip.
+3. Execute the complete logical query.
+4. Re-read the applied tip before returning and require the same publication
    identity, not merely an equal `(height, hash)` value. Every publication uses
    a fresh `Arc`, making pointer identity a unique process-local publication
    token while the query retains its starting `Arc`.
-6. If the identity changed, discard the result and return `TxIndex unavailable/catching
+5. If the identity changed, discard the result and return `TxIndex unavailable/catching
    up` (or perform a small bounded retry); do not return a negative result.
 
-The worker takes the write side of this gate only while publishing a TxIndex DB
-transition and its cached watermark. Body loading, identity validation, row
-construction, sorting, and deduplication remain outside it through prepared
-connect/rollback transitions; commit rechecks the starting watermark under the
-gate before writing. This closes query/index mutation races without blocking
-core apply. Publication-identity validation closes an `A -> B -> A` tip ABA;
-the read gate independently prevents the worker from mutating TxIndex during
-the query.
+Rows and their terminal watermark are one atomic DB batch, so readers cannot
+observe a partial transition. Publication-identity validation closes ordinary
+tip movement and an `A -> B -> A` ABA. No process-local watermark cache or
+query/mutation gate participates in correctness; worker health remains a
+separate operational signal.
 
-Apply the gate to RPC transaction/prevout reads and Electrum confirmed history,
+Apply the boundary to RPC transaction/prevout reads and Electrum confirmed history,
 transaction, and unspent reads. Change read interfaces that currently collapse
 storage/unavailable errors into empty vectors or `None`; unavailable must be
 distinguishable from an authoritative empty result. `getindexinfo` should use
 the TxIndex watermark and worker health rather than core header/applied heights.
-Electrum history and unspent scans are bounded while holding the gate, lossy
+Electrum history and unspent scans are bounded, lossy
 spending-prefix candidates are exact-resolved against block inputs, and a
 broadcast resolves all prevouts inside one completeness boundary.
 
@@ -390,7 +385,7 @@ and no authoritative path waits for or propagates that failure.
 
 ### Phase D: query correctness and status
 
-* Wire the TxIndex-specific completeness/read gate into RPC and Electrum
+* Wire the TxIndex-specific completeness boundary into RPC and Electrum
   confirmed-data readers.
 * Preserve “not found” only when the query ran against a healthy, complete
   watermark; expose lag/failure as unavailable.
@@ -496,5 +491,5 @@ The frozen one-sentence model is:
 
 > TxIndex independently stores where it is, wakes when the authoritative
 > applied chain changes, and reconciles itself to one captured attempt target;
-> complete queries are served only from a healthy watermark proven equal to
+> complete queries are served only from a durable watermark proven equal to
 > the applied tip.

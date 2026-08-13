@@ -766,21 +766,20 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     };
 
     let txindex_entry = ctx.indexer.as_ref().map(|_| {
-        let runtime = ctx
-            .tx_index_runtime
+        let watermark = ctx
+            .indexer
             .as_ref()
-            .map(|runtime| runtime.snapshot());
-        let watermark = runtime.as_ref().and_then(|state| state.watermark);
-        let txindex_synced = runtime.as_ref().is_some_and(|state| {
-            state.health == bitcoin_rs_index::IndexWorkerHealth::Healthy
-                && ctx.applied_tip.load_full().as_deref().is_some_and(|tip| {
-                    state.watermark.is_some_and(|watermark| {
-                        watermark.height == tip.height && watermark.hash == tip.hash
-                    })
-                })
+            .and_then(|indexer| indexer.lock().watermark().ok().flatten());
+        let txindex_synced = ctx.applied_tip.load_full().as_deref().is_some_and(|tip| {
+            watermark.is_some_and(|watermark| {
+                watermark.height == tip.height && watermark.hash == tip.hash
+            })
         });
-        let failed = runtime.as_ref().is_some_and(|state| {
-            matches!(state.health, bitcoin_rs_index::IndexWorkerHealth::Failed(_))
+        let failed = ctx.tx_index_runtime.as_ref().is_some_and(|runtime| {
+            matches!(
+                runtime.health(),
+                bitcoin_rs_index::IndexWorkerHealth::Failed(_)
+            )
         });
         json!({
             "synced": txindex_synced,

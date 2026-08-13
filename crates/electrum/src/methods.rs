@@ -157,7 +157,6 @@ where
 {
     indexer: Arc<bitcoin_rs_index::Indexer<S>>,
     block_source: B,
-    runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
     applied_tip: Option<Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>>,
 }
 
@@ -172,7 +171,6 @@ where
         Self {
             indexer,
             block_source,
-            runtime: None,
             applied_tip: None,
         }
     }
@@ -181,10 +179,8 @@ where
     #[must_use]
     pub fn with_completeness(
         mut self,
-        runtime: Arc<bitcoin_rs_index::TxIndexRuntime>,
         applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
     ) -> Self {
-        self.runtime = Some(runtime);
         self.applied_tip = Some(applied_tip);
         self
     }
@@ -193,19 +189,15 @@ where
         &self,
         query: impl FnOnce() -> Result<T, bitcoin_rs_index::IndexError>,
     ) -> Result<T, ElectrumError> {
-        let (Some(runtime), Some(applied_tip)) = (&self.runtime, &self.applied_tip) else {
+        let Some(applied_tip) = &self.applied_tip else {
             return query().map_err(ElectrumError::from);
         };
-        let _gate = runtime.read_gate();
         let start_tip = applied_tip
             .load_full()
             .ok_or(ElectrumError::TxIndexUnavailable)?;
-        let state = runtime.snapshot();
-        if state.health != bitcoin_rs_index::IndexWorkerHealth::Healthy
-            || !state.watermark.is_some_and(|watermark| {
-                watermark.height == start_tip.height && watermark.hash == start_tip.hash
-            })
-        {
+        if !self.indexer.watermark()?.is_some_and(|watermark| {
+            watermark.height == start_tip.height && watermark.hash == start_tip.hash
+        }) {
             return Err(ElectrumError::TxIndexUnavailable);
         }
         let result = query()?;
@@ -327,8 +319,9 @@ where
 #[cfg(all(test, feature = "fjall"))]
 mod completeness_tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
-    use bitcoin_rs_index::{IndexWatermark, Indexer, TxIndexRuntime};
+    use bitcoin_rs_index::Indexer;
     use bitcoin_rs_primitives::Hash256;
     use bitcoin_rs_storage::FjallStore;
 
@@ -345,20 +338,21 @@ mod completeness_tests {
     fn complete_query_discards_result_after_tip_aba() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(FjallStore::open(dir.path())?);
-        let hash = Hash256::from_le_bytes(&[0x31; 32]);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let original = TipSnapshot {
             tip_id: NodeId::new(1),
-            height: 12,
+            height: 0,
             chainwork: ChainWork::default(),
             hash,
         };
         let applied_tip = Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(
             original.clone(),
         ))));
-        let runtime = Arc::new(TxIndexRuntime::new());
-        runtime.publish_healthy(Some(IndexWatermark { height: 12, hash }));
-        let reader = IndexerHistoryReader::new(Arc::new(Indexer::new(store)), EmptyBlockSource)
-            .with_completeness(Arc::clone(&runtime), Arc::clone(&applied_tip));
+        let mut indexer = Indexer::new(store);
+        indexer.connect_block_atomic(&genesis, 0, hash)?;
+        let reader = IndexerHistoryReader::new(Arc::new(indexer), EmptyBlockSource)
+            .with_completeness(Arc::clone(&applied_tip));
         let replacement = TipSnapshot {
             tip_id: NodeId::new(2),
             height: 13,

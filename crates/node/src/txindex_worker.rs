@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_index::{IndexConnect, IndexerLike, TxIndexRuntime};
 use bitcoin_rs_primitives::Hash256;
@@ -18,6 +19,7 @@ use crate::apply::PruneBodyStore;
 type TxIndexHandle = Arc<Mutex<Box<dyn IndexerLike>>>;
 const FORWARD_BATCH_MAX_ROWS: usize = 250_000;
 const FORWARD_BATCH_MAX_ROW_BYTES: usize = 8 * 1024 * 1024;
+const FORWARD_BATCH_MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const STALE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(64);
 
 /// All shared inputs owned by the dedicated `TxIndex` worker thread.
@@ -61,14 +63,13 @@ impl TxIndexWorker {
     pub(crate) fn run(self) {
         if let Err(error) = self.run_inner() {
             tracing::error!(%error, "TxIndex worker stopped");
-            let _gate = self.runtime.write_gate();
             self.runtime.publish_failed(error.to_string());
         }
     }
 
     fn run_inner(&self) -> Result<()> {
-        let watermark = self.indexer.lock().watermark()?;
-        self.runtime.publish_healthy(watermark);
+        self.indexer.lock().watermark()?;
+        self.runtime.publish_healthy();
         self.reconcile()?;
 
         while !self.shutdown.load(Ordering::Acquire) {
@@ -140,47 +141,49 @@ impl TxIndexWorker {
                         current.hash
                     ))
                 })?;
-            let prepared = self
-                .indexer
+            self.indexer
                 .lock()
-                .prepare_rollback_block(&block, current)
+                .rollback_block_atomic(&block, current)
                 .map_err(fatal)?;
-            {
-                let _gate = self.runtime.write_gate();
-                self.indexer
-                    .lock()
-                    .commit_prepared_rollback(&prepared)
-                    .map_err(fatal)?;
-                watermark = self.indexer.lock().watermark().map_err(fatal)?;
-                self.runtime.publish_healthy(watermark);
-            }
+            watermark = Some(bitcoin_rs_index::IndexWatermark {
+                height: current.height - 1,
+                hash: Hash256::from_le_bytes(block.header.prev_blockhash.as_byte_array()),
+            });
         }
 
         let start = watermark.map_or(0, |cursor| cursor.height.saturating_add(1));
         let mut batch = Vec::<(bitcoin::Block, u32, Hash256)>::new();
         let mut batch_rows = 0_usize;
         let mut batch_row_bytes = 0_usize;
+        let mut batch_block_bytes = 0_usize;
         for height in start..=target.height {
             let Some(hash) = self.hash_at(target, height) else {
                 return Err(self.forward_lookup_failure(target, height));
             };
-            let block = match self.load_body(height, hash).map_err(fatal)? {
-                Some(block) => block,
-                None => return Err(self.forward_lookup_failure(target, height)),
-            };
+            let (block, block_bytes) =
+                match self.load_body_with_size(height, hash).map_err(fatal)? {
+                    Some(loaded) => loaded,
+                    None => return Err(self.forward_lookup_failure(target, height)),
+                };
             let (rows, row_bytes) = estimated_index_work(&block);
             let exceeds_limit = !batch.is_empty()
                 && (batch_rows.saturating_add(rows) > FORWARD_BATCH_MAX_ROWS
                     || batch_row_bytes.saturating_add(row_bytes) > FORWARD_BATCH_MAX_ROW_BYTES);
+            let exceeds_limit = exceeds_limit
+                || (!batch.is_empty()
+                    && batch_block_bytes.saturating_add(block_bytes)
+                        > FORWARD_BATCH_MAX_BLOCK_BYTES);
             if exceeds_limit {
                 self.commit_forward_batch(&batch).map_err(fatal)?;
                 batch.clear();
                 batch_rows = 0;
                 batch_row_bytes = 0;
+                batch_block_bytes = 0;
             }
             batch.push((block, height, hash));
             batch_rows = batch_rows.saturating_add(rows);
             batch_row_bytes = batch_row_bytes.saturating_add(row_bytes);
+            batch_block_bytes = batch_block_bytes.saturating_add(block_bytes);
         }
         if !batch.is_empty() {
             self.commit_forward_batch(&batch).map_err(fatal)?;
@@ -197,17 +200,10 @@ impl TxIndexWorker {
                 hash: *hash,
             })
             .collect::<Vec<_>>();
-        let prepared = self
-            .indexer
-            .lock()
-            .prepare_connect_blocks(&transitions)?
-            .ok_or_else(|| anyhow!("non-empty TxIndex batch produced no prepared transition"))?;
-        let _gate = self.runtime.write_gate();
-        let mut indexer = self.indexer.lock();
-        indexer.commit_prepared_connect(&prepared)?;
-        let watermark = indexer.watermark()?;
-        drop(indexer);
-        self.runtime.publish_healthy(watermark);
+        // The source bodies must reach stable storage before an independently
+        // durable TxIndex watermark can claim them.
+        self.body_store.sync()?;
+        self.indexer.lock().connect_blocks_atomic(&transitions)?;
         Ok(())
     }
 
@@ -218,6 +214,16 @@ impl TxIndexWorker {
     }
 
     fn load_body(&self, height: u32, hash: Hash256) -> Result<Option<bitcoin::Block>> {
+        Ok(self
+            .load_body_with_size(height, hash)?
+            .map(|(block, _)| block))
+    }
+
+    fn load_body_with_size(
+        &self,
+        height: u32,
+        hash: Hash256,
+    ) -> Result<Option<(bitcoin::Block, usize)>> {
         let Some(bytes) = self
             .body_store
             .load_block_body(height, hash)
@@ -225,9 +231,10 @@ impl TxIndexWorker {
         else {
             return Ok(None);
         };
+        let byte_len = bytes.len();
         let block = deserialize(&bytes)
             .with_context(|| format!("decode retained block body {height} {hash}"))?;
-        Ok(Some(block))
+        Ok(Some((block, byte_len)))
     }
 
     fn forward_lookup_failure(&self, target: &TipSnapshot, height: u32) -> AttemptError {
@@ -503,7 +510,7 @@ mod tests {
         worker.run();
 
         assert!(matches!(
-            runtime.snapshot().health,
+            runtime.health(),
             bitcoin_rs_index::IndexWorkerHealth::Failed(_)
         ));
         assert!(
