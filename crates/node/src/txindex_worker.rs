@@ -310,14 +310,14 @@ mod tests {
         block
     }
 
-    fn snapshot(tree: &BlockTree, id: bitcoin_rs_chain::NodeId) -> TipSnapshot {
-        let node = tree.node(id).expect("test node");
-        TipSnapshot {
+    fn snapshot(tree: &BlockTree, id: bitcoin_rs_chain::NodeId) -> Result<TipSnapshot> {
+        let node = tree.node(id)?;
+        Ok(TipSnapshot {
             tip_id: id,
             height: node.height,
             chainwork: node.chainwork,
             hash: node.hash,
-        }
+        })
     }
 
     fn worker(
@@ -352,7 +352,7 @@ mod tests {
         let mut tree = BlockTree::new();
         tree.insert_header(genesis.header, NodeStatus::Active)?;
         let child_id = tree.insert_header(child.header, NodeStatus::Active)?;
-        let target = snapshot(&tree, child_id);
+        let target = snapshot(&tree, child_id)?;
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
@@ -391,7 +391,7 @@ mod tests {
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_header(genesis.header, NodeStatus::Active)?;
         tree.insert_header(child.header, NodeStatus::Stale)?;
-        let target = snapshot(&tree, genesis_id);
+        let target = snapshot(&tree, genesis_id)?;
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
@@ -433,7 +433,7 @@ mod tests {
         tree.insert_header(genesis.header, NodeStatus::Active)?;
         tree.insert_header(stale.header, NodeStatus::Stale)?;
         let active_id = tree.insert_header(active.header, NodeStatus::Active)?;
-        let target = snapshot(&tree, active_id);
+        let target = snapshot(&tree, active_id)?;
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
 
@@ -464,7 +464,7 @@ mod tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let mut tree = BlockTree::new();
         let genesis_id = tree.insert_header(genesis.header, NodeStatus::Active)?;
-        let target = snapshot(&tree, genesis_id);
+        let target = snapshot(&tree, genesis_id)?;
         let applied_tip = Arc::new(ArcSwapOption::empty());
         applied_tip.store(Some(Arc::new(target)));
         let runtime = Arc::new(TxIndexRuntime::new());
