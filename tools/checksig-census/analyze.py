@@ -136,6 +136,12 @@ C150_STOP_HEIGHT = 150_000
 C150_STOP_HASH = (
     "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
 )
+# The recovered diagnostic candidate selects this product tip. It does not
+# certify a corpus. Certification still requires a fresh file-bound replay.
+CMODERN_STOP_HEIGHT = 709_635
+CMODERN_STOP_HASH = (
+    "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
+)
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -2761,15 +2767,32 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, object]]:
     )
     inv(
         "INV-7",
-        c.op_checksigadd == 0
-        and c.checkschnorr_entries == 0
-        and c.schnorr_verify_calls == 0,
-        "C_OP_CHECKSIGADD == 0 and C_CHECKSCHNORR_ENTRIES == 0 and C_SCHNORR_VERIFY_CALLS == 0",
-        op_checksigadd=c.op_checksigadd,
+        c.checkschnorr_entries >= c.schnorr_verify_calls
+        and c.schnorr_verify_calls == c.schnorr_verify_ok + c.schnorr_verify_fail,
+        "C_CHECKSCHNORR_ENTRIES >= C_SCHNORR_VERIFY_CALLS and "
+        "C_SCHNORR_VERIFY_CALLS == C_SCHNORR_VERIFY_OK + C_SCHNORR_VERIFY_FAIL",
         checkschnorr_entries=c.checkschnorr_entries,
         schnorr_verify_calls=c.schnorr_verify_calls,
+        schnorr_ok_plus_fail=c.schnorr_verify_ok + c.schnorr_verify_fail,
     )
     return results
+
+
+def _check_pre_taproot_schnorr_absence(c: Counters) -> dict[str, object]:
+    """Keep the legacy KSPIKE1 capture contract pre-Taproot."""
+    counters = {
+        "op_checksigadd": c.op_checksigadd,
+        "checkschnorr_entries": c.checkschnorr_entries,
+        "schnorr_verify_calls": c.schnorr_verify_calls,
+        "schnorr_verify_ok": c.schnorr_verify_ok,
+        "schnorr_verify_fail": c.schnorr_verify_fail,
+    }
+    return {
+        "id": "INV-KSPIKE-SCHNORR-0",
+        "passed": all(value == 0 for value in counters.values()),
+        "statement": "legacy KSPIKE1 Schnorr and OP_CHECKSIGADD counters are zero",
+        **counters,
+    }
 
 
 def check_record_counts(records: list[Record], c: Counters) -> dict[str, object]:
@@ -3165,6 +3188,7 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
 
     inv_results: list[dict[str, object]] = []
     inv_results.extend(check_counter_arithmetic(counters))
+    inv_results.append(_check_pre_taproot_schnorr_absence(counters))
     inv_results.append(check_record_counts(records, counters))
     inv_results.append(check_journal_sums(journal, counters))
     inv_results.append(check_duplicate_keys(records))
@@ -3216,6 +3240,7 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
 
     inv_results: list[dict[str, object]] = []
     inv_results.extend(check_counter_arithmetic(counters))
+    inv_results.append(_check_pre_taproot_schnorr_absence(counters))
     inv_results.append(check_all_verdicts_true(journal))
     inv_results.append(check_journal_sums(journal, counters))
     inv_results.append(check_census_capture_agreement(journal, capture_journal))
@@ -3790,8 +3815,11 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
         raise AnalyzerError(f"CTX-CUSTODY: replay.block_bytes must be >= 0, got {block_bytes}")
 
     block_source = raw["block_source"]
-    if not isinstance(block_source, str) or block_source not in ("file", "rest"):
-        raise AnalyzerError(f"CTX-CUSTODY: replay.block_source must be 'file' or 'rest', got {block_source!r}")
+    if block_source != "file":
+        raise AnalyzerError(
+            "CTX-CUSTODY: replay.block_source must be 'file', "
+            f"got {block_source!r}"
+        )
 
     if not isinstance(raw["blockfilterindex"], bool):
         raise AnalyzerError("CTX-CUSTODY: replay.blockfilterindex must be a boolean")
@@ -4819,6 +4847,11 @@ def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
     return True
 
 
+def _cmodern_passed(counts: dict[str, int]) -> bool:
+    """Require every context that defines Cmodern to occur at least once."""
+    return all(counts[name] > 0 for name in CONTEXT_COUNTER_NAMES)
+
+
 def cmd_classify_corpus(args: argparse.Namespace) -> int:
     counters_path = Path(args.counters)
     contexts_path = Path(args.contexts)
@@ -4898,13 +4931,21 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
 
     # ── Apply c150 / cmodern contract logic ──
     if args.contract == "cmodern":
-        # cmodern is not frozen until the exact tip is empirically recorded.
-        cmodern_frozen = False
-        all_passed = False
-        report_error = (
-            "CTX-CUSTODY: cmodern contract is not frozen until the exact "
-            "tip is empirically recorded"
-        )
+        if replay["stop_height"] != CMODERN_STOP_HEIGHT:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: cmodern requires stop_height {CMODERN_STOP_HEIGHT}, "
+                f"got {replay['stop_height']}"
+            )
+        if replay["stop_hash"] != CMODERN_STOP_HASH:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: cmodern requires stop_hash {CMODERN_STOP_HASH!r}, "
+                f"got {replay['stop_hash']!r}"
+            )
+        all_passed = _cmodern_passed(counts) and inv_all_passed
+        contract_result: dict[str, object] = {
+            "cmodern_frozen": True,
+            "cmodern_passed": all_passed,
+        }
     elif args.contract == "c150":
         # c150 pin: stop_height must be exactly 150000 and stop_hash must match.
         if replay["stop_height"] != C150_STOP_HEIGHT:
@@ -4917,8 +4958,8 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
                 f"CTX-CUSTODY: c150 requires stop_hash {C150_STOP_HASH!r}, "
                 f"got {replay['stop_hash']!r}"
             )
-        c150_passed = _c150_passed(counts, counters) and inv_all_passed
-        all_passed = c150_passed
+        all_passed = _c150_passed(counts, counters) and inv_all_passed
+        contract_result = {"c150_passed": all_passed}
     else:
         raise AnalyzerError(
             f"contract must be 'c150' or 'cmodern', got {args.contract!r}"
@@ -4936,12 +4977,8 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
         "replay": replay,
         "corpus_manifest": manifest,
         "counter_arithmetic": inv_results,
+        **contract_result,
     }
-    if args.contract == "cmodern":
-        report["cmodern_frozen"] = cmodern_frozen
-        report["error"] = report_error
-    else:
-        report["c150_passed"] = c150_passed
 
     # Optional cross-check: --input-count if provided.
     input_count_opt = getattr(args, "input_count", None)

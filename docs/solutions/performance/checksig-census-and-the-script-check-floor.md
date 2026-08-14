@@ -77,6 +77,30 @@ The finalizer parses and hashes each recovery stream once. A stream hash must eq
 
 The child replay artifact does not record the REST endpoint. Offline salvage therefore records `rest_url_provenance: operator_supplied_original_argv`. The exact `data_dir` string does exist in the replay artifact and must match without path normalization. A salvaged candidate records `child_exit_status: null`, `child_teardown: unobserved`, and the immutable source directory in `salvaged_from`. The candidate remains non-certifying until the selected Cmodern corpus receives the normal file-bound replay and classifier proofs.
 
+## Freeze the selected Cmodern product tip
+
+The recovered diagnostic candidate selected mainnet height `709635` and block
+hash
+`00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`.
+Bitcoin Core REST independently returned the same hash for that height. The
+candidate has all 11 context classes, and its last first-occurrence height is
+`709635`.
+
+This result freezes the product tip only. It does not certify the recovered
+diagnostic run. The classifier accepts Cmodern only when a fresh
+`mainnet-prefix-replay-v2` file replay stops at the exact tip, passes archive
+and stream custody, passes counter arithmetic, and has a positive count for
+each Cmodern context class. Report field `cmodern_frozen` means that the tip is
+fixed. Report field `cmodern_passed` means that the new file-bound corpus
+passed certification.
+
+`INV-7` uses a contract-neutral Schnorr equation:
+`checkschnorr_entries >= schnorr_verify_calls` and
+`schnorr_verify_calls == schnorr_verify_ok + schnorr_verify_fail`. The exact
+C150 predicate still requires all Schnorr and `OP_CHECKSIGADD` counters to be
+zero. This split removes the pre-Taproot zero assumption from Cmodern without
+weakening C150.
+
 ## Capture corpus and integrity proofs
 
 - **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`

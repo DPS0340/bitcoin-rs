@@ -16,6 +16,7 @@ Stdlib-only, Python 3.12+. Run: python3 test_validation_contracts.py
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -804,6 +805,21 @@ def _make_classify_args(
     return ns
 
 
+def _cmd_classify_synthetic_cmodern(args: argparse.Namespace) -> int:
+    """Bind a one-block fixture to the Cmodern report path for test coverage."""
+    if args.contract != "cmodern":
+        raise AssertionError("synthetic Cmodern helper requires contract='cmodern'")
+    stop_height = analyze.CMODERN_STOP_HEIGHT
+    stop_hash = analyze.CMODERN_STOP_HASH
+    analyze.CMODERN_STOP_HEIGHT = 0
+    analyze.CMODERN_STOP_HASH = _block_hash_display(_MAINNET_GENESIS_BLOCK)
+    try:
+        return cmd_classify_corpus(args)
+    finally:
+        analyze.CMODERN_STOP_HEIGHT = stop_height
+        analyze.CMODERN_STOP_HASH = stop_hash
+
+
 # ── Legacy JSONL helpers (for diagnostic iter_legacy_context_inputs tests) ───
 
 
@@ -952,6 +968,38 @@ def test_validate_capture_rejects_wrong_ffi_verify_entries() -> None:
             assert inv_id not in stderr_msg, (
                 f"{inv_id} should not be in failed list, stderr: {stderr_msg!r}"
             )
+
+
+
+def test_validate_capture_rejects_pre_taproot_schnorr_activity() -> None:
+    """The legacy capture contract rejects any Schnorr activity."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _write_records_file(tmp / "records.bin", [])
+        _write_records_file(tmp / "repeat.bin", [])
+        _write_journal_file(tmp / "journal.bin", [])
+        _write_journal_file(tmp / "repeat_journal.bin", [])
+        counters = _valid_counters_dict(checkschnorr_entries=1)
+        (tmp / "counters.json").write_text(json.dumps(counters))
+        (tmp / "repeat_counters.json").write_text(json.dumps(counters))
+        args = argparse.Namespace(
+            counters=tmp / "counters.json",
+            records=tmp / "records.bin",
+            journal=tmp / "journal.bin",
+            repeat_counters=tmp / "repeat_counters.json",
+            repeat_records=tmp / "repeat.bin",
+            repeat_journal=tmp / "repeat_journal.bin",
+            output=tmp / "report.json",
+            sorted_records_output=tmp / "sorted.bin",
+        )
+        assert analyze.cmd_validate_capture(args) == 1
+        report = json.loads((tmp / "report.json").read_text())
+        pre_taproot = [
+            row for row in report["invariants"]
+            if row["id"] == "INV-KSPIKE-SCHNORR-0"
+        ][0]
+        assert pre_taproot["passed"] is False
+
 
 
 def test_validate_capture_binds_corpus_identity() -> None:
@@ -2045,11 +2093,9 @@ def test_classify_corpus_txid_reversal_mutation() -> None:
 def test_classify_corpus_all_spend_contexts() -> None:
     """All required spend containers and multisig/Schnorr records are counted.
 
-    Builds all 6 spend contexts producing all 11 nonzero context counters,
-    then runs with contract="cmodern" and asserts it fails (cmodern is
-    fail-closed).  The context_counts are checked to be all positive before
-    the pass/fail assertion, proving the failure is from the contract gate,
-    not from missing data.
+    This test exercises the disk-backed context counter directly. The separate
+    synthetic-classification test covers report composition without weakening
+    the product Cmodern tip.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -2109,25 +2155,18 @@ def test_classify_corpus_all_spend_contexts() -> None:
             schnorr_verify_fail=0,
         )
 
-        args = _make_classify_args(tmp, contexts, records, journal, "cmodern", counters_dict=counters)
-        # cmodern is fail-closed: it must return 1 or raise AnalyzerError
-        _cmodern_failed = False
-        try:
-            rc = cmd_classify_corpus(args)
-            assert rc == 1, "cmodern must not certify even with all 11 counters positive"
-        except AnalyzerError:
-            _cmodern_failed = True  # not-frozen error is an acceptable failure path
-
-        # If a report was written, verify all 11 context_counts are positive,
-        # then assert all_passed is False — proving the failure is the contract
-        # gate, not missing data.
-        report_path = tmp / "report.json"
-        if report_path.exists():
-            counts = json.loads(report_path.read_text())["context_counts"]
-            for name in CONTEXT_COUNTER_NAMES:
-                assert counts[name] > 0, f"{name} should be positive in all-spend fixture"
-            report = json.loads(report_path.read_text())
-            assert report["all_passed"] is False
+        args = _make_classify_args(
+            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+        )
+        counts, context_count, _ = _count_context_records_disk(
+            Path(args.contexts),
+            Path(args.records),
+            Path(args.journal),
+            Counters(counters),
+        )
+        assert context_count == len(contexts)
+        for name in CONTEXT_COUNTER_NAMES:
+            assert counts[name] > 0, f"{name} should be positive in all-spend fixture"
 
 
 def test_classify_corpus_c150_passes() -> None:
@@ -2163,11 +2202,8 @@ def test_classify_corpus_c150_passes() -> None:
             "CTX-CUSTODY",
         )
 
-def test_classify_corpus_cmodern_fails() -> None:
-    """cmodern always fails (rc=1 or AnalyzerError) because the contract is
-    not frozen — even when all 11 context counters are nonzero it cannot
-    certify.
-    """
+def test_classify_corpus_cmodern_rejects_wrong_stop_height() -> None:
+    """Cmodern rejects evidence whose replay stops below the frozen tip."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\x41" * 32
@@ -2175,18 +2211,83 @@ def test_classify_corpus_cmodern_fails() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(tmp, [ctx_row], [record], journal, "cmodern")
-        # cmodern is fail-closed: it must return 1 or raise AnalyzerError
-        _cmodern_failed = False
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "cmodern wrong stop_height",
+            f"cmodern requires stop_height {analyze.CMODERN_STOP_HEIGHT}",
+        )
+        assert not (tmp / "report.json").exists()
+
+
+def test_classify_corpus_cmodern_rejects_wrong_stop_hash() -> None:
+    """Cmodern rejects a valid fixture whose tip hash is not the frozen hash."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\x42" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)],
+            "cmodern",
+        )
+        stop_height = analyze.CMODERN_STOP_HEIGHT
+        analyze.CMODERN_STOP_HEIGHT = 0
         try:
-            rc = cmd_classify_corpus(args)
-            assert rc == 1, "cmodern must not certify (rc=1)"
-        except AnalyzerError:
-            _cmodern_failed = True  # not-frozen error is an acceptable failure path
-        # If a report was written, all_passed must be False
-        report_path = tmp / "report.json"
-        if report_path.exists():
-            report = json.loads(report_path.read_text())
-            assert report["all_passed"] is False
+            _raises_with(
+                AnalyzerError,
+                lambda: cmd_classify_corpus(args),
+                "cmodern wrong stop_hash",
+                f"cmodern requires stop_hash {analyze.CMODERN_STOP_HASH!r}",
+            )
+        finally:
+            analyze.CMODERN_STOP_HEIGHT = stop_height
+        assert not (tmp / "report.json").exists()
+
+
+def test_cmodern_exact_product_predicate() -> None:
+    """Cmodern pins the recovered tip and requires a complete positive census."""
+    assert analyze.CMODERN_STOP_HEIGHT == 709_635
+    assert analyze.CMODERN_STOP_HASH == (
+        "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
+    )
+    counts = {name: 1 for name in CONTEXT_COUNTER_NAMES}
+    assert analyze._cmodern_passed(counts)
+    for name in CONTEXT_COUNTER_NAMES:
+        mutated = dict(counts)
+        mutated[name] = 0
+        assert not analyze._cmodern_passed(mutated)
+
+
+def test_counter_arithmetic_schnorr_invariant() -> None:
+    """INV-7 accepts Schnorr activity and rejects inconsistent totals."""
+    valid = _make_valid_counters(
+        1,
+        1,
+        1,
+        op_checksigadd=1,
+        checkschnorr_entries=2,
+        schnorr_verify_calls=1,
+        schnorr_verify_ok=1,
+    )
+    inv7 = [
+        row for row in analyze.check_counter_arithmetic(Counters(valid))
+        if row["id"] == "INV-7"
+    ][0]
+    assert inv7["passed"] is True
+
+    for overrides in (
+        {"checkschnorr_entries": 0},
+        {"schnorr_verify_ok": 0},
+    ):
+        mutated = dict(valid)
+        mutated.update(overrides)
+        inv7 = [
+            row for row in analyze.check_counter_arithmetic(Counters(mutated))
+            if row["id"] == "INV-7"
+        ][0]
+        assert inv7["passed"] is False
 
 
 def test_classify_corpus_zero_inputs() -> None:
@@ -3334,10 +3435,10 @@ def test_manifest_entry_count_mismatch_raises() -> None:
 
 
 def test_manifest_happy_path() -> None:
-    """A valid manifest/archive with a single mainnet genesis block passes
-    custody validation.  c150 is pinned to stop_height=150000 so the contract
-    fails (rc=1), but the custody/replay/manifest checks all pass and a valid
-    report is written.
+    """A valid one-block manifest/archive passes custody validation.
+
+    The synthetic Cmodern binding writes a report. The incomplete context
+    census then fails the product predicate.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -3348,8 +3449,8 @@ def test_manifest_happy_path() -> None:
         args = _make_classify_args(
             tmp, [ctx_row], [record], journal, "cmodern",
         )
-        rc = cmd_classify_corpus(args)
-        # cmodern is not frozen, so it fails (rc=1), but custody passes.
+        rc = _cmd_classify_synthetic_cmodern(args)
+        # The one-block fixture lacks ten required Cmodern context classes.
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
         assert report["schema"] == "classify-corpus-v2"
@@ -3428,13 +3529,11 @@ def test_classify_corpus_c150_rejects_mismatched_stop_hash() -> None:
         )
 
 
-# ── Tests: cmodern regression — cannot certify even with all positive ────────
+# ── Tests: Cmodern report composition on a synthetic complete census ─────────
 
 
-def test_classify_corpus_cmodern_cannot_certify_all_positive() -> None:
-    """cmodern fails even when all 11 context counters are nonzero and custody
-    is valid.  The contract is not frozen, so it can never certify.
-    """
+def test_classify_corpus_cmodern_all_positive_passes_synthetic_fixture() -> None:
+    """A complete synthetic census passes the frozen Cmodern predicate."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txids = [bytes([i + 1]) * 32 for i in range(6)]
@@ -3484,21 +3583,19 @@ def test_classify_corpus_cmodern_cannot_certify_all_positive() -> None:
             schnorr_verify_fail=0,
         )
 
-        args = _make_classify_args(tmp, contexts, records, journal, "cmodern", counters_dict=counters)
-        _cmodern_failed = False
-        try:
-            rc = cmd_classify_corpus(args)
-            assert rc == 1, "cmodern must not certify even with all 11 positive"
-        except AnalyzerError:
-            _cmodern_failed = True  # not-frozen error is an acceptable failure path
+        args = _make_classify_args(
+            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+        )
+        rc = _cmd_classify_synthetic_cmodern(args)
+        assert rc == 0
 
-        report_path = tmp / "report.json"
-        if report_path.exists():
-            report = json.loads(report_path.read_text())
-            counts = report["context_counts"]
-            for name in CONTEXT_COUNTER_NAMES:
-                assert counts[name] > 0, f"{name} should be positive"
-            assert report["all_passed"] is False
+        report = json.loads((tmp / "report.json").read_text())
+        counts = report["context_counts"]
+        for name in CONTEXT_COUNTER_NAMES:
+            assert counts[name] > 0, f"{name} should be positive"
+        assert report["cmodern_frozen"] is True
+        assert report["cmodern_passed"] is True
+        assert report["all_passed"] is True
 
 
 # ── Tests: replay/manifest field invariant mutations ─────────────────────────
@@ -3521,6 +3618,27 @@ def test_replay_rejects_wrong_network() -> None:
             lambda: cmd_classify_corpus(args),
             "wrong network",
             "CTX-CUSTODY",
+        )
+
+
+def test_replay_rejects_rest_block_source() -> None:
+    """The certifying replay schema accepts only file-bound evidence."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xed" * 32
+        args = _make_classify_args(
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)],
+            "cmodern",
+            replay_overrides={"block_source": "rest"},
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "REST certifying replay",
+            "replay.block_source must be 'file'",
         )
 
 
@@ -4449,8 +4567,8 @@ def test_classify_corpus_journal_sum_op_checksig_mismatch() -> None:
 
 
 def test_classify_corpus_inv1_verify_script_calls_mismatch() -> None:
-    """verify_script_calls != ffi_verify_entries fails INV-1.  Using cmodern
-    (no c150 pin) so the report is written and we can check inv_all_passed."""
+    """verify_script_calls != ffi_verify_entries fails INV-1 in the synthetic
+    Cmodern report path."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xc2" * 32
@@ -4461,7 +4579,7 @@ def test_classify_corpus_inv1_verify_script_calls_mismatch() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_overrides={"verify_script_calls": 999},
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
         inv1 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-1"][0]
@@ -4469,8 +4587,8 @@ def test_classify_corpus_inv1_verify_script_calls_mismatch() -> None:
 
 
 def test_classify_corpus_inv2_ffi_verify_true_mismatch() -> None:
-    """ffi_verify_true != ffi_verify_entries fails INV-2.  Using cmodern
-    (no c150 pin) so the report is written and we can check inv_all_passed."""
+    """ffi_verify_true != ffi_verify_entries fails INV-2 in the synthetic
+    Cmodern report path."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xc3" * 32
@@ -4481,7 +4599,7 @@ def test_classify_corpus_inv2_ffi_verify_true_mismatch() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_overrides={"ffi_verify_true": 999},
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
         inv2 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-2"][0]
@@ -4503,12 +4621,12 @@ def test_classify_corpus_cmodern_bad_eval_counter_fails_closed() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_overrides={"eval_script_entries": 999},
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 def test_classify_corpus_sighash_computed_mismatch() -> None:
-    """sighash_computed != ecdsa_verify_calls fails INV-5.  Using cmodern
-    (no c150 pin) so the report is written and we can check INV-5."""
+    """sighash_computed != ecdsa_verify_calls fails INV-5 in the synthetic
+    Cmodern report path."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xc5" * 32
@@ -4519,16 +4637,15 @@ def test_classify_corpus_sighash_computed_mismatch() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_overrides={"sighash_computed": 999},
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
         inv5 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-5"][0]
         assert inv5["passed"] is False
 
 def test_classify_corpus_sighash_midstate_hit_mismatch() -> None:
-    """sighash_midstate_hit is not checked by _c150_passed, INV-1..INV-7, or
-    the aggregate reconciliation.  Using cmodern, the report is written and
-    all_passed is False (cmodern is never frozen)."""
+    """An untracked sighash_midstate_hit change cannot make an incomplete
+    synthetic Cmodern census pass."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xc6" * 32
@@ -4539,7 +4656,7 @@ def test_classify_corpus_sighash_midstate_hit_mismatch() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_overrides={"sighash_midstate_hit": 999},
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 
@@ -4686,7 +4803,7 @@ def test_classify_corpus_ecdsa_reject_record_counts_entry() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_dict=counters,
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 
@@ -4727,7 +4844,7 @@ def test_classify_corpus_schnorr_reject_record_counts_entry() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_dict=counters,
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 
@@ -4768,7 +4885,7 @@ def test_classify_corpus_reason8_tapscript_skip() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_dict=counters,
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 def test_classify_corpus_ecdsa_fail_record() -> None:
@@ -4799,14 +4916,12 @@ def test_classify_corpus_ecdsa_fail_record() -> None:
             tmp, [ctx_row], [record], journal, "cmodern",
             counters_dict=counters,
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 
 def test_classify_corpus_ecdsa_success_record() -> None:
-    """An ECDSA verify success (outcome=1) counts as ecdsa_verify_call and
-    ecdsa_verify_ok but not ecdsa_verify_fail.  Using cmodern so the report
-    is written and we can verify the aggregate counts."""
+    """An ECDSA success increments calls and successes, but not failures."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         txid_le = b"\xa5" * 32
@@ -4816,7 +4931,7 @@ def test_classify_corpus_ecdsa_success_record() -> None:
         args = _make_classify_args(
             tmp, [ctx_row], [record], journal, "cmodern",
         )
-        rc = cmd_classify_corpus(args)
+        rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
 
 # ── Tests: Multi-key SQLite op_seq/ECDSA ─────────────────────────────────────
@@ -4913,13 +5028,13 @@ def test_classify_corpus_custody_archive_matches_manifest() -> None:
         ctx_row = _bare_p2pkh(txid_le)
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
-        # Use cmodern to avoid the c150 stop_height/stop_hash pin —
-        # cmodern always fails (not frozen) but still writes the report.
+        # The synthetic binding reaches report generation without weakening
+        # the product Cmodern tip.
         args = _make_classify_args(
             tmp, [ctx_row], [record], journal, "cmodern",
         )
-        rc = cmd_classify_corpus(args)
-        assert rc == 1  # cmodern never certifies
+        rc = _cmd_classify_synthetic_cmodern(args)
+        assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
         custody = report["custody"]
         archive = custody["archive"]
@@ -6619,6 +6734,7 @@ def main() -> int:
         test_counters_rejects_negative_value,
         test_counters_accepts_valid_dict,
         test_validate_capture_rejects_wrong_ffi_verify_entries,
+        test_validate_capture_rejects_pre_taproot_schnorr_activity,
         test_validate_capture_sorted_output_has_header,
         test_records_reject_invalid_encoded_fields,
         test_records_accept_preserved_over_capacity_ecdsa_reject,
@@ -6680,7 +6796,10 @@ def main() -> int:
         test_classify_corpus_txid_reversal_mutation,
         test_classify_corpus_all_spend_contexts,
         test_classify_corpus_c150_passes,
-        test_classify_corpus_cmodern_fails,
+        test_classify_corpus_cmodern_rejects_wrong_stop_height,
+        test_classify_corpus_cmodern_rejects_wrong_stop_hash,
+        test_cmodern_exact_product_predicate,
+        test_counter_arithmetic_schnorr_invariant,
         test_classify_corpus_zero_inputs,
         test_classify_corpus_definitions_match_counter_names,
         test_classify_corpus_missing_record_identity,
@@ -6716,8 +6835,9 @@ def main() -> int:
         test_classify_corpus_c150_rejects_wrong_stop_height,
         test_classify_corpus_c150_rejects_wrong_stop_hash,
         test_classify_corpus_c150_rejects_mismatched_stop_hash,
-        test_classify_corpus_cmodern_cannot_certify_all_positive,
+        test_classify_corpus_cmodern_all_positive_passes_synthetic_fixture,
         test_replay_rejects_wrong_network,
+        test_replay_rejects_rest_block_source,
         test_replay_rejects_wrong_network_magic,
         test_replay_rejects_wrong_genesis_hash,
         test_replay_rejects_start_height_nonzero,

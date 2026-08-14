@@ -173,6 +173,61 @@ The replay produces the authoritative `c150.counters.json` (24 fixed-order u64 c
 
 Expected: `context_count == 2,868,199`, `ffi_verify_entries == 2,868,199`, `eval_script_entries == 5,736,398` (exactly twice the ordinary total due to scriptSig + scriptPubKey passes per ordinary P2PKH check), all verdicts true, all 11 special context counters zero (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`), and all 13 complementary execution counters zero. Result: `all_passed: true` and `c150_passed: true`.
 Any sink open, write, stream, or close failure forces a nonzero process exit. Live REST streams or sampled evidence (such as `kernel_verify_spike`) cannot certify C150 or Cmodern product corpora.
+
+### Run A-prime — authoritative Cmodern cumulative evidence
+
+The recovered diagnostic candidate selected height `709635` with block hash
+`00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`.
+Bitcoin Core REST independently returned the same hash for that height. This
+selection freezes the product tip. It does not certify the diagnostic run.
+
+Run a fresh replay from the exported product archive. Bind the census streams,
+replay result, manifest, and archive in one classifier invocation:
+
+```bash
+REPO=/home/alpha/exp/bitcoin-rs
+EXP=$REPO/tools/checksig-census
+CMODERN=/home/alpha/bench-g14/corpora/cmodern/product
+
+mkdir -p "$EXP/out"
+
+BRS_CENSUS_COUNTERS=$EXP/out/cmodern.counters.json \
+BRS_CENSUS_CONTEXTS=$EXP/out/cmodern.contexts.bin \
+BRS_CENSUS_JOURNAL=$EXP/out/cmodern.journal.bin \
+BRS_CENSUS_RECORDS=$EXP/out/cmodern.records.bin \
+BRS_CENSUS_LABEL=cmodern \
+taskset -c 0-31 \
+"$EXP/target/release/examples/mainnet_prefix_replay" \
+  --start-height 0 \
+  --stop-height 709635 \
+  --window 1024 \
+  --blocks-file "$CMODERN/blocks.dat" \
+  --corpus-manifest "$CMODERN/manifest.json" \
+  --assume-valid-height 0 \
+  --storage-backend fjall \
+  --data-dir "$EXP/out/cmodern-datadir" \
+  --output "$EXP/out/cmodern.replay.json"
+
+cd "$EXP"
+python3 analyze.py classify-corpus \
+  --counters out/cmodern.counters.json \
+  --contexts out/cmodern.contexts.bin \
+  --records out/cmodern.records.bin \
+  --journal out/cmodern.journal.bin \
+  --replay out/cmodern.replay.json \
+  --corpus-manifest "$CMODERN/manifest.json" \
+  --archive "$CMODERN/blocks.dat" \
+  --output out/cmodern.classification.json \
+  --contract cmodern
+```
+
+The classifier requires the exact height and hash above, strict
+`mainnet-prefix-replay-v2` file custody, a successful window dispatch, all
+counter arithmetic invariants, and positive counts for all 11 Cmodern context
+classes. A certifying result has `all_passed: true`, `cmodern_frozen: true`, and
+`cmodern_passed: true`. Here, `cmodern_frozen` means the product tip is fixed;
+only `cmodern_passed` records successful corpus certification.
+
 ### Run B — KSPIKE1 capture (counters + journal + records, run twice)
 
 ```bash
