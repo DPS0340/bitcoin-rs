@@ -37,7 +37,7 @@ The two distinct cost regimes any sync measurement must name before its numbers 
 ### Native benchmark custody
 The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
 
-Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. Later validation recomputes the verdict from the custody artifacts. Custody proves internal consistency, not a cryptographic signature.
+Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. Later validation recomputes the verdict from the custody artifacts. Custody proves internal consistency, not a cryptographic signature.
 
 ## Consensus validation
 

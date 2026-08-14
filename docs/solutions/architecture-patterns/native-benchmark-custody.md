@@ -41,7 +41,7 @@ The runner also needs a strict wall-time boundary. Proof generation, evidence pa
 
 5. **Keep the timed interval narrow.** Start wall timing immediately before `Popen`. End it when `wait4` reports the child exit. Verify descriptor fingerprints, flush logs, parse native evidence, and recompute correctness after that endpoint. Generate the cell proof before the first arm.
 
-6. **Bind persisted evidence to its run.** Write one `custody-result.json` under `output_root/<run>/`. Later validation must require that exact location, load the same cell configuration and proof, reconstruct every command, reparse native evidence, and rederive the verdict.
+6. **Bind persisted evidence to its run.** After each child exits, open its native evidence once, record the fingerprint, and parse through `/proc/self/fd/N`. Retain that descriptor through `custody-result.json` publication. Verify the descriptor and configured path before and after publication, then close the descriptor in the cell cleanup path. Later validation must require the exact `output_root/<run>/custody-result.json` location, load the same cell configuration and proof, reconstruct every command, reparse native evidence, and rederive the verdict.
 
 7. **Close descriptors on every path.** Close partial input snapshots, close a prepared candidate if Core preparation raises, close all run descriptors in `finally`, and close temporary executable snapshots during repeated result validation. A descriptor leak makes a long campaign fail with `EMFILE` after apparently valid earlier cells.
 

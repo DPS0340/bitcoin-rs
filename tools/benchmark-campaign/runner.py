@@ -223,6 +223,12 @@ class ArmObservation:
 
 
 @dataclass(frozen=True)
+class ArmExecution:
+    observation: ArmObservation
+    evidence: FileCustody | None
+
+
+@dataclass(frozen=True)
 class PairResult:
     pair_index: int
     order: tuple[Role, Role]
@@ -401,6 +407,21 @@ def _snapshot_file(path_text: str, expected_sha256: str, field: str) -> FileCust
                 f"expected {expected_sha256}, got {observed_sha256}"
             )
         return FileCustody(path, _fingerprint(after), descriptor)
+    except (OSError, ContractError):
+        os.close(descriptor)
+        raise
+
+
+def _retain_generated_file(path: Path, field: str) -> FileCustody:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as error:
+        raise ContractError(f"cannot open {field} {path}: {error}") from error
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ContractError(f"{field} must be a regular file")
+        return FileCustody(path, _fingerprint(status), descriptor)
     except (OSError, ContractError):
         os.close(descriptor)
         raise
@@ -1132,7 +1153,7 @@ def _run_arm(
     run_dir: Path,
     inputs: InputCustody,
     program_custody: ProgramCustody,
-) -> ArmObservation:
+) -> ArmExecution:
     program = program_custody.identity
     arm_dir = run_dir / f"pair-{pair_index}-{order_index}-{role.value}"
     arm_dir.mkdir(mode=0o700)
@@ -1173,6 +1194,7 @@ def _run_arm(
     arm_result: NativeArmResult | None = None
     error_text: str | None = None
     started: int | None = None
+    evidence: FileCustody | None = None
     try:
         _verify_inputs_unchanged(inputs)
         _verify_program_custody(program_custody)
@@ -1227,44 +1249,81 @@ def _run_arm(
             os.fsync(stdout.fileno())
             stderr.flush()
             os.fsync(stderr.fileno())
+        if result_path.is_file():
+            evidence = _retain_generated_file(result_path, "native evidence")
+            os.fsync(evidence.descriptor)
         if exit_code != 0:
             error_text = f"native process exited with status {exit_code}"
-        elif not result_path.is_file():
+        elif evidence is None:
             error_text = "native process did not create its evidence file"
         else:
-            _fsync_file(result_path)
-            arm_result = _parse_native_result(
-                config, proof, role, command, data_dir, result_path, inputs, paths
-            )
+            try:
+                arm_result = _parse_native_result(
+                    config,
+                    proof,
+                    role,
+                    command,
+                    data_dir,
+                    Path(_descriptor_path(evidence.descriptor)),
+                    inputs,
+                    paths,
+                )
+                _verify_file_unchanged(evidence, "native evidence")
+            except (OSError, ContractError, subprocess.SubprocessError) as error:
+                error_text = str(error)
+            except BaseException:
+                os.close(evidence.descriptor)
+                evidence = None
+                raise
     except (OSError, ContractError, subprocess.SubprocessError) as error:
         if started is not None and wall_ns is None:
             wall_ns = time.monotonic_ns() - started
         error_text = str(error)
     try:
-        _persist_arm_evidence(arm_dir, (stdout_path, stderr_path, result_path))
-    except OSError as evidence_error:
+        persisted_paths = (
+            (stdout_path, stderr_path)
+            if evidence is not None
+            else (stdout_path, stderr_path, result_path)
+        )
+        _persist_arm_evidence(arm_dir, persisted_paths)
+        if evidence is not None:
+            os.fsync(evidence.descriptor)
+            _verify_file_unchanged(evidence, "native evidence")
+    except (OSError, ContractError) as evidence_error:
         message = f"cannot persist arm evidence: {evidence_error}"
         error_text = message if error_text is None else f"{error_text}; {message}"
-    return ArmObservation(
-        role=role,
-        pair_index=pair_index,
-        order_index=order_index,
-        command=command,
-        arm_dir=str(arm_dir),
-        data_dir=str(data_dir),
-        result_path=str(result_path),
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
-        pid=pid,
-        pid_starttime=pid_starttime,
-        wall_ns=wall_ns,
-        cpu_user_ns=cpu_user_ns,
-        cpu_system_ns=cpu_system_ns,
-        peak_rss_bytes=peak_rss_bytes,
-        exit_code=exit_code,
-        arm_result=arm_result,
-        error=error_text,
-    )
+    except BaseException:
+        if evidence is not None:
+            os.close(evidence.descriptor)
+            evidence = None
+        raise
+    try:
+        observation = ArmObservation(
+            role=role,
+            pair_index=pair_index,
+            order_index=order_index,
+            command=command,
+            arm_dir=str(arm_dir),
+            data_dir=str(data_dir),
+            result_path=str(result_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            pid=pid,
+            pid_starttime=pid_starttime,
+            wall_ns=wall_ns,
+            cpu_user_ns=cpu_user_ns,
+            cpu_system_ns=cpu_system_ns,
+            peak_rss_bytes=peak_rss_bytes,
+            exit_code=exit_code,
+            arm_result=arm_result,
+            error=error_text,
+        )
+        execution = ArmExecution(observation, evidence)
+    except BaseException:
+        if evidence is not None:
+            os.close(evidence.descriptor)
+        raise
+    return execution
 
 
 def _derive(
@@ -1381,6 +1440,7 @@ def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
         )
     inputs = _snapshot_inputs(config)
     programs: PreparedPrograms | None = None
+    arm_evidence: list[FileCustody] = []
     try:
         proof = _load_cell_proof(config, inputs)
         root = Path(campaign.output_root)
@@ -1394,28 +1454,31 @@ def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
         pairs: list[PairResult] = []
         seen_paths: set[str] = set()
         for pair_index, order in enumerate(schedule):
-            observations: tuple[ArmObservation, ArmObservation] = (
-                _run_arm(
-                    config,
-                    proof,
-                    order[0],
-                    pair_index,
-                    0,
-                    run_dir,
-                    inputs,
-                    programs.candidate if order[0] is Role.CANDIDATE else programs.core,
-                ),
-                _run_arm(
-                    config,
-                    proof,
-                    order[1],
-                    pair_index,
-                    1,
-                    run_dir,
-                    inputs,
-                    programs.candidate if order[1] is Role.CANDIDATE else programs.core,
-                ),
+            first = _run_arm(
+                config,
+                proof,
+                order[0],
+                pair_index,
+                0,
+                run_dir,
+                inputs,
+                programs.candidate if order[0] is Role.CANDIDATE else programs.core,
             )
+            if first.evidence is not None:
+                arm_evidence.append(first.evidence)
+            second = _run_arm(
+                config,
+                proof,
+                order[1],
+                pair_index,
+                1,
+                run_dir,
+                inputs,
+                programs.candidate if order[1] is Role.CANDIDATE else programs.core,
+            )
+            if second.evidence is not None:
+                arm_evidence.append(second.evidence)
+            observations = (first.observation, second.observation)
             for observation in observations:
                 paths = {
                     observation.arm_dir,
@@ -1436,9 +1499,15 @@ def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
             tuple(pairs),
         )
         result_path = run_dir / "custody-result.json"
+        for evidence in arm_evidence:
+            _verify_file_unchanged(evidence, "native evidence")
         _atomic_write_json(result_path, _result_json(result))
+        for evidence in arm_evidence:
+            _verify_file_unchanged(evidence, "native evidence")
         return result, result_path
     finally:
+        for evidence in arm_evidence:
+            os.close(evidence.descriptor)
         if programs is not None:
             _close_programs(programs)
         _close_inputs(inputs)

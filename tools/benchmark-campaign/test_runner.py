@@ -977,6 +977,53 @@ class DescriptorLifetimeTests(WorkspaceTestCase):
         after = len(tuple(Path("/proc/self/fd").iterdir()))
         self.assertEqual(after, before)
 
+    def test_native_evidence_retained_through_result_publication(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        original = runner._atomic_write_json  # pyright: ignore[reportPrivateUsage]
+        publication_checks: list[int] = []
+
+        def mutate_then_publish(path: Path, value: object) -> None:
+            result_files = tuple(sorted(path.parent.glob("pair-*/replay.json"))) + tuple(
+                sorted(path.parent.glob("pair-*/debug.log"))
+            )
+            self.assertEqual(len(result_files), PAIR_COUNT * 2)
+            open_targets: set[Path] = set()
+            for descriptor in Path("/proc/self/fd").iterdir():
+                try:
+                    target = os.readlink(descriptor)
+                except FileNotFoundError:
+                    continue
+                if target.startswith("/"):
+                    open_targets.add(Path(target))
+            self.assertTrue(set(result_files) <= open_targets)
+            with result_files[0].open("ab") as stream:
+                stream.write(b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            publication_checks.append(len(result_files))
+            original(path, value)
+
+        before = len(tuple(Path("/proc/self/fd").iterdir()))
+        with patch.object(runner, "_atomic_write_json", mutate_then_publish):
+            with self.assertRaisesRegex(ContractError, "native evidence changed"):
+                fixture.run()
+        after = len(tuple(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(publication_checks, [PAIR_COUNT * 2])
+        self.assertEqual(after, before)
+
+    def test_native_evidence_closes_when_parser_raises(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+
+        def fail_parse(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("unexpected parser failure")
+
+        before = len(tuple(Path("/proc/self/fd").iterdir()))
+        with patch.object(runner, "_parse_native_result", fail_parse):
+            with self.assertRaisesRegex(RuntimeError, "unexpected parser failure"):
+                fixture.run()
+        after = len(tuple(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
+
 
 if __name__ == "__main__":
     unittest.main()
