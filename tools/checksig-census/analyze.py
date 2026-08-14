@@ -765,10 +765,11 @@ class DiagnosticTeardown(NamedTuple):
 
 
 class DiagnosticStreamDigests(NamedTuple):
-    """Hashes of one validated source stream and its committed prefix."""
+    """Hashes of one validated source stream, its committed prefix, and body."""
 
     full_file_sha256: str
     committed_prefix_sha256: str
+    committed_body_sha256: str
 
 
 class DiagnosticReconstruction(NamedTuple):
@@ -1517,6 +1518,7 @@ def _validate_terminal_streams(
         "path": str(paths["contexts"]),
         "bytes": context_custody["bytes"],
         "sha256": format(context_custody["sha256"], "064x"),
+        "body_sha256": format(context_custody["body_sha256"], "064x"),
     }
 
     record_iter, record_custody = iter_records_with_custody(paths["records"])
@@ -1529,6 +1531,7 @@ def _validate_terminal_streams(
         "path": str(paths["records"]),
         "bytes": record_custody["bytes"],
         "sha256": format(record_custody["sha256"], "064x"),
+        "body_sha256": format(record_custody["body_sha256"], "064x"),
     }
 
     journal_iter, journal_custody = iter_journal_with_custody(paths["journal"])
@@ -1541,7 +1544,45 @@ def _validate_terminal_streams(
         "path": str(paths["journal"]),
         "bytes": journal_custody["bytes"],
         "sha256": format(journal_custody["sha256"], "064x"),
+        "body_sha256": format(journal_custody["body_sha256"], "064x"),
     }
+
+    sidecar_size = paths["sidecar"].stat().st_size
+    # _validate_sidecar_terminal already validated framing; derive row count from size.
+    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
+    sidecar_fd = os.open(paths["sidecar"], os.O_RDONLY)
+    try:
+        sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar short header")
+        magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar wrong magic")
+        expected_size = BRSHGT1_HEADER_STRUCT.size + sidecar_count * DIAGNOSTIC_ROW_SIZE
+        if sidecar_size != expected_size:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: terminal sidecar size {sidecar_size} != {expected_size}"
+            )
+        full_hasher = hashlib.sha256()
+        body_hasher = hashlib.sha256()
+        full_hasher.update(sidecar_header)
+        offset = BRSHGT1_HEADER_STRUCT.size
+        body_end = expected_size
+        while offset < body_end:
+            chunk = os.pread(sidecar_fd, min(8 * 1024 * 1024, body_end - offset), offset)
+            if not chunk:
+                raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
+            full_hasher.update(chunk)
+            body_hasher.update(chunk)
+            offset += len(chunk)
+        custody["sidecar"] = {
+            "path": str(paths["sidecar"]),
+            "bytes": sidecar_size,
+            "sha256": full_hasher.hexdigest(),
+            "body_sha256": body_hasher.hexdigest(),
+        }
+    finally:
+        os.close(sidecar_fd)
     return custody
 
 
@@ -1614,6 +1655,11 @@ def _finalize_candidate(
     declared_count = _validate_sidecar_terminal(
         paths["sidecar"], sidecar_row_count, final
     )
+    if recovery_signatures is not None and declared_count != sidecar_row_count:
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: recovered sidecar declared row count "
+            f"{declared_count} != {sidecar_row_count}"
+        )
     stream_custody = _validate_terminal_streams(paths, final)
     _validate_replay_diagnostic(
         paths["replay"],
@@ -1634,11 +1680,15 @@ def _finalize_candidate(
 
     if declared_count == 0:
         _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
+        sidecar_size, sidecar_sha256 = _sha256_file(paths["sidecar"])
+        stream_custody["sidecar"]["bytes"] = sidecar_size
+        stream_custody["sidecar"]["sha256"] = sidecar_sha256
     if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
         raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
 
     custody: dict[str, dict[str, object]] = {}
-    for name in ("sidecar", "replay", "counters"):
+    custody["sidecar"] = stream_custody["sidecar"]
+    for name in ("replay", "counters"):
         size, digest = _sha256_file(paths[name])
         custody[name] = {
             "path": str(paths[name]),
@@ -1663,8 +1713,18 @@ def _finalize_candidate(
                 raise AnalyzerError(
                     f"DIAG-SALVAGE: source {name} has invalid clone provenance"
                 )
-        for name in ("contexts", "records", "journal"):
+        for name in ("contexts", "records", "journal", "sidecar"):
             identity = source_custody[name]
+            source_body_sha256 = identity.get("committed_body_sha256")
+            if not isinstance(source_body_sha256, str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks committed-body custody"
+                )
+            if stream_custody[name]["body_sha256"] != source_body_sha256:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: recovered {name} body does not match "
+                    "the validated source committed body"
+                )
             source_prefix_sha256 = identity.get("committed_prefix_sha256")
             if not isinstance(source_prefix_sha256, str):
                 raise AnalyzerError(
@@ -1676,11 +1736,6 @@ def _finalize_candidate(
             ):
                 raise AnalyzerError(
                     f"DIAG-SALVAGE: exact source {name} clone has unequal hashes"
-                )
-            if source_prefix_sha256 != stream_custody[name]["sha256"]:
-                raise AnalyzerError(
-                    f"DIAG-SALVAGE: recovered {name} digest does not match "
-                    "the validated source committed prefix"
                 )
 
     candidate: dict[str, object] = {
@@ -2008,6 +2063,7 @@ def _reconstruct_diagnostic_from_fds(
         "journal": stream_file_sizes["journal"],
     }
     stream_hashers = {name: hashlib.sha256() for name in stream_file_sizes}
+    stream_body_hashers = {name: hashlib.sha256() for name in stream_file_sizes}
     hashed_bytes = {name: HEADER_SIZE for name in stream_file_sizes}
     declared_counts: dict[str, int] = {}
     stream_magics = {
@@ -2028,18 +2084,38 @@ def _reconstruct_diagnostic_from_fds(
 
     def observe_context(data: bytes) -> None:
         stream_hashers["contexts"].update(data)
+        stream_body_hashers["contexts"].update(data)
         hashed_bytes["contexts"] += len(data)
 
     def observe_records(data: bytes) -> None:
         stream_hashers["records"].update(data)
+        stream_body_hashers["records"].update(data)
         hashed_bytes["records"] += len(data)
 
     def observe_journal(data: bytes) -> None:
         stream_hashers["journal"].update(data)
+        stream_body_hashers["journal"].update(data)
         hashed_bytes["journal"] += len(data)
 
+    sidecar_full_hasher = hashlib.sha256()
+    sidecar_body_hasher = hashlib.sha256()
+    sidecar_header = os.pread(source_fds["sidecar"], BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SALVAGE: short source sidecar header")
+    sidecar_magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
+    if sidecar_magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SALVAGE: wrong source sidecar magic {sidecar_magic!r}")
+    sidecar_full_hasher.update(sidecar_header)
+
     for row_number in range(1, row_count + 1):
-        row = _read_brshgt1_row(source_fds["sidecar"], row_number)
+        row_offset = BRSHGT1_HEADER_STRUCT.size + (row_number - 1) * DIAGNOSTIC_ROW_SIZE
+        row_raw = os.pread(source_fds["sidecar"], DIAGNOSTIC_ROW_SIZE, row_offset)
+        if len(row_raw) != DIAGNOSTIC_ROW_SIZE:
+            raise AnalyzerError(f"DIAG-SIDECAR: short row {row_number}")
+        sidecar_full_hasher.update(row_raw)
+        sidecar_body_hasher.update(row_raw)
+        row = BRSHGT1_ROW_STRUCT.unpack(row_raw)
+        row = DiagnosticCheckpoint(*row)
         _validate_checkpoint_bounds(row, previous, checkpoint_file_sizes)
         classified, records, journal, context_map, record_counts = (
             _read_diagnostic_streams_from_fds(
@@ -2101,6 +2177,7 @@ def _reconstruct_diagnostic_from_fds(
                 f"bytes, expected {committed_end}"
             )
         committed_sha256 = stream_hashers[name].copy().hexdigest()
+        committed_body_sha256 = stream_body_hashers[name].hexdigest()
         offset = committed_end
         while offset < stream_file_sizes[name]:
             chunk = os.pread(
@@ -2118,7 +2195,31 @@ def _reconstruct_diagnostic_from_fds(
         source_stream_digests[name] = DiagnosticStreamDigests(
             stream_hashers[name].hexdigest(),
             committed_sha256,
+            committed_body_sha256,
         )
+
+    # Sidecar body is the committed rows after the header.
+    sidecar_size = os.fstat(source_fds["sidecar"]).st_size
+    # Prefix hash is the state after header + committed rows, before tail.
+    sidecar_prefix_hasher = sidecar_full_hasher.copy()
+    tail_offset = BRSHGT1_HEADER_STRUCT.size + row_count * DIAGNOSTIC_ROW_SIZE
+    while tail_offset < sidecar_size:
+        chunk = os.pread(
+            source_fds["sidecar"],
+            min(8 * 1024 * 1024, sidecar_size - tail_offset),
+            tail_offset,
+        )
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: sidecar ended at {tail_offset}, expected {sidecar_size}"
+            )
+        sidecar_full_hasher.update(chunk)
+        tail_offset += len(chunk)
+    source_stream_digests["sidecar"] = DiagnosticStreamDigests(
+        sidecar_full_hasher.hexdigest(),
+        sidecar_prefix_hasher.hexdigest(),
+        sidecar_body_hasher.hexdigest(),
+    )
 
     return DiagnosticReconstruction(
         row_count,
@@ -2202,22 +2303,69 @@ def _clone_committed_source(
     destination: Path,
     committed_size: int,
     *,
-    reset_sidecar_header: bool = False,
+    replacement_header: bytes | None = None,
     source_sha256: str | None = None,
+    source_committed_prefix_sha256: str | None = None,
+    source_committed_body_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Clone one retained source file, then cut the clone at its commit point."""
+    """Clone one retained source file, then normalize and cut the clone."""
+    before = os.fstat(source_fd)
+    if not (0 <= committed_size <= before.st_size):
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: committed size {committed_size} exceeds "
+            f"{source} size {before.st_size}"
+        )
+    source_header: bytes | None = None
+    if replacement_header is not None:
+        if len(replacement_header) > committed_size:
+            raise AnalyzerError(
+                "DIAG-SALVAGE: replacement header exceeds committed source"
+            )
+        source_header = os.pread(source_fd, len(replacement_header), 0)
+        if len(source_header) != len(replacement_header):
+            raise AnalyzerError(f"DIAG-SALVAGE: short source header: {source}")
+
+    source_digest = source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
+    if committed_size == before.st_size and source_committed_prefix_sha256 is not None:
+        if source_committed_prefix_sha256 != source_digest:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source committed-prefix digest mismatch: {source}"
+            )
+    if _fd_signature(source_fd) != (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+    ):
+        raise AnalyzerError(f"DIAG-SALVAGE: source changed before cloning: {source}")
+
+    identity: dict[str, object] = {
+        "path": str(source),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "bytes": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+        "sha256": source_digest,
+        "clone_provenance": (
+            CLONE_EXACT_FULL_FILE
+            if committed_size == before.st_size
+            and (replacement_header is None or replacement_header == source_header)
+            else CLONE_DIFFERS_FROM_SOURCE
+        ),
+    }
+    if source_committed_prefix_sha256 is not None:
+        identity["committed_prefix_sha256"] = source_committed_prefix_sha256
+    if source_committed_body_sha256 is not None:
+        identity["committed_body_sha256"] = source_committed_body_sha256
+    if replacement_header is not None:
+        assert source_header is not None
+        identity["source_header_hex"] = source_header.hex()
+        identity["recovery_header_hex"] = replacement_header.hex()
+
     destination_fd = os.open(
         destination,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
         0o644,
     )
     try:
-        before = os.fstat(source_fd)
-        if not (0 <= committed_size <= before.st_size):
-            raise AnalyzerError(
-                f"DIAG-SALVAGE: committed size {committed_size} exceeds "
-                f"{source} size {before.st_size}"
-            )
         try:
             fcntl.ioctl(destination_fd, FICLONE, source_fd)
         except OSError as exc:
@@ -2230,46 +2378,15 @@ def _clone_committed_source(
                 raise
             _copy_fd_fallback(source_fd, destination_fd, committed_size)
         os.ftruncate(destination_fd, committed_size)
-        if reset_sidecar_header:
-            header = BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, 0)
-            if os.pwrite(destination_fd, header, 0) != len(header):
-                raise AnalyzerError(
-                    "DIAG-SALVAGE: short recovery sidecar header write"
-                )
+        if replacement_header is not None:
+            if os.pwrite(destination_fd, replacement_header, 0) != len(replacement_header):
+                raise AnalyzerError("DIAG-SALVAGE: short recovery header write")
         os.fsync(destination_fd)
         if _fd_signature(source_fd) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
         ):
             raise AnalyzerError(f"DIAG-SALVAGE: source changed while cloning: {source}")
-        source_digest = (
-            source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
-        )
-        if _fd_signature(source_fd) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ):
-            raise AnalyzerError(f"DIAG-SALVAGE: source changed while hashing: {source}")
-        return {
-            "path": str(source),
-            "device": before.st_dev,
-            "inode": before.st_ino,
-            "bytes": before.st_size,
-            "mtime_ns": before.st_mtime_ns,
-            "ctime_ns": before.st_ctime_ns,
-            "sha256": source_digest,
-            "clone_provenance": (
-                CLONE_EXACT_FULL_FILE
-                if committed_size == before.st_size and not reset_sidecar_header
-                else CLONE_DIFFERS_FROM_SOURCE
-            ),
-        }
+        return identity
     finally:
         os.close(destination_fd)
 
@@ -2295,35 +2412,43 @@ def _materialize_recovery_dir(
     final = reconstruction.final
     source_custody: dict[str, dict[str, object]] = {}
     copy_specs = (
-        ("contexts", final.context_end, False),
-        ("records", final.record_end, False),
-        ("journal", final.journal_end, False),
+        ("contexts", final.context_end, HEADER_STRUCT.pack(CONTEXT_MAGIC, final.context_rows)),
+        ("records", final.record_end, HEADER_STRUCT.pack(RECORD_MAGIC, final.record_rows)),
+        ("journal", final.journal_end, HEADER_STRUCT.pack(JOURNAL_MAGIC, final.journal_rows)),
         (
             "sidecar",
             BRSHGT1_HEADER_STRUCT.size
             + reconstruction.row_count * DIAGNOSTIC_ROW_SIZE,
-            True,
+            BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, reconstruction.row_count),
         ),
     )
-    for name, committed_size, reset_header in copy_specs:
+    recovery_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    for name, committed_size, replacement_header in copy_specs:
         stream_digests = reconstruction.source_stream_digests.get(name)
         identity = _clone_committed_source(
             source_fds[name],
             source_paths[name],
             recovery_paths[name],
             committed_size,
-            reset_sidecar_header=reset_header,
+            replacement_header=replacement_header,
             source_sha256=(
                 stream_digests.full_file_sha256
                 if stream_digests is not None
                 else None
             ),
-        )
-        if stream_digests is not None:
-            identity["committed_prefix_sha256"] = (
+            source_committed_prefix_sha256=(
                 stream_digests.committed_prefix_sha256
-            )
+                if stream_digests is not None
+                else None
+            ),
+            source_committed_body_sha256=(
+                stream_digests.committed_body_sha256
+                if stream_digests is not None
+                else None
+            ),
+        )
         source_custody[name] = identity
+        recovery_signatures[name] = _path_signature(recovery_paths[name])
     for name in ("replay", "counters"):
         source_custody[name] = _clone_committed_source(
             source_fds[name],
@@ -2331,14 +2456,12 @@ def _materialize_recovery_dir(
             recovery_paths[name],
             os.fstat(source_fds[name]).st_size,
         )
+        recovery_signatures[name] = _path_signature(recovery_paths[name])
     dir_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
-    recovery_signatures = {
-        name: _path_signature(path) for name, path in recovery_paths.items()
-    }
     return recovery_paths, source_custody, recovery_signatures
 
 
@@ -2590,9 +2713,10 @@ def _iter_binary_entries_with_custody(
         raise AnalyzerError(
             f"{name}: file too short ({file_size} bytes < {HEADER_SIZE} header)"
         )
-    custody: dict[str, int] = {"bytes": 0, "sha256": 0}
+    custody: dict[str, int] = {"bytes": 0, "sha256": 0, "body_sha256": 0}
     stream = path.open("rb")
     running_hash = hashlib.sha256()
+    body_hash = hashlib.sha256()
     try:
         header = _read_exact_bytes(stream, HEADER_SIZE, f"{name} header")
         running_hash.update(header)
@@ -2614,6 +2738,7 @@ def _iter_binary_entries_with_custody(
                 for index in range(count):
                     raw = _read_exact_bytes(stream, entry_size, f"{name} entry {index}")
                     running_hash.update(raw)
+                    body_hash.update(raw)
                     yield index, raw
                 trailing = stream.read(1)
                 if trailing:
@@ -2622,6 +2747,7 @@ def _iter_binary_entries_with_custody(
                     )
                 custody["bytes"] = file_size
                 custody["sha256"] = int(running_hash.hexdigest(), 16)
+                custody["body_sha256"] = int(body_hash.hexdigest(), 16)
             finally:
                 stream.close()
 
@@ -4756,6 +4882,7 @@ def _count_context_records_disk(
                     ("schnorr_verify_fail", agg_schnorr_fail, counters.schnorr_verify_fail),
                     ("checkecdsa_entries", agg_checkecdsa_entries, counters.checkecdsa_entries),
                     ("checkschnorr_entries", agg_checkschnorr_entries, counters.checkschnorr_entries),
+                    ("op_checksigadd", counts["tapscript_checksigadd_checks"], counters.op_checksigadd),
                 )
                 for name, actual, expected in reconciliations:
                     if actual != expected:

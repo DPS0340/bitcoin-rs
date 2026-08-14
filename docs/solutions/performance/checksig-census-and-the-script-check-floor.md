@@ -71,9 +71,9 @@ The diagnostic controller can receive the terminal `BRSHGT1` checkpoint after th
 
 `salvage-cmodern-height` recovers this state without changing the failed run. It retains one descriptor for each source artifact from semantic reconstruction through candidate publication. The reconstruction validates every checkpoint-committed context, record, and journal slice. It hashes those same source bytes in the validation pass. It then reads and hashes a physical tail only when the source contains bytes beyond the last committed endpoint. This produces a direct full-file digest and a committed-prefix digest without a second source-stream pass.
 
-The recovery directory is new and single-writer. Each source artifact is reflink-cloned when the filesystem supports it, or copied otherwise. Stream clones are truncated to the terminal endpoints. The recovery sidecar alone receives a placeholder count before the normal finalizer patches the terminal count. Each custody entry states whether the clone is `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; equal file length does not imply exact provenance because the sidecar header can change in place.
+The recovery directory is new and single-writer. Each source artifact is reflink-cloned when the filesystem supports it, or copied otherwise. Stream clones are truncated to the terminal endpoints. The recovery step replaces only fixed headers: it writes reconstructed terminal row counts to the context, record, journal, and sidecar clones. This normalization also handles a crash after the terminal checkpoint but before the native flush patches source header counts. The source files stay unchanged.
 
-The finalizer parses and hashes each recovery stream once. A stream hash must equal its source committed-prefix hash. Source and recovery path identities must also remain stable through publication. This two-pass design proves source semantics and published recovery custody. Reconstructing the recovery streams semantically between those passes would read the same large evidence a third time without proving a new property.
+Custody records the source full-file, committed-prefix, and committed-body digests before it changes a recovery header. The finalizer parses and hashes each recovery stream once. It requires the recovery body digest to match the source committed-body digest for the context, record, journal, and sidecar files. The strict parsers independently require the normalized magic and reconstructed row-count headers. Thus, an exact header and exact body bind each recovery file to the validated source bytes without a third pass over the large evidence streams. Custody records the recovery-file digest separately. A normalized clone is `DIFFERS_FROM_SOURCE` even when its length matches the committed source prefix. Source and recovery path identities stay stable through publication.
 
 The child replay artifact does not record the REST endpoint. Offline salvage therefore records `rest_url_provenance: operator_supplied_original_argv`. The exact `data_dir` string does exist in the replay artifact and must match without path normalization. A salvaged candidate records `child_exit_status: null`, `child_teardown: unobserved`, and the immutable source directory in `salvaged_from`. The candidate remains non-certifying until the selected Cmodern corpus receives the normal file-bound replay and classifier proofs.
 
@@ -96,9 +96,11 @@ passed certification.
 
 `INV-7` uses a contract-neutral Schnorr equation:
 `checkschnorr_entries >= schnorr_verify_calls` and
-`schnorr_verify_calls == schnorr_verify_ok + schnorr_verify_fail`. The exact
-C150 predicate still requires all Schnorr and `OP_CHECKSIGADD` counters to be
-zero. This split removes the pre-Taproot zero assumption from Cmodern without
+`schnorr_verify_calls == schnorr_verify_ok + schnorr_verify_fail`. Record
+reconciliation separately requires the aggregate `op_checksigadd` count to
+equal the number of captured `CHECKSIGADD` operation records. The exact C150
+predicate still requires all Schnorr and `OP_CHECKSIGADD` counters to be zero.
+This split removes the pre-Taproot zero assumption from Cmodern without
 weakening C150.
 
 ## Capture corpus and integrity proofs

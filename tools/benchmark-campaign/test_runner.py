@@ -625,6 +625,38 @@ class NativeExecutionTests(WorkspaceTestCase):
         self.assertEqual(os.sched_getaffinity(0), parent_affinity)
         self.assertEqual(result.verdict, Verdict.FAIL_RUN)
 
+    def test_affinity_readback_mismatch_rejects_before_spawn(self) -> None:
+        parent_affinity = frozenset({0, 1, 2})
+        configured = (0, 1)
+        configured_set = frozenset(configured)
+        fixture = CampaignFixture(self.workspace, affinity=configured)
+        current_affinity = parent_affinity
+
+        def mock_setaffinity(
+            _pid: int, mask: tuple[int, ...] | frozenset[int]
+        ) -> None:
+            nonlocal current_affinity
+            requested = frozenset(mask)
+            current_affinity = (
+                frozenset({configured[0]})
+                if requested == configured_set
+                else requested
+            )
+
+        def mock_getaffinity(_pid: int) -> frozenset[int]:
+            return current_affinity
+
+        with (
+            patch.object(os, "sched_setaffinity", side_effect=mock_setaffinity),
+            patch.object(os, "sched_getaffinity", side_effect=mock_getaffinity),
+            patch.object(runner.subprocess, "Popen") as popen,
+        ):
+            result, _path = fixture.run()
+
+        popen.assert_not_called()
+        self.assertEqual(current_affinity, parent_affinity)
+        self.assertEqual(result.verdict, Verdict.FAIL_RUN)
+
     def test_restore_swap_consumes_pinned_corpus_before_detection(self) -> None:
         fixture = CampaignFixture(self.workspace, restore_swap_input=True)
         expected = _sha256(fixture.corpus)

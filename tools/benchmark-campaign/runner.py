@@ -1181,6 +1181,13 @@ def _run_arm(
             os.sched_setaffinity(0, config.affinity)
             process: subprocess.Popen[bytes] | None = None
             try:
+                effective_affinity = os.sched_getaffinity(0)
+                if effective_affinity != set(config.affinity):
+                    raise ContractError(
+                        "CPU affinity not applied: "
+                        f"configured {sorted(config.affinity)}, "
+                        f"effective {sorted(effective_affinity)}"
+                    )
                 started = time.monotonic_ns()
                 process = subprocess.Popen(
                     command,

@@ -370,17 +370,29 @@ def _require_hex(value: object, field: str, line_number: int, size: int | None =
 class _HashingReader:
     """BinaryIO wrapper that hashes every byte read and counts total bytes."""
 
-    def __init__(self, stream: BinaryIO, hasher: hashlib._Hash) -> None:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        hasher: hashlib._Hash,
+        body_hasher: hashlib._Hash,
+    ) -> None:
         self._stream = stream
         self._hasher = hasher
+        self._body_hasher = body_hasher
+        self._hash_body = False
         self._bytes_read = 0
 
     def read(self, length: int) -> bytes:
         data = self._stream.read(length)
         if data:
             self._hasher.update(data)
+            if self._hash_body:
+                self._body_hasher.update(data)
             self._bytes_read += len(data)
         return data
+
+    def start_body(self) -> None:
+        self._hash_body = True
 
     def close(self) -> None:
         self._stream.close()
@@ -399,6 +411,7 @@ class ContextIterator(Iterator[ContextInput]):
         self._path = path
         self._dedup = dedup
         self._hasher = hashlib.sha256()
+        self._body_hasher = hashlib.sha256()
         self._stream: _HashingReader | None = None
         self._count = 0
         self._closed = False
@@ -406,7 +419,9 @@ class ContextIterator(Iterator[ContextInput]):
 
     def _open(self) -> _HashingReader:
         if self._stream is None:
-            self._stream = _HashingReader(self._path.open("rb"), self._hasher)
+            self._stream = _HashingReader(
+                self._path.open("rb"), self._hasher, self._body_hasher
+            )
         return self._stream
 
     def _run(self) -> Iterator[ContextInput]:
@@ -421,6 +436,7 @@ class ContextIterator(Iterator[ContextInput]):
             )
             if magic != CONTEXT_MAGIC:
                 raise ContextError(f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}")
+            stream.start_body()
             if declared_count > 0xFFFF_FFFF_FFFF_FFFF:
                 raise ContextError(f"CTX-RAW: declared row count exceeds representable u64 range")
 
@@ -478,6 +494,7 @@ class ContextIterator(Iterator[ContextInput]):
         return {
             "bytes": self._stream._bytes_read if self._stream else 0,
             "sha256": int(self._hasher.hexdigest(), 16),
+            "body_sha256": int(self._body_hasher.hexdigest(), 16),
             "count": self._count,
         }
 

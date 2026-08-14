@@ -2202,6 +2202,68 @@ def test_classify_corpus_c150_passes() -> None:
             "CTX-CUSTODY",
         )
 
+def test_classify_corpus_cmodern_rejects_mismatched_op_checksigadd() -> None:
+    """Mutating the native op_checksigadd counter without a matching record fails."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txids = [bytes([i + 1]) * 32 for i in range(6)]
+
+        contexts = [
+            _bare_p2pkh(txids[0]),
+            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),
+            _native_w0(txids[2], flags=VERIFY_WITNESS),
+            _p2sh_wrapped_w0(txids[3], flags=VERIFY_P2SH | VERIFY_WITNESS),
+            _taproot_key_path(txids[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+            _taproot_script_path(txids[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
+        ]
+
+        records = [
+            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),
+            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),
+            _make_record_bytes(txids[2], 0, op_kind=3, sig_version=1),
+            _make_record_bytes(txids[3], 0, op_kind=3, sig_version=1),
+            _make_record_bytes(txids[5], 0, op_kind=1, sig_version=2),
+            _make_record_bytes(txids[5], 0, op_kind=5, sig_version=2, op_seq=1),
+        ]
+
+        journal = [
+            _make_journal_bytes(txids[0], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(txids[1], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(txids[2], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
+            _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+        ]
+
+        counters = _make_valid_counters(
+            record_count=6, journal_count=6, ffi_verify_entries=6,
+            op_checksig=0,
+            op_checkmultisig=4,
+            op_checksigadd=2,
+            checkecdsa_entries=4,
+            ecdsa_from_checksig=0,
+            ecdsa_from_checkmultisig=4,
+            ecdsa_verify_calls=4,
+            ecdsa_verify_ok=4,
+            ecdsa_verify_fail=0,
+            sighash_computed=4,
+            checkschnorr_entries=2,
+            schnorr_verify_calls=2,
+            schnorr_verify_ok=2,
+            schnorr_verify_fail=0,
+        )
+
+        args = _make_classify_args(
+            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: _cmd_classify_synthetic_cmodern(args),
+            "op_checksigadd mismatch",
+            "CTX-OPERATIONS",
+        )
+
+
 def test_classify_corpus_cmodern_rejects_wrong_stop_height() -> None:
     """Cmodern rejects evidence whose replay stops below the frozen tip."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -5664,6 +5726,53 @@ def test_find_cmodern_height_fake_child_success() -> None:
         assert candidate["child_exit_status"] == 0
         assert candidate["child_teardown"] == "clean"
         assert candidate["salvaged_from"] is None
+        sidecar = work_dir / "brshgt1.bin"
+        assert candidate["custody"]["brshgt1_sidecar"]["sha256"] == hashlib.sha256(
+            sidecar.read_bytes()
+        ).hexdigest()
+
+
+def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> None:
+    """A failed live finalization must not publish its sidecar count."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        child = _make_fake_binary(tmp)
+        validate_replay = analyze._validate_replay_diagnostic
+
+        def reject_replay(
+            _path: Path,
+            _final: DiagnosticCheckpoint,
+            _ceiling: int,
+            _storage_backend: str,
+            _txindex: bool,
+            _blockfilterindex: bool,
+            _data_dir: str,
+        ) -> None:
+            raise AnalyzerError("late replay validation failure")
+
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        analyze._validate_replay_diagnostic = reject_replay
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child, "127.0.0.1:18443", 100, work_dir, output
+                ),
+                "late replay validation",
+                "late replay validation failure",
+            )
+        finally:
+            analyze._validate_replay_diagnostic = validate_replay
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        assert analyze._brshgt1_count(work_dir / "brshgt1.bin") == 0
+        assert not output.exists()
 
 
 def test_find_cmodern_height_post_stop_timeout_finalizes_honestly() -> None:
@@ -5743,7 +5852,12 @@ def _directory_hashes(root: Path) -> dict[str, str]:
 
 
 def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation() -> None:
-    """Salvage copies only checkpoint-committed bytes and preserves the incident run."""
+    """Salvage copies only checkpoint-committed bytes and preserves the incident run.
+
+    A terminal checkpoint can be durable while source streams still contain
+    their initial zero row counts. Recovery normalizes those headers to the
+    terminal counts while it leaves the source files unchanged.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         stage = _write_diagnostic_stage(tmp)
@@ -5771,6 +5885,12 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
         finally:
             os.close(fd)
         for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin"):
+            fd = os.open(source_dir / name, os.O_WRONLY)
+            try:
+                assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+                os.fsync(fd)
+            finally:
+                os.close(fd)
             with (source_dir / name).open("ab") as stream:
                 stream.write(b"UNCOMMITTED-TAIL")
                 stream.flush()
@@ -5816,6 +5936,29 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             )
         assert _brshgt1_count(recovery_dir / "brshgt1.bin") == 10
 
+        final = analyze.DiagnosticCheckpoint(
+            height=candidate["earliest_defensible_height_h"],
+            block_hash_le=bytes.fromhex(candidate["block_hash_h"])[::-1],
+            context_rows=candidate["final_stream_counts"]["context_rows"],
+            context_end=candidate["final_stream_endpoints"]["context_end"],
+            record_rows=candidate["final_stream_counts"]["record_rows"],
+            record_end=candidate["final_stream_endpoints"]["record_end"],
+            journal_rows=candidate["final_stream_counts"]["journal_rows"],
+            journal_end=candidate["final_stream_endpoints"]["journal_end"],
+        )
+        recovered_paths = analyze._diagnostic_artifact_paths(recovery_dir)
+        analyze._validate_terminal_streams(recovered_paths, final)
+
+        for filename, count_field, magic in (
+            ("brsctx1.bin", "context_rows", analyze.CONTEXT_MAGIC),
+            ("brsrec1.bin", "record_rows", analyze.RECORD_MAGIC),
+            ("brsjrn1.bin", "journal_rows", analyze.JOURNAL_MAGIC),
+        ):
+            raw = (recovery_dir / filename).read_bytes()[:16]
+            file_magic, count = analyze.HEADER_STRUCT.unpack(raw)
+            assert file_magic == magic
+            assert count == candidate["final_stream_counts"][count_field]
+
         source_custody = candidate["source_full_file_custody"]
         source_names = {
             "contexts": "brsctx1.bin",
@@ -5831,15 +5974,124 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             ("contexts", "brsctx1"),
             ("records", "brsrec1"),
             ("journal", "brsjrn1"),
+            ("sidecar", "brshgt1_sidecar"),
         ):
             assert source_custody[name]["clone_provenance"] == "DIFFERS_FROM_SOURCE"
+            assert source_custody[name].get("source_header_hex") != source_custody[name].get("recovery_header_hex")
+            # Normalized header changes full/prefix hashes, but bodies are identical.
             assert (
                 source_custody[name]["committed_prefix_sha256"]
-                == candidate["custody"][custody_name]["sha256"]
+                != candidate["custody"][custody_name]["sha256"]
+            )
+            assert (
+                source_custody[name]["committed_body_sha256"]
+                == candidate["custody"][custody_name]["body_sha256"]
             )
         assert source_custody["sidecar"]["clone_provenance"] == "DIFFERS_FROM_SOURCE"
         assert source_custody["replay"]["clone_provenance"] == "EXACT_FULL_FILE"
         assert source_custody["counters"]["clone_provenance"] == "EXACT_FULL_FILE"
+
+
+def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
+    """The initial source signature binds full-file digests through cloning."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        sidecar = source_dir / "brshgt1.bin"
+        sidecar_fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(sidecar_fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(sidecar_fd)
+        finally:
+            os.close(sidecar_fd)
+        for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin"):
+            path = source_dir / name
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            with path.open("ab") as stream:
+                stream.write(b"UNCOMMITTED-TAIL")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        clone_committed_source = analyze._clone_committed_source
+        changed = False
+
+        def change_tail_then_clone(
+            source_fd: int,
+            source: Path,
+            destination: Path,
+            committed_size: int,
+            replacement_header: bytes | None = None,
+            source_sha256: str | None = None,
+            source_committed_prefix_sha256: str | None = None,
+            source_committed_body_sha256: str | None = None,
+        ) -> dict[str, object]:
+            nonlocal changed
+            if not changed and source.name == "brsctx1.bin":
+                changed = True
+                tail_offset = os.fstat(source_fd).st_size - 1
+                original = os.pread(source_fd, 1, tail_offset)
+                assert len(original) == 1
+                write_fd = os.open(source, os.O_WRONLY)
+                try:
+                    assert os.pwrite(
+                        write_fd, bytes([original[0] ^ 1]), tail_offset
+                    ) == 1
+                    os.fsync(write_fd)
+                finally:
+                    os.close(write_fd)
+            return clone_committed_source(
+                source_fd,
+                source,
+                destination,
+                committed_size,
+                replacement_header=replacement_header,
+                source_sha256=source_sha256,
+                source_committed_prefix_sha256=source_committed_prefix_sha256,
+                source_committed_body_sha256=source_committed_body_sha256,
+            )
+
+        analyze._clone_committed_source = change_tail_then_clone
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    source_dir / "state",
+                ),
+                "tail change before clone",
+                "source changed during materialization",
+            )
+        finally:
+            analyze._clone_committed_source = clone_committed_source
+        assert changed
+        assert not recovery_dir.exists()
+        assert not output.exists()
 
 
 def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
@@ -5902,10 +6154,156 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
                     source_dir / "state",
                 ),
                 "mutated recovery stream",
-                "validated source committed prefix",
+                "recovered contexts body does not match",
+                "validated source committed body",
             )
         finally:
             analyze._validate_terminal_streams = validate_terminal_streams
+        assert _directory_hashes(source_dir) == source_before
+        assert not recovery_dir.exists()
+        assert not output.exists()
+
+
+def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None:
+    """A semantically valid body replacement that races signature capture
+    must still fail source-body custody, even if the signature matches.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        sidecar = source_dir / "brshgt1.bin"
+        fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        source_before = _directory_hashes(source_dir)
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        path_signature = analyze._path_signature
+        captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
+
+        def signature_then_replace(path: Path) -> tuple[int, int, int, int, int]:
+            if path in captured_signatures:
+                return captured_signatures[path]
+            sig = path_signature(path)
+            # Replace the recovery contexts file with a semantically valid body
+            # (same size and row count, different bytes) after its signature is
+            # captured. The replacement is the race: the signature is baselined
+            # to the original clone, but the body is no longer source-identical.
+            if path.name == "brsctx1.bin" and "recovery" in path.parts:
+                captured_signatures[path] = sig
+                data = path.read_bytes()
+                mutated = bytearray(data)
+                mutated[HEADER_SIZE + 4 + CONTEXT_MIN_ROW_SIZE + 3] ^= 1
+                path.write_bytes(bytes(mutated))
+                with path.open("rb") as f:
+                    os.fsync(f.fileno())
+            return sig
+
+        analyze._path_signature = signature_then_replace
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    source_dir / "state",
+                ),
+                "pre-signature body replacement",
+                "recovered contexts body does not match",
+                "validated source committed body",
+            )
+        finally:
+            analyze._path_signature = path_signature
+        assert _directory_hashes(source_dir) == source_before
+        assert not recovery_dir.exists()
+        assert not output.exists()
+
+
+def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
+    """A salvaged sidecar must keep its reconstructed count header."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        sidecar = source_dir / "brshgt1.bin"
+        fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        source_before = _directory_hashes(source_dir)
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        path_signature = analyze._path_signature
+        captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
+
+        def signature_then_zero_count(path: Path) -> tuple[int, int, int, int, int]:
+            if path in captured_signatures:
+                return captured_signatures[path]
+            signature = path_signature(path)
+            if path.name == "brshgt1.bin" and "recovery" in path.parts:
+                captured_signatures[path] = signature
+                recovery_fd = os.open(path, os.O_WRONLY)
+                try:
+                    assert os.pwrite(recovery_fd, struct.pack("<Q", 0), 8) == 8
+                    os.fsync(recovery_fd)
+                finally:
+                    os.close(recovery_fd)
+            return signature
+
+        analyze._path_signature = signature_then_zero_count
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    source_dir / "state",
+                ),
+                "zeroed recovery sidecar count",
+                "recovered sidecar declared row count",
+            )
+        finally:
+            analyze._path_signature = path_signature
         assert _directory_hashes(source_dir) == source_before
         assert not recovery_dir.exists()
         assert not output.exists()
@@ -6968,6 +7366,7 @@ def main() -> int:
         test_classify_corpus_c150_rejects_wrong_stop_height,
         test_classify_corpus_c150_rejects_wrong_stop_hash,
         test_classify_corpus_c150_rejects_mismatched_stop_hash,
+        test_classify_corpus_cmodern_rejects_mismatched_op_checksigadd,
         test_classify_corpus_cmodern_all_positive_passes_synthetic_fixture,
         test_replay_rejects_wrong_network,
         test_replay_rejects_rest_block_source,
@@ -7051,10 +7450,14 @@ def main() -> int:
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
         test_find_cmodern_height_fake_child_success,
+        test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched,
         test_find_cmodern_height_post_stop_timeout_finalizes_honestly,
         test_find_cmodern_height_rejects_pipe_filling_trailing_output,
         test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation,
+        test_salvage_cmodern_height_rejects_tail_change_before_clone,
         test_salvage_cmodern_height_rejects_recovery_stream_mutation,
+        test_salvage_cmodern_height_rejects_pre_signature_body_replacement,
+        test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count,
         test_find_cmodern_height_assembles_fragmented_child_frames,
         test_find_cmodern_height_reaps_failed_child,
         test_find_cmodern_height_destination_race,
