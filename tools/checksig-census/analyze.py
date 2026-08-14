@@ -2228,7 +2228,7 @@ def _clone_committed_source(
                 errno.EOPNOTSUPP,
             ):
                 raise
-            _copy_fd_fallback(source_fd, destination_fd, before.st_size)
+            _copy_fd_fallback(source_fd, destination_fd, committed_size)
         os.ftruncate(destination_fd, committed_size)
         if reset_sidecar_header:
             header = BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, 0)
@@ -2286,6 +2286,11 @@ def _materialize_recovery_dir(
 ]:
     """Clone only checkpoint-committed evidence into a new directory."""
     recovery_dir.mkdir(parents=True, exist_ok=False)
+    parent_fd = os.open(recovery_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
     recovery_paths = _diagnostic_artifact_paths(recovery_dir)
     final = reconstruction.final
     source_custody: dict[str, dict[str, object]] = {}

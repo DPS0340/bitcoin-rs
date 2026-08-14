@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import signal
 import stat
@@ -51,6 +52,10 @@ ARM_COUNT = PAIR_COUNT * 2
 PERFORMANCE_GATE = 2.0
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _FD_PATH_RE = re.compile(r"/proc/self/fd/([0-9]+)\Z")
+_FIXED_CHILD_ENV: dict[str, str] = {
+    "LC_ALL": "C",
+    "TZ": "UTC",
+}
 
 
 class Domain(str, Enum):
@@ -67,6 +72,14 @@ class Corpus(str, Enum):
 class Architecture(str, Enum):
     X86_64 = "x86_64"
     AARCH64 = "aarch64"
+
+
+_HOST_ARCH_ALIASES: dict[str, Architecture] = {
+    "x86_64": Architecture.X86_64,
+    "amd64": Architecture.X86_64,
+    "aarch64": Architecture.AARCH64,
+    "arm64": Architecture.AARCH64,
+}
 
 
 class Backend(str, Enum):
@@ -1177,7 +1190,7 @@ def _run_arm(
                     shell=False,
                     close_fds=True,
                     pass_fds=tuple(inherited_descriptors),
-                    env=os.environ.copy(),
+                    env=_FIXED_CHILD_ENV,
                 )
             finally:
                 try:
@@ -1336,6 +1349,16 @@ def _make_pair(
     return PairResult(pair_index, order, candidate, core, valid, correctness)
 
 
+def _host_architecture() -> Architecture:
+    machine = platform.machine().casefold()
+    try:
+        return _HOST_ARCH_ALIASES[machine]
+    except KeyError:
+        raise ContractError(
+            f"host architecture {machine!r} is not supported by the campaign runner"
+        ) from None
+
+
 def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
     matches = tuple(config for config in campaign.cells if config.cell == cell)
     if len(matches) != 1:
@@ -1343,6 +1366,12 @@ def run_cell(campaign: CampaignConfig, cell: CellId) -> tuple[CellResult, Path]:
     config = matches[0]
     if not config.ready:
         raise ContractError(f"cell {cell.key} is blocked: {config.blocked_reason}")
+    host_arch = _host_architecture()
+    if host_arch is not cell.architecture:
+        raise ContractError(
+            f"cell {cell.key} requires {cell.architecture.value} "
+            f"but host is {host_arch.value}"
+        )
     inputs = _snapshot_inputs(config)
     programs: PreparedPrograms | None = None
     try:
@@ -1539,6 +1568,12 @@ def _verify_recorded_evidence(
 ) -> None:
     if observation.arm_result is None:
         return
+    for descriptor in (
+        inputs.corpus.descriptor,
+        inputs.manifest.descriptor,
+        inputs.proof.descriptor,
+    ):
+        os.fstat(descriptor)
     observed = _parse_native_result(
         config,
         proof,
@@ -1624,9 +1659,15 @@ def parse_result(value: object) -> CellResult:
     config = _cell_config_from_json(item["cell_config"], "result.cell_config")
     inputs = _snapshot_inputs(config)
     try:
-        proof = _load_cell_proof(config, inputs)
+        return _parse_result_with_inputs(item, config, inputs)
     finally:
         _close_inputs(inputs)
+
+
+def _parse_result_with_inputs(
+    item: dict[str, object], config: CellConfig, inputs: InputCustody
+) -> CellResult:
+    proof = _load_cell_proof(config, inputs)
     if _hash(item["proof_sha256"], "result.proof_sha256") != proof.sha256:
         raise ContractError("result proof hash was tampered")
     if _text(item["proof_scope"], "result.proof_scope") != PROOF_SCOPE:
@@ -1889,6 +1930,8 @@ def validate_result(path: Path, config_path: Path) -> CellResult:
     result = parse_result(_load_json(result_path, "result"))
     if campaign.canonical_sha256 != result.config_sha256:
         raise ContractError("result config hash does not match supplied config")
+    if campaign.schedule_seed != result.schedule_seed:
+        raise ContractError("result schedule seed does not match supplied config")
     matches = [cell for cell in campaign.cells if cell.cell == result.cell_config.cell]
     if len(matches) != 1 or matches[0] != result.cell_config:
         raise ContractError("result cell identity does not match supplied config")

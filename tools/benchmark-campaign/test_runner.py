@@ -23,6 +23,7 @@ from native_offline import AdapterKind, ContractError
 from runner import (
     ALL_CELLS,
     PAIR_COUNT,
+    Architecture,
     Verdict,
     classify_wall_performance,
     load_config,
@@ -90,7 +91,7 @@ def _candidate_script(
     exit_code: int = 0,
     sleep_seconds: float = 0.06,
 ) -> Path:
-    source = f"""#!/usr/bin/env python3.14
+    source = f"""#!{sys.executable}
 import hashlib
 import json
 import os
@@ -103,6 +104,9 @@ data_dir = pathlib.Path(args['--data-dir'])
 corpus = pathlib.Path(args['--blocks-file'])
 manifest = pathlib.Path(args['--corpus-manifest'])
 (data_dir / 'executed.txt').write_text(sys.argv[0], encoding='utf-8')
+(data_dir / 'environment.json').write_text(
+    json.dumps(dict(os.environ), sort_keys=True), encoding='utf-8'
+)
 (data_dir / 'affinity.json').write_text(
     json.dumps(sorted(os.sched_getaffinity(0))), encoding='utf-8'
 )
@@ -185,7 +189,7 @@ def _core_script(
     exit_code: int = 0,
     sleep_seconds: float = 0.06,
 ) -> Path:
-    source = f"""#!/usr/bin/env python3.14
+    source = f"""#!{sys.executable}
 import json
 import os
 import pathlib
@@ -212,6 +216,9 @@ lines.append('2026-01-01T00:00:01Z Shutdown done')
 log.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')
 data_dir = pathlib.Path(args['datadir'])
 (data_dir / 'executed.txt').write_text(sys.argv[0], encoding='utf-8')
+(data_dir / 'environment.json').write_text(
+    json.dumps(dict(os.environ), sort_keys=True), encoding='utf-8'
+)
 (data_dir / 'affinity.json').write_text(
     json.dumps(sorted(os.sched_getaffinity(0))), encoding='utf-8'
 )
@@ -433,6 +440,11 @@ class WorkspaceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory()
         self.workspace = Path(self._temporary.name).resolve()
+        machine_patcher = patch.object(
+            runner.platform, "machine", return_value="x86_64"
+        )
+        machine_patcher.start()
+        self.addCleanup(machine_patcher.stop)
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
@@ -800,6 +812,138 @@ class EvidenceCustodyTests(WorkspaceTestCase):
         ]
         self.assertGreater(elapsed, 0.42)
         self.assertLess(max(walls), 500_000_000)
+
+
+class HostArchitectureTests(WorkspaceTestCase):
+    def test_x86_cell_rejects_aarch64_host(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        with patch.object(runner, "_host_architecture", return_value=Architecture.AARCH64):
+            with self.assertRaisesRegex(ContractError, "requires x86_64.*host is aarch64"):
+                fixture.run()
+
+    def test_aarch64_cell_rejects_x86_host(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        cells = _array(raw["cells"])
+        aarch64_cell = runner.CellId(
+            runner.Domain.OFFLINE,
+            runner.Corpus.C150,
+            Architecture.AARCH64,
+            runner.Backend.FJALL,
+        )
+        for cell_entry in cells:
+            entry = _object(cell_entry)
+            cell_obj = _object(entry["cell"])
+            if (
+                cell_obj["architecture"] == "aarch64"
+                and cell_obj["corpus"] == "c150"
+                and cell_obj["domain"] == "offline"
+            ):
+                entry["blocked_reason"] = None
+                entry["proof_path"] = str(fixture.proof)
+                entry["proof_sha256"] = _sha256(fixture.proof)
+            elif (
+                cell_obj["architecture"] == "x86_64"
+                and cell_obj["corpus"] == "c150"
+                and cell_obj["domain"] == "offline"
+            ):
+                entry["blocked_reason"] = "not configured"
+                entry["proof_path"] = None
+                entry["proof_sha256"] = None
+        fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+        with patch.object(runner, "_host_architecture", return_value=Architecture.X86_64):
+            with self.assertRaisesRegex(ContractError, "requires aarch64.*host is x86_64"):
+                run_cell(load_config(fixture.config), aarch64_cell)
+
+    def test_matching_architecture_proceeds(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        with patch.object(runner.platform, "machine", return_value="AMD64"):
+            result, _path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+
+
+class FixedChildEnvTests(WorkspaceTestCase):
+    def test_hostile_parent_variable_does_not_reach_child(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        with patch.dict(os.environ, {"BENCHMARK_HOSTILE": "pwned"}):
+            result, _path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        for pair in result.pairs:
+            for arm in (pair.candidate, pair.core):
+                child_env = _object(
+                    json.loads(
+                        Path(arm.data_dir, "environment.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                )
+                self.assertNotIn("BENCHMARK_HOSTILE", child_env)
+                self.assertNotIn("PATH", child_env)
+                self.assertEqual(child_env.get("LC_ALL"), "C")
+                self.assertEqual(child_env.get("TZ"), "UTC")
+
+    def test_child_process_runs_without_path(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        result, _path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        for pair in result.pairs:
+            for arm in (pair.candidate, pair.core):
+                self.assertTrue(
+                    Path(arm.data_dir, "executed.txt").is_file(),
+                    "child process must execute successfully without PATH",
+                )
+
+
+class ScheduleSeedValidationTests(WorkspaceTestCase):
+    def test_mismatched_schedule_seed_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        raw["schedule_seed"] = 999
+        result_path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(ContractError, "schedule seed does not match"):
+            validate_result(result_path, fixture.config)
+
+
+class DescriptorLifetimeTests(WorkspaceTestCase):
+    def test_descriptors_open_during_evidence_verification(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        checked: list[bool] = []
+        original = runner._verify_recorded_evidence  # pyright: ignore[reportPrivateUsage]
+
+        def assert_open(
+            observation: runner.ArmObservation,
+            config: runner.CellConfig,
+            proof: runner.CellProof,
+            inputs: runner.InputCustody,
+            paths: dict[str, str],
+        ) -> None:
+            for descriptor in (
+                inputs.corpus.descriptor,
+                inputs.manifest.descriptor,
+                inputs.proof.descriptor,
+            ):
+                os.fstat(descriptor)
+            checked.append(True)
+            original(observation, config, proof, inputs, paths)
+
+        with patch.object(runner, "_verify_recorded_evidence", assert_open):
+            validate_result(result_path, fixture.config)
+        self.assertTrue(checked)
+        self.assertEqual(len(checked), PAIR_COUNT * 2)
+
+    def test_error_path_closes_input_descriptors(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        raw["proof_sha256"] = "0" * 64
+        result_path.write_text(json.dumps(raw), encoding="utf-8")
+        before = len(tuple(Path("/proc/self/fd").iterdir()))
+        with self.assertRaises(ContractError):
+            validate_result(result_path, fixture.config)
+        after = len(tuple(Path("/proc/self/fd").iterdir()))
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

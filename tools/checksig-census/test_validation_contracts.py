@@ -6723,6 +6723,139 @@ def test_atomic_publish_cleans_temp_on_post_link_fsync_failure() -> None:
         assert not target.exists()
         assert not any(tmp.glob(".*out.json.tmp*")), "temp must be removed on failure"
 
+
+def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
+    """The non-FICLONE fallback must copy only committed_size bytes, not the
+    full source file.  Forces the EXDEV fallback and proves via pread tracking
+    that the source is never read past the committed endpoint."""
+    import errno
+    import fcntl
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        source = tmp / "source.bin"
+        committed_size = 64
+        full_size = 192
+        source.write_bytes(b"\x00" * committed_size + b"\xff" * (full_size - committed_size))
+        destination = tmp / "dest.bin"
+
+        source_fd = os.open(source, os.O_RDONLY)
+        try:
+            original_ioctl = fcntl.ioctl
+            original_pread = os.pread
+            max_read_end = 0
+
+            def failing_ioctl(fd, request, arg):
+                raise OSError(errno.EXDEV, "simulated cross-device clone")
+
+            def tracking_pread(fd, count, offset):
+                nonlocal max_read_end
+                if fd == source_fd:
+                    max_read_end = max(max_read_end, offset + count)
+                return original_pread(fd, count, offset)
+
+            full_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            try:
+                fcntl.ioctl = failing_ioctl
+                os.pread = tracking_pread
+                analyze._clone_committed_source(
+                    source_fd,
+                    source,
+                    destination,
+                    committed_size,
+                    source_sha256=full_sha,
+                )
+            finally:
+                fcntl.ioctl = original_ioctl
+                os.pread = original_pread
+
+            assert destination.stat().st_size == committed_size
+            assert destination.read_bytes() == b"\x00" * committed_size
+            assert max_read_end <= committed_size, (
+                f"fallback read up to offset {max_read_end}, "
+                f"exceeding committed_size {committed_size}"
+            )
+        finally:
+            os.close(source_fd)
+
+
+def test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir() -> None:
+    """The newly created recovery_dir directory entry is made durable by
+    fsyncing its parent after mkdir, before any files are written inside.
+    The recovery directory itself is fsynced after its contents are placed.
+    Both must occur and the parent must precede the recovery directory."""
+    from analyze import DiagnosticReconstruction
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        source_paths = analyze._diagnostic_artifact_paths(source_dir)
+
+        for path in source_paths.values():
+            path.write_bytes(b"\x00" * 32)
+
+        source_fds: dict[str, int] = {}
+        for name, path in source_paths.items():
+            source_fds[name] = os.open(path, os.O_RDONLY)
+
+        recovery_dir = tmp / "recovery"
+        parent_resolved = str(recovery_dir.parent.resolve())
+        recovery_resolved = str(recovery_dir.resolve())
+
+        final = DiagnosticCheckpoint(
+            height=0,
+            block_hash_le=b"\x00" * 32,
+            context_rows=0,
+            context_end=16,
+            record_rows=0,
+            record_end=16,
+            journal_rows=0,
+            journal_end=16,
+        )
+        reconstruction = DiagnosticReconstruction(
+            row_count=0,
+            final=final,
+            cumulative_counts={},
+            first_heights={},
+            source_stream_digests={},
+        )
+
+        original_fsync = os.fsync
+        dir_fsync_order: list[str] = []
+
+        def tracking_fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                fd_path = os.readlink(f"/proc/self/fd/{fd}")
+                if fd_path == parent_resolved:
+                    dir_fsync_order.append("parent")
+                elif fd_path == recovery_resolved:
+                    dir_fsync_order.append("recovery_dir")
+                else:
+                    dir_fsync_order.append(f"other:{fd_path}")
+            return original_fsync(fd)
+
+        try:
+            os.fsync = tracking_fsync
+            analyze._materialize_recovery_dir(
+                source_paths, source_fds, recovery_dir, reconstruction
+            )
+        finally:
+            os.fsync = original_fsync
+            for fd in source_fds.values():
+                os.close(fd)
+
+        assert "parent" in dir_fsync_order, (
+            f"parent directory must be fsynced, got {dir_fsync_order}"
+        )
+        assert "recovery_dir" in dir_fsync_order, (
+            f"recovery directory must be fsynced, got {dir_fsync_order}"
+        )
+        parent_idx = dir_fsync_order.index("parent")
+        recovery_idx = dir_fsync_order.index("recovery_dir")
+        assert parent_idx < recovery_idx, (
+            f"parent fsync must precede recovery_dir fsync, got {dir_fsync_order}"
+        )
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 
@@ -6947,6 +7080,8 @@ def main() -> int:
         test_find_cmodern_height_settings_mismatch_txindex,
         test_find_cmodern_height_settings_mismatch_blockfilterindex,
         test_find_cmodern_height_settings_mismatch_data_dir,
+        test_clone_committed_source_fallback_copies_only_committed_size,
+        test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir,
     ]
     passed = 0
     failed = 0
