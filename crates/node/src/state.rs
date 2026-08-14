@@ -1283,7 +1283,7 @@ impl NodeState {
         Arc::clone(&self.coin_stats)
     }
 
-    /// Returns an immutable TxIndex view that does not share the worker mutex.
+    /// Returns an immutable `TxIndex` view that does not share the worker mutex.
     #[must_use]
     pub fn tx_index_reader(&self) -> Option<Arc<dyn bitcoin_rs_index::TxIndexReader>> {
         self.tx_index_storage
@@ -1362,13 +1362,13 @@ impl NodeState {
     pub fn electrum_history_reader(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
-        self.tx_index_storage.as_ref().and_then(|storage| {
-            Some(storage.electrum_history_reader(
+        self.tx_index_storage.as_ref().map(|storage| {
+            storage.electrum_history_reader(
                 self.blocks(),
                 self.block_body_source(),
                 self.block_tree(),
                 self.applied_tip(),
-            ))
+            )
         })
     }
 
