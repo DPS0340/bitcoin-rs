@@ -5905,7 +5905,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             output,
             "127.0.0.1:18443",
             100,
-            source_dir / "state",
+            str(source_dir / "state"),
         )
         assert _directory_hashes(source_dir) == source_before
 
@@ -6082,7 +6082,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    source_dir / "state",
+                    str(source_dir / "state"),
                 ),
                 "tail change before clone",
                 "source changed during materialization",
@@ -6151,7 +6151,7 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    source_dir / "state",
+                    str(source_dir / "state"),
                 ),
                 "mutated recovery stream",
                 "recovered contexts body does not match",
@@ -6227,7 +6227,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
                     output,
                     "127.0.0.1:18443",
                     100,
-                    source_dir / "state",
+                    str(source_dir / "state"),
                 ),
                 "pre-signature body replacement",
                 "recovered contexts body does not match",
@@ -6297,7 +6297,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    source_dir / "state",
+                    str(source_dir / "state"),
                 ),
                 "zeroed recovery sidecar count",
                 "recovered sidecar declared row count",
@@ -6307,6 +6307,95 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
         assert _directory_hashes(source_dir) == source_before
         assert not recovery_dir.exists()
         assert not output.exists()
+
+
+
+def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
+    """Salvage preserves exact data-dir provenance text."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        # Keep a spelling that pathlib would normalize.
+        raw_data_dir = str(source_dir / "state") + "/./"
+        replay_path = source_dir / "replay_diagnostic.json"
+        replay = json.loads(replay_path.read_text())
+        replay["data_dir"] = raw_data_dir
+        replay_path.write_text(json.dumps(replay, indent=2) + "\n", encoding="utf-8")
+
+        # Corrupt the source sidecar count to force the salvage path.
+        sidecar = source_dir / "brshgt1.bin"
+        fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin"):
+            fd = os.open(source_dir / name, os.O_WRONLY)
+            try:
+                assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        captured_data_dir: list[str] = []
+        original_validate = analyze._validate_replay_diagnostic
+
+        def capture_validate(
+            path: Path,
+            final: analyze.DiagnosticCheckpoint,
+            ceiling: int,
+            storage_backend: str,
+            txindex: bool,
+            blockfilterindex: bool,
+            data_dir: str,
+        ) -> None:
+            captured_data_dir.append(data_dir)
+            original_validate(
+                path,
+                final,
+                ceiling,
+                storage_backend,
+                txindex,
+                blockfilterindex,
+                data_dir,
+            )
+
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        args = argparse.Namespace(
+            source_dir=str(source_dir),
+            recovery_dir=str(recovery_dir),
+            output=str(output),
+            rest_url="127.0.0.1:18443",
+            stop_height=100,
+            data_dir=raw_data_dir,
+            storage_backend="fjall",
+            txindex=False,
+            blockfilterindex=False,
+        )
+        analyze._validate_replay_diagnostic = capture_validate
+        try:
+            assert analyze.cmd_salvage_cmodern_height(args) == 0
+        finally:
+            analyze._validate_replay_diagnostic = original_validate
+
+        assert captured_data_dir == [raw_data_dir]
 
 
 def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
@@ -7458,6 +7547,7 @@ def main() -> int:
         test_salvage_cmodern_height_rejects_recovery_stream_mutation,
         test_salvage_cmodern_height_rejects_pre_signature_body_replacement,
         test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count,
+        test_salvage_preserves_exact_data_dir_text_through_to_validation,
         test_find_cmodern_height_assembles_fragmented_child_frames,
         test_find_cmodern_height_reaps_failed_child,
         test_find_cmodern_height_destination_race,

@@ -2471,7 +2471,7 @@ def _salvage_diagnostic_scan(
     output_path: Path,
     rest_url: str,
     ceiling: int,
-    data_dir: Path,
+    data_dir: str,
     storage_backend: str = "fjall",
     txindex: bool = False,
     blockfilterindex: bool = False,
@@ -2480,7 +2480,7 @@ def _salvage_diagnostic_scan(
     source_dir = source_dir.resolve()
     recovery_dir = recovery_dir.resolve()
     output_path = output_path.resolve()
-    data_dir = Path(data_dir)
+    # Preserve the operator's exact provenance string for replay comparison.
     if not source_dir.is_dir():
         raise AnalyzerError(f"DIAG-SETUP: source directory not found: {source_dir}")
     if recovery_dir.exists():
@@ -2551,7 +2551,7 @@ def _salvage_diagnostic_scan(
             storage_backend,
             txindex,
             blockfilterindex,
-            str(data_dir),
+            data_dir,
             teardown,
             recovery_signatures,
         )
@@ -2570,7 +2570,7 @@ def cmd_salvage_cmodern_height(args: argparse.Namespace) -> int:
         Path(args.output),
         args.rest_url,
         args.stop_height,
-        Path(args.data_dir),
+        args.data_dir,
         storage_backend=args.storage_backend,
         txindex=args.txindex,
         blockfilterindex=args.blockfilterindex,
