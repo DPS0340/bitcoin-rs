@@ -19,76 +19,66 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
-import stat
 from pathlib import Path
 
 # Make sibling modules importable when run directly
 sys.path.insert(0, str(Path(__file__).parent))
-
+import analyze
+from analyze import (
+    CONTEXT_COUNTER_DEFINITIONS,
+    CONTEXT_COUNTER_NAMES,
+    COUNTER_NAMES,
+    EXPECTED_FFI_VERIFY_ENTRIES_FULL,
+    EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1,
+    HEADER_SIZE,
+    HEADER_STRUCT,
+    JOURNAL_MAGIC,
+    JOURNAL_SIZE,
+    JOURNAL_STRUCT,
+    MAINNET_GENESIS_HASH,
+    RECORD_MAGIC,
+    RECORD_SIZE,
+    RECORD_STRUCT,
+    AnalyzerError,
+    Counters,
+    DiagnosticCheckpoint,
+    JournalEntry,
+    Record,
+    _brshgt1_count,
+    _c150_passed,
+    _count_context_records_disk,
+    _diagnostic_counter_totals,
+    _read_diagnostic_streams,
+    _run_diagnostic_scan,
+    _validate_replay_diagnostic,
+    cmd_classify_corpus,
+    extract_bare_mode0,
+    extract_spike_width1,
+    iter_journal_with_custody,
+    iter_records_with_custody,
+    parse_counters,
+    parse_journal,
+    parse_records,
+    sort_records_raw,
+)
 from context import (
     CONTEXT_MIN_ROW_SIZE,
-    ClassifiedInput,
+    VERIFY_P2SH,
+    VERIFY_TAPROOT,
+    VERIFY_WITNESS,
     ContextError,
     ContextInput,
     InputIdentity,
     SpendContext,
     classify_input,
-    classify_context_inputs,
     iter_context_inputs,
     iter_legacy_context_inputs,
     parse_script,
-    read_context_inputs,
     read_bounded_context_rows,
-    VERIFY_P2SH,
-    VERIFY_WITNESS,
-    VERIFY_TAPROOT,
-)
-
-from analyze import (
-    COUNTER_NAMES,
-    EXPECTED_FFI_VERIFY_ENTRIES_FULL,
-    EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1,
-    HEADER_STRUCT,
-    JOURNAL_MAGIC,
-    JOURNAL_STRUCT,
-    RECORD_MAGIC,
-    RECORD_STRUCT,
-    RECORD_SIZE,
-    AnalyzerError,
-    Counters,
-    CONTEXT_COUNTER_NAMES,
-    CONTEXT_COUNTER_DEFINITIONS,
-    _c150_passed,
-    _count_context_records_disk,
-    _run_diagnostic_scan,
-    _validate_checkpoint_bounds,
-    _validate_replay_diagnostic,
-    _read_brshgt1_row,
-    _brshgt1_count,
-    _diagnostic_counter_totals,
-    _read_diagnostic_streams,
-    cmd_find_cmodern_height,
-    DiagnosticCheckpoint,
-    HEADER_SIZE,
-    JOURNAL_SIZE,
-    MAINNET_GENESIS_HASH,
-    check_counter_arithmetic,
-    cmd_classify_corpus,
-    extract_bare_mode0,
-    extract_spike_width1,
-    iter_records,
-    iter_records_with_custody,
-    iter_journal,
-    iter_journal_with_custody,
-    parse_counters,
-    parse_records,
-    parse_journal,
-    sort_records_raw,
-    JournalEntry,
-    Record,
 )
 
 # ── Shared assertion helpers ─────────────────────────────────────────────────
@@ -967,6 +957,7 @@ def test_validate_capture_rejects_wrong_ffi_verify_entries() -> None:
 def test_validate_capture_binds_corpus_identity() -> None:
     """validate-capture emits census-capture-v2 and binds corpus_size and corpus_sha256."""
     import argparse
+
     import analyze
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1013,6 +1004,7 @@ def test_validate_capture_binds_corpus_identity() -> None:
 def test_validate_capture_sorted_output_has_header() -> None:
     """The sorted-records output file must start with BRSREC1 magic + u64 count."""
     import argparse
+
     import analyze
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1304,6 +1296,7 @@ def test_bare_rejects_non_integer_summary_fields() -> None:
 def test_verdict_rejects_invalid_numeric_fields() -> None:
     """Verdict inputs must preserve strict integer and positive-finite contracts."""
     import argparse
+
     import analyze
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1434,6 +1427,7 @@ def _make_integrity_json() -> dict[str, object]:
 def test_verdict_native_mode0_contradiction_fails() -> None:
     """Contradictory native_mode0 vs inv_8 must make verdict INVALID."""
     import argparse
+
     import analyze
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -5390,6 +5384,11 @@ def main():
         control = sys.stdin.buffer.read(1)
         if not control or control == b"\\x01":
             break
+    trailing = int(os.environ.get("FAKE_CENSUS_TRAILING_BYTES", "0"))
+    if trailing:
+        sys.stdout.buffer.write(b"X" * trailing)
+        sys.stdout.buffer.flush()
+    time.sleep(float(os.environ.get("FAKE_CENSUS_TEARDOWN_SLEEP", "0")))
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -5537,7 +5536,7 @@ def test_find_cmodern_height_fake_child_success() -> None:
             os.environ.pop("FAKE_CENSUS_META", None)
             os.environ.pop("FAKE_CENSUS_STAGE", None)
         candidate = json.loads(output.read_text())
-        assert candidate["schema"] == "cmodern-candidate-diagnostic-v1"
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
         assert candidate["non_certifying"] is True
         assert candidate["certifying_replay_required"] is True
         assert candidate["earliest_defensible_height_h"] == 9
@@ -5547,6 +5546,254 @@ def test_find_cmodern_height_fake_child_success() -> None:
         expected_h = max(first.values())
         assert candidate["earliest_defensible_height_h"] == expected_h
         assert candidate["final_stream_counts"]["context_rows"] == 10
+        assert candidate["child_exit_status"] == 0
+        assert candidate["child_teardown"] == "clean"
+        assert candidate["salvaged_from"] is None
+
+
+def test_find_cmodern_height_post_stop_timeout_finalizes_honestly() -> None:
+    """A child alive after terminal proof is killed, reaped, and never reported clean."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        os.environ["FAKE_CENSUS_TEARDOWN_SLEEP"] = "5"
+        try:
+            _run_diagnostic_scan(
+                child,
+                "127.0.0.1:18443",
+                100,
+                work_dir,
+                output,
+                stop_deadline_seconds=0.2,
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+            os.environ.pop("FAKE_CENSUS_TEARDOWN_SLEEP", None)
+        candidate = json.loads(output.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
+        assert candidate["earliest_defensible_height_h"] == 9
+        assert candidate["child_teardown"] == "timeout_after_terminal_proof"
+        assert candidate["child_exit_status"] == -9
+        assert candidate["salvaged_from"] is None
+
+
+def test_find_cmodern_height_rejects_pipe_filling_trailing_output() -> None:
+    """Trailing child output larger than the pipe cannot masquerade as teardown delay."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        os.environ["FAKE_CENSUS_TRAILING_BYTES"] = str(1024 * 1024)
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _run_diagnostic_scan(
+                    child,
+                    "127.0.0.1:18443",
+                    100,
+                    work_dir,
+                    output,
+                    stop_deadline_seconds=2,
+                ),
+                "pipe-filling trailing output",
+                "trailing bytes",
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+            os.environ.pop("FAKE_CENSUS_TRAILING_BYTES", None)
+        assert not output.exists()
+
+
+def _directory_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation() -> None:
+    """Salvage copies only checkpoint-committed bytes and preserves the incident run."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        clean = json.loads(clean_output.read_text())
+        sidecar = source_dir / "brshgt1.bin"
+        fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin"):
+            with (source_dir / name).open("ab") as stream:
+                stream.write(b"UNCOMMITTED-TAIL")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        source_before = _directory_hashes(source_dir)
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        analyze._salvage_diagnostic_scan(
+            source_dir,
+            recovery_dir,
+            output,
+            "127.0.0.1:18443",
+            100,
+            source_dir / "state",
+        )
+        assert _directory_hashes(source_dir) == source_before
+
+        candidate = json.loads(output.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
+        assert candidate["earliest_defensible_height_h"] == 9
+        assert candidate["context_counts"] == clean["context_counts"]
+        assert (
+            candidate["first_occurrence_heights"]
+            == clean["first_occurrence_heights"]
+        )
+        assert candidate["final_stream_counts"] == clean["final_stream_counts"]
+        assert (
+            candidate["final_stream_endpoints"]
+            == clean["final_stream_endpoints"]
+        )
+        assert candidate["child_exit_status"] is None
+        assert candidate["child_teardown"] == "unobserved"
+        assert candidate["salvaged_from"] == str(source_dir)
+        for filename, endpoint in (
+            ("brsctx1.bin", "context_end"),
+            ("brsrec1.bin", "record_end"),
+            ("brsjrn1.bin", "journal_end"),
+        ):
+            assert (
+                (recovery_dir / filename).stat().st_size
+                == candidate["final_stream_endpoints"][endpoint]
+            )
+        assert _brshgt1_count(recovery_dir / "brshgt1.bin") == 10
+
+        source_custody = candidate["source_full_file_custody"]
+        source_names = {
+            "contexts": "brsctx1.bin",
+            "records": "brsrec1.bin",
+            "journal": "brsjrn1.bin",
+            "sidecar": "brshgt1.bin",
+            "replay": "replay_diagnostic.json",
+            "counters": "counters.json",
+        }
+        for name, filename in source_names.items():
+            assert source_custody[name]["sha256"] == source_before[filename]
+        for name, custody_name in (
+            ("contexts", "brsctx1"),
+            ("records", "brsrec1"),
+            ("journal", "brsjrn1"),
+        ):
+            assert source_custody[name]["clone_provenance"] == "DIFFERS_FROM_SOURCE"
+            assert (
+                source_custody[name]["committed_prefix_sha256"]
+                == candidate["custody"][custody_name]["sha256"]
+            )
+        assert source_custody["sidecar"]["clone_provenance"] == "DIFFERS_FROM_SOURCE"
+        assert source_custody["replay"]["clone_provenance"] == "EXACT_FULL_FILE"
+        assert source_custody["counters"]["clone_provenance"] == "EXACT_FULL_FILE"
+
+
+def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
+    """Published custody must remain bound to the validated source prefix."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        sidecar = source_dir / "brshgt1.bin"
+        fd = os.open(sidecar, os.O_WRONLY)
+        try:
+            assert os.pwrite(fd, struct.pack("<Q", 0), 8) == 8
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        source_before = _directory_hashes(source_dir)
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        validate_terminal_streams = analyze._validate_terminal_streams
+
+        def mutate_then_validate(
+            recovery_paths: dict[str, Path],
+            final: DiagnosticCheckpoint,
+        ) -> dict[str, dict[str, object]]:
+            context_fd = os.open(recovery_paths["contexts"], os.O_RDWR)
+            try:
+                offset = HEADER_SIZE + 4
+                original = os.pread(context_fd, 1, offset)
+                assert len(original) == 1
+                assert os.pwrite(context_fd, bytes([original[0] ^ 1]), offset) == 1
+                os.fsync(context_fd)
+            finally:
+                os.close(context_fd)
+            return validate_terminal_streams(recovery_paths, final)
+
+        analyze._validate_terminal_streams = mutate_then_validate
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    source_dir / "state",
+                ),
+                "mutated recovery stream",
+                "validated source committed prefix",
+            )
+        finally:
+            analyze._validate_terminal_streams = validate_terminal_streams
+        assert _directory_hashes(source_dir) == source_before
+        assert not recovery_dir.exists()
+        assert not output.exists()
 
 
 def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
@@ -6551,6 +6798,10 @@ def main() -> int:
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
         test_find_cmodern_height_fake_child_success,
+        test_find_cmodern_height_post_stop_timeout_finalizes_honestly,
+        test_find_cmodern_height_rejects_pipe_filling_trailing_output,
+        test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation,
+        test_salvage_cmodern_height_rejects_recovery_stream_mutation,
         test_find_cmodern_height_assembles_fragmented_child_frames,
         test_find_cmodern_height_reaps_failed_child,
         test_find_cmodern_height_destination_race,

@@ -12,26 +12,30 @@ Stdlib-only, Python 3.12+.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import BinaryIO, Iterator, NamedTuple
+from typing import BinaryIO, NamedTuple
 
 from context import (
+    CONTEXT_MAGIC,
     CONTEXT_MIN_ROW_SIZE,
     ClassifiedInput,
     ContextError,
-    ContextInput,
-    InputIdentity,
     SpendContext,
     classify_input,
     iter_context_inputs,
@@ -706,6 +710,19 @@ def _diagnostic_counter_totals(
     spend_counts = _diagnostic_spend_counts(classified)
     record_counts, _ = _diagnostic_record_counts(records, context_map)
     return {**spend_counts, **record_counts}
+def _accumulate_block_counts(
+    block_counts: dict[str, int],
+    height: int,
+    cumulative_counts: dict[str, int],
+    first_heights: dict[str, int],
+) -> None:
+    """Merge one block's 11 context counters into the scan aggregates."""
+    for name in CONTEXT_COUNTER_NAMES:
+        cumulative_counts[name] += block_counts[name]
+        if block_counts[name] > 0 and name not in first_heights:
+            first_heights[name] = height
+
+
 
 
 
@@ -730,6 +747,34 @@ class DiagnosticCheckpoint(NamedTuple):
     record_end: int
     journal_rows: int
     journal_end: int
+
+
+class DiagnosticTeardown(NamedTuple):
+    """Observed child teardown and optional offline-salvage provenance."""
+
+    exit_status: int | None
+    state: str
+    salvaged_from: str | None
+    source_custody: dict[str, dict[str, object]] | None
+
+
+class DiagnosticStreamDigests(NamedTuple):
+    """Hashes of one validated source stream and its committed prefix."""
+
+    full_file_sha256: str
+    committed_prefix_sha256: str
+
+
+class DiagnosticReconstruction(NamedTuple):
+    """Validated aggregate state reconstructed from committed evidence."""
+
+    row_count: int
+    final: DiagnosticCheckpoint
+    cumulative_counts: dict[str, int]
+    first_heights: dict[str, int]
+    source_stream_digests: dict[str, DiagnosticStreamDigests]
+
+
 
 
 def _read_exact_stream(stream: BinaryIO, length: int, field: str) -> bytes:
@@ -916,6 +961,7 @@ def _read_fixed_entries_slice(
     committed_rows: int,
     entry_size: int,
     name: str,
+    observe_bytes: Callable[[bytes], None] | None = None,
 ) -> list[bytes]:
     """Read a committed slice of fixed-size entries using pread."""
     if start_row < 0 or committed_rows < start_row:
@@ -940,127 +986,153 @@ def _read_fixed_entries_slice(
     raw = os.pread(fd, slice_size, start_offset)
     if len(raw) != slice_size:
         raise AnalyzerError(f"DIAG-PROTO: short pread for {name}")
+    if raw and observe_bytes is not None:
+        observe_bytes(raw)
     return [
         raw[i * entry_size : (i + 1) * entry_size]
         for i in range(committed_rows - start_row)
     ]
 
 
+def _read_diagnostic_streams_from_fds(
+    row: DiagnosticCheckpoint,
+    prev: DiagnosticCheckpoint | None,
+    ctx_fd: int,
+    rec_fd: int,
+    jrn_fd: int,
+    observe_context_bytes: Callable[[bytes], None] | None = None,
+    observe_record_bytes: Callable[[bytes], None] | None = None,
+    observe_journal_bytes: Callable[[bytes], None] | None = None,
+) -> tuple[
+    list[ClassifiedInput],
+    list[Record],
+    list[JournalEntry],
+    dict[tuple[bytes, int], str],
+    dict[str, int],
+]:
+    """Parse and validate one block's committed stream slices."""
+    prev_ctx = prev.context_rows if prev is not None else 0
+    prev_ctx_end = prev.context_end if prev is not None else HEADER_SIZE
+    prev_rec = prev.record_rows if prev is not None else 0
+    prev_rec_end = prev.record_end if prev is not None else HEADER_SIZE
+    prev_jrn = prev.journal_rows if prev is not None else 0
+    prev_jrn_end = prev.journal_end if prev is not None else HEADER_SIZE
+
+    context_inputs = read_bounded_context_rows(
+        ctx_fd,
+        start_offset=prev_ctx_end,
+        end_offset=row.context_end,
+        start_row=prev_ctx,
+        committed_rows=row.context_rows,
+        observe_bytes=observe_context_bytes,
+    )
+    classified: list[ClassifiedInput] = []
+    context_map: dict[tuple[bytes, int], str] = {}
+    for inp in context_inputs:
+        ci = classify_input(inp)
+        key = (inp.identity.txid_le, inp.identity.input_index)
+        if key in context_map:
+            display_txid = inp.identity.txid_le[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: duplicate context execution identity "
+                f"{display_txid}:{inp.identity.input_index}"
+            )
+        context_map[key] = ci.spend_context.value
+        classified.append(ci)
+
+    journal_raws = _read_fixed_entries_slice(
+        jrn_fd,
+        prev_jrn_end,
+        row.journal_end,
+        prev_jrn,
+        row.journal_rows,
+        JOURNAL_SIZE,
+        "journal",
+        observe_journal_bytes,
+    )
+    journal = [JournalEntry(raw) for raw in journal_raws]
+    journal_keys: set[tuple[bytes, int]] = set()
+    for entry in journal:
+        if entry.verdict != 1:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 for "
+                f"{display_txid}:{entry.input_index}"
+            )
+        key = (entry.spend_txid, entry.input_index)
+        if key in journal_keys:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: duplicate journal key in BRSJRN1: "
+                f"{display_txid}:{entry.input_index}"
+            )
+        journal_keys.add(key)
+
+    context_keys = set(context_map.keys())
+    if context_keys != journal_keys:
+        missing = journal_keys - context_keys
+        extra = context_keys - journal_keys
+        raise AnalyzerError(
+            f"CTX-OPERATIONS: context/journal key-set mismatch: "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+
+    record_raws = _read_fixed_entries_slice(
+        rec_fd,
+        prev_rec_end,
+        row.record_end,
+        prev_rec,
+        row.record_rows,
+        RECORD_SIZE,
+        "records",
+        observe_record_bytes,
+    )
+    records = [Record(raw) for raw in record_raws]
+    record_counts, _ = _diagnostic_record_counts(records, context_map)
+
+    record_sums: dict[tuple[bytes, int], list[int]] = {}
+    for record in records:
+        key = (record.spend_txid, record.input_index)
+        sums = record_sums.setdefault(key, [0, 0])
+        if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
+            if record.outcome != 2:
+                sums[0] += 1
+            if record.outcome == 1:
+                sums[1] += 1
+
+    for entry in journal:
+        actual_ecdsa = record_sums.get(entry.key, [0, 0])
+        expected_ecdsa = [entry.ecdsa_verify_calls, entry.ecdsa_verify_ok]
+        if actual_ecdsa != expected_ecdsa:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: journal/record ECDSA totals mismatch for "
+                f"{display_txid}:{entry.input_index}: "
+                f"expected {expected_ecdsa}, got {actual_ecdsa}"
+            )
+
+    return classified, records, journal, context_map, record_counts
+
+
 def _read_diagnostic_streams(
     row: DiagnosticCheckpoint,
     prev: DiagnosticCheckpoint | None,
     paths: dict[str, Path],
-) -> tuple[list[ClassifiedInput], list[Record], list[JournalEntry], dict[tuple[bytes, int], str], dict[str, int]]:
-    """Parse the three committed prefixes for one block.
-
-    Returns (classified, records, journal, context_map, record_counts).
-    """
+) -> tuple[
+    list[ClassifiedInput],
+    list[Record],
+    list[JournalEntry],
+    dict[tuple[bytes, int], str],
+    dict[str, int],
+]:
+    """Open the evidence streams and parse one committed block."""
     ctx_fd = os.open(paths["contexts"], os.O_RDONLY)
     rec_fd = os.open(paths["records"], os.O_RDONLY)
     jrn_fd = os.open(paths["journal"], os.O_RDONLY)
     try:
-        prev_ctx = prev.context_rows if prev is not None else 0
-        prev_ctx_end = prev.context_end if prev is not None else HEADER_SIZE
-        prev_rec = prev.record_rows if prev is not None else 0
-        prev_rec_end = prev.record_end if prev is not None else HEADER_SIZE
-        prev_jrn = prev.journal_rows if prev is not None else 0
-        prev_jrn_end = prev.journal_end if prev is not None else HEADER_SIZE
-
-        context_inputs = read_bounded_context_rows(
-            ctx_fd,
-            start_offset=prev_ctx_end,
-            end_offset=row.context_end,
-            start_row=prev_ctx,
-            committed_rows=row.context_rows,
+        return _read_diagnostic_streams_from_fds(
+            row, prev, ctx_fd, rec_fd, jrn_fd
         )
-        classified: list[ClassifiedInput] = []
-        context_map: dict[tuple[bytes, int], str] = {}
-        for inp in context_inputs:
-            ci = classify_input(inp)
-            key = (inp.identity.txid_le, inp.identity.input_index)
-            if key in context_map:
-                display_txid = inp.identity.txid_le[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate context execution identity "
-                    f"{display_txid}:{inp.identity.input_index}"
-                )
-            context_map[key] = ci.spend_context.value
-            classified.append(ci)
-
-        journal_raws = _read_fixed_entries_slice(
-            jrn_fd,
-            prev_jrn_end,
-            row.journal_end,
-            prev_jrn,
-            row.journal_rows,
-            JOURNAL_SIZE,
-            "journal",
-        )
-        journal = [JournalEntry(raw) for raw in journal_raws]
-        journal_keys: set[tuple[bytes, int]] = set()
-        for entry in journal:
-            if entry.verdict != 1:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 for {display_txid}:{entry.input_index}"
-                )
-            key = (entry.spend_txid, entry.input_index)
-            if key in journal_keys:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate journal key in BRSJRN1: {display_txid}:{entry.input_index}"
-                )
-            journal_keys.add(key)
-
-        context_keys = set(context_map.keys())
-        if context_keys != journal_keys:
-            missing = journal_keys - context_keys
-            extra = context_keys - journal_keys
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: context/journal key-set mismatch: "
-                f"missing={len(missing)} extra={len(extra)}"
-            )
-
-        record_raws = _read_fixed_entries_slice(
-            rec_fd,
-            prev_rec_end,
-            row.record_end,
-            prev_rec,
-            row.record_rows,
-            RECORD_SIZE,
-            "records",
-        )
-        records = [Record(raw) for raw in record_raws]
-        record_counts, _ = _diagnostic_record_counts(records, context_map)
-
-        # Record-level orphan/duplicate/sequence/legality checks are now
-        # performed inside _diagnostic_record_counts.  This loop only
-        # derives the per-key ECDSA verify calls/ok needed for the
-        # diagnostic journal reconciliation.
-        record_sums: dict[tuple[bytes, int], list[int]] = {}
-        for record in records:
-            key = (record.spend_txid, record.input_index)
-            sums = record_sums.setdefault(key, [0, 0, 0, 0])
-            if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
-                if record.outcome != 2:
-                    sums[2] += 1
-                if record.outcome == 1:
-                    sums[3] += 1
-
-        for entry in journal:
-            actual = record_sums.get(entry.key, [0, 0, 0, 0])
-            # CHECKMULTISIG may emit multiple ECDSA records for one opcode;
-            # reconcile only record-derived ECDSA calls/ok to the journal per key.
-            actual_ecdsa = [actual[2], actual[3]]
-            expected_ecdsa = [entry.ecdsa_verify_calls, entry.ecdsa_verify_ok]
-            if actual_ecdsa != expected_ecdsa:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: journal/record ECDSA totals mismatch for "
-                    f"{display_txid}:{entry.input_index}: expected {expected_ecdsa}, got {actual_ecdsa}"
-                )
-
-        return classified, records, journal, context_map, record_counts
     finally:
         os.close(ctx_fd)
         os.close(rec_fd)
@@ -1467,6 +1539,49 @@ def _validate_terminal_streams(
     return custody
 
 
+def _validate_sidecar_terminal_fd(
+    fd: int,
+    row_count: int,
+    final: DiagnosticCheckpoint,
+) -> int:
+    """Validate a complete sidecar through one retained descriptor."""
+    if row_count < 1:
+        raise AnalyzerError("DIAG-SIDECAR: sidecar has no checkpoint rows")
+    header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: short header")
+    magic, declared_count = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SIDECAR: wrong magic {magic!r}")
+    expected_size = BRSHGT1_HEADER_STRUCT.size + row_count * DIAGNOSTIC_ROW_SIZE
+    actual_size = os.fstat(fd).st_size
+    if actual_size != expected_size:
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: size {actual_size} != {expected_size}"
+        )
+    if declared_count not in (0, row_count):
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: declared row count {declared_count} "
+            f"is neither 0 nor {row_count}"
+        )
+    if _read_brshgt1_row(fd, row_count) != final:
+        raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
+    return declared_count
+
+
+def _validate_sidecar_terminal(
+    path: Path,
+    row_count: int,
+    final: DiagnosticCheckpoint,
+) -> int:
+    """Validate a complete sidecar without changing its declared row count."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return _validate_sidecar_terminal_fd(fd, row_count, final)
+    finally:
+        os.close(fd)
+
+
 def _finalize_candidate(
     paths: dict[str, Path],
     sidecar_row_count: int,
@@ -1480,24 +1595,42 @@ def _finalize_candidate(
     txindex: bool,
     blockfilterindex: bool,
     data_dir: str,
+    teardown: DiagnosticTeardown,
+    recovery_signatures: dict[str, tuple[int, int, int, int, int]] | None = None,
 ) -> None:
-    _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
-    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
-        raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
-    sidecar_read_fd = _open_brshgt1_read_fd(paths["sidecar"])
-    try:
-        terminal_row = _read_brshgt1_row(sidecar_read_fd, sidecar_row_count)
-    finally:
-        os.close(sidecar_read_fd)
-    if terminal_row != final:
-        raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
-
+    """Validate terminal proof, finalize custody, then publish one candidate."""
+    if recovery_signatures is not None:
+        for name, signature in recovery_signatures.items():
+            if _path_signature(paths[name]) != signature:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: recovery {name} changed before validation"
+                )
+    declared_count = _validate_sidecar_terminal(
+        paths["sidecar"], sidecar_row_count, final
+    )
     stream_custody = _validate_terminal_streams(paths, final)
     _validate_replay_diagnostic(
-        paths["replay"], final, ceiling, storage_backend, txindex,
-        blockfilterindex, data_dir,
+        paths["replay"],
+        final,
+        ceiling,
+        storage_backend,
+        txindex,
+        blockfilterindex,
+        data_dir,
     )
     _validate_native_counters(paths["counters"], final)
+    if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
+        raise AnalyzerError("DIAG-CUSTODY: terminal proof lacks all 11 contexts")
+    if max(first_heights.values()) != final.height:
+        raise AnalyzerError(
+            "DIAG-CUSTODY: terminal height does not equal the last first occurrence"
+        )
+
+    if declared_count == 0:
+        _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
+    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
+        raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
+
     custody: dict[str, dict[str, object]] = {}
     for name in ("sidecar", "replay", "counters"):
         size, digest = _sha256_file(paths[name])
@@ -1506,9 +1639,46 @@ def _finalize_candidate(
             "bytes": size,
             "sha256": digest,
         }
+    finalized_recovery_signatures = {
+        name: _path_signature(path) for name, path in paths.items()
+    }
+    source_custody = teardown.source_custody
+    if source_custody is not None:
+        source_custody = {
+            name: dict(identity) for name, identity in source_custody.items()
+        }
+        for name, identity in source_custody.items():
+            if not isinstance(identity.get("sha256"), str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks full-file custody"
+                )
+            provenance = identity.get("clone_provenance")
+            if provenance not in (CLONE_EXACT_FULL_FILE, CLONE_DIFFERS_FROM_SOURCE):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} has invalid clone provenance"
+                )
+        for name in ("contexts", "records", "journal"):
+            identity = source_custody[name]
+            source_prefix_sha256 = identity.get("committed_prefix_sha256")
+            if not isinstance(source_prefix_sha256, str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks committed-prefix custody"
+                )
+            if (
+                identity["clone_provenance"] == CLONE_EXACT_FULL_FILE
+                and identity["sha256"] != source_prefix_sha256
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: exact source {name} clone has unequal hashes"
+                )
+            if source_prefix_sha256 != stream_custody[name]["sha256"]:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: recovered {name} digest does not match "
+                    "the validated source committed prefix"
+                )
 
     candidate: dict[str, object] = {
-        "schema": "cmodern-candidate-diagnostic-v1",
+        "schema": "cmodern-candidate-diagnostic-v2",
         "non_certifying": True,
         "certifying_replay_required": True,
         "network": "mainnet",
@@ -1520,8 +1690,12 @@ def _finalize_candidate(
         "stop_height_ceiling": ceiling,
         "earliest_defensible_height_h": final.height,
         "block_hash_h": final.block_hash_le[::-1].hex(),
-        "first_occurrence_heights": {name: first_heights[name] for name in CONTEXT_COUNTER_NAMES},
-        "context_counts": {name: cumulative_counts[name] for name in CONTEXT_COUNTER_NAMES},
+        "first_occurrence_heights": {
+            name: first_heights[name] for name in CONTEXT_COUNTER_NAMES
+        },
+        "context_counts": {
+            name: cumulative_counts[name] for name in CONTEXT_COUNTER_NAMES
+        },
         "context_counter_definitions": CONTEXT_COUNTER_DEFINITIONS,
         "final_stream_counts": {
             "context_rows": final.context_rows,
@@ -1533,7 +1707,10 @@ def _finalize_candidate(
             "record_end": final.record_end,
             "journal_end": final.journal_end,
         },
-        "child_exit_status": 0,
+        "child_exit_status": teardown.exit_status,
+        "child_teardown": teardown.state,
+        "salvaged_from": teardown.salvaged_from,
+        "source_full_file_custody": source_custody,
         "child_replay_schema": "mainnet-prefix-replay-diagnostic-v1",
         "custody": {
             "brshgt1_sidecar": custody["sidecar"],
@@ -1544,6 +1721,30 @@ def _finalize_candidate(
             "brsjrn1": stream_custody["journal"],
         },
     }
+    if source_custody is not None:
+        for identity in source_custody.values():
+            source_path = Path(str(identity["path"]))
+            if _path_signature(source_path) != (
+                identity["device"],
+                identity["inode"],
+                identity["bytes"],
+                identity["mtime_ns"],
+                identity["ctime_ns"],
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source changed before candidate publication: "
+                    f"{source_path}"
+                )
+    candidate["rest_url_provenance"] = (
+        "live_parent_argv"
+        if teardown.salvaged_from is None
+        else "operator_supplied_original_argv"
+    )
+    for name, signature in finalized_recovery_signatures.items():
+        if _path_signature(paths[name]) != signature:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: {name} changed before candidate publication"
+            )
     _write_json_atomic(output_path, candidate)
 
 
@@ -1555,6 +1756,73 @@ def _send_control(proc: subprocess.Popen, control: bytes) -> None:
         proc.stdin.flush()
     except (BrokenPipeError, OSError) as exc:
         raise AnalyzerError(f"DIAG-PROTO: failed to send control byte: {exc}") from exc
+class _TrailingDrain:
+    """Bounded state for draining child stdout concurrently with teardown."""
+
+    def __init__(self) -> None:
+        self.bytes_read = 0
+        self.error: OSError | None = None
+
+    def run(self, stream: BinaryIO) -> None:
+        try:
+            while chunk := stream.read(64 * 1024):
+                self.bytes_read += len(chunk)
+        except OSError as exc:
+            self.error = exc
+
+
+def _await_child_after_terminal(
+    proc: subprocess.Popen,
+    *,
+    stop_deadline_seconds: float,
+    reap_deadline_seconds: float,
+) -> DiagnosticTeardown:
+    """Drain stdout while waiting so trailing output cannot deadlock the child."""
+    if proc.stdout is None:
+        raise AnalyzerError("DIAG-SETUP: child stdout is not piped")
+    drain = _TrailingDrain()
+    drain_thread = threading.Thread(
+        target=drain.run,
+        args=(proc.stdout,),
+        name="cmodern-terminal-drain",
+        daemon=True,
+    )
+    drain_thread.start()
+
+    timed_out = False
+    try:
+        exit_status = proc.wait(timeout=stop_deadline_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            exit_status = proc.wait(timeout=reap_deadline_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise AnalyzerError(
+                "DIAG-PROTO: child did not exit after terminal-proof kill"
+            ) from exc
+
+    drain_thread.join(timeout=reap_deadline_seconds)
+    if drain_thread.is_alive():
+        raise AnalyzerError("DIAG-PROTO: child stdout remained open after exit")
+    if drain.error is not None:
+        raise AnalyzerError(
+            f"DIAG-PROTO: failed to drain child stdout: {drain.error}"
+        ) from drain.error
+    if drain.bytes_read != 0:
+        raise AnalyzerError(
+            f"DIAG-PROTO: {drain.bytes_read} trailing bytes after terminal checkpoint"
+        )
+    if not timed_out and exit_status != 0:
+        raise AnalyzerError(
+            f"DIAG-PROTO: child exited with status {exit_status}"
+        )
+
+    state = "timeout_after_terminal_proof" if timed_out else "clean"
+    return DiagnosticTeardown(exit_status, state, None, None)
+
+
 
 
 def _run_diagnostic_scan(
@@ -1566,6 +1834,9 @@ def _run_diagnostic_scan(
     storage_backend: str = "fjall",
     txindex: bool = False,
     blockfilterindex: bool = False,
+    *,
+    stop_deadline_seconds: float = 10.0,
+    reap_deadline_seconds: float = 5.0,
 ) -> None:
     paths = {
         "contexts": work_dir / "brsctx1.bin",
@@ -1610,11 +1881,16 @@ def _run_diagnostic_scan(
             classified, _records, _journal, _context_map, record_counts = (
                 _read_diagnostic_streams(row, previous, paths)
             )
-            block_counts = {**_diagnostic_spend_counts(classified), **record_counts}
-            for name in CONTEXT_COUNTER_NAMES:
-                cumulative_counts[name] += block_counts[name]
-                if block_counts[name] > 0 and name not in first_heights:
-                    first_heights[name] = row.height
+            block_counts = {
+                **_diagnostic_spend_counts(classified),
+                **record_counts,
+            }
+            _accumulate_block_counts(
+                block_counts,
+                row.height,
+                cumulative_counts,
+                first_heights,
+            )
 
             _write_brshgt1_row(sidecar_fd, row)
             row_count += 1
@@ -1634,14 +1910,11 @@ def _run_diagnostic_scan(
             previous = row
 
         _close_stream(proc.stdin)
-        try:
-            exit_code = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired as exc:
-            raise AnalyzerError("DIAG-PROTO: child did not exit after STOP") from exc
-        if exit_code != 0:
-            raise AnalyzerError(f"DIAG-PROTO: child exited with status {exit_code}")
-        if proc.stdout.read(1) != b"":
-            raise AnalyzerError("DIAG-PROTO: trailing bytes after terminal checkpoint")
+        teardown = _await_child_after_terminal(
+            proc,
+            stop_deadline_seconds=stop_deadline_seconds,
+            reap_deadline_seconds=reap_deadline_seconds,
+        )
         _close_stream(proc.stdout)
         _close_stream(proc.stderr)
         _close_stream(stderr_file)
@@ -1651,15 +1924,524 @@ def _run_diagnostic_scan(
         os.close(sidecar_fd)
         sidecar_fd = None
         _finalize_candidate(
-            paths, row_count, row, cumulative_counts, first_heights, rest_url,
-            ceiling, output_path, storage_backend, txindex, blockfilterindex,
+            paths,
+            row_count,
+            row,
+            cumulative_counts,
+            first_heights,
+            rest_url,
+            ceiling,
+            output_path,
+            storage_backend,
+            txindex,
+            blockfilterindex,
             str(data_dir),
+            teardown,
         )
     finally:
         if proc is not None and stderr_file is not None and not child_closed:
             _reap_child(proc, stderr_file)
         if sidecar_fd is not None:
             os.close(sidecar_fd)
+
+
+def _diagnostic_artifact_paths(root: Path) -> dict[str, Path]:
+    return {
+        "contexts": root / "brsctx1.bin",
+        "records": root / "brsrec1.bin",
+        "journal": root / "brsjrn1.bin",
+        "sidecar": root / "brshgt1.bin",
+        "replay": root / "replay_diagnostic.json",
+        "counters": root / "counters.json",
+    }
+
+
+def _source_sidecar_row_count(fd: int) -> int:
+    """Validate sidecar framing and return its physical row count."""
+    file_size = os.fstat(fd).st_size
+    if file_size < BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: source sidecar is shorter than its header")
+    payload_size = file_size - BRSHGT1_HEADER_STRUCT.size
+    if payload_size % DIAGNOSTIC_ROW_SIZE != 0:
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: source has {payload_size % DIAGNOSTIC_ROW_SIZE} "
+            "bytes after its last complete row"
+        )
+    row_count = payload_size // DIAGNOSTIC_ROW_SIZE
+    if row_count < 1:
+        raise AnalyzerError("DIAG-SIDECAR: source sidecar has no rows")
+    header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    magic, declared_count = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SIDECAR: wrong source magic {magic!r}")
+    if declared_count not in (0, row_count):
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: source declares {declared_count} rows, "
+            f"but contains {row_count}"
+        )
+    return row_count
+
+
+def _reconstruct_diagnostic_from_fds(
+    row_count: int,
+    source_fds: dict[str, int],
+) -> DiagnosticReconstruction:
+    """Recompute aggregates and source hashes through one descriptor set."""
+    cumulative_counts = {name: 0 for name in CONTEXT_COUNTER_NAMES}
+    first_heights: dict[str, int] = {}
+    previous: DiagnosticCheckpoint | None = None
+    final: DiagnosticCheckpoint | None = None
+    stream_file_sizes = {
+        "contexts": os.fstat(source_fds["contexts"]).st_size,
+        "records": os.fstat(source_fds["records"]).st_size,
+        "journal": os.fstat(source_fds["journal"]).st_size,
+    }
+    checkpoint_file_sizes = {
+        "context": stream_file_sizes["contexts"],
+        "record": stream_file_sizes["records"],
+        "journal": stream_file_sizes["journal"],
+    }
+    stream_hashers = {name: hashlib.sha256() for name in stream_file_sizes}
+    hashed_bytes = {name: HEADER_SIZE for name in stream_file_sizes}
+    declared_counts: dict[str, int] = {}
+    stream_magics = {
+        "contexts": CONTEXT_MAGIC,
+        "records": RECORD_MAGIC,
+        "journal": JOURNAL_MAGIC,
+    }
+    for name, magic in stream_magics.items():
+        header = os.pread(source_fds[name], HEADER_SIZE, 0)
+        if len(header) != HEADER_SIZE:
+            raise AnalyzerError(f"DIAG-SALVAGE: short source {name} header")
+        actual_magic, declared_counts[name] = HEADER_STRUCT.unpack(header)
+        if actual_magic != magic:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: wrong source {name} magic {actual_magic!r}"
+            )
+        stream_hashers[name].update(header)
+
+    def observe_context(data: bytes) -> None:
+        stream_hashers["contexts"].update(data)
+        hashed_bytes["contexts"] += len(data)
+
+    def observe_records(data: bytes) -> None:
+        stream_hashers["records"].update(data)
+        hashed_bytes["records"] += len(data)
+
+    def observe_journal(data: bytes) -> None:
+        stream_hashers["journal"].update(data)
+        hashed_bytes["journal"] += len(data)
+
+    for row_number in range(1, row_count + 1):
+        row = _read_brshgt1_row(source_fds["sidecar"], row_number)
+        _validate_checkpoint_bounds(row, previous, checkpoint_file_sizes)
+        classified, records, journal, context_map, record_counts = (
+            _read_diagnostic_streams_from_fds(
+                row,
+                previous,
+                source_fds["contexts"],
+                source_fds["records"],
+                source_fds["journal"],
+                observe_context,
+                observe_records,
+                observe_journal,
+            )
+        )
+        block_counts = {
+            **_diagnostic_spend_counts(classified),
+            **record_counts,
+        }
+        _accumulate_block_counts(
+            block_counts,
+            row.height,
+            cumulative_counts,
+            first_heights,
+        )
+        previous = row
+        final = row
+
+    if final is None:
+        raise AnalyzerError("DIAG-SALVAGE: source contains no terminal row")
+    _validate_sidecar_terminal_fd(source_fds["sidecar"], row_count, final)
+    if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
+        raise AnalyzerError(
+            "DIAG-SALVAGE: terminal proof does not contain all 11 contexts"
+        )
+    if max(first_heights.values()) != final.height:
+        raise AnalyzerError(
+            "DIAG-SALVAGE: terminal height is not the last first occurrence"
+        )
+
+    expected_counts = {
+        "contexts": final.context_rows,
+        "records": final.record_rows,
+        "journal": final.journal_rows,
+    }
+    committed_ends = {
+        "contexts": final.context_end,
+        "records": final.record_end,
+        "journal": final.journal_end,
+    }
+    source_stream_digests: dict[str, DiagnosticStreamDigests] = {}
+    for name, committed_end in committed_ends.items():
+        if declared_counts[name] not in (0, expected_counts[name]):
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source {name} declares {declared_counts[name]} "
+                f"rows, expected 0 or {expected_counts[name]}"
+            )
+        if hashed_bytes[name] != committed_end:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: hashed {hashed_bytes[name]} committed {name} "
+                f"bytes, expected {committed_end}"
+            )
+        committed_sha256 = stream_hashers[name].copy().hexdigest()
+        offset = committed_end
+        while offset < stream_file_sizes[name]:
+            chunk = os.pread(
+                source_fds[name],
+                min(8 * 1024 * 1024, stream_file_sizes[name] - offset),
+                offset,
+            )
+            if not chunk:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} ended at {offset}, "
+                    f"expected {stream_file_sizes[name]}"
+                )
+            stream_hashers[name].update(chunk)
+            offset += len(chunk)
+        source_stream_digests[name] = DiagnosticStreamDigests(
+            stream_hashers[name].hexdigest(),
+            committed_sha256,
+        )
+
+    return DiagnosticReconstruction(
+        row_count,
+        final,
+        cumulative_counts,
+        first_heights,
+        source_stream_digests,
+    )
+
+
+
+
+def _write_all(fd: int, data: bytes | memoryview) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise AnalyzerError("DIAG-SALVAGE: short recovery write")
+        view = view[written:]
+
+
+FICLONE = 0x40049409
+CLONE_EXACT_FULL_FILE = "EXACT_FULL_FILE"
+CLONE_DIFFERS_FROM_SOURCE = "DIFFERS_FROM_SOURCE"
+
+
+def _fd_signature(fd: int) -> tuple[int, int, int, int, int]:
+    stat_result = os.fstat(fd)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+def _sha256_fd(fd: int) -> str:
+    """Hash one retained descriptor without changing its file position."""
+    digest = hashlib.sha256()
+    size = os.fstat(fd).st_size
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, min(8 * 1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source ended at {offset}, expected {size}"
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+
+
+def _path_signature(path: Path) -> tuple[int, int, int, int, int]:
+    stat_result = path.stat()
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _copy_fd_fallback(source_fd: int, destination_fd: int, size: int) -> None:
+    """Copy one file when the filesystem cannot clone extents."""
+    offset = 0
+    while offset < size:
+        chunk = os.pread(source_fd, min(8 * 1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source ended at {offset}, expected {size}"
+            )
+        _write_all(destination_fd, chunk)
+        offset += len(chunk)
+
+
+def _clone_committed_source(
+    source_fd: int,
+    source: Path,
+    destination: Path,
+    committed_size: int,
+    *,
+    reset_sidecar_header: bool = False,
+    source_sha256: str | None = None,
+) -> dict[str, object]:
+    """Clone one retained source file, then cut the clone at its commit point."""
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        before = os.fstat(source_fd)
+        if not (0 <= committed_size <= before.st_size):
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: committed size {committed_size} exceeds "
+                f"{source} size {before.st_size}"
+            )
+        try:
+            fcntl.ioctl(destination_fd, FICLONE, source_fd)
+        except OSError as exc:
+            if exc.errno not in (
+                errno.EXDEV,
+                errno.EINVAL,
+                errno.ENOTTY,
+                errno.EOPNOTSUPP,
+            ):
+                raise
+            _copy_fd_fallback(source_fd, destination_fd, before.st_size)
+        os.ftruncate(destination_fd, committed_size)
+        if reset_sidecar_header:
+            header = BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, 0)
+            if os.pwrite(destination_fd, header, 0) != len(header):
+                raise AnalyzerError(
+                    "DIAG-SALVAGE: short recovery sidecar header write"
+                )
+        os.fsync(destination_fd)
+        if _fd_signature(source_fd) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise AnalyzerError(f"DIAG-SALVAGE: source changed while cloning: {source}")
+        source_digest = (
+            source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
+        )
+        if _fd_signature(source_fd) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise AnalyzerError(f"DIAG-SALVAGE: source changed while hashing: {source}")
+        return {
+            "path": str(source),
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "bytes": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "sha256": source_digest,
+            "clone_provenance": (
+                CLONE_EXACT_FULL_FILE
+                if committed_size == before.st_size and not reset_sidecar_header
+                else CLONE_DIFFERS_FROM_SOURCE
+            ),
+        }
+    finally:
+        os.close(destination_fd)
+
+
+def _materialize_recovery_dir(
+    source_paths: dict[str, Path],
+    source_fds: dict[str, int],
+    recovery_dir: Path,
+    reconstruction: DiagnosticReconstruction,
+) -> tuple[
+    dict[str, Path],
+    dict[str, dict[str, object]],
+    dict[str, tuple[int, int, int, int, int]],
+]:
+    """Clone only checkpoint-committed evidence into a new directory."""
+    recovery_dir.mkdir(parents=True, exist_ok=False)
+    recovery_paths = _diagnostic_artifact_paths(recovery_dir)
+    final = reconstruction.final
+    source_custody: dict[str, dict[str, object]] = {}
+    copy_specs = (
+        ("contexts", final.context_end, False),
+        ("records", final.record_end, False),
+        ("journal", final.journal_end, False),
+        (
+            "sidecar",
+            BRSHGT1_HEADER_STRUCT.size
+            + reconstruction.row_count * DIAGNOSTIC_ROW_SIZE,
+            True,
+        ),
+    )
+    for name, committed_size, reset_header in copy_specs:
+        stream_digests = reconstruction.source_stream_digests.get(name)
+        identity = _clone_committed_source(
+            source_fds[name],
+            source_paths[name],
+            recovery_paths[name],
+            committed_size,
+            reset_sidecar_header=reset_header,
+            source_sha256=(
+                stream_digests.full_file_sha256
+                if stream_digests is not None
+                else None
+            ),
+        )
+        if stream_digests is not None:
+            identity["committed_prefix_sha256"] = (
+                stream_digests.committed_prefix_sha256
+            )
+        source_custody[name] = identity
+    for name in ("replay", "counters"):
+        source_custody[name] = _clone_committed_source(
+            source_fds[name],
+            source_paths[name],
+            recovery_paths[name],
+            os.fstat(source_fds[name]).st_size,
+        )
+    dir_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    recovery_signatures = {
+        name: _path_signature(path) for name, path in recovery_paths.items()
+    }
+    return recovery_paths, source_custody, recovery_signatures
+
+
+def _salvage_diagnostic_scan(
+    source_dir: Path,
+    recovery_dir: Path,
+    output_path: Path,
+    rest_url: str,
+    ceiling: int,
+    data_dir: Path,
+    storage_backend: str = "fjall",
+    txindex: bool = False,
+    blockfilterindex: bool = False,
+) -> None:
+    """Recover terminal proof without changing the failed source directory."""
+    source_dir = source_dir.resolve()
+    recovery_dir = recovery_dir.resolve()
+    output_path = output_path.resolve()
+    data_dir = Path(data_dir)
+    if not source_dir.is_dir():
+        raise AnalyzerError(f"DIAG-SETUP: source directory not found: {source_dir}")
+    if recovery_dir.exists():
+        raise AnalyzerError(
+            f"DIAG-SETUP: recovery directory already exists: {recovery_dir}"
+        )
+    if output_path.exists():
+        raise AnalyzerError(f"DIAG-SETUP: output already exists: {output_path}")
+    if source_dir == recovery_dir or source_dir in recovery_dir.parents:
+        raise AnalyzerError("DIAG-SETUP: recovery directory must be outside source")
+    if source_dir == output_path.parent or source_dir in output_path.parents:
+        raise AnalyzerError("DIAG-SETUP: output must be outside source")
+
+    source_paths = _diagnostic_artifact_paths(source_dir)
+    source_fds: dict[str, int] = {}
+    source_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    succeeded = False
+    try:
+        for name, path in source_paths.items():
+            source_fds[name] = os.open(path, os.O_RDONLY)
+            source_signatures[name] = _fd_signature(source_fds[name])
+        row_count = _source_sidecar_row_count(source_fds["sidecar"])
+        source_reconstruction = _reconstruct_diagnostic_from_fds(
+            row_count,
+            source_fds,
+        )
+        for name, fd in source_fds.items():
+            if (
+                _fd_signature(fd) != source_signatures[name]
+                or _path_signature(source_paths[name]) != source_signatures[name]
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source changed during reconstruction: "
+                    f"{source_paths[name]}"
+                )
+        recovery_paths, source_custody, recovery_signatures = (
+            _materialize_recovery_dir(
+                source_paths,
+                source_fds,
+                recovery_dir,
+                source_reconstruction,
+            )
+        )
+        for name, fd in source_fds.items():
+            if (
+                _fd_signature(fd) != source_signatures[name]
+                or _path_signature(source_paths[name]) != source_signatures[name]
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source changed during materialization: "
+                    f"{source_paths[name]}"
+                )
+        teardown = DiagnosticTeardown(
+            None,
+            "unobserved",
+            str(source_dir),
+            source_custody,
+        )
+        _finalize_candidate(
+            recovery_paths,
+            source_reconstruction.row_count,
+            source_reconstruction.final,
+            source_reconstruction.cumulative_counts,
+            source_reconstruction.first_heights,
+            rest_url,
+            ceiling,
+            output_path,
+            storage_backend,
+            txindex,
+            blockfilterindex,
+            str(data_dir),
+            teardown,
+            recovery_signatures,
+        )
+        succeeded = True
+    finally:
+        for fd in source_fds.values():
+            os.close(fd)
+        if recovery_dir.exists() and not succeeded:
+            shutil.rmtree(recovery_dir)
+
+
+def cmd_salvage_cmodern_height(args: argparse.Namespace) -> int:
+    _salvage_diagnostic_scan(
+        Path(args.source_dir),
+        Path(args.recovery_dir),
+        Path(args.output),
+        args.rest_url,
+        args.stop_height,
+        Path(args.data_dir),
+        storage_backend=args.storage_backend,
+        txindex=args.txindex,
+        blockfilterindex=args.blockfilterindex,
+    )
+    return 0
 
 
 def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
@@ -1682,8 +2464,13 @@ def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
         raise AnalyzerError(f"DIAG-SETUP: output already exists: {output}")
     work_dir.mkdir(parents=True, exist_ok=False)
     _run_diagnostic_scan(
-        binary, args.rest_url, args.stop_height, work_dir, output,
-        storage_backend=args.storage_backend, txindex=args.txindex,
+        binary,
+        args.rest_url,
+        args.stop_height,
+        work_dir,
+        output,
+        storage_backend=args.storage_backend,
+        txindex=args.txindex,
         blockfilterindex=args.blockfilterindex,
     )
     return 0
@@ -4332,6 +5119,30 @@ def build_parser() -> argparse.ArgumentParser:
     fc.add_argument("--txindex", action="store_true", default=False, help="enable txindex")
     fc.add_argument("--blockfilterindex", action="store_true", default=False, help="enable blockfilterindex")
     fc.set_defaults(func=cmd_find_cmodern_height)
+    sc = sub.add_parser(
+        "salvage-cmodern-height",
+        help="recover terminal Cmodern evidence without changing the failed run",
+    )
+    sc.add_argument("--source-dir", required=True, help="read-only failed work directory")
+    sc.add_argument("--recovery-dir", required=True, help="new directory for committed evidence")
+    sc.add_argument("--rest-url", required=True, help="original frozen REST URL (host:port)")
+    sc.add_argument("--stop-height", required=True, type=int, help="original safety ceiling")
+    sc.add_argument(
+        "--data-dir",
+        required=True,
+        help="exact original data_dir recorded by replay_diagnostic.json",
+    )
+    sc.add_argument("--output", required=True, help="new candidate output JSON path")
+    sc.add_argument("--storage-backend", default="fjall", help="original storage backend")
+    sc.add_argument("--txindex", action="store_true", default=False, help="original txindex setting")
+    sc.add_argument(
+        "--blockfilterindex",
+        action="store_true",
+        default=False,
+        help="original blockfilterindex setting",
+    )
+    sc.set_defaults(func=cmd_salvage_cmodern_height)
+
 
     return parser
 

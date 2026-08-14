@@ -101,6 +101,38 @@ Binaries produced:
 
 ## Run sequence
 
+### Find or recover the Cmodern candidate height
+
+Use `find-cmodern-height` to stop the diagnostic replay at the first height where all 11 special context counters are nonzero:
+
+```bash
+python3 analyze.py find-cmodern-height \
+  --binary "$EXP/target/release/examples/mainnet_prefix_replay" \
+  --rest-url 127.0.0.1:18443 \
+  --stop-height 961741 \
+  --work-dir "$EXP/out/cmodern-diagnostic" \
+  --output "$EXP/out/cmodern-candidate.json"
+```
+
+The candidate is diagnostic evidence, not a certifying corpus. A terminal checkpoint binds the selected height and hash to the committed stream row counts and byte endpoints. The child can finish those writes before its process teardown completes. Schema `cmodern-candidate-diagnostic-v2` therefore records `child_exit_status`, `child_teardown`, and `salvaged_from` separately instead of reporting a forced kill as a clean exit.
+
+If the child wrote the terminal checkpoint but did not exit before the controller deadline, preserve the failed work directory and recover into new paths:
+
+```bash
+python3 analyze.py salvage-cmodern-height \
+  --source-dir "$EXP/out/cmodern-diagnostic" \
+  --recovery-dir "$EXP/out/cmodern-recovery" \
+  --rest-url 127.0.0.1:18443 \
+  --stop-height 961741 \
+  --data-dir "$EXP/out/cmodern-diagnostic/state" \
+  --storage-backend fjall \
+  --output "$EXP/out/cmodern-candidate.json"
+```
+
+Salvage opens every source artifact once and keeps those descriptors open through publication. It validates each checkpoint-committed slice and hashes the source streams during that same pass. It reflink-clones or copies the files into the new recovery directory, truncates each stream at its committed endpoint, and resets only the recovery sidecar header. `source_full_file_custody` records a direct full-file SHA-256 and `clone_provenance` (`EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`) for every source. Stream entries also record the committed-prefix SHA-256. Final validation hashes the recovery streams and requires those hashes to equal the source committed-prefix hashes. The source paths, bytes, and metadata must remain unchanged until the candidate is published.
+
+`--rest-url` comes from the original controller command. The child replay JSON does not contain that value, so salvaged candidates label it `operator_supplied_original_argv`. `--data-dir` must match the exact string in `replay_diagnostic.json`. Do not resolve or rewrite it.
+
 ### Run A — authoritative C150 cumulative evidence
 
 ```bash

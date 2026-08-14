@@ -1,3 +1,23 @@
+---
+title: CHECKSIG census and the script-check floor
+date: 2026-08-12
+category: performance
+module: checksig census
+problem_type: performance_issue
+component: census analyzer
+severity: medium
+symptoms:
+  - A terminal census checkpoint can exist before child process teardown completes.
+  - Revalidating recovered evidence can require redundant terabyte-scale reads.
+root_cause: logic_error
+resolution_type: code_fix
+tags:
+  - checksig
+  - cmodern
+  - custody
+  - salvage
+---
+
 # CHECKSIG census and the script-check floor
 
 Status: **OPEN.** The CHECKSIG census over mainnet blocks 0..150,000 shows
@@ -44,6 +64,19 @@ Across 2,868,199 input checks, the 24 u64 counters yielded:
 **Key Census Fact**: Exactly $a = 1.0$ ECDSA attempts occur per kernel script check ($2,868,199 / 2,868,199$). Every input in mainnet blocks 0..150,000 is an ordinary legacy bare P2PKH spend. All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) are zero. `eval_script_entries` is exactly $2 \times 2,868,199 = 5,736,398$. The exact product predicate (`_c150_passed`) evaluates to `all_passed: true` and `c150_passed: true`.
 
 **Certification Pipeline and Rule**: Authoritative certification requires strict `mainnet-prefix-replay-v2` inputs, file-bound binary streams, and exact classifier (`classify-corpus-v2`) validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+
+## Recover terminal proof after slow process teardown
+
+The diagnostic controller can receive the terminal `BRSHGT1` checkpoint after the child has closed and flushed all evidence sinks, but before the child finishes chainstate teardown. A fixed process-exit deadline must not redefine completed evidence as incomplete. It must also not report a killed child as a clean exit. Candidate schema v2 records evidence completion and process teardown separately.
+
+`salvage-cmodern-height` recovers this state without changing the failed run. It retains one descriptor for each source artifact from semantic reconstruction through candidate publication. The reconstruction validates every checkpoint-committed context, record, and journal slice. It hashes those same source bytes in the validation pass. It then reads and hashes a physical tail only when the source contains bytes beyond the last committed endpoint. This produces a direct full-file digest and a committed-prefix digest without a second source-stream pass.
+
+The recovery directory is new and single-writer. Each source artifact is reflink-cloned when the filesystem supports it, or copied otherwise. Stream clones are truncated to the terminal endpoints. The recovery sidecar alone receives a placeholder count before the normal finalizer patches the terminal count. Each custody entry states whether the clone is `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; equal file length does not imply exact provenance because the sidecar header can change in place.
+
+The finalizer parses and hashes each recovery stream once. A stream hash must equal its source committed-prefix hash. Source and recovery path identities must also remain stable through publication. This two-pass design proves source semantics and published recovery custody. Reconstructing the recovery streams semantically between those passes would read the same large evidence a third time without proving a new property.
+
+The child replay artifact does not record the REST endpoint. Offline salvage therefore records `rest_url_provenance: operator_supplied_original_argv`. The exact `data_dir` string does exist in the replay artifact and must match without path normalization. A salvaged candidate records `child_exit_status: null`, `child_teardown: unobserved`, and the immutable source directory in `salvaged_from`. The candidate remains non-certifying until the selected Cmodern corpus receives the normal file-bound replay and classifier proofs.
+
 ## Capture corpus and integrity proofs
 
 - **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`

@@ -190,6 +190,13 @@ Authoritative C150/Cmodern certification requires file-bound binary streams, str
 Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
 
 Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+
+### Terminal proof
+
+A `BRSHGT1` checkpoint that binds one replay height and block hash to the committed row counts and byte endpoints of the `BRSCTX1`, `BRSREC1`, and `BRSJRN1` evidence streams. The proof is complete when every committed slice validates, all 11 Cmodern context classes have appeared, and the checkpoint height equals the last first-occurrence height. Child process exit is a separate fact. Slow chainstate teardown or a forced post-proof kill does not erase completed evidence and must not be reported as a clean exit.
+
+Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`. The final recovery stream hash must equal the validated source committed-prefix hash before candidate publication. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+
 ### Front-half duplication
 
 The failure mode where a batched fast path recomputes the sequential path's

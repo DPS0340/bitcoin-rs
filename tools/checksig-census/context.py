@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
-import json
-import struct
 import hashlib
+import json
 import os
+import struct
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import BinaryIO, Iterator
-
+from typing import BinaryIO
 
 CONTEXT_MAGIC = b"BRSCTX1\x00"
 CONTEXT_HEADER = struct.Struct("<8sQ")
@@ -218,10 +218,17 @@ def decode_context_row(
 class _PreadBoundedReader:
     """Sequential view over one immutable committed prefix using ``pread``."""
 
-    def __init__(self, fd: int, start: int, end: int) -> None:
+    def __init__(
+        self,
+        fd: int,
+        start: int,
+        end: int,
+        observe_bytes: Callable[[bytes], None] | None = None,
+    ) -> None:
         self._fd = fd
         self._cursor = start
         self._end = end
+        self._observe_bytes = observe_bytes
 
     @property
     def cursor(self) -> int:
@@ -237,6 +244,8 @@ class _PreadBoundedReader:
             return b""
         data = os.pread(self._fd, length, self._cursor)
         self._cursor += len(data)
+        if data and self._observe_bytes is not None:
+            self._observe_bytes(data)
         return data
 
 
@@ -247,12 +256,14 @@ def read_bounded_context_rows(
     end_offset: int,
     start_row: int,
     committed_rows: int,
+    observe_bytes: Callable[[bytes], None] | None = None,
 ) -> list[ContextInput]:
     """Read only newly committed BRSCTX1 rows from an already-open fd.
 
     The producer may still have the placeholder header count zero. A patched
     terminal count is accepted only when it covers the requested committed
-    prefix. Bytes beyond ``end_offset`` are never observed.
+    prefix. Bytes beyond ``end_offset`` are never observed. ``observe_bytes``
+    receives each committed payload byte exactly once.
     """
     if start_row < 0 or committed_rows < start_row:
         raise ContextError(
@@ -280,7 +291,7 @@ def read_bounded_context_rows(
             f"CTX-RAW: terminal row count {declared_count} is below committed prefix count {committed_rows}"
         )
 
-    reader = _PreadBoundedReader(fd, start_offset, end_offset)
+    reader = _PreadBoundedReader(fd, start_offset, end_offset, observe_bytes)
     rows = [
         decode_context_row(
             reader,
