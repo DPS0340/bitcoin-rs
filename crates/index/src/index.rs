@@ -1644,7 +1644,7 @@ mod watermark_tests {
 
 /// Read-only `TxIndex` interface used by RPC complete queries.
 pub trait TxIndexReader: Send + Sync {
-    /// Loads the exact durable watermark from the TxIndex store.
+    /// Loads the exact durable watermark from the `TxIndex` store.
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
 
     /// Resolves a confirmed transaction by txid via `source`.
@@ -1669,9 +1669,9 @@ pub trait TxIndexReader: Send + Sync {
     ) -> Result<Option<u64>, IndexError>;
 }
 
-/// Mutation-only interface owned by the asynchronous TxIndex worker.
+/// Mutation-only interface owned by the asynchronous `TxIndex` worker.
 pub trait TxIndexWriter: Send + Sync {
-    /// Loads the exact durable watermark from the TxIndex store.
+    /// Loads the exact durable watermark from the `TxIndex` store.
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
 
     /// Atomically connects a contiguous slice and publishes its terminal watermark.
