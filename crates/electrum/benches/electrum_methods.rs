@@ -350,14 +350,16 @@ fn bench_method(c: &mut Criterion, method: &'static str, label: &str, fixture: &
     group.bench_function("before_scan", |b| {
         b.iter(|| {
             black_box(
-                dispatch(black_box(method), scan_index, mempool, params).expect("dispatch succeeds"),
+                dispatch(black_box(method), scan_index, mempool, params)
+                    .expect("dispatch succeeds"),
             )
         });
     });
     group.bench_function("after_fast", |b| {
         b.iter(|| {
             black_box(
-                dispatch(black_box(method), fast_index, mempool, params).expect("dispatch succeeds"),
+                dispatch(black_box(method), fast_index, mempool, params)
+                    .expect("dispatch succeeds"),
             )
         });
     });

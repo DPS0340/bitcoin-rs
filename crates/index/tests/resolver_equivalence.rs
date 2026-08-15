@@ -235,7 +235,11 @@ fn the_position_path_reads_ranges_and_never_whole_blocks() {
     let history = indexer
         .resolve_script_history(scripthash, &positioned)
         .expect("fast resolver");
-    assert_eq!(history.len(), 4, "fixture must resolve one entry per height");
+    assert_eq!(
+        history.len(),
+        4,
+        "fixture must resolve one entry per height"
+    );
     assert_eq!(
         positioned.full_loads.get(),
         0,

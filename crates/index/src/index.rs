@@ -903,17 +903,15 @@ fn pending_rows_for_decoded_block(
     // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
     // pins this against the byte offsets the zero-copy path measures directly.
     let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
-    let mut offset =
-        u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
-            offset: u64::try_from(prologue).unwrap_or(u64::MAX),
-        })?;
+    let mut offset = u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
+        offset: u64::try_from(prologue).unwrap_or(u64::MAX),
+    })?;
 
     for (tx, txid) in block.txdata.iter().zip(txids) {
-        let byte_len = u32::try_from(tx.total_size()).map_err(|_| {
-            IndexError::UnaddressablePosition {
+        let byte_len =
+            u32::try_from(tx.total_size()).map_err(|_| IndexError::UnaddressablePosition {
                 offset: u64::from(offset),
-            }
-        })?;
+            })?;
         let position = crate::types::TxPosition::new(offset, byte_len);
         offset = offset
             .checked_add(byte_len)
