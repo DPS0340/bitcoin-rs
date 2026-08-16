@@ -134,8 +134,46 @@ remains the number the result is most sensitive to.
 
 ## Step 2.2: the v5 record codec
 
-**Result: 11.75 bytes saved per output (21.7% of the payload), and lookups are
-faster than v4 rather than slower.**
+**Result: 11.75 bytes saved per output (21.7% of the payload), for a lookup cost
+of about 3 ns on a typical record and a lookup *win* on a fat one.**
+
+> **Correction, 2026-08-16.** This section first said "lookups are faster than
+> v4 rather than slower", quoting the `utxo_commit` arms. Those arms use a
+> **256-output** record, and the two layouts cross over well above the record
+> size mainnet actually has. The measured average is 3.626 outputs per record,
+> where v5 is slower. The claim was true of the fixture and false of the
+> workload, which is the more useful thing to be right about.
+
+### Where the two layouts cross over
+
+`find_output`, by record size, `before_v4` against `after_v5`:
+
+| outputs | `miss` | | | `hit_last` | | |
+|---|---:|---:|---:|---:|---:|---:|
+| | v4 | v5 | ratio | v4 | v5 | ratio |
+| 1 | 1.7 ns | 3.6 ns | 0.48x | 2.1 ns | 12.5 ns | 0.16x |
+| **3.626 (measured mainnet average)** | ~4 ns | ~7 ns | **~0.57x** | 3.7 ns | 18.4 ns | 0.20x |
+| 16 | 16.6 ns | 20.6 ns | 0.80x | 16.8 ns | 40.6 ns | 0.41x |
+| 64 | 109.3 ns | 79.5 ns | **1.37x** | 126.3 ns | 136.6 ns | 0.92x |
+| 256 | 471.8 ns | 298.7 ns | **1.58x** | 481.6 ns | 499.7 ns | 0.96x |
+
+v5 pays a fixed ~10 ns to read the directory header and decode the matched
+payload, and then scans at a fraction of v4's per-output cost. Below roughly 64
+outputs the fixed cost dominates; above it the scan does. `hit_first` never
+crosses, because v4's best case is a single constant-offset read the optimizer
+reduces to almost nothing.
+
+**In absolute terms the loss is 3 ns per lookup at the mainnet average.** At
+~4,000 spent inputs per block that is 12 µs against a 50 ms commit budget —
+0.02% — bought with 21.7% of the record payload. The win concentrates on batch
+payouts, the records where a lookup was expensive in the first place.
+
+The `utxo_commit` arms measure 705 ns -> 300 ns (2.35x) on their 256-output
+fixture, against this harness's 472 ns -> 299 ns (1.58x) for the same shape.
+The v5 figures agree; the v4 ones do not, because `utxo_commit` drives the real
+`UtxoRecord::find_output` while this harness reimplements the v4 search as a
+direct loop that the optimizer handles better. **The microbenchmark is the
+conservative number** and the one quoted above.
 
 v5 keeps v4's record header and replaces the per-output layout:
 
@@ -171,6 +209,10 @@ way it failed is the part worth keeping.
 | `get_middle` | 384 ns | 1.67 µs | **342 ns** |
 | `spend_fanout_64` | 18.5 µs | 39.9 µs | 21.3 µs |
 | `spend_fanout_64_noop_listener` | 86.7 µs | 115.2 µs | **77.1 µs** |
+
+Those `same_txid_lookup` arms hold **256 outputs in one record**, which is the
+far side of the crossover above. Read them as the fat-record case, not as the
+typical one.
 
 Two mistakes produced that 4.4-4.9x, and neither was visible until the benchmark
 was reshaped:

@@ -156,9 +156,13 @@ fn bench_codec(c: &mut Criterion, count: usize) {
 }
 
 fn record_codec(c: &mut Criterion) {
-    // 1 output is the single-output record, MEASURED_OUTPUTS_PER_RECORD the
-    // chainstate average, 16 the tail that amortizes the txid best.
-    for count in [1, MEASURED_OUTPUTS_PER_RECORD, 16] {
+    // 1 is the single-output record, MEASURED_OUTPUTS_PER_RECORD the chainstate
+    // average, and 256 the batch-payout shape `utxo_commit`'s lookup arms use.
+    // The intermediate points exist because the two layouts cross over: v5
+    // trades a fixed setup cost for a per-output scan that is far cheaper, so
+    // which one wins depends on how many outputs the record holds. Reporting
+    // only one size would let either arm look like the answer.
+    for count in [1, MEASURED_OUTPUTS_PER_RECORD, 16, 64, 256] {
         bench_codec(c, count);
     }
 }
