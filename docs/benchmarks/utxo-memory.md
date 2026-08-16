@@ -110,18 +110,131 @@ converged, and the tip value is still unknown.
 
 | | Tip projection, 180M outputs | Share of the 16 GiB budget |
 |---|---:|---:|
-| Today | **13.28 GiB** | **83%** |
-| With the Step 2.2 encoding work | **9.61 GiB** | 60% |
+| Today (v4) | **13.28 GiB** | **83%** |
+| With the v5 codec, as built and measured | **11.31 GiB** | **71%** |
+| Projected before building it | 9.61 GiB | 60% |
 
-The 17 B/output those changes remove is **28% of process RSS**, about 3.7 GiB at
-tip. At 83% of budget on the UTXO path alone — before `txindex` and
-`blockfilterindex`, which the G14 budget requires — that margin decides the gate.
+**The projection was optimistic and the measured figure is what stands.** It
+assumed 17 B/output from four changes; three of them shipped and deliver a
+measured **11.75 B/output**, which is 14.8% of process RSS and about **1.97 GiB
+at tip**. The fourth — hoisting `height` into the record header, worth roughly 3
+B/output — was not attempted, because it needs an invariant BIP30 duplicate
+txids may break. Core-style script compression, the other 3 B/output, is
+untouched.
 
-**Step 2.2 is justified. Step 2.4 is not**: fragmentation measured 5% after
-churning twice the whole set.
+At 83% of budget on the UTXO path alone — before `txindex` and
+`blockfilterindex`, which the G14 budget requires — that 12-point margin is
+worth having, but it does not by itself settle the gate.
+
+**Step 2.2 is justified and done. Step 2.4 is not**: fragmentation measured 5%
+after churning twice the whole set.
 
 The projection holds outputs per record at 3.626, which has not converged and
 remains the number the result is most sensitive to.
+
+## Step 2.2: the v5 record codec
+
+**Result: 11.75 bytes saved per output (21.7% of the payload), and lookups are
+faster than v4 rather than slower.**
+
+v5 keeps v4's record header and replaces the per-output layout:
+
+```
+txid(32) || output_count(4) || legacy_inline_len(1) || widths(1)
+|| vout_dir  : one fixed-width little-endian entry per output
+|| len_dir   : one fixed-width payload length per output
+|| payloads  : varint(amount) [|| raw amount] || varint(height << 1 | coinbase) || script
+```
+
+Three encodings do the shrinking, all pure per-output transforms with no
+cross-output invariant to violate: Core's `CTxOutCompressor` amount transform,
+`height` and `coinbase` packed into one varint, and directory widths that are
+the narrowest the record needs. The script length is not stored at all — the
+script is whatever remains of its payload, so the length directory pays for
+itself.
+
+Hoisting `height` into the record header would save 3 bytes more and is **not
+done**: it needs "every output of a record shares one height" to hold, and
+BIP30's duplicate coinbase txids are exactly where it might not.
+
+### Rejected first draft: flat varints
+
+The first v5 was a flat frame per output —
+`varint(vout) || varint(amount) || varint(packed_height) || varint(script_len) || script`
+— with no directories. It hit the size target and **failed on speed**, and the
+way it failed is the part worth keeping.
+
+| Operation | v4 | flat v5 | directory v5 |
+|---|---:|---:|---:|
+| `get_miss` (real shard lookup) | 705 ns | 3.42 µs | **300 ns** |
+| `get_last` | 728 ns | 3.43 µs | **617 ns** |
+| `get_middle` | 384 ns | 1.67 µs | **342 ns** |
+| `spend_fanout_64` | 18.5 µs | 39.9 µs | 21.3 µs |
+| `spend_fanout_64_noop_listener` | 86.7 µs | 115.2 µs | **77.1 µs** |
+
+Two mistakes produced that 4.4-4.9x, and neither was visible until the benchmark
+was reshaped:
+
+1. **The benchmark measured the wrong operation.** It timed whole-record
+   `encode`/`decode`. The operation that dominates is `find_output(vout)` —
+   every spent input resolves through `Shard::get`/`get_entry`/`get_meta`, and
+   all three land there. Whole-record decode is the snapshot and rescan path,
+   which is rare by comparison.
+2. **v4 gets lazy field skipping for free, and v5 cannot.** Every v4 field sits
+   at a constant offset, so when only `vout` is read the optimizer deletes the
+   loads for the rest. In a flat variable-length layout each varint's length is
+   what locates the next field, so the reads are a serial dependency chain no
+   optimizer can remove — and locating output `i` meant walking the bytes of
+   outputs `0..i`, scripts included.
+
+The directories fix exactly that: a lookup scans one dense fixed-width array and
+sums a second, touching ~2 bytes per output instead of ~35. It is why `get_miss`
+ends up **2.3x faster than v4**, not merely level with it.
+
+### What it costs
+
+Encoding is 1.6-2.4x slower, because the directory widths are a property of the
+whole record, so nothing can be written until every payload length is known.
+At block scale that shows up as commit p95 rising 3% (`existing`), 8%
+(`uniform`) and 21% (`concentrated`, which puts all 10,000 entries in one
+shard). Against the G14 budget of 50 ms this is not close to binding: the worst
+case measured is 2.57 ms.
+
+One encode "optimization" was tried and **rejected by measurement** — staging
+both directories in a `SmallVec` scratch and copying once, instead of one push
+per entry. It measured 505.7 ns against 428.5 ns on a 16-output record: setting
+up the scratch costs more than the bounds checks it saves at one or two bytes
+per entry.
+
+### How it is checked
+
+- `crates/utxo/tests/record_codec_equivalence.rs`, 7 tests. v4 is retained as
+  the oracle and both codecs run over the same inputs; equality is **per field**
+  over every decoded `OneUtxoOut`, in order, because comparing encoded bytes
+  would be meaningless when the layouts are supposed to differ. Size is asserted
+  as a property, not a spot check.
+- `non_canonical_v5_spellings_are_rejected` covers what the variable-length and
+  fixed-width layouts each introduced: a non-minimal varint, the amount escape
+  used for a value the compact form already covers, and a directory wider than
+  the record needs. `UtxoRecord` compares by bytes, so a second spelling of one
+  record is a correctness bug.
+- `find_output_decompresses_at_most_the_amount_it_returns` asserts the *work*,
+  not the time: one amount decompression for a hit, none for a miss, none for
+  `max_vout`, no matter how many outputs the record holds. A wall-clock
+  assertion in a test suite is a flake generator; counting the expensive
+  operation is the same claim made deterministically.
+
+Reproduce:
+
+```
+cargo bench -p bitcoin-rs-utxo --bench record_codec
+cargo bench -p bitcoin-rs-utxo --bench utxo_commit -- "lookup|spend_fanout_64"
+```
+
+The `utxo_commit` arms cannot be paired in one run — only one codec is compiled
+in — so the v4 comparison was taken A-B-A across a stash, with the two v5 runs
+agreeing to 0.1-2.9%. That drift bounds the rebuild effect well below every
+ratio quoted above.
 
 ## Superseded: the pre-measurement sizing
 
