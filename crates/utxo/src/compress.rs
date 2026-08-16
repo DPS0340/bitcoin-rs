@@ -164,18 +164,44 @@ thread_local! {
     pub(crate) static DECOMPRESS_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
-/// Inverse of [`compress_amount`].
+/// The powers of ten the transform can factor out, indexed by exponent.
+///
+/// Replaces a `while` loop of up to nine dependent multiplies. Decoding an
+/// amount is on the record read path, and that loop was most of its fixed cost.
+const POW10: [u64; 10] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+/// Inverse of [`compress_amount`], or `None` when `compressed` is not something
+/// [`compress_amount`] could have produced.
+///
+/// The rejection is not defensive tidiness. `read_varint` will hand this any
+/// `u64` a corrupt or hostile record contains, and the transform multiplies by
+/// up to 10^9: `decompress_amount(u64::MAX)` is 2.05e22, which **panics in a
+/// debug build** and wraps silently in a release one. `validate_encoded`
+/// decodes every output of every record loaded from a snapshot, so that path is
+/// reachable from a file on disk.
+///
+/// Requiring the result back inside the compressible domain also completes the
+/// canonicality rule: the compact form may encode only amounts the escape
+/// refuses, and the escape refuses exactly the amounts the compact form
+/// covers. Together they leave each amount exactly one spelling.
 #[inline]
-pub(crate) fn decompress_amount(compressed: u64) -> u64 {
+pub(crate) fn decompress_amount(compressed: u64) -> Option<u64> {
     #[cfg(test)]
     DECOMPRESS_CALLS.with(|calls| calls.set(calls.get() + 1));
-    decompress_amount_inner(compressed)
-}
 
-#[inline]
-const fn decompress_amount_inner(compressed: u64) -> u64 {
     if compressed == 0 {
-        return 0;
+        return Some(0);
     }
     let x = compressed - 1;
     let exponent = x % 10;
@@ -183,17 +209,14 @@ const fn decompress_amount_inner(compressed: u64) -> u64 {
     if exponent < 9 {
         let last_digit = n % 9;
         n /= 9;
-        n = n * 10 + last_digit + 1;
+        n = n.checked_mul(10)?.checked_add(last_digit + 1)?;
     } else {
-        n += 1;
+        n = n.checked_add(1)?;
     }
-    let mut result = n;
-    let mut remaining = exponent;
-    while remaining > 0 {
-        result *= 10;
-        remaining -= 1;
-    }
-    result
+    // `exponent` is `x % 10`, so the lookup is in range by construction.
+    let scale = POW10.get(usize::try_from(exponent).ok()?)?;
+    let value = n.checked_mul(*scale)?;
+    (value <= MAX_COMPRESSIBLE_AMOUNT).then_some(value)
 }
 
 #[cfg(test)]
@@ -324,7 +347,7 @@ mod tests {
             let compressed = compress_amount(value).expect("within the money supply");
             assert_eq!(
                 decompress_amount(compressed),
-                value,
+                Some(value),
                 "amount round trip failed for {value}"
             );
         }
@@ -362,7 +385,23 @@ mod tests {
         #[test]
         fn compressed_amounts_round_trip(value in 0..=MAX_COMPRESSIBLE_AMOUNT) {
             let compressed = compress_amount(value).expect("in range");
-            prop_assert_eq!(decompress_amount(compressed), value);
+            prop_assert_eq!(decompress_amount(compressed), Some(value));
+        }
+
+        /// No `u64` may panic the decoder, and every value it accepts must be
+        /// one the encoder could have produced.
+        ///
+        /// `read_varint` hands this whatever a corrupt or hostile record
+        /// contains, and `validate_encoded` runs it over every output of every
+        /// record loaded from a snapshot. The second half is the canonicality
+        /// rule: if some compressed value outside the encoder's image were
+        /// accepted, one amount would have two spellings.
+        #[test]
+        fn decompress_accepts_exactly_the_encoder_image(compressed in any::<u64>()) {
+            if let Some(value) = decompress_amount(compressed) {
+                prop_assert!(value <= MAX_COMPRESSIBLE_AMOUNT);
+                prop_assert_eq!(compress_amount(value).ok(), Some(compressed));
+            }
         }
 
         /// The compression must be injective over the range it will ever see,

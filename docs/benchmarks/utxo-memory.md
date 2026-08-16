@@ -151,17 +151,23 @@ of about 3 ns on a typical record and a lookup *win* on a fat one.**
 | outputs | `miss` | | | `hit_last` | | |
 |---|---:|---:|---:|---:|---:|---:|
 | | v4 | v5 | ratio | v4 | v5 | ratio |
-| 1 | 1.7 ns | 3.6 ns | 0.48x | 2.1 ns | 12.5 ns | 0.16x |
-| **3.626 (measured mainnet average)** | ~4 ns | ~7 ns | **~0.57x** | 3.7 ns | 18.4 ns | 0.20x |
-| 16 | 16.6 ns | 20.6 ns | 0.80x | 16.8 ns | 40.6 ns | 0.41x |
-| 64 | 109.3 ns | 79.5 ns | **1.37x** | 126.3 ns | 136.6 ns | 0.92x |
-| 256 | 471.8 ns | 298.7 ns | **1.58x** | 481.6 ns | 499.7 ns | 0.96x |
+| 1 | 2.6 ns | 7.6 ns | 0.35x | 2.5 ns | 15.6 ns | 0.16x |
+| **3.626 (measured mainnet average)** | 3.9 ns | 6.9 ns | 0.57x | 3.6 ns | 17.1 ns | 0.21x |
+| 16 | 16.6 ns | 20.7 ns | 0.80x | 17.1 ns | 39.7 ns | 0.43x |
+| 64 | 108.4 ns | 78.7 ns | 1.38x | 126.8 ns | 135.4 ns | 0.94x |
+| 256 | 462.1 ns | 294.1 ns | 1.57x | 476.7 ns | 492.5 ns | 0.97x |
 
-v5 pays a fixed ~10 ns to read the directory header and decode the matched
+v5 pays a fixed ~11 ns to read the directory header and decode the matched
 payload, and then scans at a fraction of v4's per-output cost. Below roughly 64
 outputs the fixed cost dominates; above it the scan does. `hit_first` never
 crosses, because v4's best case is a single constant-offset read the optimizer
 reduces to almost nothing.
+
+Replacing the amount transform's `while` loop of up to nine dependent multiplies
+with a power-of-ten lookup took that fixed cost from 12.5 ns to 11.3 ns — 1.1x,
+real but small. It was worth doing for a different reason (see below); the
+remaining fixed cost is the directory read and building the returned view, not
+the arithmetic.
 
 **In absolute terms the loss is 3 ns per lookup at the mainnet average.** At
 ~4,000 spent inputs per block that is 12 µs against a 50 ms commit budget —
@@ -232,6 +238,31 @@ was reshaped:
 The directories fix exactly that: a lookup scans one dense fixed-width array and
 sums a second, touching ~2 bytes per output instead of ~35. It is why `get_miss`
 ends up **2.3x faster than v4**, not merely level with it.
+
+### A corrupt record could panic the decoder
+
+Found while looking at why `find_output` has a fixed cost, and worth more than
+the answer to that question.
+
+`decompress_amount` finished with a `while` loop multiplying by ten up to nine
+times. `read_varint` hands it whatever a record contains, and
+`validate_encoded` runs it over every output of every record loaded from a
+snapshot — so a file on disk could reach it with an arbitrary `u64`.
+`decompress_amount(u64::MAX)` is 2.05e22: **a panic in a debug build, a silent
+wrap in a release one.** Reproduced before fixing, as
+`an_absurd_compressed_amount_is_rejected_rather_than_overflowing`, which failed
+with `attempt to multiply with overflow`.
+
+The fix returns `Option` and requires the decompressed value back inside the
+compressible domain, which also closes a canonicality hole that was open until
+now: the compact form may encode only amounts the escape refuses, and the escape
+refuses exactly the amounts the compact form covers, so each amount has one
+spelling and no other.
+
+`decompress_accepts_exactly_the_encoder_image` states that as a property over
+every `u64`: whatever the decoder accepts must round-trip back to the same
+compressed value through the encoder. It does not merely check for absence of
+panics — it pins the accepted set to the encoder's image exactly.
 
 ### What it costs
 

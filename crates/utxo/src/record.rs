@@ -1472,7 +1472,10 @@ fn decode_output_at<'a>(
         }
         (value, end)
     } else {
-        (crate::compress::decompress_amount(amount), cursor)
+        (
+            crate::compress::decompress_amount(amount).ok_or(UtxoError::CorruptRecord)?,
+            cursor,
+        )
     };
 
     let (packed, cursor) = crate::compress::read_varint(body, cursor)?;
@@ -2010,6 +2013,31 @@ mod tests {
             Err(UtxoError::CorruptRecord)
         ));
 
+        Ok(())
+    }
+
+    /// A corrupt record must not be able to panic the decoder.
+    #[test]
+    fn an_absurd_compressed_amount_is_rejected_rather_than_overflowing() -> Result<(), UtxoError> {
+        // `varint(u64::MAX - 1)`: ten bytes, and not the escape sentinel, so it
+        // reaches the amount transform.
+        let mut payload = vec![0xFE_u8];
+        payload.extend_from_slice(&[0xFF; 8]);
+        payload.push(0x01);
+        payload.extend_from_slice(&[0x02, 0x51, 0xAC]);
+
+        let mut bytes = Hash256::default().to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.push(0x11);
+        bytes.push(0x00);
+        bytes.push(u8::try_from(payload.len()).unwrap_or(0));
+        bytes.extend_from_slice(&payload);
+
+        assert!(matches!(
+            UtxoRecord::from_encoded(ThinRecordBuf::from_slice(&bytes)?),
+            Err(UtxoError::CorruptRecord)
+        ));
         Ok(())
     }
 
