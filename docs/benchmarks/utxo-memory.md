@@ -129,6 +129,28 @@ worth having, but it does not by itself settle the gate.
 **Step 2.2 is justified and done. Step 2.4 is not**: fragmentation measured 5%
 after churning twice the whole set.
 
+### When to revert v5
+
+Stated now, while the numbers are in front of us, so that whoever reads this
+later does not have to reconstruct the trade.
+
+v5 costs about **3 ns per lookup** at the measured mainnet average and **3-21%
+on block commit p95**, against budgets with roughly twenty times the headroom.
+It buys **12 points of the 16 GiB tip-RSS budget**. That is a good trade only
+while tip RSS is actually near the budget — and the budget has never been
+measured. The 13.83 GiB figure everything here is projected from comes from
+*excluded* evidence at height 645,804, on a run that never made the tip.
+
+**If G14 tip RSS measures well under budget — say below 10 GiB — this
+complexity is not earning its keep and reverting is the right call.** v4 is
+retained in the tree as the equivalence oracle and the benchmark's `before`
+arm, so a revert is a revert rather than a rewrite.
+
+The second thing that would change the answer is outputs per record. The
+projection holds it at 3.626; it has not converged (2.296 at height 183k, 4.056
+at 390k), and it is the number the result is most sensitive to, because the
+32-byte txid amortizes over it directly.
+
 The projection holds outputs per record at 3.626, which has not converged and
 remains the number the result is most sensitive to.
 
