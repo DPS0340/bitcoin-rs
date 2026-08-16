@@ -170,6 +170,45 @@ impl HistogramFn for HistogramHandle {
     }
 }
 
+/// Resident set size of this process in bytes, or `None` where the platform
+/// cannot report it.
+///
+/// Used by the memory-attribution reporting on the checkpoint path. The G14
+/// budget is written against RSS, and the UTXO set can only account for its own
+/// allocations, so the residual between the two is the number that says whether
+/// an encoding change is worth making.
+#[must_use]
+pub fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix("VmRSS:")?;
+            value
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(1024)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No `/proc`; shell out rather than take a platform-specific dependency
+        // for one number read once per checkpoint.
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1024)
+    }
+}
+
 /// Installs in-memory process metrics and returns its handle when configured.
 ///
 /// The workspace pins `metrics-exporter-prometheus` without its HTTP listener.

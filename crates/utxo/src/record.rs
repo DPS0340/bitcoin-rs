@@ -716,6 +716,17 @@ impl UtxoRecord {
         self.buf.as_bytes()
     }
 
+    /// Bytes this record holds from the allocator: header plus buffer capacity.
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        THIN_HEADER_LEN.saturating_add(self.buf.capacity())
+    }
+
+    /// Live encoded payload length, excluding the allocation header and any
+    /// spare capacity.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
     fn header(&self) -> RecordHeader {
         match decode_header(self.buf.as_bytes()) {
             Ok(header) => header,

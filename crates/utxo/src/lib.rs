@@ -24,7 +24,7 @@ pub use key::{UtxoBuildHasher, UtxoKey};
 pub use record::{OneUtxoOut, UtxoRecord};
 pub use set::{
     BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeListener, UtxoError, UtxoInserted,
-    UtxoRemoved, UtxoScan, UtxoSet, UtxoSetView,
+    UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet, UtxoSetView,
 };
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
