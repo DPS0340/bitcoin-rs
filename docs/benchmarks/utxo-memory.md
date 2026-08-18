@@ -111,13 +111,15 @@ converged, and the tip value is still unknown.
 | | Tip projection, 180M outputs | Share of the 16 GiB budget |
 |---|---:|---:|
 | Today (v4) | **13.28 GiB** | **83%** |
-| With the v5 codec, as built and measured | **11.31 GiB** | **71%** |
+| With the v5 codec, measured on a real chainstate | **11.35 GiB** | **71%** |
 | Projected before building it | 9.61 GiB | 60% |
 
 **The projection was optimistic and the measured figure is what stands.** It
 assumed 17 B/output from four changes; three of them shipped and deliver a
-measured **11.75 B/output**, which is 14.8% of process RSS and about **1.97 GiB
-at tip**. The fourth — hoisting `height` into the record header, worth roughly 3
+measured **11.49 B/output of RSS** on a real 38,145,360-output chainstate, which
+is 14.5% of process RSS and about **1.93 GiB at tip**. (An earlier revision of
+this line quoted 11.75 from the synthetic bench; the real chainstate came in 5.1%
+under it.) The fourth — hoisting `height` into the record header, worth roughly 3
 B/output — was not attempted, because it needs an invariant BIP30 duplicate
 txids may break. Core-style script compression, the other 3 B/output, is
 untouched.
@@ -165,6 +167,46 @@ of about 3 ns on a typical record and a lookup *win* on a fat one.**
 > size mainnet actually has. The measured average is 3.626 outputs per record,
 > where v5 is slower. The claim was true of the fixture and false of the
 > workload, which is the more useful thing to be right about.
+
+### Measured on the real chainstate, not the synthetic bench
+
+Everything above about size came from a synthetic fixture. The same 2.03 GiB
+`utxo-v4.dat` a real pruned sync produced at height 412,732 — 10,519,335 records
+and **38,145,360 outputs** — was then loaded by a v4 build and a v5 build.
+Same file, same machine, only the codec differs
+(`crates/utxo/examples/snapshot_memory.rs`).
+
+| Layer | v4 | v5 | Saved |
+|---|---:|---:|---:|
+| Record payload | 55.08 B/output | 43.90 B/output | **11.18** |
+| ...plus allocation header and slack | 57.28 | 46.11 | 11.17 |
+| ...plus hash-table backing store | 61.24 | 50.07 | 11.17 |
+| **Process RSS** | **65.57** | **54.08** | **11.49** |
+
+**The synthetic bench was 5.1% optimistic.** It predicted 11.75 B/output of
+payload; the real chainstate gives **11.18**. The figure to quote is 11.18.
+
+Two things corroborate the instrument. The v4 payload here is 55.08 B/output
+against the 55.1 the original attribution run measured by a completely different
+route, and the RSS saving (11.49) is slightly *larger* than the payload saving
+(11.17), which is what an allocator returning whole size classes should do.
+
+**And it is consensus-neutral on real data.** Both builds produce the identical
+`hash_serialized_3` —
+`438e59e4c0400b89cd06a5bb3623234a299ba5cf600043fb298ab345c328edfb` — and a
+`MuHash` trailer whose SHA-256 matches the one the checkpoint manifest recorded
+when the v4 node wrote it. That is the golden-vector assertion from
+`crates/utxo/tests/snapshot_v4_golden.rs`, restated over 38 million real outputs
+instead of 433 fixture ones.
+
+What this does **not** measure is full-node tip RSS: it loads the UTXO set alone,
+with no fjall, CoinStats, block-record log or runtime alongside it. The G14 gate
+still needs a synced tip node with `txindex` and `blockfilterindex`.
+
+```
+cargo run -p bitcoin-rs-utxo --example snapshot_memory --release -- \
+    <datadir>/chainstate-checkpoints/gen-*/utxo-v4.dat [manifest-trailer-sha256]
+```
 
 ### Where the two layouts cross over
 
