@@ -75,6 +75,22 @@ impl BlockSource for NodeBlockSource {
         let bytes = self.block_body_bytes(record)?;
         deserialize::<Block>(&bytes).ok()
     }
+
+    fn block_bytes_at_height(&self, height: u32, offset: u32, len: u32) -> Option<Vec<u8>> {
+        // Only the durable body source can slice. A session record holds its
+        // body as a hex string, so serving a range from it would mean decoding
+        // the whole thing first — exactly the work the range read exists to
+        // avoid. Returning `None` sends the caller to `block_at_height`, which
+        // is correct and no slower than it is today.
+        let source = self.block_body_source.as_ref()?;
+        let hash = if let Some(tree) = &self.block_tree {
+            tree.read().active_node_at_height(height)?.hash
+        } else {
+            let guard = self.blocks.read();
+            record_at_height(&guard, height)?.hash
+        };
+        source.block_body_range(height, hash, offset, len)
+    }
 }
 
 impl NodeBlockSource {
@@ -192,6 +208,85 @@ mod tests {
             panic!("expected block at height 0");
         };
         assert_eq!(decoded.block_hash(), genesis.block_hash());
+    }
+
+    /// Body source that can slice, backed by one in-memory body.
+    struct RangedBody {
+        height: u32,
+        hash: Hash256,
+        bytes: Vec<u8>,
+    }
+
+    impl BlockBodySource for RangedBody {
+        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            (self.height == height && self.hash == hash).then(|| self.bytes.clone())
+        }
+
+        fn block_body_range(
+            &self,
+            height: u32,
+            hash: Hash256,
+            offset: u32,
+            len: u32,
+        ) -> Option<Vec<u8>> {
+            if self.height != height || self.hash != hash {
+                return None;
+            }
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(usize::try_from(len).ok()?)?;
+            self.bytes.get(start..end).map(<[u8]>::to_vec)
+        }
+    }
+
+    #[test]
+    fn block_bytes_at_height_agrees_with_slicing_the_whole_block() -> TestResult {
+        let genesis = genesis_block(Network::Regtest);
+        let bytes = serialize(&genesis);
+        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let body_source = Arc::new(RangedBody {
+            height: record.height,
+            hash: record.hash,
+            bytes: bytes.clone(),
+        });
+        let blocks = Arc::new(RwLock::new(vec![record]));
+        let source = NodeBlockSource::new(blocks).with_block_body_source(body_source);
+
+        for offset in 0..u32::try_from(bytes.len())? {
+            for len in [0_u32, 1, 7] {
+                let end = offset.saturating_add(len);
+                let ranged = source.block_bytes_at_height(0, offset, len);
+                if usize::try_from(end)? > bytes.len() {
+                    assert_eq!(
+                        ranged, None,
+                        "a range past the end must not be served short"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    ranged.as_deref(),
+                    Some(&bytes[usize::try_from(offset)?..usize::try_from(end)?]),
+                    "range ({offset}, {len}) diverged from the serialized block"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn block_bytes_at_height_declines_without_a_durable_body_source() {
+        // A session record holds its body as hex, so slicing it would mean
+        // decoding the whole thing first. `None` sends the caller to
+        // `block_at_height`, which is what it would have done anyway.
+        let genesis = genesis_block(Network::Regtest);
+        let record = BlockRecord::from_block(0, &genesis);
+        let blocks = Arc::new(RwLock::new(vec![record]));
+        let source = NodeBlockSource::new(blocks);
+
+        assert!(source.block_bytes_at_height(0, 0, 4).is_none());
+        assert!(
+            source.block_at_height(0).is_some(),
+            "declining a range must not mean the block is unavailable"
+        );
     }
 
     #[test]

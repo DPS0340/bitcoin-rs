@@ -10,7 +10,10 @@ pub mod status;
 /// Stable electrs-shaped row types.
 pub mod types;
 
-pub use index::{BlockSource, IndexError, IndexRowCounts, Indexer, IndexerLike};
+pub use index::{
+    BlockSource, INDEX_FORMAT_VERSION, IndexError, IndexFormat, IndexRowCounts, Indexer,
+    IndexerLike,
+};
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use status::{HistoryEntry, HistoryHeight, StatusHash, compute_status_hash};
 pub use types::{

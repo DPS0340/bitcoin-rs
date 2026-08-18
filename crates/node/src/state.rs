@@ -483,6 +483,34 @@ impl BlockBodySource for StoredBlockBodySource {
         self.store.load_block_body(height, hash).ok().flatten()
     }
 
+    fn block_body_range(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        offset: u32,
+        len: u32,
+    ) -> Option<Vec<u8>> {
+        // `None` is overloaded here: it means both "this store cannot slice"
+        // and "the read failed". Callers must treat either as a reason to fall
+        // back to the whole body, so the return type stays — but this is the
+        // hot path for every Electrum history call now, and an I/O error that
+        // silently degrades into a full block scan is exactly the failure that
+        // would otherwise show up only as unexplained latency.
+        match self.store.load_block_body_range(height, hash, offset, len) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    height,
+                    offset,
+                    len,
+                    "ranged block body read failed; falling back to the whole body"
+                );
+                None
+            }
+        }
+    }
+
     fn block_body_metadata(
         &self,
         height: u32,
@@ -826,6 +854,59 @@ fn open_tx_index(config: &Config) -> Result<Option<(TxIndexHandle, TxIndexStorag
     }
 }
 
+/// Logs which row-value format the transaction index carries.
+///
+/// Reading is correct on either format — a row written without transaction
+/// positions takes the whole-block scan fallback — so this never refuses a
+/// start. It exists because the difference is three orders of magnitude on
+/// Electrum history resolution, and an operator running the slow path should be
+/// told rather than left to measure it.
+///
+/// Names the directory to delete, matching the disconnect-marker refusal above:
+/// this node has no `-reindex`, and an instruction the operator cannot follow is
+/// worse than none.
+fn report_index_format(config: &Config, indexer: &dyn bitcoin_rs_index::IndexerLike) {
+    match indexer.ensure_format_version() {
+        Ok(bitcoin_rs_index::IndexFormat::Current) => {
+            tracing::debug!(
+                version = bitcoin_rs_index::INDEX_FORMAT_VERSION,
+                "txindex row format is current"
+            );
+        }
+        Ok(bitcoin_rs_index::IndexFormat::Legacy { found }) => {
+            tracing::warn!(
+                found = ?found,
+                expected = bitcoin_rs_index::INDEX_FORMAT_VERSION,
+                txindex_dir = %config.data_dir.join("txindex").display(),
+                "txindex predates transaction-position row values; history and \
+                 transaction lookups will scan whole blocks. Results stay correct. \
+                 To rebuild in the current format, stop the node, delete the \
+                 named directory, and restart to re-sync the index."
+            );
+        }
+        Ok(bitcoin_rs_index::IndexFormat::UnreadableMarker { len }) => {
+            // Deliberately does not tell the operator to delete anything. The
+            // rows themselves may be fine; what is damaged is the marker, and a
+            // re-sync would erase the only evidence of how that happened.
+            tracing::warn!(
+                marker_len = len,
+                expected_len = core::mem::size_of::<u32>(),
+                txindex_dir = %config.data_dir.join("txindex").display(),
+                "txindex format marker is not a readable version; treating the \
+                 index as legacy, so history and transaction lookups will scan \
+                 whole blocks. Results stay correct. Report this rather than \
+                 deleting the directory: the marker is damaged metadata, not an \
+                 old index."
+            );
+        }
+        Err(error) => {
+            // A metadata read failure says nothing about row correctness, so it
+            // must not stop a start that would otherwise succeed.
+            tracing::warn!(%error, "could not determine txindex row format");
+        }
+    }
+}
+
 fn open_filter_index(config: &Config) -> Result<FilterIndexHandle> {
     if !config.blockfilterindex {
         let filter_index: Box<dyn bitcoin_rs_filters::FilterIndexLike> =
@@ -994,6 +1075,9 @@ impl NodeState {
         let block_body_store =
             storage.block_body_store(Arc::clone(&block_files), &config.data_dir)?;
         let tx_index_pair = open_tx_index(&config)?;
+        if let Some((tx_index, _)) = tx_index_pair.as_ref() {
+            report_index_format(&config, &**tx_index.lock());
+        }
         let (tx_index, tx_index_storage) = tx_index_pair
             .map_or((None, None), |(tx_index, tx_index_storage)| {
                 (Some(tx_index), Some(Arc::new(tx_index_storage)))

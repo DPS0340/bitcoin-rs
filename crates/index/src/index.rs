@@ -28,6 +28,17 @@ pub enum IndexError {
         /// Actual header length observed by the visitor.
         len: usize,
     },
+    /// A transaction's byte range in the block does not fit the `u32` that
+    /// [`crate::types::TxPosition`] stores.
+    ///
+    /// Unreachable for any consensus-valid block — a block is capped far below
+    /// 4 GiB — but the arithmetic is checked rather than wrapped, and the
+    /// failure is an addressing limit, not a malformed header.
+    #[error("transaction byte range does not fit u32 at block offset {offset}")]
+    UnaddressablePosition {
+        /// Block byte offset reached when the range stopped fitting.
+        offset: u64,
+    },
 }
 
 /// Counts of rows written by a confirmed block ingest.
@@ -170,6 +181,30 @@ impl<S: KvStore> Indexer<S> {
         scripthash: crate::ScriptHash,
         source: &B,
     ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
+        let rows = self.iter_funding_rows_with_values(scripthash)?;
+        let mut entries = Vec::new();
+        for (row, value) in &rows {
+            let height = row.height();
+            match positioned_history(scripthash, height, value, source) {
+                Some(found) => entries.extend(found),
+                None => scan_height_history(scripthash, height, source, &mut entries),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_script_history`].
+    ///
+    /// Loads and fully decodes the block once per funding row, then hashes every
+    /// output script in it. Retained as the correctness oracle for the resolver
+    /// equivalence tests, as the `before` arm of the `resolve_script_history`
+    /// benchmark group, and as the live fallback for rows written before row
+    /// values carried transaction positions.
+    pub fn resolve_script_history_scan<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
         let rows = self.iter_funding_rows(scripthash)?;
         let mut entries = Vec::new();
         let mut last_height: Option<u32> = None;
@@ -200,6 +235,29 @@ impl<S: KvStore> Indexer<S> {
         }
         Ok(entries)
     }
+
+    /// Iterates confirmed funding rows for `scripthash` with their row values.
+    ///
+    /// The value carries the transaction byte positions that let a resolver read
+    /// only the matching transactions; see [`crate::types::TxPositionValue`].
+    fn iter_funding_rows_with_values(
+        &self,
+        scripthash: crate::ScriptHash,
+    ) -> Result<Vec<(crate::HashPrefixRow, Vec<u8>)>, IndexError> {
+        let prefix = ScriptHashRow::scan_prefix(scripthash);
+        let iter = self.store.iter_prefix(ColumnFamily::Funding, &prefix)?;
+        collect_prefix_rows_with_values(iter)
+    }
+
+    /// Iterates confirmed transaction-id rows for `txid` with their row values.
+    fn iter_txid_rows_with_values(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Vec<(crate::HashPrefixRow, Vec<u8>)>, IndexError> {
+        let prefix = TxidRow::scan_prefix(txid);
+        let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
+        collect_prefix_rows_with_values(iter)
+    }
     /// Resolves confirmed unspent-output candidates for `scripthash` via `source`.
     ///
     /// For every funding-row (prefix, height), fetches the block and emits a
@@ -214,35 +272,32 @@ impl<S: KvStore> Indexer<S> {
         scripthash: crate::ScriptHash,
         source: &B,
     ) -> Result<Vec<(bitcoin::Txid, u32, u64)>, IndexError> {
-        let rows = self.iter_funding_rows(scripthash)?;
-        let mut outputs = Vec::new();
-        let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
-        for row in &rows {
-            let height = row.height();
-            if last_height != Some(height) {
-                cached_block = source.block_at_height(height);
-                last_height = Some(height);
-            }
-            let Some(block) = cached_block.as_ref() else {
-                continue;
-            };
-            for tx in &block.txdata {
-                let txid = tx.compute_txid();
-                for (vout_idx, output) in tx.output.iter().enumerate() {
-                    if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes())
-                        != scripthash
-                    {
-                        continue;
-                    }
-                    let Ok(vout) = u32::try_from(vout_idx) else {
-                        continue;
-                    };
-                    outputs.push((txid, vout, output.value.to_sat()));
-                }
-            }
-        }
-        Ok(outputs)
+        Ok(self
+            .resolve_unspent_outputs_with_height(scripthash, source)?
+            .into_iter()
+            .map(|(txid, vout, value, _height)| (txid, vout, value))
+            .collect())
+    }
+
+    /// Naive reference implementation of [`Self::resolve_unspent_outputs`].
+    ///
+    /// Retained as the correctness oracle for the resolver equivalence tests and
+    /// as the `before` arm of the `resolve_unspent` benchmark group. Deliberately
+    /// carries no optimization: an oracle that shares an optimization with the
+    /// implementation it checks cannot catch a fault in that optimization.
+    ///
+    /// Not a fallback path — [`Self::resolve_unspent_outputs`] is always correct
+    /// and always faster. Call that one.
+    pub fn resolve_unspent_outputs_scan<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<(bitcoin::Txid, u32, u64)>, IndexError> {
+        Ok(self
+            .resolve_unspent_outputs_with_height_scan(scripthash, source)?
+            .into_iter()
+            .map(|(txid, vout, value, _height)| (txid, vout, value))
+            .collect())
     }
 
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
@@ -251,6 +306,32 @@ impl<S: KvStore> Indexer<S> {
     /// when callers need the confirmation height (e.g. Electrum `listunspent`
     /// emits the height for each unspent output).
     pub fn resolve_unspent_outputs_with_height<B: BlockSource>(
+        &self,
+        scripthash: crate::ScriptHash,
+        source: &B,
+    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+        let rows = self.iter_funding_rows_with_values(scripthash)?;
+        let mut outputs = Vec::new();
+        for (row, value) in &rows {
+            let height = row.height();
+            match positioned_unspent_outputs(scripthash, height, value, source) {
+                Some(found) => outputs.extend(found),
+                None => scan_height_unspent_outputs(scripthash, height, source, &mut outputs),
+            }
+        }
+        Ok(outputs)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_unspent_outputs_with_height`].
+    ///
+    /// Computes every transaction's txid before testing any output script, which
+    /// is the shape this resolver had before the lazy-txid change. Retained as
+    /// the correctness oracle for the resolver equivalence tests and as the
+    /// `before` arm of the `resolve_unspent` benchmark group.
+    ///
+    /// Not a fallback path — [`Self::resolve_unspent_outputs_with_height`] is
+    /// always correct and always faster. Call that one.
+    pub fn resolve_unspent_outputs_with_height_scan<B: BlockSource>(
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
@@ -324,6 +405,43 @@ impl<S: KvStore> Indexer<S> {
     /// The 8-byte prefix is lossy; this method exact-resolves it by comparing
     /// the full 32-byte txid before returning.
     pub fn resolve_transaction<B: BlockSource + ?Sized>(
+        &self,
+        txid: bitcoin::Txid,
+        source: &B,
+    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+        let rows = self.iter_txid_rows_with_values(&txid)?;
+        for (row, value) in &rows {
+            let height = row.height();
+            if let Some(positions) = crate::types::TxPositionValue::decode(value) {
+                let found = positions
+                    .iter()
+                    .filter_map(|position| transaction_at(height, *position, source))
+                    .find(|tx| tx.compute_txid() == txid);
+                if let Some(tx) = found {
+                    return Ok(Some(tx));
+                }
+            }
+            // The positions did not produce the transaction, which is either an
+            // 8-byte txid-prefix collision or a stale row. Both are rare, and
+            // both are answered correctly by scanning; "not found" is never
+            // reported on the strength of positions alone.
+            if let Some(block) = source.block_at_height(height) {
+                for tx in &block.txdata {
+                    if tx.compute_txid() == txid {
+                        return Ok(Some(tx.clone()));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Naive reference implementation of [`Self::resolve_transaction`].
+    ///
+    /// Loads and fully decodes the block for each candidate row, then computes
+    /// every transaction's txid until one matches. Retained as the correctness
+    /// oracle and the `before` arm of the `resolve_transaction` benchmark group.
+    pub fn resolve_transaction_scan<B: BlockSource + ?Sized>(
         &self,
         txid: bitcoin::Txid,
         source: &B,
@@ -404,6 +522,74 @@ impl<S: KvStore> Indexer<S> {
             }
         }
         Ok(None)
+    }
+
+    /// Reports whether this index's rows carry transaction positions, adopting
+    /// the current format when the index is empty.
+    ///
+    /// Reading is always correct either way — a row without positions takes the
+    /// scan fallback — so this exists to tell an operator which path their node
+    /// is on, not to gate correctness. The difference is three orders of
+    /// magnitude on history resolution, which is worth a startup line.
+    ///
+    /// An index with rows but no version marker predates the format and is
+    /// reported as [`IndexFormat::Legacy`]. The marker is written only for an
+    /// empty index, because that is the only case where every row that will ever
+    /// exist is going to be written with positions. Writing it for a populated
+    /// legacy index would claim positions that are not there.
+    pub fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        match self.read_format_version()? {
+            Some(FormatMarker::Version(found)) => {
+                return Ok(if found == INDEX_FORMAT_VERSION {
+                    IndexFormat::Current
+                } else {
+                    IndexFormat::Legacy { found: Some(found) }
+                });
+            }
+            Some(FormatMarker::Unreadable { len }) => {
+                return Ok(IndexFormat::UnreadableMarker { len });
+            }
+            None => {}
+        }
+        if self.has_any_header()? {
+            return Ok(IndexFormat::Legacy { found: None });
+        }
+        let mut batch = self.store.new_batch();
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            INDEX_FORMAT_VERSION_KEY,
+            &INDEX_FORMAT_VERSION.to_le_bytes(),
+        );
+        self.store.write(batch)?;
+        Ok(IndexFormat::Current)
+    }
+
+    fn read_format_version(&self) -> Result<Option<FormatMarker>, IndexError> {
+        let Some(bytes) = self
+            .store
+            .get(ColumnFamily::UtxoMeta, INDEX_FORMAT_VERSION_KEY)?
+        else {
+            return Ok(None);
+        };
+        let Ok(encoded) = <[u8; 4]>::try_from(bytes.as_slice()) else {
+            // Reported as its own outcome rather than folded into version 0: an
+            // operator told "your index is at version 0" deletes and re-syncs,
+            // which is the wrong response to bytes that should be a `u32` and
+            // are not.
+            return Ok(Some(FormatMarker::Unreadable { len: bytes.len() }));
+        };
+        Ok(Some(FormatMarker::Version(u32::from_le_bytes(encoded))))
+    }
+
+    /// True when the header column family holds at least one row.
+    ///
+    /// Deliberately not `header_count`: a legacy index takes this branch on
+    /// every single start, and counting reads every row in the column family
+    /// and allocates an 80-byte array per row — roughly a million of each at
+    /// mainnet height — to answer a question that is only ever yes or no.
+    fn has_any_header(&self) -> Result<bool, IndexError> {
+        let mut rows = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
+        Ok(rows.next().transpose()?.is_some())
     }
 
     const FLUSH_THRESHOLD_ROWS: usize = 500_000;
@@ -574,12 +760,14 @@ impl<S: KvStore> Indexer<S> {
         }
 
         let mut batch = self.store.new_batch();
-        for row in &rows.txid_rows {
+        // Rollback deletes by key only. Positions live in the value, so they
+        // disappear with the row and need no separate handling.
+        for_each_row_group(&rows.txid_rows, |row, _positions| {
             batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
-        }
-        for row in &rows.funding_rows {
+        });
+        for_each_row_group(&rows.funding_rows, |row, _positions| {
             batch.delete(ColumnFamily::Funding, row.as_bytes());
-        }
+        });
         for row in &rows.spending_rows {
             batch.delete(ColumnFamily::Spending, row.as_bytes());
         }
@@ -617,12 +805,20 @@ impl<S: KvStore> Indexer<S> {
             return Ok(counts);
         }
         let mut batch = self.store.new_batch();
-        for row in &self.pending_rows.txid_rows {
-            batch.put(ColumnFamily::TxConfirmed, row.as_bytes(), &[]);
-        }
-        for row in &self.pending_rows.funding_rows {
-            batch.put(ColumnFamily::Funding, row.as_bytes(), &[]);
-        }
+        for_each_row_group(&self.pending_rows.txid_rows, |row, positions| {
+            batch.put(
+                ColumnFamily::TxConfirmed,
+                row.as_bytes(),
+                &crate::types::TxPositionValue::encode(positions),
+            );
+        });
+        for_each_row_group(&self.pending_rows.funding_rows, |row, positions| {
+            batch.put(
+                ColumnFamily::Funding,
+                row.as_bytes(),
+                &crate::types::TxPositionValue::encode(positions),
+            );
+        });
         for row in &self.pending_rows.spending_rows {
             batch.put(ColumnFamily::Spending, row.as_bytes(), &[]);
         }
@@ -670,6 +866,8 @@ fn pending_rows_for_block(
             txids,
             txid_count: 0,
             invalid_header_len: None,
+            block,
+            pending_funding: Vec::new(),
         };
         match bsl::Block::visit(block, &mut visitor) {
             Ok(_) => visitor.txid_count,
@@ -698,8 +896,33 @@ fn pending_rows_for_decoded_block(
         });
     };
     rows.header_rows.push(header.to_db_row());
+
+    // Byte offsets are derived arithmetically rather than by re-serializing: a
+    // serialized block is `header || varint(tx_count) || tx...`, so the first
+    // transaction starts after the header and the count, and each subsequent one
+    // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
+    // pins this against the byte offsets the zero-copy path measures directly.
+    let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
+    let mut offset = u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
+        offset: u64::try_from(prologue).unwrap_or(u64::MAX),
+    })?;
+
     for (tx, txid) in block.txdata.iter().zip(txids) {
-        rows.txid_rows.push(TxidRow::row(txid, height));
+        let byte_len =
+            u32::try_from(tx.total_size()).map_err(|_| IndexError::UnaddressablePosition {
+                offset: u64::from(offset),
+            })?;
+        let position = crate::types::TxPosition::new(offset, byte_len);
+        offset = offset
+            .checked_add(byte_len)
+            .ok_or_else(|| IndexError::UnaddressablePosition {
+                offset: u64::from(offset),
+            })?;
+
+        rows.txid_rows.push(PositionedRow {
+            row: TxidRow::row(txid, height),
+            position,
+        });
         for tx_in in &tx.input {
             if !tx_in.previous_output.is_null() {
                 rows.spending_rows
@@ -709,20 +932,71 @@ fn pending_rows_for_decoded_block(
         for tx_out in &tx.output {
             if !is_op_return_script(tx_out.script_pubkey.as_bytes()) {
                 let scripthash = ScriptHash::new(&tx_out.script_pubkey);
-                rows.funding_rows
-                    .push(ScriptHashRow::row(scripthash, height));
+                rows.funding_rows.push(PositionedRow {
+                    row: ScriptHashRow::row(scripthash, height),
+                    position,
+                });
             }
         }
     }
     Ok(rows)
 }
 
+/// One index row together with the transaction byte range that produced it.
+///
+/// Ordered by key first so a sorted slice groups by row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PositionedRow {
+    row: HashPrefixRow,
+    position: crate::types::TxPosition,
+}
+
 #[derive(Default)]
 struct PendingRows {
-    txid_rows: Vec<HashPrefixRow>,
-    funding_rows: Vec<HashPrefixRow>,
+    txid_rows: Vec<PositionedRow>,
+    funding_rows: Vec<PositionedRow>,
     spending_rows: Vec<HashPrefixRow>,
     header_rows: Vec<[u8; crate::types::HEADER_ROW_SIZE]>,
+}
+
+/// Counts distinct row keys in a sorted `PositionedRow` slice.
+///
+/// The reported count must stay "rows the store receives", not "positions
+/// collected": one key can carry several positions when a block funds the same
+/// script from more than one transaction, and those collapse into one row.
+fn distinct_row_count(rows: &[PositionedRow]) -> usize {
+    let mut count = 0;
+    let mut last: Option<HashPrefixRow> = None;
+    for entry in rows {
+        if last != Some(entry.row) {
+            count += 1;
+            last = Some(entry.row);
+        }
+    }
+    count
+}
+
+/// Calls `emit` once per row key in a sorted slice, with that key's positions.
+///
+/// Two blocks at one height that share a key merge their positions into one
+/// value. That is safe because the reader validates every position and falls
+/// back to a full scan on the first one that does not resolve, so a merged value
+/// costs at most a scan — see [`crate::types::TxPositionValue`].
+fn for_each_row_group<F>(rows: &[PositionedRow], mut emit: F)
+where
+    F: FnMut(HashPrefixRow, &[crate::types::TxPosition]),
+{
+    let mut positions = Vec::new();
+    let mut index = 0;
+    while index < rows.len() {
+        let key = rows[index].row;
+        positions.clear();
+        while index < rows.len() && rows[index].row == key {
+            positions.push(rows[index].position);
+            index += 1;
+        }
+        emit(key, &positions);
+    }
 }
 
 impl PendingRows {
@@ -737,10 +1011,10 @@ impl PendingRows {
         self.header_rows.dedup();
     }
 
-    const fn counts(&self) -> IndexRowCounts {
+    fn counts(&self) -> IndexRowCounts {
         IndexRowCounts {
-            txids: self.txid_rows.len(),
-            funding: self.funding_rows.len(),
+            txids: distinct_row_count(&self.txid_rows),
+            funding: distinct_row_count(&self.funding_rows),
             spending: self.spending_rows.len(),
             headers: self.header_rows.len(),
         }
@@ -766,6 +1040,41 @@ struct IndexBlockVisitor<'a> {
     txids: TxidSource<'a>,
     txid_count: usize,
     invalid_header_len: Option<usize>,
+    /// The serialized block being visited, used as the base for byte offsets.
+    block: &'a [u8],
+    /// Funding prefixes seen for the transaction currently being parsed.
+    ///
+    /// `visit_tx_out` fires while the transaction is still being parsed, so its
+    /// byte range is not known yet — `visit_transaction` runs at the end and is
+    /// the first point where the position exists. Outputs are therefore buffered
+    /// here and drained once, in emission order.
+    pending_funding: Vec<crate::types::HashPrefix>,
+}
+
+impl IndexBlockVisitor<'_> {
+    /// Byte range of `tx` within the block being visited.
+    ///
+    /// The slice `bitcoin_slices` hands back borrows from `self.block`, so the
+    /// difference of their addresses is that transaction's offset. Computed from
+    /// addresses only — nothing is dereferenced.
+    fn push_txid_row(&mut self, txid_bytes: &[u8], position: crate::types::TxPosition) {
+        self.rows.txid_rows.push(PositionedRow {
+            row: TxidRow::row_bytes(txid_bytes, self.height_bytes),
+            position,
+        });
+    }
+
+    fn position_of(&self, tx: &bsl::Transaction<'_>) -> Option<crate::types::TxPosition> {
+        let bytes: &[u8] = tx.as_ref();
+        let offset = bytes
+            .as_ptr()
+            .addr()
+            .checked_sub(self.block.as_ptr().addr())?;
+        Some(crate::types::TxPosition::new(
+            u32::try_from(offset).ok()?,
+            u32::try_from(bytes.len()).ok()?,
+        ))
+    }
 }
 
 impl Visitor for IndexBlockVisitor<'_> {
@@ -779,43 +1088,47 @@ impl Visitor for IndexBlockVisitor<'_> {
     }
 
     fn visit_transaction(&mut self, tx: &bsl::Transaction<'_>) -> ControlFlow<()> {
+        let Some(position) = self.position_of(tx) else {
+            // A transaction that does not lie inside the block slice, or whose
+            // offset does not fit `u32`, cannot be addressed by a position.
+            // Refuse the block rather than write a row that points nowhere.
+            return ControlFlow::Break(());
+        };
+        for prefix in self.pending_funding.drain(..) {
+            self.rows.funding_rows.push(PositionedRow {
+                row: HashPrefixRow {
+                    prefix,
+                    height: self.height_bytes,
+                },
+                position,
+            });
+        }
         match self.txids {
             TxidSource::Compute => {
                 let txid = tx.txid_sha2();
-                self.rows
-                    .txid_rows
-                    .push(TxidRow::row_bytes(txid.as_slice(), self.height_bytes));
+                self.push_txid_row(txid.as_slice(), position);
             }
             TxidSource::Validate(txids) => {
                 if let Some(txid) = txids.get(self.txid_count) {
                     let computed = tx.txid_sha2();
                     let txid_bytes: &[u8] = txid.as_ref();
                     if txid_bytes == computed.as_slice() {
-                        self.rows
-                            .txid_rows
-                            .push(TxidRow::row_bytes(txid_bytes, self.height_bytes));
+                        self.push_txid_row(txid_bytes, position);
                     } else {
-                        self.rows
-                            .txid_rows
-                            .push(TxidRow::row_bytes(computed.as_slice(), self.height_bytes));
+                        self.push_txid_row(computed.as_slice(), position);
                     }
                 } else {
                     let txid = tx.txid_sha2();
-                    self.rows
-                        .txid_rows
-                        .push(TxidRow::row_bytes(txid.as_slice(), self.height_bytes));
+                    self.push_txid_row(txid.as_slice(), position);
                 }
             }
             TxidSource::Trusted(txids) => {
                 if let Some(txid) = txids.get(self.txid_count) {
-                    self.rows
-                        .txid_rows
-                        .push(TxidRow::row_bytes(txid.as_ref(), self.height_bytes));
+                    let txid_bytes: &[u8] = txid.as_ref();
+                    self.push_txid_row(txid_bytes, position);
                 } else {
                     let txid = tx.txid_sha2();
-                    self.rows
-                        .txid_rows
-                        .push(TxidRow::row_bytes(txid.as_slice(), self.height_bytes));
+                    self.push_txid_row(txid.as_slice(), position);
                 }
             }
         }
@@ -838,10 +1151,8 @@ impl Visitor for IndexBlockVisitor<'_> {
     fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut<'_>) -> ControlFlow<()> {
         let script = tx_out.script_pubkey();
         if !is_op_return_script(script) {
-            self.rows.funding_rows.push(HashPrefixRow {
-                prefix: ScriptHash::from_script_bytes(script).prefix(),
-                height: self.height_bytes,
-            });
+            self.pending_funding
+                .push(ScriptHash::from_script_bytes(script).prefix());
         }
         ControlFlow::Continue(())
     }
@@ -861,6 +1172,143 @@ enum TxidSource<'a> {
     Compute,
     Validate(&'a [bitcoin::Txid]),
     Trusted(&'a [bitcoin::Txid]),
+}
+
+/// Reads and decodes the single transaction a position names.
+///
+/// Returns `None` when the source cannot serve the range, when the range is out
+/// of bounds, or when the bytes are not exactly one transaction. `deserialize`
+/// rejects trailing bytes, so a range covering more than one transaction fails
+/// here rather than silently decoding the first.
+fn transaction_at<B: BlockSource + ?Sized>(
+    height: u32,
+    position: crate::types::TxPosition,
+    source: &B,
+) -> Option<bitcoin::Transaction> {
+    let bytes = source.block_bytes_at_height(height, position.offset(), position.byte_len())?;
+    bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(&bytes).ok()
+}
+
+/// Resolves one funding row's history entries from its positions.
+///
+/// Returns `None` — meaning "scan this height instead" — if **any** position
+/// fails to resolve to a transaction funding `scripthash`. Skipping a failed
+/// position and keeping the rest is what would turn a partial result into a
+/// silently complete-looking one; see [`crate::types::TxPositionValue`].
+fn positioned_history<B: BlockSource + ?Sized>(
+    scripthash: crate::ScriptHash,
+    height: u32,
+    value: &[u8],
+    source: &B,
+) -> Option<Vec<crate::HistoryEntry>> {
+    let positions = crate::types::TxPositionValue::decode(value)?;
+    let mut entries = Vec::with_capacity(positions.len());
+    for position in positions {
+        let tx = transaction_at(height, *position, source)?;
+        if !funds_scripthash(&tx, scripthash) {
+            return None;
+        }
+        entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
+    }
+    Some(entries)
+}
+
+/// Appends the history entries a full scan of `height` produces.
+fn scan_height_history<B: BlockSource + ?Sized>(
+    scripthash: crate::ScriptHash,
+    height: u32,
+    source: &B,
+    entries: &mut Vec<crate::HistoryEntry>,
+) {
+    let Some(block) = source.block_at_height(height) else {
+        return;
+    };
+    for tx in &block.txdata {
+        if funds_scripthash(tx, scripthash) {
+            entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
+        }
+    }
+}
+
+/// Resolves one funding row's unspent-output candidates from its positions.
+///
+/// Same all-or-scan rule as [`positioned_history`].
+fn positioned_unspent_outputs<B: BlockSource + ?Sized>(
+    scripthash: crate::ScriptHash,
+    height: u32,
+    value: &[u8],
+    source: &B,
+) -> Option<Vec<(bitcoin::Txid, u32, u64, u32)>> {
+    let positions = crate::types::TxPositionValue::decode(value)?;
+    let mut outputs = Vec::new();
+    for position in positions {
+        let tx = transaction_at(height, *position, source)?;
+        let before = outputs.len();
+        append_matching_outputs(&tx, scripthash, height, &mut outputs);
+        if outputs.len() == before {
+            return None;
+        }
+    }
+    Some(outputs)
+}
+
+/// Appends the unspent-output candidates a full scan of `height` produces.
+fn scan_height_unspent_outputs<B: BlockSource + ?Sized>(
+    scripthash: crate::ScriptHash,
+    height: u32,
+    source: &B,
+    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+) {
+    let Some(block) = source.block_at_height(height) else {
+        return;
+    };
+    for tx in &block.txdata {
+        append_matching_outputs(tx, scripthash, height, outputs);
+    }
+}
+
+/// Appends `(txid, vout, value, height)` for every output of `tx` matching
+/// `scripthash`, computing the txid only once a match is found.
+fn append_matching_outputs(
+    tx: &bitcoin::Transaction,
+    scripthash: crate::ScriptHash,
+    height: u32,
+    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+) {
+    let mut computed_txid: Option<bitcoin::Txid> = None;
+    for (vout_idx, output) in tx.output.iter().enumerate() {
+        if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) != scripthash {
+            continue;
+        }
+        let Ok(vout) = u32::try_from(vout_idx) else {
+            continue;
+        };
+        let txid = *computed_txid.get_or_insert_with(|| tx.compute_txid());
+        outputs.push((txid, vout, output.value.to_sat(), height));
+    }
+}
+
+fn funds_scripthash(tx: &bitcoin::Transaction, scripthash: crate::ScriptHash) -> bool {
+    tx.output.iter().any(|output| {
+        crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) == scripthash
+    })
+}
+
+fn collect_prefix_rows_with_values(
+    iter: bitcoin_rs_storage::KvIter<'_>,
+) -> Result<Vec<(crate::HashPrefixRow, Vec<u8>)>, IndexError> {
+    let mut rows = Vec::new();
+    for entry in iter {
+        let (key, value) = entry?;
+        if key.len() == crate::HASH_PREFIX_ROW_SIZE {
+            rows.push((
+                zerocopy::FromBytes::read_from_bytes(&key[..])
+                    .map_err(|_| IndexError::InvalidHeaderLength { len: key.len() })?,
+                value,
+            ));
+        }
+    }
+    Ok(rows)
 }
 
 fn collect_prefix_rows(
@@ -886,6 +1334,15 @@ fn collect_prefix_rows(
 pub trait IndexerLike: Send + Sync {
     /// Walks `block` once and writes index rows. See `Indexer::ingest_block`.
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError>;
+
+    /// Reports the row-value format. See [`Indexer::ensure_format_version`].
+    ///
+    /// Defaults to [`IndexFormat::Current`] for the in-memory and stub indexers
+    /// used in tests, which have no persisted rows and therefore no legacy ones.
+    /// A store-backed implementation must override this.
+    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        Ok(IndexFormat::Current)
+    }
 
     /// Walks `block` once and writes index rows, reusing precomputed transaction IDs when supported.
     ///
@@ -999,6 +1456,48 @@ pub trait IndexerLike: Send + Sync {
     ) -> Result<Option<u64>, IndexError>;
 }
 
+/// Metadata key marking which row-value format an index was written with.
+const INDEX_FORMAT_VERSION_KEY: &[u8] = b"index:format_version";
+
+/// Current row-value format. Version 1 added transaction byte positions to
+/// funding and txid row values; version 0 (unmarked) has empty values.
+pub const INDEX_FORMAT_VERSION: u32 = 1;
+
+/// Which row-value format an opened index carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexFormat {
+    /// Rows carry transaction positions; resolvers take the fast path.
+    Current,
+    /// Rows predate transaction positions; resolvers scan whole blocks.
+    ///
+    /// Correct but far slower. Clearing the index directory and re-syncing
+    /// rebuilds it in the current format.
+    Legacy {
+        /// The version marker found, or `None` when the index carries none.
+        found: Option<u32>,
+    },
+    /// A version marker exists but is not the 4 little-endian bytes of a `u32`.
+    ///
+    /// Resolvers scan, exactly as for [`Self::Legacy`], but the operator
+    /// response differs: this is damaged metadata, not an old index, and
+    /// deleting the directory would discard the evidence of whatever wrote it.
+    UnreadableMarker {
+        /// Byte length of the marker value that failed to decode.
+        len: usize,
+    },
+}
+
+/// What the format-version marker key holds, when it is present at all.
+enum FormatMarker {
+    /// Four little-endian bytes that decoded to this version.
+    Version(u32),
+    /// Present, but not a 4-byte little-endian `u32`.
+    Unreadable {
+        /// Byte length of the value found.
+        len: usize,
+    },
+}
+
 /// Provides block lookups for resolving lossy index prefixes to full identities.
 ///
 /// The index column families store 8-byte prefixes of txids/scripthashes/outpoints.
@@ -1009,11 +1508,29 @@ pub trait IndexerLike: Send + Sync {
 pub trait BlockSource {
     /// Returns the Bitcoin block at `height` on the active chain, if known.
     fn block_at_height(&self, height: u32) -> Option<bitcoin::Block>;
+
+    /// Returns `len` serialized bytes starting `offset` bytes into the active
+    /// block at `height`, without materializing or decoding the whole body.
+    ///
+    /// This is what lets a resolver read only the transactions a row's
+    /// [`crate::types::TxPosition`]s name instead of scanning the block.
+    ///
+    /// Defaults to `None`, meaning "this source cannot slice". A caller must
+    /// then fall back to `block_at_height` — `None` never means the bytes are
+    /// absent, and an out-of-range request yields `None` rather than a short
+    /// read.
+    fn block_bytes_at_height(&self, _height: u32, _offset: u32, _len: u32) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
     fn ingest_block(&mut self, block: &[u8], height: u32) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_block(self, block, height)
+    }
+
+    fn ensure_format_version(&self) -> Result<IndexFormat, IndexError> {
+        Self::ensure_format_version(self)
     }
 
     fn ingest_block_with_txids(
