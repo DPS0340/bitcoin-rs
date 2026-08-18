@@ -117,7 +117,6 @@ MULTISIG_ELIGIBLE_CONTEXTS: frozenset[SpendContext] = frozenset((
     SpendContext.NATIVE_WITNESS_V0,
     SpendContext.P2SH_WRAPPED_WITNESS_V0,
 ))
-
 HEADER_STRUCT = struct.Struct("<8sQ")
 RECORD_STRUCT = struct.Struct("<32sIIBBBBBBBB32s72s65s7s")
 JOURNAL_STRUCT = struct.Struct("<32sIIIIIB3s")
@@ -316,19 +315,19 @@ class Record:
     """Parsed 224-byte record."""
 
     __slots__ = (
-        "spend_txid",
-        "input_index",
-        "op_seq",
-        "op_kind",
-        "sig_version",
-        "outcome",
         "der_len",
-        "pubkey_len",
-        "sighash_type",
-        "reject_reason",
-        "sighash",
         "der_sig",
+        "input_index",
+        "op_kind",
+        "op_seq",
+        "outcome",
         "pubkey",
+        "pubkey_len",
+        "reject_reason",
+        "sig_version",
+        "sighash",
+        "sighash_type",
+        "spend_txid",
     )
 
     def __init__(self, raw: bytes) -> None:
@@ -461,12 +460,12 @@ class JournalEntry:
     """Parsed 56-byte journal entry."""
 
     __slots__ = (
-        "spend_txid",
-        "input_index",
-        "checksig_ops",
         "checkmultisig_ops",
+        "checksig_ops",
         "ecdsa_verify_calls",
         "ecdsa_verify_ok",
+        "input_index",
+        "spend_txid",
         "verdict",
     )
 
@@ -2699,7 +2698,6 @@ def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
     )
     return 0
 
-
 # ── Binary parsing ──────────────────────────────────────────────────────────
 
 
@@ -3155,8 +3153,7 @@ def check_census_capture_agreement(
                 )
                 if field_name == "ecdsa_verify_calls" and bv > 0:
                     ratio = cv / bv
-                    if ratio > max_ratio:
-                        max_ratio = ratio
+                    max_ratio = max(max_ratio, ratio)
 
     width_multiplier: int | None = None
     if max_ratio > 2.5 and max_ratio < 3.5:
@@ -3376,7 +3373,7 @@ def extract_spike_width1(spike: dict[str, object]) -> float:
             )
         return _require_positive_finite_float(
             spike["us_per_input"], "spike JSON: top-level us_per_input"
-            )
+        )
     raise AnalyzerError("spike JSON: no us_per_input found")
 
 
@@ -5221,7 +5218,6 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
     return 1
 
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze.py",
@@ -5401,7 +5397,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="original blockfilterindex setting",
     )
     sc.set_defaults(func=cmd_salvage_cmodern_height)
-
 
     return parser
 

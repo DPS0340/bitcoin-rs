@@ -14,8 +14,11 @@ use thiserror::Error;
 /// C ABI version for the non-terminal checkpoint structure.
 pub const ABI_VERSION: u32 = 1;
 
+const STRUCT_SIZE_BYTES: usize = 56;
+
 /// Expected in-memory size of [`CensusCheckpoint`] on the C side.
-pub const STRUCT_SIZE: u32 = mem::size_of::<CensusCheckpoint>() as u32;
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+pub const STRUCT_SIZE: u32 = STRUCT_SIZE_BYTES as u32;
 
 /// Fixed size of a BRSREC1 row in bytes.
 const RECORD_ROW_SIZE: u64 = 224;
@@ -23,8 +26,8 @@ const RECORD_ROW_SIZE: u64 = 224;
 /// Fixed size of a BRSJRN1 row in bytes.
 const JOURNAL_ROW_SIZE: u64 = 56;
 
-/// Minimum size of a BRSCTX1 row in bytes (row_len field + fixed fields).
-const CONTEXT_ROW_MIN_SIZE: u64 = 52;
+/// Minimum size of a BRSCTX1 row in bytes (`row_len` field + fixed fields).
+const CONTEXT_ROW_MIN_SIZE: u64 = 56;
 
 /// Non-terminal checkpoint returned by the patched kernel census sinks.
 ///
@@ -43,6 +46,11 @@ pub struct CensusCheckpoint {
     pub journal_rows: u64,
     pub journal_end: u64,
 }
+
+const _: () = assert!(
+    mem::size_of::<CensusCheckpoint>() == STRUCT_SIZE_BYTES,
+    "CensusCheckpoint layout must match the C ABI"
+);
 
 impl CensusCheckpoint {
     /// Verify that the reported endpoints are at least 16 bytes and that the
@@ -149,7 +157,7 @@ pub fn capture() -> Result<CensusCheckpoint, CensusCheckpointError> {
     // SAFETY: `btck_census_checkpoint` is only linked when the patched kernel
     // is in use. The pointer is valid for the call and `out_size` exactly
     // matches the C struct size.
-    let rc = unsafe { btck_census_checkpoint(&mut raw, mem::size_of::<CensusCheckpoint>()) };
+    let rc = unsafe { btck_census_checkpoint(&raw mut raw, mem::size_of::<CensusCheckpoint>()) };
     if rc != 0 {
         return Err(CensusCheckpointError::KernelFailed(rc));
     }
@@ -218,19 +226,19 @@ mod tests {
             journal_rows: 1,
             journal_end: 16 + JOURNAL_ROW_SIZE,
         };
-        cp.validate_coherent().unwrap();
+        assert_eq!(cp.validate_coherent(), Ok(()));
     }
 
     #[test]
     fn validate_coherent_accepts_exact_context_row_minimum() {
         let mut checkpoint = CensusCheckpoint {
             context_rows: 1,
-            context_end: 16 + CONTEXT_ROW_MIN_SIZE,
+            context_end: 16 + 4 + 52,
             record_end: 16,
             journal_end: 16,
             ..Default::default()
         };
-        checkpoint.validate_coherent().unwrap();
+        assert_eq!(checkpoint.validate_coherent(), Ok(()));
 
         checkpoint.context_end -= 1;
         assert!(checkpoint.validate_coherent().is_err());

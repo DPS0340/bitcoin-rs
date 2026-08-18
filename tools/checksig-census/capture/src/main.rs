@@ -37,7 +37,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin::consensus::Decodable as _;
-use bitcoin::hashes::{sha256, Hash as _, HashEngine as _};
+use bitcoin::hashes::{Hash as _, HashEngine as _, sha256};
 use bitcoin::hex::DisplayHex as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use bitcoin_rs_consensus::ConsensusError;
@@ -126,8 +126,9 @@ fn main() -> Result<()> {
     for sample in &filtered {
         blocks += 1;
 
-        let block = bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(sample.raw.as_slice()))
-            .with_context(|| format!("decode corpus block at height {}", sample.height))?;
+        let block =
+            bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(sample.raw.as_slice()))
+                .with_context(|| format!("decode corpus block at height {}", sample.height))?;
         let hash = block.block_hash();
         let block_hash = hash.to_string();
         let flags = production_verify_flags(
@@ -174,14 +175,12 @@ fn main() -> Result<()> {
                 })?;
 
             for (input_index, input) in tx.input.iter().enumerate() {
-                let prevout = prevout_map
-                    .get(&input.previous_output)
-                    .with_context(|| {
-                        format!(
-                            "missing prevout for sidecar at height {} tx_index {} input_index {}",
-                            sample.height, tx_index, input_index
-                        )
-                    })?;
+                let prevout = prevout_map.get(&input.previous_output).with_context(|| {
+                    format!(
+                        "missing prevout for sidecar at height {} tx_index {} input_index {}",
+                        sample.height, tx_index, input_index
+                    )
+                })?;
                 let witness_hex: Vec<String> = input
                     .witness
                     .iter()
@@ -303,16 +302,14 @@ impl Args {
                 "--output" => output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
                 "--start" => start = Some(parse_u32(&next_arg(&mut args, "--start")?, "--start")?),
                 "--stop" => stop = Some(parse_u32(&next_arg(&mut args, "--stop")?, "--stop")?),
-                "--counters" => {
-                    counters = Some(PathBuf::from(next_arg(&mut args, "--counters")?))
-                }
-                "--journal" => {
-                    journal = Some(PathBuf::from(next_arg(&mut args, "--journal")?))
-                }
+                "--counters" => counters = Some(PathBuf::from(next_arg(&mut args, "--counters")?)),
+                "--journal" => journal = Some(PathBuf::from(next_arg(&mut args, "--journal")?)),
                 "--context-sidecar" => {
                     context_sidecar = Some(PathBuf::from(next_arg(&mut args, "--context-sidecar")?))
                 }
-                other => bail!("unknown argument: {other}\nusage: checksig-census-capture --corpus <path> [--output <path>] [--start <u32>] [--stop <u32>] [--counters <path>] [--journal <path>] [--context-sidecar <path>]"),
+                other => bail!(
+                    "unknown argument: {other}\nusage: checksig-census-capture --corpus <path> [--output <path>] [--start <u32>] [--stop <u32>] [--counters <path>] [--journal <path>] [--context-sidecar <path>]"
+                ),
             }
         }
         let corpus = corpus.context("--corpus is required")?;
@@ -351,8 +348,7 @@ fn resolve_default_sidecar(corpus: &std::path::Path, output: Option<&PathBuf>) -
 
 fn ensure_parent(path: &std::path::Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     Ok(())
 }
@@ -385,16 +381,11 @@ fn corpus_height_range(corpus: &[SampleBlock]) -> (u32, u32) {
         corpus.iter().map(|sample| sample.height).max().unwrap_or(0),
     )
 }
-
 // ── Production flag derivation ──────────────────────────────────────────────
 
 /// Mirrors the buried-deployment fallback in `compute_verify_flags` from
 /// `crates/node/src/apply.rs`, including Core's hash-pinned BIP16 exception.
-fn production_verify_flags(
-    network: Network,
-    height: u32,
-    block_hash: Hash256,
-) -> VerifyFlags {
+fn production_verify_flags(network: Network, height: u32, block_hash: Hash256) -> VerifyFlags {
     let mut flags = VerifyFlags::NONE;
     if !network.is_bip16_p2sh_exception(block_hash) {
         flags = flags.union(VerifyFlags::P2SH);

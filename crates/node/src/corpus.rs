@@ -135,6 +135,12 @@ pub enum CorpusError {
     /// The manifest has no entries.
     #[error("empty corpus entries")]
     EmptyEntries,
+    /// The inclusive stop height cannot be represented as a vector capacity.
+    #[error("entry capacity for stop height {stop} does not fit this platform")]
+    EntryCapacityOverflow {
+        /// Declared inclusive stop height.
+        stop: u32,
+    },
     /// The entry count does not match the declared stop height.
     #[error("expected {expected} entries for stop height {stop}, got {count}")]
     EntryCountMismatch {
@@ -469,8 +475,8 @@ fn read_http_line(stream: &mut BufReader<TcpStream>) -> Result<String, CoreRestE
     if read == 0 {
         return Err(CoreRestError::Io(io::ErrorKind::UnexpectedEof.into()));
     }
-    let read = u64::try_from(read).map_err(|_| CoreRestError::OversizedHeaderLine)?;
-    if read > MAX_HTTP_LINE_BYTES || !bytes.ends_with(b"\n") {
+    let max_line = usize::try_from(MAX_HTTP_LINE_BYTES).unwrap_or(usize::MAX);
+    if read > max_line || !bytes.ends_with(b"\n") {
         return Err(CoreRestError::OversizedHeaderLine);
     }
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
@@ -557,9 +563,9 @@ impl CorpusBlockSource for RestCorpusSource {
                 computed: computed.to_string_be(),
             });
         }
-        let mut previous_hash = [0_u8; 32];
-        previous_hash.copy_from_slice(&payload[4..36]);
-        let actual_prev = Hash256::from_le_bytes(&previous_hash);
+        let mut actual_prev_bytes = [0_u8; 32];
+        actual_prev_bytes.copy_from_slice(&payload[4..36]);
+        let actual_prev = Hash256::from_le_bytes(&actual_prev_bytes);
         if height == 0 {
             let expected = self.network.genesis_block_hash();
             if computed != expected {
@@ -643,7 +649,7 @@ pub(crate) fn export_from_sources(
     let (archive_path, manifest_path) = prepare_corpus_destinations(archive_path, manifest_path)?;
     let tip = block_tree.tip_height();
     match tip {
-        Some(height) if stop_height <= height => {}
+        Some(tip_height) if stop_height <= tip_height => {}
         _ => {
             return Err(CorpusError::StopAboveTip {
                 stop: stop_height,
@@ -688,9 +694,9 @@ fn write_corpus_archive(
 
     let (mut archive_temp, archive_file) = TempFile::create(archive_path)?;
     let mut hashing_writer = HashingWriter::new(BufWriter::new(archive_file));
-    let capacity = usize::try_from(u64::from(stop_height) + 1)
-        .map_err(|_| CorpusError::OffsetOverflow { index: 0 })?;
-    let mut entries = Vec::with_capacity(capacity);
+    let entry_capacity = usize::try_from(u64::from(stop_height) + 1)
+        .map_err(|_| CorpusError::EntryCapacityOverflow { stop: stop_height })?;
+    let mut entries = Vec::with_capacity(entry_capacity);
     let archive_size;
     {
         let mut frames = CoreFrameWriter::new(&mut hashing_writer, network.magic());
@@ -1021,8 +1027,10 @@ impl CorpusManifest {
             .checked_add(1)
             .ok_or(CorpusError::OffsetOverflow { index: 0 })?;
         let entry_count =
-            u64::try_from(self.entries.len()).map_err(|_| CorpusError::OffsetOverflow {
-                index: self.entries.len(),
+            u64::try_from(self.entries.len()).map_err(|_| CorpusError::EntryCountMismatch {
+                stop: self.stop_height,
+                expected: expected_count,
+                count: self.entries.len(),
             })?;
         if entry_count != expected_count {
             return Err(CorpusError::EntryCountMismatch {
@@ -1035,12 +1043,12 @@ impl CorpusManifest {
         let mut expected_offset = 0_u64;
         let last_index = self.entries.len().saturating_sub(1);
         for (index, entry) in self.entries.iter().enumerate() {
-            let expected_height = self
-                .start_height
-                .checked_add(
-                    u32::try_from(index).map_err(|_| CorpusError::OffsetOverflow { index })?,
-                )
-                .ok_or(CorpusError::OffsetOverflow { index })?;
+            let height_offset = u32::try_from(index).map_err(|_| CorpusError::HeightMismatch {
+                index,
+                expected: self.stop_height,
+                actual: entry.height,
+            })?;
+            let expected_height = self.start_height.wrapping_add(height_offset);
             if entry.height != expected_height {
                 return Err(CorpusError::HeightMismatch {
                     index,
@@ -1319,16 +1327,10 @@ fn parse_hash256(s: &str) -> Result<Hash256, CorpusError> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::disallowed_types,
-    clippy::pedantic,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
+// Test fixtures fail at the assertion site; production parsing stays fallible.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use std::io::{BufRead as _, BufReader, Cursor, Write as _};
     use std::net::TcpListener;
     use std::thread;
@@ -1619,7 +1621,8 @@ mod tests {
             let mut bodies = HashMap::new();
             for (height, block) in blocks.iter().enumerate() {
                 let hash = block_hash256(block);
-                bodies.insert((height as u32, hash), serialize(block));
+                let height = u32::try_from(height).expect("test chain height fits u32");
+                bodies.insert((height, hash), serialize(block));
             }
             Self { bodies }
         }
@@ -1660,7 +1663,10 @@ mod tests {
         assert_eq!(manifest.entries.len(), 3);
 
         let archive_bytes = fs::read(&archive_path)?;
-        assert_eq!(archive_bytes.len() as u64, manifest.archive.size);
+        assert_eq!(
+            u64::try_from(archive_bytes.len()).expect("archive length fits u64"),
+            manifest.archive.size
+        );
         assert_eq!(sha256_of(&archive_bytes), manifest.archive.sha256);
 
         assert_eq!(&archive_bytes[..4], Network::Regtest.magic());
@@ -1670,7 +1676,10 @@ mod tests {
             archive_bytes[6],
             archive_bytes[7],
         ]);
-        assert_eq!(payload_len, serialize(&blocks[0]).len() as u32);
+        assert_eq!(
+            payload_len,
+            u32::try_from(serialize(&blocks[0]).len()).expect("payload length fits u32")
+        );
 
         let mut reader = CoreFrameReader::new(
             Cursor::new(archive_bytes.as_slice()),
@@ -1684,11 +1693,17 @@ mod tests {
             let expected = serialize(block);
             assert_eq!(record.payload, expected, "payload mismatch at height {i}");
             let entry = &manifest.entries[i];
-            assert_eq!(entry.height, i as u32);
+            assert_eq!(
+                entry.height,
+                u32::try_from(i).expect("test height fits u32")
+            );
             assert_eq!(entry.hash, block_hash256(block));
             assert_eq!(entry.offset, record.metadata.offset);
             assert_eq!(entry.payload_length, record.metadata.len);
-            assert_eq!(entry.payload_length, expected.len() as u32);
+            assert_eq!(
+                entry.payload_length,
+                u32::try_from(expected.len()).expect("payload length fits u32")
+            );
         }
         assert!(reader.next_record()?.is_none());
 

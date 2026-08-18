@@ -24,10 +24,9 @@ fn main() -> Result<()> {
         )
         .context("export corpus from REST")?
     } else {
-        let data_dir = args
-            .data_dir
-            .as_ref()
-            .context("active-chain export requires --data-dir")?;
+        let Some(data_dir) = args.data_dir.as_ref() else {
+            bail!("exactly one corpus source must be configured");
+        };
         let mut config = Config::default_for_network(network);
         config.data_dir.clone_from(data_dir);
         config.storage_backend.clone_from(&args.storage_backend);

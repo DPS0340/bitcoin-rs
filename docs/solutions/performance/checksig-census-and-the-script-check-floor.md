@@ -103,6 +103,7 @@ predicate still requires all Schnorr and `OP_CHECKSIGADD` counters to be zero.
 This split removes the pre-Taproot zero assumption from Cmodern without
 weakening C150.
 
+**Certification Pipeline and Rule**: Authoritative certification requires strict `mainnet-prefix-replay-v2` inputs, file-bound binary streams, and exact classifier (`classify-corpus-v2`) validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
 ## Capture corpus and integrity proofs
 
 - **KSPIKE1 Corpus**: `/home/alpha/bench-g14/results/u0-spike-corpus/corpus.bin`

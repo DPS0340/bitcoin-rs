@@ -59,7 +59,7 @@ fn main() -> Result<()> {
         captured
     };
 
-    let checkpoint_generation = probe_reorg_durability(&args, &config, &validation, &before)?;
+    let checkpoint_generation = verify_durable_reorg(&args, &config, &validation, &before)?;
 
     let after = {
         let state = NodeState::open(config).with_context(|| {
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn probe_reorg_durability(
+fn verify_durable_reorg(
     args: &Args,
     config: &Config,
     validation: &Validation,
@@ -119,6 +119,7 @@ fn probe_reorg_durability(
         )
     })?;
     let mut handles = state.apply_handles();
+    // Full verification, same as the timed trial that produced the validation artifact.
     handles.assume_valid_height = 0;
     handles.assume_valid_gate =
         Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));

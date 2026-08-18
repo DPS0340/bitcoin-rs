@@ -85,7 +85,7 @@ pub struct CoreFrameMetadata {
     pub len: u32,
 }
 
-/// A complete Core frame returned by [`CoreFrameReader::next`].
+/// A complete Core frame returned by [`CoreFrameReader::next_record`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreFrameRecord {
     /// Position and size metadata for this record.
@@ -360,7 +360,9 @@ mod tests {
         let mut writer = CoreFrameWriter::new(&mut buf, MAGIC);
         writer.write(b"peek")?;
         let mut reader = CoreFrameReader::new(Cursor::new(&buf[..]), MAGIC, u32::MAX);
-        let _ = reader.next_record()?.expect("expected one record");
+        let Some(_record) = reader.next_record()? else {
+            panic!("expected one record");
+        };
         // The frame reader owns the cursor, but get_ref still lets callers
         // observe the exact byte position the parser reached.
         assert_eq!(reader.get_ref().position(), reader.offset());
@@ -404,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn short_payload() -> Result<(), CoreFrameError> {
+    fn short_payload() {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC);
         data.extend_from_slice(&10_u32.to_le_bytes());
@@ -418,7 +420,6 @@ mod tests {
             }
             other => panic!("expected PartialPayload, got {other:?}"),
         }
-        Ok(())
     }
 
     #[test]
@@ -439,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_offset_overflow() -> Result<(), CoreFrameError> {
+    fn reader_offset_overflow() {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC);
         data.extend_from_slice(&4_u32.to_le_bytes());
@@ -451,7 +452,6 @@ mod tests {
             Err(CoreFrameError::Overflow { .. }) => {}
             other => panic!("expected Overflow, got {other:?}"),
         }
-        Ok(())
     }
 
     #[test]

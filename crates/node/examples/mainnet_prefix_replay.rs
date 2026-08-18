@@ -331,7 +331,6 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
         blocks_path: blocks_path.clone(),
     })
 }
-
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if args.stop_height < args.start_height {
@@ -1385,7 +1384,6 @@ fn update_prev_checkpoint(
     *prev = Some(next);
     Ok(())
 }
-
 fn print_usage() {
     println!(
         "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex] [--blockfilterindex]"
@@ -1757,7 +1755,7 @@ mod tests {
             abi_version: 1,
             struct_size: 56,
             context_rows: 1,
-            context_end: 16 + 52,
+            context_end: 16 + 56,
             record_rows: 2,
             record_end: 16 + 2 * 224,
             journal_rows: 3,

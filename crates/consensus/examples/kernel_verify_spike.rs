@@ -130,25 +130,25 @@ impl Args {
                     start_height = Some(parse_u32(
                         &next_arg(&mut args, "--start-height")?,
                         "--start-height",
-                    )?)
+                    )?);
                 }
                 "--stop-height" => {
                     stop_height = Some(parse_u32(
                         &next_arg(&mut args, "--stop-height")?,
                         "--stop-height",
-                    )?)
+                    )?);
                 }
                 "--sample-count" => {
                     sample_count = Some(parse_usize(
                         &next_arg(&mut args, "--sample-count")?,
                         "--sample-count",
-                    )?)
+                    )?);
                 }
                 "--min-inputs" => {
                     min_inputs = Some(parse_usize(
                         &next_arg(&mut args, "--min-inputs")?,
                         "--min-inputs",
-                    )?)
+                    )?);
                 }
                 other => bail!(
                     "unknown argument: {other}\nusage: kernel_verify_spike --corpus <path> --output <path> [--rest-url <host:port>] [--start-height <u32>] [--stop-height <u32>] [--sample-count <usize>] [--min-inputs <usize>]"
@@ -625,6 +625,8 @@ fn measure(corpus: &[SampleBlock], items: &[WorkItem], args: &Args) -> Result<se
     }))
 }
 
+// Benchmark ratios intentionally trade integer precision for a fractional result.
+#[allow(clippy::as_conversions, clippy::cast_precision_loss)]
 fn duration_us_per_input(elapsed: Duration, total_inputs: usize) -> Result<f64> {
     let micros = u64::try_from(elapsed.as_micros()).context("elapsed micros exceed u64")?;
     let inputs = u64::try_from(total_inputs).context("input count exceeds u64")?;
