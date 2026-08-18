@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -115,9 +116,191 @@ def _consume_blob(
     if length > remaining:
         raise ContextError(
             f"CTX-RAW: row {row_number} {field} length {length} exceeds "
-            f"the {remaining} bytes remaining in its row"
+            f"{remaining} bytes remaining in row"
         )
     return _read_exact(stream, length, field, row_number), remaining - length
+
+
+def decode_context_row(
+    stream: BinaryIO,
+    row_number: int,
+    available: int,
+    *,
+    boundary: str = "end of file",
+) -> ContextInput:
+    """Decode one canonically framed BRSCTX1 row from ``stream``.
+
+    ``available`` is the exact number of bytes remaining in the caller's
+    trusted boundary. Strict full-file and live committed-prefix parsing both
+    use this function so framing and field legality cannot drift.
+    """
+    row_length = CONTEXT_ROW_LENGTH.unpack(
+        _read_exact(stream, CONTEXT_ROW_LENGTH.size, "row length", row_number)
+    )[0]
+    if row_length < CONTEXT_MIN_ROW_SIZE:
+        raise ContextError(
+            f"CTX-RAW: row {row_number} length {row_length} is shorter than "
+            f"the {CONTEXT_MIN_ROW_SIZE}-byte fixed body"
+        )
+    if row_length > CONTEXT_MAX_ROW_BYTES:
+        raise ContextError(
+            f"CTX-RAW: row {row_number} length {row_length} exceeds "
+            f"the {CONTEXT_MAX_ROW_BYTES}-byte maximum"
+        )
+    payload_available = available - CONTEXT_ROW_LENGTH.size
+    if row_length > payload_available:
+        raise ContextError(
+            f"CTX-RAW: row {row_number} length {row_length} extends "
+            f"{payload_available} bytes past {boundary}"
+        )
+
+    (
+        txid_le,
+        input_index,
+        verify_flags,
+        prevout_length,
+        script_sig_length,
+        witness_count,
+    ) = CONTEXT_FIXED.unpack(
+        _read_exact(stream, CONTEXT_FIXED.size, "fixed fields", row_number)
+    )
+
+    if prevout_length > 0xFFFF_FFFF:
+        raise ContextError(f"CTX-RAW: row {row_number} prevout length overflows u32")
+    if script_sig_length > 0xFFFF_FFFF:
+        raise ContextError(f"CTX-RAW: row {row_number} scriptSig length overflows u32")
+    if witness_count > 0xFFFF_FFFF:
+        raise ContextError(f"CTX-RAW: row {row_number} witness count overflows u32")
+
+    remaining = row_length - CONTEXT_FIXED.size
+    if witness_count > remaining // 4:
+        raise ContextError(
+            f"CTX-RAW: row {row_number} witness count {witness_count} cannot fit "
+            f"in the {remaining} bytes remaining in its row"
+        )
+
+    prevout, remaining = _consume_blob(
+        stream, prevout_length, remaining, "prevout script", row_number
+    )
+    script_sig, remaining = _consume_blob(
+        stream, script_sig_length, remaining, "scriptSig", row_number
+    )
+
+    witness: list[bytes] = []
+    for item_index in range(witness_count):
+        if remaining < 4:
+            raise ContextError(
+                f"CTX-RAW: row {row_number} is short before witness item {item_index}"
+            )
+        item_length = struct.unpack(
+            "<I", _read_exact(stream, 4, "witness item length", row_number)
+        )[0]
+        remaining -= 4
+        item, remaining = _consume_blob(
+            stream,
+            item_length,
+            remaining,
+            f"witness item {item_index}",
+            row_number,
+        )
+        witness.append(item)
+
+    if remaining != 0:
+        raise ContextError(
+            f"CTX-RAW: row {row_number} length mismatch: {remaining} unconsumed bytes"
+        )
+
+    return ContextInput(
+        identity=InputIdentity(txid_le=txid_le, input_index=input_index),
+        verify_flags=verify_flags,
+        prevout_script_pubkey=prevout,
+        script_sig=script_sig,
+        witness=tuple(witness),
+    )
+
+
+class _PreadBoundedReader:
+    """Sequential view over one immutable committed prefix using ``pread``."""
+
+    def __init__(self, fd: int, start: int, end: int) -> None:
+        self._fd = fd
+        self._cursor = start
+        self._end = end
+
+    @property
+    def cursor(self) -> int:
+        return self._cursor
+
+    @property
+    def remaining(self) -> int:
+        return self._end - self._cursor
+
+    def read(self, length: int) -> bytes:
+        length = min(length, self.remaining)
+        if length <= 0:
+            return b""
+        data = os.pread(self._fd, length, self._cursor)
+        self._cursor += len(data)
+        return data
+
+
+def read_bounded_context_rows(
+    fd: int,
+    *,
+    start_offset: int,
+    end_offset: int,
+    start_row: int,
+    committed_rows: int,
+) -> list[ContextInput]:
+    """Read only newly committed BRSCTX1 rows from an already-open fd.
+
+    The producer may still have the placeholder header count zero. A patched
+    terminal count is accepted only when it covers the requested committed
+    prefix. Bytes beyond ``end_offset`` are never observed.
+    """
+    if start_row < 0 or committed_rows < start_row:
+        raise ContextError(
+            f"CTX-RAW: invalid committed row range {start_row}..{committed_rows}"
+        )
+    if start_offset < CONTEXT_HEADER.size or end_offset < start_offset:
+        raise ContextError(
+            f"CTX-RAW: invalid committed byte range {start_offset}..{end_offset}"
+        )
+    file_size = os.fstat(fd).st_size
+    if end_offset > file_size:
+        raise ContextError(
+            f"CTX-RAW: committed endpoint {end_offset} exceeds current file size {file_size}"
+        )
+    header = os.pread(fd, CONTEXT_HEADER.size, 0)
+    if len(header) != CONTEXT_HEADER.size:
+        raise ContextError(
+            f"CTX-RAW: short header: expected {CONTEXT_HEADER.size} bytes, got {len(header)}"
+        )
+    magic, declared_count = CONTEXT_HEADER.unpack(header)
+    if magic != CONTEXT_MAGIC:
+        raise ContextError(
+            f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}"
+        )
+    if declared_count != 0 and declared_count < committed_rows:
+        raise ContextError(
+            f"CTX-RAW: terminal row count {declared_count} is below committed prefix count {committed_rows}"
+        )
+
+    reader = _PreadBoundedReader(fd, start_offset, end_offset)
+    rows = [
+        decode_context_row(
+            reader,
+            row_number,
+            reader.remaining,
+            boundary="committed endpoint",
+        )
+        for row_number in range(start_row + 1, committed_rows + 1)
+    ]
+    if reader.cursor != end_offset:
+        raise ContextError(
+            f"CTX-RAW: {end_offset - reader.cursor} trailing byte(s) within committed prefix"
+        )
+    return rows
 
 
 def _parse_legacy_row(value: object, line_number: int) -> ContextInput:
@@ -268,106 +451,19 @@ class ContextIterator(Iterator[ContextInput]):
             identities: set[tuple[bytes, int]] | None = set() if self._dedup else None
 
             for row_number in range(1, declared_count + 1):
-                row_length = CONTEXT_ROW_LENGTH.unpack(
-                    _read_exact(
-                        stream, CONTEXT_ROW_LENGTH.size, "row length", row_number
-                    )
-                )[0]
-                if row_length < CONTEXT_MIN_ROW_SIZE:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} length {row_length} is shorter than "
-                        f"the {CONTEXT_MIN_ROW_SIZE}-byte fixed body"
-                    )
-                if row_length > CONTEXT_MAX_ROW_BYTES:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} length {row_length} exceeds "
-                        f"the {CONTEXT_MAX_ROW_BYTES}-byte maximum"
-                    )
-                payload_remaining = file_size - stream._bytes_read
-                if row_length > payload_remaining:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} length {row_length} extends "
-                        f"{payload_remaining} bytes past end of file"
-                    )
-                fixed = _read_exact(
-                    stream, CONTEXT_FIXED.size, "fixed fields", row_number
+                evidence = decode_context_row(
+                    stream, row_number, file_size - stream._bytes_read
                 )
-                (
-                    txid_le,
-                    input_index,
-                    verify_flags,
-                    prevout_length,
-                    script_sig_length,
-                    witness_count,
-                ) = CONTEXT_FIXED.unpack(fixed)
-
-                if prevout_length > 0xFFFF_FFFF:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} prevout length overflows u32"
-                    )
-                if script_sig_length > 0xFFFF_FFFF:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} scriptSig length overflows u32"
-                    )
-                if witness_count > 0xFFFF_FFFF:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} witness count overflows u32"
-                    )
-
-                remaining = row_length - CONTEXT_FIXED.size
-                if witness_count > remaining // 4:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} witness count {witness_count} cannot fit "
-                        f"in the {remaining} bytes remaining in its row"
-                    )
-
-                prevout, remaining = _consume_blob(
-                    stream, prevout_length, remaining, "prevout script", row_number
-                )
-                script_sig, remaining = _consume_blob(
-                    stream, script_sig_length, remaining, "scriptSig", row_number
-                )
-
-                witness: list[bytes] = []
-                for item_index in range(witness_count):
-                    if remaining < 4:
-                        raise ContextError(
-                            f"CTX-RAW: row {row_number} is short before witness item {item_index}"
-                        )
-                    item_length = struct.unpack(
-                        "<I", _read_exact(stream, 4, "witness item length", row_number)
-                    )[0]
-                    remaining -= 4
-                    item, remaining = _consume_blob(
-                        stream,
-                        item_length,
-                        remaining,
-                        f"witness item {item_index}",
-                        row_number,
-                    )
-                    witness.append(item)
-
-                if remaining != 0:
-                    raise ContextError(
-                        f"CTX-RAW: row {row_number} length mismatch: {remaining} unconsumed bytes"
-                    )
-
-                identity = InputIdentity(txid_le=txid_le, input_index=input_index)
+                identity = evidence.identity
                 if identities is not None:
                     if identity.execution_key in identities:
                         raise ContextError(
                             f"CTX-EXECUTION: duplicate context execution identity "
-                            f"{identity.display_txid}:{input_index}"
+                            f"{identity.display_txid}:{identity.input_index}"
                         )
                     identities.add(identity.execution_key)
                 self._count += 1
-                yield ContextInput(
-                    identity=identity,
-                    verify_flags=verify_flags,
-                    prevout_script_pubkey=prevout,
-                    script_sig=script_sig,
-                    witness=tuple(witness),
-                )
+                yield evidence
 
             trailing = stream.read(1)
             if trailing:
