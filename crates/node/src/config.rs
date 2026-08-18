@@ -16,6 +16,42 @@ const DEFAULT_RPC_USER: &str = "bitcoin-rs";
 const DEFAULT_RPC_PASSWORD: &str = "bitcoin-rs";
 const DEFAULT_DBCACHE_MB: u64 = 450;
 const DEFAULT_ZMQ_HWM: u32 = 1_000;
+const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
+const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
+
+/// A complete built-in node network selection.
+///
+/// Unlike [`Network`], which selects consensus rules, this also selects P2P
+/// bootstrap behavior. Low-level settings in the same or a later configuration
+/// layer may explicitly override the network-derived defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NetworkSelection {
+    /// Bitcoin mainnet.
+    Mainnet,
+    /// Legacy Bitcoin testnet.
+    Testnet3,
+    /// Bitcoin testnet4.
+    Testnet4,
+    /// Bitcoin signet.
+    Signet,
+    /// Local regression-test network.
+    Regtest,
+    /// ecash drynet4: mainnet consensus history on a distinct P2P network.
+    Drynet4,
+}
+
+impl NetworkSelection {
+    const fn consensus_network(self) -> Network {
+        match self {
+            Self::Mainnet | Self::Drynet4 => Network::Mainnet,
+            Self::Testnet3 => Network::Testnet3,
+            Self::Testnet4 => Network::Testnet4,
+            Self::Signet => Network::Signet,
+            Self::Regtest => Network::Regtest,
+        }
+    }
+}
 
 /// RPC authentication configuration before it is converted into the RPC crate's runtime policy.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -80,7 +116,8 @@ pub struct ZmqPublication {
     pub hwm: u32,
 }
 
-/// Fully resolved node configuration.
+/// Fully merged node configuration. Fixed-peer hostnames are intentionally
+/// resolved later by the P2P bootstrap worker.
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -88,12 +125,16 @@ pub struct Config {
     /// Bitcoin network selected for consensus and default ports.
     #[serde(deserialize_with = "deserialize_network")]
     pub network: Network,
+    /// Optional P2P message-start override for fork networks sharing this chain's genesis.
+    pub p2p_magic: Option<[u8; 4]>,
     /// Node data directory.
     pub data_dir: PathBuf,
     /// Storage backend name: `rocksdb`, `fjall`, `redb`, or `mdbx`.
     pub storage_backend: String,
     /// JSON-RPC bind address.
     pub rpc_bind: SocketAddr,
+    /// Whether the Bitcoin Core-compatible REST gateway is enabled.
+    pub rest: bool,
     /// JSON-RPC authentication configuration.
     pub rpc_auth: Auth,
     /// Optional Electrum TCP bind address.
@@ -104,9 +145,11 @@ pub struct Config {
     pub p2p_listen: Vec<SocketAddr>,
     /// Whether DNS seeds are used for peer bootstrap.
     pub dns_seeds_enabled: bool,
-    /// Fixed outbound peers to connect to. When non-empty, DNS seed bootstrap is
-    /// disabled and the node dials only these addresses (Bitcoin Core `-connect`).
-    pub connect: Vec<SocketAddr>,
+    /// Fixed outbound peer endpoints to connect to. Hostnames remain unresolved
+    /// until the P2P dial path so transient DNS failures do not prevent startup.
+    /// When non-empty, DNS seed bootstrap is disabled and the node dials only
+    /// these endpoints (Bitcoin Core `-connect`).
+    pub connect: Vec<String>,
     /// Pruning target in MiB. Zero disables pruning.
     pub prune_target_mb: u64,
     /// Whether utreexo mode is enabled.
@@ -151,6 +194,10 @@ pub struct Config {
     pub zmqpubrawblockhwm: Option<u32>,
     /// Optional `rawtx` PUB socket high-water mark.
     pub zmqpubrawtxhwm: Option<u32>,
+    /// ZMQ `sequence` PUB bind endpoints.
+    pub zmqpubsequence: Vec<String>,
+    /// Optional `sequence` PUB socket high-water mark.
+    pub zmqpubsequencehwm: Option<u32>,
     /// Block height at or below which script verification is skipped during block apply.
     ///
     /// On mainnet the default is the hash-pinned assume-valid anchor
@@ -168,9 +215,11 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("network", &self.network)
+            .field("p2p_magic", &self.p2p_magic)
             .field("data_dir", &self.data_dir)
             .field("storage_backend", &self.storage_backend)
             .field("rpc_bind", &self.rpc_bind)
+            .field("rest", &self.rest)
             .field("rpc_auth", &self.rpc_auth)
             .field("electrum_bind", &self.electrum_bind)
             .field("electrum_tls_cert", &self.electrum_tls_cert)
@@ -211,6 +260,8 @@ impl fmt::Debug for Config {
             .field("zmqpubhashtxhwm", &self.zmqpubhashtxhwm)
             .field("zmqpubrawblockhwm", &self.zmqpubrawblockhwm)
             .field("zmqpubrawtxhwm", &self.zmqpubrawtxhwm)
+            .field("zmqpubsequence", &self.zmqpubsequence)
+            .field("zmqpubsequencehwm", &self.zmqpubsequencehwm)
             .field("assume_valid_height", &self.assume_valid_height)
             .finish_non_exhaustive()
     }
@@ -228,9 +279,11 @@ impl Config {
     pub fn default_for_network(network: Network) -> Self {
         Self {
             network,
+            p2p_magic: None,
             data_dir: PathBuf::from(".bitcoin-rs"),
             storage_backend: DEFAULT_STORAGE_BACKEND.to_owned(),
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
+            rest: false,
             rpc_auth: Auth::default(),
             electrum_bind: None,
             electrum_tls_cert: None,
@@ -259,6 +312,8 @@ impl Config {
             zmqpubhashtxhwm: None,
             zmqpubrawblockhwm: None,
             zmqpubrawtxhwm: None,
+            zmqpubsequence: Vec::new(),
+            zmqpubsequencehwm: None,
             assume_valid_height: network
                 .assume_valid_anchor()
                 .map_or(0, |(height, _)| height),
@@ -315,6 +370,20 @@ impl Config {
 
     /// Validates backend names and simple cross-field constraints.
     pub fn validate(&self) -> Result<()> {
+        if self.p2p_magic.is_some() {
+            ensure!(
+                self.network == Network::Mainnet,
+                "P2P magic overrides currently require --network mainnet"
+            );
+            ensure!(
+                !self.connect.is_empty(),
+                "P2P magic overrides require at least one --connect peer"
+            );
+            ensure!(
+                !self.dns_seeds_enabled,
+                "P2P magic overrides require --dns-seeds-enabled=false"
+            );
+        }
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
@@ -357,12 +426,19 @@ impl Config {
             ("zmqpubhashtxhwm", self.zmqpubhashtxhwm),
             ("zmqpubrawblockhwm", self.zmqpubrawblockhwm),
             ("zmqpubrawtxhwm", self.zmqpubrawtxhwm),
+            ("zmqpubsequencehwm", self.zmqpubsequencehwm),
         ] {
             if hwm.is_some_and(|value| value > 2_147_483_647) {
                 bail!("{name} exceeds libzmq SNDHWM range");
             }
         }
         Ok(())
+    }
+
+    /// Returns the effective P2P message-start bytes.
+    #[must_use]
+    pub fn p2p_magic(&self) -> [u8; 4] {
+        self.p2p_magic.unwrap_or_else(|| self.network.magic())
     }
 
     /// Returns active ZMQ publications in Core notification order.
@@ -392,6 +468,12 @@ impl Config {
             crate::zmq_publisher::ZmqTopic::RawTx,
             &self.zmqpubrawtx,
             self.zmqpubrawtxhwm,
+        );
+        push_zmq_publications(
+            &mut publications,
+            crate::zmq_publisher::ZmqTopic::Sequence,
+            &self.zmqpubsequence,
+            self.zmqpubsequencehwm,
         );
         publications
     }
@@ -427,9 +509,13 @@ impl Config {
         Ok(config)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_layer(&mut self, layer: &ConfigLayer) {
         if let Some(network) = layer.network {
-            self.network = network;
+            self.apply_network_selection(network);
+        }
+        if let Some(p2p_magic) = layer.p2p_magic {
+            self.p2p_magic = Some(p2p_magic);
         }
         if let Some(data_dir) = &layer.data_dir {
             self.data_dir.clone_from(data_dir);
@@ -439,6 +525,9 @@ impl Config {
         }
         if let Some(rpc_bind) = layer.rpc_bind {
             self.rpc_bind = rpc_bind;
+        }
+        if let Some(rest) = layer.rest {
+            self.rest = rest;
         }
         if let Some(auth) = &layer.rpc_auth {
             self.rpc_auth = auth.clone();
@@ -513,6 +602,9 @@ impl Config {
         if let Some(endpoints) = &layer.zmqpubrawtx {
             self.zmqpubrawtx.clone_from(endpoints);
         }
+        if let Some(endpoints) = &layer.zmqpubsequence {
+            self.zmqpubsequence.clone_from(endpoints);
+        }
         if let Some(hwm) = layer.zmqpubhashblockhwm {
             self.zmqpubhashblockhwm = Some(hwm);
         }
@@ -525,8 +617,27 @@ impl Config {
         if let Some(hwm) = layer.zmqpubrawtxhwm {
             self.zmqpubrawtxhwm = Some(hwm);
         }
+        if let Some(hwm) = layer.zmqpubsequencehwm {
+            self.zmqpubsequencehwm = Some(hwm);
+        }
         if let Some(height) = layer.assume_valid_height {
             self.assume_valid_height = height;
+        }
+    }
+
+    fn apply_network_selection(&mut self, selection: NetworkSelection) {
+        let network = selection.consensus_network();
+        self.network = network;
+        self.p2p_magic = None;
+        self.rpc_bind = SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port()));
+        self.p2p_listen = vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))];
+        self.dns_seeds_enabled = true;
+        self.connect.clear();
+
+        if selection == NetworkSelection::Drynet4 {
+            self.p2p_magic = Some(DRYNET4_P2P_MAGIC);
+            self.dns_seeds_enabled = false;
+            self.connect = vec![DRYNET4_CONNECT.to_owned()];
         }
     }
 
@@ -557,15 +668,22 @@ pub(crate) struct ConfigLayer {
     pub(crate) config: Option<PathBuf>,
     #[arg(long = "bitcoin-conf")]
     pub(crate) bitcoin_conf: Option<PathBuf>,
-    #[arg(long, value_parser = parse_network)]
-    #[serde(deserialize_with = "deserialize_optional_network")]
-    pub(crate) network: Option<Network>,
+    /// Select the Bitcoin or fork network, including its P2P bootstrap profile.
+    #[arg(long, value_parser = parse_network_selection)]
+    pub(crate) network: Option<NetworkSelection>,
+    /// Override the four P2P message-start bytes for a fork network.
+    #[arg(long = "p2p-magic", value_parser = parse_p2p_magic)]
+    #[serde(deserialize_with = "deserialize_optional_p2p_magic")]
+    pub(crate) p2p_magic: Option<[u8; 4]>,
     #[arg(long = "data-dir")]
     pub(crate) data_dir: Option<PathBuf>,
     #[arg(long = "storage-backend")]
     pub(crate) storage_backend: Option<String>,
     #[arg(long = "rpc-bind")]
     pub(crate) rpc_bind: Option<SocketAddr>,
+    /// Enable the Bitcoin Core-compatible REST gateway.
+    #[arg(long)]
+    pub(crate) rest: Option<bool>,
     #[arg(skip)]
     pub(crate) rpc_auth: Option<Auth>,
     #[arg(long = "rpc-user")]
@@ -584,8 +702,12 @@ pub(crate) struct ConfigLayer {
     pub(crate) p2p_listen: Option<Vec<SocketAddr>>,
     #[arg(long = "dns-seeds-enabled")]
     pub(crate) dns_seeds_enabled: Option<bool>,
-    #[arg(long = "connect", value_delimiter = ',')]
-    pub(crate) connect: Option<Vec<SocketAddr>>,
+    #[arg(
+        long = "connect",
+        value_delimiter = ',',
+        value_parser = parse_connect_endpoint
+    )]
+    pub(crate) connect: Option<Vec<String>>,
     #[arg(long = "prune-target-mb")]
     pub(crate) prune_target_mb: Option<u64>,
     #[arg(long = "utreexo-mode")]
@@ -624,6 +746,8 @@ pub(crate) struct ConfigLayer {
     pub(crate) zmqpubrawblock: Option<Vec<String>>,
     #[arg(long = "zmqpubrawtx", value_delimiter = ',')]
     pub(crate) zmqpubrawtx: Option<Vec<String>>,
+    #[arg(long = "zmqpubsequence", value_delimiter = ',')]
+    pub(crate) zmqpubsequence: Option<Vec<String>>,
     #[arg(long = "zmqpubhashblockhwm")]
     pub(crate) zmqpubhashblockhwm: Option<u32>,
     #[arg(long = "zmqpubhashtxhwm")]
@@ -632,6 +756,8 @@ pub(crate) struct ConfigLayer {
     pub(crate) zmqpubrawblockhwm: Option<u32>,
     #[arg(long = "zmqpubrawtxhwm")]
     pub(crate) zmqpubrawtxhwm: Option<u32>,
+    #[arg(long = "zmqpubsequencehwm")]
+    pub(crate) zmqpubsequencehwm: Option<u32>,
     #[arg(long = "assume-valid-height")]
     pub(crate) assume_valid_height: Option<u32>,
 }
@@ -652,13 +778,18 @@ impl ConfigLayer {
             let key = key.as_ref();
             let value = value.as_ref();
             match key {
-                "BITCOIN_RS_NETWORK" => layer.network = Some(parse_network(value)?),
+                "BITCOIN_RS_NETWORK" => layer.network = Some(parse_network_selection(value)?),
+                "BITCOIN_RS_P2P_MAGIC" => layer.p2p_magic = Some(parse_p2p_magic(value)?),
                 "BITCOIN_RS_DATA_DIR" => layer.data_dir = Some(PathBuf::from(value)),
                 "BITCOIN_RS_STORAGE_BACKEND" => layer.storage_backend = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_BIND" => layer.rpc_bind = Some(value.parse()?),
+                "BITCOIN_RS_REST" => layer.rest = Some(parse_bool(value)?),
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),
+                "BITCOIN_RS_ELECTRUM_BIND" if value.trim().is_empty() => {
+                    layer.clear_electrum_bind = true;
+                }
                 "BITCOIN_RS_ELECTRUM_BIND" => layer.electrum_bind = Some(value.parse()?),
                 "BITCOIN_RS_ELECTRUM_TLS_CERT" => {
                     layer.electrum_tls_cert = Some(PathBuf::from(value));
@@ -667,7 +798,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_DNS_SEEDS_ENABLED" => {
                     layer.dns_seeds_enabled = Some(parse_bool(value)?);
                 }
-                "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_socket_list(value)?),
+                "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_connect_list(value)?),
                 "BITCOIN_RS_PRUNE_TARGET_MB" => layer.prune_target_mb = Some(value.parse()?),
                 "BITCOIN_RS_UTREEXO_MODE" => layer.utreexo_mode = Some(parse_bool(value)?),
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
@@ -708,6 +839,9 @@ impl ConfigLayer {
                 "BITCOIN_RS_ZMQPUBRAWTX" => {
                     layer.zmqpubrawtx = Some(parse_string_list(value));
                 }
+                "BITCOIN_RS_ZMQPUBSEQUENCE" => {
+                    layer.zmqpubsequence = Some(parse_string_list(value));
+                }
                 "BITCOIN_RS_ZMQPUBHASHBLOCKHWM" => {
                     layer.zmqpubhashblockhwm = Some(value.parse()?);
                 }
@@ -719,6 +853,9 @@ impl ConfigLayer {
                 }
                 "BITCOIN_RS_ZMQPUBRAWTXHWM" => {
                     layer.zmqpubrawtxhwm = Some(value.parse()?);
+                }
+                "BITCOIN_RS_ZMQPUBSEQUENCEHWM" => {
+                    layer.zmqpubsequencehwm = Some(value.parse()?);
                 }
                 "BITCOIN_RS_ASSUME_VALID_HEIGHT" => {
                     layer.assume_valid_height = Some(value.parse()?);
@@ -751,10 +888,14 @@ fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
 }
 
 fn effective_network(toml: Option<&ConfigLayer>, env: &ConfigLayer, cli: &ConfigLayer) -> Network {
-    cli.network
-        .or(env.network)
-        .or_else(|| toml.and_then(|layer| layer.network))
+    layer_network(cli)
+        .or_else(|| layer_network(env))
+        .or_else(|| toml.and_then(layer_network))
         .unwrap_or(Network::Mainnet)
+}
+
+fn layer_network(layer: &ConfigLayer) -> Option<Network> {
+    layer.network.map(NetworkSelection::consensus_network)
 }
 
 fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
@@ -762,6 +903,30 @@ fn parse_socket_list(value: &str) -> Result<Vec<SocketAddr>> {
         .split(',')
         .filter(|part| !part.trim().is_empty())
         .map(|part| Ok(part.trim().parse()?))
+        .collect()
+}
+
+fn parse_connect_endpoint(value: &str) -> std::result::Result<String, String> {
+    let value = value.trim();
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(value.to_owned());
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return Err(format!("connect peer `{value}` must include a port"));
+    };
+    if host.is_empty() {
+        return Err(format!("connect peer `{value}` has an empty hostname"));
+    }
+    port.parse::<u16>()
+        .map_err(|error| format!("connect peer `{value}` has an invalid port: {error}"))?;
+    Ok(value.to_owned())
+}
+
+fn parse_connect_list(value: &str) -> Result<Vec<String>> {
+    value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| parse_connect_endpoint(part.trim()).map_err(anyhow::Error::msg))
         .collect()
 }
 
@@ -796,6 +961,20 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_p2p_magic(value: &str) -> Result<[u8; 4]> {
+    let value = value.trim();
+    ensure!(
+        value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "p2p magic must be exactly eight hexadecimal characters"
+    );
+    let mut magic = [0_u8; 4];
+    for (index, slot) in magic.iter_mut().enumerate() {
+        let start = index * 2;
+        *slot = u8::from_str_radix(&value[start..start + 2], 16)?;
+    }
+    Ok(magic)
+}
+
 fn parse_network(value: &str) -> anyhow::Result<Network> {
     match value.trim().to_ascii_lowercase().as_str() {
         "main" | "mainnet" | "bitcoin" => Ok(Network::Mainnet),
@@ -807,6 +986,18 @@ fn parse_network(value: &str) -> anyhow::Result<Network> {
     }
 }
 
+fn parse_network_selection(value: &str) -> anyhow::Result<NetworkSelection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "main" | "mainnet" | "bitcoin" => Ok(NetworkSelection::Mainnet),
+        "test" | "testnet" | "testnet3" => Ok(NetworkSelection::Testnet3),
+        "testnet4" => Ok(NetworkSelection::Testnet4),
+        "signet" => Ok(NetworkSelection::Signet),
+        "regtest" => Ok(NetworkSelection::Regtest),
+        "drynet4" => Ok(NetworkSelection::Drynet4),
+        other => bail!("unknown network {other}"),
+    }
+}
+
 fn deserialize_network<'de, D>(deserializer: D) -> core::result::Result<Network, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -815,15 +1006,15 @@ where
     parse_network(&raw).map_err(serde::de::Error::custom)
 }
 
-fn deserialize_optional_network<'de, D>(
+fn deserialize_optional_p2p_magic<'de, D>(
     deserializer: D,
-) -> core::result::Result<Option<Network>, D::Error>
+) -> core::result::Result<Option<[u8; 4]>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
     raw.as_deref()
-        .map(parse_network)
+        .map(parse_p2p_magic)
         .transpose()
         .map_err(serde::de::Error::custom)
 }

@@ -2,6 +2,13 @@
 
 Shared domain vocabulary for this project: entities, named processes, and status concepts with project-specific meaning. Seeded with core domain vocabulary, then accretes as ce-compound processes learnings; direct edits are fine. Glossary only, not a spec or catch-all.
 
+## Node interfaces
+
+### REST gateway
+The optional, unauthenticated Bitcoin Core-compatible HTTP surface served on
+the existing JSON-RPC listener. It is enabled with `rest=1`; JSON-RPC requests
+on the same listener retain their configured authentication.
+
 ## Initial Block Download
 
 ### Initial Block Download (IBD)
@@ -29,6 +36,12 @@ The mainnet consensus checkpoint (height 938343, block `00000000000000000000cceb
 ### Optimized default posture
 The standard node operational configuration tuned for mainnet sync: `fjall` storage backend, multi-peer block download active (outbound peer target 8, pending block budget 128, 16 in-flight requests per peer), hash-pinned assume-valid active on mainnet (height 938343), 450 MiB database cache (`dbcache`, matching Bitcoin Core parity), with secondary indexes (`txindex`, `blockfilterindex`), pruning, and `utreexo` stateless validation disabled by default.
 
+### Container deployment posture
+The checked-in Docker Compose specialization of the optimized default posture. The image compiles only the production `fjall` storage and `bitcoinkernel` verifier features and runs as an unprivileged user. The BIP300/301 integration Compose publishes P2P on the configured host port, keeps JSON-RPC on the host loopback interface, leaves `txindex` and the optional Electrum service disabled, supplies local-development RPC credential fallbacks that deployments should override, and namespaces node and enforcer data by `BITCOIN_RS_NETWORK` so incompatible P2P networks never reuse runtime state. Shutdown allows up to 5 minutes because the bounded subsystem drain is followed by an unbounded, synchronous full-UTXO clean checkpoint; this is an operational SIGKILL guard, not a checkpoint-duration guarantee.
+
+### Node network selection
+The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically supplies consensus rules and P2P bootstrap identity while preserving later, low-level overrides. Standard Bitcoin names use their matching consensus `Network`, message start, and DNS bootstrap. `drynet4` uses mainnet consensus history with message start `eca5d404`, disables Bitcoin DNS seeds, and connects to `drynet4.drivechain.dev:8533`. Compose passes the same selection to bitcoin-rs and the BIP300/301 enforcer and uses it to namespace their data directories. The internal consensus `Network` remains `mainnet` for drynet4.
+
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
 
@@ -45,6 +58,20 @@ Programs and inputs stay role-bound for the full cell. Before each child starts,
 Bitcoin Core's C++ consensus engine (`libbitcoinkernel`), compiled into `bitcoin-rs` as the production consensus default across consensus, node, and binary crates. Beyond script verification it is also the block **parser** on the apply path — see *One-shot kernel block parse*. It validates input scripts across all script classes (legacy, segwit, and Taproot key-path and script-path spends). Default builds require system dependencies (`cmake` and `libboost-dev`). Production transaction and block input-script verification route to bitcoinkernel when default features are enabled, while Rust performs surrounding non-script transaction and block consensus checks; the Rust `Interpreter` remains a separate portable script-verification surface under `--no-default-features`.
 ### bitcoinconsensus
 Removed historical script verification backend. Previously linked as an extracted C library for non-taproot script checks before being deleted in favor of `bitcoinkernel`. The library lacked complete-prevout and Taproot script-path verification capabilities required for current mainnet script validation (exposed by block 938344 during mainnet IBD).
+
+### Difficulty-1 target
+The network-independent reference target used by Bitcoin Core's difficulty
+calculation: compact nBits `0x1d00ffff`, rather than the selected network's
+PoW limit. Confusing the two makes every network report difficulty `1.0` at
+its easiest target. See
+`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
+
+### Float value/text parity
+The distinction between equal IEEE-754 values and equal serialized spellings.
+Core's UniValue uses `%.16g`, while the live RPC path's sonic-rs serializer
+uses shortest-round-trip formatting, so compatibility means preserving the
+value and operation order, not forcing JSON text to match. See
+`docs/solutions/logic-errors/core-float-parity-is-value-parity-not-json-text-parity.md`.
 
 ### Rust interpreter (portable posture)
 The pure-Rust script verification path maintained alongside the bitcoinkernel default. Enabled under `--no-default-features` without C++ build dependencies. Its non-Taproot path is a stub that accepts only a bare `OP_TRUE` spend with an empty scriptSig and witness, so it cannot validate ordinary spends either, and it has no Taproot script-path support. What it does verify is the Taproot key path, in full. It is retained for differential testing and lightweight non-production environments; a mainnet sync stops early on the first real spend.
@@ -144,9 +171,35 @@ keeps its ownership for retry.
 
 Still open around it: returning a disconnected block's transactions through one
 production admission pipeline shared by Electrum, P2P relay, and reorg handling;
-publishing a disconnect notification; and backfilling the filter index after a
-gap. Raw mempool insertion is not reconsideration because it cannot reconstruct
-fee, policy, conflict, and ancestry metadata.
+and backfilling the filter index after a gap. The `pubsequence` stream publishes
+block connect/disconnect notifications, but intentionally does not publish
+mempool `A`/`R` events: the current mempool counter and mutation reasons cannot
+yet guarantee the enforcer's required contiguous transaction event sequence.
+Raw mempool insertion is not reconsideration because it cannot reconstruct fee,
+policy, conflict, and ancestry metadata.
+
+### Sequence stream
+
+The Core-compatible `pubsequence` ZMQ stream is a unified block-event stream.
+Each event carries the block hash, one label (`C` for connect or `D` for
+disconnect), and a topic-local little-endian `u32` sequence counter. Reorg
+disconnects are emitted tip-first before connects on the replacement branch.
+This implementation deliberately omits mempool `A`/`R` events until the
+mempool has per-transaction sequence assignment and explicit removal reasons.
+
+### Chain control
+
+Consensus-affecting RPCs do not mutate the RPC context's block-tree handle
+directly. They delegate through the node-owned `ChainControl` boundary so the
+same apply-admission and chain-transition locks protect RPC-triggered and
+sync-triggered reorganizations. `invalidateblock` marks the named subtree
+invalid, republishes the best remaining header tip, and moves applied
+chainstate to it through the normal disconnect path. Before changing header
+status it previews the replacement tip and loads every body required by the
+complete disconnect/connect plan. The same chain-transition witness remains
+held from that preflight through header invalidation and branch switching, so
+another apply or reorg cannot enter between them; successful disconnects emit
+the same `pubsequence` `D` events as an organic reorg.
 
 ### Dispatch-bound parallelism
 

@@ -29,6 +29,12 @@ impl Handler {
         Self { ctx }
     }
 
+    /// Returns the shared context used by the handlers.
+    #[must_use]
+    pub fn context(&self) -> &Arc<Context> {
+        &self.ctx
+    }
+
     /// Dispatches one Bitcoin Core-compatible JSON-RPC method.
     pub fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
         match method {
@@ -47,6 +53,7 @@ impl Handler {
             "getblockfilter" => chain::getblockfilter(&self.ctx, params),
             "getindexinfo" => chain::getindexinfo(&self.ctx, params),
             "pruneblockchain" => chain::pruneblockchain(&self.ctx, params),
+            "invalidateblock" => chain::invalidateblock(&self.ctx, params),
             "getrawtransaction" => tx::getrawtransaction(&self.ctx, params),
             "gettxout" => tx::gettxout(&self.ctx, params),
             "gettxoutproof" => tx::gettxoutproof(&self.ctx, params),

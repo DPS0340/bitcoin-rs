@@ -67,4 +67,6 @@ pub use run::run;
 pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
 pub use utxo_view::UtxoSetView;
-pub use zmq_publisher::{NoOpZmqPublisher, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher};
+pub use zmq_publisher::{
+    NoOpZmqPublisher, SequenceEvent, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher,
+};

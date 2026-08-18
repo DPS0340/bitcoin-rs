@@ -1,0 +1,12 @@
+.git
+.github
+.agents
+.codex
+.bitcoin-rs
+.env
+target
+**/target
+crash-*
+perf.data*
+flamegraph.svg
+docs/benchmarks/data

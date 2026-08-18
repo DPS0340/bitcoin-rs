@@ -1,7 +1,6 @@
 use core::fmt;
 use std::io;
 
-use sonic_rs::{Value, json};
 use thiserror::Error;
 
 /// JSON-RPC 2.0 and Bitcoin Core-compatible RPC errors.
@@ -69,17 +68,6 @@ impl RpcError {
             Self::NotFound(_) => Self::CORE_NOT_FOUND,
             Self::MethodDisabled(_) | Self::Internal(_) => Self::INTERNAL_ERROR,
         }
-    }
-
-    /// Converts this error into a JSON-RPC response object for `id`.
-    #[must_use]
-    pub fn response(&self, id: &Value) -> Value {
-        json!({
-            "jsonrpc": "2.0",
-            "result": null,
-            "error": {"code": self.code(), "message": self.to_string()},
-            "id": id
-        })
     }
 }
 

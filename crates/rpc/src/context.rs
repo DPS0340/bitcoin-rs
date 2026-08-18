@@ -219,6 +219,29 @@ pub trait PruneService: Send + Sync {
     /// Reports whether pruning is enabled and the highest completed prune height.
     fn status(&self) -> PruneStatus;
 }
+
+/// Node-owned control plane for consensus-affecting chain RPCs.
+pub trait ChainControl: Send + Sync {
+    /// Invalidates a block and descendants and selects the best remaining chain.
+    fn invalidate_block(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<(), ChainControlError>;
+}
+
+/// Failure from a node-owned chain mutation.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ChainControlError {
+    /// The requested block is unknown.
+    #[error("unknown block")]
+    UnknownBlock,
+    /// Genesis cannot be invalidated.
+    #[error("cannot invalidate the genesis block")]
+    Genesis,
+    /// The mutation failed after its request was accepted.
+    #[error("{0}")]
+    Failed(String),
+}
 #[derive(Debug, Default)]
 struct NoopFilterIndex;
 
@@ -272,6 +295,8 @@ pub struct Context {
     pub filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
     /// Optional storage pruning mutator.
     pub prune_service: Option<Arc<dyn PruneService>>,
+    /// Optional node-owned chain mutation service.
+    pub chain_control: Option<Arc<dyn ChainControl>>,
     /// Optional shared confirmed-block indexer used to resolve prevout values for fee statistics.
     /// `None` for embedded/test callers without txindex.
     pub indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
@@ -351,6 +376,7 @@ impl Context {
             filter_index: noop_filter_index(),
             indexer: None,
             prune_service: None,
+            chain_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
             peers: Arc::new(RwLock::new(Vec::new())),
@@ -417,6 +443,7 @@ impl Context {
             banned,
             added_nodes,
             prune_service: None,
+            chain_control: None,
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             mining_sender,
         }
@@ -433,6 +460,13 @@ impl Context {
     #[must_use]
     pub fn with_prune_service(mut self, prune_service: Arc<dyn PruneService>) -> Self {
         self.prune_service = Some(prune_service);
+        self
+    }
+
+    /// Attaches the node-owned chain mutation service.
+    #[must_use]
+    pub fn with_chain_control(mut self, chain_control: Arc<dyn ChainControl>) -> Self {
+        self.chain_control = Some(chain_control);
         self
     }
 
@@ -457,17 +491,29 @@ impl Context {
             .map_or_else(PruneStatus::default, |service| service.status())
     }
 
-    /// Returns the f64 difficulty for `bits`, computed against the network's
-    /// `PoW` limit. Returns `0.0` on any conversion failure.
+    /// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
+    ///
+    /// Keep the operation order here in sync with Core's `GetDifficulty`;
+    /// changing the repeated 256 scaling into an equivalent exponentiation can
+    /// change the final floating-point bit.
     #[must_use]
     pub fn difficulty_for_bits(&self, bits: bitcoin::CompactTarget) -> f64 {
-        let params = bitcoin::params::Params::new(bitcoin_network(self.chain_network));
-        let current_target = bitcoin::pow::Target::from_compact(bits);
-        if current_target == bitcoin::pow::Target::ZERO {
+        let consensus_bits = bits.to_consensus();
+        let mantissa = consensus_bits & 0x00ff_ffff;
+        if mantissa == 0 {
             return 0.0;
         }
-
-        target_to_f64(params.max_attainable_target) / target_to_f64(current_target)
+        let mut shift = (consensus_bits >> 24) & 0xff;
+        let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
+        while shift < 29 {
+            difficulty *= 256.0;
+            shift += 1;
+        }
+        while shift > 29 {
+            difficulty /= 256.0;
+            shift -= 1;
+        }
+        difficulty
     }
 
     /// Publishes a new best-chain tip and wakes getblocktemplate long polls.
@@ -744,13 +790,6 @@ fn bitcoin_network(network: Network) -> bitcoin::Network {
         Network::Signet => bitcoin::Network::Signet,
         Network::Regtest => bitcoin::Network::Regtest,
     }
-}
-
-fn target_to_f64(target: bitcoin::pow::Target) -> f64 {
-    target
-        .to_be_bytes()
-        .iter()
-        .fold(0.0_f64, |acc, &byte| acc.mul_add(256.0, f64::from(byte)))
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@ pub enum ZmqTopic {
     RawBlock,
     /// Raw serialized transaction notification.
     RawTx,
+    /// Block sequence notification.
+    Sequence,
 }
 
 impl ZmqTopic {
@@ -38,6 +40,7 @@ impl ZmqTopic {
             Self::HashTx => "hashtx",
             Self::RawBlock => "rawblock",
             Self::RawTx => "rawtx",
+            Self::Sequence => "sequence",
         }
     }
 
@@ -49,6 +52,7 @@ impl ZmqTopic {
             Self::HashTx => "pubhashtx",
             Self::RawBlock => "pubrawblock",
             Self::RawTx => "pubrawtx",
+            Self::Sequence => "pubsequence",
         }
     }
 
@@ -58,6 +62,31 @@ impl ZmqTopic {
             Self::HashTx => 1,
             Self::RawBlock => 2,
             Self::RawTx => 3,
+            Self::Sequence => 4,
+        }
+    }
+}
+
+/// Event published on Core's unified `sequence` topic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceEvent {
+    /// A block was connected.
+    Connected(Hash256),
+    /// A block was disconnected.
+    Disconnected(Hash256),
+}
+
+impl SequenceEvent {
+    fn hash(self) -> Hash256 {
+        match self {
+            Self::Connected(hash) | Self::Disconnected(hash) => hash,
+        }
+    }
+
+    const fn label(self) -> u8 {
+        match self {
+            Self::Connected(_) => b'C',
+            Self::Disconnected(_) => b'D',
         }
     }
 }
@@ -104,6 +133,9 @@ pub trait ZmqPublisher: Send + Sync + core::fmt::Debug {
 
     /// Publish a `rawtx` notification with the serialized transaction bytes.
     fn publish_rawtx(&self, bytes: &[u8]);
+
+    /// Publish a block event on Core's unified `sequence` topic.
+    fn publish_sequence(&self, _event: SequenceEvent) {}
 }
 
 /// Default no-op implementation. All methods discard their input silently.
@@ -132,6 +164,8 @@ impl ZmqPublisher for NoOpZmqPublisher {
     fn publish_rawblock(&self, _bytes: &[u8]) {}
 
     fn publish_rawtx(&self, _bytes: &[u8]) {}
+
+    fn publish_sequence(&self, _event: SequenceEvent) {}
 }
 
 /// `ZmqPublisher` that emits each event via `tracing::info!`.
@@ -173,6 +207,15 @@ impl ZmqPublisher for TracingZmqPublisher {
             len = bytes.len(),
         );
     }
+
+    fn publish_sequence(&self, event: SequenceEvent) {
+        tracing::info!(
+            target: "bitcoin_rs_node::zmq",
+            topic = "sequence",
+            hash = %event.hash().to_string_be(),
+            label = event.label(),
+        );
+    }
 }
 
 struct EndpointSocket {
@@ -188,7 +231,8 @@ pub struct SocketZmqPublisher {
     hashtx_endpoints: Vec<usize>,
     rawblock_endpoints: Vec<usize>,
     rawtx_endpoints: Vec<usize>,
-    counters: [AtomicU32; 4],
+    sequence_endpoints: Vec<usize>,
+    counters: [AtomicU32; 5],
 }
 
 impl fmt::Debug for SocketZmqPublisher {
@@ -210,6 +254,7 @@ impl SocketZmqPublisher {
         let mut hashtx_endpoints = Vec::new();
         let mut rawblock_endpoints = Vec::new();
         let mut rawtx_endpoints = Vec::new();
+        let mut sequence_endpoints = Vec::new();
 
         for publication in publications {
             if let Some(existing_hwm) = endpoint_hwms.get(&publication.endpoint) {
@@ -258,6 +303,7 @@ impl SocketZmqPublisher {
                 ZmqTopic::HashTx => hashtx_endpoints.push(endpoint_index),
                 ZmqTopic::RawBlock => rawblock_endpoints.push(endpoint_index),
                 ZmqTopic::RawTx => rawtx_endpoints.push(endpoint_index),
+                ZmqTopic::Sequence => sequence_endpoints.push(endpoint_index),
             }
         }
 
@@ -268,6 +314,7 @@ impl SocketZmqPublisher {
             hashtx_endpoints,
             rawblock_endpoints,
             rawtx_endpoints,
+            sequence_endpoints,
             counters: core::array::from_fn(|_| AtomicU32::new(0)),
         })
     }
@@ -299,6 +346,7 @@ impl SocketZmqPublisher {
             ZmqTopic::HashTx => &self.hashtx_endpoints,
             ZmqTopic::RawBlock => &self.rawblock_endpoints,
             ZmqTopic::RawTx => &self.rawtx_endpoints,
+            ZmqTopic::Sequence => &self.sequence_endpoints,
         }
     }
 }
@@ -333,11 +381,22 @@ impl ZmqPublisher for SocketZmqPublisher {
     fn publish_rawtx(&self, bytes: &[u8]) {
         self.publish(ZmqTopic::RawTx, bytes);
     }
+
+    fn publish_sequence(&self, event: SequenceEvent) {
+        self.publish(ZmqTopic::Sequence, &sequence_payload(event));
+    }
 }
 
 pub(crate) fn hash_body_from_hash(hash: Hash256) -> [u8; 32] {
     let mut body = hash.to_le_bytes();
     body.reverse();
+    body
+}
+
+pub(crate) fn sequence_payload(event: SequenceEvent) -> [u8; 33] {
+    let mut body = [0_u8; 33];
+    body[..32].copy_from_slice(&hash_body_from_hash(event.hash()));
+    body[32] = event.label();
     body
 }
 
@@ -377,6 +436,7 @@ mod tests {
         publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
         publisher.publish_rawblock(&[]);
         publisher.publish_rawtx(&[]);
+        publisher.publish_sequence(SequenceEvent::Connected(Hash256::default()));
     }
 
     #[test]
@@ -389,6 +449,7 @@ mod tests {
         publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
         publisher.publish_rawblock(&[1, 2, 3]);
         publisher.publish_rawtx(&[4, 5, 6]);
+        publisher.publish_sequence(SequenceEvent::Disconnected(Hash256::default()));
     }
 
     #[test]
@@ -403,6 +464,26 @@ mod tests {
 
         assert_eq!(hash_body_from_hash(hash), expected);
         assert_eq!(sequence_body(0x0102_0304), [0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn sequence_event_payload_uses_core_hash_orientation_and_label() {
+        let le = core::array::from_fn(|index| u8::try_from(index).unwrap_or_default());
+        let hash = Hash256::from_le_bytes(&le);
+        assert_eq!(
+            sequence_payload(SequenceEvent::Connected(hash)),
+            [
+                31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+                10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, b'C'
+            ]
+        );
+        assert_eq!(
+            sequence_payload(SequenceEvent::Disconnected(hash)),
+            [
+                31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11,
+                10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, b'D'
+            ]
+        );
     }
 
     #[test]
@@ -501,5 +582,50 @@ mod tests {
         }
 
         anyhow::bail!("timed out waiting for ZMQ PUB/SUB notification")
+    }
+
+    #[test]
+    fn socket_publisher_delivers_shared_sequence_stream() -> anyhow::Result<()> {
+        let socket_dir = tempfile::tempdir()?;
+        let socket_path = socket_dir.path().join("sequence.sock");
+        let endpoint = format!("ipc://{}", socket_path.display());
+        let publisher = SocketZmqPublisher::bind(&[ZmqPublication {
+            topic: ZmqTopic::Sequence,
+            endpoint: endpoint.clone(),
+            hwm: 10,
+        }])?;
+        let context = zmq::Context::new();
+        let subscriber = context.socket(zmq::SUB)?;
+        subscriber.set_subscribe(b"sequence")?;
+        subscriber.connect(&endpoint)?;
+
+        let hash = Hash256::from_le_bytes(&[0x22_u8; 32]);
+        thread::sleep(Duration::from_millis(100));
+        publisher.publish_sequence(SequenceEvent::Connected(hash));
+        publisher.publish_sequence(SequenceEvent::Disconnected(hash));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received = Vec::new();
+        while Instant::now() < deadline && received.len() < 2 {
+            match subscriber.recv_multipart(zmq::DONTWAIT) {
+                Ok(frames) => received.push(frames),
+                Err(zmq::Error::EAGAIN) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        assert_eq!(received.len(), 2);
+        let connected = &received[0];
+        let disconnected = &received[1];
+        assert_eq!(connected[0], b"sequence");
+        assert_eq!(connected[1].len(), 33);
+        assert_eq!(connected[1][..32], hash_body_from_hash(hash));
+        assert_eq!(connected[1][32], b'C');
+        assert_eq!(disconnected[1][..32], hash_body_from_hash(hash));
+        assert_eq!(disconnected[1][32], b'D');
+        let connected_sequence = u32::from_le_bytes(connected[2].as_slice().try_into()?);
+        let disconnected_sequence = u32::from_le_bytes(disconnected[2].as_slice().try_into()?);
+        assert_eq!(disconnected_sequence, connected_sequence + 1);
+        Ok(())
     }
 }

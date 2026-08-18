@@ -19,13 +19,15 @@ pub mod context;
 pub mod error;
 /// Method dispatch and Core-compatible handlers.
 pub mod handlers;
+/// Bitcoin Core-compatible REST endpoints.
+pub mod rest;
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub mod server;
 
 pub use auth::Auth;
 pub use context::{
-    BlockBodyMetadata, BlockBodySource, BlockRecord, Context, NetworkState, PruneResult,
-    PruneService, PruneServiceError, PruneStatus, ZmqNotification,
+    BlockBodyMetadata, BlockBodySource, BlockRecord, ChainControl, ChainControlError, Context,
+    NetworkState, PruneResult, PruneService, PruneServiceError, PruneStatus, ZmqNotification,
 };
 pub use error::RpcError;
 pub use handlers::Handler;

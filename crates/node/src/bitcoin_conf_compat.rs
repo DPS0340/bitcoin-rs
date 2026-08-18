@@ -54,6 +54,7 @@ fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
         "rpcuser" => layer.rpc_user = Some(value.to_owned()),
         "rpcpassword" => layer.rpc_password = Some(value.to_owned()),
         "rpccookiefile" => layer.rpc_cookie = Some(value.into()),
+        "rest" => layer.rest = parse_core_bool(value),
         "listen" if parse_core_bool(value).is_some_and(|listen| !listen) => {
             layer.p2p_listen = Some(Vec::new());
         }
@@ -68,10 +69,12 @@ fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
         "zmqpubhashtx" => push_endpoint(&mut layer.zmqpubhashtx, value),
         "zmqpubrawblock" => push_endpoint(&mut layer.zmqpubrawblock, value),
         "zmqpubrawtx" => push_endpoint(&mut layer.zmqpubrawtx, value),
+        "zmqpubsequence" => push_endpoint(&mut layer.zmqpubsequence, value),
         "zmqpubhashblockhwm" => layer.zmqpubhashblockhwm = value.parse().ok(),
         "zmqpubhashtxhwm" => layer.zmqpubhashtxhwm = value.parse().ok(),
         "zmqpubrawblockhwm" => layer.zmqpubrawblockhwm = value.parse().ok(),
         "zmqpubrawtxhwm" => layer.zmqpubrawtxhwm = value.parse().ok(),
+        "zmqpubsequencehwm" => layer.zmqpubsequencehwm = value.parse().ok(),
         _ => {}
     }
     if layer.rpc_user.is_some() || layer.rpc_password.is_some() {
@@ -139,6 +142,9 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.rpc_bind.is_some() {
             self.rpc_bind = other.rpc_bind;
         }
+        if other.rest.is_some() {
+            self.rest = other.rest;
+        }
         if other.rpc_auth.is_some() {
             self.rpc_auth.clone_from(&other.rpc_auth);
         }
@@ -196,6 +202,9 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.zmqpubrawtx.is_some() {
             self.zmqpubrawtx.clone_from(&other.zmqpubrawtx);
         }
+        if other.zmqpubsequence.is_some() {
+            self.zmqpubsequence.clone_from(&other.zmqpubsequence);
+        }
         if other.zmqpubhashblockhwm.is_some() {
             self.zmqpubhashblockhwm = other.zmqpubhashblockhwm;
         }
@@ -207,6 +216,9 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.zmqpubrawtxhwm.is_some() {
             self.zmqpubrawtxhwm = other.zmqpubrawtxhwm;
+        }
+        if other.zmqpubsequencehwm.is_some() {
+            self.zmqpubsequencehwm = other.zmqpubsequencehwm;
         }
     }
 }

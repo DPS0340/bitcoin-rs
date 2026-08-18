@@ -1,7 +1,7 @@
 //! Top-level orchestration: wire subsystems, spin the event loop, drain.
 
 use crate as bitcoin_rs_node;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -65,6 +65,28 @@ type BannedSubnets = Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>
 type P2pChainQuery = Arc<dyn bitcoin_rs_p2p::ChainQuery>;
 type OutboundConnectionHandle =
     std::thread::JoinHandle<core::result::Result<(), bitcoin_rs_p2p::PeerError>>;
+
+#[derive(Clone)]
+struct RpcChainControl {
+    handles: crate::apply::ApplyHandles,
+}
+
+impl bitcoin_rs_rpc::ChainControl for RpcChainControl {
+    fn invalidate_block(
+        &self,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> core::result::Result<(), bitcoin_rs_rpc::ChainControlError> {
+        crate::reorg::invalidate_block(&self.handles, hash).map_err(|error| match error {
+            crate::reorg::ReorgError::UnknownBlock(_) => {
+                bitcoin_rs_rpc::ChainControlError::UnknownBlock
+            }
+            crate::reorg::ReorgError::CannotInvalidateGenesis => {
+                bitcoin_rs_rpc::ChainControlError::Genesis
+            }
+            other => bitcoin_rs_rpc::ChainControlError::Failed(other.to_string()),
+        })
+    }
+}
 
 /// Bounds rapid DNS retries while the initial outbound pool is still empty.
 #[derive(Default)]
@@ -174,7 +196,7 @@ fn spawn_p2p_listeners(
 ) -> anyhow::Result<Vec<std::thread::JoinHandle<Result<(), bitcoin_rs_p2p::listener::ListenerError>>>>
 {
     let mut handles = Vec::with_capacity(config.p2p_listen.len());
-    let magic = bitcoin::p2p::Magic::from_bytes(config.network.magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(config.p2p_magic());
     for addr in &config.p2p_listen {
         let listener_addr = *addr;
         let listener_shutdown = std::sync::Arc::clone(shutdown);
@@ -260,7 +282,7 @@ fn spawn_p2p_outbound_drain(
     >,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let outbound_rx = state.p2p_outbound_receiver();
-    let magic = bitcoin::p2p::Magic::from_bytes(state.config().network.magic());
+    let magic = bitcoin::p2p::Magic::from_bytes(state.config().p2p_magic());
     let outbound_registry = state.peers();
     let outbound_peer_outbound = state.peer_outbound();
     let outbound_banned = state.banned_subnets();
@@ -524,15 +546,24 @@ fn spawn_fixed_peer_bootstrap(
             .name("bitcoin-rs-fixed-peer-bootstrap".to_owned())
             .spawn(move || {
                 while !bootstrap_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    for addr in &connect {
-                        if peer_outbound.read().contains_key(addr)
-                            || peers.read().iter().any(|peer| peer.addr == *addr)
-                        {
-                            continue;
-                        }
-                        if outbound_tx.try_send(*addr).is_err() {
-                            // Queue full or closed; retry on the next tick.
-                            break;
+                    'endpoints: for endpoint in &connect {
+                        let addresses = match endpoint.as_str().to_socket_addrs() {
+                            Ok(addresses) => addresses,
+                            Err(error) => {
+                                tracing::warn!(endpoint, %error, "fixed peer resolution failed");
+                                continue;
+                            }
+                        };
+                        for addr in addresses {
+                            if peer_outbound.read().contains_key(&addr)
+                                || peers.read().iter().any(|peer| peer.addr == addr)
+                            {
+                                continue;
+                            }
+                            if outbound_tx.try_send(addr).is_err() {
+                                // Queue full or closed; retry on the next tick.
+                                break 'endpoints;
+                            }
                         }
                     }
                     if wait_for_shutdown(&bootstrap_shutdown, Duration::from_secs(2)) {
@@ -618,6 +649,9 @@ pub fn run(mut config: Config) -> Result<()> {
     if let Some(prune_service) = state.prune_service() {
         rpc_context = rpc_context.with_prune_service(prune_service);
     }
+    rpc_context = rpc_context.with_chain_control(Arc::new(RpcChainControl {
+        handles: state.apply_handles(),
+    }));
     rpc_context = rpc_context.with_zmq_notifications(state.active_zmq_notifications());
     let rpc_handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::new(rpc_context)));
     let rpc_server = bitcoin_rs_rpc::RpcServer::bind(
@@ -626,6 +660,7 @@ pub fn run(mut config: Config) -> Result<()> {
         rpc_handler,
         RPC_MAX_CONNECTIONS,
         RPC_IDLE_TIMEOUT,
+        state.config().rest,
     )?;
     let rpc_local_addr = rpc_server.local_addr()?;
     tracing::info!(addr = %rpc_local_addr, "rpc listener bound");
@@ -883,7 +918,7 @@ mod tests {
         // below is exercised — with an empty `connect`, `bootstrap_worker`
         // would be `None` and the cleanup-ordering assertion could not catch a
         // regression that moves `?` back onto `write_clean_checkpoint`.
-        config.connect = vec![SocketAddr::from(([127, 0, 0, 1], 1))];
+        config.connect = vec!["127.0.0.1:1".to_owned()];
 
         let state = crate::state::NodeState::open(config.clone())?;
         state.apply_block(&bitcoin::blockdata::constants::genesis_block(
