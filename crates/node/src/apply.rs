@@ -1654,6 +1654,9 @@ fn prove_window(
         if verdict.is_err() {
             return Vec::new();
         }
+        if !units.is_empty() {
+            metrics::counter!("node.window.verify_success_total").increment(1);
+        }
     }
 
     prepared
@@ -6162,6 +6165,7 @@ mod consensus_rule_tests {
     fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::OP_EQUAL;
+        let (recorder, metrics_handle) = crate::metrics::test_recorder();
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let prevout = bitcoin::OutPoint {
@@ -6216,7 +6220,8 @@ mod consensus_rule_tests {
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
         let (handles, block, raw) = build(100)?;
-        let proven = prove_window(&handles, &[&block], &[raw]);
+        let proven =
+            metrics::with_local_recorder(&recorder, || prove_window(&handles, &[&block], &[raw]));
         assert_eq!(
             proven.len(),
             1,
@@ -6230,6 +6235,13 @@ mod consensus_rule_tests {
             "a skipped block must carry no script proof: the proof branch bypasses the \
              trust-gate re-read at commit, so a gate that flips in between would let an \
              unverified block through"
+        );
+        assert_eq!(
+            metrics_handle
+                .snapshot()
+                .get("node.window.verify_success_total"),
+            None,
+            "an empty verification dispatch must not count as script verification",
         );
 
         // Full verification must be completely unaffected.
