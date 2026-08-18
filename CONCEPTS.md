@@ -37,7 +37,7 @@ The two distinct cost regimes any sync measurement must name before its numbers 
 ### Native benchmark custody
 The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
 
-Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. Later validation recomputes the verdict from the custody artifacts. Custody proves internal consistency, not a cryptographic signature.
+Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. A successful arm includes complete process and resource measurements. A demonstrated correctness failure remains a failure when the other arm has no result. Later validation recomputes the verdict from the custody artifacts and rechecks every input after the last evidence read. Custody proves internal consistency, not a cryptographic signature.
 
 ## Consensus validation
 
@@ -195,7 +195,7 @@ Replay state stability is certified by untimed durability proofs (`crates/node/e
 
 A `BRSHGT1` checkpoint that binds one replay height and block hash to the committed row counts and byte endpoints of the `BRSCTX1`, `BRSREC1`, and `BRSJRN1` evidence streams. The proof is complete when every committed slice validates, all 11 Cmodern context classes have appeared, and the checkpoint height equals the last first-occurrence height. Child process exit is a separate fact. Slow chainstate teardown or a forced post-proof kill does not erase completed evidence and must not be reported as a clean exit.
 
-Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`. The final recovery stream hash must equal the validated source committed-prefix hash before candidate publication. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. It creates missing recovery ancestors root-to-leaf and fsyncs each parent. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; exact JSON clones must match the source size and digest, while normalized binary bodies must match their validated source bodies. Source and recovery descriptors and paths stay stable through candidate publication. A late mismatch durably removes the candidate. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
 
 ### Front-half duplication
 

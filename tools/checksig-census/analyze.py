@@ -1713,6 +1713,19 @@ def _finalize_candidate(
                 raise AnalyzerError(
                     f"DIAG-SALVAGE: source {name} has invalid clone provenance"
                 )
+        for name in ("replay", "counters"):
+            identity = source_custody[name]
+            if identity["clone_provenance"] != CLONE_EXACT_FULL_FILE:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} must be an exact full-file clone"
+                )
+            if (
+                identity["bytes"] != custody[name]["bytes"]
+                or identity["sha256"] != custody[name]["sha256"]
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: exact recovery {name} does not match source"
+                )
         for name in ("contexts", "records", "journal", "sidecar"):
             identity = source_custody[name]
             source_body_sha256 = identity.get("committed_body_sha256")
@@ -2325,14 +2338,20 @@ def _clone_committed_source(
         if len(source_header) != len(replacement_header):
             raise AnalyzerError(f"DIAG-SALVAGE: short source header: {source}")
 
-    source_digest = source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
+    source_digest = (
+        source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
+    )
     if committed_size == before.st_size and source_committed_prefix_sha256 is not None:
         if source_committed_prefix_sha256 != source_digest:
             raise AnalyzerError(
                 f"DIAG-SALVAGE: source committed-prefix digest mismatch: {source}"
             )
     if _fd_signature(source_fd) != (
-        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
     ):
         raise AnalyzerError(f"DIAG-SALVAGE: source changed before cloning: {source}")
 
@@ -2379,16 +2398,57 @@ def _clone_committed_source(
             _copy_fd_fallback(source_fd, destination_fd, committed_size)
         os.ftruncate(destination_fd, committed_size)
         if replacement_header is not None:
-            if os.pwrite(destination_fd, replacement_header, 0) != len(replacement_header):
+            if os.pwrite(destination_fd, replacement_header, 0) != len(
+                replacement_header
+            ):
                 raise AnalyzerError("DIAG-SALVAGE: short recovery header write")
         os.fsync(destination_fd)
         if _fd_signature(source_fd) != (
-            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
         ):
-            raise AnalyzerError(f"DIAG-SALVAGE: source changed while cloning: {source}")
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source changed while cloning: {source}"
+            )
         return identity
     finally:
         os.close(destination_fd)
+
+
+def _verify_retained_files(
+    paths: dict[str, Path],
+    descriptors: dict[str, int],
+    signatures: dict[str, tuple[int, int, int, int, int]],
+    phase: str,
+) -> None:
+    for name, descriptor in descriptors.items():
+        if (
+            _fd_signature(descriptor) != signatures[name]
+            or _path_signature(paths[name]) != signatures[name]
+        ):
+            raise AnalyzerError(f"DIAG-SALVAGE: {phase}: {paths[name]}")
+
+
+def _mkdir_exclusive_durable(path: Path) -> None:
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    if not cursor.is_dir():
+        raise AnalyzerError(
+            f"DIAG-SETUP: recovery ancestor is not a directory: {cursor}"
+        )
+    for directory in reversed(missing):
+        directory.mkdir()
+        parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
 
 def _materialize_recovery_dir(
@@ -2402,12 +2462,7 @@ def _materialize_recovery_dir(
     dict[str, tuple[int, int, int, int, int]],
 ]:
     """Clone only checkpoint-committed evidence into a new directory."""
-    recovery_dir.mkdir(parents=True, exist_ok=False)
-    parent_fd = os.open(recovery_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+    _mkdir_exclusive_durable(recovery_dir)
     recovery_paths = _diagnostic_artifact_paths(recovery_dir)
     final = reconstruction.final
     source_custody: dict[str, dict[str, object]] = {}
@@ -2497,6 +2552,7 @@ def _salvage_diagnostic_scan(
     source_paths = _diagnostic_artifact_paths(source_dir)
     source_fds: dict[str, int] = {}
     source_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    recovery_fds: dict[str, int] = {}
     succeeded = False
     try:
         for name, path in source_paths.items():
@@ -2507,15 +2563,12 @@ def _salvage_diagnostic_scan(
             row_count,
             source_fds,
         )
-        for name, fd in source_fds.items():
-            if (
-                _fd_signature(fd) != source_signatures[name]
-                or _path_signature(source_paths[name]) != source_signatures[name]
-            ):
-                raise AnalyzerError(
-                    f"DIAG-SALVAGE: source changed during reconstruction: "
-                    f"{source_paths[name]}"
-                )
+        _verify_retained_files(
+            source_paths,
+            source_fds,
+            source_signatures,
+            "source changed during reconstruction",
+        )
         recovery_paths, source_custody, recovery_signatures = (
             _materialize_recovery_dir(
                 source_paths,
@@ -2524,15 +2577,20 @@ def _salvage_diagnostic_scan(
                 source_reconstruction,
             )
         )
-        for name, fd in source_fds.items():
-            if (
-                _fd_signature(fd) != source_signatures[name]
-                or _path_signature(source_paths[name]) != source_signatures[name]
-            ):
-                raise AnalyzerError(
-                    f"DIAG-SALVAGE: source changed during materialization: "
-                    f"{source_paths[name]}"
-                )
+        _verify_retained_files(
+            source_paths,
+            source_fds,
+            source_signatures,
+            "source changed during materialization",
+        )
+        for name, path in recovery_paths.items():
+            recovery_fds[name] = os.open(path, os.O_RDONLY)
+        _verify_retained_files(
+            recovery_paths,
+            recovery_fds,
+            recovery_signatures,
+            "recovery changed during materialization",
+        )
         teardown = DiagnosticTeardown(
             None,
             "unobserved",
@@ -2555,8 +2613,40 @@ def _salvage_diagnostic_scan(
             teardown,
             recovery_signatures,
         )
+        try:
+            _verify_retained_files(
+                source_paths,
+                source_fds,
+                source_signatures,
+                "source changed after candidate publication",
+            )
+            _verify_retained_files(
+                recovery_paths,
+                recovery_fds,
+                recovery_signatures,
+                "recovery changed after candidate publication",
+            )
+        except BaseException as custody_error:
+            try:
+                try:
+                    output_path.unlink()
+                except FileNotFoundError:
+                    # The candidate is already absent; fsync its parent below.
+                    pass
+                parent_fd = os.open(
+                    output_path.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError as rollback_error:
+                raise rollback_error from custody_error
+            raise
         succeeded = True
     finally:
+        for fd in recovery_fds.values():
+            os.close(fd)
         for fd in source_fds.values():
             os.close(fd)
         if recovery_dir.exists() and not succeeded:

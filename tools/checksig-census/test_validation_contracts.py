@@ -6197,6 +6197,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
         recovery_dir = tmp / "recovery"
         output = tmp / "salvaged.json"
         path_signature = analyze._path_signature
+        fd_signature = analyze._fd_signature
         captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
 
         def signature_then_replace(path: Path) -> tuple[int, int, int, int, int]:
@@ -6217,7 +6218,12 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
                     os.fsync(f.fileno())
             return sig
 
+        def stable_mutated_fd(fd: int) -> tuple[int, int, int, int, int]:
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            return captured_signatures.get(path, fd_signature(fd))
+
         analyze._path_signature = signature_then_replace
+        analyze._fd_signature = stable_mutated_fd
         try:
             _raises_with(
                 AnalyzerError,
@@ -6234,11 +6240,228 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
                 "validated source committed body",
             )
         finally:
+            analyze._fd_signature = fd_signature
             analyze._path_signature = path_signature
         assert _directory_hashes(source_dir) == source_before
         assert not recovery_dir.exists()
         assert not output.exists()
 
+
+def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
+    """An exact JSON clone must remain byte-identical to its source."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        source_before = _directory_hashes(source_dir)
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        path_signature = analyze._path_signature
+        validate_replay = analyze._validate_replay_diagnostic
+        replay_signature: tuple[int, int, int, int, int] | None = None
+
+        def stable_replay_signature(path: Path) -> tuple[int, int, int, int, int]:
+            nonlocal replay_signature
+            if path == recovery_dir / "replay_diagnostic.json":
+                if replay_signature is None:
+                    replay_signature = path_signature(path)
+                return replay_signature
+            return path_signature(path)
+
+        def mutate_then_validate(
+            path: Path,
+            final: DiagnosticCheckpoint,
+            ceiling: int,
+            storage_backend: str,
+            txindex: bool,
+            blockfilterindex: bool,
+            data_dir: str,
+        ) -> None:
+            replay = json.loads(path.read_text())
+            replay["elapsed_seconds"] = 1.0
+            path.write_text(json.dumps(replay, indent=2) + "\n")
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            validate_replay(
+                path,
+                final,
+                ceiling,
+                storage_backend,
+                txindex,
+                blockfilterindex,
+                data_dir,
+            )
+
+        analyze._path_signature = stable_replay_signature
+        analyze._validate_replay_diagnostic = mutate_then_validate
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "semantically valid exact replay replacement",
+                "exact recovery replay does not match source",
+            )
+        finally:
+            analyze._validate_replay_diagnostic = validate_replay
+            analyze._path_signature = path_signature
+        assert _directory_hashes(source_dir) == source_before
+        assert not recovery_dir.exists()
+        assert not output.exists()
+
+
+
+def test_salvage_rolls_back_candidate_after_post_publication_replacement() -> None:
+    """Late source or recovery replacement removes and durably rolls back output."""
+    for replaced_set in ("source", "recovery"):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            stage = _write_diagnostic_stage(tmp)
+            source_dir = tmp / "source"
+            source_dir.mkdir()
+            clean_output = tmp / "clean.json"
+            meta_path = _build_meta(tmp, stage, 100, source_dir)
+            child = _make_fake_binary(tmp)
+            os.environ["FAKE_CENSUS_META"] = str(meta_path)
+            os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+            try:
+                _run_diagnostic_scan(
+                    child, "127.0.0.1:18443", 100, source_dir, clean_output
+                )
+            finally:
+                os.environ.pop("FAKE_CENSUS_META", None)
+                os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+            recovery_dir = tmp / "recovery"
+            output = tmp / "salvaged.json"
+            write_json_atomic = analyze._write_json_atomic
+            original_fsync = os.fsync
+            published = False
+            rollback_fsynced = False
+
+            def tracking_fsync(fd):
+                nonlocal rollback_fsynced
+                status = os.fstat(fd)
+                if (
+                    published
+                    and not output.exists()
+                    and stat.S_ISDIR(status.st_mode)
+                    and Path(os.readlink(f"/proc/self/fd/{fd}")) == output.parent
+                ):
+                    rollback_fsynced = True
+                return original_fsync(fd)
+
+            def publish_then_replace(path: Path, value: dict[str, object]) -> None:
+                nonlocal published
+                write_json_atomic(path, value)
+                published = True
+                artifact_root = (
+                    source_dir if replaced_set == "source" else recovery_dir
+                )
+                artifact = artifact_root / "replay_diagnostic.json"
+                held = artifact.with_name("held-replay.json")
+                artifact.rename(held)
+                artifact.write_bytes(held.read_bytes())
+                with artifact.open("rb") as stream:
+                    original_fsync(stream.fileno())
+
+            analyze._write_json_atomic = publish_then_replace
+            os.fsync = tracking_fsync
+            try:
+                _raises_with(
+                    AnalyzerError,
+                    lambda: analyze._salvage_diagnostic_scan(
+                        source_dir,
+                        recovery_dir,
+                        output,
+                        "127.0.0.1:18443",
+                        100,
+                        str(source_dir / "state"),
+                    ),
+                    f"post-publication {replaced_set} replacement",
+                    f"{replaced_set} changed after candidate publication",
+                )
+            finally:
+                os.fsync = original_fsync
+                analyze._write_json_atomic = write_json_atomic
+            assert published
+            assert rollback_fsynced
+            assert not output.exists()
+            assert not recovery_dir.exists()
+
+
+def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
+    """An interrupt during final custody verification cannot orphan output."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        verify_retained = analyze._verify_retained_files
+
+        def interrupt_after_publication(
+            paths: dict[str, Path],
+            descriptors: dict[str, int],
+            signatures: dict[str, tuple[int, int, int, int, int]],
+            phase: str,
+        ) -> None:
+            if "after candidate publication" in phase:
+                raise KeyboardInterrupt
+            verify_retained(paths, descriptors, signatures, phase)
+
+        analyze._verify_retained_files = interrupt_after_publication
+        try:
+            _raises(
+                KeyboardInterrupt,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "post-publication interrupt",
+            )
+        finally:
+            analyze._verify_retained_files = verify_retained
+        assert not output.exists()
+        assert not recovery_dir.exists()
 
 def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
     """A salvaged sidecar must keep its reconstructed count header."""
@@ -6271,6 +6494,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
         recovery_dir = tmp / "recovery"
         output = tmp / "salvaged.json"
         path_signature = analyze._path_signature
+        fd_signature = analyze._fd_signature
         captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
 
         def signature_then_zero_count(path: Path) -> tuple[int, int, int, int, int]:
@@ -6287,7 +6511,12 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
                     os.close(recovery_fd)
             return signature
 
+        def stable_zeroed_fd(fd: int) -> tuple[int, int, int, int, int]:
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            return captured_signatures.get(path, fd_signature(fd))
+
         analyze._path_signature = signature_then_zero_count
+        analyze._fd_signature = stable_zeroed_fd
         try:
             _raises_with(
                 AnalyzerError,
@@ -6303,6 +6532,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
                 "recovered sidecar declared row count",
             )
         finally:
+            analyze._fd_signature = fd_signature
             analyze._path_signature = path_signature
         assert _directory_hashes(source_dir) == source_before
         assert not recovery_dir.exists()
@@ -7266,28 +7496,29 @@ def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
 
 
 def test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir() -> None:
-    """The newly created recovery_dir directory entry is made durable by
-    fsyncing its parent after mkdir, before any files are written inside.
-    The recovery directory itself is fsynced after its contents are placed.
-    Both must occur and the parent must precede the recovery directory."""
+    """Each new recovery ancestor becomes durable before its child is used."""
     from analyze import DiagnosticReconstruction
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         source_dir = tmp / "source"
         source_dir.mkdir()
         source_paths = analyze._diagnostic_artifact_paths(source_dir)
-
         for path in source_paths.values():
             path.write_bytes(b"\x00" * 32)
 
-        source_fds: dict[str, int] = {}
-        for name, path in source_paths.items():
-            source_fds[name] = os.open(path, os.O_RDONLY)
-
-        recovery_dir = tmp / "recovery"
-        parent_resolved = str(recovery_dir.parent.resolve())
-        recovery_resolved = str(recovery_dir.resolve())
-
+        source_fds = {
+            name: os.open(path, os.O_RDONLY) for name, path in source_paths.items()
+        }
+        ancestor_a = tmp / "new-a"
+        ancestor_b = ancestor_a / "new-b"
+        recovery_dir = ancestor_b / "recovery"
+        expected_order = [
+            str(tmp.resolve()),
+            str(ancestor_a.resolve()),
+            str(ancestor_b.resolve()),
+            str(recovery_dir.resolve()),
+        ]
         final = DiagnosticCheckpoint(
             height=0,
             block_hash_le=b"\x00" * 32,
@@ -7305,20 +7536,13 @@ def test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir() -> None:
             first_heights={},
             source_stream_digests={},
         )
-
         original_fsync = os.fsync
-        dir_fsync_order: list[str] = []
+        fsynced_directories: list[str] = []
 
         def tracking_fsync(fd):
-            st = os.fstat(fd)
-            if stat.S_ISDIR(st.st_mode):
-                fd_path = os.readlink(f"/proc/self/fd/{fd}")
-                if fd_path == parent_resolved:
-                    dir_fsync_order.append("parent")
-                elif fd_path == recovery_resolved:
-                    dir_fsync_order.append("recovery_dir")
-                else:
-                    dir_fsync_order.append(f"other:{fd_path}")
+            status = os.fstat(fd)
+            if stat.S_ISDIR(status.st_mode):
+                fsynced_directories.append(os.readlink(f"/proc/self/fd/{fd}"))
             return original_fsync(fd)
 
         try:
@@ -7331,16 +7555,9 @@ def test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir() -> None:
             for fd in source_fds.values():
                 os.close(fd)
 
-        assert "parent" in dir_fsync_order, (
-            f"parent directory must be fsynced, got {dir_fsync_order}"
-        )
-        assert "recovery_dir" in dir_fsync_order, (
-            f"recovery directory must be fsynced, got {dir_fsync_order}"
-        )
-        parent_idx = dir_fsync_order.index("parent")
-        recovery_idx = dir_fsync_order.index("recovery_dir")
-        assert parent_idx < recovery_idx, (
-            f"parent fsync must precede recovery_dir fsync, got {dir_fsync_order}"
+        assert fsynced_directories == expected_order, (
+            "new recovery ancestors must be created and fsynced root-to-leaf "
+            f"before the recovery directory contents: {fsynced_directories}"
         )
 
 # ── Runner ───────────────────────────────────────────────────────────────────
@@ -7546,6 +7763,9 @@ def main() -> int:
         test_salvage_cmodern_height_rejects_tail_change_before_clone,
         test_salvage_cmodern_height_rejects_recovery_stream_mutation,
         test_salvage_cmodern_height_rejects_pre_signature_body_replacement,
+        test_salvage_rejects_semantically_valid_exact_replay_replacement,
+        test_salvage_rolls_back_candidate_after_post_publication_replacement,
+        test_salvage_rolls_back_candidate_on_post_publication_interrupt,
         test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count,
         test_salvage_preserves_exact_data_dir_text_through_to_validation,
         test_find_cmodern_height_assembles_fragmented_child_frames,

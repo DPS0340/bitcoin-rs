@@ -690,6 +690,28 @@ class NativeExecutionTests(WorkspaceTestCase):
         result, _path = CampaignFixture(self.workspace, core_gap=True).run()
         self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
 
+    def test_incorrect_unpaired_arm_still_fails_correctness(self) -> None:
+        for incorrect_role in (runner.Role.CANDIDATE, runner.Role.CORE):
+            if incorrect_role is runner.Role.CANDIDATE:
+                fixture = CampaignFixture(
+                    self.workspace, candidate_hash="c" * 64, core_exit=7
+                )
+            else:
+                fixture = CampaignFixture(
+                    self.workspace, candidate_exit=7, core_hash="c" * 64
+                )
+            with self.subTest(incorrect_role=incorrect_role.value):
+                result, result_path = fixture.run()
+                self.assertEqual(result.valid_pairs, 0)
+                self.assertTrue(
+                    all(pair.correctness_match is False for pair in result.pairs)
+                )
+                self.assertEqual(result.verdict, Verdict.FAIL_CORRECTNESS)
+                self.assertEqual(
+                    validate_result(result_path, fixture.config),
+                    result,
+                )
+
     def test_native_process_failure_is_not_replaced(self) -> None:
         result, _path = CampaignFixture(self.workspace, candidate_exit=7).run()
         self.assertEqual(result.scheduled_pairs, PAIR_COUNT)
@@ -813,6 +835,27 @@ class EvidenceCustodyTests(WorkspaceTestCase):
         fixture.proof.write_text("{}", encoding="utf-8")
         with self.assertRaisesRegex(ContractError, "proof_path hash mismatch"):
             validate_result(result_path, fixture.config)
+
+    def test_successful_arm_requires_complete_measurements(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        for field in (
+            "pid",
+            "pid_starttime",
+            "wall_ns",
+            "cpu_user_ns",
+            "cpu_system_ns",
+            "peak_rss_bytes",
+        ):
+            with self.subTest(field=field):
+                mutated = _object(json.loads(json.dumps(raw)))
+                pair = _object(_array(mutated["pairs"])[0])
+                candidate = _object(pair["candidate"])
+                candidate[field] = None
+                result_path.write_text(json.dumps(mutated), encoding="utf-8")
+                with self.assertRaisesRegex(ContractError, "valid was tampered"):
+                    validate_result(result_path, fixture.config)
 
     def test_post_wait_parse_latency_is_not_in_arm_wall(self) -> None:
         fixture = CampaignFixture(self.workspace)
@@ -964,6 +1007,38 @@ class DescriptorLifetimeTests(WorkspaceTestCase):
             validate_result(result_path, fixture.config)
         self.assertTrue(checked)
         self.assertEqual(len(checked), PAIR_COUNT * 2)
+
+    def test_final_validation_rechecks_input_path_custody(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        _result, result_path = fixture.run()
+        original = runner._verify_recorded_evidence  # pyright: ignore[reportPrivateUsage]
+        checked = 0
+
+        def replace_after_final_evidence_check(
+            observation: runner.ArmObservation,
+            config: runner.CellConfig,
+            proof: runner.CellProof,
+            inputs: runner.InputCustody,
+            paths: dict[str, str],
+        ) -> None:
+            nonlocal checked
+            original(observation, config, proof, inputs, paths)
+            checked += 1
+            if checked == PAIR_COUNT * 2:
+                held = fixture.corpus.with_name("held-corpus.bin")
+                fixture.corpus.rename(held)
+                fixture.corpus.write_bytes(held.read_bytes())
+
+        with (
+            patch.object(
+                runner,
+                "_verify_recorded_evidence",
+                replace_after_final_evidence_check,
+            ),
+            self.assertRaisesRegex(ContractError, "corpus_path changed"),
+        ):
+            validate_result(result_path, fixture.config)
+        self.assertEqual(checked, PAIR_COUNT * 2)
 
     def test_error_path_closes_input_descriptors(self) -> None:
         fixture = CampaignFixture(self.workspace)

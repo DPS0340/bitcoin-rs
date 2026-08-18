@@ -218,7 +218,15 @@ class ArmObservation:
     @property
     def run_valid(self) -> bool:
         return (
-            self.error is None and self.exit_code == 0 and self.arm_result is not None
+            self.error is None
+            and self.exit_code == 0
+            and self.arm_result is not None
+            and self.pid is not None
+            and self.pid_starttime is not None
+            and self.wall_ns is not None
+            and self.cpu_user_ns is not None
+            and self.cpu_system_ns is not None
+            and self.peak_rss_bytes is not None
         )
 
 
@@ -1400,16 +1408,19 @@ def _make_pair(
     candidate = by_role[Role.CANDIDATE]
     core = by_role[Role.CORE]
     valid = candidate.run_valid and core.run_valid
+    candidate_result = candidate.arm_result
+    core_result = core.arm_result
     correctness: bool | None = None
-    if valid:
-        candidate_result = candidate.arm_result
-        core_result = core.arm_result
-        if candidate_result is None or core_result is None:
-            raise AssertionError("valid pair must contain both native arm results")
+    if (
+        candidate_result is not None
+        and not candidate_result.correctness_ok
+        or core_result is not None
+        and not core_result.correctness_ok
+    ):
+        correctness = False
+    elif candidate_result is not None and core_result is not None:
         correctness = (
-            candidate_result.correctness_ok
-            and core_result.correctness_ok
-            and candidate_result.height == core_result.height
+            candidate_result.height == core_result.height
             and candidate_result.bestblock == core_result.bestblock
         )
     return PairResult(pair_index, order, candidate, core, valid, correctness)
@@ -1991,6 +2002,7 @@ def _parse_result_with_inputs(
         is not derived.verdict
     ):
         raise ContractError("result.verdict was tampered")
+    _verify_inputs_unchanged(inputs)
     return derived
 
 
