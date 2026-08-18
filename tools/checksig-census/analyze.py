@@ -12,22 +12,27 @@ Stdlib-only, Python 3.12+.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import statistics
 import struct
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO, NamedTuple
 
 from context import (
+    CONTEXT_MAGIC,
     CONTEXT_MIN_ROW_SIZE,
     ClassifiedInput,
     ContextError,
@@ -106,15 +111,12 @@ CONTEXT_COUNTER_DEFINITIONS: dict[str, str] = {
     "tapscript_checksigadd_checks": "BRSREC1 executed-operation records with sig_version TAPSCRIPT and op_kind CHECKSIGADD",
 }
 
-MULTISIG_ELIGIBLE_CONTEXTS: frozenset[SpendContext] = frozenset(
-    (
-        SpendContext.BARE,
-        SpendContext.P2SH,
-        SpendContext.NATIVE_WITNESS_V0,
-        SpendContext.P2SH_WRAPPED_WITNESS_V0,
-    )
-)
-
+MULTISIG_ELIGIBLE_CONTEXTS: frozenset[SpendContext] = frozenset((
+    SpendContext.BARE,
+    SpendContext.P2SH,
+    SpendContext.NATIVE_WITNESS_V0,
+    SpendContext.P2SH_WRAPPED_WITNESS_V0,
+))
 HEADER_STRUCT = struct.Struct("<8sQ")
 RECORD_STRUCT = struct.Struct("<32sIIBBBBBBBB32s72s65s7s")
 JOURNAL_STRUCT = struct.Struct("<32sIIIIIB3s")
@@ -130,7 +132,15 @@ MAINNET_GENESIS_HASH = (
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 )
 C150_STOP_HEIGHT = 150_000
-C150_STOP_HASH = "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+C150_STOP_HASH = (
+    "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
+)
+# The recovered diagnostic candidate selects this product tip. It does not
+# certify a corpus. Certification still requires a fresh file-bound replay.
+CMODERN_STOP_HEIGHT = 709_635
+CMODERN_STOP_HASH = (
+    "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
+)
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -164,7 +174,9 @@ def _require_non_bool_int(value: object, field: str) -> int:
     return value
 
 
-def _require_exact_keys(d: dict[str, object], expected: set[str], label: str) -> None:
+def _require_exact_keys(
+    d: dict[str, object], expected: set[str], label: str
+) -> None:
     """Reject unknown or missing keys in *d* against *expected*."""
     actual = set(d.keys())
     unknown = actual - expected
@@ -193,13 +205,13 @@ def _require_u64(value: object, field: str) -> int:
     """Validate a u64 (0 ..= 2**64-1)."""
     v = _require_non_bool_int(value, field)
     if v < 0 or v > 0xFFFFFFFFFFFFFFFF:
-        raise AnalyzerError(f"CTX-CUSTODY: {field} must be u64, got {v}")
+        raise AnalyzerError(
+            f"CTX-CUSTODY: {field} must be u64, got {v}"
+        )
     return v
 
 
-def _require_custody_ref(
-    value: object, label: str, *, with_schema: bool = False
-) -> dict[str, object]:
+def _require_custody_ref(value: object, label: str, *, with_schema: bool = False) -> dict[str, object]:
     """Validate a custody reference object (path/bytes/sha256, optionally schema/version)."""
     if not isinstance(value, dict):
         raise AnalyzerError(f"CTX-CUSTODY: {label} must be an object")
@@ -224,9 +236,7 @@ def _require_custody_ref(
             )
         version = _require_int_field(value["version"], f"{label}.version")
         if version != 1:
-            raise AnalyzerError(
-                f"CTX-CUSTODY: {label}.version must be 1, got {version}"
-            )
+            raise AnalyzerError(f"CTX-CUSTODY: {label}.version must be 1, got {version}")
         result["schema"] = schema
         result["version"] = version
     return result
@@ -301,7 +311,6 @@ class Counters:
         self.journal_count: int = raw["journal_count"]
         self.context_count: int = raw["context_count"]
 
-
 class Record:
     """Parsed 224-byte record."""
 
@@ -357,26 +366,16 @@ class Record:
             and self.pubkey == b"\x00" * 65
         )
         if self.pubkey_len > 65 and not _is_exact_over_capacity_reject:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65"
-            )
+            raise AnalyzerError(f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65")
         # ── Canonical field-range validation ──
         if self.op_kind > 5:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record op_kind {self.op_kind} exceeds 5"
-            )
+            raise AnalyzerError(f"CTX-OPERATIONS: record op_kind {self.op_kind} exceeds 5")
         if self.sig_version > 3:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record sig_version {self.sig_version} exceeds 3"
-            )
+            raise AnalyzerError(f"CTX-OPERATIONS: record sig_version {self.sig_version} exceeds 3")
         if self.outcome > 2:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record outcome {self.outcome} exceeds 2"
-            )
+            raise AnalyzerError(f"CTX-OPERATIONS: record outcome {self.outcome} exceeds 2")
         if self.reject_reason > 8:
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: record reject_reason {self.reject_reason} exceeds 8"
-            )
+            raise AnalyzerError(f"CTX-OPERATIONS: record reject_reason {self.reject_reason} exceeds 8")
         # Canonical outcome/reject combinations:
         # outcome 0/1 (post-verification) must not carry a reject reason.
         # outcome 2 (pre-verification reject) must have a valid reason and no sighash.
@@ -396,12 +395,12 @@ class Record:
                 )
             # ── Reject-family compatibility: exact native emission ──
             _is_ecdsa_rec = self.sig_version in (0, 1) and self.op_kind in (1, 2, 3, 4)
-            _is_schnorr_rec = (self.sig_version == 2 and self.op_kind in (1, 2, 5)) or (
-                self.sig_version == 3 and self.op_kind == 0
+            _is_schnorr_rec = (
+                (self.sig_version == 2 and self.op_kind in (1, 2, 5))
+                or (self.sig_version == 3 and self.op_kind == 0)
             )
             _is_tapscript_skip = (
-                self.sig_version == 2
-                and self.op_kind in (1, 2, 5)
+                self.sig_version == 2 and self.op_kind in (1, 2, 5)
                 and self.der_len == 0
             )
             if self.reject_reason in (1, 2, 3):
@@ -419,14 +418,15 @@ class Record:
                         f"or sig_version 3 op 0), got sig_version "
                         f"{self.sig_version}, op_kind {self.op_kind}"
                     )
-            elif self.reject_reason == 8 and not _is_tapscript_skip:
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: reject_reason 8 requires Tapscript "
-                    f"skipped call (sig_version 2, op_kind 1/2/5, "
-                    f"empty signature), got sig_version "
-                    f"{self.sig_version}, op_kind {self.op_kind}, "
-                    f"der_len {self.der_len}"
-                )
+            elif self.reject_reason == 8:
+                if not _is_tapscript_skip:
+                    raise AnalyzerError(
+                        f"CTX-OPERATIONS: reject_reason 8 requires Tapscript "
+                        f"skipped call (sig_version 2, op_kind 1/2/5, "
+                        f"empty signature), got sig_version "
+                        f"{self.sig_version}, op_kind {self.op_kind}, "
+                        f"der_len {self.der_len}"
+                    )
         if self.der_len > 72:
             # The native instrumented kernel stores the original vchSig length in
             # der_len but only copies up to 72 bytes into the fixed-size der_sig
@@ -446,7 +446,7 @@ class Record:
             raise AnalyzerError(
                 f"CTX-OPERATIONS: record der_sig has non-zero padding beyond der_len={self.der_len}"
             )
-        if self.pubkey[self.pubkey_len :] != b"\x00" * (65 - self.pubkey_len):
+        if self.pubkey[self.pubkey_len:] != b"\x00" * (65 - self.pubkey_len):
             raise AnalyzerError(
                 f"CTX-OPERATIONS: record pubkey has non-zero padding beyond pubkey_len={self.pubkey_len}"
             )
@@ -499,6 +499,7 @@ class JournalEntry:
         return (self.spend_txid, self.input_index)
 
 
+
 # ── Canonical BRSREC1 interpretation (shared by disk classifier and diagnostic scanner)
 
 
@@ -507,18 +508,9 @@ class JournalEntry:
 _RECORD_COUNTER_RULES: list[tuple[str, list[tuple[int, int, str]]]] = [
     ("bare_multisig_checks", [(3, 0, "bare"), (4, 0, "bare")]),
     ("p2sh_multisig_checks", [(3, 0, "p2sh"), (4, 0, "p2sh")]),
-    (
-        "native_witness_v0_multisig_checks",
-        [(3, 1, "native_witness_v0"), (4, 1, "native_witness_v0")],
-    ),
-    (
-        "p2sh_wrapped_witness_v0_multisig_checks",
-        [(3, 1, "p2sh_wrapped_witness_v0"), (4, 1, "p2sh_wrapped_witness_v0")],
-    ),
-    (
-        "tapscript_schnorr_checks",
-        [(5, 2, "tapscript"), (1, 2, "tapscript"), (2, 2, "tapscript")],
-    ),
+    ("native_witness_v0_multisig_checks", [(3, 1, "native_witness_v0"), (4, 1, "native_witness_v0")]),
+    ("p2sh_wrapped_witness_v0_multisig_checks", [(3, 1, "p2sh_wrapped_witness_v0"), (4, 1, "p2sh_wrapped_witness_v0")]),
+    ("tapscript_schnorr_checks", [(5, 2, "tapscript"), (1, 2, "tapscript"), (2, 2, "tapscript")]),
     ("tapscript_checksigadd_checks", [(5, 2, "tapscript")]),
 ]
 
@@ -679,9 +671,7 @@ def _diagnostic_record_counts(
     return counts, op_seq_by_identity
 
 
-def _record_legality_message(
-    error: str, op_name: str, sig_name: str, identity: str
-) -> str:
+def _record_legality_message(error: str, op_name: str, sig_name: str, identity: str) -> str:
     """Human-readable message for a BRSREC1 legality error code."""
     if error == "multisig_sig":
         return f"multisig record must have sig_version BASE or WITNESS_V0, got {sig_name} for {identity}"
@@ -725,6 +715,20 @@ def _diagnostic_counter_totals(
     spend_counts = _diagnostic_spend_counts(classified)
     record_counts, _ = _diagnostic_record_counts(records, context_map)
     return {**spend_counts, **record_counts}
+def _accumulate_block_counts(
+    block_counts: dict[str, int],
+    height: int,
+    cumulative_counts: dict[str, int],
+    first_heights: dict[str, int],
+) -> None:
+    """Merge one block's 11 context counters into the scan aggregates."""
+    for name in CONTEXT_COUNTER_NAMES:
+        cumulative_counts[name] += block_counts[name]
+        if block_counts[name] > 0 and name not in first_heights:
+            first_heights[name] = height
+
+
+
 
 
 # ── Cmodern diagnostic checkpoint protocol
@@ -748,6 +752,35 @@ class DiagnosticCheckpoint(NamedTuple):
     record_end: int
     journal_rows: int
     journal_end: int
+
+
+class DiagnosticTeardown(NamedTuple):
+    """Observed child teardown and optional offline-salvage provenance."""
+
+    exit_status: int | None
+    state: str
+    salvaged_from: str | None
+    source_custody: dict[str, dict[str, object]] | None
+
+
+class DiagnosticStreamDigests(NamedTuple):
+    """Hashes of one validated source stream, its committed prefix, and body."""
+
+    full_file_sha256: str
+    committed_prefix_sha256: str
+    committed_body_sha256: str
+
+
+class DiagnosticReconstruction(NamedTuple):
+    """Validated aggregate state reconstructed from committed evidence."""
+
+    row_count: int
+    final: DiagnosticCheckpoint
+    cumulative_counts: dict[str, int]
+    first_heights: dict[str, int]
+    source_stream_digests: dict[str, DiagnosticStreamDigests]
+
+
 
 
 def _read_exact_stream(stream: BinaryIO, length: int, field: str) -> bytes:
@@ -789,9 +822,7 @@ def _read_diagnostic_preface(stream: BinaryIO) -> None:
     if version != DIAGNOSTIC_VERSION:
         raise AnalyzerError(f"DIAG-PROTO: unsupported protocol version {version}")
     if row_size != DIAGNOSTIC_ROW_SIZE:
-        raise AnalyzerError(
-            f"DIAG-PROTO: unsupported row size {row_size}, expected {DIAGNOSTIC_ROW_SIZE}"
-        )
+        raise AnalyzerError(f"DIAG-PROTO: unsupported row size {row_size}, expected {DIAGNOSTIC_ROW_SIZE}")
 
 
 def _read_checkpoint_row(stream: BinaryIO) -> DiagnosticCheckpoint:
@@ -926,6 +957,8 @@ def _read_brshgt1_row(fd: int, row_number: int) -> DiagnosticCheckpoint:
     )
 
 
+
+
 def _read_fixed_entries_slice(
     fd: int,
     start_offset: int,
@@ -934,16 +967,13 @@ def _read_fixed_entries_slice(
     committed_rows: int,
     entry_size: int,
     name: str,
+    observe_bytes: Callable[[bytes], None] | None = None,
 ) -> list[bytes]:
     """Read a committed slice of fixed-size entries using pread."""
     if start_row < 0 or committed_rows < start_row:
-        raise AnalyzerError(
-            f"DIAG-PROTO: invalid {name} row range {start_row}..{committed_rows}"
-        )
+        raise AnalyzerError(f"DIAG-PROTO: invalid {name} row range {start_row}..{committed_rows}")
     if start_offset < HEADER_SIZE or end_offset < start_offset:
-        raise AnalyzerError(
-            f"DIAG-PROTO: invalid {name} byte range {start_offset}..{end_offset}"
-        )
+        raise AnalyzerError(f"DIAG-PROTO: invalid {name} byte range {start_offset}..{end_offset}")
     expected_start = HEADER_SIZE + start_row * entry_size
     expected_end = HEADER_SIZE + committed_rows * entry_size
     if start_offset != expected_start or end_offset != expected_end:
@@ -958,16 +988,136 @@ def _read_fixed_entries_slice(
         )
     slice_size = end_offset - start_offset
     if slice_size != (committed_rows - start_row) * entry_size:
-        raise AnalyzerError(
-            f"DIAG-PROTO: {name} slice size {slice_size} does not match row delta"
-        )
+        raise AnalyzerError(f"DIAG-PROTO: {name} slice size {slice_size} does not match row delta")
     raw = os.pread(fd, slice_size, start_offset)
     if len(raw) != slice_size:
         raise AnalyzerError(f"DIAG-PROTO: short pread for {name}")
+    if raw and observe_bytes is not None:
+        observe_bytes(raw)
     return [
         raw[i * entry_size : (i + 1) * entry_size]
         for i in range(committed_rows - start_row)
     ]
+
+
+def _read_diagnostic_streams_from_fds(
+    row: DiagnosticCheckpoint,
+    prev: DiagnosticCheckpoint | None,
+    ctx_fd: int,
+    rec_fd: int,
+    jrn_fd: int,
+    observe_context_bytes: Callable[[bytes], None] | None = None,
+    observe_record_bytes: Callable[[bytes], None] | None = None,
+    observe_journal_bytes: Callable[[bytes], None] | None = None,
+) -> tuple[
+    list[ClassifiedInput],
+    list[Record],
+    list[JournalEntry],
+    dict[tuple[bytes, int], str],
+    dict[str, int],
+]:
+    """Parse and validate one block's committed stream slices."""
+    prev_ctx = prev.context_rows if prev is not None else 0
+    prev_ctx_end = prev.context_end if prev is not None else HEADER_SIZE
+    prev_rec = prev.record_rows if prev is not None else 0
+    prev_rec_end = prev.record_end if prev is not None else HEADER_SIZE
+    prev_jrn = prev.journal_rows if prev is not None else 0
+    prev_jrn_end = prev.journal_end if prev is not None else HEADER_SIZE
+
+    context_inputs = read_bounded_context_rows(
+        ctx_fd,
+        start_offset=prev_ctx_end,
+        end_offset=row.context_end,
+        start_row=prev_ctx,
+        committed_rows=row.context_rows,
+        observe_bytes=observe_context_bytes,
+    )
+    classified: list[ClassifiedInput] = []
+    context_map: dict[tuple[bytes, int], str] = {}
+    for inp in context_inputs:
+        ci = classify_input(inp)
+        key = (inp.identity.txid_le, inp.identity.input_index)
+        if key in context_map:
+            display_txid = inp.identity.txid_le[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: duplicate context execution identity "
+                f"{display_txid}:{inp.identity.input_index}"
+            )
+        context_map[key] = ci.spend_context.value
+        classified.append(ci)
+
+    journal_raws = _read_fixed_entries_slice(
+        jrn_fd,
+        prev_jrn_end,
+        row.journal_end,
+        prev_jrn,
+        row.journal_rows,
+        JOURNAL_SIZE,
+        "journal",
+        observe_journal_bytes,
+    )
+    journal = [JournalEntry(raw) for raw in journal_raws]
+    journal_keys: set[tuple[bytes, int]] = set()
+    for entry in journal:
+        if entry.verdict != 1:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 for "
+                f"{display_txid}:{entry.input_index}"
+            )
+        key = (entry.spend_txid, entry.input_index)
+        if key in journal_keys:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-EXECUTION: duplicate journal key in BRSJRN1: "
+                f"{display_txid}:{entry.input_index}"
+            )
+        journal_keys.add(key)
+
+    context_keys = set(context_map.keys())
+    if context_keys != journal_keys:
+        missing = journal_keys - context_keys
+        extra = context_keys - journal_keys
+        raise AnalyzerError(
+            f"CTX-OPERATIONS: context/journal key-set mismatch: "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+
+    record_raws = _read_fixed_entries_slice(
+        rec_fd,
+        prev_rec_end,
+        row.record_end,
+        prev_rec,
+        row.record_rows,
+        RECORD_SIZE,
+        "records",
+        observe_record_bytes,
+    )
+    records = [Record(raw) for raw in record_raws]
+    record_counts, _ = _diagnostic_record_counts(records, context_map)
+
+    record_sums: dict[tuple[bytes, int], list[int]] = {}
+    for record in records:
+        key = (record.spend_txid, record.input_index)
+        sums = record_sums.setdefault(key, [0, 0])
+        if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
+            if record.outcome != 2:
+                sums[0] += 1
+            if record.outcome == 1:
+                sums[1] += 1
+
+    for entry in journal:
+        actual_ecdsa = record_sums.get(entry.key, [0, 0])
+        expected_ecdsa = [entry.ecdsa_verify_calls, entry.ecdsa_verify_ok]
+        if actual_ecdsa != expected_ecdsa:
+            display_txid = entry.spend_txid[::-1].hex()
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: journal/record ECDSA totals mismatch for "
+                f"{display_txid}:{entry.input_index}: "
+                f"expected {expected_ecdsa}, got {actual_ecdsa}"
+            )
+
+    return classified, records, journal, context_map, record_counts
 
 
 def _read_diagnostic_streams(
@@ -981,116 +1131,14 @@ def _read_diagnostic_streams(
     dict[tuple[bytes, int], str],
     dict[str, int],
 ]:
-    """Parse the three committed prefixes for one block.
-
-    Returns (classified, records, journal, context_map, record_counts).
-    """
+    """Open the evidence streams and parse one committed block."""
     ctx_fd = os.open(paths["contexts"], os.O_RDONLY)
     rec_fd = os.open(paths["records"], os.O_RDONLY)
     jrn_fd = os.open(paths["journal"], os.O_RDONLY)
     try:
-        prev_ctx = prev.context_rows if prev is not None else 0
-        prev_ctx_end = prev.context_end if prev is not None else HEADER_SIZE
-        prev_rec = prev.record_rows if prev is not None else 0
-        prev_rec_end = prev.record_end if prev is not None else HEADER_SIZE
-        prev_jrn = prev.journal_rows if prev is not None else 0
-        prev_jrn_end = prev.journal_end if prev is not None else HEADER_SIZE
-
-        context_inputs = read_bounded_context_rows(
-            ctx_fd,
-            start_offset=prev_ctx_end,
-            end_offset=row.context_end,
-            start_row=prev_ctx,
-            committed_rows=row.context_rows,
+        return _read_diagnostic_streams_from_fds(
+            row, prev, ctx_fd, rec_fd, jrn_fd
         )
-        classified: list[ClassifiedInput] = []
-        context_map: dict[tuple[bytes, int], str] = {}
-        for inp in context_inputs:
-            ci = classify_input(inp)
-            key = (inp.identity.txid_le, inp.identity.input_index)
-            if key in context_map:
-                display_txid = inp.identity.txid_le[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate context execution identity "
-                    f"{display_txid}:{inp.identity.input_index}"
-                )
-            context_map[key] = ci.spend_context.value
-            classified.append(ci)
-
-        journal_raws = _read_fixed_entries_slice(
-            jrn_fd,
-            prev_jrn_end,
-            row.journal_end,
-            prev_jrn,
-            row.journal_rows,
-            JOURNAL_SIZE,
-            "journal",
-        )
-        journal = [JournalEntry(raw) for raw in journal_raws]
-        journal_keys: set[tuple[bytes, int]] = set()
-        for entry in journal:
-            if entry.verdict != 1:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: journal verdict {entry.verdict} != 1 for {display_txid}:{entry.input_index}"
-                )
-            key = (entry.spend_txid, entry.input_index)
-            if key in journal_keys:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-EXECUTION: duplicate journal key in BRSJRN1: {display_txid}:{entry.input_index}"
-                )
-            journal_keys.add(key)
-
-        context_keys = set(context_map.keys())
-        if context_keys != journal_keys:
-            missing = journal_keys - context_keys
-            extra = context_keys - journal_keys
-            raise AnalyzerError(
-                f"CTX-OPERATIONS: context/journal key-set mismatch: "
-                f"missing={len(missing)} extra={len(extra)}"
-            )
-
-        record_raws = _read_fixed_entries_slice(
-            rec_fd,
-            prev_rec_end,
-            row.record_end,
-            prev_rec,
-            row.record_rows,
-            RECORD_SIZE,
-            "records",
-        )
-        records = [Record(raw) for raw in record_raws]
-        record_counts, _ = _diagnostic_record_counts(records, context_map)
-
-        # Record-level orphan/duplicate/sequence/legality checks are now
-        # performed inside _diagnostic_record_counts.  This loop only
-        # derives the per-key ECDSA verify calls/ok needed for the
-        # diagnostic journal reconciliation.
-        record_sums: dict[tuple[bytes, int], list[int]] = {}
-        for record in records:
-            key = (record.spend_txid, record.input_index)
-            sums = record_sums.setdefault(key, [0, 0, 0, 0])
-            if record.sig_version in (0, 1) and record.op_kind in (1, 2, 3, 4):
-                if record.outcome != 2:
-                    sums[2] += 1
-                if record.outcome == 1:
-                    sums[3] += 1
-
-        for entry in journal:
-            actual = record_sums.get(entry.key, [0, 0, 0, 0])
-            # CHECKMULTISIG may emit multiple ECDSA records for one opcode;
-            # reconcile only record-derived ECDSA calls/ok to the journal per key.
-            actual_ecdsa = [actual[2], actual[3]]
-            expected_ecdsa = [entry.ecdsa_verify_calls, entry.ecdsa_verify_ok]
-            if actual_ecdsa != expected_ecdsa:
-                display_txid = entry.spend_txid[::-1].hex()
-                raise AnalyzerError(
-                    f"CTX-OPERATIONS: journal/record ECDSA totals mismatch for "
-                    f"{display_txid}:{entry.input_index}: expected {expected_ecdsa}, got {actual_ecdsa}"
-                )
-
-        return classified, records, journal, context_map, record_counts
     finally:
         os.close(ctx_fd)
         os.close(rec_fd)
@@ -1108,9 +1156,7 @@ def _validate_checkpoint_bounds(
             raise AnalyzerError("DIAG-PROTO: first checkpoint row must have height 0")
         genesis_le = bytes.fromhex(MAINNET_GENESIS_HASH)[::-1]
         if row.block_hash_le != genesis_le:
-            raise AnalyzerError(
-                "DIAG-PROTO: height 0 checkpoint hash is not mainnet genesis"
-            )
+            raise AnalyzerError("DIAG-PROTO: height 0 checkpoint hash is not mainnet genesis")
     else:
         if row.height != prev.height + 1:
             raise AnalyzerError(
@@ -1127,9 +1173,7 @@ def _validate_checkpoint_bounds(
     for name in ("context", "record", "journal"):
         end = getattr(row, f"{name}_end")
         count = getattr(row, f"{name}_rows")
-        previous_end = (
-            getattr(prev, f"{name}_end", HEADER_SIZE) if prev else HEADER_SIZE
-        )
+        previous_end = getattr(prev, f"{name}_end", HEADER_SIZE) if prev else HEADER_SIZE
         previous_count = getattr(prev, f"{name}_rows", 0) if prev else 0
         if count < previous_count:
             raise AnalyzerError(
@@ -1187,9 +1231,7 @@ def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
             while view:
                 written = os.write(fd, view)
                 if written == 0:
-                    raise AnalyzerError(
-                        "DIAG-OUTPUT: zero-byte write to temporary file"
-                    )
+                    raise AnalyzerError("DIAG-OUTPUT: zero-byte write to temporary file")
                 view = view[written:]
             os.fsync(fd)
         finally:
@@ -1216,12 +1258,11 @@ def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
                 if dir_fd is None:
                     dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
                 os.fsync(dir_fd)
-            # Rollback must finish even when cleanup receives an interrupt.
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:
                 rollback_error = exc
         try:
             _unlink_temp()
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             if rollback_error is None:
                 rollback_error = exc
         if rollback_error is not None:
@@ -1283,34 +1324,24 @@ def _launch_diagnostic_child(
     blockfilterindex: bool,
 ) -> tuple[subprocess.Popen, BinaryIO]:
     env = os.environ.copy()
-    env.update(
-        {
-            "BRS_CENSUS_COUNTERS": str(counters_path),
-            "BRS_CENSUS_CONTEXTS": str(work_dir / "brsctx1.bin"),
-            "BRS_CENSUS_RECORDS": str(work_dir / "brsrec1.bin"),
-            "BRS_CENSUS_JOURNAL": str(work_dir / "brsjrn1.bin"),
-            "BRS_CENSUS_LABEL": "cmodern-diagnostic",
-        }
-    )
+    env.update({
+        "BRS_CENSUS_COUNTERS": str(counters_path),
+        "BRS_CENSUS_CONTEXTS": str(work_dir / "brsctx1.bin"),
+        "BRS_CENSUS_RECORDS": str(work_dir / "brsrec1.bin"),
+        "BRS_CENSUS_JOURNAL": str(work_dir / "brsjrn1.bin"),
+        "BRS_CENSUS_LABEL": "cmodern-diagnostic",
+    })
     command = [
         str(binary),
         "--cmodern-diagnostic-protocol",
-        "--rest-url",
-        rest_url,
-        "--start-height",
-        "0",
-        "--assume-valid-height",
-        "0",
-        "--window",
-        "1",
-        "--stop-height",
-        str(ceiling),
-        "--data-dir",
-        str(data_dir),
-        "--output",
-        str(replay_json),
-        "--storage-backend",
-        storage_backend,
+        "--rest-url", rest_url,
+        "--start-height", "0",
+        "--assume-valid-height", "0",
+        "--window", "1",
+        "--stop-height", str(ceiling),
+        "--data-dir", str(data_dir),
+        "--output", str(replay_json),
+        "--storage-backend", storage_backend,
     ]
     if txindex:
         command.append("--txindex")
@@ -1384,7 +1415,9 @@ def _validate_replay_diagnostic(
         )
     start_height = _require_u32(raw["start_height"], "start_height")
     if start_height != 0:
-        raise AnalyzerError(f"DIAG-CUSTODY: start_height {start_height} != 0")
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: start_height {start_height} != 0"
+        )
     requested = _require_u32(
         raw["requested_stop_height_ceiling"], "requested_stop_height_ceiling"
     )
@@ -1408,7 +1441,9 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(f"DIAG-CUSTODY: child replay window {window} != 1")
     assume = _require_u32(raw["assume_valid_height"], "assume_valid_height")
     if assume != 0:
-        raise AnalyzerError(f"DIAG-CUSTODY: assume_valid_height {assume} != 0")
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: assume_valid_height {assume} != 0"
+        )
     if raw["stop_reason"] != "controller-request":
         raise AnalyzerError(
             f"DIAG-CUSTODY: stop_reason {raw['stop_reason']!r} != 'controller-request'"
@@ -1420,7 +1455,9 @@ def _validate_replay_diagnostic(
             f"!= {storage_backend!r}"
         )
     if raw["txindex"] is not txindex:
-        raise AnalyzerError(f"DIAG-CUSTODY: txindex {raw['txindex']!r} != {txindex!r}")
+        raise AnalyzerError(
+            f"DIAG-CUSTODY: txindex {raw['txindex']!r} != {txindex!r}"
+        )
     if raw["blockfilterindex"] is not blockfilterindex:
         raise AnalyzerError(
             f"DIAG-CUSTODY: blockfilterindex {raw['blockfilterindex']!r} "
@@ -1445,7 +1482,6 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(
             f"DIAG-CUSTODY: elapsed_seconds must be non-negative, got {elapsed_f}"
         )
-
 
 def _validate_native_counters(path: Path, final: DiagnosticCheckpoint) -> None:
     try:
@@ -1475,15 +1511,13 @@ def _validate_terminal_streams(
     for _ in context_iter:
         continue
     context_custody = context_iter.custody()
-    if (
-        context_custody["count"] != final.context_rows
-        or context_custody["bytes"] != final.context_end
-    ):
+    if context_custody["count"] != final.context_rows or context_custody["bytes"] != final.context_end:
         raise AnalyzerError("DIAG-CUSTODY: terminal context header/checkpoint mismatch")
     custody["contexts"] = {
         "path": str(paths["contexts"]),
         "bytes": context_custody["bytes"],
         "sha256": format(context_custody["sha256"], "064x"),
+        "body_sha256": format(context_custody["body_sha256"], "064x"),
     }
 
     record_iter, record_custody = iter_records_with_custody(paths["records"])
@@ -1496,23 +1530,102 @@ def _validate_terminal_streams(
         "path": str(paths["records"]),
         "bytes": record_custody["bytes"],
         "sha256": format(record_custody["sha256"], "064x"),
+        "body_sha256": format(record_custody["body_sha256"], "064x"),
     }
 
     journal_iter, journal_custody = iter_journal_with_custody(paths["journal"])
     for _ in journal_iter:
         continue
     journal_count = (journal_custody["bytes"] - HEADER_SIZE) // JOURNAL_SIZE
-    if (
-        journal_count != final.journal_rows
-        or journal_custody["bytes"] != final.journal_end
-    ):
+    if journal_count != final.journal_rows or journal_custody["bytes"] != final.journal_end:
         raise AnalyzerError("DIAG-CUSTODY: terminal journal header/checkpoint mismatch")
     custody["journal"] = {
         "path": str(paths["journal"]),
         "bytes": journal_custody["bytes"],
         "sha256": format(journal_custody["sha256"], "064x"),
+        "body_sha256": format(journal_custody["body_sha256"], "064x"),
     }
+
+    sidecar_size = paths["sidecar"].stat().st_size
+    # _validate_sidecar_terminal already validated framing; derive row count from size.
+    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
+    sidecar_fd = os.open(paths["sidecar"], os.O_RDONLY)
+    try:
+        sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar short header")
+        magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar wrong magic")
+        expected_size = BRSHGT1_HEADER_STRUCT.size + sidecar_count * DIAGNOSTIC_ROW_SIZE
+        if sidecar_size != expected_size:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: terminal sidecar size {sidecar_size} != {expected_size}"
+            )
+        full_hasher = hashlib.sha256()
+        body_hasher = hashlib.sha256()
+        full_hasher.update(sidecar_header)
+        offset = BRSHGT1_HEADER_STRUCT.size
+        body_end = expected_size
+        while offset < body_end:
+            chunk = os.pread(sidecar_fd, min(8 * 1024 * 1024, body_end - offset), offset)
+            if not chunk:
+                raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
+            full_hasher.update(chunk)
+            body_hasher.update(chunk)
+            offset += len(chunk)
+        custody["sidecar"] = {
+            "path": str(paths["sidecar"]),
+            "bytes": sidecar_size,
+            "sha256": full_hasher.hexdigest(),
+            "body_sha256": body_hasher.hexdigest(),
+        }
+    finally:
+        os.close(sidecar_fd)
     return custody
+
+
+def _validate_sidecar_terminal_fd(
+    fd: int,
+    row_count: int,
+    final: DiagnosticCheckpoint,
+) -> int:
+    """Validate a complete sidecar through one retained descriptor."""
+    if row_count < 1:
+        raise AnalyzerError("DIAG-SIDECAR: sidecar has no checkpoint rows")
+    header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: short header")
+    magic, declared_count = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SIDECAR: wrong magic {magic!r}")
+    expected_size = BRSHGT1_HEADER_STRUCT.size + row_count * DIAGNOSTIC_ROW_SIZE
+    actual_size = os.fstat(fd).st_size
+    if actual_size != expected_size:
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: size {actual_size} != {expected_size}"
+        )
+    if declared_count not in (0, row_count):
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: declared row count {declared_count} "
+            f"is neither 0 nor {row_count}"
+        )
+    if _read_brshgt1_row(fd, row_count) != final:
+        raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
+    return declared_count
+
+
+def _validate_sidecar_terminal(
+    path: Path,
+    row_count: int,
+    final: DiagnosticCheckpoint,
+) -> int:
+    """Validate a complete sidecar without changing its declared row count."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return _validate_sidecar_terminal_fd(fd, row_count, final)
+    finally:
+        os.close(fd)
 
 
 def _finalize_candidate(
@@ -1528,18 +1641,24 @@ def _finalize_candidate(
     txindex: bool,
     blockfilterindex: bool,
     data_dir: str,
+    teardown: DiagnosticTeardown,
+    recovery_signatures: dict[str, tuple[int, int, int, int, int]] | None = None,
 ) -> None:
-    _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
-    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
-        raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
-    sidecar_read_fd = _open_brshgt1_read_fd(paths["sidecar"])
-    try:
-        terminal_row = _read_brshgt1_row(sidecar_read_fd, sidecar_row_count)
-    finally:
-        os.close(sidecar_read_fd)
-    if terminal_row != final:
-        raise AnalyzerError("DIAG-SIDECAR: terminal row mismatch")
-
+    """Validate terminal proof, finalize custody, then publish one candidate."""
+    if recovery_signatures is not None:
+        for name, signature in recovery_signatures.items():
+            if _path_signature(paths[name]) != signature:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: recovery {name} changed before validation"
+                )
+    declared_count = _validate_sidecar_terminal(
+        paths["sidecar"], sidecar_row_count, final
+    )
+    if recovery_signatures is not None and declared_count != sidecar_row_count:
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: recovered sidecar declared row count "
+            f"{declared_count} != {sidecar_row_count}"
+        )
     stream_custody = _validate_terminal_streams(paths, final)
     _validate_replay_diagnostic(
         paths["replay"],
@@ -1551,17 +1670,88 @@ def _finalize_candidate(
         data_dir,
     )
     _validate_native_counters(paths["counters"], final)
+    if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
+        raise AnalyzerError("DIAG-CUSTODY: terminal proof lacks all 11 contexts")
+    if max(first_heights.values()) != final.height:
+        raise AnalyzerError(
+            "DIAG-CUSTODY: terminal height does not equal the last first occurrence"
+        )
+
+    if declared_count == 0:
+        _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
+        sidecar_size, sidecar_sha256 = _sha256_file(paths["sidecar"])
+        stream_custody["sidecar"]["bytes"] = sidecar_size
+        stream_custody["sidecar"]["sha256"] = sidecar_sha256
+    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
+        raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
+
     custody: dict[str, dict[str, object]] = {}
-    for name in ("sidecar", "replay", "counters"):
+    custody["sidecar"] = stream_custody["sidecar"]
+    for name in ("replay", "counters"):
         size, digest = _sha256_file(paths[name])
         custody[name] = {
             "path": str(paths[name]),
             "bytes": size,
             "sha256": digest,
         }
+    finalized_recovery_signatures = {
+        name: _path_signature(path) for name, path in paths.items()
+    }
+    source_custody = teardown.source_custody
+    if source_custody is not None:
+        source_custody = {
+            name: dict(identity) for name, identity in source_custody.items()
+        }
+        for name, identity in source_custody.items():
+            if not isinstance(identity.get("sha256"), str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks full-file custody"
+                )
+            provenance = identity.get("clone_provenance")
+            if provenance not in (CLONE_EXACT_FULL_FILE, CLONE_DIFFERS_FROM_SOURCE):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} has invalid clone provenance"
+                )
+        for name in ("replay", "counters"):
+            identity = source_custody[name]
+            if identity["clone_provenance"] != CLONE_EXACT_FULL_FILE:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} must be an exact full-file clone"
+                )
+            if (
+                identity["bytes"] != custody[name]["bytes"]
+                or identity["sha256"] != custody[name]["sha256"]
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: exact recovery {name} does not match source"
+                )
+        for name in ("contexts", "records", "journal", "sidecar"):
+            identity = source_custody[name]
+            source_body_sha256 = identity.get("committed_body_sha256")
+            if not isinstance(source_body_sha256, str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks committed-body custody"
+                )
+            if stream_custody[name]["body_sha256"] != source_body_sha256:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: recovered {name} body does not match "
+                    "the validated source committed body"
+                )
+            source_prefix_sha256 = identity.get("committed_prefix_sha256")
+            if not isinstance(source_prefix_sha256, str):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} lacks committed-prefix custody"
+                )
+            if (
+                identity["clone_provenance"] == CLONE_EXACT_FULL_FILE
+                and identity["sha256"] != source_prefix_sha256
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: exact source {name} clone has unequal hashes"
+                )
 
     candidate: dict[str, object] = {
-        "schema": "cmodern-candidate-diagnostic-v1",
+        "schema": "cmodern-candidate-diagnostic-v2",
         "non_certifying": True,
         "certifying_replay_required": True,
         "network": "mainnet",
@@ -1590,7 +1780,10 @@ def _finalize_candidate(
             "record_end": final.record_end,
             "journal_end": final.journal_end,
         },
-        "child_exit_status": 0,
+        "child_exit_status": teardown.exit_status,
+        "child_teardown": teardown.state,
+        "salvaged_from": teardown.salvaged_from,
+        "source_full_file_custody": source_custody,
         "child_replay_schema": "mainnet-prefix-replay-diagnostic-v1",
         "custody": {
             "brshgt1_sidecar": custody["sidecar"],
@@ -1601,6 +1794,30 @@ def _finalize_candidate(
             "brsjrn1": stream_custody["journal"],
         },
     }
+    if source_custody is not None:
+        for identity in source_custody.values():
+            source_path = Path(str(identity["path"]))
+            if _path_signature(source_path) != (
+                identity["device"],
+                identity["inode"],
+                identity["bytes"],
+                identity["mtime_ns"],
+                identity["ctime_ns"],
+            ):
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source changed before candidate publication: "
+                    f"{source_path}"
+                )
+    candidate["rest_url_provenance"] = (
+        "live_parent_argv"
+        if teardown.salvaged_from is None
+        else "operator_supplied_original_argv"
+    )
+    for name, signature in finalized_recovery_signatures.items():
+        if _path_signature(paths[name]) != signature:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: {name} changed before candidate publication"
+            )
     _write_json_atomic(output_path, candidate)
 
 
@@ -1612,6 +1829,73 @@ def _send_control(proc: subprocess.Popen, control: bytes) -> None:
         proc.stdin.flush()
     except (BrokenPipeError, OSError) as exc:
         raise AnalyzerError(f"DIAG-PROTO: failed to send control byte: {exc}") from exc
+class _TrailingDrain:
+    """Bounded state for draining child stdout concurrently with teardown."""
+
+    def __init__(self) -> None:
+        self.bytes_read = 0
+        self.error: OSError | None = None
+
+    def run(self, stream: BinaryIO) -> None:
+        try:
+            while chunk := stream.read(64 * 1024):
+                self.bytes_read += len(chunk)
+        except OSError as exc:
+            self.error = exc
+
+
+def _await_child_after_terminal(
+    proc: subprocess.Popen,
+    *,
+    stop_deadline_seconds: float,
+    reap_deadline_seconds: float,
+) -> DiagnosticTeardown:
+    """Drain stdout while waiting so trailing output cannot deadlock the child."""
+    if proc.stdout is None:
+        raise AnalyzerError("DIAG-SETUP: child stdout is not piped")
+    drain = _TrailingDrain()
+    drain_thread = threading.Thread(
+        target=drain.run,
+        args=(proc.stdout,),
+        name="cmodern-terminal-drain",
+        daemon=True,
+    )
+    drain_thread.start()
+
+    timed_out = False
+    try:
+        exit_status = proc.wait(timeout=stop_deadline_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            exit_status = proc.wait(timeout=reap_deadline_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise AnalyzerError(
+                "DIAG-PROTO: child did not exit after terminal-proof kill"
+            ) from exc
+
+    drain_thread.join(timeout=reap_deadline_seconds)
+    if drain_thread.is_alive():
+        raise AnalyzerError("DIAG-PROTO: child stdout remained open after exit")
+    if drain.error is not None:
+        raise AnalyzerError(
+            f"DIAG-PROTO: failed to drain child stdout: {drain.error}"
+        ) from drain.error
+    if drain.bytes_read != 0:
+        raise AnalyzerError(
+            f"DIAG-PROTO: {drain.bytes_read} trailing bytes after terminal checkpoint"
+        )
+    if not timed_out and exit_status != 0:
+        raise AnalyzerError(
+            f"DIAG-PROTO: child exited with status {exit_status}"
+        )
+
+    state = "timeout_after_terminal_proof" if timed_out else "clean"
+    return DiagnosticTeardown(exit_status, state, None, None)
+
+
 
 
 def _run_diagnostic_scan(
@@ -1623,6 +1907,9 @@ def _run_diagnostic_scan(
     storage_backend: str = "fjall",
     txindex: bool = False,
     blockfilterindex: bool = False,
+    *,
+    stop_deadline_seconds: float = 10.0,
+    reap_deadline_seconds: float = 5.0,
 ) -> None:
     paths = {
         "contexts": work_dir / "brsctx1.bin",
@@ -1644,16 +1931,8 @@ def _run_diagnostic_scan(
     child_closed = False
     try:
         proc, stderr_file = _launch_diagnostic_child(
-            binary,
-            rest_url,
-            ceiling,
-            work_dir,
-            paths["replay"],
-            data_dir,
-            paths["stderr"],
-            paths["counters"],
-            storage_backend,
-            txindex,
+            binary, rest_url, ceiling, work_dir, paths["replay"], data_dir,
+            paths["stderr"], paths["counters"], storage_backend, txindex,
             blockfilterindex,
         )
         if proc.stdout is None:
@@ -1675,11 +1954,16 @@ def _run_diagnostic_scan(
             classified, _records, _journal, _context_map, record_counts = (
                 _read_diagnostic_streams(row, previous, paths)
             )
-            block_counts = {**_diagnostic_spend_counts(classified), **record_counts}
-            for name in CONTEXT_COUNTER_NAMES:
-                cumulative_counts[name] += block_counts[name]
-                if block_counts[name] > 0 and name not in first_heights:
-                    first_heights[name] = row.height
+            block_counts = {
+                **_diagnostic_spend_counts(classified),
+                **record_counts,
+            }
+            _accumulate_block_counts(
+                block_counts,
+                row.height,
+                cumulative_counts,
+                first_heights,
+            )
 
             _write_brshgt1_row(sidecar_fd, row)
             row_count += 1
@@ -1699,14 +1983,11 @@ def _run_diagnostic_scan(
             previous = row
 
         _close_stream(proc.stdin)
-        try:
-            exit_code = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired as exc:
-            raise AnalyzerError("DIAG-PROTO: child did not exit after STOP") from exc
-        if exit_code != 0:
-            raise AnalyzerError(f"DIAG-PROTO: child exited with status {exit_code}")
-        if proc.stdout.read(1) != b"":
-            raise AnalyzerError("DIAG-PROTO: trailing bytes after terminal checkpoint")
+        teardown = _await_child_after_terminal(
+            proc,
+            stop_deadline_seconds=stop_deadline_seconds,
+            reap_deadline_seconds=reap_deadline_seconds,
+        )
         _close_stream(proc.stdout)
         _close_stream(proc.stderr)
         _close_stream(stderr_file)
@@ -1728,12 +2009,662 @@ def _run_diagnostic_scan(
             txindex,
             blockfilterindex,
             str(data_dir),
+            teardown,
         )
     finally:
         if proc is not None and stderr_file is not None and not child_closed:
             _reap_child(proc, stderr_file)
         if sidecar_fd is not None:
             os.close(sidecar_fd)
+
+
+def _diagnostic_artifact_paths(root: Path) -> dict[str, Path]:
+    return {
+        "contexts": root / "brsctx1.bin",
+        "records": root / "brsrec1.bin",
+        "journal": root / "brsjrn1.bin",
+        "sidecar": root / "brshgt1.bin",
+        "replay": root / "replay_diagnostic.json",
+        "counters": root / "counters.json",
+    }
+
+
+def _source_sidecar_row_count(fd: int) -> int:
+    """Validate sidecar framing and return its physical row count."""
+    file_size = os.fstat(fd).st_size
+    if file_size < BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: source sidecar is shorter than its header")
+    payload_size = file_size - BRSHGT1_HEADER_STRUCT.size
+    if payload_size % DIAGNOSTIC_ROW_SIZE != 0:
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: source has {payload_size % DIAGNOSTIC_ROW_SIZE} "
+            "bytes after its last complete row"
+        )
+    row_count = payload_size // DIAGNOSTIC_ROW_SIZE
+    if row_count < 1:
+        raise AnalyzerError("DIAG-SIDECAR: source sidecar has no rows")
+    header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    magic, declared_count = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SIDECAR: wrong source magic {magic!r}")
+    if declared_count not in (0, row_count):
+        raise AnalyzerError(
+            f"DIAG-SIDECAR: source declares {declared_count} rows, "
+            f"but contains {row_count}"
+        )
+    return row_count
+
+
+def _reconstruct_diagnostic_from_fds(
+    row_count: int,
+    source_fds: dict[str, int],
+) -> DiagnosticReconstruction:
+    """Recompute aggregates and source hashes through one descriptor set."""
+    cumulative_counts = {name: 0 for name in CONTEXT_COUNTER_NAMES}
+    first_heights: dict[str, int] = {}
+    previous: DiagnosticCheckpoint | None = None
+    final: DiagnosticCheckpoint | None = None
+    stream_file_sizes = {
+        "contexts": os.fstat(source_fds["contexts"]).st_size,
+        "records": os.fstat(source_fds["records"]).st_size,
+        "journal": os.fstat(source_fds["journal"]).st_size,
+    }
+    checkpoint_file_sizes = {
+        "context": stream_file_sizes["contexts"],
+        "record": stream_file_sizes["records"],
+        "journal": stream_file_sizes["journal"],
+    }
+    stream_hashers = {name: hashlib.sha256() for name in stream_file_sizes}
+    stream_body_hashers = {name: hashlib.sha256() for name in stream_file_sizes}
+    hashed_bytes = {name: HEADER_SIZE for name in stream_file_sizes}
+    declared_counts: dict[str, int] = {}
+    stream_magics = {
+        "contexts": CONTEXT_MAGIC,
+        "records": RECORD_MAGIC,
+        "journal": JOURNAL_MAGIC,
+    }
+    for name, magic in stream_magics.items():
+        header = os.pread(source_fds[name], HEADER_SIZE, 0)
+        if len(header) != HEADER_SIZE:
+            raise AnalyzerError(f"DIAG-SALVAGE: short source {name} header")
+        actual_magic, declared_counts[name] = HEADER_STRUCT.unpack(header)
+        if actual_magic != magic:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: wrong source {name} magic {actual_magic!r}"
+            )
+        stream_hashers[name].update(header)
+
+    def observe_context(data: bytes) -> None:
+        stream_hashers["contexts"].update(data)
+        stream_body_hashers["contexts"].update(data)
+        hashed_bytes["contexts"] += len(data)
+
+    def observe_records(data: bytes) -> None:
+        stream_hashers["records"].update(data)
+        stream_body_hashers["records"].update(data)
+        hashed_bytes["records"] += len(data)
+
+    def observe_journal(data: bytes) -> None:
+        stream_hashers["journal"].update(data)
+        stream_body_hashers["journal"].update(data)
+        hashed_bytes["journal"] += len(data)
+
+    sidecar_full_hasher = hashlib.sha256()
+    sidecar_body_hasher = hashlib.sha256()
+    sidecar_header = os.pread(source_fds["sidecar"], BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SALVAGE: short source sidecar header")
+    sidecar_magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
+    if sidecar_magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError(f"DIAG-SALVAGE: wrong source sidecar magic {sidecar_magic!r}")
+    sidecar_full_hasher.update(sidecar_header)
+
+    for row_number in range(1, row_count + 1):
+        row_offset = BRSHGT1_HEADER_STRUCT.size + (row_number - 1) * DIAGNOSTIC_ROW_SIZE
+        row_raw = os.pread(source_fds["sidecar"], DIAGNOSTIC_ROW_SIZE, row_offset)
+        if len(row_raw) != DIAGNOSTIC_ROW_SIZE:
+            raise AnalyzerError(f"DIAG-SIDECAR: short row {row_number}")
+        sidecar_full_hasher.update(row_raw)
+        sidecar_body_hasher.update(row_raw)
+        row = BRSHGT1_ROW_STRUCT.unpack(row_raw)
+        row = DiagnosticCheckpoint(*row)
+        _validate_checkpoint_bounds(row, previous, checkpoint_file_sizes)
+        classified, records, journal, context_map, record_counts = (
+            _read_diagnostic_streams_from_fds(
+                row,
+                previous,
+                source_fds["contexts"],
+                source_fds["records"],
+                source_fds["journal"],
+                observe_context,
+                observe_records,
+                observe_journal,
+            )
+        )
+        block_counts = {
+            **_diagnostic_spend_counts(classified),
+            **record_counts,
+        }
+        _accumulate_block_counts(
+            block_counts,
+            row.height,
+            cumulative_counts,
+            first_heights,
+        )
+        previous = row
+        final = row
+
+    if final is None:
+        raise AnalyzerError("DIAG-SALVAGE: source contains no terminal row")
+    _validate_sidecar_terminal_fd(source_fds["sidecar"], row_count, final)
+    if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
+        raise AnalyzerError(
+            "DIAG-SALVAGE: terminal proof does not contain all 11 contexts"
+        )
+    if max(first_heights.values()) != final.height:
+        raise AnalyzerError(
+            "DIAG-SALVAGE: terminal height is not the last first occurrence"
+        )
+
+    expected_counts = {
+        "contexts": final.context_rows,
+        "records": final.record_rows,
+        "journal": final.journal_rows,
+    }
+    committed_ends = {
+        "contexts": final.context_end,
+        "records": final.record_end,
+        "journal": final.journal_end,
+    }
+    source_stream_digests: dict[str, DiagnosticStreamDigests] = {}
+    for name, committed_end in committed_ends.items():
+        if declared_counts[name] not in (0, expected_counts[name]):
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source {name} declares {declared_counts[name]} "
+                f"rows, expected 0 or {expected_counts[name]}"
+            )
+        if hashed_bytes[name] != committed_end:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: hashed {hashed_bytes[name]} committed {name} "
+                f"bytes, expected {committed_end}"
+            )
+        committed_sha256 = stream_hashers[name].copy().hexdigest()
+        committed_body_sha256 = stream_body_hashers[name].hexdigest()
+        offset = committed_end
+        while offset < stream_file_sizes[name]:
+            chunk = os.pread(
+                source_fds[name],
+                min(8 * 1024 * 1024, stream_file_sizes[name] - offset),
+                offset,
+            )
+            if not chunk:
+                raise AnalyzerError(
+                    f"DIAG-SALVAGE: source {name} ended at {offset}, "
+                    f"expected {stream_file_sizes[name]}"
+                )
+            stream_hashers[name].update(chunk)
+            offset += len(chunk)
+        source_stream_digests[name] = DiagnosticStreamDigests(
+            stream_hashers[name].hexdigest(),
+            committed_sha256,
+            committed_body_sha256,
+        )
+
+    # Sidecar body is the committed rows after the header.
+    sidecar_size = os.fstat(source_fds["sidecar"]).st_size
+    # Prefix hash is the state after header + committed rows, before tail.
+    sidecar_prefix_hasher = sidecar_full_hasher.copy()
+    tail_offset = BRSHGT1_HEADER_STRUCT.size + row_count * DIAGNOSTIC_ROW_SIZE
+    while tail_offset < sidecar_size:
+        chunk = os.pread(
+            source_fds["sidecar"],
+            min(8 * 1024 * 1024, sidecar_size - tail_offset),
+            tail_offset,
+        )
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: sidecar ended at {tail_offset}, expected {sidecar_size}"
+            )
+        sidecar_full_hasher.update(chunk)
+        tail_offset += len(chunk)
+    source_stream_digests["sidecar"] = DiagnosticStreamDigests(
+        sidecar_full_hasher.hexdigest(),
+        sidecar_prefix_hasher.hexdigest(),
+        sidecar_body_hasher.hexdigest(),
+    )
+
+    return DiagnosticReconstruction(
+        row_count,
+        final,
+        cumulative_counts,
+        first_heights,
+        source_stream_digests,
+    )
+
+
+
+
+def _write_all(fd: int, data: bytes | memoryview) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise AnalyzerError("DIAG-SALVAGE: short recovery write")
+        view = view[written:]
+
+
+FICLONE = 0x40049409
+CLONE_EXACT_FULL_FILE = "EXACT_FULL_FILE"
+CLONE_DIFFERS_FROM_SOURCE = "DIFFERS_FROM_SOURCE"
+
+
+def _fd_signature(fd: int) -> tuple[int, int, int, int, int]:
+    stat_result = os.fstat(fd)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+def _sha256_fd(fd: int) -> str:
+    """Hash one retained descriptor without changing its file position."""
+    digest = hashlib.sha256()
+    size = os.fstat(fd).st_size
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, min(8 * 1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source ended at {offset}, expected {size}"
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+
+
+def _path_signature(path: Path) -> tuple[int, int, int, int, int]:
+    stat_result = path.stat()
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _copy_fd_fallback(source_fd: int, destination_fd: int, size: int) -> None:
+    """Copy one file when the filesystem cannot clone extents."""
+    offset = 0
+    while offset < size:
+        chunk = os.pread(source_fd, min(8 * 1024 * 1024, size - offset), offset)
+        if not chunk:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source ended at {offset}, expected {size}"
+            )
+        _write_all(destination_fd, chunk)
+        offset += len(chunk)
+
+
+def _clone_committed_source(
+    source_fd: int,
+    source: Path,
+    destination: Path,
+    committed_size: int,
+    *,
+    replacement_header: bytes | None = None,
+    source_sha256: str | None = None,
+    source_committed_prefix_sha256: str | None = None,
+    source_committed_body_sha256: str | None = None,
+) -> dict[str, object]:
+    """Clone one retained source file, then normalize and cut the clone."""
+    before = os.fstat(source_fd)
+    if not (0 <= committed_size <= before.st_size):
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: committed size {committed_size} exceeds "
+            f"{source} size {before.st_size}"
+        )
+    source_header: bytes | None = None
+    if replacement_header is not None:
+        if len(replacement_header) > committed_size:
+            raise AnalyzerError(
+                "DIAG-SALVAGE: replacement header exceeds committed source"
+            )
+        source_header = os.pread(source_fd, len(replacement_header), 0)
+        if len(source_header) != len(replacement_header):
+            raise AnalyzerError(f"DIAG-SALVAGE: short source header: {source}")
+
+    source_digest = (
+        source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
+    )
+    if committed_size == before.st_size and source_committed_prefix_sha256 is not None:
+        if source_committed_prefix_sha256 != source_digest:
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source committed-prefix digest mismatch: {source}"
+            )
+    if _fd_signature(source_fd) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ):
+        raise AnalyzerError(f"DIAG-SALVAGE: source changed before cloning: {source}")
+
+    identity: dict[str, object] = {
+        "path": str(source),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "bytes": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+        "sha256": source_digest,
+        "clone_provenance": (
+            CLONE_EXACT_FULL_FILE
+            if committed_size == before.st_size
+            and (replacement_header is None or replacement_header == source_header)
+            else CLONE_DIFFERS_FROM_SOURCE
+        ),
+    }
+    if source_committed_prefix_sha256 is not None:
+        identity["committed_prefix_sha256"] = source_committed_prefix_sha256
+    if source_committed_body_sha256 is not None:
+        identity["committed_body_sha256"] = source_committed_body_sha256
+    if replacement_header is not None:
+        assert source_header is not None
+        identity["source_header_hex"] = source_header.hex()
+        identity["recovery_header_hex"] = replacement_header.hex()
+
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o644,
+    )
+    try:
+        try:
+            fcntl.ioctl(destination_fd, FICLONE, source_fd)
+        except OSError as exc:
+            if exc.errno not in (
+                errno.EXDEV,
+                errno.EINVAL,
+                errno.ENOTTY,
+                errno.EOPNOTSUPP,
+            ):
+                raise
+            _copy_fd_fallback(source_fd, destination_fd, committed_size)
+        os.ftruncate(destination_fd, committed_size)
+        if replacement_header is not None:
+            if os.pwrite(destination_fd, replacement_header, 0) != len(
+                replacement_header
+            ):
+                raise AnalyzerError("DIAG-SALVAGE: short recovery header write")
+        os.fsync(destination_fd)
+        if _fd_signature(source_fd) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ):
+            raise AnalyzerError(
+                f"DIAG-SALVAGE: source changed while cloning: {source}"
+            )
+        return identity
+    finally:
+        os.close(destination_fd)
+
+
+def _verify_retained_files(
+    paths: dict[str, Path],
+    descriptors: dict[str, int],
+    signatures: dict[str, tuple[int, int, int, int, int]],
+    phase: str,
+) -> None:
+    for name, descriptor in descriptors.items():
+        if (
+            _fd_signature(descriptor) != signatures[name]
+            or _path_signature(paths[name]) != signatures[name]
+        ):
+            raise AnalyzerError(f"DIAG-SALVAGE: {phase}: {paths[name]}")
+
+
+def _mkdir_exclusive_durable(path: Path) -> None:
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    if not cursor.is_dir():
+        raise AnalyzerError(
+            f"DIAG-SETUP: recovery ancestor is not a directory: {cursor}"
+        )
+    for directory in reversed(missing):
+        directory.mkdir()
+        parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+
+def _materialize_recovery_dir(
+    source_paths: dict[str, Path],
+    source_fds: dict[str, int],
+    recovery_dir: Path,
+    reconstruction: DiagnosticReconstruction,
+) -> tuple[
+    dict[str, Path],
+    dict[str, dict[str, object]],
+    dict[str, tuple[int, int, int, int, int]],
+]:
+    """Clone only checkpoint-committed evidence into a new directory."""
+    _mkdir_exclusive_durable(recovery_dir)
+    recovery_paths = _diagnostic_artifact_paths(recovery_dir)
+    final = reconstruction.final
+    source_custody: dict[str, dict[str, object]] = {}
+    copy_specs = (
+        ("contexts", final.context_end, HEADER_STRUCT.pack(CONTEXT_MAGIC, final.context_rows)),
+        ("records", final.record_end, HEADER_STRUCT.pack(RECORD_MAGIC, final.record_rows)),
+        ("journal", final.journal_end, HEADER_STRUCT.pack(JOURNAL_MAGIC, final.journal_rows)),
+        (
+            "sidecar",
+            BRSHGT1_HEADER_STRUCT.size
+            + reconstruction.row_count * DIAGNOSTIC_ROW_SIZE,
+            BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, reconstruction.row_count),
+        ),
+    )
+    recovery_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    for name, committed_size, replacement_header in copy_specs:
+        stream_digests = reconstruction.source_stream_digests.get(name)
+        identity = _clone_committed_source(
+            source_fds[name],
+            source_paths[name],
+            recovery_paths[name],
+            committed_size,
+            replacement_header=replacement_header,
+            source_sha256=(
+                stream_digests.full_file_sha256
+                if stream_digests is not None
+                else None
+            ),
+            source_committed_prefix_sha256=(
+                stream_digests.committed_prefix_sha256
+                if stream_digests is not None
+                else None
+            ),
+            source_committed_body_sha256=(
+                stream_digests.committed_body_sha256
+                if stream_digests is not None
+                else None
+            ),
+        )
+        source_custody[name] = identity
+        recovery_signatures[name] = _path_signature(recovery_paths[name])
+    for name in ("replay", "counters"):
+        source_custody[name] = _clone_committed_source(
+            source_fds[name],
+            source_paths[name],
+            recovery_paths[name],
+            os.fstat(source_fds[name]).st_size,
+        )
+        recovery_signatures[name] = _path_signature(recovery_paths[name])
+    dir_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    return recovery_paths, source_custody, recovery_signatures
+
+
+def _salvage_diagnostic_scan(
+    source_dir: Path,
+    recovery_dir: Path,
+    output_path: Path,
+    rest_url: str,
+    ceiling: int,
+    data_dir: str,
+    storage_backend: str = "fjall",
+    txindex: bool = False,
+    blockfilterindex: bool = False,
+) -> None:
+    """Recover terminal proof without changing the failed source directory."""
+    source_dir = source_dir.resolve()
+    recovery_dir = recovery_dir.resolve()
+    output_path = output_path.resolve()
+    # Preserve the operator's exact provenance string for replay comparison.
+    if not source_dir.is_dir():
+        raise AnalyzerError(f"DIAG-SETUP: source directory not found: {source_dir}")
+    if recovery_dir.exists():
+        raise AnalyzerError(
+            f"DIAG-SETUP: recovery directory already exists: {recovery_dir}"
+        )
+    if output_path.exists():
+        raise AnalyzerError(f"DIAG-SETUP: output already exists: {output_path}")
+    if source_dir == recovery_dir or source_dir in recovery_dir.parents:
+        raise AnalyzerError("DIAG-SETUP: recovery directory must be outside source")
+    if source_dir == output_path.parent or source_dir in output_path.parents:
+        raise AnalyzerError("DIAG-SETUP: output must be outside source")
+
+    source_paths = _diagnostic_artifact_paths(source_dir)
+    source_fds: dict[str, int] = {}
+    source_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+    recovery_fds: dict[str, int] = {}
+    succeeded = False
+    try:
+        for name, path in source_paths.items():
+            source_fds[name] = os.open(path, os.O_RDONLY)
+            source_signatures[name] = _fd_signature(source_fds[name])
+        row_count = _source_sidecar_row_count(source_fds["sidecar"])
+        source_reconstruction = _reconstruct_diagnostic_from_fds(
+            row_count,
+            source_fds,
+        )
+        _verify_retained_files(
+            source_paths,
+            source_fds,
+            source_signatures,
+            "source changed during reconstruction",
+        )
+        recovery_paths, source_custody, recovery_signatures = (
+            _materialize_recovery_dir(
+                source_paths,
+                source_fds,
+                recovery_dir,
+                source_reconstruction,
+            )
+        )
+        _verify_retained_files(
+            source_paths,
+            source_fds,
+            source_signatures,
+            "source changed during materialization",
+        )
+        for name, path in recovery_paths.items():
+            recovery_fds[name] = os.open(path, os.O_RDONLY)
+        _verify_retained_files(
+            recovery_paths,
+            recovery_fds,
+            recovery_signatures,
+            "recovery changed during materialization",
+        )
+        teardown = DiagnosticTeardown(
+            None,
+            "unobserved",
+            str(source_dir),
+            source_custody,
+        )
+        _finalize_candidate(
+            recovery_paths,
+            source_reconstruction.row_count,
+            source_reconstruction.final,
+            source_reconstruction.cumulative_counts,
+            source_reconstruction.first_heights,
+            rest_url,
+            ceiling,
+            output_path,
+            storage_backend,
+            txindex,
+            blockfilterindex,
+            data_dir,
+            teardown,
+            recovery_signatures,
+        )
+        try:
+            _verify_retained_files(
+                source_paths,
+                source_fds,
+                source_signatures,
+                "source changed after candidate publication",
+            )
+            _verify_retained_files(
+                recovery_paths,
+                recovery_fds,
+                recovery_signatures,
+                "recovery changed after candidate publication",
+            )
+        except BaseException as custody_error:
+            try:
+                try:
+                    output_path.unlink()
+                except FileNotFoundError:
+                    # The candidate is already absent; fsync its parent below.
+                    pass
+                parent_fd = os.open(
+                    output_path.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError as rollback_error:
+                raise rollback_error from custody_error
+            raise
+        succeeded = True
+    finally:
+        for fd in recovery_fds.values():
+            os.close(fd)
+        for fd in source_fds.values():
+            os.close(fd)
+        if recovery_dir.exists() and not succeeded:
+            shutil.rmtree(recovery_dir)
+
+
+def cmd_salvage_cmodern_height(args: argparse.Namespace) -> int:
+    _salvage_diagnostic_scan(
+        Path(args.source_dir),
+        Path(args.recovery_dir),
+        Path(args.output),
+        args.rest_url,
+        args.stop_height,
+        args.data_dir,
+        storage_backend=args.storage_backend,
+        txindex=args.txindex,
+        blockfilterindex=args.blockfilterindex,
+    )
+    return 0
 
 
 def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
@@ -1766,7 +2697,6 @@ def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
         blockfilterindex=args.blockfilterindex,
     )
     return 0
-
 
 # ── Binary parsing ──────────────────────────────────────────────────────────
 
@@ -1822,7 +2752,9 @@ def _iter_binary_entries(
         header = _read_exact_bytes(stream, HEADER_SIZE, f"{name} header")
         file_magic, count = HEADER_STRUCT.unpack(header)
         if file_magic != magic:
-            raise AnalyzerError(f"{name}: bad magic {file_magic!r}, expected {magic!r}")
+            raise AnalyzerError(
+                f"{name}: bad magic {file_magic!r}, expected {magic!r}"
+            )
         expected_payload = count * entry_size
         available = file_size - HEADER_SIZE
         if available < expected_payload:
@@ -1840,9 +2772,7 @@ def _iter_binary_entries(
             )
 
 
-def _read_exact_bytes(
-    stream: BinaryIO, length: int, field: str, scope: str = ""
-) -> bytes:
+def _read_exact_bytes(stream: BinaryIO, length: int, field: str, scope: str = "") -> bytes:
     """Read exactly *length* bytes from *stream* or raise AnalyzerError."""
     data = stream.read(length)
     if data is None or len(data) < length:
@@ -1853,7 +2783,9 @@ def _read_exact_bytes(
 
 def iter_records(path: Path) -> Iterator[Record]:
     """Stream BRSREC1 records one at a time without materializing the file."""
-    for _index, raw in _iter_binary_entries(path, RECORD_MAGIC, RECORD_SIZE, "records"):
+    for _index, raw in _iter_binary_entries(
+        path, RECORD_MAGIC, RECORD_SIZE, "records"
+    ):
         yield Record(raw)
 
 
@@ -1869,15 +2801,18 @@ def _iter_binary_entries_with_custody(
         raise AnalyzerError(
             f"{name}: file too short ({file_size} bytes < {HEADER_SIZE} header)"
         )
-    custody: dict[str, int] = {"bytes": 0, "sha256": 0}
+    custody: dict[str, int] = {"bytes": 0, "sha256": 0, "body_sha256": 0}
     stream = path.open("rb")
     running_hash = hashlib.sha256()
+    body_hash = hashlib.sha256()
     try:
         header = _read_exact_bytes(stream, HEADER_SIZE, f"{name} header")
         running_hash.update(header)
         file_magic, count = HEADER_STRUCT.unpack(header)
         if file_magic != magic:
-            raise AnalyzerError(f"{name}: bad magic {file_magic!r}, expected {magic!r}")
+            raise AnalyzerError(
+                f"{name}: bad magic {file_magic!r}, expected {magic!r}"
+            )
         expected_payload = count * entry_size
         available = file_size - HEADER_SIZE
         if available < expected_payload:
@@ -1891,6 +2826,7 @@ def _iter_binary_entries_with_custody(
                 for index in range(count):
                     raw = _read_exact_bytes(stream, entry_size, f"{name} entry {index}")
                     running_hash.update(raw)
+                    body_hash.update(raw)
                     yield index, raw
                 trailing = stream.read(1)
                 if trailing:
@@ -1899,6 +2835,7 @@ def _iter_binary_entries_with_custody(
                     )
                 custody["bytes"] = file_size
                 custody["sha256"] = int(running_hash.hexdigest(), 16)
+                custody["body_sha256"] = int(body_hash.hexdigest(), 16)
             finally:
                 stream.close()
 
@@ -1908,7 +2845,9 @@ def _iter_binary_entries_with_custody(
         raise
 
 
-def iter_records_with_custody(path: Path) -> tuple[Iterator[Record], dict[str, int]]:
+def iter_records_with_custody(
+    path: Path
+) -> tuple[Iterator[Record], dict[str, int]]:
     """Stream BRSREC1 records and compute custody on the single open."""
     gen, custody = _iter_binary_entries_with_custody(
         path, RECORD_MAGIC, RECORD_SIZE, "records"
@@ -1917,7 +2856,7 @@ def iter_records_with_custody(path: Path) -> tuple[Iterator[Record], dict[str, i
 
 
 def iter_journal_with_custody(
-    path: Path,
+    path: Path
 ) -> tuple[Iterator[JournalEntry], dict[str, int]]:
     """Stream BRSJRN1 journal entries and compute custody on the single open."""
     gen, custody = _iter_binary_entries_with_custody(
@@ -1925,15 +2864,12 @@ def iter_journal_with_custody(
     )
     return ((JournalEntry(raw) for _idx, raw in gen), custody)
 
-
 def iter_journal(path: Path) -> Iterator[JournalEntry]:
     """Stream BRSJRN1 journal entries one at a time without materializing the file."""
     for _index, raw in _iter_binary_entries(
         path, JOURNAL_MAGIC, JOURNAL_SIZE, "journal entries"
     ):
         yield JournalEntry(raw)
-
-
 def parse_counters(path: Path) -> tuple[Counters, dict[str, int]]:
     """Parse counters JSON and return (Counters, custody) from the single read."""
     counters_bytes = path.read_bytes()
@@ -1990,11 +2926,7 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
 
     def inv(inv_id: str, passed: bool, statement: str, **extra: object) -> None:
-        entry: dict[str, object] = {
-            "id": inv_id,
-            "passed": passed,
-            "statement": statement,
-        }
+        entry: dict[str, object] = {"id": inv_id, "passed": passed, "statement": statement}
         entry.update(extra)
         results.append(entry)
 
@@ -2054,15 +2986,32 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, object]]:
     )
     inv(
         "INV-7",
-        c.op_checksigadd == 0
-        and c.checkschnorr_entries == 0
-        and c.schnorr_verify_calls == 0,
-        "C_OP_CHECKSIGADD == 0 and C_CHECKSCHNORR_ENTRIES == 0 and C_SCHNORR_VERIFY_CALLS == 0",
-        op_checksigadd=c.op_checksigadd,
+        c.checkschnorr_entries >= c.schnorr_verify_calls
+        and c.schnorr_verify_calls == c.schnorr_verify_ok + c.schnorr_verify_fail,
+        "C_CHECKSCHNORR_ENTRIES >= C_SCHNORR_VERIFY_CALLS and "
+        "C_SCHNORR_VERIFY_CALLS == C_SCHNORR_VERIFY_OK + C_SCHNORR_VERIFY_FAIL",
         checkschnorr_entries=c.checkschnorr_entries,
         schnorr_verify_calls=c.schnorr_verify_calls,
+        schnorr_ok_plus_fail=c.schnorr_verify_ok + c.schnorr_verify_fail,
     )
     return results
+
+
+def _check_pre_taproot_schnorr_absence(c: Counters) -> dict[str, object]:
+    """Keep the legacy KSPIKE1 capture contract pre-Taproot."""
+    counters = {
+        "op_checksigadd": c.op_checksigadd,
+        "checkschnorr_entries": c.checkschnorr_entries,
+        "schnorr_verify_calls": c.schnorr_verify_calls,
+        "schnorr_verify_ok": c.schnorr_verify_ok,
+        "schnorr_verify_fail": c.schnorr_verify_fail,
+    }
+    return {
+        "id": "INV-KSPIKE-SCHNORR-0",
+        "passed": all(value == 0 for value in counters.values()),
+        "statement": "legacy KSPIKE1 Schnorr and OP_CHECKSIGADD counters are zero",
+        **counters,
+    }
 
 
 def check_record_counts(records: list[Record], c: Counters) -> dict[str, object]:
@@ -2457,6 +3406,7 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
 
     inv_results: list[dict[str, object]] = []
     inv_results.extend(check_counter_arithmetic(counters))
+    inv_results.append(_check_pre_taproot_schnorr_absence(counters))
     inv_results.append(check_record_counts(records, counters))
     inv_results.append(check_journal_sums(journal, counters))
     inv_results.append(check_duplicate_keys(records))
@@ -2508,6 +3458,7 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
 
     inv_results: list[dict[str, object]] = []
     inv_results.extend(check_counter_arithmetic(counters))
+    inv_results.append(_check_pre_taproot_schnorr_absence(counters))
     inv_results.append(check_all_verdicts_true(journal))
     inv_results.append(check_journal_sums(journal, counters))
     inv_results.append(check_census_capture_agreement(journal, capture_journal))
@@ -2917,6 +3868,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     return 0 if verdict != "INVALID" else 2
 
 
+
 # ── Subcommand: classify-corpus ──────────────────────────────────────────────
 
 
@@ -2976,36 +3928,15 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
         raise AnalyzerError("CTX-CUSTODY: replay artifact root is not an object")
 
     _REPLAY_KEYS = {
-        "schema",
-        "network",
-        "network_magic",
-        "genesis_hash",
-        "start_height",
-        "start_hash",
-        "stop_height",
-        "stop_hash",
-        "block_count",
-        "window",
-        "assume_valid_height",
-        "window_verify_success_total",
-        "corpus_manifest",
-        "archive",
-        "block_bytes",
-        "block_source",
-        "blockfilterindex",
-        "blocks_per_second",
-        "checkpoint_generation",
-        "data_dir",
-        "decode_seconds",
-        "elapsed_seconds",
-        "fetch_seconds",
-        "git_head",
-        "measurement_target",
-        "rss_high_water_bytes",
-        "stage_seconds",
-        "storage_backend",
-        "tx_count",
-        "txindex",
+        "schema", "network", "network_magic", "genesis_hash",
+        "start_height", "start_hash", "stop_height", "stop_hash",
+        "block_count", "window", "assume_valid_height",
+        "window_verify_success_total", "corpus_manifest", "archive",
+        "block_bytes", "block_source", "blockfilterindex",
+        "blocks_per_second", "checkpoint_generation", "data_dir",
+        "decode_seconds", "elapsed_seconds", "fetch_seconds",
+        "git_head", "measurement_target", "rss_high_water_bytes",
+        "stage_seconds", "storage_backend", "tx_count", "txindex",
     }
     _require_exact_keys(raw, _REPLAY_KEYS, "replay artifact root")
 
@@ -3058,7 +3989,9 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     window = _require_int_field(raw["window"], "replay.window")
     if window <= 1:
-        raise AnalyzerError(f"CTX-WINDOW: replay.window must be > 1, got {window}")
+        raise AnalyzerError(
+            f"CTX-WINDOW: replay.window must be > 1, got {window}"
+        )
 
     assume_valid_height = _require_int_field(
         raw["assume_valid_height"], "replay.assume_valid_height"
@@ -3081,7 +4014,9 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     corpus_manifest = _require_custody_ref(
         raw["corpus_manifest"], "replay.corpus_manifest", with_schema=True
     )
-    archive = _require_custody_ref(raw["archive"], "replay.archive", with_schema=False)
+    archive = _require_custody_ref(
+        raw["archive"], "replay.archive", with_schema=False
+    )
 
     # ── Optional timing/metadata fields emitted by the Rust replay binary.
     # These are not load-bearing for the contract, but the schema is frozen,
@@ -3095,14 +4030,13 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     block_bytes = _require_non_bool_int(raw["block_bytes"], "replay.block_bytes")
     if block_bytes < 0:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: replay.block_bytes must be >= 0, got {block_bytes}"
-        )
+        raise AnalyzerError(f"CTX-CUSTODY: replay.block_bytes must be >= 0, got {block_bytes}")
 
     block_source = raw["block_source"]
-    if not isinstance(block_source, str) or block_source not in ("file", "rest"):
+    if block_source != "file":
         raise AnalyzerError(
-            f"CTX-CUSTODY: replay.block_source must be 'file' or 'rest', got {block_source!r}"
+            "CTX-CUSTODY: replay.block_source must be 'file', "
+            f"got {block_source!r}"
         )
 
     if not isinstance(raw["blockfilterindex"], bool):
@@ -3110,44 +4044,32 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     if not isinstance(raw["txindex"], bool):
         raise AnalyzerError("CTX-CUSTODY: replay.txindex must be a boolean")
 
-    blocks_per_second = _require_float(
-        raw["blocks_per_second"], "replay.blocks_per_second", ge=0.0
-    )
+    blocks_per_second = _require_float(raw["blocks_per_second"], "replay.blocks_per_second", ge=0.0)
     checkpoint_generation = _require_non_bool_int(
         raw["checkpoint_generation"], "replay.checkpoint_generation"
     )
     if checkpoint_generation < 1:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: replay.checkpoint_generation must be >= 1, got {checkpoint_generation}"
-        )
+        raise AnalyzerError(f"CTX-CUSTODY: replay.checkpoint_generation must be >= 1, got {checkpoint_generation}")
 
     data_dir = raw["data_dir"]
     if not isinstance(data_dir, str) or len(data_dir) == 0:
         raise AnalyzerError("CTX-CUSTODY: replay.data_dir must be a nonempty string")
 
-    decode_seconds = _require_float(
-        raw["decode_seconds"], "replay.decode_seconds", ge=0.0
-    )
-    elapsed_seconds = _require_float(
-        raw["elapsed_seconds"], "replay.elapsed_seconds", ge=0.0
-    )
+    decode_seconds = _require_float(raw["decode_seconds"], "replay.decode_seconds", ge=0.0)
+    elapsed_seconds = _require_float(raw["elapsed_seconds"], "replay.elapsed_seconds", ge=0.0)
     fetch_seconds = _require_float(raw["fetch_seconds"], "replay.fetch_seconds", ge=0.0)
 
     git_head = _require_hex_str(raw["git_head"], "replay.git_head", 40)
 
     measurement_target = raw["measurement_target"]
     if not isinstance(measurement_target, str) or len(measurement_target) == 0:
-        raise AnalyzerError(
-            "CTX-CUSTODY: replay.measurement_target must be a nonempty string"
-        )
+        raise AnalyzerError("CTX-CUSTODY: replay.measurement_target must be a nonempty string")
 
     rss_high_water_bytes = _require_non_bool_int(
         raw["rss_high_water_bytes"], "replay.rss_high_water_bytes"
     )
     if rss_high_water_bytes < 0:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: replay.rss_high_water_bytes must be >= 0, got {rss_high_water_bytes}"
-        )
+        raise AnalyzerError(f"CTX-CUSTODY: replay.rss_high_water_bytes must be >= 0, got {rss_high_water_bytes}")
 
     stage_seconds = raw["stage_seconds"]
     if not isinstance(stage_seconds, list):
@@ -3159,9 +4081,7 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
                 "CTX-CUSTODY: replay.stage_seconds entries must be objects with "
                 "count, stage, and sum_seconds"
             )
-        _require_exact_keys(
-            _stage_entry, _STAGE_ENTRY_KEYS, "replay.stage_seconds entry"
-        )
+        _require_exact_keys(_stage_entry, _STAGE_ENTRY_KEYS, "replay.stage_seconds entry")
         _stage_count = _stage_entry["count"]
         if isinstance(_stage_count, bool) or not isinstance(_stage_count, int):
             raise AnalyzerError(
@@ -3173,9 +4093,7 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
             )
         _stage_name = _stage_entry["stage"]
         if not isinstance(_stage_name, str):
-            raise AnalyzerError(
-                "CTX-CUSTODY: replay.stage_seconds stage must be a string"
-            )
+            raise AnalyzerError("CTX-CUSTODY: replay.stage_seconds stage must be a string")
         _stage_sum = _stage_entry["sum_seconds"]
         if isinstance(_stage_sum, bool) or not isinstance(_stage_sum, float):
             raise AnalyzerError(
@@ -3189,15 +4107,11 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     storage_backend = raw["storage_backend"]
     if not isinstance(storage_backend, str) or len(storage_backend) == 0:
-        raise AnalyzerError(
-            "CTX-CUSTODY: replay.storage_backend must be a nonempty string"
-        )
+        raise AnalyzerError("CTX-CUSTODY: replay.storage_backend must be a nonempty string")
 
     tx_count = _require_non_bool_int(raw["tx_count"], "replay.tx_count")
     if tx_count < 0:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: replay.tx_count must be >= 0, got {tx_count}"
-        )
+        raise AnalyzerError(f"CTX-CUSTODY: replay.tx_count must be >= 0, got {tx_count}")
 
     return {
         "schema": "mainnet-prefix-replay-v2",
@@ -3258,14 +4172,8 @@ def _validate_corpus_manifest(
         raise AnalyzerError("CTX-CUSTODY: corpus manifest root is not an object")
 
     _MANIFEST_KEYS = {
-        "schema",
-        "version",
-        "network",
-        "network_magic",
-        "genesis_hash",
-        "range",
-        "archive",
-        "entries",
+        "schema", "version", "network", "network_magic", "genesis_hash",
+        "range", "archive", "entries",
     }
     _require_exact_keys(raw, _MANIFEST_KEYS, "corpus manifest root")
 
@@ -3323,7 +4231,9 @@ def _validate_corpus_manifest(
     # ── entries ──
     entries = raw["entries"]
     if not isinstance(entries, list) or len(entries) == 0:
-        raise AnalyzerError("CTX-CUSTODY: manifest.entries must be a non-empty array")
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.entries must be a non-empty array"
+        )
 
     # ── Cross-check manifest file bytes/SHA-256 against replay ──
     replay_cm = replay["corpus_manifest"]
@@ -3496,7 +4406,9 @@ def _validate_corpus_manifest(
             bytes_consumed += 80
 
             # Double-SHA256 of the 80-byte header → internal LE hash.
-            hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
+            hash_raw = hashlib.sha256(
+                hashlib.sha256(header_bytes).digest()
+            ).digest()
             hash_display = hash_raw[::-1].hex()
 
             if hash_display != entry_hash:
@@ -3534,11 +4446,12 @@ def _validate_corpus_manifest(
                     )
 
             # Last block hash must equal replay stop_hash.
-            if index == last_index and entry_hash != replay_stop_hash:
-                raise AnalyzerError(
-                    f"CTX-CUSTODY: last block hash {entry_hash} != "
-                    f"replay stop_hash {replay_stop_hash}"
-                )
+            if index == last_index:
+                if entry_hash != replay_stop_hash:
+                    raise AnalyzerError(
+                        f"CTX-CUSTODY: last block hash {entry_hash} != "
+                        f"replay stop_hash {replay_stop_hash}"
+                    )
 
             prev_block_hash_raw = hash_raw
 
@@ -3548,10 +4461,7 @@ def _validate_corpus_manifest(
             while remaining > 0:
                 to_read = min(remaining, chunk_size)
                 chunk = _read_exact_bytes(
-                    stream,
-                    to_read,
-                    f"archive frame {index} payload chunk",
-                    scope="CTX-CUSTODY",
+                    stream, to_read, f"archive frame {index} payload chunk", scope="CTX-CUSTODY"
                 )
                 running_hash.update(chunk)
                 bytes_consumed += to_read
@@ -3634,11 +4544,12 @@ def _count_context_records_disk(
 
     conn: sqlite3.Connection | None = None
 
-    def insert_bounded(sql: str, rows: Iterator[tuple[object, ...]]) -> int:
+    def insert_bounded(
+        sql: str, rows: Iterator[tuple[object, ...]]
+    ) -> int:
         inserted = 0
         exhausted = False
         while not exhausted:
-
             def next_chunk() -> Iterator[tuple[object, ...]]:
                 nonlocal exhausted, inserted
                 for _ in range(chunk_size):
@@ -3705,9 +4616,7 @@ def _count_context_records_disk(
                     )
                     contexts_custody = context_iter.custody()
                 except ContextError as exc:
-                    raise AnalyzerError(
-                        f"CTX-RAW: BRSCTX1 stream failed: {exc}"
-                    ) from exc
+                    raise AnalyzerError(f"CTX-RAW: BRSCTX1 stream failed: {exc}") from exc
                 except sqlite3.IntegrityError as exc:
                     raise AnalyzerError(
                         f"CTX-EXECUTION: duplicate context execution identity in BRSCTX1: {exc}"
@@ -3793,9 +4702,7 @@ def _count_context_records_disk(
                         "SELECT spend_context, COUNT(*) FROM contexts GROUP BY spend_context"
                     ).fetchall()
                 )
-                counts["p2sh_redeem_spends"] = spend_counts.get(
-                    SpendContext.P2SH.value, 0
-                )
+                counts["p2sh_redeem_spends"] = spend_counts.get(SpendContext.P2SH.value, 0)
                 counts["native_witness_v0_spends"] = spend_counts.get(
                     SpendContext.NATIVE_WITNESS_V0.value, 0
                 )
@@ -3859,9 +4766,7 @@ def _count_context_records_disk(
                     " WHERE op_seq != expected ORDER BY stream_pos LIMIT 1"
                 ).fetchone()
                 if sequence_error is not None:
-                    record_failures.append(
-                        (sequence_error[4], 1, sequence_error[:4], "sequence")
-                    )
+                    record_failures.append((sequence_error[4], 1, sequence_error[:4], "sequence"))
 
                 invalid = conn.execute(
                     "WITH classified AS ("
@@ -3908,7 +4813,7 @@ def _count_context_records_disk(
                             f"expected {expected}, got {actual}"
                         )
                     # kind == "invalid"
-                    txid_le, input_index, op, sig, _ctx_name, error_code = row
+                    txid_le, input_index, op, sig, ctx_name, error_code = row
                     identity = f"txid={txid_le[::-1].hex()}, input_index={input_index}"
                     sig_name = _sig_version_name(sig)
                     if error_code == "multisig_sig":
@@ -3922,9 +4827,7 @@ def _count_context_records_disk(
                     elif error_code == "wrapped_multisig":
                         message = f"P2SH-wrapped witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
                     elif error_code == "taproot_multisig":
-                        message = (
-                            f"multisig record joined to a Taproot input {identity}"
-                        )
+                        message = f"multisig record joined to a Taproot input {identity}"
                     elif error_code == "checksigadd_sig":
                         message = f"CHECKSIGADD record must have sig_version TAPSCRIPT, got {sig_name} for {identity}"
                     elif error_code == "checksigadd_context":
@@ -3932,9 +4835,7 @@ def _count_context_records_disk(
                     elif error_code == "keypath_sig":
                         message = f"key-path record must have sig_version TAPROOT, got {sig_name} for {identity}"
                     elif error_code == "keypath_context":
-                        message = (
-                            f"key-path record joined to a non-key-path input {identity}"
-                        )
+                        message = f"key-path record joined to a non-key-path input {identity}"
                     elif error_code == "tapscript_checksig":
                         message = f"Tapscript CHECKSIG record joined to a non-Tapscript input {identity}"
                     elif error_code == "witness_checksig":
@@ -3978,12 +4879,10 @@ def _count_context_records_disk(
                 ).fetchone()
                 for name, value in zip(
                     (
-                        "bare_multisig_checks",
-                        "p2sh_multisig_checks",
+                        "bare_multisig_checks", "p2sh_multisig_checks",
                         "native_witness_v0_multisig_checks",
                         "p2sh_wrapped_witness_v0_multisig_checks",
-                        "tapscript_schnorr_checks",
-                        "tapscript_checksigadd_checks",
+                        "tapscript_schnorr_checks", "tapscript_checksigadd_checks",
                     ),
                     record_tallies,
                 ):
@@ -4003,17 +4902,10 @@ def _count_context_records_disk(
                     " FROM records"
                 ).fetchone()
                 (
-                    agg_ecdsa_calls,
-                    agg_ecdsa_ok,
-                    agg_ecdsa_fail,
-                    agg_schnorr_calls,
-                    agg_schnorr_ok,
-                    agg_schnorr_fail,
-                    agg_checkecdsa_entries,
-                    agg_checkschnorr_entries,
-                    reject_pubkey,
-                    reject_empty_sig,
-                    reject_missing_data,
+                    agg_ecdsa_calls, agg_ecdsa_ok, agg_ecdsa_fail,
+                    agg_schnorr_calls, agg_schnorr_ok, agg_schnorr_fail,
+                    agg_checkecdsa_entries, agg_checkschnorr_entries,
+                    reject_pubkey, reject_empty_sig, reject_missing_data,
                 ) = (value or 0 for value in aggregate)
 
                 ecdsa_mismatch = conn.execute(
@@ -4061,10 +4953,7 @@ def _count_context_records_disk(
                         f"op_checksig + op_checksigverify "
                         f"{counters.op_checksig + counters.op_checksigverify}"
                     )
-                if (
-                    sum_checkmultisig
-                    != counters.op_checkmultisig + counters.op_checkmultisigverify
-                ):
+                if sum_checkmultisig != counters.op_checkmultisig + counters.op_checkmultisigverify:
                     raise AnalyzerError(
                         f"CTX-OPERATIONS: SUM(checkmultisig_ops) {sum_checkmultisig} != "
                         f"op_checkmultisig + op_checkmultisigverify "
@@ -4072,34 +4961,15 @@ def _count_context_records_disk(
                     )
 
                 reconciliations = (
-                    (
-                        "ecdsa_verify_calls",
-                        agg_ecdsa_calls,
-                        counters.ecdsa_verify_calls,
-                    ),
+                    ("ecdsa_verify_calls", agg_ecdsa_calls, counters.ecdsa_verify_calls),
                     ("ecdsa_verify_ok", agg_ecdsa_ok, counters.ecdsa_verify_ok),
                     ("ecdsa_verify_fail", agg_ecdsa_fail, counters.ecdsa_verify_fail),
-                    (
-                        "schnorr_verify_calls",
-                        agg_schnorr_calls,
-                        counters.schnorr_verify_calls,
-                    ),
+                    ("schnorr_verify_calls", agg_schnorr_calls, counters.schnorr_verify_calls),
                     ("schnorr_verify_ok", agg_schnorr_ok, counters.schnorr_verify_ok),
-                    (
-                        "schnorr_verify_fail",
-                        agg_schnorr_fail,
-                        counters.schnorr_verify_fail,
-                    ),
-                    (
-                        "checkecdsa_entries",
-                        agg_checkecdsa_entries,
-                        counters.checkecdsa_entries,
-                    ),
-                    (
-                        "checkschnorr_entries",
-                        agg_checkschnorr_entries,
-                        counters.checkschnorr_entries,
-                    ),
+                    ("schnorr_verify_fail", agg_schnorr_fail, counters.schnorr_verify_fail),
+                    ("checkecdsa_entries", agg_checkecdsa_entries, counters.checkecdsa_entries),
+                    ("checkschnorr_entries", agg_checkschnorr_entries, counters.checkschnorr_entries),
+                    ("op_checksigadd", counts["tapscript_checksigadd_checks"], counters.op_checksigadd),
                 )
                 for name, actual, expected in reconciliations:
                     if actual != expected:
@@ -4134,15 +5004,11 @@ def _count_context_records_disk(
         else:
             os.environ.pop("TMPDIR", None)
 
-    return (
-        counts,
-        context_count,
-        {
-            "contexts": contexts_custody,
-            "records": record_custody,
-            "journal": journal_custody,
-        },
-    )
+    return counts, context_count, {
+        "contexts": contexts_custody,
+        "records": record_custody,
+        "journal": journal_custody,
+    }
 
 
 def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
@@ -4195,7 +5061,14 @@ def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
         counters.schnorr_verify_ok,
         counters.schnorr_verify_fail,
     )
-    return not any(v != 0 for v in complementary_zero)
+    if any(v != 0 for v in complementary_zero):
+        return False
+    return True
+
+
+def _cmodern_passed(counts: dict[str, int]) -> bool:
+    """Require every context that defines Cmodern to occur at least once."""
+    return all(counts[name] > 0 for name in CONTEXT_COUNTER_NAMES)
 
 
 def cmd_classify_corpus(args: argparse.Namespace) -> int:
@@ -4219,10 +5092,7 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
 
     # ── Run disk-backed counter computation (returns custody for ctx/rec/jrn) ──
     counts, context_count, bin_custody = _count_context_records_disk(
-        contexts_path,
-        records_path,
-        journal_path,
-        counters,
+        contexts_path, records_path, journal_path, counters,
         Path(args.scratch_dir) if getattr(args, "scratch_dir", None) else None,
     )
 
@@ -4270,11 +5140,7 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
     inv_all_passed = all(r["passed"] for r in inv_results)
 
     # ── Zero-input evidence precedence: validate counts > 0 before contract logic ──
-    if (
-        counters.context_count == 0
-        or counters.journal_count == 0
-        or counters.record_count == 0
-    ):
+    if counters.context_count == 0 or counters.journal_count == 0 or counters.record_count == 0:
         raise AnalyzerError(
             "CTX-EXECUTION: zero-input evidence rejected: "
             f"context_count={counters.context_count}, "
@@ -4284,13 +5150,21 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
 
     # ── Apply c150 / cmodern contract logic ──
     if args.contract == "cmodern":
-        # cmodern is not frozen until the exact tip is empirically recorded.
-        cmodern_frozen = False
-        all_passed = False
-        report_error = (
-            "CTX-CUSTODY: cmodern contract is not frozen until the exact "
-            "tip is empirically recorded"
-        )
+        if replay["stop_height"] != CMODERN_STOP_HEIGHT:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: cmodern requires stop_height {CMODERN_STOP_HEIGHT}, "
+                f"got {replay['stop_height']}"
+            )
+        if replay["stop_hash"] != CMODERN_STOP_HASH:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: cmodern requires stop_hash {CMODERN_STOP_HASH!r}, "
+                f"got {replay['stop_hash']!r}"
+            )
+        all_passed = _cmodern_passed(counts) and inv_all_passed
+        contract_result: dict[str, object] = {
+            "cmodern_frozen": True,
+            "cmodern_passed": all_passed,
+        }
     elif args.contract == "c150":
         # c150 pin: stop_height must be exactly 150000 and stop_hash must match.
         if replay["stop_height"] != C150_STOP_HEIGHT:
@@ -4303,8 +5177,8 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
                 f"CTX-CUSTODY: c150 requires stop_hash {C150_STOP_HASH!r}, "
                 f"got {replay['stop_hash']!r}"
             )
-        c150_passed = _c150_passed(counts, counters) and inv_all_passed
-        all_passed = c150_passed
+        all_passed = _c150_passed(counts, counters) and inv_all_passed
+        contract_result = {"c150_passed": all_passed}
     else:
         raise AnalyzerError(
             f"contract must be 'c150' or 'cmodern', got {args.contract!r}"
@@ -4322,20 +5196,17 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
         "replay": replay,
         "corpus_manifest": manifest,
         "counter_arithmetic": inv_results,
+        **contract_result,
     }
-    if args.contract == "cmodern":
-        report["cmodern_frozen"] = cmodern_frozen
-        report["error"] = report_error
-    else:
-        report["c150_passed"] = c150_passed
 
     # Optional cross-check: --input-count if provided.
     input_count_opt = getattr(args, "input_count", None)
-    if input_count_opt is not None and input_count_opt != context_count:
-        raise AnalyzerError(
-            f"CTX-SOURCE: --input-count {input_count_opt} != "
-            f"BRSCTX1 context count {context_count}"
-        )
+    if input_count_opt is not None:
+        if input_count_opt != context_count:
+            raise AnalyzerError(
+                f"CTX-SOURCE: --input-count {input_count_opt} != "
+                f"BRSCTX1 context count {context_count}"
+            )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -4494,32 +5365,38 @@ def build_parser() -> argparse.ArgumentParser:
         "find-cmodern-height",
         help="launch a diagnostic replay to find the first mainnet height with all 11 special contexts",
     )
-    fc.add_argument(
-        "--binary", required=True, help="feature-built mainnet_prefix_replay binary"
-    )
+    fc.add_argument("--binary", required=True, help="feature-built mainnet_prefix_replay binary")
     fc.add_argument("--rest-url", required=True, help="frozen REST URL (host:port)")
-    fc.add_argument(
-        "--stop-height", required=True, type=int, help="safety ceiling (inclusive u32)"
-    )
-    fc.add_argument(
-        "--work-dir",
-        required=True,
-        help="new work directory for BRS streams and scratch state",
-    )
+    fc.add_argument("--stop-height", required=True, type=int, help="safety ceiling (inclusive u32)")
+    fc.add_argument("--work-dir", required=True, help="new work directory for BRS streams and scratch state")
     fc.add_argument("--output", required=True, help="candidate output JSON path")
-    fc.add_argument(
-        "--storage-backend", default="fjall", help="storage backend for replay state"
+    fc.add_argument("--storage-backend", default="fjall", help="storage backend for replay state")
+    fc.add_argument("--txindex", action="store_true", default=False, help="enable txindex")
+    fc.add_argument("--blockfilterindex", action="store_true", default=False, help="enable blockfilterindex")
+    fc.set_defaults(func=cmd_find_cmodern_height)
+    sc = sub.add_parser(
+        "salvage-cmodern-height",
+        help="recover terminal Cmodern evidence without changing the failed run",
     )
-    fc.add_argument(
-        "--txindex", action="store_true", default=False, help="enable txindex"
+    sc.add_argument("--source-dir", required=True, help="read-only failed work directory")
+    sc.add_argument("--recovery-dir", required=True, help="new directory for committed evidence")
+    sc.add_argument("--rest-url", required=True, help="original frozen REST URL (host:port)")
+    sc.add_argument("--stop-height", required=True, type=int, help="original safety ceiling")
+    sc.add_argument(
+        "--data-dir",
+        required=True,
+        help="exact original data_dir recorded by replay_diagnostic.json",
     )
-    fc.add_argument(
+    sc.add_argument("--output", required=True, help="new candidate output JSON path")
+    sc.add_argument("--storage-backend", default="fjall", help="original storage backend")
+    sc.add_argument("--txindex", action="store_true", default=False, help="original txindex setting")
+    sc.add_argument(
         "--blockfilterindex",
         action="store_true",
         default=False,
-        help="enable blockfilterindex",
+        help="original blockfilterindex setting",
     )
-    fc.set_defaults(func=cmd_find_cmodern_height)
+    sc.set_defaults(func=cmd_salvage_cmodern_height)
 
     return parser
 

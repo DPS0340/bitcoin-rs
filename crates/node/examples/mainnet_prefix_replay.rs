@@ -32,6 +32,11 @@ use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
+/// Consensus-maximum serialized block size in bytes, derived from the
+/// maximum block weight (BIP 141). No valid serialized block can be larger.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+const MAX_SERIALIZED_BLOCK_SIZE: u32 = Weight::MAX_BLOCK.to_wu() as u32;
+
 /// A reader that hashes every byte it yields.
 ///
 /// Used so a Core-framed archive can be verified with a single streaming pass.
@@ -67,12 +72,12 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.state.update(&buf[..n]);
-            let read_len = u64::try_from(n)
+            let increment = u64::try_from(n)
                 .map_err(|_| std::io::Error::other("read length does not fit u64"))?;
             self.bytes_read = self
                 .bytes_read
-                .checked_add(read_len)
-                .ok_or_else(|| std::io::Error::other("bytes read overflow u64"))?;
+                .checked_add(increment)
+                .ok_or_else(|| std::io::Error::other("archive byte count overflow"))?;
         }
         Ok(n)
     }
@@ -134,15 +139,16 @@ fn replay_prefix(
         let block = Block::consensus_decode(&mut cursor)
             .with_context(|| format!("decode block bytes at height {height}"))?;
         let consumed = cursor.position();
-        let payload_len =
+        let payload_length =
             u64::try_from(bytes.len()).context("block payload length does not fit u64")?;
-        if consumed != payload_len {
+        if consumed != payload_length {
             let consumed =
                 usize::try_from(consumed).context("decoded block length does not fit usize")?;
-            bail!(
-                "block payload at height {height} has {} trailing bytes",
-                bytes.len().saturating_sub(consumed)
-            );
+            let trailing = bytes
+                .len()
+                .checked_sub(consumed)
+                .context("decoder consumed beyond the block payload")?;
+            bail!("block payload at height {height} has {trailing} trailing bytes");
         }
         decode_time += decode_started.elapsed();
 
@@ -325,11 +331,6 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
         blocks_path: blocks_path.clone(),
     })
 }
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "replay setup and custody output form one ordered transaction"
-)]
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if args.stop_height < args.start_height {
@@ -381,141 +382,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ReplayTotals {
-        start_hash,
-        stop_hash,
-        tx_count,
-        block_bytes,
-        fetch_time,
-        decode_time,
-        elapsed,
-    } = replay_prefix(
+    let totals = replay_prefix(
         &args,
-        file_inputs.as_ref().map(|f| &f.manifest),
+        file_inputs.as_ref().map(|inputs| &inputs.manifest),
         &apply_handles,
     )?;
     // The full UTXO scan is opt-in and starts after the internal replay timer.
     // Performance custody runs must omit it because process wall and CPU still
     // include the scan; separate validation runs pass this option.
     if let Some(path) = args.validation_output.as_deref() {
-        write_validation_artifact(path, &apply_handles, args.stop_height, stop_hash.as_deref())?;
+        write_validation_artifact(
+            path,
+            &apply_handles,
+            args.stop_height,
+            totals.stop_hash.as_deref(),
+        )?;
     }
-    let window = args.window.max(1);
-
-    let block_count = args
-        .stop_height
-        .saturating_sub(args.start_height)
-        .saturating_add(1);
-    let stage_seconds = stage_decomposition(metrics_handle.clone());
-    let snapshot = metrics_handle
-        .as_ref()
-        .map(bitcoin_rs_node::metrics::MetricsHandle::snapshot)
-        .unwrap_or_default();
-    let window_verify_success_total = counter_value(&snapshot, "node.window.verify_success_total");
-
-    if file_mode {
-        if window <= 1 {
-            bail!("file custody requires --window > 1");
-        }
-        if window_verify_success_total == 0 {
-            bail!("file custody requires at least one successful window verification dispatch");
-        }
-    }
-
-    let checkpoint_generation = if file_mode {
-        Some(
-            state
-                .publish_checkpoint()
-                .context("publish clean checkpoint")?,
-        )
-    } else {
-        None
-    };
-
-    let artifact = if file_mode {
-        let inputs = file_inputs
-            .as_ref()
-            .context("file mode requires prepared inputs")?;
-        json!({
-            "schema": "mainnet-prefix-replay-v2",
-            "measurement_target": "mainnet-prefix-replay",
-            "git_head": git_head().ok(),
-            "network": "mainnet",
-            "network_magic": inputs.manifest.network_magic.as_slice().to_lower_hex_string(),
-            "genesis_hash": inputs.manifest.genesis_hash.to_string_be(),
-            "corpus_manifest": {
-                "schema": CorpusManifest::SCHEMA,
-                "version": CorpusManifest::VERSION,
-                "path": inputs.manifest_path,
-                "bytes": inputs.manifest_bytes_len,
-                "sha256": inputs.manifest_sha.as_slice().to_lower_hex_string(),
-            },
-            "archive": {
-                "path": inputs.blocks_path,
-                "bytes": inputs.manifest.archive.size,
-                "sha256": inputs.manifest.archive.sha256.as_slice().to_lower_hex_string(),
-            },
-            "start_height": args.start_height,
-            "start_hash": start_hash,
-            "stop_height": args.stop_height,
-            "stop_hash": stop_hash,
-            "assume_valid_height": args.assume_valid_height,
-            // The effective value, not the raw flag: `--window 0` normalises to 1.
-            "window": window,
-            "window_verify_success_total": window_verify_success_total,
-            "checkpoint_generation": checkpoint_generation
-                .context("file mode requires a published checkpoint")?,
-            "storage_backend": args.storage_backend,
-            "txindex": args.txindex,
-            "blockfilterindex": args.blockfilterindex,
-            "block_count": block_count,
-            "tx_count": tx_count,
-            "block_bytes": block_bytes,
-            "elapsed_seconds": elapsed.as_secs_f64(),
-            "blocks_per_second": f64::from(block_count) / elapsed.as_secs_f64(),
-            "fetch_seconds": fetch_time.as_secs_f64(),
-            "decode_seconds": decode_time.as_secs_f64(),
-            "stage_seconds": stage_seconds,
-            "rss_high_water_bytes": rss_high_water_bytes(),
-            "block_source": "file",
-            "data_dir": args.data_dir,
-        })
-    } else {
-        let block_source = if args.rest_url.is_some() {
-            "rest"
-        } else {
-            "bitcoin-cli"
-        };
-        json!({
-            "schema": "mainnet-prefix-replay-v1",
-            "measurement_target": "mainnet-prefix-replay",
-            "git_head": git_head().ok(),
-            "storage_backend": args.storage_backend,
-            "txindex": args.txindex,
-            "blockfilterindex": args.blockfilterindex,
-            "assume_valid_height": args.assume_valid_height,
-            "window": window,
-            "start_height": args.start_height,
-            "start_hash": start_hash,
-            "stop_height": args.stop_height,
-            "stop_hash": stop_hash,
-            "block_count": block_count,
-            "tx_count": tx_count,
-            "block_bytes": block_bytes,
-            "elapsed_seconds": elapsed.as_secs_f64(),
-            "blocks_per_second": f64::from(block_count) / elapsed.as_secs_f64(),
-            "fetch_seconds": fetch_time.as_secs_f64(),
-            "decode_seconds": decode_time.as_secs_f64(),
-            "stage_seconds": stage_seconds,
-            "rss_high_water_bytes": rss_high_water_bytes(),
-            "bitcoin_cli": args.bitcoin_cli,
-            "bitcoin_cli_args": args.bitcoin_cli_args,
-            "block_source": block_source,
-            "rest_url": args.rest_url,
-            "blocks_file": args.blocks_file,
-            "data_dir": args.data_dir,
-        })
-    };
+    let artifact =
+        build_replay_artifact(&args, &state, file_inputs.as_ref(), &totals, metrics_handle)?;
     let rendered = serde_json::to_string_pretty(&artifact).context("render artifact JSON")?;
     if let Some(output) = args.output {
         std::fs::write(&output, rendered + "\n")
@@ -524,6 +408,148 @@ fn main() -> Result<()> {
         println!("{rendered}");
     }
     Ok(())
+}
+
+struct ArtifactMetrics {
+    block_count: u32,
+    window: usize,
+    window_verify_success_total: u64,
+    stage_seconds: Vec<serde_json::Value>,
+    rss_high_water_bytes: Option<u64>,
+}
+
+fn build_replay_artifact(
+    args: &Args,
+    state: &NodeState,
+    file_inputs: Option<&FileInputs>,
+    totals: &ReplayTotals,
+    metrics_handle: Option<bitcoin_rs_node::metrics::MetricsHandle>,
+) -> Result<serde_json::Value> {
+    let snapshot = metrics_handle
+        .as_ref()
+        .map(bitcoin_rs_node::metrics::MetricsHandle::snapshot)
+        .unwrap_or_default();
+    let metrics = ArtifactMetrics {
+        block_count: args
+            .stop_height
+            .saturating_sub(args.start_height)
+            .saturating_add(1),
+        window: args.window.max(1),
+        window_verify_success_total: counter_value(&snapshot, "node.window.verify_success_total"),
+        stage_seconds: stage_decomposition(metrics_handle),
+        rss_high_water_bytes: rss_high_water_bytes(),
+    };
+    let Some(inputs) = file_inputs else {
+        return Ok(legacy_replay_artifact(args, totals, &metrics));
+    };
+    if metrics.window <= 1 {
+        bail!("file custody requires --window > 1");
+    }
+    if metrics.window_verify_success_total == 0 {
+        bail!("file custody requires at least one successful window verification dispatch");
+    }
+    let checkpoint_generation = state
+        .publish_checkpoint()
+        .context("publish clean checkpoint")?;
+    Ok(file_replay_artifact(
+        args,
+        inputs,
+        totals,
+        &metrics,
+        checkpoint_generation,
+    ))
+}
+
+fn file_replay_artifact(
+    args: &Args,
+    inputs: &FileInputs,
+    totals: &ReplayTotals,
+    metrics: &ArtifactMetrics,
+    checkpoint_generation: u64,
+) -> serde_json::Value {
+    json!({
+        "schema": "mainnet-prefix-replay-v2",
+        "measurement_target": "mainnet-prefix-replay",
+        "git_head": git_head().ok(),
+        "network": "mainnet",
+        "network_magic": inputs.manifest.network_magic.as_slice().to_lower_hex_string(),
+        "genesis_hash": inputs.manifest.genesis_hash.to_string_be(),
+        "corpus_manifest": {
+            "schema": CorpusManifest::SCHEMA,
+            "version": CorpusManifest::VERSION,
+            "path": &inputs.manifest_path,
+            "bytes": inputs.manifest_bytes_len,
+            "sha256": inputs.manifest_sha.as_slice().to_lower_hex_string(),
+        },
+        "archive": {
+            "path": &inputs.blocks_path,
+            "bytes": inputs.manifest.archive.size,
+            "sha256": inputs.manifest.archive.sha256.as_slice().to_lower_hex_string(),
+        },
+        "start_height": args.start_height,
+        "start_hash": &totals.start_hash,
+        "stop_height": args.stop_height,
+        "stop_hash": &totals.stop_hash,
+        "assume_valid_height": args.assume_valid_height,
+        "window": metrics.window,
+        "window_verify_success_total": metrics.window_verify_success_total,
+        "checkpoint_generation": checkpoint_generation,
+        "storage_backend": &args.storage_backend,
+        "txindex": args.txindex,
+        "blockfilterindex": args.blockfilterindex,
+        "block_count": metrics.block_count,
+        "tx_count": totals.tx_count,
+        "block_bytes": totals.block_bytes,
+        "elapsed_seconds": totals.elapsed.as_secs_f64(),
+        "blocks_per_second": f64::from(metrics.block_count) / totals.elapsed.as_secs_f64(),
+        "fetch_seconds": totals.fetch_time.as_secs_f64(),
+        "decode_seconds": totals.decode_time.as_secs_f64(),
+        "stage_seconds": &metrics.stage_seconds,
+        "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "block_source": "file",
+        "data_dir": &args.data_dir,
+    })
+}
+
+fn legacy_replay_artifact(
+    args: &Args,
+    totals: &ReplayTotals,
+    metrics: &ArtifactMetrics,
+) -> serde_json::Value {
+    let block_source = if args.rest_url.is_some() {
+        "rest"
+    } else {
+        "bitcoin-cli"
+    };
+    json!({
+        "schema": "mainnet-prefix-replay-v1",
+        "measurement_target": "mainnet-prefix-replay",
+        "git_head": git_head().ok(),
+        "storage_backend": &args.storage_backend,
+        "txindex": args.txindex,
+        "blockfilterindex": args.blockfilterindex,
+        "assume_valid_height": args.assume_valid_height,
+        "window": metrics.window,
+        "start_height": args.start_height,
+        "start_hash": &totals.start_hash,
+        "stop_height": args.stop_height,
+        "stop_hash": &totals.stop_hash,
+        "block_count": metrics.block_count,
+        "tx_count": totals.tx_count,
+        "block_bytes": totals.block_bytes,
+        "elapsed_seconds": totals.elapsed.as_secs_f64(),
+        "blocks_per_second": f64::from(metrics.block_count) / totals.elapsed.as_secs_f64(),
+        "fetch_seconds": totals.fetch_time.as_secs_f64(),
+        "decode_seconds": totals.decode_time.as_secs_f64(),
+        "stage_seconds": &metrics.stage_seconds,
+        "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "bitcoin_cli": &args.bitcoin_cli,
+        "bitcoin_cli_args": &args.bitcoin_cli_args,
+        "block_source": block_source,
+        "rest_url": &args.rest_url,
+        "blocks_file": &args.blocks_file,
+        "data_dir": &args.data_dir,
+    })
 }
 
 fn write_validation_artifact(
@@ -726,12 +752,10 @@ fn open_block_source<'a>(
             .clone();
         let file = std::fs::File::open(path)
             .with_context(|| format!("open Core-framed archive {}", path.display()))?;
-        let max_payload = u32::try_from(Weight::MAX_BLOCK.to_wu())
-            .context("maximum block weight does not fit u32")?;
         let reader = CoreFrameReader::new(
             HashingReader::new(BufReader::with_capacity(1 << 20, file)),
             network.magic(),
-            max_payload,
+            MAX_SERIALIZED_BLOCK_SIZE,
         );
         return Ok(BlockSource::File {
             reader: Box::new(reader),
@@ -788,7 +812,7 @@ impl BlockSource<'_> {
                 next_index,
             } => {
                 let offset = reader.offset();
-                let record = reader.read_next().with_context(|| {
+                let record = reader.next_record().with_context(|| {
                     format!("read Core frame at offset {offset} for height {height}")
                 })?;
                 let Some(record) = record else {
@@ -852,7 +876,7 @@ impl BlockSource<'_> {
             } => {
                 let offset = reader.offset();
                 match reader
-                    .read_next()
+                    .next_record()
                     .with_context(|| format!("trailing Core frame at offset {offset}"))?
                 {
                     None => {
@@ -1013,12 +1037,11 @@ fn decode_and_validate_block(
     let mut cursor = std::io::Cursor::new(bytes);
     let block = Block::consensus_decode(&mut cursor)
         .with_context(|| format!("decode block bytes at height {height}"))?;
-    let consumed =
-        usize::try_from(cursor.position()).context("decoded block length exceeds usize")?;
-    if consumed != bytes.len() {
+    let consumed = cursor.position();
+    if consumed != u64::try_from(bytes.len()).expect("block length fits u64") {
         bail!(
             "block payload at height {height} has {} trailing bytes",
-            bytes.len() - consumed
+            bytes.len() - usize::try_from(consumed).expect("decoded block length fits usize")
         );
     }
     let actual_hash = block.block_hash();
@@ -1112,10 +1135,10 @@ fn read_control_byte(stdin: &mut impl Read) -> Result<u8> {
 fn write_diagnostic_artifact(
     args: &Args,
     actual_stop_height: u32,
-    actual_stop_hash: &str,
+    actual_stop_hash: String,
     elapsed: Duration,
 ) -> Result<()> {
-    let output = args.output.as_deref().context("--output is required")?;
+    let output = args.output.as_deref().expect("validated --output");
     let artifact = json!({
         "schema": "mainnet-prefix-replay-diagnostic-v1",
         "non_certifying": true,
@@ -1294,7 +1317,7 @@ fn run_census_diagnostic(
     args: &Args,
     apply_handles: &bitcoin_rs_node::apply::ApplyHandles,
 ) -> Result<()> {
-    let rest_url = args.rest_url.as_deref().context("--rest-url is required")?;
+    let rest_url = args.rest_url.as_deref().expect("validated --rest-url");
     let mut client =
         CoreRestClient::connect(rest_url).map_err(|e: CoreRestError| anyhow::Error::from(e))?;
 
@@ -1330,7 +1353,7 @@ fn run_census_diagnostic(
             0x01 => {
                 let actual_stop_hash = block_hash.to_string();
                 census_checkpoint::flush().context("terminal flush after diagnostic stop")?;
-                write_diagnostic_artifact(args, height, &actual_stop_hash, started.elapsed())?;
+                write_diagnostic_artifact(args, height, actual_stop_hash, started.elapsed())?;
                 return Ok(());
             }
             0x00 => {
@@ -1361,7 +1384,6 @@ fn update_prev_checkpoint(
     *prev = Some(next);
     Ok(())
 }
-
 fn print_usage() {
     println!(
         "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex] [--blockfilterindex]"
@@ -1763,7 +1785,7 @@ mod tests {
         write_diagnostic_artifact(
             &args,
             11,
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
             Duration::from_secs(3),
         )
         .unwrap();
@@ -1792,7 +1814,7 @@ mod tests {
         let err = write_diagnostic_artifact(
             &args,
             11,
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
             Duration::from_secs(3),
         )
         .unwrap_err();
@@ -1816,7 +1838,7 @@ mod tests {
         write_diagnostic_artifact(
             &args,
             7,
-            "0000000000000000000000000000000000000000000000000000000000000007",
+            "0000000000000000000000000000000000000000000000000000000000000007".into(),
             Duration::from_secs(1),
         )
         .unwrap();
@@ -1846,7 +1868,7 @@ mod tests {
         let err = write_diagnostic_artifact(
             &args,
             11,
-            "000000000000000000000000000000000000000000000000000000000000000a",
+            "000000000000000000000000000000000000000000000000000000000000000a".into(),
             Duration::from_secs(3),
         )
         .unwrap_err();

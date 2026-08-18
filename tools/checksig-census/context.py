@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -98,15 +98,11 @@ class ScriptElement:
     pushed: bytes | None
 
 
-def _read_exact(
-    stream: BinaryIO, length: int, field: str, row_number: int | None = None
-) -> bytes:
+def _read_exact(stream: BinaryIO, length: int, field: str, row_number: int | None = None) -> bytes:
     data = stream.read(length)
     if len(data) != length:
         location = "header" if row_number is None else f"row {row_number}"
-        raise ContextError(
-            f"CTX-RAW: short {field} in {location}: expected {length} bytes, got {len(data)}"
-        )
+        raise ContextError(f"CTX-RAW: short {field} in {location}: expected {length} bytes, got {len(data)}")
     return data
 
 
@@ -222,10 +218,17 @@ def decode_context_row(
 class _PreadBoundedReader:
     """Sequential view over one immutable committed prefix using ``pread``."""
 
-    def __init__(self, fd: int, start: int, end: int) -> None:
+    def __init__(
+        self,
+        fd: int,
+        start: int,
+        end: int,
+        observe_bytes: Callable[[bytes], None] | None = None,
+    ) -> None:
         self._fd = fd
         self._cursor = start
         self._end = end
+        self._observe_bytes = observe_bytes
 
     @property
     def cursor(self) -> int:
@@ -241,6 +244,8 @@ class _PreadBoundedReader:
             return b""
         data = os.pread(self._fd, length, self._cursor)
         self._cursor += len(data)
+        if data and self._observe_bytes is not None:
+            self._observe_bytes(data)
         return data
 
 
@@ -251,12 +256,14 @@ def read_bounded_context_rows(
     end_offset: int,
     start_row: int,
     committed_rows: int,
+    observe_bytes: Callable[[bytes], None] | None = None,
 ) -> list[ContextInput]:
     """Read only newly committed BRSCTX1 rows from an already-open fd.
 
     The producer may still have the placeholder header count zero. A patched
     terminal count is accepted only when it covers the requested committed
-    prefix. Bytes beyond ``end_offset`` are never observed.
+    prefix. Bytes beyond ``end_offset`` are never observed. ``observe_bytes``
+    receives each committed payload byte exactly once.
     """
     if start_row < 0 or committed_rows < start_row:
         raise ContextError(
@@ -278,15 +285,13 @@ def read_bounded_context_rows(
         )
     magic, declared_count = CONTEXT_HEADER.unpack(header)
     if magic != CONTEXT_MAGIC:
-        raise ContextError(
-            f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}"
-        )
+        raise ContextError(f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}")
     if declared_count != 0 and declared_count < committed_rows:
         raise ContextError(
             f"CTX-RAW: terminal row count {declared_count} is below committed prefix count {committed_rows}"
         )
 
-    reader = _PreadBoundedReader(fd, start_offset, end_offset)
+    reader = _PreadBoundedReader(fd, start_offset, end_offset, observe_bytes)
     rows = [
         decode_context_row(
             reader,
@@ -319,11 +324,9 @@ def _parse_legacy_row(value: object, line_number: int) -> ContextInput:
             f"missing={missing}, extra={extra}"
         )
     if row["schema"] != CONTEXT_INPUT_SCHEMA:
-        raise ContextError(
-            f"CTX-DIAG line {line_number}: schema must be {CONTEXT_INPUT_SCHEMA!r}"
-        )
+        raise ContextError(f"CTX-DIAG line {line_number}: schema must be {CONTEXT_INPUT_SCHEMA!r}")
 
-    _require_hex(row["block_hash"], "block_hash", line_number, 32)
+    block_hash_bytes = _require_hex(row["block_hash"], "block_hash", line_number, 32)
     txid_bytes = _require_hex(row["txid"], "txid", line_number, 32)
     witness_value = row["witness_hex"]
     if not isinstance(witness_value, list):
@@ -334,14 +337,9 @@ def _parse_legacy_row(value: object, line_number: int) -> ContextInput:
     )
 
     return ContextInput(
-        identity=InputIdentity(
-            txid_le=txid_bytes[::-1],
-            input_index=_require_uint(row["input_index"], "input_index", line_number),
-        ),
+        identity=InputIdentity(txid_le=txid_bytes[::-1], input_index=_require_uint(row["input_index"], "input_index", line_number)),
         verify_flags=0,
-        prevout_script_pubkey=_require_hex(
-            row["prevout_script_pubkey_hex"], "prevout_script_pubkey_hex", line_number
-        ),
+        prevout_script_pubkey=_require_hex(row["prevout_script_pubkey_hex"], "prevout_script_pubkey_hex", line_number),
         script_sig=_require_hex(row["script_sig_hex"], "script_sig_hex", line_number),
         witness=witness,
     )
@@ -349,15 +347,11 @@ def _parse_legacy_row(value: object, line_number: int) -> ContextInput:
 
 def _require_uint(value: object, field: str, line_number: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ContextError(
-            f"CTX-DIAG line {line_number}: {field} must be a non-negative integer"
-        )
+        raise ContextError(f"CTX-DIAG line {line_number}: {field} must be a non-negative integer")
     return value
 
 
-def _require_hex(
-    value: object, field: str, line_number: int, size: int | None = None
-) -> bytes:
+def _require_hex(value: object, field: str, line_number: int, size: int | None = None) -> bytes:
     if not isinstance(value, str):
         raise ContextError(f"CTX-DIAG line {line_number}: {field} must be a string")
     if value != value.lower() or len(value) % 2 != 0:
@@ -367,30 +361,38 @@ def _require_hex(
     try:
         decoded = bytes.fromhex(value)
     except ValueError:
-        raise ContextError(
-            f"CTX-DIAG line {line_number}: {field} must be lowercase hex"
-        )
+        raise ContextError(f"CTX-DIAG line {line_number}: {field} must be lowercase hex")
     if size is not None and len(decoded) != size:
-        raise ContextError(
-            f"CTX-DIAG line {line_number}: {field} must encode exactly {size} bytes"
-        )
+        raise ContextError(f"CTX-DIAG line {line_number}: {field} must encode exactly {size} bytes")
     return decoded
 
 
 class _HashingReader:
     """BinaryIO wrapper that hashes every byte read and counts total bytes."""
 
-    def __init__(self, stream: BinaryIO, hasher: hashlib._Hash) -> None:
+    def __init__(
+        self,
+        stream: BinaryIO,
+        hasher: hashlib._Hash,
+        body_hasher: hashlib._Hash,
+    ) -> None:
         self._stream = stream
         self._hasher = hasher
+        self._body_hasher = body_hasher
+        self._hash_body = False
         self._bytes_read = 0
 
     def read(self, length: int) -> bytes:
         data = self._stream.read(length)
         if data:
             self._hasher.update(data)
+            if self._hash_body:
+                self._body_hasher.update(data)
             self._bytes_read += len(data)
         return data
+
+    def start_body(self) -> None:
+        self._hash_body = True
 
     def close(self) -> None:
         self._stream.close()
@@ -409,6 +411,7 @@ class ContextIterator(Iterator[ContextInput]):
         self._path = path
         self._dedup = dedup
         self._hasher = hashlib.sha256()
+        self._body_hasher = hashlib.sha256()
         self._stream: _HashingReader | None = None
         self._count = 0
         self._closed = False
@@ -416,7 +419,9 @@ class ContextIterator(Iterator[ContextInput]):
 
     def _open(self) -> _HashingReader:
         if self._stream is None:
-            self._stream = _HashingReader(self._path.open("rb"), self._hasher)
+            self._stream = _HashingReader(
+                self._path.open("rb"), self._hasher, self._body_hasher
+            )
         return self._stream
 
     def _run(self) -> Iterator[ContextInput]:
@@ -424,21 +429,16 @@ class ContextIterator(Iterator[ContextInput]):
         try:
             file_size = self._path.stat().st_size
             if file_size < CONTEXT_HEADER.size:
-                raise ContextError(
-                    f"CTX-RAW: short header: expected {CONTEXT_HEADER.size} bytes, got {file_size}"
-                )
+                raise ContextError(f"CTX-RAW: short header: expected {CONTEXT_HEADER.size} bytes, got {file_size}")
 
             magic, declared_count = CONTEXT_HEADER.unpack(
                 _read_exact(stream, CONTEXT_HEADER.size, "header")
             )
             if magic != CONTEXT_MAGIC:
-                raise ContextError(
-                    f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}"
-                )
+                raise ContextError(f"CTX-RAW: wrong magic {magic!r}, expected {CONTEXT_MAGIC!r}")
+            stream.start_body()
             if declared_count > 0xFFFF_FFFF_FFFF_FFFF:
-                raise ContextError(
-                    "CTX-RAW: declared row count exceeds representable u64 range"
-                )
+                raise ContextError(f"CTX-RAW: declared row count exceeds representable u64 range")
 
             available = file_size - CONTEXT_HEADER.size
             minimum_framed_row = CONTEXT_ROW_LENGTH.size + CONTEXT_MIN_ROW_SIZE
@@ -467,9 +467,7 @@ class ContextIterator(Iterator[ContextInput]):
 
             trailing = stream.read(1)
             if trailing:
-                raise ContextError(
-                    "CTX-RAW: trailing bytes after declared BRSCTX1 rows"
-                )
+                raise ContextError("CTX-RAW: trailing bytes after declared BRSCTX1 rows")
         finally:
             if not self._closed:
                 self.close()
@@ -496,6 +494,7 @@ class ContextIterator(Iterator[ContextInput]):
         return {
             "bytes": self._stream._bytes_read if self._stream else 0,
             "sha256": int(self._hasher.hexdigest(), 16),
+            "body_sha256": int(self._body_hasher.hexdigest(), 16),
             "count": self._count,
         }
 
@@ -509,25 +508,15 @@ def read_context_inputs(path: Path) -> list[ContextInput]:
     return list(iter_context_inputs(path))
 
 
-def iter_legacy_context_inputs(
-    path: Path, expected_input_count: int
-) -> Iterator[ContextInput]:
+def iter_legacy_context_inputs(path: Path, expected_input_count: int) -> Iterator[ContextInput]:
     """Diagnostic-only JSONL iterator; no census certification path uses this."""
-    if (
-        isinstance(expected_input_count, bool)
-        or not isinstance(expected_input_count, int)
-        or expected_input_count < 0
-    ):
-        raise ContextError(
-            "CTX-DIAG: expected_input_count must be a non-negative integer"
-        )
+    if isinstance(expected_input_count, bool) or not isinstance(expected_input_count, int) or expected_input_count < 0:
+        raise ContextError("CTX-DIAG: expected_input_count must be a non-negative integer")
     seen = 0
     identities: set[tuple[bytes, int]] = set()
     for line_number, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip():
-            raise ContextError(
-                f"CTX-DIAG line {line_number}: blank lines are not permitted"
-            )
+            raise ContextError(f"CTX-DIAG line {line_number}: blank lines are not permitted")
         try:
             value = json.loads(line)
         except json.JSONDecodeError as error:
@@ -563,9 +552,7 @@ def parse_script(script: bytes) -> tuple[ScriptElement, ...]:
             pushed = b""
         elif 1 <= opcode <= 75:
             if offset + opcode > len(script):
-                raise ContextError(
-                    f"script push opcode {opcode} truncated at byte {offset}"
-                )
+                raise ContextError(f"script push opcode {opcode} truncated at byte {offset}")
             pushed = script[offset : offset + opcode]
             offset += opcode
         elif opcode == 76:
@@ -665,11 +652,7 @@ def _classify_taproot(evidence: ContextInput) -> SpendContext:
             raise ContextError("taproot key-path signature has wrong length")
         return SpendContext.TAPROOT_KEY_PATH
     control_block = witness[-1]
-    if (
-        len(control_block) < 33
-        or (len(control_block) - 1) % 32 != 0
-        or len(control_block) > 4129
-    ):
+    if len(control_block) < 33 or (len(control_block) - 1) % 32 != 0 or len(control_block) > 4129:
         raise ContextError("tapscript control block has wrong length")
     return SpendContext.TAPSCRIPT
 
@@ -677,9 +660,9 @@ def _classify_taproot(evidence: ContextInput) -> SpendContext:
 def classify_input(evidence: ContextInput) -> ClassifiedInput:
     prevout = evidence.prevout_script_pubkey
     if _is_p2tr(prevout):
-        if not (evidence.verify_flags & VERIFY_WITNESS) or not (
-            evidence.verify_flags & VERIFY_TAPROOT
-        ):
+        if not (evidence.verify_flags & VERIFY_WITNESS):
+            context = _classify_bare(evidence)
+        elif not (evidence.verify_flags & VERIFY_TAPROOT):
             context = _classify_bare(evidence)
         else:
             context = _classify_taproot(evidence)

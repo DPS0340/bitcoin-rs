@@ -381,7 +381,6 @@ fn corpus_height_range(corpus: &[SampleBlock]) -> (u32, u32) {
         corpus.iter().map(|sample| sample.height).max().unwrap_or(0),
     )
 }
-
 // ── Production flag derivation ──────────────────────────────────────────────
 
 /// Mirrors the buried-deployment fallback in `compute_verify_flags` from

@@ -1688,7 +1688,7 @@ mod tests {
         );
         for (i, block) in blocks.iter().enumerate() {
             let record = reader
-                .read_next()?
+                .next_record()?
                 .ok_or_else(|| std::io::Error::other("expected a frame"))?;
             let expected = serialize(block);
             assert_eq!(record.payload, expected, "payload mismatch at height {i}");
@@ -1705,7 +1705,7 @@ mod tests {
                 u32::try_from(expected.len()).expect("payload length fits u32")
             );
         }
-        assert!(reader.read_next()?.is_none());
+        assert!(reader.next_record()?.is_none());
 
         let loaded = CorpusManifest::load(&manifest_path)?;
         assert_eq!(loaded, manifest);

@@ -2643,7 +2643,7 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
         let Err(error) = state.publish_checkpoint() else {
-            anyhow::bail!("checkpoint publication unexpectedly succeeded");
+            anyhow::bail!("checkpoint publication succeeded without an applied tip");
         };
         assert!(
             error.to_string().contains("no applied tip"),

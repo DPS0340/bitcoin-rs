@@ -1,3 +1,23 @@
+---
+title: CHECKSIG census and the script-check floor
+date: 2026-08-12
+category: performance
+module: checksig census
+problem_type: performance_issue
+component: census analyzer
+severity: medium
+symptoms:
+  - A terminal census checkpoint can exist before child process teardown completes.
+  - Revalidating recovered evidence can require redundant terabyte-scale reads.
+root_cause: logic_error
+resolution_type: code_fix
+tags:
+  - checksig
+  - cmodern
+  - custody
+  - salvage
+---
+
 # CHECKSIG census and the script-check floor
 
 Status: **OPEN.** The CHECKSIG census over mainnet blocks 0..150,000 shows
@@ -42,6 +62,46 @@ Across 2,868,199 input checks, the 24 u64 counters yielded:
 | `schnorr_verify_fail` | 0 | Failed Schnorr verification calls |
 
 **Key Census Fact**: Exactly $a = 1.0$ ECDSA attempts occur per kernel script check ($2,868,199 / 2,868,199$). Every input in mainnet blocks 0..150,000 is an ordinary legacy bare P2PKH spend. All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) are zero. `eval_script_entries` is exactly $2 \times 2,868,199 = 5,736,398$. The exact product predicate (`_c150_passed`) evaluates to `all_passed: true` and `c150_passed: true`.
+
+**Certification Pipeline and Rule**: Authoritative certification requires strict `mainnet-prefix-replay-v2` inputs, file-bound binary streams, and exact classifier (`classify-corpus-v2`) validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+
+## Recover terminal proof after slow process teardown
+
+The diagnostic controller can receive the terminal `BRSHGT1` checkpoint after the child has closed and flushed all evidence sinks, but before the child finishes chainstate teardown. A fixed process-exit deadline must not redefine completed evidence as incomplete. It must also not report a killed child as a clean exit. Candidate schema v2 records evidence completion and process teardown separately.
+
+`salvage-cmodern-height` recovers this state without changing the failed run. It retains one descriptor for each source and recovery artifact from semantic reconstruction through candidate publication. The reconstruction validates every checkpoint-committed context, record, and journal slice. It hashes those same source bytes in the validation pass. It then reads and hashes a physical tail only when the source contains bytes beyond the last committed endpoint. This produces a direct full-file digest and a committed-prefix digest without a second source-stream pass.
+
+The recovery directory is new and single-writer. The recovery step creates each missing ancestor from root to leaf and fsyncs its parent before it creates the next child. Each source artifact is reflink-cloned when the filesystem supports it, or copied otherwise. Stream clones are truncated to the terminal endpoints. The recovery step replaces only fixed headers: it writes reconstructed terminal row counts to the context, record, journal, and sidecar clones. This normalization also handles a crash after the terminal checkpoint but before the native flush patches source header counts. The source files stay unchanged.
+
+Custody records the source full-file, committed-prefix, and committed-body digests before it changes a recovery header. The finalizer parses and hashes each recovery stream once. It requires the recovery body digest to match the source committed-body digest for the context, record, journal, and sidecar files. It requires each exact replay and counters clone to match the source size and SHA-256 digest. The strict parsers independently require the normalized magic and reconstructed row-count headers. Thus, an exact header and exact body bind each normalized stream to the validated source bytes without a third pass over the large evidence streams. Source and recovery path identities and retained descriptors must remain stable through publication. A post-publication mismatch unlinks the candidate and fsyncs its parent before salvage fails.
+
+The child replay artifact does not record the REST endpoint. Offline salvage therefore records `rest_url_provenance: operator_supplied_original_argv`. The exact `data_dir` string does exist in the replay artifact and must match without path normalization. A salvaged candidate records `child_exit_status: null`, `child_teardown: unobserved`, and the immutable source directory in `salvaged_from`. The candidate remains non-certifying until the selected Cmodern corpus receives the normal file-bound replay and classifier proofs.
+
+## Freeze the selected Cmodern product tip
+
+The recovered diagnostic candidate selected mainnet height `709635` and block
+hash
+`00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`.
+Bitcoin Core REST independently returned the same hash for that height. The
+candidate has all 11 context classes, and its last first-occurrence height is
+`709635`.
+
+This result freezes the product tip only. It does not certify the recovered
+diagnostic run. The classifier accepts Cmodern only when a fresh
+`mainnet-prefix-replay-v2` file replay stops at the exact tip, passes archive
+and stream custody, passes counter arithmetic, and has a positive count for
+each Cmodern context class. Report field `cmodern_frozen` means that the tip is
+fixed. Report field `cmodern_passed` means that the new file-bound corpus
+passed certification.
+
+`INV-7` uses a contract-neutral Schnorr equation:
+`checkschnorr_entries >= schnorr_verify_calls` and
+`schnorr_verify_calls == schnorr_verify_ok + schnorr_verify_fail`. Record
+reconciliation separately requires the aggregate `op_checksigadd` count to
+equal the number of captured `CHECKSIGADD` operation records. The exact C150
+predicate still requires all Schnorr and `OP_CHECKSIGADD` counters to be zero.
+This split removes the pre-Taproot zero assumption from Cmodern without
+weakening C150.
 
 **Certification Pipeline and Rule**: Authoritative certification requires strict `mainnet-prefix-replay-v2` inputs, file-bound binary streams, and exact classifier (`classify-corpus-v2`) validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
 ## Capture corpus and integrity proofs
