@@ -27,10 +27,10 @@ fn main() -> Result<()> {
         let data_dir = args
             .data_dir
             .as_ref()
-            .expect("Args::parse enforces exactly one source");
+            .context("active-chain export requires --data-dir")?;
         let mut config = Config::default_for_network(network);
-        config.data_dir = data_dir.clone();
-        config.storage_backend = args.storage_backend.clone();
+        config.data_dir.clone_from(data_dir);
+        config.storage_backend.clone_from(&args.storage_backend);
         config.p2p_listen.clear();
         config.dns_seeds_enabled = false;
 
@@ -49,7 +49,10 @@ fn main() -> Result<()> {
     println!("archive: {}", args.archive.display());
     println!("manifest: {}", args.manifest.display());
     println!("archive size: {} bytes", manifest.archive.size);
-    println!("archive sha256: {}", manifest.archive.sha256.as_slice().to_lower_hex_string());
+    println!(
+        "archive sha256: {}",
+        manifest.archive.sha256.as_slice().to_lower_hex_string()
+    );
     Ok(())
 }
 
@@ -88,16 +91,14 @@ impl Args {
                 "--data-dir" => data_dir = Some(PathBuf::from(next_arg(&mut args, "--data-dir")?)),
                 "--rest-url" => rest_url = Some(next_arg(&mut args, "--rest-url")?),
                 "--storage-backend" => {
-                    parsed.storage_backend = next_arg(&mut args, "--storage-backend")?
+                    parsed.storage_backend = next_arg(&mut args, "--storage-backend")?;
                 }
                 "--network" => parsed.network = next_arg(&mut args, "--network")?,
                 "--stop-height" => {
-                    stop_height = Some(parse_height(&next_arg(&mut args, "--stop-height")?)?)
+                    stop_height = Some(parse_height(&next_arg(&mut args, "--stop-height")?)?);
                 }
                 "--archive" => archive = Some(PathBuf::from(next_arg(&mut args, "--archive")?)),
-                "--manifest" => {
-                    manifest = Some(PathBuf::from(next_arg(&mut args, "--manifest")?))
-                }
+                "--manifest" => manifest = Some(PathBuf::from(next_arg(&mut args, "--manifest")?)),
                 other => bail!("unknown argument: {other}"),
             }
         }

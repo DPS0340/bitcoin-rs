@@ -6220,9 +6220,8 @@ mod consensus_rule_tests {
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
         let (handles, block, raw) = build(100)?;
-        let proven = metrics::with_local_recorder(&recorder, || {
-            prove_window(&handles, &[&block], &[raw])
-        });
+        let proven =
+            metrics::with_local_recorder(&recorder, || prove_window(&handles, &[&block], &[raw]));
         assert_eq!(
             proven.len(),
             1,
@@ -6238,7 +6237,9 @@ mod consensus_rule_tests {
              unverified block through"
         );
         assert_eq!(
-            metrics_handle.snapshot().get("node.window.verify_success_total"),
+            metrics_handle
+                .snapshot()
+                .get("node.window.verify_success_total"),
             None,
             "an empty verification dispatch must not count as script verification",
         );

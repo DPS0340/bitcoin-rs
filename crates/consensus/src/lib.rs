@@ -36,13 +36,13 @@ pub mod bip66;
 pub mod bip68;
 /// BIP9 versionbits checks.
 pub mod bip9;
+/// Non-terminal CHECKSIG census checkpoint ABI wrapper.
+#[cfg(feature = "checksig-census")]
+pub mod census_checkpoint;
 /// Dual-path block connection.
 pub mod connect_block;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
-/// Non-terminal CHECKSIG census checkpoint ABI wrapper.
-#[cfg(feature = "checksig-census")]
-pub mod census_checkpoint;
 /// Portable Rust validator.
 pub mod rust_path;
 /// Private AVX2 SHA256d64 kernel for Merkle hashing.

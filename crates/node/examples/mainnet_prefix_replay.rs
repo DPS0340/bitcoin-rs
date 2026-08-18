@@ -6,27 +6,27 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::ffi::OsString;
+#[cfg(feature = "checksig-census")]
+use std::fs::OpenOptions;
 use std::io::BufReader;
 #[cfg(feature = "checksig-census")]
 use std::io::{Read, Write};
-#[cfg(feature = "checksig-census")]
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use bitcoin::{Block, BlockHash, Weight};
 use bitcoin::consensus::Decodable as _;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
-use bitcoin_rs_node::Network;
-use bitcoin_rs_node::config::Config;
-use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
-use bitcoin_rs_node::corpus::CorpusManifest;
+use bitcoin::{Block, BlockHash, Weight};
 #[cfg(feature = "checksig-census")]
 use bitcoin_rs_consensus::census_checkpoint;
+use bitcoin_rs_node::Network;
+use bitcoin_rs_node::config::Config;
+use bitcoin_rs_node::corpus::CorpusManifest;
+use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
@@ -34,6 +34,7 @@ use sha2::{Digest as _, Sha256};
 
 /// Consensus-maximum serialized block size in bytes, derived from the
 /// maximum block weight (BIP 141). No valid serialized block can be larger.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
 const MAX_SERIALIZED_BLOCK_SIZE: u32 = Weight::MAX_BLOCK.to_wu() as u32;
 
 /// A reader that hashes every byte it yields.
@@ -71,10 +72,12 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.state.update(&buf[..n]);
+            let increment = u64::try_from(n)
+                .map_err(|_| std::io::Error::other("read length does not fit u64"))?;
             self.bytes_read = self
                 .bytes_read
-                .checked_add(u64::try_from(n).expect("read length fits u64"))
-                .expect("bytes read do not overflow u64");
+                .checked_add(increment)
+                .ok_or_else(|| std::io::Error::other("archive byte count overflow"))?;
         }
         Ok(n)
     }
@@ -136,11 +139,16 @@ fn replay_prefix(
         let block = Block::consensus_decode(&mut cursor)
             .with_context(|| format!("decode block bytes at height {height}"))?;
         let consumed = cursor.position();
-        if consumed != u64::try_from(bytes.len()).expect("block length fits u64") {
-            bail!(
-                "block payload at height {height} has {} trailing bytes",
-                bytes.len() - usize::try_from(consumed).expect("decoded block length fits usize")
-            );
+        let payload_length =
+            u64::try_from(bytes.len()).context("block payload length does not fit u64")?;
+        if consumed != payload_length {
+            let consumed =
+                usize::try_from(consumed).context("decoded block length does not fit usize")?;
+            let trailing = bytes
+                .len()
+                .checked_sub(consumed)
+                .context("decoder consumed beyond the block payload")?;
+            bail!("block payload at height {height} has {trailing} trailing bytes");
         }
         decode_time += decode_started.elapsed();
 
@@ -155,7 +163,8 @@ fn replay_prefix(
                     block.header.prev_blockhash
                 );
             }
-            if actual_hash.to_string() != apply_handles.network.genesis_block_hash().to_string_be() {
+            if actual_hash.to_string() != apply_handles.network.genesis_block_hash().to_string_be()
+            {
                 bail!(
                     "genesis block hash mismatch at height 0: expected {}, got {actual_hash}",
                     apply_handles.network.genesis_block_hash().to_string_be()
@@ -193,7 +202,9 @@ fn replay_prefix(
             window_bytes_held = 0;
         }
     }
-    source.ensure_eof().with_context(|| "trailing data in Core-framed archive")?;
+    source
+        .ensure_eof()
+        .with_context(|| "trailing data in Core-framed archive")?;
     apply_window(apply_handles, &mut window_blocks, &mut window_bytes)?;
     Ok(ReplayTotals {
         start_hash,
@@ -263,11 +274,11 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
     let blocks_path = args
         .blocks_file
         .as_ref()
-        .expect("file mode checked before call");
+        .context("file mode requires --blocks-file")?;
     let manifest_path = args
         .corpus_manifest
         .as_ref()
-        .expect("file mode checked before call");
+        .context("file mode requires --corpus-manifest")?;
     let (manifest, manifest_bytes) = CorpusManifest::load_with_bytes(manifest_path)
         .with_context(|| format!("load corpus manifest {}", manifest_path.display()))?;
     if manifest.network != Network::Mainnet {
@@ -310,7 +321,8 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
     let manifest_digest = Sha256::digest(&manifest_bytes);
     let mut manifest_sha = [0_u8; 32];
     manifest_sha.copy_from_slice(manifest_digest.as_ref());
-    let manifest_bytes_len = manifest_bytes.len() as u64;
+    let manifest_bytes_len =
+        u64::try_from(manifest_bytes.len()).context("manifest length does not fit u64")?;
     Ok(FileInputs {
         manifest,
         manifest_path: manifest_path.clone(),
@@ -371,130 +383,24 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ReplayTotals {
-        start_hash,
-        stop_hash,
-        tx_count,
-        block_bytes,
-        fetch_time,
-        decode_time,
-        elapsed,
-    } = replay_prefix(&args, file_inputs.as_ref().map(|f| &f.manifest), &apply_handles)?;
+    let totals = replay_prefix(
+        &args,
+        file_inputs.as_ref().map(|inputs| &inputs.manifest),
+        &apply_handles,
+    )?;
     // The full UTXO scan is opt-in and starts after the internal replay timer.
     // Performance custody runs must omit it because process wall and CPU still
     // include the scan; separate validation runs pass this option.
     if let Some(path) = args.validation_output.as_deref() {
-        write_validation_artifact(path, &apply_handles, args.stop_height, stop_hash.as_deref())?;
+        write_validation_artifact(
+            path,
+            &apply_handles,
+            args.stop_height,
+            totals.stop_hash.as_deref(),
+        )?;
     }
-    let window = args.window.max(1);
-
-    let block_count = args
-        .stop_height
-        .saturating_sub(args.start_height)
-        .saturating_add(1);
-    let stage_seconds = stage_decomposition(metrics_handle.clone());
-    let snapshot = metrics_handle
-        .as_ref()
-        .map(bitcoin_rs_node::metrics::MetricsHandle::snapshot)
-        .unwrap_or_default();
-    let window_verify_success_total = counter_value(&snapshot, "node.window.verify_success_total");
-
-    if file_mode {
-        if window <= 1 {
-            bail!("file custody requires --window > 1");
-        }
-        if window_verify_success_total == 0 {
-            bail!("file custody requires at least one successful window verification dispatch");
-        }
-    }
-
-    let checkpoint_generation = if file_mode {
-        Some(state.publish_checkpoint().context("publish clean checkpoint")?)
-    } else {
-        None
-    };
-
-    let artifact = if file_mode {
-        let inputs = file_inputs.as_ref().expect("file mode checked above");
-        json!({
-            "schema": "mainnet-prefix-replay-v2",
-            "measurement_target": "mainnet-prefix-replay",
-            "git_head": git_head().ok(),
-            "network": "mainnet",
-            "network_magic": inputs.manifest.network_magic.as_slice().to_lower_hex_string(),
-            "genesis_hash": inputs.manifest.genesis_hash.to_string_be(),
-            "corpus_manifest": {
-                "schema": CorpusManifest::SCHEMA,
-                "version": CorpusManifest::VERSION,
-                "path": inputs.manifest_path,
-                "bytes": inputs.manifest_bytes_len,
-                "sha256": inputs.manifest_sha.as_slice().to_lower_hex_string(),
-            },
-            "archive": {
-                "path": inputs.blocks_path,
-                "bytes": inputs.manifest.archive.size,
-                "sha256": inputs.manifest.archive.sha256.as_slice().to_lower_hex_string(),
-            },
-            "start_height": args.start_height,
-            "start_hash": start_hash,
-            "stop_height": args.stop_height,
-            "stop_hash": stop_hash,
-            "assume_valid_height": args.assume_valid_height,
-            // The effective value, not the raw flag: `--window 0` normalises to 1.
-            "window": window,
-            "window_verify_success_total": window_verify_success_total,
-            "checkpoint_generation": checkpoint_generation.expect("file mode checked above"),
-            "storage_backend": args.storage_backend,
-            "txindex": args.txindex,
-            "blockfilterindex": args.blockfilterindex,
-            "block_count": block_count,
-            "tx_count": tx_count,
-            "block_bytes": block_bytes,
-            "elapsed_seconds": elapsed.as_secs_f64(),
-            "blocks_per_second": f64::from(block_count) / elapsed.as_secs_f64(),
-            "fetch_seconds": fetch_time.as_secs_f64(),
-            "decode_seconds": decode_time.as_secs_f64(),
-            "stage_seconds": stage_seconds,
-            "rss_high_water_bytes": rss_high_water_bytes(),
-            "block_source": "file",
-            "data_dir": args.data_dir,
-        })
-    } else {
-        let block_source = if args.rest_url.is_some() {
-            "rest"
-        } else {
-            "bitcoin-cli"
-        };
-        json!({
-            "schema": "mainnet-prefix-replay-v1",
-            "measurement_target": "mainnet-prefix-replay",
-            "git_head": git_head().ok(),
-            "storage_backend": args.storage_backend,
-            "txindex": args.txindex,
-            "blockfilterindex": args.blockfilterindex,
-            "assume_valid_height": args.assume_valid_height,
-            "window": window,
-            "start_height": args.start_height,
-            "start_hash": start_hash,
-            "stop_height": args.stop_height,
-            "stop_hash": stop_hash,
-            "block_count": block_count,
-            "tx_count": tx_count,
-            "block_bytes": block_bytes,
-            "elapsed_seconds": elapsed.as_secs_f64(),
-            "blocks_per_second": f64::from(block_count) / elapsed.as_secs_f64(),
-            "fetch_seconds": fetch_time.as_secs_f64(),
-            "decode_seconds": decode_time.as_secs_f64(),
-            "stage_seconds": stage_seconds,
-            "rss_high_water_bytes": rss_high_water_bytes(),
-            "bitcoin_cli": args.bitcoin_cli,
-            "bitcoin_cli_args": args.bitcoin_cli_args,
-            "block_source": block_source,
-            "rest_url": args.rest_url,
-            "blocks_file": args.blocks_file,
-            "data_dir": args.data_dir,
-        })
-    };
+    let artifact =
+        build_replay_artifact(&args, &state, file_inputs.as_ref(), &totals, metrics_handle)?;
     let rendered = serde_json::to_string_pretty(&artifact).context("render artifact JSON")?;
     if let Some(output) = args.output {
         std::fs::write(&output, rendered + "\n")
@@ -503,6 +409,148 @@ fn main() -> Result<()> {
         println!("{rendered}");
     }
     Ok(())
+}
+
+struct ArtifactMetrics {
+    block_count: u32,
+    window: usize,
+    window_verify_success_total: u64,
+    stage_seconds: Vec<serde_json::Value>,
+    rss_high_water_bytes: Option<u64>,
+}
+
+fn build_replay_artifact(
+    args: &Args,
+    state: &NodeState,
+    file_inputs: Option<&FileInputs>,
+    totals: &ReplayTotals,
+    metrics_handle: Option<bitcoin_rs_node::metrics::MetricsHandle>,
+) -> Result<serde_json::Value> {
+    let snapshot = metrics_handle
+        .as_ref()
+        .map(bitcoin_rs_node::metrics::MetricsHandle::snapshot)
+        .unwrap_or_default();
+    let metrics = ArtifactMetrics {
+        block_count: args
+            .stop_height
+            .saturating_sub(args.start_height)
+            .saturating_add(1),
+        window: args.window.max(1),
+        window_verify_success_total: counter_value(&snapshot, "node.window.verify_success_total"),
+        stage_seconds: stage_decomposition(metrics_handle),
+        rss_high_water_bytes: rss_high_water_bytes(),
+    };
+    let Some(inputs) = file_inputs else {
+        return Ok(legacy_replay_artifact(args, totals, &metrics));
+    };
+    if metrics.window <= 1 {
+        bail!("file custody requires --window > 1");
+    }
+    if metrics.window_verify_success_total == 0 {
+        bail!("file custody requires at least one successful window verification dispatch");
+    }
+    let checkpoint_generation = state
+        .publish_checkpoint()
+        .context("publish clean checkpoint")?;
+    Ok(file_replay_artifact(
+        args,
+        inputs,
+        totals,
+        &metrics,
+        checkpoint_generation,
+    ))
+}
+
+fn file_replay_artifact(
+    args: &Args,
+    inputs: &FileInputs,
+    totals: &ReplayTotals,
+    metrics: &ArtifactMetrics,
+    checkpoint_generation: u64,
+) -> serde_json::Value {
+    json!({
+        "schema": "mainnet-prefix-replay-v2",
+        "measurement_target": "mainnet-prefix-replay",
+        "git_head": git_head().ok(),
+        "network": "mainnet",
+        "network_magic": inputs.manifest.network_magic.as_slice().to_lower_hex_string(),
+        "genesis_hash": inputs.manifest.genesis_hash.to_string_be(),
+        "corpus_manifest": {
+            "schema": CorpusManifest::SCHEMA,
+            "version": CorpusManifest::VERSION,
+            "path": &inputs.manifest_path,
+            "bytes": inputs.manifest_bytes_len,
+            "sha256": inputs.manifest_sha.as_slice().to_lower_hex_string(),
+        },
+        "archive": {
+            "path": &inputs.blocks_path,
+            "bytes": inputs.manifest.archive.size,
+            "sha256": inputs.manifest.archive.sha256.as_slice().to_lower_hex_string(),
+        },
+        "start_height": args.start_height,
+        "start_hash": &totals.start_hash,
+        "stop_height": args.stop_height,
+        "stop_hash": &totals.stop_hash,
+        "assume_valid_height": args.assume_valid_height,
+        "window": metrics.window,
+        "window_verify_success_total": metrics.window_verify_success_total,
+        "checkpoint_generation": checkpoint_generation,
+        "storage_backend": &args.storage_backend,
+        "txindex": args.txindex,
+        "blockfilterindex": args.blockfilterindex,
+        "block_count": metrics.block_count,
+        "tx_count": totals.tx_count,
+        "block_bytes": totals.block_bytes,
+        "elapsed_seconds": totals.elapsed.as_secs_f64(),
+        "blocks_per_second": f64::from(metrics.block_count) / totals.elapsed.as_secs_f64(),
+        "fetch_seconds": totals.fetch_time.as_secs_f64(),
+        "decode_seconds": totals.decode_time.as_secs_f64(),
+        "stage_seconds": &metrics.stage_seconds,
+        "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "block_source": "file",
+        "data_dir": &args.data_dir,
+    })
+}
+
+fn legacy_replay_artifact(
+    args: &Args,
+    totals: &ReplayTotals,
+    metrics: &ArtifactMetrics,
+) -> serde_json::Value {
+    let block_source = if args.rest_url.is_some() {
+        "rest"
+    } else {
+        "bitcoin-cli"
+    };
+    json!({
+        "schema": "mainnet-prefix-replay-v1",
+        "measurement_target": "mainnet-prefix-replay",
+        "git_head": git_head().ok(),
+        "storage_backend": &args.storage_backend,
+        "txindex": args.txindex,
+        "blockfilterindex": args.blockfilterindex,
+        "assume_valid_height": args.assume_valid_height,
+        "window": metrics.window,
+        "start_height": args.start_height,
+        "start_hash": &totals.start_hash,
+        "stop_height": args.stop_height,
+        "stop_hash": &totals.stop_hash,
+        "block_count": metrics.block_count,
+        "tx_count": totals.tx_count,
+        "block_bytes": totals.block_bytes,
+        "elapsed_seconds": totals.elapsed.as_secs_f64(),
+        "blocks_per_second": f64::from(metrics.block_count) / totals.elapsed.as_secs_f64(),
+        "fetch_seconds": totals.fetch_time.as_secs_f64(),
+        "decode_seconds": totals.decode_time.as_secs_f64(),
+        "stage_seconds": &metrics.stage_seconds,
+        "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "bitcoin_cli": &args.bitcoin_cli,
+        "bitcoin_cli_args": &args.bitcoin_cli_args,
+        "block_source": block_source,
+        "rest_url": &args.rest_url,
+        "blocks_file": &args.blocks_file,
+        "data_dir": &args.data_dir,
+    })
 }
 
 fn write_validation_artifact(
@@ -641,7 +689,10 @@ impl Args {
 /// utxo — and anything added later), sorted by total time descending.
 /// Deliberately unfiltered: a surprise entry in this list is diagnostic
 /// signal, not noise.
-fn counter_value(snapshot: &hashbrown::HashMap<String, bitcoin_rs_node::metrics::MetricValue>, name: &str) -> u64 {
+fn counter_value(
+    snapshot: &hashbrown::HashMap<String, bitcoin_rs_node::metrics::MetricValue>,
+    name: &str,
+) -> u64 {
     match snapshot.get(name) {
         Some(bitcoin_rs_node::metrics::MetricValue::Counter(value)) => *value,
         _ => 0,
@@ -708,7 +759,7 @@ fn open_block_source<'a>(
             MAX_SERIALIZED_BLOCK_SIZE,
         );
         return Ok(BlockSource::File {
-            reader,
+            reader: Box::new(reader),
             manifest,
             next_index: 0,
         });
@@ -733,7 +784,7 @@ enum BlockSource<'a> {
     /// Core's `-loadblock` reads the same bytes, so this source removes the
     /// HTTP / second-process CPU overhead that a REST fetch adds.
     File {
-        reader: CoreFrameReader<HashingReader<BufReader<std::fs::File>>>,
+        reader: Box<CoreFrameReader<HashingReader<BufReader<std::fs::File>>>>,
         manifest: CorpusManifest,
         next_index: usize,
     },
@@ -756,17 +807,23 @@ impl BlockSource<'_> {
             Self::Rest(receiver) => receiver
                 .recv()
                 .with_context(|| format!("prefetch thread gone before height {height}"))?,
-            Self::File { reader, manifest, next_index } => {
+            Self::File {
+                reader,
+                manifest,
+                next_index,
+            } => {
                 let offset = reader.offset();
-                let record = reader
-                    .next()
-                    .with_context(|| format!("read Core frame at offset {offset} for height {height}"))?;
+                let record = reader.next_record().with_context(|| {
+                    format!("read Core frame at offset {offset} for height {height}")
+                })?;
                 let Some(record) = record else {
                     bail!("Core-framed archive ended at offset {offset} before height {height}");
                 };
                 let entry_index = *next_index;
                 *next_index += 1;
-                if entry_index != height as usize {
+                let expected_index =
+                    usize::try_from(height).context("block height does not fit usize")?;
+                if entry_index != expected_index {
                     bail!("manifest entry index mismatch: expected {height}, got {entry_index}");
                 }
                 let entry = manifest
@@ -803,9 +860,7 @@ impl BlockSource<'_> {
                 let expected = bitcoin::BlockHash::from_byte_array(*entry.hash.as_byte_array());
                 if hash != expected {
                     bail!(
-                        "frame header hash mismatch at height {height}: manifest {}, archive {}",
-                        expected,
-                        hash
+                        "frame header hash mismatch at height {height}: manifest {expected}, archive {hash}"
                     );
                 }
                 Ok((hash.to_string(), bytes))
@@ -817,10 +872,12 @@ impl BlockSource<'_> {
     /// or if the bytes consumed do not match the manifest's archive digest.
     fn ensure_eof(&mut self) -> Result<()> {
         match self {
-            Self::File { reader, manifest, .. } => {
+            Self::File {
+                reader, manifest, ..
+            } => {
                 let offset = reader.offset();
                 match reader
-                    .next()
+                    .next_record()
                     .with_context(|| format!("trailing Core frame at offset {offset}"))?
                 {
                     None => {
@@ -863,11 +920,13 @@ fn spawn_prefetch(
     start_height: u32,
     stop_height: u32,
 ) -> Result<crossbeam_channel::Receiver<Result<FetchedBlock>>> {
-    let mut client = CoreRestClient::connect(host).map_err(|e: CoreRestError| anyhow::Error::from(e))?;
+    let mut client =
+        CoreRestClient::connect(host).map_err(|e: CoreRestError| anyhow::Error::from(e))?;
     let (sender, receiver) = crossbeam_channel::bounded(32);
     std::thread::spawn(move || {
         for height in start_height..=stop_height {
-            let item = fetch_rest_block(&mut client, height).map_err(|e: CoreRestError| anyhow::Error::from(e));
+            let item = fetch_rest_block(&mut client, height)
+                .map_err(|e: CoreRestError| anyhow::Error::from(e));
             let failed = item.is_err();
             // A send error means the apply loop dropped the receiver; stop.
             if sender.send(item).is_err() || failed {
@@ -949,12 +1008,18 @@ fn validate_diagnostic_args(args: &Args) -> Result<()> {
         bail!("--cmodern-diagnostic-protocol requires --window 1");
     }
     if args.output.is_none() {
-        bail!("--cmodern-diagnostic-protocol requires --output because stdout is the binary protocol");
+        bail!(
+            "--cmodern-diagnostic-protocol requires --output because stdout is the binary protocol"
+        );
     }
     if args.validation_output.is_some() {
         bail!("--cmodern-diagnostic-protocol does not support --validation-output");
     }
-    for var in ["BRS_CENSUS_CONTEXTS", "BRS_CENSUS_RECORDS", "BRS_CENSUS_JOURNAL"] {
+    for var in [
+        "BRS_CENSUS_CONTEXTS",
+        "BRS_CENSUS_RECORDS",
+        "BRS_CENSUS_JOURNAL",
+    ] {
         if std::env::var(var).is_err() {
             bail!("--cmodern-diagnostic-protocol requires the {var} environment variable");
         }
@@ -1097,14 +1162,30 @@ fn write_diagnostic_artifact(
 
     ensure_diagnostic_output_absent(output)?;
     let (mut temp, mut file) = DiagnosticTempOutput::create(output)?;
-    file.write_all(rendered.as_bytes())
-        .with_context(|| format!("write temporary diagnostic artifact {}", temp.path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("terminate temporary diagnostic artifact {}", temp.path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush temporary diagnostic artifact {}", temp.path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("fsync temporary diagnostic artifact {}", temp.path.display()))?;
+    file.write_all(rendered.as_bytes()).with_context(|| {
+        format!(
+            "write temporary diagnostic artifact {}",
+            temp.path.display()
+        )
+    })?;
+    file.write_all(b"\n").with_context(|| {
+        format!(
+            "terminate temporary diagnostic artifact {}",
+            temp.path.display()
+        )
+    })?;
+    file.flush().with_context(|| {
+        format!(
+            "flush temporary diagnostic artifact {}",
+            temp.path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "fsync temporary diagnostic artifact {}",
+            temp.path.display()
+        )
+    })?;
     drop(file);
 
     temp.publish(output)?;
@@ -1125,7 +1206,10 @@ fn write_diagnostic_artifact(
 #[cfg(feature = "checksig-census")]
 fn ensure_diagnostic_output_absent(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => bail!("refusing to replace existing diagnostic output {}", path.display()),
+        Ok(_) => bail!(
+            "refusing to replace existing diagnostic output {}",
+            path.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error)
             .with_context(|| format!("inspect diagnostic output destination {}", path.display())),
@@ -1143,9 +1227,12 @@ impl DiagnosticTempOutput {
     fn create(target: &Path) -> Result<(Self, std::fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let file_name = target
-            .file_name()
-            .with_context(|| format!("diagnostic output path {} has no file name", target.display()))?;
+        let file_name = target.file_name().with_context(|| {
+            format!(
+                "diagnostic output path {} has no file name",
+                target.display()
+            )
+        })?;
         let parent = target
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -1158,11 +1245,7 @@ impl DiagnosticTempOutput {
             let mut temp_name = file_name.to_os_string();
             temp_name.push(format!(".tmp.{}.{id}", std::process::id()));
             let path = parent.join(&temp_name);
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(file) => return Ok((Self { path, armed: true }, file)),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -1253,13 +1336,8 @@ fn run_census_diagnostic(
     for height in args.start_height..=args.stop_height {
         let (hash, raw) = fetch_rest_block(&mut client, height)
             .map_err(|e: CoreRestError| anyhow::Error::from(e))?;
-        let block = decode_and_validate_block(
-            height,
-            &hash,
-            &raw,
-            &mut prev_hash,
-            apply_handles.network,
-        )?;
+        let block =
+            decode_and_validate_block(height, &hash, &raw, &mut prev_hash, apply_handles.network)?;
         let block_hash = block.block_hash();
         apply_one_block(apply_handles, block, raw)?;
         let checkpoint = census_checkpoint::capture().context("census checkpoint")?;
@@ -1276,18 +1354,12 @@ fn run_census_diagnostic(
             0x01 => {
                 let actual_stop_hash = block_hash.to_string();
                 census_checkpoint::flush().context("terminal flush after diagnostic stop")?;
-                write_diagnostic_artifact(
-                    args,
-                    height,
-                    actual_stop_hash,
-                    started.elapsed(),
-                )?;
+                write_diagnostic_artifact(args, height, actual_stop_hash, started.elapsed())?;
                 return Ok(());
             }
             0x00 => {
                 if height == args.stop_height {
-                    census_checkpoint::flush()
-                        .context("terminal flush at safety ceiling")?;
+                    census_checkpoint::flush().context("terminal flush at safety ceiling")?;
                     bail!("safety ceiling exhausted without controller selection");
                 }
             }
@@ -1295,8 +1367,7 @@ fn run_census_diagnostic(
         }
     }
 
-    census_checkpoint::flush()
-        .context("terminal flush at safety ceiling")?;
+    census_checkpoint::flush().context("terminal flush at safety ceiling")?;
     bail!("safety ceiling exhausted without controller selection");
 }
 
@@ -1314,7 +1385,6 @@ fn update_prev_checkpoint(
     *prev = Some(next);
     Ok(())
 }
-
 
 fn print_usage() {
     println!(
@@ -1346,11 +1416,17 @@ mod tests {
         buf
     }
 
-    fn manifest_for_archive(network: Network, archive: &[u8], payloads: &[&[u8]]) -> CorpusManifest {
+    fn manifest_for_archive(
+        network: Network,
+        archive: &[u8],
+        payloads: &[&[u8]],
+    ) -> CorpusManifest {
         let mut entries = Vec::new();
         let mut offset = 0_u64;
         for (height, payload) in payloads.iter().enumerate() {
-            let header = payload.get(..80).expect("payload must include a block header");
+            let header = payload
+                .get(..80)
+                .expect("payload must include a block header");
             let hash = Hash256::from_le_bytes(
                 &bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array(),
             );
@@ -1419,14 +1495,18 @@ mod tests {
     #[test]
     fn file_source_rejects_wrong_magic() {
         let archive = write_archive(Network::Mainnet.magic(), &[&regtest_genesis_bytes()[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &archive, &[&regtest_genesis_bytes()[..]]);
+        let manifest =
+            manifest_for_archive(Network::Regtest, &archive, &[&regtest_genesis_bytes()[..]]);
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("wrong magic"), "{err:?}");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("wrong magic"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1443,7 +1523,12 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("partial payload"), "{err:?}");
+        assert!(
+            format!("{err:?}")
+                .to_lowercase()
+                .contains("partial payload"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1461,7 +1546,10 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(format!("{err:?}").to_lowercase().contains("wrong magic"), "{err}");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("wrong magic"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1496,7 +1584,10 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("hash mismatch"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("hash mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1513,7 +1604,10 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("offset mismatch"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("offset mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1530,7 +1624,10 @@ mod tests {
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let err = source.fetch(0).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("length mismatch"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("length mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1548,14 +1645,25 @@ mod tests {
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         source.fetch(0).unwrap();
         let err = source.ensure_eof().unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("sha-256 mismatch"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("sha-256 mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
     fn file_mode_requires_paired_arguments() {
-        let mut args = vec![OsString::from("--blocks-file"), OsString::from("/tmp/archive")];
+        let mut args = vec![
+            OsString::from("--blocks-file"),
+            OsString::from("/tmp/archive"),
+        ];
         let err = Args::parse(args.drain(..)).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("must be provided together"), "{err}");
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("must be provided together"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1598,7 +1706,10 @@ mod tests {
         args.corpus_manifest = Some(manifest_temp.path().to_path_buf());
 
         let err = prepare_file_inputs(&args).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("stop height"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("stop height"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1620,21 +1731,27 @@ mod tests {
         args.corpus_manifest = Some(manifest_temp.path().to_path_buf());
 
         let err = prepare_file_inputs(&args).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("archive size"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("archive size"),
+            "{err}"
+        );
     }
-
 
     #[cfg(feature = "checksig-census")]
     #[test]
     fn diagnostic_preface_and_row_encoding() {
-
-
         let mut out: Vec<u8> = Vec::new();
         write_diagnostic_preface(&mut out).unwrap();
         assert_eq!(out.len(), 16);
         assert_eq!(&out[0..8], b"BRSHGT1\0");
-        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), DIAGNOSTIC_VERSION);
-        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), DIAGNOSTIC_ROW_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(out[8..12].try_into().unwrap()),
+            DIAGNOSTIC_VERSION
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[12..16].try_into().unwrap()),
+            DIAGNOSTIC_ROW_SIZE
+        );
 
         let checkpoint = census_checkpoint::CensusCheckpoint {
             abi_version: 1,
@@ -1651,7 +1768,10 @@ mod tests {
 
         let row_start = 16;
         assert_eq!(out.len(), row_start + 84);
-        assert_eq!(u32::from_le_bytes(out[row_start..row_start + 4].try_into().unwrap()), 7);
+        assert_eq!(
+            u32::from_le_bytes(out[row_start..row_start + 4].try_into().unwrap()),
+            7
+        );
         assert_eq!(&out[row_start + 4..row_start + 36], &[0x42; 32]);
         let read_hash = <[u8; 32]>::try_from(&out[row_start + 4..row_start + 36]).unwrap();
         assert_eq!(read_hash, [0x42; 32]);
@@ -1700,7 +1820,12 @@ mod tests {
             Duration::from_secs(3),
         )
         .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("refusing to replace existing"), "{err}");
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("refusing to replace existing"),
+            "{err}"
+        );
         let content = std::fs::read_to_string(&output).unwrap();
         assert_eq!(content, "already here");
     }
@@ -1728,7 +1853,12 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name())
             .collect();
-        assert!(entries.iter().any(|n| n.to_string_lossy() == "diagnostic.json.tmp"), "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.to_string_lossy() == "diagnostic.json.tmp"),
+            "{entries:?}"
+        );
     }
 
     #[cfg(feature = "checksig-census")]
@@ -1744,7 +1874,10 @@ mod tests {
             Duration::from_secs(3),
         )
         .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("diagnostic output"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("diagnostic output"),
+            "{err}"
+        );
     }
 
     #[cfg(feature = "checksig-census")]
@@ -1766,7 +1899,12 @@ mod tests {
         args.rest_url = Some("127.0.0.1:18443".into());
         args.output = Some(PathBuf::from("/tmp/diagnostic.json"));
         args.window = 2;
-        assert!(validate_diagnostic_args(&args).unwrap_err().to_string().contains("--window 1"));
+        assert!(
+            validate_diagnostic_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("--window 1")
+        );
 
         args.window = 1;
         // SAFETY: test-only environment mutation.
@@ -1778,7 +1916,9 @@ mod tests {
         validate_diagnostic_args(&args).unwrap();
 
         // SAFETY: test-only environment mutation.
-        unsafe { std::env::remove_var("BRS_CENSUS_JOURNAL"); }
+        unsafe {
+            std::env::remove_var("BRS_CENSUS_JOURNAL");
+        }
     }
 
     #[cfg(feature = "checksig-census")]

@@ -292,5 +292,4 @@ mod tests {
             Some(&MetricValue::Histogram { count: 2, sum: 5.0 })
         );
     }
-
 }

@@ -78,7 +78,9 @@ impl CensusCheckpoint {
             .journal_rows
             .checked_mul(JOURNAL_ROW_SIZE)
             .and_then(|b| b.checked_add(16))
-            .ok_or_else(|| CensusCheckpointError::Incoherent("journal row count overflow".into()))?;
+            .ok_or_else(|| {
+                CensusCheckpointError::Incoherent("journal row count overflow".into())
+            })?;
         if self.journal_end != expected_journal_end {
             return Err(CensusCheckpointError::Incoherent(format!(
                 "journal_end {} != 16 + journal_rows * {} = {}",
@@ -90,7 +92,9 @@ impl CensusCheckpoint {
             .context_rows
             .checked_mul(CONTEXT_ROW_MIN_SIZE)
             .and_then(|b| b.checked_add(16))
-            .ok_or_else(|| CensusCheckpointError::Incoherent("context row count overflow".into()))?;
+            .ok_or_else(|| {
+                CensusCheckpointError::Incoherent("context row count overflow".into())
+            })?;
         if self.context_end < min_context_end {
             return Err(CensusCheckpointError::Incoherent(format!(
                 "context_end {} is below the minimum 16 + context_rows * {} = {}",

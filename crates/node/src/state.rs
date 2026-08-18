@@ -2642,7 +2642,9 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let error = state.publish_checkpoint().unwrap_err();
+        let Err(error) = state.publish_checkpoint() else {
+            anyhow::bail!("checkpoint publication succeeded without an applied tip");
+        };
         assert!(
             error.to_string().contains("no applied tip"),
             "unexpected error: {error}"
@@ -2655,20 +2657,24 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node");
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
+        config.data_dir = data_dir;
         config.p2p_listen.clear();
         let state = NodeState::open(config.clone())?;
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let tip = state.apply_block(&genesis)?;
         let generation = state.publish_checkpoint()?;
-        assert!(generation > 0, "published checkpoint must have a positive generation");
+        assert!(
+            generation > 0,
+            "published checkpoint must have a positive generation"
+        );
         drop(state);
 
         let resumed = NodeState::open(config)?;
         assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
-        let applied = resumed.applied_tip().load_full().ok_or_else(|| {
-            std::io::Error::other("checkpoint did not publish applied tip")
-        })?;
+        let applied = resumed
+            .applied_tip()
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
         assert_eq!(applied.height, tip.height);
         assert_eq!(applied.hash, tip.hash);
         Ok(())

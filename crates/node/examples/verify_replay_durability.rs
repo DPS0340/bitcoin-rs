@@ -32,8 +32,8 @@ fn main() -> Result<()> {
 
     let validation_bytes = fs::read(&args.validation)
         .with_context(|| format!("read validation file {}", args.validation.display()))?;
-    let validation_file_size = u64::try_from(validation_bytes.len())
-        .context("validation file length does not fit u64")?;
+    let validation_file_size =
+        u64::try_from(validation_bytes.len()).context("validation file length does not fit u64")?;
     let validation_file_sha256 = Sha256::digest(&validation_bytes)
         .as_slice()
         .to_lower_hex_string();
@@ -50,7 +50,8 @@ fn main() -> Result<()> {
                 args.storage_backend
             )
         })?;
-        let captured = capture_invariants(&state).context("capture invariants before reorg probe")?;
+        let captured =
+            capture_invariants(&state).context("capture invariants before reorg probe")?;
         captured
             .invariants
             .ensure_matches_validation(&validation)
@@ -58,49 +59,7 @@ fn main() -> Result<()> {
         captured
     };
 
-    let checkpoint_generation = {
-        let state = NodeState::open(config.clone()).with_context(|| {
-            format!(
-                "reopen checkpointed state for durability probe in {}",
-                args.data_dir.display()
-            )
-        })?;
-        let mut handles = state.apply_handles();
-        // Full verification, same as the timed-trial that produced the validation artifact.
-        handles.assume_valid_height = 0;
-        handles.assume_valid_gate = Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));
-
-        let (original_tip_id, parent_id, parent_hash) = {
-            let tree = state.block_tree();
-            let tree = tree.read();
-            let original_tip_id = tree.lookup(before.tip_hash).with_context(|| {
-                format!("resolve original tip {} in reopened block tree", before.tip_hash)
-            })?;
-            let parent_id = tree
-                .parent_id(original_tip_id)
-                .context("resolve original tip parent in reopened block tree")?
-                .context("validation names a genesis-only state; no parent exists")?;
-            let parent_hash = tree
-                .node(parent_id)
-                .context("resolve original tip parent node in reopened block tree")?
-                .hash;
-            (original_tip_id, parent_id, parent_hash)
-        };
-
-        bitcoin_rs_node::reorg::switch_to_branch(&handles, parent_id, |_| None, |_| {})
-            .context("switch durable state from original tip to its parent")?;
-        ensure_applied_tip(&state, validation.stop_height - 1, parent_hash)
-            .context("verify applied parent after durable disconnect")?;
-
-        bitcoin_rs_node::reorg::switch_to_branch(&handles, original_tip_id, |_| None, |_| {})
-            .context("switch durable state from parent back to original tip")?;
-        ensure_applied_tip(&state, validation.stop_height, before.tip_hash)
-            .context("verify applied original tip after durable reconnect")?;
-
-        state
-            .publish_checkpoint()
-            .context("publish clean checkpoint after durable reconnect")?
-    };
+    let checkpoint_generation = probe_reorg_durability(&args, &config, &validation, &before)?;
 
     let after = {
         let state = NodeState::open(config).with_context(|| {
@@ -145,6 +104,58 @@ fn main() -> Result<()> {
 
     println!("wrote durability proof {}", args.output.display());
     Ok(())
+}
+
+fn probe_reorg_durability(
+    args: &Args,
+    config: &Config,
+    validation: &Validation,
+    before: &CapturedInvariants,
+) -> Result<u64> {
+    let state = NodeState::open(config.clone()).with_context(|| {
+        format!(
+            "reopen checkpointed state for durability probe in {}",
+            args.data_dir.display()
+        )
+    })?;
+    let mut handles = state.apply_handles();
+    handles.assume_valid_height = 0;
+    handles.assume_valid_gate =
+        Arc::new(bitcoin_rs_node::apply::AssumeValidGate::with_anchor(None));
+
+    let (original_tip_id, parent_id, parent_hash) = {
+        let tree = state.block_tree();
+        let tree = tree.read();
+        let original_tip_id = tree.lookup(before.tip_hash).with_context(|| {
+            format!(
+                "resolve original tip {} in reopened block tree",
+                before.tip_hash
+            )
+        })?;
+        let parent_id = tree
+            .parent_id(original_tip_id)
+            .context("resolve original tip parent in reopened block tree")?
+            .context("validation names a genesis-only state; no parent exists")?;
+        let parent_hash = tree
+            .node(parent_id)
+            .context("resolve original tip parent node in reopened block tree")?
+            .hash;
+        (original_tip_id, parent_id, parent_hash)
+    };
+
+    bitcoin_rs_node::reorg::switch_to_branch(&handles, parent_id, |_| None, |_| {})
+        .context("switch durable state from original tip to its parent")?;
+    ensure_applied_tip(&state, validation.stop_height - 1, parent_hash)
+        .context("verify applied parent after durable disconnect")?;
+
+    bitcoin_rs_node::reorg::switch_to_branch(&handles, original_tip_id, |_| None, |_| {})
+        .context("switch durable state from parent back to original tip")?;
+    ensure_applied_tip(&state, validation.stop_height, before.tip_hash)
+        .context("verify applied original tip after durable reconnect")?;
+
+    state
+        .publish_checkpoint()
+        .context("publish clean checkpoint after durable reconnect")
 }
 
 fn node_config(args: &Args) -> Config {
@@ -304,7 +315,11 @@ fn capture_invariants(state: &NodeState) -> Result<CapturedInvariants> {
     })
 }
 
-fn ensure_applied_tip(state: &NodeState, expected_height: u32, expected_hash: Hash256) -> Result<()> {
+fn ensure_applied_tip(
+    state: &NodeState,
+    expected_height: u32,
+    expected_hash: Hash256,
+) -> Result<()> {
     let applied = state
         .applied_tip()
         .load_full()
@@ -389,7 +404,9 @@ impl Args {
                     PathBuf::from(next_arg(&mut args, "--output")?),
                     "--output",
                 )?,
-                other => bail!("unknown argument {other:?}; --data-dir must name a disposable copy"),
+                other => {
+                    bail!("unknown argument {other:?}; --data-dir must name a disposable copy")
+                }
             }
         }
 
@@ -481,8 +498,9 @@ fn ensure_output_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => bail!("refusing to replace existing output {}", path.display()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("inspect output destination {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect output destination {}", path.display()))
+        }
     }
 }
 

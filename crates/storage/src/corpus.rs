@@ -114,12 +114,12 @@ impl<W: Write> CoreFrameWriter<W> {
     /// Creates a writer with an explicit starting offset.
     ///
     /// `offset` is the byte position of the next record's magic in the stream.
-    pub fn with_offset(
-        inner: W,
-        magic: [u8; CORE_FRAME_MAGIC_LEN],
-        offset: u64,
-    ) -> Self {
-        Self { inner, magic, offset }
+    pub fn with_offset(inner: W, magic: [u8; CORE_FRAME_MAGIC_LEN], offset: u64) -> Self {
+        Self {
+            inner,
+            magic,
+            offset,
+        }
     }
 
     /// Returns the byte offset of the next record to be written.
@@ -181,11 +181,7 @@ impl<R: Read> CoreFrameReader<R> {
     /// larger than `max_payload` bytes.
     ///
     /// The initial offset is `0`. Use [`Self::with_offset`] to start elsewhere.
-    pub fn new(
-        inner: R,
-        expected_magic: [u8; CORE_FRAME_MAGIC_LEN],
-        max_payload: u32,
-    ) -> Self {
+    pub fn new(inner: R, expected_magic: [u8; CORE_FRAME_MAGIC_LEN], max_payload: u32) -> Self {
         Self::with_offset(inner, expected_magic, max_payload, 0)
     }
 
@@ -225,7 +221,7 @@ impl<R: Read> CoreFrameReader<R> {
     ///
     /// Returns `Ok(None)` when the stream ends exactly at a record boundary.
     /// Any partial magic, length, or payload is an error.
-    pub fn next(&mut self) -> Result<Option<CoreFrameRecord>, CoreFrameError> {
+    pub fn next_record(&mut self) -> Result<Option<CoreFrameRecord>, CoreFrameError> {
         let record_offset = self.offset;
 
         let mut header = [0_u8; HEADER_LEN];
@@ -322,20 +318,8 @@ mod tests {
         let first = writer.write(b"")?;
         let second = writer.write(b"second")?;
 
-        assert_eq!(
-            first,
-            CoreFrameMetadata {
-                offset: 0,
-                len: 0,
-            }
-        );
-        assert_eq!(
-            second,
-            CoreFrameMetadata {
-                offset: 8,
-                len: 6,
-            }
-        );
+        assert_eq!(first, CoreFrameMetadata { offset: 0, len: 0 });
+        assert_eq!(second, CoreFrameMetadata { offset: 8, len: 6 });
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&MAGIC);
@@ -347,31 +331,25 @@ mod tests {
 
         let mut reader = CoreFrameReader::new(Cursor::new(&buf[..]), MAGIC, u32::MAX);
 
-        let Some(first_record) = reader.next()? else {
+        let Some(first_record) = reader.next_record()? else {
             panic!("expected first record");
         };
         assert_eq!(
             first_record.metadata,
-            CoreFrameMetadata {
-                offset: 0,
-                len: 0,
-            }
+            CoreFrameMetadata { offset: 0, len: 0 }
         );
         assert_eq!(first_record.payload, b"");
 
-        let Some(second_record) = reader.next()? else {
+        let Some(second_record) = reader.next_record()? else {
             panic!("expected second record");
         };
         assert_eq!(
             second_record.metadata,
-            CoreFrameMetadata {
-                offset: 8,
-                len: 6,
-            }
+            CoreFrameMetadata { offset: 8, len: 6 }
         );
         assert_eq!(second_record.payload, b"second");
 
-        assert_eq!(reader.next()?, None);
+        assert_eq!(reader.next_record()?, None);
         assert_eq!(reader.get_ref().position(), reader.offset());
         Ok(())
     }
@@ -382,18 +360,18 @@ mod tests {
         let mut writer = CoreFrameWriter::new(&mut buf, MAGIC);
         writer.write(b"peek")?;
         let mut reader = CoreFrameReader::new(Cursor::new(&buf[..]), MAGIC, u32::MAX);
-        let _ = reader.next()?.expect("expected one record");
+        let _ = reader.next_record()?.expect("expected one record");
         // The frame reader owns the cursor, but get_ref still lets callers
         // observe the exact byte position the parser reached.
         assert_eq!(reader.get_ref().position(), reader.offset());
-        assert_eq!(reader.next()?, None);
+        assert_eq!(reader.next_record()?, None);
         Ok(())
     }
 
     #[test]
     fn empty_input() -> Result<(), CoreFrameError> {
         let mut reader = CoreFrameReader::new(Cursor::new(b""), MAGIC, u32::MAX);
-        assert_eq!(reader.next()?, None);
+        assert_eq!(reader.next_record()?, None);
         Ok(())
     }
 
@@ -403,7 +381,7 @@ mod tests {
         CoreFrameWriter::new(&mut buf, *b"GOOD").write(b"payload")?;
 
         let mut reader = CoreFrameReader::new(Cursor::new(&buf[..]), *b"BADS", u32::MAX);
-        match reader.next() {
+        match reader.next_record() {
             Err(CoreFrameError::WrongMagic { expected, got }) => {
                 assert_eq!(expected, *b"BADS");
                 assert_eq!(got, *b"GOOD");
@@ -416,7 +394,7 @@ mod tests {
     #[test]
     fn short_header() {
         let mut reader = CoreFrameReader::new(Cursor::new(&[1u8, 2, 3]), MAGIC, u32::MAX);
-        match reader.next() {
+        match reader.next_record() {
             Err(CoreFrameError::PartialHeader { needed, got }) => {
                 assert_eq!(needed, HEADER_LEN);
                 assert_eq!(got, 3);
@@ -433,7 +411,7 @@ mod tests {
         data.extend_from_slice(b"hello");
 
         let mut reader = CoreFrameReader::new(Cursor::new(&data[..]), MAGIC, u32::MAX);
-        match reader.next() {
+        match reader.next_record() {
             Err(CoreFrameError::PartialPayload { expected, got }) => {
                 assert_eq!(expected, 10);
                 assert_eq!(got, 5);
@@ -451,7 +429,7 @@ mod tests {
         data.extend_from_slice(b"12345678");
 
         let mut reader = CoreFrameReader::new(Cursor::new(&data[..]), MAGIC, 4);
-        match reader.next() {
+        match reader.next_record() {
             Err(CoreFrameError::PayloadTooLarge { length, max }) => {
                 assert_eq!(length, 8);
                 assert_eq!(max, 4);
@@ -469,7 +447,7 @@ mod tests {
 
         let mut reader =
             CoreFrameReader::with_offset(Cursor::new(&data[..]), MAGIC, 4, u64::MAX - 7);
-        match reader.next() {
+        match reader.next_record() {
             Err(CoreFrameError::Overflow { .. }) => {}
             other => panic!("expected Overflow, got {other:?}"),
         }

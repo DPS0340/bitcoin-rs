@@ -127,18 +127,32 @@ impl Args {
                 "--corpus" => corpus = Some(PathBuf::from(next_arg(&mut args, "--corpus")?)),
                 "--output" => output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
                 "--start-height" => {
-                    start_height = Some(parse_u32(&next_arg(&mut args, "--start-height")?, "--start-height")?)
+                    start_height = Some(parse_u32(
+                        &next_arg(&mut args, "--start-height")?,
+                        "--start-height",
+                    )?)
                 }
                 "--stop-height" => {
-                    stop_height = Some(parse_u32(&next_arg(&mut args, "--stop-height")?, "--stop-height")?)
+                    stop_height = Some(parse_u32(
+                        &next_arg(&mut args, "--stop-height")?,
+                        "--stop-height",
+                    )?)
                 }
                 "--sample-count" => {
-                    sample_count = Some(parse_usize(&next_arg(&mut args, "--sample-count")?, "--sample-count")?)
+                    sample_count = Some(parse_usize(
+                        &next_arg(&mut args, "--sample-count")?,
+                        "--sample-count",
+                    )?)
                 }
                 "--min-inputs" => {
-                    min_inputs = Some(parse_usize(&next_arg(&mut args, "--min-inputs")?, "--min-inputs")?)
+                    min_inputs = Some(parse_usize(
+                        &next_arg(&mut args, "--min-inputs")?,
+                        "--min-inputs",
+                    )?)
                 }
-                other => bail!("unknown argument: {other}\nusage: kernel_verify_spike --corpus <path> --output <path> [--rest-url <host:port>] [--start-height <u32>] [--stop-height <u32>] [--sample-count <usize>] [--min-inputs <usize>]"),
+                other => bail!(
+                    "unknown argument: {other}\nusage: kernel_verify_spike --corpus <path> --output <path> [--rest-url <host:port>] [--start-height <u32>] [--stop-height <u32>] [--sample-count <usize>] [--min-inputs <usize>]"
+                ),
             }
         }
         Ok(Self {
@@ -181,11 +195,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
 
 /// Uses the mainnet activation-height fallback, including Core's hash-pinned
 /// BIP16 exception. Production derives BIP9 state from the active header chain.
-fn production_verify_flags(
-    network: Network,
-    height: u32,
-    block_hash: Hash256,
-) -> VerifyFlags {
+fn production_verify_flags(network: Network, height: u32, block_hash: Hash256) -> VerifyFlags {
     let mut flags = VerifyFlags::NONE;
     if !network.is_bip16_p2sh_exception(block_hash) {
         flags = flags.union(VerifyFlags::P2SH);
@@ -251,8 +261,7 @@ fn extract_corpus(args: &Args) -> Result<()> {
 
     eprintln!(
         "extracting corpus: replaying blocks 0..={stop_height}, sampling {}..={stop_height} from {}",
-        args.start_height,
-        args.rest_url
+        args.start_height, args.rest_url
     );
     let started = Instant::now();
     let mut client = RestClient::connect(&args.rest_url)?;
@@ -332,9 +341,7 @@ fn extract_corpus(args: &Args) -> Result<()> {
         started.elapsed()
     );
     if total_inputs < min_inputs {
-        bail!(
-            "corpus too small: {total_inputs} non-coinbase inputs < required {min_inputs}"
-        );
+        bail!("corpus too small: {total_inputs} non-coinbase inputs < required {min_inputs}");
     }
     write_corpus(&args.corpus, &samples)
 }

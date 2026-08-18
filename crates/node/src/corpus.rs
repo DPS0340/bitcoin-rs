@@ -286,7 +286,9 @@ pub enum CorpusError {
         len: usize,
     },
     /// The hash reported by Core differs from the payload header hash.
-    #[error("REST block hash mismatch at height {height}: reported {reported}, computed {computed}")]
+    #[error(
+        "REST block hash mismatch at height {height}: reported {reported}, computed {computed}"
+    )]
     RestHashMismatch {
         /// Requested height.
         height: u32,
@@ -304,7 +306,9 @@ pub enum CorpusError {
         actual: String,
     },
     /// Consecutive REST blocks do not form one chain.
-    #[error("REST chain discontinuity at height {height}: expected parent {expected_prev}, got {actual_prev}")]
+    #[error(
+        "REST chain discontinuity at height {height}: expected parent {expected_prev}, got {actual_prev}"
+    )]
     RestContinuity {
         /// Discontinuous block height.
         height: u32,
@@ -390,7 +394,10 @@ impl CoreRestClient {
         })?;
         stream.set_read_timeout(Some(REST_TIMEOUT))?;
         stream.set_write_timeout(Some(REST_TIMEOUT))?;
-        Ok(Self { host: host.to_owned(), stream: BufReader::new(stream) })
+        Ok(Self {
+            host: host.to_owned(),
+            stream: BufReader::new(stream),
+        })
     }
 
     /// Fetches one bounded response, reconnecting once if the keep-alive socket failed.
@@ -425,21 +432,30 @@ impl CoreRestClient {
                 .strip_prefix("content-length:")
                 .map(str::trim)
             {
-                let length = value.parse().map_err(|_| CoreRestError::InvalidContentLength {
-                    value: value.to_owned(),
-                })?;
+                let length = value
+                    .parse()
+                    .map_err(|_| CoreRestError::InvalidContentLength {
+                        value: value.to_owned(),
+                    })?;
                 content_length = Some(length);
             }
         }
-        let length = content_length
-            .ok_or_else(|| CoreRestError::MissingContentLength { status: status.clone() })?;
+        let length = content_length.ok_or_else(|| CoreRestError::MissingContentLength {
+            status: status.clone(),
+        })?;
         if length > MAX_BODY_BYTES {
-            return Err(CoreRestError::OversizedBody { path: path.to_owned(), len: length });
+            return Err(CoreRestError::OversizedBody {
+                path: path.to_owned(),
+                len: length,
+            });
         }
         let mut body = vec![0_u8; length];
         self.stream.read_exact(&mut body)?;
         if status.split_whitespace().nth(1) != Some("200") {
-            return Err(CoreRestError::HttpStatus { path: path.to_owned(), status });
+            return Err(CoreRestError::HttpStatus {
+                path: path.to_owned(),
+                status,
+            });
         }
         Ok(body)
     }
@@ -447,11 +463,14 @@ impl CoreRestClient {
 
 fn read_http_line(stream: &mut BufReader<TcpStream>) -> Result<String, CoreRestError> {
     let mut bytes = Vec::new();
-    let read = stream.take(MAX_HTTP_LINE_BYTES + 1).read_until(b'\n', &mut bytes)?;
+    let read = stream
+        .take(MAX_HTTP_LINE_BYTES + 1)
+        .read_until(b'\n', &mut bytes)?;
     if read == 0 {
         return Err(CoreRestError::Io(io::ErrorKind::UnexpectedEof.into()));
     }
-    if read as u64 > MAX_HTTP_LINE_BYTES || !bytes.ends_with(b"\n") {
+    let read = u64::try_from(read).map_err(|_| CoreRestError::OversizedHeaderLine)?;
+    if read > MAX_HTTP_LINE_BYTES || !bytes.ends_with(b"\n") {
         return Err(CoreRestError::OversizedHeaderLine);
     }
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
@@ -523,7 +542,10 @@ impl CorpusBlockSource for RestCorpusSource {
     fn next_block(&mut self, height: u32) -> Result<CorpusBlock, CorpusError> {
         let (reported, payload) = (self.fetcher)(height)?;
         if payload.len() < 80 {
-            return Err(CorpusError::RestShortPayload { height, len: payload.len() });
+            return Err(CorpusError::RestShortPayload {
+                height,
+                len: payload.len(),
+            });
         }
         let hash = Hash256::from_str_be(&reported)
             .map_err(|_| CoreRestError::InvalidHashHex(reported.clone()))?;
@@ -535,9 +557,9 @@ impl CorpusBlockSource for RestCorpusSource {
                 computed: computed.to_string_be(),
             });
         }
-        let actual_prev = Hash256::from_le_bytes(
-            payload[4..36].try_into().expect("fixed-size block header field"),
-        );
+        let mut previous_hash = [0_u8; 32];
+        previous_hash.copy_from_slice(&payload[4..36]);
+        let actual_prev = Hash256::from_le_bytes(&previous_hash);
         if height == 0 {
             let expected = self.network.genesis_block_hash();
             if computed != expected {
@@ -549,7 +571,9 @@ impl CorpusBlockSource for RestCorpusSource {
         } else if self.prev != Some(actual_prev) {
             return Err(CorpusError::RestContinuity {
                 height,
-                expected_prev: self.prev.map_or_else(String::new, |hash| hash.to_string_be()),
+                expected_prev: self
+                    .prev
+                    .map_or_else(String::new, bitcoin_rs_primitives::Hash256::to_string_be),
                 actual_prev: actual_prev.to_string_be(),
             });
         }
@@ -616,15 +640,28 @@ pub(crate) fn export_from_sources(
     archive_path: &Path,
     manifest_path: &Path,
 ) -> Result<CorpusManifest, CorpusError> {
-    let (archive_path, manifest_path) =
-        prepare_corpus_destinations(archive_path, manifest_path)?;
+    let (archive_path, manifest_path) = prepare_corpus_destinations(archive_path, manifest_path)?;
     let tip = block_tree.tip_height();
     match tip {
-        Some(_h) if stop_height <= _h => {}
-        _ => return Err(CorpusError::StopAboveTip { stop: stop_height, tip }),
+        Some(height) if stop_height <= height => {}
+        _ => {
+            return Err(CorpusError::StopAboveTip {
+                stop: stop_height,
+                tip,
+            });
+        }
     }
-    let mut source = BlockTreeSource { tree: block_tree, body: body_source };
-    write_corpus_archive(&mut source, network, stop_height, &archive_path, &manifest_path)
+    let mut source = BlockTreeSource {
+        tree: block_tree,
+        body: body_source,
+    };
+    write_corpus_archive(
+        &mut source,
+        network,
+        stop_height,
+        &archive_path,
+        &manifest_path,
+    )
 }
 
 fn prepare_corpus_destinations(
@@ -646,12 +683,14 @@ fn write_corpus_archive(
     archive_path: &Path,
     manifest_path: &Path,
 ) -> Result<CorpusManifest, CorpusError> {
-    ensure_absent(&archive_path)?;
-    ensure_absent(&manifest_path)?;
+    ensure_absent(archive_path)?;
+    ensure_absent(manifest_path)?;
 
-    let (mut archive_temp, archive_file) = TempFile::create(&archive_path)?;
+    let (mut archive_temp, archive_file) = TempFile::create(archive_path)?;
     let mut hashing_writer = HashingWriter::new(BufWriter::new(archive_file));
-    let mut entries = Vec::with_capacity(stop_height as usize + 1);
+    let capacity = usize::try_from(u64::from(stop_height) + 1)
+        .map_err(|_| CorpusError::OffsetOverflow { index: 0 })?;
+    let mut entries = Vec::with_capacity(capacity);
     let archive_size;
     {
         let mut frames = CoreFrameWriter::new(&mut hashing_writer, network.magic());
@@ -679,7 +718,9 @@ fn write_corpus_archive(
     }
     let (mut buf, hasher) = hashing_writer.into_parts();
     buf.flush()?;
-    let file = buf.into_inner().map_err(|error| error.into_error())?;
+    let file = buf
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
     file.sync_all()?;
     let archive_digest: [u8; 32] = hasher.finalize().into();
     drop(file);
@@ -697,18 +738,18 @@ fn write_corpus_archive(
         entries,
     )?;
     let manifest_bytes = serde_json::to_vec(&CorpusManifestV1::from(&manifest))?;
-    let (mut manifest_temp, mut manifest_file) = TempFile::create(&manifest_path)?;
+    let (mut manifest_temp, mut manifest_file) = TempFile::create(manifest_path)?;
     manifest_file.write_all(&manifest_bytes)?;
     manifest_file.flush()?;
     manifest_file.sync_all()?;
     drop(manifest_file);
 
-    ensure_absent(&archive_path)?;
-    ensure_absent(&manifest_path)?;
-    archive_temp.publish(&archive_path)?;
-    sync_parent(&archive_path)?;
-    manifest_temp.publish(&manifest_path)?;
-    sync_parent(&manifest_path)?;
+    ensure_absent(archive_path)?;
+    ensure_absent(manifest_path)?;
+    archive_temp.publish(archive_path)?;
+    sync_parent(archive_path)?;
+    manifest_temp.publish(manifest_path)?;
+    sync_parent(manifest_path)?;
     Ok(manifest)
 }
 
@@ -750,9 +791,11 @@ struct TempFile {
 impl TempFile {
     fn create(target: &Path) -> Result<(Self, fs::File), CorpusError> {
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let file_name = target.file_name().ok_or_else(|| CorpusError::InvalidOutputPath {
-            path: target.to_owned(),
-        })?;
+        let file_name = target
+            .file_name()
+            .ok_or_else(|| CorpusError::InvalidOutputPath {
+                path: target.to_owned(),
+            })?;
         for _ in 0..128 {
             let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let mut temp_name = file_name.to_os_string();
@@ -803,9 +846,11 @@ impl Drop for TempFile {
 }
 
 fn prepare_destination(path: &Path) -> Result<PathBuf, CorpusError> {
-    let file_name = path.file_name().ok_or_else(|| CorpusError::InvalidOutputPath {
-        path: path.to_owned(),
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CorpusError::InvalidOutputPath {
+            path: path.to_owned(),
+        })?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -875,8 +920,7 @@ impl CorpusManifest {
         let start_height = 0;
         let stop_height = match entries.len() {
             0 => return Err(CorpusError::EmptyEntries),
-            n => u32::try_from(n - 1)
-                .map_err(|_| CorpusError::OffsetOverflow { index: 0 })?,
+            n => u32::try_from(n - 1).map_err(|_| CorpusError::OffsetOverflow { index: 0 })?,
         };
 
         let manifest = Self {
@@ -976,7 +1020,11 @@ impl CorpusManifest {
         let expected_count = u64::from(self.stop_height)
             .checked_add(1)
             .ok_or(CorpusError::OffsetOverflow { index: 0 })?;
-        if self.entries.len() as u64 != expected_count {
+        let entry_count =
+            u64::try_from(self.entries.len()).map_err(|_| CorpusError::OffsetOverflow {
+                index: self.entries.len(),
+            })?;
+        if entry_count != expected_count {
             return Err(CorpusError::EntryCountMismatch {
                 stop: self.stop_height,
                 expected: expected_count,
@@ -987,10 +1035,16 @@ impl CorpusManifest {
         let mut expected_offset = 0_u64;
         let last_index = self.entries.len().saturating_sub(1);
         for (index, entry) in self.entries.iter().enumerate() {
-            if entry.height != self.start_height.wrapping_add(index as u32) {
+            let expected_height = self
+                .start_height
+                .checked_add(
+                    u32::try_from(index).map_err(|_| CorpusError::OffsetOverflow { index })?,
+                )
+                .ok_or(CorpusError::OffsetOverflow { index })?;
+            if entry.height != expected_height {
                 return Err(CorpusError::HeightMismatch {
                     index,
-                    expected: self.start_height.wrapping_add(index as u32),
+                    expected: expected_height,
                     actual: entry.height,
                 });
             }
@@ -1040,7 +1094,6 @@ impl ArchiveInfo {
         Self { size, sha256 }
     }
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1180,7 +1233,6 @@ impl From<&CorpusManifest> for CorpusManifestV1 {
     }
 }
 
-
 fn network_name(network: Network) -> &'static str {
     match network {
         Network::Mainnet => "mainnet",
@@ -1221,7 +1273,10 @@ fn is_lower_hex(s: &str, expected_len: usize) -> Result<(), CorpusError> {
             length: s.len(),
         });
     }
-    if !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(CorpusError::InvalidHex(s.to_owned()));
     }
     Ok(())
@@ -1264,16 +1319,24 @@ fn parse_hash256(s: &str) -> Result<Hash256, CorpusError> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::disallowed_types,
+    clippy::pedantic,
+    clippy::expect_used,
+    clippy::unwrap_used
+)]
 mod tests {
-    use std::{fs, path::Path};
     use std::collections::HashMap;
     use std::io::{BufRead as _, BufReader, Cursor, Write as _};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::thread;
+    use std::{fs, path::Path};
 
     use bitcoin::Block;
     use bitcoin::block::{Header as BlockHeader, Version};
-    use bitcoin::consensus::{deserialize, serialize};
+    use bitcoin::consensus::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
     use bitcoin_rs_chain::{BlockTree, NodeStatus};
@@ -1283,11 +1346,9 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        ArchiveInfo, BlockTreeSource, CorpusEntry, CorpusError, CorpusManifest,
-        CorpusManifestV1, CoreRestClient, CoreRestError, FetchedBlock,
-        HASH_HEX_LEN, MAX_BODY_BYTES, MAX_PAYLOAD_BYTES, SCHEMA, VERSION,
-        RestCorpusSource, export_from_sources, fetch_rest_block,
-        write_corpus_archive,
+        ArchiveInfo, BlockTreeSource, CoreRestClient, CoreRestError, CorpusEntry, CorpusError,
+        CorpusManifest, CorpusManifestV1, HASH_HEX_LEN, MAX_BODY_BYTES, MAX_PAYLOAD_BYTES,
+        RestCorpusSource, SCHEMA, VERSION, export_from_sources, write_corpus_archive,
     };
 
     fn sample_archive() -> ArchiveInfo {
@@ -1330,20 +1391,16 @@ mod tests {
     #[test]
     fn rejects_wrong_schema() {
         let json = r#"{"schema":"other","version":1,"network":"regtest","network_magic":"fabfb5da","genesis_hash":"0000000000000000000000000000000000000000000000000000000000000000","range":{"start_height":0,"stop_height":0},"archive":{"size":8,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"entries":[{"height":0,"hash":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"payload_length":0}]}"#;
-        let err = CorpusManifest::try_from(
-            serde_json::from_str::<CorpusManifestV1>(json).unwrap(),
-        )
-        .unwrap_err();
+        let err = CorpusManifest::try_from(serde_json::from_str::<CorpusManifestV1>(json).unwrap())
+            .unwrap_err();
         assert!(matches!(err, CorpusError::SchemaMismatch { .. }));
     }
 
     #[test]
     fn rejects_wrong_version() {
         let json = r#"{"schema":"bitcoin-rs-corpus-manifest","version":2,"network":"regtest","network_magic":"fabfb5da","genesis_hash":"0000000000000000000000000000000000000000000000000000000000000000","range":{"start_height":0,"stop_height":0},"archive":{"size":8,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"entries":[{"height":0,"hash":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"payload_length":0}]}"#;
-        let err = CorpusManifest::try_from(
-            serde_json::from_str::<CorpusManifestV1>(json).unwrap(),
-        )
-        .unwrap_err();
+        let err = CorpusManifest::try_from(serde_json::from_str::<CorpusManifestV1>(json).unwrap())
+            .unwrap_err();
         assert!(matches!(err, CorpusError::VersionMismatch { .. }));
     }
 
@@ -1355,7 +1412,9 @@ mod tests {
         let path = dir.path().join("manifest.json");
         manifest.save(&path).unwrap();
 
-        let text = fs::read_to_string(&path).unwrap().replace("regtest", "unknown");
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("regtest", "unknown");
         fs::write(&path, text).unwrap();
 
         let err = CorpusManifest::load(&path).unwrap_err();
@@ -1390,8 +1449,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_entries() {
-        let err =
-            CorpusManifest::new(Network::Regtest, sample_archive(), Vec::new()).unwrap_err();
+        let err = CorpusManifest::new(Network::Regtest, sample_archive(), Vec::new()).unwrap_err();
         assert!(matches!(err, CorpusError::EmptyEntries));
     }
 
@@ -1450,7 +1508,10 @@ mod tests {
         let path = dir.path().join("manifest.json");
         manifest.save(&path).unwrap();
 
-        let text = fs::read_to_string(&path).unwrap().replace("\"network_magic\":\"fabfb5da\"", "\"network_magic\":\"fabfb5\"");
+        let text = fs::read_to_string(&path).unwrap().replace(
+            "\"network_magic\":\"fabfb5da\"",
+            "\"network_magic\":\"fabfb5\"",
+        );
         fs::write(&path, text).unwrap();
 
         let err = CorpusManifest::load(&path).unwrap_err();
@@ -1505,7 +1566,10 @@ mod tests {
         // validate the wire form for the boundary value.
         let json = format!(
             r#"{{"schema":"{}","version":{},"network":"regtest","network_magic":"fabfb5da","genesis_hash":"0000000000000000000000000000000000000000000000000000000000000000","range":{{"start_height":0,"stop_height":{}}},"archive":{{"size":8,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}},"entries":[{{"height":{},"hash":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"payload_length":0}}]}}"#,
-            SCHEMA, VERSION, u32::MAX, u32::MAX
+            SCHEMA,
+            VERSION,
+            u32::MAX,
+            u32::MAX
         );
         assert!(serde_json::from_str::<CorpusManifestV1>(&json).is_ok());
     }
@@ -1528,7 +1592,7 @@ mod tests {
                 nonce: 0,
             };
             let next_hash = header.block_hash();
-            tree.insert_header(header.clone(), NodeStatus::HeaderValid)
+            tree.insert_header(header, NodeStatus::HeaderValid)
                 .expect("test chain inserts must succeed");
             let block = Block {
                 header,
@@ -1615,7 +1679,7 @@ mod tests {
         );
         for (i, block) in blocks.iter().enumerate() {
             let record = reader
-                .next()?
+                .next_record()?
                 .ok_or_else(|| std::io::Error::other("expected a frame"))?;
             let expected = serialize(block);
             assert_eq!(record.payload, expected, "payload mismatch at height {i}");
@@ -1626,7 +1690,7 @@ mod tests {
             assert_eq!(entry.payload_length, record.metadata.len);
             assert_eq!(entry.payload_length, expected.len() as u32);
         }
-        assert!(reader.next()?.is_none());
+        assert!(reader.next_record()?.is_none());
 
         let loaded = CorpusManifest::load(&manifest_path)?;
         assert_eq!(loaded, manifest);
@@ -1712,7 +1776,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, CorpusError::BodyHashMismatch { height: 1, .. }));
+        assert!(matches!(
+            err,
+            CorpusError::BodyHashMismatch { height: 1, .. }
+        ));
         assert!(!manifest_path.exists());
         Ok(())
     }
@@ -1785,7 +1852,10 @@ mod tests {
         fs::remove_file(&archive_path)?;
         fs::remove_file(&manifest_path)?;
 
-        let mut source = BlockTreeSource { tree: &tree, body: &body_source };
+        let mut source = BlockTreeSource {
+            tree: &tree,
+            body: &body_source,
+        };
         let via_writer = write_corpus_archive(
             &mut source,
             Network::Regtest,
@@ -1803,8 +1873,7 @@ mod tests {
     }
 
     fn make_rest_blocks(stop: u32) -> (Vec<Block>, Vec<(String, Vec<u8>)>) {
-        let genesis =
-            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let mut blocks = vec![genesis.clone()];
         let mut records = vec![(genesis.block_hash().to_string(), serialize(&genesis))];
         let mut prev_hash = genesis.block_hash();
@@ -1832,20 +1901,17 @@ mod tests {
     fn make_regtest_tree(blocks: &[Block]) -> BlockTree {
         let mut tree = BlockTree::new();
         for block in blocks {
-            tree.insert_header(block.header.clone(), NodeStatus::HeaderValid)
+            tree.insert_header(block.header, NodeStatus::HeaderValid)
                 .expect("regtest chain inserts must succeed");
         }
         tree
     }
 
-    fn make_rest_source(
-        records: Vec<(String, Vec<u8>)>,
-        network: Network,
-    ) -> RestCorpusSource {
+    fn make_rest_source(records: Vec<(String, Vec<u8>)>, network: Network) -> RestCorpusSource {
         let mut iter = records.into_iter();
         RestCorpusSource {
             fetcher: Box::new(move |height| {
-                let (hash, payload) = iter.next().ok_or(CoreRestError::HttpStatus {
+                let (hash, payload) = iter.next().ok_or_else(|| CoreRestError::HttpStatus {
                     path: format!("/rest/blockhashbyheight/{height}.hex"),
                     status: "HTTP/1.1 404 Not Found".to_owned(),
                 })?;
@@ -1982,8 +2048,8 @@ mod tests {
         dir.path()
             .read_dir()
             .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |t| t.is_file()))
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .all(|e| {
                 let name = e.file_name();
                 let s = name.to_string_lossy();
@@ -1992,14 +2058,18 @@ mod tests {
     }
 
     fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut out = format!("HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n", status, body.len())
-            .into_bytes();
+        let mut out = format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\n\r\n",
+            status,
+            body.len()
+        )
+        .into_bytes();
         out.extend_from_slice(body);
         out
     }
 
     fn http_no_content_length(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut out = format!("HTTP/1.1 {}\r\n\r\n", status).into_bytes();
+        let mut out = format!("HTTP/1.1 {status}\r\n\r\n").into_bytes();
         out.extend_from_slice(body);
         out
     }
@@ -2046,7 +2116,9 @@ mod tests {
         assert_eq!(client.get("/a").unwrap(), body);
 
         let err = client.get("/b").unwrap_err();
-        assert!(matches!(err, CoreRestError::HttpStatus { status, .. } if status.starts_with("HTTP/1.1 404")));
+        assert!(
+            matches!(err, CoreRestError::HttpStatus { status, .. } if status.starts_with("HTTP/1.1 404"))
+        );
     }
 
     #[test]

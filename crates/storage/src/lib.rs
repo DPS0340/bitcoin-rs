@@ -5,12 +5,12 @@
 pub mod block_file;
 /// Logical column-family names shared by all storage backends.
 pub mod column_families;
+/// Streaming length-prefixed Core frame reader and writer.
+pub mod corpus;
 /// Storage error type.
 pub mod error;
 /// Backend-neutral key-value store traits.
 pub mod trait_;
-/// Streaming length-prefixed Core frame reader and writer.
-pub mod corpus;
 
 #[cfg(feature = "fjall")]
 /// Fjall-backed [`KvStore`](trait_::KvStore) implementation.
@@ -30,12 +30,12 @@ pub use block_file::{
     block_file_max_height_key, decode_block_file_max_height, encode_block_file_max_height,
 };
 pub use column_families::ColumnFamily;
+pub use corpus::{
+    CORE_FRAME_HEADER_LEN, CORE_FRAME_MAGIC_LEN, CoreFrameError, CoreFrameMetadata,
+    CoreFrameReader, CoreFrameRecord, CoreFrameWriter,
+};
 pub use error::StorageError;
 pub use trait_::{KvIter, KvPair, KvSnapshot, KvStore, WriteBatch};
-pub use corpus::{
-    CoreFrameError, CoreFrameMetadata, CoreFrameReader, CoreFrameRecord, CoreFrameWriter,
-    CORE_FRAME_HEADER_LEN, CORE_FRAME_MAGIC_LEN,
-};
 
 #[cfg(feature = "fjall")]
 pub use fjall_impl::FjallStore;
