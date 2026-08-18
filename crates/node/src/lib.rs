@@ -22,6 +22,8 @@ mod checkpoint;
 mod checkpoint_fs;
 /// Layered node configuration.
 pub mod config;
+/// Block corpus manifest for contiguous archive integrity.
+pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
 /// Central synchronous event loop.
@@ -49,8 +51,6 @@ pub mod signal;
 pub mod state;
 /// Block download orchestrator.
 pub mod sync;
-/// Asynchronous `TxIndex` bootstrap and authoritative-chain reconciliation.
-pub mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
 /// Prevout lookups across a window of consecutive blocks.

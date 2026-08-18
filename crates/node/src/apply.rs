@@ -93,6 +93,14 @@ pub(crate) trait UndoStore: Send + Sync {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<(), StorageError>;
 
+    /// Clears a marker armed for a disconnect that then touched nothing.
+    ///
+    /// Separate from [`Self::disarm_disconnect`] because the two callers know
+    /// different things. This one runs before any mutation, so it may clear
+    /// unconditionally. The checkpoint's clear may not: it cannot tell a
+    /// completed rollback from a half-finished one except by the phase.
+    fn cancel_disconnect(&self) -> Result<(), StorageError>;
+
     /// Records that the rollback finished, in memory, and is owed a checkpoint.
     ///
     /// Distinct from clearing. Both phases refuse a startup, because both mean
@@ -108,9 +116,14 @@ pub(crate) trait UndoStore: Send + Sync {
 
     /// Clears the marker once a disconnect has finished cleanly.
     ///
-    /// The marker guards the window where a single authoritative-state
-    /// disconnect tears state mid-rollback. Derived indexes recover separately
-    /// from their own durable watermarks.
+    /// What this pair does NOT close: the UTXO set and the tip are in memory
+    /// behind periodic checkpoints while the transaction index persists
+    /// immediately, so a crash after a clean disconnect but before the next
+    /// checkpoint still restores a tip that names a block whose index rows are
+    /// gone. That skew is the same one block connection has, and closing it
+    /// needs a replay path from the last durable state, which this node does not
+    /// have. The marker guards the window where a single disconnect tears state
+    /// mid-rollback. Do not cite it as crash safety for the whole operation.
     fn disarm_disconnect(&self) -> Result<(), StorageError>;
 
     /// Reads the marker left by a disconnect that never finished.
@@ -241,6 +254,11 @@ impl UndoStore for InMemoryUndoStore {
         Ok(())
     }
 
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        *self.marker.write() = None;
+        Ok(())
+    }
+
     fn complete_disconnect(
         &self,
         height: u32,
@@ -352,6 +370,18 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
             }
             .encode(),
         )?;
+        self.store.flush()
+    }
+
+    fn cancel_disconnect(&self) -> Result<(), StorageError> {
+        use bitcoin_rs_storage::WriteBatch as _;
+
+        let mut batch = self.store.new_batch();
+        batch.delete(
+            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+            DISCONNECT_MARKER_KEY,
+        );
+        self.store.write(batch)?;
         self.store.flush()
     }
 
@@ -715,14 +745,14 @@ pub struct ApplyHandles {
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Shared best-applied-block tip handle.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// Payload-free, coalescing wake for the asynchronous `TxIndex` worker.
-    pub(crate) tx_index_wake: Option<crossbeam_channel::Sender<()>>,
     /// Shared in-memory block tree.
     pub block_tree: Arc<RwLock<BlockTree>>,
     /// Shared UTXO set.
     pub utxo: Arc<UtxoSet>,
     /// Shared coinstats listener.
     pub coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+    /// Shared best-effort confirmed transaction indexer, when enabled.
+    pub tx_index: Option<Arc<parking_lot::Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
     /// Shared best-effort compact-filter indexer.
     pub filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
     /// Shared mempool.
@@ -762,14 +792,6 @@ pub struct ApplyHandles {
 }
 
 impl ApplyHandles {
-    /// Publishes an authoritative applied tip before nudging the derived `TxIndex` worker.
-    pub(crate) fn publish_applied_tip(&self, tip: TipSnapshot) {
-        self.applied_tip.store(Some(Arc::new(tip)));
-        if let Some(wake) = &self.tx_index_wake {
-            let _ = wake.try_send(());
-        }
-    }
-
     pub(crate) fn begin_chain_transition(
         &self,
     ) -> core::result::Result<ChainTransition<'_>, ApplyError> {
@@ -792,6 +814,7 @@ impl ApplyHandles {
         block_tree: Arc<RwLock<BlockTree>>,
         utxo: Arc<UtxoSet>,
         coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+        tx_index: Option<Arc<parking_lot::Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
         filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
         mempool: Arc<RwLock<Mempool>>,
         blocks: Arc<RwLock<Vec<BlockRecord>>>,
@@ -802,10 +825,10 @@ impl ApplyHandles {
             network,
             chain_tip,
             applied_tip,
-            tx_index_wake: None,
             block_tree,
             utxo,
             coin_stats,
+            tx_index,
             filter_index,
             mempool,
             blocks,
@@ -849,6 +872,7 @@ struct DisconnectPlan {
     undo: bitcoin_rs_utxo::UndoBatch,
     height: u32,
     tx_count_delta: u64,
+    txids: Vec<bitcoin::Txid>,
 }
 
 fn plan_disconnect(
@@ -881,7 +905,8 @@ fn plan_disconnect(
     //
     // Computing txids here and verifying the merkle root with them catches
     // mutation (a duplicate final transaction on an odd count) that
-    // `check_merkle_root` alone misses.
+    // `check_merkle_root` alone misses, and the txids are reused for index
+    // rollback below.
     let txids: Vec<bitcoin::Txid> = block
         .txdata
         .iter()
@@ -948,20 +973,20 @@ fn plan_disconnect(
         undo,
         height,
         tx_count_delta,
+        txids,
     })
 }
 
 /// Disconnects the applied tip, restoring the consensus state the block
 /// replaced.
 ///
-/// Restores authoritative chain state and `applied_tip`. `TxIndex` is deliberately
-/// absent: its worker observes the published tip and reconciles independently.
-/// It does NOT yet restore every other state connection touches:
+/// Restores the UTXO set, the transaction index, and `applied_tip`. It does
+/// NOT yet restore the other state connection touches, so it has no production
+/// caller and must not get one until they are handled:
 ///
 /// | Handle | Status |
 /// |---|---|
-/// | `utxo`, `applied_tip` | restored here |
-/// | `tx_index` | reconciled asynchronously from its durable `(height, hash)` watermark |
+/// | `utxo`, `tx_index`, `applied_tip` | restored here |
 /// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
 /// | `filter_header_cache` | repointed here at the parent, or cleared when the index has no header for it |
 /// | `filter_index` | retained deliberately — its rows are hash-addressed, like block bodies, so a disconnected block's filter stays valid and simply stops being reachable. What is owed is BACKFILL after a gap, not rollback |
@@ -976,7 +1001,8 @@ fn plan_disconnect(
 /// runs first, so the common failures cost nothing.
 ///
 /// One partial-failure window remains and is not yet closed. If `undo_block`
-/// fails, the UTXO set is worse than untouched:
+/// fails after the index has rolled back, the index no longer describes the
+/// block while the tip still does. The UTXO set is worse than untouched:
 /// `commit_adds_and_removes` walks shards, and both its serial and its parallel
 /// path can return an error after other shards already committed, so the set
 /// can be left partly undone.
@@ -996,8 +1022,10 @@ fn plan_disconnect(
 ///
 /// 1. Read and decode the undo record. Nothing is mutated until this succeeds,
 ///    so a missing or corrupt record costs nothing.
-/// 2. Restore the UTXO set.
-/// 3. Move `applied_tip` to the parent, last. While it still names this block a
+/// 2. Roll the transaction index back. It is derived state, and its rows still
+///    point at an intact UTXO set at this point.
+/// 3. Restore the UTXO set.
+/// 4. Move `applied_tip` to the parent, last. While it still names this block a
 ///    concurrent reader sees a consistent older state; moving it first would
 ///    advertise a tip whose outputs are still spent.
 ///
@@ -1006,10 +1034,10 @@ fn plan_disconnect(
 /// and any block whose body does not match its own header.
 ///
 /// Takes no height. The applied tip already knows it, and a second source for
-/// the same fact is a second source of disagreement: the undo key is keyed by
-/// height, so a caller passing a stale one could restore the wrong state. There
-/// is no parameter to get wrong.
-// Keep the marker, UTXO, and tip ordering visible in one operation.
+/// the same fact is a second source of disagreement: the undo key and the index
+/// rollback are both keyed by height, so a caller passing a stale one could
+/// delete the wrong rows. There is no parameter to get wrong.
+// Keep the marker, index, UTXO, and tip ordering visible in one operation.
 // Splitting the sequence would hide the fatal boundary this function enforces.
 #[allow(clippy::too_many_lines)]
 pub fn disconnect_block(
@@ -1041,6 +1069,7 @@ pub(crate) fn disconnect_block_admitted(
         undo,
         height,
         tx_count_delta,
+        txids,
     } = plan_disconnect(handles, block, block_hash)
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
 
@@ -1049,11 +1078,25 @@ pub(crate) fn disconnect_block_admitted(
     // what this guards against; a crash is. A crash writes no error anywhere,
     // and the marker is the only thing that survives it.
     //
+    // Above the index rollback, not below it: that rollback commits a delete
+    // batch, so a crash between it and the arming would leave the index rolled
+    // back while the UTXO set and the tip still name the block.
+    //
     // Deliberately per-disconnect rather than per-reorg: each disconnect commits
     // fully, so a branch switch interrupted BETWEEN disconnects leaves a
     // consistent chain at a lower tip, which is recoverable by connecting
     // forward. Holding the marker across a whole switch would refuse startup for
     // that case and force a needless reindex.
+    // Read before arming. A branch switch disconnects several blocks in a row,
+    // and arming overwrites the marker, so an earlier disconnect's `RolledBack`
+    // debt — still owed a checkpoint — would be destroyed by the next arm and
+    // then cleared by a refusal. `prior` is what a refusal restores.
+    let prior = handles
+        .undo_store
+        .load_disconnect_marker()
+        .map_err(|error| {
+            crate::DisconnectError::Refused(Box::new(ApplyError::UndoPersistence(error)))
+        })?;
     handles
         .undo_store
         .arm_disconnect(height, block_hash)
@@ -1064,6 +1107,39 @@ pub(crate) fn disconnect_block_admitted(
         handles.admission.close_permanently();
         error
     };
+    // Index rollback flushes buffered rows and then issues every delete in one
+    // write batch, so an ERROR at either step leaves the rollback un-started and
+    // the chain exactly as it was. That is still a refusal, so the marker armed
+    // above has nothing to guard and comes back off.
+    if let Some(tx_index) = &handles.tx_index {
+        let rollback = tx_index
+            .lock()
+            .rollback_block_with_verified_txids(block, height, &txids);
+        if let Err(error) = rollback {
+            let refusal = ApplyError::IndexRollback(error);
+            // This disconnect touched nothing, so its own marker goes. Any debt
+            // that predated it is restored rather than dropped: a clean clear
+            // here would tell a restart the chain is whole when an earlier
+            // rollback in this same switch is still waiting for a checkpoint.
+            let restored = match prior {
+                Some(DisconnectMarker {
+                    hash,
+                    height,
+                    phase: DisconnectPhase::RolledBack,
+                }) => handles.undo_store.complete_disconnect(height, hash),
+                _ => handles.undo_store.cancel_disconnect(),
+            };
+            return Err(match restored {
+                Ok(()) => crate::DisconnectError::Refused(Box::new(refusal)),
+                Err(disarm) => poison(crate::DisconnectError::MarkerStuck {
+                    hash: block_hash,
+                    height,
+                    source: Box::new(ApplyError::UndoPersistence(disarm)),
+                }),
+            });
+        }
+    }
+
     // Past this line every failure is `Fatal`. The UTXO commit walks shards and
     // can stop part-way, so from here some state is rolled back and some is
     // not.
@@ -1126,7 +1202,9 @@ pub(crate) fn disconnect_block_admitted(
             })
         })?;
 
-    handles.publish_applied_tip(parent_tip.clone());
+    handles
+        .applied_tip
+        .store(Some(Arc::new(parent_tip.clone())));
 
     if handles.zmq_publisher.wants_notifications() {
         handles
@@ -1575,6 +1653,9 @@ fn prove_window(
             .record(verify_started.elapsed().as_secs_f64());
         if verdict.is_err() {
             return Vec::new();
+        }
+        if !units.is_empty() {
+            metrics::counter!("node.window.verify_success_total").increment(1);
         }
     }
 
@@ -2043,6 +2124,7 @@ fn apply_block_admitted(
     // full-block serialize on every apply.
     let block_bytes: bytes::Bytes = {
         let needs_body = handles.block_body_store.is_some()
+            || handles.tx_index.is_some()
             || handles.cache_block_bodies_in_memory
             || wants_rawblock
             || needs_g14_sample;
@@ -2085,6 +2167,38 @@ fn apply_block_admitted(
     metrics::histogram!("node.apply_block.block_body_persist_seconds")
         .record(block_body_persist_dur.as_secs_f64());
     block_body_persist_result?;
+
+    let tx_index_ingest_started = quanta::Instant::now();
+    if let Some(tx_index) = &handles.tx_index {
+        let tx_index_ingest_result = tx_index.lock().ingest_decoded_block_with_verified_txids(
+            block,
+            &block_bytes,
+            height,
+            scratch.txids(),
+        );
+        match tx_index_ingest_result {
+            Ok(counts) => {
+                tracing::debug!(
+                    height,
+                    txids = counts.txids,
+                    funding = counts.funding,
+                    spending = counts.spending,
+                    headers = counts.headers,
+                    "tx_index ingested block"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    height,
+                    %error,
+                    "tx_index failed to ingest block; best-effort path continues"
+                );
+            }
+        }
+    }
+    let tx_index_ingest_dur = tx_index_ingest_started.elapsed();
+    metrics::histogram!("node.apply_block.tx_index_ingest_seconds")
+        .record(tx_index_ingest_dur.as_secs_f64());
 
     let utxo_commit_started = quanta::Instant::now();
     let utxo_commit_result = handles.utxo.commit_borrowed_block(&changes, &block_hash);
@@ -2204,6 +2318,7 @@ fn apply_block_admitted(
         block_record_us = block_record_dur.as_micros(),
         block_tree_insert_us = block_tree_insert_dur.as_micros(),
         mempool_evict_us = mempool_evict_dur.as_micros(),
+        tx_index_ingest_us = tx_index_ingest_dur.as_micros(),
         filter_index_us = filter_dur.as_micros(),
         coin_stats_us = coin_stats_dur.as_micros(),
         total_us = total_dur.as_micros(),
@@ -2227,7 +2342,7 @@ fn apply_block_admitted(
             }
         }
     }
-    handles.publish_applied_tip(tip.clone());
+    handles.applied_tip.store(Some(Arc::new(tip.clone())));
     if handles.zmq_publisher.wants_notifications() {
         handles
             .zmq_publisher
@@ -3428,6 +3543,7 @@ mod consensus_rule_tests {
         node::{ChainWork, NodeStatus},
     };
     use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
+    use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
     use bitcoin_rs_primitives::{Hash256, OutPoint};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
@@ -6049,6 +6165,7 @@ mod consensus_rule_tests {
     fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::OP_EQUAL;
+        let (recorder, metrics_handle) = crate::metrics::test_recorder();
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let prevout = bitcoin::OutPoint {
@@ -6103,7 +6220,8 @@ mod consensus_rule_tests {
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
         let (handles, block, raw) = build(100)?;
-        let proven = prove_window(&handles, &[&block], &[raw]);
+        let proven =
+            metrics::with_local_recorder(&recorder, || prove_window(&handles, &[&block], &[raw]));
         assert_eq!(
             proven.len(),
             1,
@@ -6117,6 +6235,13 @@ mod consensus_rule_tests {
             "a skipped block must carry no script proof: the proof branch bypasses the \
              trust-gate re-read at commit, so a gate that flips in between would let an \
              unverified block through"
+        );
+        assert_eq!(
+            metrics_handle
+                .snapshot()
+                .get("node.window.verify_success_total"),
+            None,
+            "an empty verification dispatch must not count as script verification",
         );
 
         // Full verification must be completely unaffected.
@@ -6302,6 +6427,123 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// Records the marker calls in order, delegating the rest.
+    ///
+    /// Ordering is the whole property: a marker armed after the index rollback
+    /// would leave a crash between them invisible, and no assertion on the final
+    /// state can tell the two orders apart.
+    #[derive(Debug, Default)]
+    struct MarkerSequenceStore {
+        inner: InMemoryUndoStore,
+        events: parking_lot::Mutex<Vec<&'static str>>,
+    }
+
+    impl UndoStore for MarkerSequenceStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("arm");
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("cancel");
+            self.inner.cancel_disconnect()
+        }
+
+        fn complete_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("complete");
+            self.inner.complete_disconnect(height, hash)
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.events.lock().push("disarm");
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    /// The index rollback commits a delete batch, so it is a mutation and the
+    /// marker must already be armed when it runs. This uses the refusing indexer
+    /// because that path proves both halves at once: the marker was armed before
+    /// the rollback was attempted, and the refusal took it back off.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn the_marker_is_armed_before_the_index_rollback_and_cleared_on_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        let store = Arc::new(MarkerSequenceStore::default());
+        handles.undo_store = Arc::<MarkerSequenceStore>::clone(&store);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer that refuses, or this proves nothing"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert!(
+            store.events.lock().is_empty(),
+            "connecting a block must touch the marker not at all"
+        );
+
+        let outcome = disconnect_block(&handles, &block);
+        assert!(
+            matches!(&outcome, Err(crate::DisconnectError::Refused(boxed))
+                if matches!(**boxed, ApplyError::IndexRollback(_))),
+            "the refusing indexer must still refuse, got {outcome:?}"
+        );
+        assert_eq!(
+            store.events.lock().as_slice(),
+            ["arm", "cancel"],
+            "the marker must be armed before the rollback runs, and a refusal that \
+             touched nothing must cancel it rather than leave a false poison"
+        );
+        assert_eq!(
+            store.load_disconnect_marker()?,
+            None,
+            "a refusal changed nothing, so it must leave no marker behind"
+        );
+        Ok(())
+    }
+
     /// A store that refuses every write, to prove the undo persistence is a
     /// real gate rather than a best-effort side effect.
     #[derive(Debug, Default)]
@@ -6334,6 +6576,12 @@ mod consensus_rule_tests {
         ) -> Result<(), bitcoin_rs_storage::StorageError> {
             Err(bitcoin_rs_storage::StorageError::Backend(
                 "injected marker write failure".to_owned(),
+            ))
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::Backend(
+                "injected marker cancel failure".to_owned(),
             ))
         }
 
@@ -6389,6 +6637,10 @@ mod consensus_rule_tests {
             hash: Hash256,
         ) -> Result<(), bitcoin_rs_storage::StorageError> {
             self.inner.arm_disconnect(height, hash)
+        }
+
+        fn cancel_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.cancel_disconnect()
         }
 
         fn complete_disconnect(
@@ -6885,6 +7137,60 @@ mod consensus_rule_tests {
         Ok(())
     }
 
+    /// An indexer that cannot roll back must stop the disconnect, not be
+    /// skipped. Finishing would leave index rows describing a block the chain
+    /// no longer contains, and queries would answer from them.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn disconnect_refuses_when_the_indexer_cannot_roll_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let filter_index = Arc::new(RecordingFilterIndex::default());
+        let utxo = Arc::new(UtxoSet::new());
+        let handles =
+            apply_handles_with_filter_index(Network::Regtest, Arc::clone(&utxo), &filter_index);
+        assert!(
+            handles.tx_index.is_some(),
+            "fixture must carry an indexer for this test to mean anything"
+        );
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        let outputs_before = utxo.len();
+
+        let outcome = disconnect_block(&handles, &block);
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(crate::DisconnectError::Refused(boxed))
+                    if matches!(**boxed, ApplyError::IndexRollback(_))
+            ),
+            "an indexer without rollback must refuse the disconnect, got {outcome:?}"
+        );
+        assert_eq!(
+            utxo.len(),
+            outputs_before,
+            "the UTXO set must be untouched when the index refuses"
+        );
+        assert_eq!(
+            handles
+                .applied_tip
+                .load()
+                .as_ref()
+                .map_or(0, |tip| tip.height),
+            1,
+            "the tip must not move when the index refuses"
+        );
+        Ok(())
+    }
+
     /// Disconnecting anything but the tip would restore outputs that later
     /// blocks already spent, so it must be refused rather than attempted.
     #[test]
@@ -7109,6 +7415,7 @@ mod consensus_rule_tests {
     fn apply_block_skips_confirmed_transaction_cache() -> Result<(), Box<dyn std::error::Error>> {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        assert!(handles.tx_index.is_none());
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -7180,6 +7487,7 @@ mod consensus_rule_tests {
                 .with_zmq_publisher(publisher_for_handles);
         handles.cache_block_bodies_in_memory = false;
         assert!(handles.block_body_store.is_none());
+        assert!(handles.tx_index.is_none());
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -7241,6 +7549,7 @@ mod consensus_rule_tests {
                 .with_zmq_publisher(publisher);
         handles.cache_block_bodies_in_memory = false;
         assert!(handles.block_body_store.is_none());
+        assert!(handles.tx_index.is_none());
         let genesis_tip = applied_header_tip(
             &handles,
             Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
@@ -7255,6 +7564,67 @@ mod consensus_rule_tests {
 
         apply_block(&handles, &block)?;
 
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn apply_block_keeps_txindex_failure_best_effort() -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let handles = apply_handles_with_tx_index(
+            Network::Regtest,
+            Arc::new(UtxoSet::new()),
+            failing_tx_index(),
+        );
+        let genesis_tip = applied_header_tip(
+            &handles,
+            Hash256::from_le_bytes(genesis.block_hash().as_byte_array()),
+            &genesis,
+            0,
+        )?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let stats_before = handles.coin_stats.snapshot();
+
+        let tip = apply_block(&handles, &block)?;
+
+        assert!(
+            handles.transactions.read().is_empty(),
+            "failed txindex ingest must not populate confirmed tx cache"
+        );
+        assert_eq!(tip.height, 1);
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(1),
+            "best-effort txindex failure must still publish the new applied tip"
+        );
+        assert!(
+            !handles.blocks.read().is_empty(),
+            "best-effort txindex failure must still publish a block record"
+        );
+        assert_eq!(
+            handles.utxo.len(),
+            1,
+            "best-effort txindex failure must still commit UTXO changes"
+        );
+        assert!(
+            handles.block_tree.read().lookup(block_hash).is_some(),
+            "best-effort txindex failure must still insert the block into the block tree"
+        );
+        assert_eq!(
+            handles.coin_stats.snapshot().height,
+            stats_before.height.saturating_add(1),
+            "best-effort txindex failure must still advance coin stats height"
+        );
+        assert_eq!(
+            handles.coin_stats.snapshot().tx_count,
+            stats_before.tx_count.saturating_add(1),
+            "best-effort txindex failure must still advance coin stats transaction count"
+        );
         Ok(())
     }
 
@@ -8219,6 +8589,7 @@ mod consensus_rule_tests {
             Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
                 bitcoin_rs_coinstats::CoinStats::default(),
             )),
+            Some(noop_tx_index()),
             filter_index,
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Arc::new(RwLock::new(Vec::new())),
@@ -9219,7 +9590,7 @@ mod consensus_rule_tests {
     }
 
     fn apply_handles_for_network(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {
-        apply_handles_without_tx_index(network, utxo)
+        apply_handles_with_tx_index(network, utxo, noop_tx_index())
     }
 
     fn apply_handles_without_tx_index(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {
@@ -9232,12 +9603,88 @@ mod consensus_rule_tests {
             Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
                 bitcoin_rs_coinstats::CoinStats::default(),
             )),
+            None,
             noop_filter_index(),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
+    }
+
+    fn apply_handles_with_tx_index(
+        network: Network,
+        utxo: Arc<UtxoSet>,
+        tx_index: Arc<Mutex<Box<dyn IndexerLike>>>,
+    ) -> ApplyHandles {
+        ApplyHandles::new(
+            network,
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(RwLock::new(BlockTree::new())),
+            utxo,
+            Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
+                bitcoin_rs_coinstats::CoinStats::default(),
+            )),
+            Some(tx_index),
+            noop_filter_index(),
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
+            Arc::new(crate::NoOpZmqPublisher),
+        )
+    }
+
+    struct NoopIndexer;
+
+    impl IndexerLike for NoopIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<IndexRowCounts, IndexError> {
+            Ok(IndexRowCounts::default())
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, IndexError> {
+            Ok(None)
+        }
+    }
+
+    fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
+        let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
+        Arc::new(Mutex::new(indexer))
+    }
+
+    struct FailingIndexer;
+
+    impl IndexerLike for FailingIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<IndexRowCounts, IndexError> {
+            Err(IndexError::Storage(
+                bitcoin_rs_storage::StorageError::backend("forced txindex failure"),
+            ))
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, IndexError> {
+            Ok(None)
+        }
+    }
+
+    fn failing_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
+        let indexer: Box<dyn IndexerLike> = Box::new(FailingIndexer);
+        Arc::new(Mutex::new(indexer))
     }
 
     #[derive(Debug, Default)]

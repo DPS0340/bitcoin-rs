@@ -45,6 +45,13 @@ The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically suppl
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
 
+## Benchmark campaign tooling
+
+### Native benchmark custody
+The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
+
+Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. A successful arm includes complete process and resource measurements. A demonstrated correctness failure remains a failure when the other arm has no result. Later validation recomputes the verdict from the custody artifacts and rechecks every input after the last evidence read. Custody proves internal consistency, not a cryptographic signature.
+
 ## Consensus validation
 
 ### bitcoinkernel
@@ -118,14 +125,10 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after UTXO undo. TxIndex is not part of this authoritative commit: it reconciles independently after the tip publication. Naming the commit point first shows which authoritative steps need atomicity. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first authoritative mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first shows which steps need atomicity. The index rollback is one disk batch. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
-### Required invariant method (trait participation)
-A trait method whose default returns success lets an implementation that never
-opted in be mistaken for one that did. Methods required for correctness have no
-permissive default. `TxIndexWriter` therefore requires atomic connect and
-rollback implementations, while the separate `TxIndexReader` exposes no
-mutation methods. A writer cannot compile while silently omitting rollback.
+### Refusing default (trait participation)
+A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
 
 ### Undo record
 
@@ -174,72 +177,6 @@ mempool `A`/`R` events: the current mempool counter and mutation reasons cannot
 yet guarantee the enforcer's required contiguous transaction event sequence.
 Raw mempool insertion is not reconsideration because it cannot reconstruct fee,
 policy, conflict, and ancestry metadata.
-
-### Backfillable derived state
-
-State that is a deterministic projection of the authoritative applied chain and
-can own its progress outside block application. The #77 proof is
-TxIndex: core retains the applied tip, anchored ancestry, and exact block
-bodies; a TxIndex worker owns its rows and `(height, hash)` watermark. This is a
-boundary and recovery contract, not a generic consumer trait. Filter indexes,
-Utreexo, and other consumers must separately prove how they move backward and
-what source data they require before adopting it. See
-`docs/plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md`.
-
-### TxIndex watermark
-
-The #77 durable statement of exactly which applied-chain block the
-TxIndex rows represent: `(height, block_hash)`. Row additions or deletions and
-the terminal watermark commit in one TxIndex DB batch. A row count is not a
-watermark. TxIndex may durably lead the core checkpoint restored after a crash,
-but only because it can identity-check the watermark block body, delete that
-block's rows, and atomically retreat to its parent. This consumer-ahead rule is
-TxIndex-specific. A watermark above the reconciliation target retreats before
-any same-height ancestry comparison. If the watermark's expected header
-identity row is absent, the index is inconsistent: rollback must leave both
-rows and watermark unchanged and fail the worker rather than treating the
-block as already removed. Until pruning retains every body newer than the
-TxIndex watermark, configuration rejects enabling TxIndex and pruning together;
-otherwise bootstrap or catch-up could lose a required source body permanently.
-
-### Reconciliation attempt target
-
-One captured `applied_tip` used to anchor ancestry reads during a
-TxIndex reconciliation pass. It prevents a worker from mixing heights from
-different live tips, but it does not pin or retain the branch. If its forward
-ancestry disappears and core has published a different tip, the worker abandons
-the attempt and captures a fresh target. If the same published target cannot be
-resolved, or the durable watermark body needed for rollback is missing, that is
-a source failure rather than an ordinary retry.
-
-### TxIndex completeness boundary
-
-The #77 read boundary that prevents asynchronous index lag from being
-reported as an authoritative negative. A complete TxIndex query captures the
-applied tip, reads the durable DB watermark directly and requires it to match,
-then verifies before returning that the applied-tip publication identity did
-not change. Each publication uses a fresh `Arc`, so pointer identity is a
-unique process-local token that also detects an `A -> B -> A` value ABA. The
-query retains its starting `Arc`, which prevents that address from being reused
-before the final comparison. Lag or concurrent chain movement returns
-unavailable (or a bounded retry), not "not found." Worker health is operational
-status only, not a second copy of durable progress. Rich Electrum readiness and
-partial-history policy are separate concerns. Lossy spending-prefix matches
-are candidates, not proof: complete unspent reads scan the referenced block
-inputs for the full outpoint. Worker connect and rollback each use one atomic
-transition API, with rows and terminal watermark written in the same DB batch.
-The writer object is moved into the worker thread and has no shared mutex. RPC
-and Electrum construct independent immutable readers over the same store, so
-row construction cannot block queries through an object-level lock.
-
-### Coalesced index wake
-
-The #77 capacity-one, payload-free notification sent after a successful
-runtime `applied_tip` publication. It means only "reconcile again"; it carries
-no ordering or recovery truth. Duplicate wakes may coalesce because startup
-always reconciles and a worker compares its watermark with a fresh applied tip
-before sleeping. It is not a chain event, WAL record, event cursor, or sequence
-stream.
 
 ### Sequence stream
 
@@ -297,24 +234,21 @@ not one interleaved run. See
 
 ### Script-check floor
 
-The native reference baseline for script verification, calculated by
-running the exact captured input corpus through `CPubKey::Verify` from
-libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
-31.99.0 development sources: public key parsing, lax DER parsing, signature
-normalization, and `secp256k1_ecdsa_verify`). On mainnet 0..150,000, all
-2,868,199 input checks execute exactly one `OP_CHECKSIG` and one successful
-ECDSA verification ($a = 1.0$). Native `CPubKey::Verify` execution averages
-39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs
-per check ($X$).
+The native reference baseline for script verification, calculated by running the exact captured input corpus through `CPubKey::Verify` from `libbitcoinkernel-sys 0.3.0` (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development sources: public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`). The capture pipeline uses same-open parse-stream custody to emit 24 fixed-order u64 counters and four file-bound native streams (`BRSCTX1\0` contexts, `BRSJRN1\0` journal, `BRSREC1\0` records, and 24-counter JSON).
 
-The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA
-overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI
-wrapper costs). The residual is a ceiling over non-native per-check work, not a
-promised or wholly removable gain. At 46.59% of per-check verification cost,
-this residual exceeds the 27.73% threshold required for a 5% total wall-time
-improvement (a 5.85s ceiling within the 12.55s script stage), keeping the
-non-crypto script optimization lever open. See
-`docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+On mainnet 0..150,000, all 2,868,199 input checks are ordinary legacy bare P2PKH spends that execute exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$). `eval_script_entries` equals 5,736,398 ($2 \times 2,868,199$, two evaluator passes per input check: scriptSig + scriptPubKey). All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) and all 13 complementary execution counters are zero. The strict `classify-corpus-v2` classifier evaluates the exact product predicate (`_c150_passed`), yielding `all_passed: true` and `c150_passed: true`.
+
+Authoritative C150/Cmodern certification requires file-bound binary streams, strict `mainnet-prefix-replay-v2` inputs, and exact classifier validation. The Cmodern product contract is pinned to mainnet height `709635` and block hash `00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`, selected by the recovered diagnostic candidate and independently matched against Bitcoin Core REST. This pin selects the corpus boundary; it does not certify the diagnostic run. Cmodern certification still requires a fresh file-bound replay at that exact tip, valid custody and counter arithmetic, and positive counts for all 11 context classes. Direct Core REST export can export raw blocks before replay, but live REST export cannot replace file-bound census evidence. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+
+Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
+
+Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+
+### Terminal proof
+
+A `BRSHGT1` checkpoint that binds one replay height and block hash to the committed row counts and byte endpoints of the `BRSCTX1`, `BRSREC1`, and `BRSJRN1` evidence streams. The proof is complete when every committed slice validates, all 11 Cmodern context classes have appeared, and the checkpoint height equals the last first-occurrence height. Child process exit is a separate fact. Slow chainstate teardown or a forced post-proof kill does not erase completed evidence and must not be reported as a clean exit.
+
+Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. It creates missing recovery ancestors root-to-leaf and fsyncs each parent. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; exact JSON clones must match the source size and digest, while normalized binary bodies must match their validated source bodies. Source and recovery descriptors and paths stay stable through candidate publication. A late mismatch durably removes the candidate. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
 
 ### Front-half duplication
 
@@ -329,7 +263,7 @@ is splitting the sequential path into a prepare half and a commit half so the
 preparation happens once.
 
 ### Disconnect marker phase
-The durable record that an authoritative block disconnect started, and how far it got. It is armed and flushed BEFORE the first UTXO mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. TxIndex is outside its coverage and recovers from its own durable watermark. `InFlight` means authoritative mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse startup. The marker detects torn authoritative chainstate; it does not coordinate or repair derived indexes.
+The durable record that a block disconnect started, and how far it got. Armed and flushed BEFORE the first mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. Armed above the index rollback too, because that rollback commits a delete batch, so a crash between the two would leave the index rolled back while the UTXO set and tip still name the block. It carries a phase because two different callers clear it and they know different things. `InFlight` means mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse a startup. The refusal path has a third operation, `cancel_disconnect`, because an index rollback that failed touched nothing and must clear unconditionally — routing it through the checkpoint's guarded clear would no-op on an `InFlight` marker and strand a false poison on an undamaged node. What this does not close: the UTXO set and tip live behind periodic checkpoints while the index persists immediately, so a crash after a clean disconnect but before the next checkpoint still restores a tip whose index rows are gone. Closing that needs a replay path this node does not have.
 
 ### Count-and-byte bound
 A window sized by whichever of two caps binds first. A count alone is wrong wherever item size varies by orders of magnitude: early-chain blocks average 4.6 KB, so 1024 of them is 5 MB, while at the tip the same 1024 is 2 GB. A byte cap alone is wrong in the other direction, letting a window hold tens of thousands of tiny items. Taking the minimum makes the batch large exactly where items are small and per-batch overhead dominates, and small where items are large and it does not. The script window uses it, and the same shape is owed by the sync staging budget, whose count is still sized for tip-scale blocks. One item larger than the whole byte cap still goes through alone: refusing it would stall the chain rather than process it.

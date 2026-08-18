@@ -331,8 +331,7 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     {
         total_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         total_weight = block.weight().to_wu();
-        fee_fields = compute_fee_fields(ctx, &block)
-            .map_err(|error| RpcError::Internal(error.to_string()))?;
+        fee_fields = compute_fee_fields(ctx, &block);
         txs = u64::try_from(block.txdata.len()).unwrap_or(u64::MAX);
         for tx in &block.txdata {
             ins = ins.saturating_add(u64::try_from(tx.input.len()).unwrap_or(u64::MAX));
@@ -424,35 +423,26 @@ struct FeeFields {
     totalfee: u64,
 }
 
-fn resolve_per_tx_fees(
-    ctx: &Context,
-    block: &bitcoin::Block,
-) -> Result<Option<Vec<(u64, u64)>>, crate::TxIndexQueryError> {
-    if ctx.indexer.is_none() {
-        return Ok(None);
-    }
-    ctx.complete_tx_index_query(|indexer| {
-        let tx_count = block.txdata.len().saturating_sub(1);
-        let mut fees = Vec::with_capacity(tx_count);
-        for tx in block.txdata.iter().skip(1) {
-            let mut total_in = 0_u64;
-            for input in &tx.input {
-                let Some(value) = indexer.resolve_outpoint_value(input.previous_output, ctx)?
-                else {
-                    return Ok(None);
-                };
-                total_in = total_in.saturating_add(value);
-            }
-            let total_out = tx.output.iter().fold(0_u64, |sum, output| {
-                sum.saturating_add(output.value.to_sat())
-            });
-            let Some(fee) = total_in.checked_sub(total_out) else {
-                return Ok(None);
-            };
-            fees.push((fee, tx.weight().to_wu()));
+fn resolve_per_tx_fees(ctx: &Context, block: &bitcoin::Block) -> Option<Vec<(u64, u64)>> {
+    let indexer = ctx.indexer.as_ref()?;
+    let tx_count = block.txdata.len().saturating_sub(1);
+    let mut fees = Vec::with_capacity(tx_count);
+    for tx in block.txdata.iter().skip(1) {
+        let mut total_in = 0_u64;
+        for input in &tx.input {
+            let value = indexer
+                .lock()
+                .resolve_outpoint_value(input.previous_output, ctx)
+                .ok()??;
+            total_in = total_in.saturating_add(value);
         }
-        Ok(Some(fees))
-    })
+        let total_out = tx.output.iter().fold(0_u64, |sum, output| {
+            sum.saturating_add(output.value.to_sat())
+        });
+        let fee = total_in.checked_sub(total_out)?;
+        fees.push((fee, tx.weight().to_wu()));
+    }
+    Some(fees)
 }
 
 fn percentiles_by_weight(scores: &mut [(u64, u64)], total_weight: u64) -> [u64; 5] {
@@ -504,15 +494,12 @@ fn truncated_median(values: &mut [u64]) -> u64 {
         .saturating_add((low % 2).saturating_add(high % 2) / 2)
 }
 
-fn compute_fee_fields(
-    ctx: &Context,
-    block: &bitcoin::Block,
-) -> Result<FeeFields, crate::TxIndexQueryError> {
-    let Some(per_tx) = resolve_per_tx_fees(ctx, block)? else {
-        return Ok(FeeFields::default());
+fn compute_fee_fields(ctx: &Context, block: &bitcoin::Block) -> FeeFields {
+    let Some(per_tx) = resolve_per_tx_fees(ctx, block) else {
+        return FeeFields::default();
     };
     if per_tx.is_empty() {
-        return Ok(FeeFields::default());
+        return FeeFields::default();
     }
 
     let totalfee = per_tx
@@ -551,7 +538,7 @@ fn compute_fee_fields(
         .map_or(0, |rate| rate);
     let feerate_percentiles = percentiles_by_weight(&mut rates, total_weight);
 
-    Ok(FeeFields {
+    FeeFields {
         avgfee,
         avgfeerate,
         feerate_percentiles,
@@ -561,7 +548,7 @@ fn compute_fee_fields(
         minfee,
         minfeerate,
         totalfee,
-    })
+    }
 }
 
 /// Bitcoin block subsidy at `height` in satoshis. 50 BTC initially, halving
@@ -758,48 +745,27 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     let header_height = ctx.height();
     let applied_height = ctx.applied_height();
     let synced = header_height > 0 && applied_height >= header_height;
-    let filter_entry = || {
+    let entry = || {
         json!({
             "synced": synced,
             "best_block_height": applied_height,
         })
     };
 
-    let txindex_entry = ctx.indexer.as_ref().map(|_| {
-        let watermark = ctx
-            .indexer
-            .as_ref()
-            .and_then(|indexer| indexer.watermark().ok().flatten());
-        let txindex_synced = ctx.applied_tip.load_full().as_deref().is_some_and(|tip| {
-            watermark.is_some_and(|watermark| {
-                watermark.height == tip.height && watermark.hash == tip.hash
-            })
-        });
-        let failed = ctx.tx_index_runtime.as_ref().is_some_and(|runtime| {
-            matches!(
-                runtime.health(),
-                bitcoin_rs_index::IndexWorkerHealth::Failed(_)
-            )
-        });
-        json!({
-            "synced": txindex_synced,
-            "best_block_height": watermark.map_or(0, |watermark| watermark.height),
-            "failed": failed,
-        })
-    });
+    let txindex_entry = ctx.indexer.is_some().then(entry);
     match filter {
         None => {
             let mut indexes = sonic_rs::Object::new();
             if let Some(entry) = txindex_entry {
                 let _ = indexes.insert(&"txindex", entry);
             }
-            let _ = indexes.insert(&"basicblockfilterindex", filter_entry());
+            let _ = indexes.insert(&"basicblockfilterindex", entry());
             Ok(indexes.into())
         }
         Some("txindex") => {
             Ok(txindex_entry.map_or_else(|| json!({}), |entry| json!({ "txindex": entry })))
         }
-        Some("basicblockfilterindex") => Ok(json!({ "basicblockfilterindex": filter_entry() })),
+        Some("basicblockfilterindex") => Ok(json!({ "basicblockfilterindex": entry() })),
         Some(_) => Ok(json!({})),
     }
 }
@@ -1126,10 +1092,7 @@ mod tests {
         let ctx = Context::new();
         let block = genesis_block(bitcoin::Network::Regtest);
 
-        assert_eq!(
-            compute_fee_fields(&ctx, &block).expect("no-index default"),
-            FeeFields::default()
-        );
+        assert_eq!(compute_fee_fields(&ctx, &block), FeeFields::default());
     }
 
     #[test]

@@ -35,7 +35,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::Config;
 
-type TxIndexHandle = Box<dyn bitcoin_rs_index::TxIndexWriter>;
+type TxIndexHandle = Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>;
 type FilterIndexHandle = Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>;
 
 struct DisabledFilterIndex;
@@ -182,8 +182,8 @@ pub enum ApplyError {
     /// The supplied block body does not match its own header.
     ///
     /// The header hash commits to the merkle root, not to the transactions the
-    /// caller handed over. A body swapped under a matching header would restore
-    /// authoritative state from the wrong transactions.
+    /// caller handed over. A body swapped under a matching header would roll
+    /// the index back over the wrong rows.
     #[error("block {hash} body does not match its header merkle root")]
     DisconnectBodyMismatch {
         /// Block whose body was rejected.
@@ -203,6 +203,9 @@ pub enum ApplyError {
     /// disconnected.
     #[error("coinstats rewind: {0}")]
     CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
+    /// Rolling the transaction index back failed.
+    #[error("index rollback: {0}")]
+    IndexRollback(#[source] bitcoin_rs_index::IndexError),
 }
 
 /// The outcome of a refused or failed block disconnect.
@@ -661,8 +664,8 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
 /// Concrete txindex store handles retained per backend.
 ///
 /// Mirrors `NodeStorage` but for the txindex sub-database. Kept alongside the
-/// erased writer handle so read services can open independent views of the
-/// live `KvStore`.
+/// erased `Arc<Mutex<Box<dyn IndexerLike>>>` so the Electrum `IndexHandle` can
+/// observe the live `KvStore` for header reads.
 enum TxIndexStorage {
     #[cfg(feature = "rocksdb")]
     RocksDb(Arc<bitcoin_rs_storage::RocksDbStore>),
@@ -675,19 +678,6 @@ enum TxIndexStorage {
 }
 
 impl TxIndexStorage {
-    fn rpc_reader(&self) -> Arc<dyn bitcoin_rs_index::TxIndexReader> {
-        match self {
-            #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
-            #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
-            #[cfg(feature = "redb")]
-            Self::Redb(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
-            #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store))),
-        }
-    }
-
     fn electrum_index_handle(&self) -> bitcoin_rs_electrum::IndexHandle {
         match self {
             #[cfg(feature = "rocksdb")]
@@ -706,7 +696,6 @@ impl TxIndexStorage {
         blocks: Arc<RwLock<Vec<bitcoin_rs_rpc::BlockRecord>>>,
         block_body_source: Arc<dyn BlockBodySource>,
         block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
-        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     ) -> Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> {
         let block_source = crate::NodeBlockSource::new(blocks)
             .with_block_body_source(block_body_source)
@@ -715,34 +704,34 @@ impl TxIndexStorage {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(
-                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(applied_tip),
-                )
+                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
+                    indexer,
+                    block_source,
+                ))
             }
             #[cfg(feature = "fjall")]
             Self::Fjall(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(
-                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(applied_tip),
-                )
+                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
+                    indexer,
+                    block_source,
+                ))
             }
             #[cfg(feature = "redb")]
             Self::Redb(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(
-                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(applied_tip),
-                )
+                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
+                    indexer,
+                    block_source,
+                ))
             }
             #[cfg(feature = "mdbx")]
             Self::Mdbx(store) => {
                 let indexer = Arc::new(bitcoin_rs_index::Indexer::new(Arc::clone(store)));
-                Arc::new(
-                    bitcoin_rs_electrum::methods::IndexerHistoryReader::new(indexer, block_source)
-                        .with_completeness(applied_tip),
-                )
+                Arc::new(bitcoin_rs_electrum::methods::IndexerHistoryReader::new(
+                    indexer,
+                    block_source,
+                ))
             }
         }
     }
@@ -790,36 +779,48 @@ fn open_tx_index(config: &Config) -> Result<Option<(TxIndexHandle, TxIndexStorag
             let store = Arc::new(
                 bitcoin_rs_storage::RocksDbStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
+            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((indexer, TxIndexStorage::RocksDb(store))))
+            Ok(Some((
+                Arc::new(Mutex::new(indexer)),
+                TxIndexStorage::RocksDb(store),
+            )))
         }
         #[cfg(feature = "fjall")]
         "fjall" => {
             let store = Arc::new(
                 bitcoin_rs_storage::FjallStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
+            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((indexer, TxIndexStorage::Fjall(store))))
+            Ok(Some((
+                Arc::new(Mutex::new(indexer)),
+                TxIndexStorage::Fjall(store),
+            )))
         }
         #[cfg(feature = "redb")]
         "redb" => {
             let store = Arc::new(
                 bitcoin_rs_storage::RedbStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
+            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((indexer, TxIndexStorage::Redb(store))))
+            Ok(Some((
+                Arc::new(Mutex::new(indexer)),
+                TxIndexStorage::Redb(store),
+            )))
         }
         #[cfg(feature = "mdbx")]
         "mdbx" => {
             let store = Arc::new(
                 bitcoin_rs_storage::MdbxStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
             );
-            let indexer: Box<dyn bitcoin_rs_index::TxIndexWriter> =
+            let indexer: Box<dyn bitcoin_rs_index::IndexerLike> =
                 Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            Ok(Some((indexer, TxIndexStorage::Mdbx(store))))
+            Ok(Some((
+                Arc::new(Mutex::new(indexer)),
+                TxIndexStorage::Mdbx(store),
+            )))
         }
         other => bail!("unsupported storage backend for txindex: {other}"),
     }
@@ -873,11 +874,8 @@ pub struct NodeState {
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
     coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
-    tx_index: Mutex<Option<TxIndexHandle>>,
+    tx_index: Option<TxIndexHandle>,
     tx_index_storage: Option<Arc<TxIndexStorage>>,
-    tx_index_runtime: Option<Arc<bitcoin_rs_index::TxIndexRuntime>>,
-    tx_index_wake_rx: Mutex<Option<Receiver<()>>>,
-    tx_index_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     filter_index: FilterIndexHandle,
     prune_service: Option<Arc<dyn PruneService>>,
     zmq_publisher: Arc<dyn crate::ZmqPublisher>,
@@ -972,19 +970,22 @@ impl NodeState {
             // node has no reindex. An instruction the operator cannot follow is
             // worse than none.
             //
-            // Remove authoritative and directly coupled durable views. TxIndex
-            // is excluded: its independent watermark reconciles after the
-            // authoritative chain is rebuilt.
+            // Remove all durable views. A torn disconnect can roll the
+            // transaction index back while the UTXO checkpoint and tip still
+            // name the block. Keeping an older checkpoint can restore that
+            // stale chainstate beside the rolled-back index. The marker lives
+            // in the chainstate store, so removing it clears the marker too.
             bail!(
                 "refusing to start: a disconnect of block {hash} at height {height} never \
-                 completed, so the UTXO set and the chain tip may \
+                 completed, so the UTXO set, the transaction index, and the chain tip may \
                  disagree. The node cannot repair this in place, because it cannot tell \
                  which of those commits landed before the disconnect stopped. Remove \
-                 or quarantine {chainstate}, {checkpoints}, and {filters}, then resync.",
+                 or quarantine {chainstate}, {checkpoints}, {txindex}, and {filters}, then resync.",
                 hash = marker.hash,
                 height = marker.height,
                 chainstate = config.data_dir.join("chainstate").display(),
                 checkpoints = config.data_dir.join("chainstate-checkpoints").display(),
+                txindex = config.data_dir.join("txindex").display(),
                 filters = config.data_dir.join("filters").display(),
             );
         }
@@ -1093,23 +1094,14 @@ impl NodeState {
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let tx_index_runtime = tx_index
-            .as_ref()
-            .map(|_| Arc::new(bitcoin_rs_index::TxIndexRuntime::new()));
-        let (tx_index_wake, tx_index_wake_rx) = if tx_index.is_some() {
-            let (tx, rx) = crossbeam_channel::bounded(1);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
-            tx_index_wake,
             block_tree: Arc::clone(&block_tree),
             utxo: Arc::clone(&utxo),
             coin_stats: Arc::clone(&coin_stats),
+            tx_index: tx_index.as_ref().map(Arc::clone),
             filter_index: Arc::clone(&filter_index),
             mempool: Arc::clone(&mempool),
             blocks: Arc::clone(&blocks),
@@ -1170,11 +1162,8 @@ impl NodeState {
             block_body_store,
             utxo,
             coin_stats,
-            tx_index: Mutex::new(tx_index),
+            tx_index,
             tx_index_storage,
-            tx_index_runtime,
-            tx_index_wake_rx: Mutex::new(tx_index_wake_rx),
-            tx_index_worker: Mutex::new(None),
             filter_index,
             prune_service,
             zmq_publisher,
@@ -1216,6 +1205,21 @@ impl NodeState {
 
     pub(crate) const fn resume_source(&self) -> ResumeSource {
         self.resume_source
+    }
+
+    /// Publishes a durable clean checkpoint and returns the published
+    /// generation, or an error if there is no applied tip.
+    ///
+    /// This is the public boundary for the private checkpoint machinery; it
+    /// keeps `CheckpointWrite`, `CheckpointError`, and the checkpoint module
+    /// internal to the crate.
+    pub fn publish_checkpoint(&self) -> Result<u64> {
+        match self.write_clean_checkpoint()? {
+            crate::checkpoint::CheckpointWrite::Published { generation } => Ok(generation),
+            crate::checkpoint::CheckpointWrite::SkippedNoAppliedTip => {
+                bail!("checkpoint refused: no applied tip to publish")
+            }
+        }
     }
 
     pub(crate) fn write_clean_checkpoint(
@@ -1283,71 +1287,17 @@ impl NodeState {
         Arc::clone(&self.coin_stats)
     }
 
-    /// Returns an immutable `TxIndex` view that does not share the worker mutex.
+    /// Returns the shared block indexer handle, when txindex is enabled.
     #[must_use]
-    pub fn tx_index_reader(&self) -> Option<Arc<dyn bitcoin_rs_index::TxIndexReader>> {
-        self.tx_index_storage
-            .as_ref()
-            .map(|storage| storage.rpc_reader())
-    }
-
-    /// Returns process-local `TxIndex` worker health.
-    #[must_use]
-    pub fn tx_index_runtime(&self) -> Option<Arc<bitcoin_rs_index::TxIndexRuntime>> {
-        self.tx_index_runtime.as_ref().map(Arc::clone)
-    }
-
-    /// Starts the asynchronous `TxIndex` worker once, after startup recovery completes.
-    pub(crate) fn start_tx_index_worker(&self) -> anyhow::Result<()> {
-        let Some(runtime) = &self.tx_index_runtime else {
-            return Ok(());
-        };
-        if self.tx_index_worker.lock().is_some() {
-            return Ok(());
-        }
-        let wake_rx = self
-            .tx_index_wake_rx
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("TxIndex worker receiver is unavailable"))?;
-        let indexer = self
-            .tx_index
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("TxIndex writer is unavailable"))?;
-        let worker = crate::txindex_worker::TxIndexWorker::new(
-            indexer,
-            Arc::clone(runtime),
-            Arc::clone(&self.applied_tip),
-            Arc::clone(&self.block_tree),
-            Arc::clone(&self.block_body_store),
-            wake_rx,
-            Arc::clone(&self.apply_handles.shutdown),
-        );
-        let handle = std::thread::Builder::new()
-            .name("bitcoin-rs-txindex".into())
-            .spawn(move || worker.run())?;
-        *self.tx_index_worker.lock() = Some(handle);
-        Ok(())
-    }
-
-    /// Joins the `TxIndex` worker after the process-wide shutdown flag is set.
-    pub(crate) fn join_tx_index_worker(&self) {
-        let Some(handle) = self.tx_index_worker.lock().take() else {
-            return;
-        };
-        if handle.join().is_ok() {
-            tracing::info!("TxIndex worker exited");
-        } else {
-            tracing::error!("TxIndex worker panicked");
-        }
+    pub fn tx_index(&self) -> Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>> {
+        self.tx_index.as_ref().map(Arc::clone)
     }
 
     /// Builds an Electrum `IndexHandle` backed by the live txindex store.
     ///
-    /// The handle observes the same `KvStore` owned by the asynchronous worker,
-    /// so `blockchain.block.headers` returns real data once reconciliation is
-    /// underway.
+    /// The handle observes the same `KvStore` the writer side ingests into via
+    /// `apply_block`, so `blockchain.block.headers` returns real data once IBD
+    /// is underway.
     #[must_use]
     pub fn electrum_index_handle(&self) -> Option<bitcoin_rs_electrum::IndexHandle> {
         self.tx_index_storage
@@ -1367,7 +1317,6 @@ impl NodeState {
                 self.blocks(),
                 self.block_body_source(),
                 self.block_tree(),
-                self.applied_tip(),
             )
         })
     }
@@ -1662,10 +1611,7 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
 
-        assert!(
-            state.tx_index_reader().is_none(),
-            "txindex disabled by default"
-        );
+        assert!(state.tx_index().is_none(), "txindex disabled by default");
         assert!(
             !state.data_dir().join("txindex").exists(),
             "disabled txindex must not create storage"
@@ -1681,13 +1627,10 @@ mod tests {
         config.p2p_listen.clear();
         config.txindex = true;
         let state = NodeState::open(config)?;
-        let (Some(a), Some(b)) = (state.tx_index_reader(), state.tx_index_reader()) else {
+        let (Some(a), Some(b)) = (state.tx_index(), state.tx_index()) else {
             panic!("txindex handle missing when enabled");
         };
-        assert!(
-            !Arc::ptr_eq(&a, &b),
-            "readers must be independent views over the same store"
-        );
+        assert!(Arc::ptr_eq(&a, &b), "tx_index handle stable across calls");
         assert!(
             state.data_dir().join("txindex").exists(),
             "enabled txindex must create storage"
@@ -1952,25 +1895,21 @@ mod tests {
     }
 
     #[test]
-    fn txindex_runtime_and_wakeup_follow_configuration() -> anyhow::Result<()> {
+    fn apply_handles_follow_txindex_availability() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("without-txindex");
         config.p2p_listen.clear();
         config.txindex = false;
         let state = NodeState::open(config)?;
-        assert!(state.tx_index_reader().is_none());
-        assert!(state.tx_index_runtime().is_none());
-        assert!(state.apply_handles().tx_index_wake.is_none());
+        assert!(state.apply_handles().tx_index.is_none());
 
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("with-txindex");
         config.p2p_listen.clear();
         config.txindex = true;
         let state = NodeState::open(config)?;
-        assert!(state.tx_index_reader().is_some());
-        assert!(state.tx_index_runtime().is_some());
-        assert!(state.apply_handles().tx_index_wake.is_some());
+        assert!(state.apply_handles().tx_index.is_some());
         Ok(())
     }
 
@@ -2685,7 +2624,7 @@ mod tests {
             Err(error) => error,
         };
         let message = error.to_string();
-        for store in ["chainstate", "chainstate-checkpoints", "filters"] {
+        for store in ["chainstate", "chainstate-checkpoints", "txindex", "filters"] {
             let path = data_dir.join(store);
             assert!(
                 message.contains(&path.display().to_string()),
@@ -2693,6 +2632,51 @@ mod tests {
                 path.display()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn publish_checkpoint_refuses_when_no_applied_tip() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        let state = NodeState::open(config)?;
+        let Err(error) = state.publish_checkpoint() else {
+            anyhow::bail!("checkpoint publication succeeded without an applied tip");
+        };
+        assert!(
+            error.to_string().contains("no applied tip"),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_checkpoint_returns_generation_and_reopens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir;
+        config.p2p_listen.clear();
+        let state = NodeState::open(config.clone())?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let tip = state.apply_block(&genesis)?;
+        let generation = state.publish_checkpoint()?;
+        assert!(
+            generation > 0,
+            "published checkpoint must have a positive generation"
+        );
+        drop(state);
+
+        let resumed = NodeState::open(config)?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+        let applied = resumed
+            .applied_tip()
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
+        assert_eq!(applied.height, tip.height);
+        assert_eq!(applied.hash, tip.hash);
         Ok(())
     }
 

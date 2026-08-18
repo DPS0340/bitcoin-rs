@@ -33,10 +33,10 @@ Done:
 * `ColumnFamily::UndoData` across all four backends, and a versioned undo codec
   bound to the block hash (`crates/utxo/src/undo_codec.rs`).
 * Undo generation in the same pass as the forward UTXO changes. The undo write
-  is queued before the block body and the UTXO commit. A clean
+  is queued before the block body, the index, and the UTXO commit. A clean
   checkpoint makes the queued record durable.
-* `disconnect_block`, which restores the UTXO set and `applied_tip`. TxIndex is
-  outside this authoritative mutation and reconciles from its own watermark.
+* `disconnect_block`, which restores the UTXO set, the transaction index, and
+  `applied_tip`. Its ordering claims are mutation-verified.
 * Node-owned `invalidateblock` control, which invalidates the named header
   subtree and uses the normal branch-switch/disconnect path rather than
   mutating chainstate in the RPC crate. It previews the replacement tip and
@@ -66,45 +66,6 @@ intentionally open.
 Transaction reconsideration requires one production admission pipeline shared
 by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
 the required fee, policy, conflict, and ancestry metadata.
-
-## Asynchronous TxIndex boundary (#77)
-
-Issue #77 replaced only synchronous TxIndex participation in connect and
-disconnect. It did not replace `switch_to_branch`, UTXO undo, the disconnect
-marker, or the authoritative `applied_tip` commit point.
-
-The frozen design is
-[`docs/plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md`](../../plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md).
-TxIndex owns an atomic `(height, hash)` watermark and reconciles its rows from
-exact retained block bodies in a separate worker. Core disconnect no longer
-rolls TxIndex back, and the disconnect marker no longer covers TxIndex
-mutation. TxIndex may durably lead the core checkpoint
-restored after a crash and will rewind itself; this rule is TxIndex-specific and
-must not be generalized to UTXO state, coinstats, or future consumers whose
-backward transition cannot be reconstructed from retained bodies. Complete RPC
-and Electrum reads compare the durable DB watermark directly with the captured
-applied tip. They retain the starting applied-tip `Arc` and require the
-same publication identity at return; because every publication allocates a
-fresh `Arc`, this rejects `A -> B -> A` value ABA as well as an ordinary tip
-move. A disappearing captured target is retried with bounded
-exponential backoff: repeated stale targets do not prove the current source is
-broken, but immediate retries can hot-spin while the authoritative tip moves.
-Electrum's unspent read distinguishes an unsupported reader from an
-authoritative empty result and bounds complete-query work. Forward and rollback
-each expose one identity-checked atomic transition; there is no process-local
-watermark copy, prepared transition, or reader/writer gate. Worker health is
-observability only, while the DB watermark is the sole durable progress state.
-The `TxIndexWriter` object moves into the worker thread; RPC and Electrum use
-independent `TxIndexReader` views over the same store, so worker row construction
-does not contend on a shared object mutex. Electrum
-exact-resolves lossy spending-prefix candidates against block inputs, batches
-broadcast prevout reads under one completeness boundary, uses set membership for mempool spends,
-and caps per-session scripthash subscriptions.
-Because reconciliation currently depends on exact retained block bodies, node
-configuration temporarily rejects `txindex` together with a nonzero prune
-target. Supporting both requires the pruner to retain bodies through the
-TxIndex watermark (or an equivalent rebuild source), not merely the core durable
-tip.
 
 ## Why it matters
 
@@ -136,16 +97,17 @@ Consequences:
    to `RolledBack`; only a clean checkpoint can clear it after publication. A
    checkpoint refuses `InFlight`, and startup refuses either phase. The marker
    prevents service on inconsistent state. It does not repair that state.
-3. **TxIndex rows and its terminal watermark share one atomic write batch.** A
-   partial derived transition can survive a crash, so the watermark must never
-   be a second write.
+3. **Index rollback is one atomic write batch.** A partial index rollback can
+   survive a crash, so one batch is the required boundary.
 
 ## Disconnect order
 
-1. `utxo.undo_block(&undo)`
-2. roll `applied_tip` back to the parent and send a coalescing TxIndex wake
+1. `tx_index.rollback_block(&block, height)` when present
+2. `utxo.undo_block(&undo)`
+3. roll `applied_tip` back to the parent
+4. *(no step 4 — see retention below)*
 
-Step 2 is the commit point. A failure before it leaves the node believing the
+Step 3 is the commit point. A failure before it leaves the node believing the
 block is still connected, which is a recoverable state.
 
 ## Do not assume undo is idempotent
@@ -182,14 +144,13 @@ Done:
 | `ColumnFamily::UndoData` | enum, its `ALL` list, and all four backends |
 | Versioned undo codec | first byte a format version; keyed by height **and** block hash, with 10 rejection tests |
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
-| Persistence | queued before the block body and UTXO commit; flushed with a clean checkpoint, not per block |
-| `disconnect_block` | restores UTXO and tip; TxIndex does not participate |
-| Asynchronous TxIndex | worker-owned rows plus atomic `(height, hash)` watermark; stale suffix rollback and current suffix connect use exact retained bodies |
+| Persistence | queued before the block body, index, and UTXO commit; flushed with a clean checkpoint, not per block |
+| `disconnect_block` | restores UTXO, index, and tip, in that order, all four orderings mutation-verified |
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
 | `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
-| Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first authoritative mutation; startup refuses while it is set. It does not cover TxIndex. See *Disconnect marker phase* in `CONCEPTS.md` |
+| Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first mutation and above the index rollback; startup refuses while it is set. See *Disconnect marker phase* in `CONCEPTS.md` |
 | Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. One witness covers authoritative replanning, all disconnects, and the available contiguous connect prefix. |
 | Branch switching | `switch_to_branch` recomputes the complete ordered `plan_reorg` result under the transition guard and mutates only when it equals the optimistic plan. A shorter branch is eligible when its accumulated work is greater. A permanent connect failure invalidates its subtree and selects the best valid tip. |
 | Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix available from bounded staging, durable storage, or the applied body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
@@ -228,6 +189,6 @@ normal shutdown path.
    the durable boundary for disconnect. Keep `InFlight` until rollback completes,
    keep `RolledBack` until a clean checkpoint is durable, and refuse to clear an
    incomplete operation.
-3. **A trait default that returns success is a silent-corruption path.** Methods
-   required for a durable transition are mandatory on `TxIndexWriter`; read-only
-   consumers receive a separate `TxIndexReader` that cannot mutate state.
+3. **A trait default that returns success is a silent-corruption path.** When a
+   consumer must participate in rollback, make the default refuse. See
+   `IndexError::UnsupportedRollback`.

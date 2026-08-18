@@ -41,8 +41,7 @@ is useful, not because they describe current behaviour. Do not treat either as
 a description of how the node works today.
 
 - [plans/](plans/) holds design blueprints for multi-step campaigns, each dated
-  and scoped to the work that prompted it. The frozen Issue #77 design is
-  [asynchronous TxIndex reconciliation](plans/2026-08-13-issue-77-async-txindex-reconciliation-plan.md).
+  and scoped to the work that prompted it.
 - [brainstorms/](brainstorms/) holds exploratory requirements from before a
   direction was settled.
 

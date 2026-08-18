@@ -99,32 +99,14 @@ mod tests {
             .with_block_body_source(state.block_body_source())
             .with_block_tree(state.block_tree());
         let tx_index = state
-            .tx_index_reader()
+            .tx_index()
             .ok_or_else(|| anyhow::anyhow!("txindex missing after enabled open"))?;
-        state.start_tx_index_worker()?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let ready = tx_index.watermark()?.is_some_and(|watermark| {
-                watermark.height == tip.height && watermark.hash == tip.hash
-            });
-            if ready {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!("TxIndex worker did not reconcile imported genesis");
-            }
-            std::thread::yield_now();
-        }
-        let resolved = tx_index.resolve_transaction(txid, &source)?;
+        let resolved = tx_index.lock().resolve_transaction(txid, &source)?;
         assert_eq!(
             resolved.as_ref().map(bitcoin::Transaction::compute_txid),
             Some(txid),
             "genesis coinbase must resolve through txindex"
         );
-        state
-            .shutdown()
-            .store(true, std::sync::atomic::Ordering::Release);
-        state.join_tx_index_worker();
         assert!(
             state.mempool().read().is_empty(),
             "genesis import must leave mempool empty"

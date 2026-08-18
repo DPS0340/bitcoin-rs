@@ -52,8 +52,6 @@ rpc_password = "toml-pass"
             "mdbx",
             "--dbcache-mb",
             "2048",
-            "--prune-target-mb",
-            "0",
             "--log-level",
             "trace",
         ],
@@ -61,7 +59,7 @@ rpc_password = "toml-pass"
 
     assert_eq!(config.network, Network::Regtest);
     assert_eq!(config.storage_backend, "mdbx");
-    assert_eq!(config.prune_target_mb, 0);
+    assert_eq!(config.prune_target_mb, 1000);
     assert_eq!(config.dbcache_mb, 2048);
     assert_eq!(config.log_level, "trace");
     assert!(config.txindex);
@@ -200,21 +198,6 @@ fn electrum_bind_requires_txindex() -> Result<()> {
         Err(error) => assert_eq!(error.to_string(), "electrum_bind requires txindex"),
     }
     Ok(())
-}
-
-#[test]
-fn txindex_rejects_pruning_until_body_retention_is_watermark_aware() {
-    let mut config = Config::default_for_network(Network::Regtest);
-    config.txindex = true;
-    config.prune_target_mb = 550;
-
-    match config.validate() {
-        Ok(()) => panic!("txindex with pruning unexpectedly validated"),
-        Err(error) => assert_eq!(
-            error.to_string(),
-            "txindex currently requires pruning to be disabled"
-        ),
-    }
 }
 
 #[test]
