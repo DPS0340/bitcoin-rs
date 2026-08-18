@@ -227,25 +227,15 @@ not one interleaved run. See
 
 ### Script-check floor
 
-The native reference baseline for script verification, calculated by
-running the exact captured input corpus through `CPubKey::Verify` from
-libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
-31.99.0 development sources: public key parsing, lax DER parsing, signature
-normalization, and `secp256k1_ecdsa_verify`). On mainnet 0..150,000, all
-2,868,199 input checks execute exactly one `OP_CHECKSIG` and one successful
-ECDSA verification ($a = 1.0$). Native `CPubKey::Verify` execution averages
-39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs
-per check ($X$).
+The native reference baseline for script verification, calculated by running the exact captured input corpus through `CPubKey::Verify` from `libbitcoinkernel-sys 0.3.0` (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development sources: public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`). The capture pipeline uses same-open parse-stream custody to emit 24 fixed-order u64 counters and four file-bound native streams (`BRSCTX1\0` contexts, `BRSJRN1\0` journal, `BRSREC1\0` records, and 24-counter JSON).
 
-The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA
-overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI
-wrapper costs). The residual is a ceiling over non-native per-check work, not a
-promised or wholly removable gain. At 46.59% of per-check verification cost,
-this residual exceeds the 27.73% threshold required for a 5% total wall-time
-improvement (a 5.85s ceiling within the 12.55s script stage), keeping the
-non-crypto script optimization lever open. See
-`docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+On mainnet 0..150,000, all 2,868,199 input checks are ordinary legacy bare P2PKH spends that execute exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$). `eval_script_entries` equals 5,736,398 ($2 \times 2,868,199$, two evaluator passes per input check: scriptSig + scriptPubKey). All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) and all 13 complementary execution counters are zero. The strict `classify-corpus-v2` classifier evaluates the exact product predicate (`_c150_passed`), yielding `all_passed: true` and `c150_passed: true`.
 
+Authoritative C150/Cmodern certification requires file-bound binary streams, strict `mainnet-prefix-replay-v2` inputs, and exact classifier validation. Direct Core REST export can export raw blocks prior to replay, but live REST export cannot replace file-bound census evidence for certification. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+
+Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
+
+Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
 ### Front-half duplication
 
 The failure mode where a batched fast path recomputes the sequential path's
