@@ -169,7 +169,7 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         let Some(record) = ctx.block_by_hash(hash) else {
             return Err(RpcError::NotFound("block not found"));
         };
-        return proof_from_records(ctx, &[record], &wanted);
+        return proof_from_single_record(ctx, &record, &wanted);
     }
 
     // Without a block hash the scan below reads, deserializes and hashes every
@@ -180,8 +180,7 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     if let Some(proof) = proof_via_index(ctx, &wanted) {
         return Ok(proof);
     }
-    let blocks = ctx.blocks.read().clone();
-    proof_from_records(ctx, &blocks, &wanted)
+    proof_from_block_log(ctx, &wanted)
 }
 
 /// Answers `gettxoutproof` from the txindex, or `None` when it cannot.
@@ -231,21 +230,48 @@ fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Opt
     None
 }
 
-/// Builds the merkle proof from the first record whose block holds every wanted
-/// txid, or reports why none did.
+/// Builds the proof from one named block, or reports why it could not.
 ///
-/// This is the pre-index path, kept whole: it is the fallback whenever the
-/// index cannot answer, the oracle the equivalence tests compare against, and
-/// the `before` arm of the benchmark. Each record's body is loaded exactly once
-/// so the arm measures the scan itself, not a doubled read.
-fn proof_from_records(
+/// The explicit-`blockhash` path: the caller named the block, so there is
+/// nothing to scan and the two failures are distinguishable — a body that is not
+/// there, and a block that does not hold every wanted txid. Both messages are
+/// the ones this handler returned before the index path existed.
+fn proof_from_single_record(
     ctx: &Arc<Context>,
-    records: &[crate::context::BlockRecord],
+    record: &crate::context::BlockRecord,
     wanted: &hashbrown::HashSet<Txid>,
 ) -> Result<Value, RpcError> {
+    let Some(bytes) = ctx.block_body_bytes(record) else {
+        return Err(RpcError::NotFound("block data pruned"));
+    };
+    proof_from_body(&bytes, wanted)
+        .ok_or(RpcError::NotFound("no block contains all requested txids"))
+}
+
+/// Scans the whole block-record log for a block holding every wanted txid.
+///
+/// Deliberately does **not** clone the log, and deliberately does not hold its
+/// lock either. Cloning it copies every record on the chain — about 160 MB at a
+/// mainnet tip — to answer one call, on the exact path taken when the index
+/// cannot. Holding the read guard instead would stall block application for the
+/// length of a scan that loads a block body from disk per record.
+///
+/// So the length is snapshotted once and each record is copied out under a
+/// momentary lock, released before its body is read. Records are only ever
+/// appended, and the tail `pop` on disconnect only removes what was never in the
+/// snapshot's range, so a stale length can miss a block appended mid-scan but
+/// can never read a record that moved.
+fn proof_from_block_log(
+    ctx: &Arc<Context>,
+    wanted: &hashbrown::HashSet<Txid>,
+) -> Result<Value, RpcError> {
+    let len = ctx.blocks.read().len();
     let mut saw_pruned_block = false;
-    for record in records {
-        let Some(bytes) = ctx.block_body_bytes(record) else {
+    for index in 0..len {
+        let Some(record) = ctx.blocks.read().get(index).cloned() else {
+            break;
+        };
+        let Some(bytes) = ctx.block_body_bytes(&record) else {
             saw_pruned_block = true;
             continue;
         };
@@ -1175,6 +1201,73 @@ mod tests {
             probes.load(core::sync::atomic::Ordering::Relaxed),
             wanted.len(),
             "every wanted txid must be probed before the index path gives up"
+        );
+    }
+
+    /// Pins that the block-record lock is released before each body load.
+    ///
+    /// The scan reads a block body from disk per record. Holding the log's
+    /// `RwLock` across that would stall block application for the whole scan,
+    /// and cloning the log to avoid it copies every record on the chain — about
+    /// 160 MB at a mainnet tip. The walk does neither, and this proves it: the
+    /// body source tries to take the write lock, which can only succeed if the
+    /// scan is not holding a read guard.
+    #[test]
+    fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
+        struct LockProbeSource {
+            blocks: Arc<parking_lot::RwLock<Vec<BlockRecord>>>,
+            bodies: Vec<(u32, Vec<u8>)>,
+        }
+
+        impl crate::BlockBodySource for LockProbeSource {
+            fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+                assert!(
+                    self.blocks.try_write().is_some(),
+                    "the block-record lock must not be held across a body load"
+                );
+                self.bodies
+                    .iter()
+                    .find(|(known, _)| *known == height)
+                    .map(|(_, bytes)| bytes.clone())
+            }
+        }
+
+        let blocks = [distinct_block(21), distinct_block(22), distinct_block(23)];
+        let Some(wanted) = blocks[2]
+            .txdata
+            .first()
+            .map(bitcoin::Transaction::compute_txid)
+        else {
+            panic!("block has no transactions");
+        };
+
+        let ctx = Context::new();
+        let log = Arc::clone(&ctx.blocks);
+        let bodies = blocks
+            .iter()
+            .enumerate()
+            .map(|(height, block)| {
+                let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
+                (height, serialize(block))
+            })
+            .collect::<Vec<_>>();
+        let ctx = Arc::new(ctx.with_block_body_source(Arc::new(LockProbeSource {
+            blocks: log,
+            bodies,
+        })));
+
+        // Body-less records, so every body must come from the source above.
+        for (height, block) in blocks.iter().enumerate() {
+            let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
+            let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            ctx.add_block(BlockRecord::synthetic(height, hash));
+        }
+
+        let result = proof_for(&ctx, &[wanted]);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "the scan should answer from the body source: {result:?}"
         );
     }
 }

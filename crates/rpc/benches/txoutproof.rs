@@ -15,7 +15,7 @@
 //! map would leave the syscall sequence out entirely, which is the mistake
 //! `crates/index/benches/history_resolve.rs` records having made.
 //!
-//! **This is a small-window measurement.** The fixture is a few thousand blocks;
+//! **These are small-window measurements.** The fixtures are thousands of blocks;
 //! mainnet is near a million. The scan arm is linear in the number of records,
 //! so the ratio here is a lower bound on the ratio at tip, not a prediction of
 //! it — see
@@ -51,11 +51,14 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use parking_lot::Mutex;
 use sonic_rs::{JsonValueTrait as _, json};
 
-/// Fixture blocks. Large enough that the scan's per-record cost dominates the
-/// one-off dispatch overhead, small enough that Criterion finishes.
-const FIXTURE_BLOCKS: u32 = 2_000;
-/// Transactions per fixture block. The scan hashes every one of them.
-const TXS_PER_BLOCK: usize = 8;
+/// The two fixture shapes, as (blocks, transactions per block).
+///
+/// One shape cannot answer the question. With 8 tiny transactions the per-record
+/// cost is the file open and read, which understates a real chain; with 500 it is
+/// the deserialize-and-hash of the body, which is what a mainnet block actually
+/// costs. Reporting the slope at both bounds the extrapolation from either side.
+/// Block counts differ so each shape stays inside a Criterion run.
+const FIXTURE_SHAPES: [(u32, usize); 2] = [(2_000, 8), (200, 500)];
 /// Fixture blocks start above the heights any real chain constant refers to, so
 /// nothing here can be mistaken for mainnet data.
 const BASE_HEIGHT: u32 = 1_000_000;
@@ -120,7 +123,7 @@ struct Fixture {
     last_txid: Txid,
 }
 
-fn build_fixture() -> Fixture {
+fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let blocks_dir = tempfile::tempdir().expect("blocks tempdir");
     let store = Arc::new(RocksDbStore::open(dir.path()).expect("open rocksdb"));
@@ -128,13 +131,13 @@ fn build_fixture() -> Fixture {
     let mut indexer = Indexer::new(store);
 
     let mut positions = HashMap::new();
-    let mut records = Vec::with_capacity(FIXTURE_BLOCKS as usize);
+    let mut records = Vec::with_capacity(fixture_blocks as usize);
     let mut first_txid = None;
     let mut last_txid = None;
 
-    for index in 0..FIXTURE_BLOCKS {
+    for index in 0..fixture_blocks {
         let height = BASE_HEIGHT + index;
-        let txdata = (0..TXS_PER_BLOCK)
+        let txdata = (0..txs_per_block)
             .map(|slot| {
                 let seed = u64::from(height)
                     .wrapping_mul(1_000_003)
@@ -230,24 +233,27 @@ fn dispatch_proof(ctx: &Arc<Context>, txid: Txid) -> sonic_rs::Value {
 }
 
 fn bench_txoutproof(c: &mut Criterion) {
-    let fixture = build_fixture();
-
     let mut group = c.benchmark_group("gettxoutproof");
-    // The scan arm reads every block body before the last one; at 2,000 blocks a
-    // single iteration is already milliseconds, so the default sample size would
-    // run for minutes without telling us anything more.
+    // The scan arm reads every block body before the last one, so a single
+    // iteration is already milliseconds and the default sample size would run for
+    // minutes without saying anything more.
     group.sample_size(20);
 
-    for (position, txid) in [
-        ("first_block", fixture.first_txid),
-        ("last_block", fixture.last_txid),
-    ] {
-        group.bench_function(format!("before_scan/{position}"), |b| {
-            b.iter(|| black_box(dispatch_proof(&fixture.scanning, txid)));
-        });
-        group.bench_function(format!("after_index/{position}"), |b| {
-            b.iter(|| black_box(dispatch_proof(&fixture.indexed, txid)));
-        });
+    for (fixture_blocks, txs_per_block) in FIXTURE_SHAPES {
+        let fixture = build_fixture(fixture_blocks, txs_per_block);
+        let shape = format!("{fixture_blocks}x{txs_per_block}tx");
+
+        for (position, txid) in [
+            ("first_block", fixture.first_txid),
+            ("last_block", fixture.last_txid),
+        ] {
+            group.bench_function(format!("before_scan/{shape}/{position}"), |b| {
+                b.iter(|| black_box(dispatch_proof(&fixture.scanning, txid)));
+            });
+            group.bench_function(format!("after_index/{shape}/{position}"), |b| {
+                b.iter(|| black_box(dispatch_proof(&fixture.indexed, txid)));
+            });
+        }
     }
 
     group.finish();
