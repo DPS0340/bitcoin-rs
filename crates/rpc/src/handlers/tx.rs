@@ -177,7 +177,7 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     // block confirms a txid, so ask it first and scan only when it cannot
     // answer — the same route Bitcoin Core takes, which requires the block hash
     // *unless* txindex is enabled.
-    if let Some(proof) = proof_via_index(ctx, &wanted)? {
+    if let Some(proof) = proof_via_index(ctx, &wanted) {
         return Ok(proof);
     }
     let blocks = ctx.blocks.read().clone();
@@ -186,42 +186,51 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 
 /// Answers `gettxoutproof` from the txindex, or `None` when it cannot.
 ///
-/// Resolves the confirming height of one wanted txid and tries to build the
-/// proof from that block alone. Every miss — no indexer, an unresolved or stale
-/// row, a pruned body, or a block that does not hold *all* the wanted txids —
-/// returns `None` so the caller falls back to the scan. That fallback is not
-/// belt-and-braces: BIP30's duplicate coinbase txids mean a txid can confirm in
-/// more than one block, so a block chosen from a single txid is a candidate,
-/// never a verdict.
-fn proof_via_index(
-    ctx: &Arc<Context>,
-    wanted: &hashbrown::HashSet<Txid>,
-) -> Result<Option<Value>, RpcError> {
-    let Some(indexer) = &ctx.indexer else {
-        return Ok(None);
-    };
-    let Some(probe) = wanted.iter().next() else {
-        return Ok(None);
-    };
-    let height = indexer
-        .lock()
-        .resolve_transaction_height(*probe, ctx.as_ref())
-        .map_err(|error| RpcError::Internal(format!("txindex lookup failed: {error}")))?;
-    let Some(height) = height else {
-        return Ok(None);
-    };
-    let Some(record) = ctx.block_by_height(height) else {
-        return Ok(None);
-    };
-    Ok(proof_from_record(ctx, &record, wanted))
+/// Probes the wanted txids until one resolves to a confirming height, then tries
+/// to build the proof from that block alone. Probing *every* txid rather than an
+/// arbitrary one matters: `wanted` is a `HashSet`, so "the first" is whichever
+/// the hasher happens to yield, and one unresolvable txid would otherwise drop
+/// the call into the full chain scan non-deterministically — the very cost this
+/// path exists to avoid.
+///
+/// Every miss returns `None` so the caller falls back to that scan: no indexer,
+/// no row, a stale row, a pruned body, or a block that does not hold *all* the
+/// wanted txids. The last of those is not belt-and-braces — BIP30's duplicate
+/// coinbase txids mean a txid can confirm in more than one block, so a block
+/// chosen from a single txid is a candidate, never a verdict.
+///
+/// An index that returns an error is a miss too, logged rather than propagated.
+/// Before this path existed a broken txindex could not fail this call, and the
+/// scan can still answer it; an optimization must not turn a working call into
+/// an error.
+fn proof_via_index(ctx: &Arc<Context>, wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
+    let indexer = ctx.indexer.as_ref()?;
+    for probe in wanted {
+        let resolved = indexer
+            .lock()
+            .resolve_transaction_height(*probe, ctx.as_ref());
+        let height = match resolved {
+            Ok(Some(height)) => height,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    txid = %probe,
+                    %error,
+                    "txindex lookup failed; answering from the block scan instead"
+                );
+                return None;
+            }
+        };
+        let Some(record) = ctx.block_by_height(height) else {
+            continue;
+        };
+        if let Some(proof) = proof_from_record(ctx, &record, wanted) {
+            return Some(proof);
+        }
+    }
+    None
 }
 
-/// Builds the merkle proof from the first record whose block holds every wanted
-/// txid, or reports why none did.
-///
-/// This is the pre-index path, kept whole: it is the fallback whenever the
-/// index cannot answer, the oracle the equivalence tests compare against, and
-/// the `before` arm of the benchmark.
 /// Builds the merkle proof from the first record whose block holds every wanted
 /// txid, or reports why none did.
 ///
@@ -898,6 +907,274 @@ mod tests {
                 Err(RpcError::NotFound("no block contains all requested txids"))
             ),
             "txids spread across blocks must keep the pre-index error: {result:?}"
+        );
+    }
+
+    /// Resolves only the txids it was told about, so a probe can be made to miss.
+    struct SelectiveIndexer {
+        resolvable: Vec<(Txid, u32)>,
+        fail: bool,
+    }
+
+    impl IndexerLike for SelectiveIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<IndexRowCounts, IndexError> {
+            Ok(IndexRowCounts::default())
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, IndexError> {
+            Ok(None)
+        }
+
+        fn resolve_transaction_height(
+            &self,
+            txid: Txid,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u32>, IndexError> {
+            if self.fail {
+                return Err(IndexError::InvalidHeaderLength { len: 0 });
+            }
+            Ok(self
+                .resolvable
+                .iter()
+                .find(|(known, _)| *known == txid)
+                .map(|(_, height)| *height))
+        }
+    }
+
+    fn ctx_with_selective_indexer(resolvable: Vec<(Txid, u32)>, fail: bool) -> Arc<Context> {
+        let mut ctx = Context::new();
+        let indexer: Box<dyn IndexerLike> = Box::new(SelectiveIndexer { resolvable, fail });
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        Arc::new(ctx)
+    }
+
+    /// A body source that refuses to serve anything, so any scan over
+    /// body-less records fails loudly instead of quietly succeeding.
+    struct PanicOnScan;
+
+    impl crate::BlockBodySource for PanicOnScan {
+        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            panic!("the index path should not have scanned: {height}:{hash}");
+        }
+    }
+
+    #[test]
+    fn gettxoutproof_index_path_answers_for_several_txids_in_one_block() {
+        let block = block_with_two_txs(11);
+        let wanted = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let resolvable = wanted.iter().map(|txid| (*txid, 1)).collect::<Vec<_>>();
+
+        let ctx = ctx_with_selective_indexer(resolvable, false);
+        ctx.add_block(BlockRecord::synthetic(
+            0,
+            Hash256::from_le_bytes(&[5_u8; 32]),
+        ));
+        ctx.add_block(BlockRecord::from_block(1, &block));
+
+        let result = proof_for(&ctx, &wanted);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "several txids in one block should resolve through the index: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_probes_every_txid_before_giving_up_on_the_index() {
+        // `wanted` is a HashSet, so which txid is probed first is whatever the
+        // hasher yields. Making only the *second*-added txid resolvable pins that
+        // an unresolvable probe does not by itself drop the call into the scan —
+        // the scan here would panic.
+        let block = block_with_two_txs(12);
+        let wanted = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let Some(only_one) = wanted.last().copied() else {
+            panic!("block has no transactions");
+        };
+
+        let mut ctx = Context::new().with_block_body_source(Arc::new(PanicOnScan));
+        let indexer: Box<dyn IndexerLike> = Box::new(SelectiveIndexer {
+            resolvable: vec![(only_one, 1)],
+            fail: false,
+        });
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        let ctx = Arc::new(ctx);
+        ctx.add_block(BlockRecord::synthetic(
+            0,
+            Hash256::from_le_bytes(&[6_u8; 32]),
+        ));
+        ctx.add_block(BlockRecord::from_block(1, &block));
+
+        let result = proof_for(&ctx, &wanted);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "one unresolvable probe must not abandon the index path: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_falls_back_to_the_scan_when_the_index_errors() {
+        // Before this path existed, a broken txindex could not fail this call and
+        // the scan answered it. An optimization must not turn a working call into
+        // an error.
+        let blocks = [distinct_block(1), distinct_block(2)];
+        let Some(wanted) = blocks[1]
+            .txdata
+            .first()
+            .map(bitcoin::Transaction::compute_txid)
+        else {
+            panic!("block has no transactions");
+        };
+
+        let ctx = ctx_with_selective_indexer(vec![(wanted, 1)], true);
+        seed_blocks(&ctx, &blocks);
+
+        let result = proof_for(&ctx, &[wanted]);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "an erroring index must fall back to the scan, not fail the call: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_with_blockhash_never_consults_the_index() {
+        // The explicit-blockhash path is unchanged by this work, and an indexer
+        // that panics on use proves it stays that way.
+        struct PanicIndexer;
+
+        impl IndexerLike for PanicIndexer {
+            fn ingest_block(
+                &mut self,
+                _block: &[u8],
+                _height: u32,
+            ) -> Result<IndexRowCounts, IndexError> {
+                Ok(IndexRowCounts::default())
+            }
+
+            fn resolve_outpoint_value(
+                &self,
+                _outpoint: bitcoin::OutPoint,
+                _source: &dyn BlockSource,
+            ) -> Result<Option<u64>, IndexError> {
+                Ok(None)
+            }
+
+            fn resolve_transaction_height(
+                &self,
+                _txid: Txid,
+                _source: &dyn BlockSource,
+            ) -> Result<Option<u32>, IndexError> {
+                panic!("the explicit-blockhash path must not consult the index");
+            }
+        }
+
+        let mut ctx = Context::new();
+        let indexer: Box<dyn IndexerLike> = Box::new(PanicIndexer);
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        let ctx = Arc::new(ctx);
+        let block = distinct_block(4);
+        let Some(wanted) = block.txdata.first().map(bitcoin::Transaction::compute_txid) else {
+            panic!("block has no transactions");
+        };
+        let record = BlockRecord::from_block(0, &block);
+        let block_hash = record.hash;
+        ctx.add_block(record);
+
+        let result = super::gettxoutproof(
+            &ctx,
+            &json!([[wanted.to_string()], block_hash.to_string_be()]),
+        );
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "the explicit-blockhash path should answer without the index: {result:?}"
+        );
+    }
+
+    /// Counts probes so the loop can be pinned deterministically.
+    ///
+    /// `probes_every_txid_before_giving_up_on_the_index` pins the *outcome*, but
+    /// only probabilistically: `wanted` is a `HashSet`, so a one-probe
+    /// implementation happens to pick the resolvable txid about half the time.
+    /// Resolving nothing and counting instead is deterministic.
+    struct CountingIndexer {
+        probes: Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl IndexerLike for CountingIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<IndexRowCounts, IndexError> {
+            Ok(IndexRowCounts::default())
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, IndexError> {
+            Ok(None)
+        }
+
+        fn resolve_transaction_height(
+            &self,
+            _txid: Txid,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u32>, IndexError> {
+            self.probes
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn gettxoutproof_asks_the_index_about_every_wanted_txid() {
+        let block = block_with_two_txs(13);
+        let wanted = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let probes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+
+        let mut ctx = Context::new();
+        let indexer: Box<dyn IndexerLike> = Box::new(CountingIndexer {
+            probes: Arc::clone(&probes),
+        });
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        let ctx = Arc::new(ctx);
+        ctx.add_block(BlockRecord::from_block(0, &block));
+
+        // Resolves nothing, so this falls through to the scan and still answers.
+        let result = proof_for(&ctx, &wanted);
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "the scan must still answer when the index resolves nothing: {result:?}"
+        );
+
+        assert_eq!(
+            probes.load(core::sync::atomic::Ordering::Relaxed),
+            wanted.len(),
+            "every wanted txid must be probed before the index path gives up"
         );
     }
 }
