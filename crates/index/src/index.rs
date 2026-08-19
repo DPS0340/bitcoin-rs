@@ -436,6 +436,40 @@ impl<S: KvStore> Indexer<S> {
         Ok(None)
     }
 
+    /// Resolves the height of the block confirming `txid`, without
+    /// materializing the transaction.
+    ///
+    /// Same candidate walk as [`Self::resolve_transaction`] — positions first,
+    /// then a full-block scan that answers the rare stale row or 8-byte
+    /// txid-prefix collision — but it reports *which block* rather than which
+    /// transaction, which is what a merkle-proof caller needs. Returns `None`
+    /// when no candidate row resolves to `txid`, and "not found" is never
+    /// reported on the strength of positions alone.
+    pub fn resolve_transaction_height<B: BlockSource + ?Sized>(
+        &self,
+        txid: bitcoin::Txid,
+        source: &B,
+    ) -> Result<Option<u32>, IndexError> {
+        let rows = self.iter_txid_rows_with_values(&txid)?;
+        for (row, value) in &rows {
+            let height = row.height();
+            if let Some(positions) = crate::types::TxPositionValue::decode(value)
+                && positions
+                    .iter()
+                    .filter_map(|position| transaction_at(height, *position, source))
+                    .any(|tx| tx.compute_txid() == txid)
+            {
+                return Ok(Some(height));
+            }
+            if let Some(block) = source.block_at_height(height)
+                && block.txdata.iter().any(|tx| tx.compute_txid() == txid)
+            {
+                return Ok(Some(height));
+            }
+        }
+        Ok(None)
+    }
+
     /// Naive reference implementation of [`Self::resolve_transaction`].
     ///
     /// Loads and fully decodes the block for each candidate row, then computes
@@ -1442,6 +1476,20 @@ pub trait IndexerLike: Send + Sync {
         Ok(None)
     }
 
+    /// Resolves the height of the block confirming `txid` via `source`.
+    ///
+    /// Default implementations may return `Ok(None)` when the concrete indexer
+    /// does not support transaction lookup, so a caller that must answer
+    /// correctly without an index keeps its own fallback path.
+    fn resolve_transaction_height(
+        &self,
+        txid: bitcoin::Txid,
+        source: &dyn BlockSource,
+    ) -> Result<Option<u32>, IndexError> {
+        let _ = (txid, source);
+        Ok(None)
+    }
+
     /// Resolves the satoshi value of the transaction output at `outpoint` via
     /// `source`. Returns `Ok(None)` when the transaction is not indexed or the
     /// `vout` is out of range.
@@ -1592,6 +1640,14 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         source: &dyn BlockSource,
     ) -> Result<Option<bitcoin::Transaction>, IndexError> {
         Self::resolve_transaction(self, txid, source)
+    }
+
+    fn resolve_transaction_height(
+        &self,
+        txid: bitcoin::Txid,
+        source: &dyn BlockSource,
+    ) -> Result<Option<u32>, IndexError> {
+        Self::resolve_transaction_height(self, txid, source)
     }
 
     fn resolve_outpoint_value(
@@ -1958,6 +2014,71 @@ mod tests {
         };
 
         assert_eq!(indexer.resolve_tx_with_height(txid, &source)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_transaction_height_returns_the_confirming_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let Some(tx) = block.txdata.first() else {
+            return Err(std::io::Error::other("genesis block has no transactions").into());
+        };
+        let txid = tx.compute_txid();
+        let (_dir, mut indexer) = indexer()?;
+
+        indexer.ingest_block(&serialize(&block), 0)?;
+
+        let source = FakeSource {
+            block,
+            target_height: 0,
+        };
+
+        assert_eq!(indexer.resolve_transaction_height(txid, &source)?, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_transaction_height_returns_none_for_unknown_txid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, indexer) = indexer()?;
+        let txid = bitcoin::Txid::from_byte_array([0xff; 32]);
+        let source = FakeSource {
+            block: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+            target_height: 0,
+        };
+
+        assert_eq!(indexer.resolve_transaction_height(txid, &source)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_transaction_height_agrees_with_the_transaction_resolver()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The two resolvers walk the same candidate rows; a caller that picks a
+        // block by height must land on the block the transaction resolver would
+        // have read the transaction out of.
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let Some(tx) = block.txdata.first() else {
+            return Err(std::io::Error::other("genesis block has no transactions").into());
+        };
+        let txid = tx.compute_txid();
+        let (_dir, mut indexer) = indexer()?;
+
+        indexer.ingest_block(&serialize(&block), 0)?;
+
+        let source = FakeSource {
+            block,
+            target_height: 0,
+        };
+
+        let by_height = indexer.resolve_transaction_height(txid, &source)?;
+        let by_transaction = indexer.resolve_tx_with_height(txid, &source)?;
+
+        // Both resolvers returning `None` would satisfy the equality below while
+        // proving nothing, so pin the resolved value before comparing.
+        assert_eq!(by_height, Some(0));
+        assert_eq!(by_height, by_transaction.map(|(_, height)| height));
         Ok(())
     }
 

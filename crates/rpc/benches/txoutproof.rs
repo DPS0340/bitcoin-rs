@@ -1,0 +1,261 @@
+//! `gettxoutproof` refactor-set benchmark.
+//!
+//! Both arms of the set run over one identical fixture in one process, so the
+//! before/after ratio comes from a single run and cannot be confounded by the
+//! rebuild and baseline drift recorded in
+//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
+//!
+//! `before_scan` is the pre-index path: no indexer on the `Context`, so the
+//! handler walks every block record, loads each body, deserializes it and hashes
+//! every transaction in it. `after_index` is the same call on the same fixture
+//! with a populated txindex attached.
+//!
+//! Block bodies are served from a **real `FlatFileBlockStore`**, the same path
+//! production takes: open, `fstat`, seek, read. Serving them from an in-memory
+//! map would leave the syscall sequence out entirely, which is the mistake
+//! `crates/index/benches/history_resolve.rs` records having made.
+//!
+//! **This is a small-window measurement.** The fixture is a few thousand blocks;
+//! mainnet is near a million. The scan arm is linear in the number of records,
+//! so the ratio here is a lower bound on the ratio at tip, not a prediction of
+//! it — see
+//! `docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`.
+//!
+//! Two positions are benchmarked because the scan is position-dependent and the
+//! index is not: `first_block` is the scan's best case (it stops immediately)
+//! and `last_block` is its worst. Reporting only the worst would overstate the
+//! win; reporting only the best would hide it.
+// PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
+#![allow(missing_docs)]
+// A benchmark fixture that fails to build has no meaningful degraded mode: a
+// handler returning `Err` would be timed as a fast early return and reported as
+// a win. Panicking is the correct outcome, so `expect` is deliberate here.
+#![allow(clippy::expect_used)]
+
+use std::collections::HashMap;
+use std::hint::black_box;
+use std::sync::Arc;
+
+use bitcoin::consensus::encode::serialize;
+use bitcoin::hashes::Hash as _;
+use bitcoin::{
+    Amount, Block, CompactTarget, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
+    Txid, Witness, absolute, block, transaction,
+};
+use bitcoin_rs_index::{Indexer, IndexerLike};
+use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_rpc::{BlockBodySource, BlockRecord, Context, Handler};
+use bitcoin_rs_storage::RocksDbStore;
+use bitcoin_rs_storage::block_file::{BlockFilePosition, FlatFileBlockStore};
+use criterion::{Criterion, criterion_group, criterion_main};
+use parking_lot::Mutex;
+use sonic_rs::{JsonValueTrait as _, json};
+
+/// Fixture blocks. Large enough that the scan's per-record cost dominates the
+/// one-off dispatch overhead, small enough that Criterion finishes.
+const FIXTURE_BLOCKS: u32 = 2_000;
+/// Transactions per fixture block. The scan hashes every one of them.
+const TXS_PER_BLOCK: usize = 8;
+/// Fixture blocks start above the heights any real chain constant refers to, so
+/// nothing here can be mistaken for mainnet data.
+const BASE_HEIGHT: u32 = 1_000_000;
+
+/// Serves fixture bodies out of the flat block files, paying the real syscalls.
+struct FlatFileBodySource {
+    files: FlatFileBlockStore,
+    positions: HashMap<u32, (BlockFilePosition, [u8; 32])>,
+}
+
+impl BlockBodySource for FlatFileBodySource {
+    fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+        let (position, hash) = self.positions.get(&height)?;
+        self.files.load(*position, height, *hash).ok()?
+    }
+}
+
+fn empty_header() -> block::Header {
+    block::Header {
+        version: block::Version::TWO,
+        prev_blockhash: bitcoin::BlockHash::all_zeros(),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: CompactTarget::from_consensus(0x1d00_ffff),
+        nonce: 0,
+    }
+}
+
+/// A transaction whose txid is a function of its seed, so every fixture
+/// transaction is distinct and the index has real work to disambiguate.
+fn filler_tx(seed: u64) -> Transaction {
+    let mut script = [0_u8; 32];
+    script[..8].copy_from_slice(&seed.to_le_bytes());
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(seed.to_le_bytes().to_vec()),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
+        }],
+    }
+}
+
+struct Fixture {
+    // Held for their `Drop`: the RocksDB and block-file directories must outlive
+    // the indexer and the body source.
+    _dir: tempfile::TempDir,
+    _blocks_dir: tempfile::TempDir,
+    /// Context with a populated txindex: the `after` arm.
+    indexed: Arc<Context>,
+    /// Context with no indexer at all: the `before` arm.
+    scanning: Arc<Context>,
+    /// Txid planted in the first fixture block — the scan's best case.
+    first_txid: Txid,
+    /// Txid planted in the last fixture block — the scan's worst case.
+    last_txid: Txid,
+}
+
+fn build_fixture() -> Fixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocks_dir = tempfile::tempdir().expect("blocks tempdir");
+    let store = Arc::new(RocksDbStore::open(dir.path()).expect("open rocksdb"));
+    let files = FlatFileBlockStore::open(blocks_dir.path()).expect("open block files");
+    let mut indexer = Indexer::new(store);
+
+    let mut positions = HashMap::new();
+    let mut records = Vec::with_capacity(FIXTURE_BLOCKS as usize);
+    let mut first_txid = None;
+    let mut last_txid = None;
+
+    for index in 0..FIXTURE_BLOCKS {
+        let height = BASE_HEIGHT + index;
+        let txdata = (0..TXS_PER_BLOCK)
+            .map(|slot| {
+                let seed = u64::from(height)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(u64::try_from(slot).unwrap_or(0));
+                filler_tx(seed)
+            })
+            .collect::<Vec<_>>();
+
+        let mut block = Block {
+            header: empty_header(),
+            txdata,
+        };
+        if let Some(root) = block.compute_merkle_root() {
+            block.header.merkle_root = root;
+        }
+
+        let planted = block
+            .txdata
+            .first()
+            .map(Transaction::compute_txid)
+            .expect("fixture block has transactions");
+        if index == 0 {
+            first_txid = Some(planted);
+        }
+        last_txid = Some(planted);
+
+        let bytes = serialize(&block);
+        indexer
+            .ingest_block(&bytes, height)
+            .expect("ingest fixture block");
+        let hash = block.block_hash().to_byte_array();
+        let position = files
+            .persist(None, height, hash, &bytes)
+            .expect("persist fixture body");
+        positions.insert(height, (position, hash));
+        records.push(BlockRecord::synthetic(
+            height,
+            Hash256::from_le_bytes(&hash),
+        ));
+    }
+
+    let source = Arc::new(FlatFileBodySource { files, positions });
+
+    let scanning = Arc::new(Context::new().with_block_body_source(Arc::clone(&source) as Arc<_>));
+    for record in &records {
+        scanning.add_block(record.clone());
+    }
+
+    let mut indexed_ctx = Context::new().with_block_body_source(source as Arc<_>);
+    let boxed: Box<dyn IndexerLike> = Box::new(indexer);
+    indexed_ctx.indexer = Some(Arc::new(Mutex::new(boxed)));
+    let indexed = Arc::new(indexed_ctx);
+    for record in records {
+        indexed.add_block(record);
+    }
+
+    let first_txid = first_txid.expect("at least one fixture block");
+    let last_txid = last_txid.expect("at least one fixture block");
+
+    // A fixture where either arm fails would benchmark an error return and
+    // report a spectacular, meaningless speedup. Prove both answer first.
+    for (label, ctx) in [("scan", &scanning), ("index", &indexed)] {
+        for (position, txid) in [("first", first_txid), ("last", last_txid)] {
+            let proof = dispatch_proof(ctx, txid);
+            assert!(
+                proof.as_str().is_some(),
+                "{label} arm returned no proof for the {position} block"
+            );
+        }
+    }
+
+    // The two arms must agree, or the benchmark is timing two different answers.
+    assert_eq!(
+        dispatch_proof(&scanning, last_txid).as_str(),
+        dispatch_proof(&indexed, last_txid).as_str(),
+        "the arms disagree; the benchmark would be meaningless"
+    );
+
+    Fixture {
+        _dir: dir,
+        _blocks_dir: blocks_dir,
+        indexed,
+        scanning,
+        first_txid,
+        last_txid,
+    }
+}
+
+fn dispatch_proof(ctx: &Arc<Context>, txid: Txid) -> sonic_rs::Value {
+    Handler::new(Arc::clone(ctx))
+        .dispatch("gettxoutproof", &json!([[txid.to_string()]]))
+        .expect("gettxoutproof failed")
+}
+
+fn bench_txoutproof(c: &mut Criterion) {
+    let fixture = build_fixture();
+
+    let mut group = c.benchmark_group("gettxoutproof");
+    // The scan arm reads every block body before the last one; at 2,000 blocks a
+    // single iteration is already milliseconds, so the default sample size would
+    // run for minutes without telling us anything more.
+    group.sample_size(20);
+
+    for (position, txid) in [
+        ("first_block", fixture.first_txid),
+        ("last_block", fixture.last_txid),
+    ] {
+        group.bench_function(format!("before_scan/{position}"), |b| {
+            b.iter(|| black_box(dispatch_proof(&fixture.scanning, txid)));
+        });
+        group.bench_function(format!("after_index/{position}"), |b| {
+            b.iter(|| black_box(dispatch_proof(&fixture.indexed, txid)));
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_txoutproof
+}
+criterion_main!(benches);

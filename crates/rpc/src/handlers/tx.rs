@@ -163,38 +163,86 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         wanted.insert(parse_txid(txid)?);
     }
 
-    let blocks = match array.get(1).and_then(JsonValueTrait::as_str) {
-        Some(hash_str) => {
-            let hash = Hash256::from_str(hash_str)
-                .map_err(|_| RpcError::InvalidParams("blockhash must be 64 hex characters"))?;
-            let Some(record) = ctx.block_by_hash(hash) else {
-                return Err(RpcError::NotFound("block not found"));
-            };
-            vec![record]
-        }
-        None => ctx.blocks.read().clone(),
+    if let Some(hash_str) = array.get(1).and_then(JsonValueTrait::as_str) {
+        let hash = Hash256::from_str(hash_str)
+            .map_err(|_| RpcError::InvalidParams("blockhash must be 64 hex characters"))?;
+        let Some(record) = ctx.block_by_hash(hash) else {
+            return Err(RpcError::NotFound("block not found"));
+        };
+        return proof_from_records(ctx, &[record], &wanted);
+    }
+
+    // Without a block hash the scan below reads, deserializes and hashes every
+    // block on the chain to answer one call. The txindex already knows which
+    // block confirms a txid, so ask it first and scan only when it cannot
+    // answer — the same route Bitcoin Core takes, which requires the block hash
+    // *unless* txindex is enabled.
+    if let Some(proof) = proof_via_index(ctx, &wanted)? {
+        return Ok(proof);
+    }
+    let blocks = ctx.blocks.read().clone();
+    proof_from_records(ctx, &blocks, &wanted)
+}
+
+/// Answers `gettxoutproof` from the txindex, or `None` when it cannot.
+///
+/// Resolves the confirming height of one wanted txid and tries to build the
+/// proof from that block alone. Every miss — no indexer, an unresolved or stale
+/// row, a pruned body, or a block that does not hold *all* the wanted txids —
+/// returns `None` so the caller falls back to the scan. That fallback is not
+/// belt-and-braces: BIP30's duplicate coinbase txids mean a txid can confirm in
+/// more than one block, so a block chosen from a single txid is a candidate,
+/// never a verdict.
+fn proof_via_index(
+    ctx: &Arc<Context>,
+    wanted: &hashbrown::HashSet<Txid>,
+) -> Result<Option<Value>, RpcError> {
+    let Some(indexer) = &ctx.indexer else {
+        return Ok(None);
     };
+    let Some(probe) = wanted.iter().next() else {
+        return Ok(None);
+    };
+    let height = indexer
+        .lock()
+        .resolve_transaction_height(*probe, ctx.as_ref())
+        .map_err(|error| RpcError::Internal(format!("txindex lookup failed: {error}")))?;
+    let Some(height) = height else {
+        return Ok(None);
+    };
+    let Some(record) = ctx.block_by_height(height) else {
+        return Ok(None);
+    };
+    Ok(proof_from_record(ctx, &record, wanted))
+}
+
+/// Builds the merkle proof from the first record whose block holds every wanted
+/// txid, or reports why none did.
+///
+/// This is the pre-index path, kept whole: it is the fallback whenever the
+/// index cannot answer, the oracle the equivalence tests compare against, and
+/// the `before` arm of the benchmark.
+/// Builds the merkle proof from the first record whose block holds every wanted
+/// txid, or reports why none did.
+///
+/// This is the pre-index path, kept whole: it is the fallback whenever the
+/// index cannot answer, the oracle the equivalence tests compare against, and
+/// the `before` arm of the benchmark. Each record's body is loaded exactly once
+/// so the arm measures the scan itself, not a doubled read.
+fn proof_from_records(
+    ctx: &Arc<Context>,
+    records: &[crate::context::BlockRecord],
+    wanted: &hashbrown::HashSet<Txid>,
+) -> Result<Value, RpcError> {
     let mut saw_pruned_block = false;
-    for record in &blocks {
+    for record in records {
         let Some(bytes) = ctx.block_body_bytes(record) else {
             saw_pruned_block = true;
             continue;
         };
-        let Ok(block) = deserialize::<bitcoin::Block>(&bytes) else {
-            continue;
-        };
-        let block_txids = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect::<hashbrown::HashSet<Txid>>();
-        if !wanted.iter().all(|txid| block_txids.contains(txid)) {
-            continue;
+        if let Some(proof) = proof_from_body(&bytes, wanted) {
+            return Ok(proof);
         }
-
-        let merkle_block =
-            MerkleBlock::from_block_with_predicate(&block, |txid| wanted.contains(txid));
-        return Ok(json!(serialize(&merkle_block).to_lower_hex_string()));
     }
 
     if saw_pruned_block {
@@ -202,6 +250,34 @@ pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     } else {
         Err(RpcError::NotFound("no block contains all requested txids"))
     }
+}
+
+/// Builds the merkle proof for `wanted` from one block record, or `None` when
+/// that block is pruned, undecodable, or does not hold every wanted txid.
+fn proof_from_record(
+    ctx: &Arc<Context>,
+    record: &crate::context::BlockRecord,
+    wanted: &hashbrown::HashSet<Txid>,
+) -> Option<Value> {
+    let bytes = ctx.block_body_bytes(record)?;
+    proof_from_body(&bytes, wanted)
+}
+
+/// Builds the merkle proof for `wanted` from one serialized block, or `None`
+/// when it does not decode or does not hold every wanted txid.
+fn proof_from_body(bytes: &[u8], wanted: &hashbrown::HashSet<Txid>) -> Option<Value> {
+    let block = deserialize::<bitcoin::Block>(bytes).ok()?;
+    let block_txids = block
+        .txdata
+        .iter()
+        .map(bitcoin::Transaction::compute_txid)
+        .collect::<hashbrown::HashSet<Txid>>();
+    if !wanted.iter().all(|txid| block_txids.contains(txid)) {
+        return None;
+    }
+
+    let merkle_block = MerkleBlock::from_block_with_predicate(&block, |txid| wanted.contains(txid));
+    Some(json!(serialize(&merkle_block).to_lower_hex_string()))
 }
 
 pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -600,6 +676,229 @@ mod tests {
             result,
             Err(RpcError::NotFound("block data pruned"))
         ));
+    }
+
+    /// Builds a block distinguishable from the blocks of other markers: the
+    /// coinbase script makes the txid differ, and the merkle root is recomputed
+    /// so `verifytxoutproof` can still extract matches from a proof over it.
+    fn distinct_block(marker: u8) -> bitcoin::Block {
+        let mut block = genesis_block(bitcoin::Network::Regtest);
+        if let Some(tx) = block.txdata.first_mut()
+            && let Some(input) = tx.input.first_mut()
+        {
+            input.script_sig = bitcoin::ScriptBuf::from_bytes(vec![marker; 4]);
+        }
+        if let Some(root) = block.compute_merkle_root() {
+            block.header.merkle_root = root;
+        }
+        block
+    }
+
+    /// Adds a second transaction so one block can hold two wanted txids.
+    fn block_with_two_txs(marker: u8) -> bitcoin::Block {
+        let mut block = distinct_block(marker);
+        let extra = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000 + u64::from(marker)),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        block.txdata.push(extra);
+        if let Some(root) = block.compute_merkle_root() {
+            block.header.merkle_root = root;
+        }
+        block
+    }
+
+    /// Reports whatever height it was built with, standing in for the txindex.
+    struct HeightIndexer(Option<u32>);
+
+    impl IndexerLike for HeightIndexer {
+        fn ingest_block(
+            &mut self,
+            _block: &[u8],
+            _height: u32,
+        ) -> Result<IndexRowCounts, IndexError> {
+            Ok(IndexRowCounts::default())
+        }
+
+        fn resolve_outpoint_value(
+            &self,
+            _outpoint: bitcoin::OutPoint,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u64>, IndexError> {
+            Ok(None)
+        }
+
+        fn resolve_transaction_height(
+            &self,
+            _txid: Txid,
+            _source: &dyn BlockSource,
+        ) -> Result<Option<u32>, IndexError> {
+            Ok(self.0)
+        }
+    }
+
+    fn ctx_with_height_indexer(height: Option<u32>) -> Arc<Context> {
+        let mut ctx = Context::new();
+        let indexer: Box<dyn IndexerLike> = Box::new(HeightIndexer(height));
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        Arc::new(ctx)
+    }
+
+    fn seed_blocks(ctx: &Arc<Context>, blocks: &[bitcoin::Block]) {
+        for (height, block) in blocks.iter().enumerate() {
+            let height = u32::try_from(height).unwrap_or_else(|err| panic!("height: {err}"));
+            ctx.add_block(BlockRecord::from_block(height, block));
+        }
+    }
+
+    fn proof_for(ctx: &Arc<Context>, txids: &[Txid]) -> Result<sonic_rs::Value, RpcError> {
+        let names = txids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        super::gettxoutproof(ctx, &json!([names]))
+    }
+
+    #[test]
+    fn gettxoutproof_index_path_matches_the_scan_it_replaces() {
+        let blocks = [distinct_block(1), distinct_block(2), distinct_block(3)];
+        let Some(wanted) = blocks[2]
+            .txdata
+            .first()
+            .map(bitcoin::Transaction::compute_txid)
+        else {
+            panic!("block has no transactions");
+        };
+
+        let scan_ctx = Arc::new(Context::new());
+        seed_blocks(&scan_ctx, &blocks);
+        let scanned =
+            proof_for(&scan_ctx, &[wanted]).unwrap_or_else(|err| panic!("scan path failed: {err}"));
+
+        let index_ctx = ctx_with_height_indexer(Some(2));
+        seed_blocks(&index_ctx, &blocks);
+        let indexed = proof_for(&index_ctx, &[wanted])
+            .unwrap_or_else(|err| panic!("index path failed: {err}"));
+
+        assert_eq!(
+            indexed.as_str(),
+            scanned.as_str(),
+            "the index path must return the proof the scan would have returned"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_index_path_does_not_read_unrelated_block_bodies() {
+        struct PanicBodySource;
+
+        impl crate::BlockBodySource for PanicBodySource {
+            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+                panic!("index path should not load unrelated body {height}:{hash}");
+            }
+        }
+
+        // Records without a body force a `BlockBodySource` read, so a scan over
+        // them panics; only skipping them entirely keeps this test green.
+        let mut ctx = Context::new().with_block_body_source(Arc::new(PanicBodySource));
+        let indexer: Box<dyn IndexerLike> = Box::new(HeightIndexer(Some(2)));
+        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        let ctx = Arc::new(ctx);
+        ctx.add_block(BlockRecord::synthetic(
+            0,
+            Hash256::from_le_bytes(&[7_u8; 32]),
+        ));
+        ctx.add_block(BlockRecord::synthetic(
+            1,
+            Hash256::from_le_bytes(&[8_u8; 32]),
+        ));
+        let block = distinct_block(3);
+        let Some(wanted) = block.txdata.first().map(bitcoin::Transaction::compute_txid) else {
+            panic!("block has no transactions");
+        };
+        ctx.add_block(BlockRecord::from_block(2, &block));
+
+        let result = proof_for(&ctx, &[wanted]);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "index path should answer from the indexed block alone: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_falls_back_to_the_scan_when_the_index_cannot_answer() {
+        let blocks = [distinct_block(1), distinct_block(2)];
+        let Some(wanted) = blocks[1]
+            .txdata
+            .first()
+            .map(bitcoin::Transaction::compute_txid)
+        else {
+            panic!("block has no transactions");
+        };
+
+        let ctx = ctx_with_height_indexer(None);
+        seed_blocks(&ctx, &blocks);
+
+        let result = proof_for(&ctx, &[wanted]);
+
+        assert!(
+            result.as_ref().is_ok_and(|value| value.as_str().is_some()),
+            "an index that cannot answer must not turn a findable proof into an error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_falls_back_when_the_indexed_block_lacks_some_wanted_txids() {
+        // The candidate block holds one wanted txid; only the second block holds
+        // both. A block chosen from a single txid is a candidate, not a verdict,
+        // so pointing the index at the wrong one must still produce the proof.
+        let both = block_with_two_txs(9);
+        let blocks = [distinct_block(1), both.clone()];
+        let wanted = both
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+
+        let scan_ctx = Arc::new(Context::new());
+        seed_blocks(&scan_ctx, &blocks);
+        let scanned =
+            proof_for(&scan_ctx, &wanted).unwrap_or_else(|err| panic!("scan path failed: {err}"));
+
+        let index_ctx = ctx_with_height_indexer(Some(0));
+        seed_blocks(&index_ctx, &blocks);
+        let fell_back = proof_for(&index_ctx, &wanted)
+            .unwrap_or_else(|err| panic!("fallback path failed: {err}"));
+
+        assert_eq!(
+            fell_back.as_str(),
+            scanned.as_str(),
+            "a candidate block missing some wanted txids must fall back to the scan"
+        );
+    }
+
+    #[test]
+    fn gettxoutproof_keeps_its_error_when_no_block_holds_every_txid() {
+        let blocks = [distinct_block(1), distinct_block(2)];
+        let wanted = blocks
+            .iter()
+            .filter_map(|block| block.txdata.first().map(bitcoin::Transaction::compute_txid))
+            .collect::<Vec<_>>();
+
+        let index_ctx = ctx_with_height_indexer(Some(0));
+        seed_blocks(&index_ctx, &blocks);
+
+        let result = proof_for(&index_ctx, &wanted);
+
+        assert!(
+            matches!(
+                result,
+                Err(RpcError::NotFound("no block contains all requested txids"))
+            ),
+            "txids spread across blocks must keep the pre-index error: {result:?}"
+        );
     }
 }
 
