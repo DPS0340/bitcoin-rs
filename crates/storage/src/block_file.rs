@@ -262,6 +262,57 @@ impl FlatFileBlockStore {
         Ok(Some(prefix))
     }
 
+    /// Loads `len` body bytes starting `offset` bytes into the body.
+    ///
+    /// `offset` is relative to the **body**, not to the record header, so a
+    /// caller holding a transaction's offset within the serialized block passes
+    /// it unchanged.
+    ///
+    /// The complete frame is validated first, exactly as [`Self::load`] does, so
+    /// a range is never served out of a record that does not belong to `height`
+    /// and `hash`. A range extending past the body's end returns `Ok(None)`
+    /// rather than a short read: a truncated transaction would decode into
+    /// something other than the transaction the caller asked for.
+    ///
+    /// Missing files, malformed frames, mismatched targets, out-of-bounds ranges
+    /// and short reads all return `Ok(None)`.
+    pub fn load_range(
+        &self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        offset: u32,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(end) = offset.checked_add(len) else {
+            return Ok(None);
+        };
+        if end > position.len {
+            return Ok(None);
+        }
+        let Some(mut file) = self.open_for_read(position.file_no)? else {
+            return Ok(None);
+        };
+        if !record_matches(&mut file, position, height, hash)? {
+            return Ok(None);
+        }
+
+        let Some(body_offset) = body_offset(position.offset) else {
+            return Ok(None);
+        };
+        let Some(range_offset) = body_offset.checked_add(u64::from(offset)) else {
+            return Ok(None);
+        };
+        let range_len = usize::try_from(len)
+            .map_err(|_| StorageError::InvalidOperation("block range length does not fit usize"))?;
+        let mut range = vec![0_u8; range_len];
+        file.seek(SeekFrom::Start(range_offset))?;
+        if !read_exact_or_none(&mut file, &mut range)? {
+            return Ok(None);
+        }
+        Ok(Some(range))
+    }
+
     /// Returns the file currently receiving appends.
     #[must_use]
     pub fn current_file_number(&self) -> u32 {
@@ -516,6 +567,82 @@ mod tests {
         assert_eq!(
             store.load_prefix(second, 2, hash(2), 4)?,
             Some(b"a lo".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_range_agrees_with_slicing_the_whole_body() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let body: Vec<u8> = (0..=255_u8).cycle().take(1_000).collect();
+        let position = store.persist(None, 9, hash(9), &body)?;
+
+        // Exhaustive over a coarse grid rather than a handful of cases: an
+        // off-by-one in the header skip shows up only at specific offsets.
+        for offset in (0_u32..1_000).step_by(37) {
+            for len in [0_u32, 1, 2, 33, 256, 999] {
+                let Some(end) = offset.checked_add(len) else {
+                    continue;
+                };
+                let ranged = store.load_range(position, 9, hash(9), offset, len)?;
+                if end > 1_000 {
+                    assert_eq!(
+                        ranged, None,
+                        "a range past the body end must not be served short"
+                    );
+                    continue;
+                }
+                let start = usize::try_from(offset).unwrap_or_default();
+                let stop = usize::try_from(end).unwrap_or_default();
+                assert_eq!(
+                    ranged.as_deref(),
+                    Some(&body[start..stop]),
+                    "load_range({offset}, {len}) diverged from slicing load()"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn load_range_refuses_a_frame_that_is_not_the_requested_block()
+    -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let position = store.persist(None, 11, hash(11), b"the original body")?;
+
+        // Same frame, wrong identity: a range must be as strongly bound to
+        // (height, hash) as a whole-body load is, or a reorged-away block could
+        // serve bytes for a height it no longer owns.
+        assert_eq!(store.load_range(position, 12, hash(11), 0, 4)?, None);
+        assert_eq!(store.load_range(position, 11, hash(12), 0, 4)?, None);
+        assert_eq!(
+            store.load_range(position, 11, hash(11), 0, 4)?,
+            Some(b"the ".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_range_rejects_out_of_bounds_and_overflowing_ranges() -> Result<(), crate::StorageError>
+    {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let position = store.persist(None, 5, hash(5), b"0123456789")?;
+
+        assert_eq!(store.load_range(position, 5, hash(5), 10, 1)?, None);
+        assert_eq!(store.load_range(position, 5, hash(5), 11, 0)?, None);
+        assert_eq!(store.load_range(position, 5, hash(5), 0, 11)?, None);
+        assert_eq!(store.load_range(position, 5, hash(5), u32::MAX, 1)?, None);
+        // The exact end of the body is in bounds.
+        assert_eq!(
+            store.load_range(position, 5, hash(5), 10, 0)?,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            store.load_range(position, 5, hash(5), 9, 1)?,
+            Some(b"9".to_vec())
         );
         Ok(())
     }

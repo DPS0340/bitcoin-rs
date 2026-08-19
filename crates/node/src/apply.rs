@@ -461,6 +461,20 @@ pub(crate) trait PruneBodyStore: Send + Sync {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError>;
 
+    /// Loads `len` body bytes starting `offset` bytes into the serialized block.
+    ///
+    /// Defaults to `Ok(None)`, meaning "this store cannot slice"; callers fall
+    /// back to [`Self::load_block_body`]. Never a short read.
+    fn load_block_body_range(
+        &self,
+        _height: u32,
+        _hash: bitcoin_rs_primitives::Hash256,
+        _offset: u32,
+        _len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+
     fn block_body_metadata(
         &self,
         height: u32,
@@ -500,6 +514,25 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
             }
         }
         Ok(Self { index, files })
+    }
+
+    /// Resolves the flat-file position of a block body, or `None` when the
+    /// block is unknown or its index row is not a decodable position.
+    ///
+    /// Every read path starts here, so it is written once rather than three
+    /// times: divergence between the whole-body, ranged, and metadata lookups
+    /// would surface as one of them silently disagreeing about which blocks
+    /// exist.
+    fn body_position(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+    ) -> Result<Option<BlockFilePosition>, StorageError> {
+        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+            return Ok(None);
+        };
+        Ok(BlockFilePosition::decode(&encoded))
     }
 }
 
@@ -551,14 +584,24 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
-            return Ok(None);
-        };
-        let Some(position) = BlockFilePosition::decode(&encoded) else {
+        let Some(position) = self.body_position(height, hash)? else {
             return Ok(None);
         };
         self.files.load(position, height, *hash.as_byte_array())
+    }
+
+    fn load_block_body_range(
+        &self,
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        offset: u32,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(position) = self.body_position(height, hash)? else {
+            return Ok(None);
+        };
+        self.files
+            .load_range(position, height, *hash.as_byte_array(), offset, len)
     }
 
     fn block_body_metadata(
@@ -566,11 +609,7 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<(usize, usize)>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
-            return Ok(None);
-        };
-        let Some(position) = BlockFilePosition::decode(&encoded) else {
+        let Some(position) = self.body_position(height, hash)? else {
             return Ok(None);
         };
         let Some(prefix) = self.files.load_prefix(
@@ -1653,6 +1692,9 @@ fn prove_window(
             .record(verify_started.elapsed().as_secs_f64());
         if verdict.is_err() {
             return Vec::new();
+        }
+        if !units.is_empty() {
+            metrics::counter!("node.window.verify_success_total").increment(1);
         }
     }
 
@@ -6162,6 +6204,7 @@ mod consensus_rule_tests {
     fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::OP_EQUAL;
+        let (recorder, metrics_handle) = crate::metrics::test_recorder();
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let prevout = bitcoin::OutPoint {
@@ -6216,7 +6259,8 @@ mod consensus_rule_tests {
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
         let (handles, block, raw) = build(100)?;
-        let proven = prove_window(&handles, &[&block], &[raw]);
+        let proven =
+            metrics::with_local_recorder(&recorder, || prove_window(&handles, &[&block], &[raw]));
         assert_eq!(
             proven.len(),
             1,
@@ -6230,6 +6274,13 @@ mod consensus_rule_tests {
             "a skipped block must carry no script proof: the proof branch bypasses the \
              trust-gate re-read at commit, so a gate that flips in between would let an \
              unverified block through"
+        );
+        assert_eq!(
+            metrics_handle
+                .snapshot()
+                .get("node.window.verify_success_total"),
+            None,
+            "an empty verification dispatch must not count as script verification",
         );
 
         // Full verification must be completely unaffected.

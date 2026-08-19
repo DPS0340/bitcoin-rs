@@ -45,6 +45,13 @@ The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically suppl
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
 
+## Benchmark campaign tooling
+
+### Native benchmark custody
+The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
+
+Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. A successful arm includes complete process and resource measurements. A demonstrated correctness failure remains a failure when the other arm has no result. Later validation recomputes the verdict from the custody artifacts and rechecks every input after the last evidence read. Custody proves internal consistency, not a cryptographic signature.
+
 ## Consensus validation
 
 ### bitcoinkernel
@@ -227,24 +234,21 @@ not one interleaved run. See
 
 ### Script-check floor
 
-The native reference baseline for script verification, calculated by
-running the exact captured input corpus through `CPubKey::Verify` from
-libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1, embedding Bitcoin Core
-31.99.0 development sources: public key parsing, lax DER parsing, signature
-normalization, and `secp256k1_ecdsa_verify`). On mainnet 0..150,000, all
-2,868,199 input checks execute exactly one `OP_CHECKSIG` and one successful
-ECDSA verification ($a = 1.0$). Native `CPubKey::Verify` execution averages
-39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs
-per check ($X$).
+The native reference baseline for script verification, calculated by running the exact captured input corpus through `CPubKey::Verify` from `libbitcoinkernel-sys 0.3.0` (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development sources: public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`). The capture pipeline uses same-open parse-stream custody to emit 24 fixed-order u64 counters and four file-bound native streams (`BRSCTX1\0` contexts, `BRSJRN1\0` journal, `BRSREC1\0` records, and 24-counter JSON).
 
-The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA
-overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI
-wrapper costs). The residual is a ceiling over non-native per-check work, not a
-promised or wholly removable gain. At 46.59% of per-check verification cost,
-this residual exceeds the 27.73% threshold required for a 5% total wall-time
-improvement (a 5.85s ceiling within the 12.55s script stage), keeping the
-non-crypto script optimization lever open. See
-`docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+On mainnet 0..150,000, all 2,868,199 input checks are ordinary legacy bare P2PKH spends that execute exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$). `eval_script_entries` equals 5,736,398 ($2 \times 2,868,199$, two evaluator passes per input check: scriptSig + scriptPubKey). All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) and all 13 complementary execution counters are zero. The strict `classify-corpus-v2` classifier evaluates the exact product predicate (`_c150_passed`), yielding `all_passed: true` and `c150_passed: true`.
+
+Authoritative C150/Cmodern certification requires file-bound binary streams, strict `mainnet-prefix-replay-v2` inputs, and exact classifier validation. The Cmodern product contract is pinned to mainnet height `709635` and block hash `00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`, selected by the recovered diagnostic candidate and independently matched against Bitcoin Core REST. This pin selects the corpus boundary; it does not certify the diagnostic run. Cmodern certification still requires a fresh file-bound replay at that exact tip, valid custody and counter arithmetic, and positive counts for all 11 context classes. Direct Core REST export can export raw blocks before replay, but live REST export cannot replace file-bound census evidence. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+
+Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - F = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
+
+Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+
+### Terminal proof
+
+A `BRSHGT1` checkpoint that binds one replay height and block hash to the committed row counts and byte endpoints of the `BRSCTX1`, `BRSREC1`, and `BRSJRN1` evidence streams. The proof is complete when every committed slice validates, all 11 Cmodern context classes have appeared, and the checkpoint height equals the last first-occurrence height. Child process exit is a separate fact. Slow chainstate teardown or a forced post-proof kill does not erase completed evidence and must not be reported as a clean exit.
+
+Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. It creates missing recovery ancestors root-to-leaf and fsyncs each parent. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; exact JSON clones must match the source size and digest, while normalized binary bodies must match their validated source bodies. Source and recovery descriptors and paths stay stable through candidate publication. A late mismatch durably removes the candidate. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
 
 ### Front-half duplication
 
@@ -266,6 +270,15 @@ A window sized by whichever of two caps binds first. A count alone is wrong wher
 
 ### Identity-bearing key
 A key that distinguishes which producer wrote a row, as opposed to one that merely locates it. The index's funding, spending, and txid keys are an 8-byte prefix plus a height, so two blocks at one height that share an output script derive identical keys, and rolling the first back a second time deletes the second's rows. The block-header row is identity-bearing because its key is the 80-byte serialized header and the block hash is the double-SHA256 of exactly those bytes. Checking it before deleting is a proxy for rekeying the other three families, taken because rekeying breaks the electrs-compatible layout and forces a reindex.
+
+### Prefix-row rescan cost
+The cost shape of every lossy-prefix index resolver: read the block once per matching row, deserialize it whole, then hash every output script in it to recover what the 8-byte prefix threw away. Measured, not asserted — `resolve_script_history` rises 63.9x for a 64x rise in funding rows and 3.6x for 4x the block bytes, so the two terms are linear and they multiply. The consequence is that per-row work is bounded by block size rather than by how many transactions actually matched, which is why an address funded at 64 heights costs 86.53 ms end-to-end against a 30 ms budget. `resolve_unspent_outputs` pays roughly double because it computes a txid for every transaction before checking any script, while `resolve_script_history` computes one only after a match. The fix is not a cheaper scan: it is carrying the matching transactions' byte positions in the row value, which is unused today, so resolution reads only those ranges and the exact-check survives untouched. See *Identity-bearing key* for what the same lossy prefix costs on the rollback side.
+
+### All-or-scan position fallback
+The invariant that lets index row values carry transaction byte positions without carrying block identity. Funding and txid keys are an 8-byte prefix plus a height, so a superseded block at the same height leaves rows whose positions point into a different block's body — and because the reader exact-checks what it decodes, the failure is a silently short result rather than an error, which is the worst shape a read path can have. Rather than pay 8 bytes per row for a block tag (measured: 0.66x on top of the 1.67x the positions already cost), the reader **falls back to a full block scan the moment any single position fails to resolve**, and trusts the position list only when every one of them matches. Stale offsets land at arbitrary points in unrelated bytes and essentially never decode to a matching transaction, so they take the fallback; an 8-byte prefix collision between two scripthashes takes it too, correctly, once per 2^64 pairs. The rule that makes this safe is that a failed position is never *skipped* — skipping one and keeping the rest is exactly how a partial result gets reported as a complete one. Accepts one residual: a stale offset landing precisely on a transaction boundary whose transaction also matches, while a different transaction in that block matches too. See *Prefix-row rescan cost* for what the positions buy and *Identity-bearing key* for the same lossy prefix on the write side.
+
+### Paired-arm benchmark
+A Criterion group holding the before and after implementations of one change over one identical fixture, so the ratio comes from a single run. Adopted because a stored baseline cannot be trusted across a rebuild, and because the before implementation is wanted anyway as the equivalence oracle — the same function serves both roles. Its second use is diagnostic: while both arms still call the same code, their spread *is* the harness noise floor, measured rather than assumed. That reading is what disqualified the 64-height `subscribe` and `get_balance` groups, whose identical arms differ by 2.0-2.4x on a laptop and therefore cannot resolve a 1.05x gate, while `get_history` held within 1%. A group that cannot resolve the gate does not get to report a win.
 
 ### Resolution-time sampling
 Recording a statistic when its outcome is known rather than when the subject arrives. The fee estimator counted a transaction against every confirmation target the moment it entered, so a fresh arrival was already a failure at every target and a burst silenced the estimator before anything had missed a deadline. It also broke the decay: the denominator had been decaying since entry while a confirmation arrived undecayed, reporting 81 successes in 100 as roughly 85%. Sampling numerator and denominator together at the moment a target resolves fixes both, because they then decay from the same block. The counterpart rule is that a subject leaving for an unrelated reason is untracked without being sampled: an eviction says something about the mempool, not about whether the transaction would have confirmed.
