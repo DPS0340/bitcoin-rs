@@ -22,6 +22,8 @@ mod checkpoint;
 mod checkpoint_fs;
 /// Layered node configuration.
 pub mod config;
+/// Block corpus manifest for contiguous archive integrity.
+pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
 /// Central synchronous event loop.

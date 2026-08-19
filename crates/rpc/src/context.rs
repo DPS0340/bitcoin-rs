@@ -54,6 +54,25 @@ pub trait BlockBodySource: Send + Sync {
     fn block_body_metadata(&self, _height: u32, _hash: Hash256) -> Option<BlockBodyMetadata> {
         None
     }
+
+    /// Returns `len` body bytes starting `offset` bytes into the serialized
+    /// block, letting a caller read one transaction without materializing the
+    /// whole body.
+    ///
+    /// Defaults to `None` so a backend that cannot slice keeps working: callers
+    /// must treat `None` as "read the whole body instead", never as "those bytes
+    /// do not exist". An out-of-range request also yields `None` rather than a
+    /// short read — a truncated transaction decodes into something other than
+    /// the one that was asked for.
+    fn block_body_range(
+        &self,
+        _height: u32,
+        _hash: Hash256,
+        _offset: u32,
+        _len: u32,
+    ) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl BlockRecord {

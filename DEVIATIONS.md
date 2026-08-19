@@ -256,6 +256,56 @@ serving remains deferred.
   Core` claim requires multi-day same-window live mainnet IBD against
   `bitcoin-rs` and `bitcoind`. Operator responsibility.
 
+## §8 — Task 8: index rows carry transaction byte positions
+
+`PLAN.md` Task 8 specifies porting electrs verbatim, and electrs writes
+`(8-byte prefix || height)` keys with **empty** values. This implementation puts
+a packed `TxPosition[n]` in that unused value: the `(offset, length)` byte range
+of every transaction that produced the row, within its block's serialized body.
+
+### Why
+
+Resolution was `O(funding rows x block size)`. `Indexer::resolve_script_history`
+loaded and fully decoded the block once per row, then SHA256-hashed every output
+script in it. Measured on synthetic fixtures, the cost rose 63.9x for 64x the
+rows and 3.6x for 4x the block bytes — the two terms are linear and they
+multiply. End-to-end, Electrum `blockchain.scripthash.get_history` cost 86.53 ms
+for an address funded at 64 heights, against a G14 budget of 30 ms.
+
+With positions the resolver reads only the named byte ranges. The block-size term
+disappears: at 8 funding heights the same call costs 8.95 µs over 250 KB blocks
+and 9.12 µs over 1 MB blocks. Full numbers, method, and mutation coverage are in
+[`docs/benchmarks/index-read-path.md`](docs/benchmarks/index-read-path.md).
+
+### What this costs
+
+Funding and `TxConfirmed` row storage goes from 12 bytes per row (key only) to
+20 (12 key + 8 value), a measured **1.67x** on those two families, uncompressed.
+Spending rows are unchanged: nothing resolves them back to transactions today.
+
+### Compatibility
+
+Keys, key ordering and row counts are untouched, so an existing index keeps
+working — a row with an empty value takes the whole-block scan path, which is the
+verbatim electrs behaviour and is retained as `*_scan`. Nothing forces a reindex;
+clearing the index directory and re-syncing is what earns the fast path.
+
+`ColumnFamily::UtxoMeta` carries an `index:format_version` marker, adopted only
+when the index is empty. A populated index without one is reported as
+`IndexFormat::Legacy` and the node logs a startup warning naming the directory to
+delete. It does not refuse to start: reads stay correct either way.
+
+### The rule that makes it safe
+
+Funding and txid keys carry no block identity, so a superseded block at the same
+height leaves rows pointing into a different block's bytes. Rather than pay 8
+more bytes per row for a block tag, the reader **falls back to a full block scan
+the moment any single position fails to resolve**, and never skips a failed
+position while keeping the rest. See the *All-or-scan position fallback* concept
+in `CONCEPTS.md`. The residual accepted: a stale offset landing exactly on a
+transaction boundary whose transaction also matches, while a different
+transaction in that block matches too.
+
 ## §9 — UTXO record payload encoding, and the arena PLAN.md specified
 
 `PLAN.md` design principle 8 specifies a `bumpalo::Bump` arena per shard for
