@@ -1046,6 +1046,51 @@ mod tests {
         assert!(record.header_bytes().is_none());
         assert!(record.header_hex().is_empty());
     }
+
+    /// Covers the record the block tree derives, which had no test at all.
+    ///
+    /// `header_record` builds its header with `try_into().ok()`, so a length that
+    /// does not fit yields `None` and the header vanishes silently — where the
+    /// old `String` field would at least have carried something. A mutation that
+    /// dropped the header from this path failed no test before this one existed.
+    #[test]
+    fn tree_derived_record_carries_the_header() {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
+
+        let ctx = Context::new();
+        let header = bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 7,
+        };
+        let hash = {
+            let mut tree = ctx.block_tree.write();
+            let id = tree
+                .insert_node(None, header, NodeStatus::Active)
+                .expect("genesis inserts");
+            tree.node(id).expect("inserted node").hash
+        };
+
+        // Nothing was pushed into `blocks`, so the record can only come from the
+        // tree.
+        let record = ctx.record_for_hash(hash).expect("tree resolves the hash");
+
+        assert_eq!(
+            record.header_bytes().map(|bytes| bytes.as_slice()),
+            Some(serialize(&header).as_slice()),
+            "the tree-derived record must carry the header the tree holds"
+        );
+        assert_eq!(
+            record.header_hex(),
+            serialize(&header).to_lower_hex_string()
+        );
+    }
     #[test]
     fn block_by_height_returns_record_after_add_block() {
         use bitcoin_rs_primitives::Hash256;
