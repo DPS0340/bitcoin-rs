@@ -15,6 +15,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 fn run_equivalence_suite<S: KvStore>(store: S) -> Result<[u8; 32], StorageError> {
     insert_rows(&store)?;
     verify_rows(&store)?;
+    verify_snapshot_multi_get(&store)?;
     verify_prefix_iteration(&store)?;
     verify_mixed_column_family_batch_ordering(&store)?;
     verify_mixed_owned_value_batch_ordering(&store)?;
@@ -154,6 +155,34 @@ fn verify_prefix_iteration(store: &impl KvStore) -> Result<(), StorageError> {
         let actual = collect_iter(store.iter_prefix(cf, PREFIX)?)?;
         assert_eq!(actual, expected);
     }
+    Ok(())
+}
+
+fn verify_snapshot_multi_get(store: &impl KvStore) -> Result<(), StorageError> {
+    const CF: ColumnFamily = ColumnFamily::BlockBodies;
+    const KEY_A: &[u8] = b"snapshot-a";
+    const KEY_B: &[u8] = b"snapshot-b";
+    const KEY_C: &[u8] = b"snapshot-c";
+    const KEY_D: &[u8] = b"snapshot-d";
+
+    let mut batch = store.new_batch();
+    batch.put(CF, KEY_A, b"value-a");
+    batch.put(CF, KEY_C, b"value-c");
+    batch.put(CF, KEY_D, b"value-d");
+    store.write(batch)?;
+
+    let snapshot = store.snapshot()?;
+    store.put(CF, KEY_A, b"changed-after-snapshot")?;
+    assert_eq!(
+        snapshot.get_many_sorted(CF, &[KEY_A, KEY_B, KEY_C, KEY_D])?,
+        vec![
+            Some(b"value-a".to_vec()),
+            None,
+            Some(b"value-c".to_vec()),
+            Some(b"value-d".to_vec()),
+        ]
+    );
+    assert!(snapshot.get_many_sorted(CF, &[KEY_B, KEY_A]).is_err());
     Ok(())
 }
 

@@ -9,7 +9,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::{BlockRecord, ChainControlError, Context};
+use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -331,7 +331,7 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     {
         total_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         total_weight = block.weight().to_wu();
-        fee_fields = compute_fee_fields(ctx, &block);
+        fee_fields = compute_fee_fields(ctx, &block).map_err(TxQueryError::into_rpc_error)?;
         txs = u64::try_from(block.txdata.len()).unwrap_or(u64::MAX);
         for tx in &block.txdata {
             ins = ins.saturating_add(u64::try_from(tx.input.len()).unwrap_or(u64::MAX));
@@ -423,83 +423,100 @@ struct FeeFields {
     totalfee: u64,
 }
 
-fn resolve_per_tx_fees(ctx: &Context, block: &bitcoin::Block) -> Option<Vec<(u64, u64)>> {
-    let indexer = ctx.indexer.as_ref()?;
+fn resolve_per_tx_fees(
+    ctx: &Context,
+    block: &bitcoin::Block,
+) -> Result<Vec<(u64, u64)>, TxQueryError> {
+    let Some(tx_index) = ctx.tx_index.as_ref() else {
+        return Err(TxQueryError::Unavailable(
+            "transaction index disabled".into(),
+        ));
+    };
     let tx_count = block.txdata.len().saturating_sub(1);
     let mut fees = Vec::with_capacity(tx_count);
     for tx in block.txdata.iter().skip(1) {
         let mut total_in = 0_u64;
         for input in &tx.input {
-            let value = indexer
-                .lock()
-                .resolve_outpoint_value(input.previous_output, ctx)
-                .ok()??;
-            total_in = total_in.saturating_add(value);
+            match tx_index.outpoint_value(&input.previous_output) {
+                Ok(Some(value)) => total_in = total_in.saturating_add(value),
+                Ok(None) => {
+                    return Err(TxQueryError::Unavailable(
+                        "input value missing from complete index".into(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         }
         let total_out = tx.output.iter().fold(0_u64, |sum, output| {
             sum.saturating_add(output.value.to_sat())
         });
-        let fee = total_in.checked_sub(total_out)?;
+        let Some(fee) = total_in.checked_sub(total_out) else {
+            return Err(TxQueryError::Unavailable("negative fee".into()));
+        };
         fees.push((fee, tx.weight().to_wu()));
     }
-    Some(fees)
+    Ok(fees)
+}
+
+fn truncated_median(scores: &mut [u64]) -> u64 {
+    if scores.is_empty() {
+        return 0;
+    }
+    scores.sort_unstable();
+    let n = scores.len();
+    if n == 1 {
+        return scores[0];
+    }
+    if n == 2 {
+        return u64::midpoint(scores[0], scores[1]);
+    }
+    let lo = n / 4;
+    let hi = n - lo;
+    let slice = &scores[lo..hi];
+    let m = slice.len();
+    if m % 2 == 1 {
+        slice[m / 2]
+    } else {
+        u64::midpoint(slice[m / 2 - 1], slice[m / 2])
+    }
 }
 
 fn percentiles_by_weight(scores: &mut [(u64, u64)], total_weight: u64) -> [u64; 5] {
-    const NUMERATORS: [u64; 5] = [1, 1, 1, 3, 9];
-    const DENOMINATORS: [u64; 5] = [10, 4, 2, 4, 10];
-
-    if scores.is_empty() || total_weight == 0 {
+    if total_weight == 0 || scores.is_empty() {
         return [0; 5];
     }
-
-    scores.sort_unstable_by(|(left_rate, left_weight), (right_rate, right_weight)| {
-        (*left_rate, *left_weight).cmp(&(*right_rate, *right_weight))
-    });
-    let mut out = [0_u64; 5];
+    scores.sort_by_key(|score| score.0);
+    let thresholds = [
+        total_weight * 10 / 100,
+        total_weight * 25 / 100,
+        total_weight * 50 / 100,
+        total_weight * 75 / 100,
+        total_weight * 90 / 100,
+    ];
+    let mut result = [0_u64; 5];
     let mut cumulative = 0_u64;
-    let mut percentile = 0_usize;
-    let mut last_rate = 0_u64;
-    for (rate, weight) in scores.iter().copied() {
-        last_rate = rate;
-        cumulative = cumulative.saturating_add(weight);
-        while percentile < out.len()
-            && u128::from(cumulative) * u128::from(DENOMINATORS[percentile])
-                >= u128::from(total_weight) * u128::from(NUMERATORS[percentile])
-        {
-            out[percentile] = rate;
-            percentile += 1;
+    let mut index = 0;
+    let n = scores.len();
+    for (i, threshold) in thresholds.iter().enumerate() {
+        while cumulative < *threshold && index < n {
+            cumulative = cumulative.saturating_add(scores[index].1);
+            index += 1;
         }
+        result[i] = if cumulative < *threshold {
+            scores[n - 1].0
+        } else if index == 0 {
+            scores[0].0
+        } else {
+            scores[index - 1].0
+        };
     }
-    while percentile < out.len() {
-        out[percentile] = last_rate;
-        percentile += 1;
-    }
-    out
+    result
 }
 
-fn truncated_median(values: &mut [u64]) -> u64 {
-    if values.is_empty() {
-        return 0;
-    }
-    values.sort_unstable();
-    let mid = values.len() / 2;
-    if values.len() % 2 == 1 {
-        return values[mid];
-    }
-    let low = values[mid - 1];
-    let high = values[mid];
-    (low / 2)
-        .saturating_add(high / 2)
-        .saturating_add((low % 2).saturating_add(high % 2) / 2)
-}
-
-fn compute_fee_fields(ctx: &Context, block: &bitcoin::Block) -> FeeFields {
-    let Some(per_tx) = resolve_per_tx_fees(ctx, block) else {
-        return FeeFields::default();
-    };
+fn compute_fee_fields(ctx: &Context, block: &bitcoin::Block) -> Result<FeeFields, TxQueryError> {
+    let per_tx = resolve_per_tx_fees(ctx, block)?;
     if per_tx.is_empty() {
-        return FeeFields::default();
+        return Ok(FeeFields::default());
     }
 
     let totalfee = per_tx
@@ -538,7 +555,7 @@ fn compute_fee_fields(ctx: &Context, block: &bitcoin::Block) -> FeeFields {
         .map_or(0, |rate| rate);
     let feerate_percentiles = percentiles_by_weight(&mut rates, total_weight);
 
-    FeeFields {
+    Ok(FeeFields {
         avgfee,
         avgfeerate,
         feerate_percentiles,
@@ -548,7 +565,7 @@ fn compute_fee_fields(ctx: &Context, block: &bitcoin::Block) -> FeeFields {
         minfee,
         minfeerate,
         totalfee,
-    }
+    })
 }
 
 /// Bitcoin block subsidy at `height` in satoshis. 50 BTC initially, halving
@@ -752,7 +769,18 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         })
     };
 
-    let txindex_entry = ctx.indexer.is_some().then(entry);
+    let txindex_entry = ctx
+        .tx_index
+        .as_ref()
+        .map(|tx_index| tx_index.index_info())
+        .transpose()?;
+    let txindex_entry = txindex_entry.map(|info| {
+        json!({
+            "synced": info.synced,
+            "best_block_height": info.best_block_height,
+        })
+    });
+
     match filter {
         None => {
             let mut indexes = sonic_rs::Object::new();
@@ -1088,11 +1116,17 @@ mod tests {
     }
 
     #[test]
-    fn compute_fee_fields_defaults_without_indexer() {
+    fn compute_fee_fields_errors_without_indexer() {
         let ctx = Context::new();
         let block = genesis_block(bitcoin::Network::Regtest);
 
-        assert_eq!(compute_fee_fields(&ctx, &block), FeeFields::default());
+        assert!(
+            matches!(
+                compute_fee_fields(&ctx, &block),
+                Err(TxQueryError::Unavailable(_))
+            ),
+            "expected error when txindex is disabled"
+        );
     }
 
     #[test]

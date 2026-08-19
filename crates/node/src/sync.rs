@@ -813,9 +813,6 @@ impl BlockSync {
             return (0, 0);
         };
         let started = Instant::now();
-        if let Some(tx_index) = &self.handles.tx_index {
-            tx_index.lock().begin_batch();
-        }
         let (drained, expected_len) = self
             .drain_cached_expected_blocks(staged_count)
             .unwrap_or_else(|| {
@@ -912,12 +909,6 @@ impl BlockSync {
             self.advance_expected_apply_cache(&applied_hashes, failed_hash.is_some());
             metrics::histogram!("node.sync.apply_buffered_blocks_seconds")
                 .record(started.elapsed().as_secs_f64());
-        }
-        #[allow(clippy::significant_drop_in_scrutinee)]
-        if let Some(tx_index) = &self.handles.tx_index {
-            if let Err(error) = tx_index.lock().end_batch() {
-                tracing::warn!(%error, "block sync: tx_index batch flush failed");
-            }
         }
         (applied, failed)
     }
@@ -1681,7 +1672,6 @@ mod tests {
     };
     use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
     use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-    use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
     use bitcoin_rs_mempool::{Mempool, MempoolLimits};
     use bitcoin_rs_p2p::{PeerInfo, PeerLease, PeerSource};
     use bitcoin_rs_primitives::Hash256;
@@ -2379,7 +2369,8 @@ mod tests {
         stage_body(&sync, &main[0]);
         assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
         stage_body(&sync, &main[0]);
-        sync.handles.block_body_store = Some(Arc::new(FailOnceBodyStore::new(1)));
+        let fail_once_store = Arc::new(FailOnceBodyStore::new(1));
+        sync.handles.block_body_store = Some(fail_once_store);
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let genesis_id = sync
@@ -6697,7 +6688,8 @@ mod tests {
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
         );
-        handles.block_body_store = Some(Arc::new(FailOnceBodyStore::new(2)));
+        let fail_once_store = Arc::new(FailOnceBodyStore::new(2));
+        handles.block_body_store = Some(fail_once_store);
         let sync = BlockSync::new(
             handles,
             peers,
@@ -7333,6 +7325,7 @@ mod tests {
                 *failed = true;
                 return Err(StorageError::backend("fail-once block body store"));
             }
+            drop(failed);
             self.persisted.lock().insert(height, body.to_vec());
             Ok(())
         }
@@ -7362,6 +7355,31 @@ mod tests {
             .collect()
     }
 
+    struct NoopFilterIndex;
+
+    impl FilterIndexLike for NoopFilterIndex {
+        fn wants_filters(&self) -> bool {
+            false
+        }
+
+        fn put_filter(
+            &self,
+            _block_hash: Hash256,
+            _prev_header: Hash256,
+            _filter_bytes: &[u8],
+        ) -> Result<Hash256, FilterIndexError> {
+            Ok(Hash256::default())
+        }
+
+        fn filter_header(&self, _block_hash: Hash256) -> Result<Option<Hash256>, FilterIndexError> {
+            Ok(None)
+        }
+
+        fn filter(&self, _block_hash: Hash256) -> Result<Option<Vec<u8>>, FilterIndexError> {
+            Ok(None)
+        }
+    }
+
     #[allow(clippy::arc_with_non_send_sync)]
     fn apply_handles(
         chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
@@ -7377,70 +7395,13 @@ mod tests {
             Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
                 bitcoin_rs_coinstats::CoinStats::default(),
             )),
-            Some(noop_tx_index()),
+            None,
             noop_filter_index(),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
-    }
-
-    struct NoopIndexer;
-
-    impl IndexerLike for NoopIndexer {
-        fn ingest_block(
-            &mut self,
-            _block: &[u8],
-            _height: u32,
-        ) -> Result<IndexRowCounts, IndexError> {
-            Ok(IndexRowCounts::default())
-        }
-
-        fn rollback_block(
-            &mut self,
-            _block: &bitcoin::Block,
-            _height: u32,
-        ) -> Result<IndexRowCounts, IndexError> {
-            Ok(IndexRowCounts::default())
-        }
-
-        fn resolve_outpoint_value(
-            &self,
-            _outpoint: bitcoin::OutPoint,
-            _source: &dyn BlockSource,
-        ) -> Result<Option<u64>, IndexError> {
-            Ok(None)
-        }
-    }
-
-    fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-        let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-        Arc::new(Mutex::new(indexer))
-    }
-
-    struct NoopFilterIndex;
-
-    impl FilterIndexLike for NoopFilterIndex {
-        fn wants_filters(&self) -> bool {
-            false
-        }
-
-        fn put_filter(
-            &self,
-            _block_hash: bitcoin_rs_primitives::Hash256,
-            _prev_header: bitcoin_rs_primitives::Hash256,
-            _filter_bytes: &[u8],
-        ) -> Result<bitcoin_rs_primitives::Hash256, FilterIndexError> {
-            Ok(bitcoin_rs_primitives::Hash256::default())
-        }
-
-        fn filter_header(
-            &self,
-            _block_hash: bitcoin_rs_primitives::Hash256,
-        ) -> Result<Option<bitcoin_rs_primitives::Hash256>, FilterIndexError> {
-            Ok(None)
-        }
     }
 
     fn noop_filter_index() -> Arc<Box<dyn FilterIndexLike>> {
