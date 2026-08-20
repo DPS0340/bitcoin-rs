@@ -10,9 +10,20 @@ confounded by the rebuild and baseline drift recorded in
 `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 
 The arms differ by whether the `Context` carries a txindex. `before_scan` is the
-pre-index path: no indexer, so the handler walks every block record, loads each
-body, deserializes it and hashes every transaction in it. `after_index` is the
-same call on the same fixture with a populated `Indexer<RocksDbStore>` attached.
+pre-index path: no `tx_index`, so the handler walks every block record, loads
+each body, deserializes it and hashes every transaction in it. `after_index` is
+the same call on the same fixture with a populated `Indexer<RocksDbStore>`
+behind a `TxIndexQuery`.
+
+That query implementation is the benchmark's, not production's: the real one is
+`TxIndexQueryEngine` in `bitcoin-rs-node`, which `crates/rpc` cannot depend on
+without a cycle. The bench's stands in for it over the *same* RocksDB index and
+the *same* flat block files, so the measured cost is a real row lookup plus a
+real body read rather than a `HashMap` hit — but it resolves through
+`Indexer::resolve_tx_with_height`, which fetches the whole candidate block where
+production reads only the bytes a stored `TxPosition` names. **The `after` arm is
+therefore slower than production**, which puts the measured win on the
+conservative side of the real one.
 
 Block bodies are served from a real `FlatFileBlockStore`, the same open /
 `fstat` / seek / read sequence production takes. Serving them from an in-memory
@@ -32,46 +43,58 @@ sharing this host was stopped first and the run waited for writeback to drain.
 
 | Shape | Arm | `first_block` | `last_block` |
 |---|---|---:|---:|
-| 2,000 blocks x 8 tx | `before_scan` | 16.366 µs | **20.824 ms** |
-| | `after_index` | 26.987 µs | **31.312 µs** |
-| | ratio | **0.61x** | **665x** |
-| 200 blocks x 500 tx | `before_scan` | 542.54 µs | **57.228 ms** |
-| | `after_index` | 701.30 µs | **700.34 µs** |
-| | ratio | **0.77x** | **81.7x** |
+| 2,000 blocks x 8 tx | `before_scan` | 46.485 µs | **75.383 ms** |
+| | `after_index` | 95.186 µs | **32.556 µs** |
+| | ratio | **0.49x** | **2,315x** |
+| 200 blocks x 500 tx | `before_scan` | 611.94 µs | **74.849 ms** |
+| | `after_index` | 834.84 µs | **780.85 µs** |
+| | ratio | **0.73x** | **95.9x** |
 
 Two positions, because the scan is position-dependent and the index is not.
 
+**These numbers replace an earlier revision's and are not comparable to it.**
+That revision was measured before this host's WSL memory allocation was cut from
+36 GB to 12 GB, and the `before_scan` arm — whose code did not change between the
+two runs — got 3.6x slower across the cut. Absolute figures here describe this
+host under that allocation; only ratios measured *within* a run mean anything,
+which is why both arms share one fixture in one process.
+
 **The index arm is slower in the scan's best case, and that is a real cost, not
-noise.** It runs 10.6 µs longer at 8 transactions per block and 158.8 µs longer
-at 500. That is what consulting an index costs — a row lookup, a ranged read and
-a txid comparison — and it does not go away, because the proof still needs the
-block loaded either way. An earlier revision of this page reported the best case
-as "within noise at 1.04x"; that was measured on a single fixture shape and was
-wrong.
+noise.** It runs 48.7 µs longer at 8 transactions per block and 222.9 µs longer
+at 500. That is what consulting an index costs — a row lookup and a candidate
+block load — and it does not go away, because the proof still needs the block
+loaded either way. Part of it is the bench's own adapter loading whole candidate
+blocks where production reads a positioned range, as noted above.
 
 What makes it acceptable is what "the scan's best case" means: the scan walks
 from height 0, so it wins only when the wanted transaction is in the *first block
 on the chain*. On any real chain that case does not arise. The case that does
-arise is the one the second column measures, where the index arm is flat at
-31 µs / 700 µs regardless of position while the scan grows without bound.
+arise is the one the second column measures, where the index arm stays inside
+33–95 µs / 780–835 µs regardless of position while the scan grows without bound.
+
+One thing this run does not explain: within the index arm, `first_block` is
+slower than `last_block` (95.2 vs 32.6 µs at 8 tx/block), which position alone
+should not cause. Whatever it is — measurement order, index cache state, prefix
+row counts — it is bounded by tens of microseconds and does not touch the
+conclusion, but it is recorded rather than smoothed over.
 
 ## Extrapolating to a real chain
 
-The scan is linear in the number of block records. Per record it costs **10.41 µs**
-at 8 transactions per block and **286.1 µs** at 500. Against the 963,124 records a
+The scan is linear in the number of block records. Per record it costs **37.69 µs**
+at 8 transactions per block and **374.2 µs** at 500. Against the 963,124 records a
 mainnet node holds at the time of writing, that brackets one `gettxoutproof` call
-at **10 seconds to 4.6 minutes** of unbounded work.
+at **36 seconds to 6 minutes** of unbounded work.
 
-The earlier revision of this page gave only the lower bound and called it a floor.
-It still is one — real blocks range from a single coinbase to a few thousand
-transactions, so neither shape is the chain — but the range is now bounded from
-above as well as below. See
+Real blocks range from a single coinbase to a few thousand transactions, so
+neither shape is the chain and neither bound is a prediction. See
 `docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`
 for why neither number should be scaled naively.
 
 Note also what the fixture cannot show: at 200-2,000 records, `Context::block_by_height`
 resolves a record by linear scan in negligible time. At 963k records that scan is
-itself O(chain), and the index arm pays it too. Fixing it is separate work.
+itself O(chain), and the index arm pays it too. That is fixed separately, by the
+binary search in `record_at_height`.
+
 ## What is not claimed
 
 - **No latency budget is touched.** `gettxoutproof` is not a G14 budget item. The
@@ -84,25 +107,38 @@ itself O(chain), and the index arm pays it too. Fixing it is separate work.
 
 ## Correctness, and how the tests were checked
 
-The scan is retained whole as `proof_from_records`: it is the fallback whenever
+The scan is retained whole as `proof_from_block_log`: it is the fallback whenever
 the index cannot answer, and the oracle the equivalence tests compare against.
-Twelve tests cover the set — nine in `crates/rpc/src/handlers/tx.rs`, three in
-`crates/index/src/index.rs`.
+Eleven tests cover the set — nine in `crates/rpc/src/handlers/tx.rs`, two in
+`crates/node/src/txindex_worker_query_tests.rs`.
 
 The tests were then audited by mutation, because a green suite proves nothing
 until it is shown to fail when the behaviour it claims to pin is removed:
 
 | Mutation | Expected | Result |
 |---|---|---|
-| `proof_via_index` always returns `None` | red | 1 test failed |
-| the all-wanted-txids guard never fires | red | the 2 predicted tests failed |
-| `resolve_transaction_height` always returns `None` | red | 2 failed; the test that pins `None` correctly stayed green |
+| a failing index decides the answer instead of falling back | red | the named test failed |
+| only one arbitrary wanted txid is probed | red | 3 tests failed |
+| a candidate block is trusted without holding every wanted txid | red | the named test failed |
+| the scan holds the block-log read lock across every body load | red | the named test failed |
+| `transaction_height` never resolves a height | red | the named test failed |
+| `transaction_height` answers the tip height without proving the transaction is there | red | the 2 predicted tests failed |
 
-Two real defects surfaced during that audit and were fixed:
+One mutation was **invalid** and is recorded as such rather than as a pass:
+replacing the index-error path's `return None` with `continue` left every test
+green, but it does not remove the property those tests name — both keep the call
+answerable from the scan, and `continue` is arguably the better behaviour. It was
+reformulated as "a failing index decides the answer", which is the property, and
+that one goes red.
 
-- The three `crates/index` tests **were not running at all**. That module is
-  `#[cfg(all(test, feature = "rocksdb"))]` and the crate's default feature set is
-  empty, so they were being filtered out while appearing to pass.
-- `resolve_transaction_height_agrees_with_the_transaction_resolver` passed
-  vacuously: both resolvers returning `None` satisfied the equality. It now pins
-  the resolved height before comparing.
+The audit also found two real coverage gaps, both fixed here:
+
+- `falls_back_when_the_indexed_block_lacks_some_wanted_txids` pinned the outcome
+  but not the mechanism. Its stub index answered the same height for every probe,
+  so "keeps probing after a failed candidate" and "gives up on the first" both
+  landed in the fallback scan, which answers either way. Counting probes
+  separates them: `keeps_probing_after_a_candidate_block_fails_verification`.
+- `falls_back_to_the_scan_when_the_index_errors` asserted only that *some* string
+  came back. It now compares against the scan's own answer, so a failing index
+  cannot decide what the answer is — and it runs over all three `TxQueryError`
+  variants rather than one.

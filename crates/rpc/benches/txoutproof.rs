@@ -5,7 +5,7 @@
 //! rebuild and baseline drift recorded in
 //! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 //!
-//! `before_scan` is the pre-index path: no indexer on the `Context`, so the
+//! `before_scan` is the pre-index path: no `tx_index` on the `Context`, so the
 //! handler walks every block record, loads each body, deserializes it and hashes
 //! every transaction in it. `after_index` is the same call on the same fixture
 //! with a populated txindex attached.
@@ -42,13 +42,14 @@ use bitcoin::{
     Amount, Block, CompactTarget, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
     Txid, Witness, absolute, block, transaction,
 };
-use bitcoin_rs_index::{Indexer, IndexerLike};
+use bitcoin_rs_index::{BlockSource, Indexer};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockBodySource, BlockRecord, Context, Handler};
+use bitcoin_rs_rpc::{
+    BlockBodySource, BlockRecord, Context, Handler, TxIndexInfo, TxIndexQuery, TxQueryError,
+};
 use bitcoin_rs_storage::RocksDbStore;
 use bitcoin_rs_storage::block_file::{BlockFilePosition, FlatFileBlockStore};
 use criterion::{Criterion, criterion_group, criterion_main};
-use parking_lot::Mutex;
 use sonic_rs::{JsonValueTrait as _, json};
 
 /// The two fixture shapes, as (blocks, transactions per block).
@@ -73,6 +74,55 @@ impl BlockBodySource for FlatFileBodySource {
     fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
         let (position, hash) = self.positions.get(&height)?;
         self.files.load(*position, height, *hash).ok()?
+    }
+}
+
+impl BlockSource for FlatFileBodySource {
+    fn block_at_height(&self, height: u32) -> Option<Block> {
+        let bytes = self.block_body(height, Hash256::from_le_bytes(&[0_u8; 32]))?;
+        bitcoin::consensus::encode::deserialize(&bytes).ok()
+    }
+}
+
+/// The `after` arm's index, wired the way production wires the real one.
+///
+/// The handler now talks to `TxIndexQuery`, whose production implementor lives
+/// in `bitcoin-rs-node` and cannot be reached from here without a dependency
+/// cycle. This stands in for it over the *same* RocksDB index and the *same*
+/// flat block files, so the measured cost is a real row lookup plus a real body
+/// read — not a `HashMap` hit, which would zero out the index's own cost and
+/// inflate the reported win.
+///
+/// One deliberate difference: `resolve_tx_with_height` fetches the whole
+/// candidate block, while the production engine reads only the bytes a stored
+/// position names. This arm is therefore *slower* than production, so the
+/// measured win is a floor rather than a claim.
+struct FixtureIndexQuery {
+    indexer: Indexer<RocksDbStore>,
+    source: Arc<FlatFileBodySource>,
+}
+
+impl TxIndexQuery for FixtureIndexQuery {
+    fn transaction(&self, _txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+        unreachable!("gettxoutproof does not materialize transactions")
+    }
+
+    fn outpoint_value(&self, _outpoint: &bitcoin::OutPoint) -> Result<Option<u64>, TxQueryError> {
+        unreachable!("gettxoutproof does not resolve prevout values")
+    }
+
+    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
+        Ok(TxIndexInfo {
+            synced: true,
+            best_block_height: 0,
+        })
+    }
+
+    fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+        self.indexer
+            .resolve_tx_with_height(*txid, self.source.as_ref())
+            .map(|found| found.map(|(_, height)| height))
+            .map_err(|error| TxQueryError::Storage(error.to_string().into()))
     }
 }
 
@@ -110,12 +160,12 @@ fn filler_tx(seed: u64) -> Transaction {
 
 struct Fixture {
     // Held for their `Drop`: the RocksDB and block-file directories must outlive
-    // the indexer and the body source.
+    // the index and the body source.
     _dir: tempfile::TempDir,
     _blocks_dir: tempfile::TempDir,
     /// Context with a populated txindex: the `after` arm.
     indexed: Arc<Context>,
-    /// Context with no indexer at all: the `before` arm.
+    /// Context with no `tx_index` at all: the `before` arm.
     scanning: Arc<Context>,
     /// Txid planted in the first fixture block — the scan's best case.
     first_txid: Txid,
@@ -186,9 +236,8 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
         scanning.add_block(record.clone());
     }
 
-    let mut indexed_ctx = Context::new().with_block_body_source(source as Arc<_>);
-    let boxed: Box<dyn IndexerLike> = Box::new(indexer);
-    indexed_ctx.indexer = Some(Arc::new(Mutex::new(boxed)));
+    let mut indexed_ctx = Context::new().with_block_body_source(Arc::clone(&source) as Arc<_>);
+    indexed_ctx.tx_index = Some(Arc::new(FixtureIndexQuery { indexer, source }));
     let indexed = Arc::new(indexed_ctx);
     for record in records {
         indexed.add_block(record);
