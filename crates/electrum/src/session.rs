@@ -139,10 +139,8 @@ impl SessionState {
         match request.method.as_str() {
             "blockchain.scripthash.subscribe" => {
                 let scripthash = parse_scripthash_param(&request.params)?;
-                let value =
-                    self.subscriptions
-                        .subscribe_scripthash(&self.index, &self.mempool, scripthash);
-                Ok(value)
+                self.subscriptions
+                    .subscribe_scripthash(&self.index, &self.mempool, scripthash)
             }
             "blockchain.headers.subscribe" => {
                 self.subscriptions.subscribe_headers(result.clone());

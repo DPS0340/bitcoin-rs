@@ -11,13 +11,12 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::{BlockRecord, ChainControl, ChainControlError, Context, Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
 #[test]
@@ -163,7 +162,8 @@ fn invalidateblock_delegates_to_node_control_and_returns_null() -> Result<(), Rp
 }
 
 #[test]
-fn invalidateblock_maps_unknown_block_to_core_not_found() {
+fn invalidateblock_maps_unknown_block_to_core_not_found() -> Result<(), Box<dyn std::error::Error>>
+{
     let ctx = Context::new().with_chain_control(Arc::new(RecordingChainControl {
         called: Arc::new(AtomicBool::new(false)),
         result: Err(ChainControlError::UnknownBlock),
@@ -173,8 +173,10 @@ fn invalidateblock_maps_unknown_block_to_core_not_found() {
 
     let error = handler
         .dispatch("invalidateblock", &json!([hash]))
-        .expect_err("unknown block must fail");
+        .err()
+        .ok_or_else(|| std::io::Error::other("unknown block unexpectedly succeeded"))?;
     assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+    Ok(())
 }
 
 #[test]
@@ -392,10 +394,13 @@ fn getindexinfo_returns_available_indexes() -> Result<(), Box<dyn std::error::Er
 fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut ctx = Context::new();
-    let indexer: Box<dyn IndexerLike> = Box::new(FakeIndexer {
+    ctx.tx_index = Some(Arc::new(FakeTxIndex {
         values: HashMap::new(),
-    });
-    ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        info: bitcoin_rs_rpc::TxIndexInfo {
+            synced: false,
+            best_block_height: 0,
+        },
+    }));
     let handler = Handler::new(Arc::new(ctx));
 
     let result = handler.dispatch("getindexinfo", &json!(["txindex"]))?;
@@ -408,14 +413,15 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
 }
 
 #[test]
-fn getblockstats_fee_fields_are_zero_without_indexer() -> Result<(), Box<dyn std::error::Error>> {
+fn getblockstats_errors_without_indexer() {
     let (ctx, _low_tx, _high_tx) = fee_stats_context(None);
     let handler = Handler::new(ctx);
 
-    let result = handler.dispatch("getblockstats", &json!([7]))?;
-
-    assert_fee_fields_zero(&result)?;
-    Ok(())
+    let result = handler.dispatch("getblockstats", &json!([7]));
+    assert!(
+        matches!(result, Err(RpcError::Internal(_))),
+        "expected unavailable index to be an explicit error, got {result:?}"
+    );
 }
 
 #[test]
@@ -451,17 +457,17 @@ fn getblockstats_uses_indexer_for_fee_fields() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn getblockstats_fee_fields_are_all_zero_when_any_prevout_missing()
--> Result<(), Box<dyn std::error::Error>> {
+fn getblockstats_errors_when_any_prevout_missing() {
     let mut values = HashMap::new();
     values.insert(outpoint(21), 10_000);
     let (ctx, _low_tx, _high_tx) = fee_stats_context(Some(values));
     let handler = Handler::new(ctx);
 
-    let result = handler.dispatch("getblockstats", &json!([7]))?;
-
-    assert_fee_fields_zero(&result)?;
-    Ok(())
+    let result = handler.dispatch("getblockstats", &json!([7]));
+    assert!(
+        matches!(result, Err(RpcError::Internal(_))),
+        "expected incomplete fee inputs to be an explicit error, got {result:?}"
+    );
 }
 
 #[test]
@@ -590,21 +596,28 @@ impl FilterIndexLike for StaticFilterIndex {
     }
 }
 
-struct FakeIndexer {
+struct FakeTxIndex {
     values: HashMap<OutPoint, u64>,
+    info: bitcoin_rs_rpc::TxIndexInfo,
 }
 
-impl IndexerLike for FakeIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
+impl bitcoin_rs_rpc::TxIndexQuery for FakeTxIndex {
+    fn transaction(
+        &self,
+        _txid: &Txid,
+    ) -> Result<Option<Transaction>, bitcoin_rs_rpc::TxQueryError> {
+        Ok(None)
     }
 
-    fn resolve_outpoint_value(
+    fn outpoint_value(
         &self,
-        outpoint: OutPoint,
-        _source: &dyn BlockSource,
-    ) -> Result<Option<u64>, IndexError> {
-        Ok(self.values.get(&outpoint).copied())
+        outpoint: &OutPoint,
+    ) -> Result<Option<u64>, bitcoin_rs_rpc::TxQueryError> {
+        Ok(self.values.get(outpoint).copied())
+    }
+
+    fn index_info(&self) -> Result<bitcoin_rs_rpc::TxIndexInfo, bitcoin_rs_rpc::TxQueryError> {
+        Ok(self.info)
     }
 }
 
@@ -617,8 +630,13 @@ fn fee_stats_context(
     let block = fee_block(low_tx.clone(), high_tx.clone());
     let mut ctx = Context::new();
     if let Some(values) = values {
-        let indexer: Box<dyn IndexerLike> = Box::new(FakeIndexer { values });
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        ctx.tx_index = Some(Arc::new(FakeTxIndex {
+            values,
+            info: bitcoin_rs_rpc::TxIndexInfo {
+                synced: true,
+                best_block_height: 7,
+            },
+        }));
     }
     ctx.add_block(BlockRecord::from_block(7, &block));
     (Arc::new(ctx), low_tx, high_tx)
@@ -678,22 +696,6 @@ fn fee_tx(label: u8, output_sat: u64) -> Transaction {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     }
-}
-
-fn assert_fee_fields_zero(value: &sonic_rs::Value) -> Result<(), Box<dyn std::error::Error>> {
-    for field in [
-        "avgfee",
-        "avgfeerate",
-        "maxfee",
-        "maxfeerate",
-        "medianfee",
-        "minfee",
-        "minfeerate",
-        "totalfee",
-    ] {
-        assert_eq!(value.get(field).as_u64(), Some(0), "{field} must be zero");
-    }
-    assert_percentiles(value, &[0, 0, 0, 0, 0])
 }
 
 fn assert_percentiles(
@@ -764,6 +766,15 @@ impl Fixture {
             hash: block_hash,
         });
         ctx.add_block(BlockRecord::from_block(7, &block));
+        let mut values = HashMap::new();
+        values.insert(outpoint(1), 6_000);
+        ctx.tx_index = Some(Arc::new(FakeTxIndex {
+            values,
+            info: bitcoin_rs_rpc::TxIndexInfo {
+                synced: true,
+                best_block_height: 7,
+            },
+        }));
         let txid = ctx.add_transaction(tx.clone());
         let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7);
         ctx.mempool.write().insert_entry(entry)?;
