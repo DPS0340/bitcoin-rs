@@ -3,7 +3,7 @@ use std::path::Path;
 use bytes::Bytes;
 use rust_rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Direction, IteratorMode,
-    Options, ReadOptions, WriteBatch as RocksWriteBatch,
+    Options, ReadOptions, WriteBatch as RocksWriteBatch, WriteOptions,
 };
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
@@ -11,6 +11,7 @@ use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
 const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const BLOCK_CACHE_SIZE: usize = 256 * 1024 * 1024;
 const BLOOM_BITS_PER_KEY: f64 = 10.0;
+const WRITE_BUFFER_SIZE: usize = 128 << 20;
 
 /// `RocksDB`-backed key-value store.
 pub struct RocksDbStore {
@@ -24,7 +25,7 @@ impl RocksDbStore {
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
         db_options.set_compression_type(DBCompressionType::Lz4);
-        db_options.set_atomic_flush(true);
+        db_options.set_atomic_flush(false);
 
         let mut table_options = BlockBasedOptions::default();
         table_options.set_block_size(BLOCK_SIZE);
@@ -34,6 +35,7 @@ impl RocksDbStore {
 
         let mut cf_options = Options::default();
         cf_options.set_compression_type(DBCompressionType::Lz4);
+        cf_options.set_write_buffer_size(WRITE_BUFFER_SIZE);
         cf_options.set_block_based_table_factory(&table_options);
 
         let descriptors = ColumnFamily::ALL
@@ -49,6 +51,30 @@ impl RocksDbStore {
         self.db
             .cf_handle(cf.name())
             .ok_or(StorageError::UnknownColumnFamily(cf))
+    }
+
+    /// Translates a portable [`RocksDbWriteBatch`] into a native `RocksDB` write batch.
+    fn rocks_batch(&self, batch: RocksDbWriteBatch) -> Result<RocksWriteBatch, StorageError> {
+        let mut rocks_batch = RocksWriteBatch::default();
+        let mut handles = [None; ColumnFamily::ALL.len()];
+        for op in batch.ops {
+            match op {
+                BatchOp::Put { cf, key, value } => {
+                    rocks_batch.put_cf(cached_cf_handle(self, &mut handles, cf)?, key, value);
+                }
+                BatchOp::Delete { cf, key } => {
+                    rocks_batch.delete_cf(cached_cf_handle(self, &mut handles, cf)?, key);
+                }
+                BatchOp::DeleteRange { cf, start, end } => {
+                    rocks_batch.delete_range_cf(
+                        cached_cf_handle(self, &mut handles, cf)?,
+                        start,
+                        end,
+                    );
+                }
+            }
+        }
+        Ok(rocks_batch)
     }
 }
 
@@ -97,30 +123,21 @@ impl KvStore for RocksDbStore {
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
-        let mut rocks_batch = RocksWriteBatch::default();
-        let mut handles = [None; ColumnFamily::ALL.len()];
-        for op in batch.ops {
-            match op {
-                BatchOp::Put { cf, key, value } => {
-                    rocks_batch.put_cf(cached_cf_handle(self, &mut handles, cf)?, key, value);
-                }
-                BatchOp::Delete { cf, key } => {
-                    rocks_batch.delete_cf(cached_cf_handle(self, &mut handles, cf)?, key);
-                }
-                BatchOp::DeleteRange { cf, start, end } => {
-                    rocks_batch.delete_range_cf(
-                        cached_cf_handle(self, &mut handles, cf)?,
-                        start,
-                        end,
-                    );
-                }
-            }
-        }
+        let rocks_batch = self.rocks_batch(batch)?;
         self.db.write(&rocks_batch).map_err(StorageError::backend)
     }
 
+    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let rocks_batch = self.rocks_batch(batch)?;
+        let mut write_options = WriteOptions::default();
+        write_options.set_sync(true);
+        self.db
+            .write_opt(&rocks_batch, &write_options)
+            .map_err(StorageError::backend)
+    }
+
     fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().map_err(StorageError::backend)
+        self.db.flush_wal(true).map_err(StorageError::backend)
     }
 
     fn snapshot(&self) -> Result<Box<dyn KvSnapshot + '_>, StorageError> {
@@ -207,6 +224,36 @@ impl KvSnapshot for RocksDbSnapshot<'_> {
         self.snapshot
             .get_cf(self.db.cf_handle(cf)?, key)
             .map_err(StorageError::backend)
+    }
+
+    fn get_many_sorted(
+        &self,
+        cf: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StorageError> {
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(StorageError::InvalidOperation(
+                "snapshot batch keys are not strictly ascending",
+            ));
+        }
+
+        let mut read_options = ReadOptions::default();
+        read_options.set_snapshot(&self.snapshot);
+        self.db
+            .db
+            .batched_multi_get_cf_slice_opt(
+                self.db.cf_handle(cf)?,
+                keys.iter().copied(),
+                true,
+                &read_options,
+            )
+            .into_iter()
+            .map(|result| {
+                result
+                    .map(|value| value.map(|pinned| pinned.as_ref().to_vec()))
+                    .map_err(StorageError::backend)
+            })
+            .collect()
     }
 
     fn iter_prefix<'a>(

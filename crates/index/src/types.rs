@@ -307,22 +307,20 @@ impl TxPosition {
 ///
 /// # Staleness
 ///
-/// Funding and txid keys are an 8-byte prefix plus a height and carry no block
-/// identity, so a replacement block at the same height derives the same keys
-/// (see the *Identity-bearing key* concept). A row left behind by a superseded
-/// block therefore points into a different block's body.
+/// The value does not carry block identity. The durable index supplies that
+/// identity by committing every row change with an exact full-hash watermark.
+/// The single writer rolls rows back before it writes a replacement block, and
+/// snapshot queries accept rows only while that watermark equals the applied
+/// tip and the revision and tip stay unchanged. In that valid state, positions
+/// belong to the canonical block hash used for the read.
 ///
-/// The value carries no block tag to detect that. Instead **the reader must
-/// fall back to a full block scan the moment any single position fails to
-/// resolve to a transaction matching what it is looking for.** Stale offsets
-/// land at arbitrary points in a different block's bytes and essentially never
-/// decode to a matching transaction, so they trigger the fallback. The same
-/// fallback fires on an 8-byte prefix collision between two distinct
-/// scripthashes, which is correct and costs a scan once per 2^64 pairs.
-///
-/// This is the one invariant that keeps a partial result from being reported as
-/// a complete one. A reader that skips a failed position and keeps the rest
-/// silently under-reports history.
+/// Readers still validate the complete position list before I/O and exact-check
+/// every decoded transaction. If one position is malformed, unavailable, or
+/// does not match the requested transaction or script, the reader must discard
+/// all tentative results for that row and scan the full block. It must never
+/// skip one position and keep the rest. A stale row under an accepted watermark
+/// means manual mutation, broken backend atomicity, or storage corruption; it is
+/// outside the valid index-state contract.
 pub struct TxPositionValue;
 
 impl TxPositionValue {

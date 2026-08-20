@@ -59,16 +59,16 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
             return super::tx_render::tx_to_value(tx);
         }
     }
-    if let Some(indexer) = &ctx.indexer {
-        let tx = indexer
-            .lock()
-            .resolve_transaction(txid, ctx.as_ref())
-            .map_err(|error| RpcError::Internal(format!("txindex lookup failed: {error}")))?;
-        if let Some(tx) = tx {
-            if !verbose {
-                return Ok(json!(serialize(&tx).to_lower_hex_string()));
+    if let Some(tx_index) = ctx.tx_index.as_ref() {
+        match tx_index.transaction(&txid) {
+            Ok(Some(tx)) => {
+                if !verbose {
+                    return Ok(json!(serialize(&tx).to_lower_hex_string()));
+                }
+                return super::tx_render::tx_to_value(&tx);
             }
-            return super::tx_render::tx_to_value(&tx);
+            Ok(None) => {}
+            Err(error) => return Err(error.into_rpc_error()),
         }
     }
     Err(RpcError::NotFound("transaction not found"))
@@ -280,21 +280,22 @@ fn parse_txid(value: &str) -> Result<Txid, RpcError> {
 mod tests {
     use alloc::sync::Arc;
 
-    use bitcoin::Txid;
-    use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::hex::DisplayHex as _;
-    use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
+    use bitcoin::{OutPoint, Txid};
     use bitcoin_rs_mempool::MempoolEntry;
     use bitcoin_rs_primitives::Hash256;
-    use parking_lot::Mutex;
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
     use super::getrawtransaction;
     use crate::Handler;
-    use crate::context::{BlockRecord, Context};
+    use crate::context::{BlockRecord, Context, TxIndexQuery, TxQueryError};
     use crate::error::RpcError;
+
+    fn genesis_block(network: bitcoin::Network) -> bitcoin::Block {
+        bitcoin::blockdata::constants::genesis_block(network)
+    }
 
     #[test]
     fn getrawtransaction_falls_back_to_mempool_for_unconfirmed()
@@ -325,37 +326,30 @@ mod tests {
     #[test]
     fn getrawtransaction_checks_mempool_before_failing_txindex()
     -> Result<(), Box<dyn std::error::Error>> {
-        struct FailingIndexer;
+        struct FailingQuery;
 
-        impl IndexerLike for FailingIndexer {
-            fn ingest_block(
-                &mut self,
-                _block: &[u8],
-                _height: u32,
-            ) -> Result<IndexRowCounts, IndexError> {
-                Ok(IndexRowCounts::default())
+        impl TxIndexQuery for FailingQuery {
+            fn transaction(
+                &self,
+                _txid: &Txid,
+            ) -> Result<Option<bitcoin::Transaction>, TxQueryError> {
+                Err(TxQueryError::Storage("disk full".into()))
             }
 
-            fn resolve_transaction(
-                &self,
-                _txid: Txid,
-                _source: &dyn BlockSource,
-            ) -> Result<Option<bitcoin::Transaction>, IndexError> {
-                Err(IndexError::InvalidHeaderLength { len: 0 })
-            }
-
-            fn resolve_outpoint_value(
-                &self,
-                _outpoint: bitcoin::OutPoint,
-                _source: &dyn BlockSource,
-            ) -> Result<Option<u64>, IndexError> {
+            fn outpoint_value(&self, _outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
                 Ok(None)
+            }
+
+            fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
+                Ok(crate::context::TxIndexInfo {
+                    synced: false,
+                    best_block_height: 0,
+                })
             }
         }
 
         let mut ctx = Context::new();
-        let indexer: Box<dyn IndexerLike> = Box::new(FailingIndexer);
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        ctx.tx_index = Some(Arc::new(FailingQuery));
         let ctx = Arc::new(ctx);
         let genesis = genesis_block(bitcoin::Network::Regtest);
         let coinbase = genesis
@@ -402,33 +396,27 @@ mod tests {
 
     #[test]
     fn getrawtransaction_resolves_confirmed_transaction_from_txindex_without_cache() {
-        struct StaticIndexer {
+        struct StaticQuery {
             tx: bitcoin::Transaction,
         }
 
-        impl IndexerLike for StaticIndexer {
-            fn ingest_block(
-                &mut self,
-                _block: &[u8],
-                _height: u32,
-            ) -> Result<IndexRowCounts, IndexError> {
-                Ok(IndexRowCounts::default())
+        impl TxIndexQuery for StaticQuery {
+            fn transaction(
+                &self,
+                txid: &Txid,
+            ) -> Result<Option<bitcoin::Transaction>, TxQueryError> {
+                Ok((self.tx.compute_txid() == *txid).then(|| self.tx.clone()))
             }
 
-            fn resolve_transaction(
-                &self,
-                txid: Txid,
-                _source: &dyn BlockSource,
-            ) -> Result<Option<bitcoin::Transaction>, IndexError> {
-                Ok((self.tx.compute_txid() == txid).then(|| self.tx.clone()))
-            }
-
-            fn resolve_outpoint_value(
-                &self,
-                _outpoint: bitcoin::OutPoint,
-                _source: &dyn BlockSource,
-            ) -> Result<Option<u64>, IndexError> {
+            fn outpoint_value(&self, _outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
                 Ok(None)
+            }
+
+            fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
+                Ok(crate::context::TxIndexInfo {
+                    synced: true,
+                    best_block_height: 1,
+                })
             }
         }
 
@@ -438,10 +426,9 @@ mod tests {
         };
         let txid = coinbase.compute_txid();
         let mut ctx = Context::new();
-        let indexer: Box<dyn IndexerLike> = Box::new(StaticIndexer {
+        ctx.tx_index = Some(Arc::new(StaticQuery {
             tx: coinbase.clone(),
-        });
-        ctx.indexer = Some(Arc::new(Mutex::new(indexer)));
+        }));
         let ctx = Arc::new(ctx);
 
         assert!(

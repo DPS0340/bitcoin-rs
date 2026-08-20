@@ -32,6 +32,48 @@ impl FjallStore {
             .get(cf.index())
             .ok_or(StorageError::UnknownColumnFamily(cf))
     }
+
+    fn write_with_durability(
+        &self,
+        batch: FjallWriteBatch,
+        durability: Option<PersistMode>,
+    ) -> Result<(), StorageError> {
+        let mut fjall_batch = self.db.batch();
+        if let Some(durability) = durability {
+            fjall_batch = fjall_batch.durability(Some(durability));
+        }
+        let mut keyspaces = [None; ColumnFamily::ALL.len()];
+        for op in batch.ops {
+            match op {
+                BatchOp::Put { cf, key, value } => {
+                    fjall_batch.insert(
+                        cached_keyspace(self, &mut keyspaces, cf)?,
+                        key,
+                        value.as_ref(),
+                    );
+                }
+                BatchOp::Delete { cf, key } => {
+                    fjall_batch.remove(cached_keyspace(self, &mut keyspaces, cf)?, key);
+                }
+                BatchOp::DeleteRange { cf, start, end } => {
+                    let keyspace = cached_keyspace(self, &mut keyspaces, cf)?;
+                    let keys = keyspace
+                        .range(start..end)
+                        .map(|guard| {
+                            guard
+                                .key()
+                                .map(|key| key.to_vec())
+                                .map_err(StorageError::backend)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for key in keys {
+                        fjall_batch.remove(keyspace, key);
+                    }
+                }
+            }
+        }
+        fjall_batch.commit().map_err(StorageError::backend)
+    }
 }
 
 impl KvStore for FjallStore {
@@ -69,38 +111,11 @@ impl KvStore for FjallStore {
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
-        let mut fjall_batch = self.db.batch();
-        let mut keyspaces = [None; ColumnFamily::ALL.len()];
-        for op in batch.ops {
-            match op {
-                BatchOp::Put { cf, key, value } => {
-                    fjall_batch.insert(
-                        cached_keyspace(self, &mut keyspaces, cf)?,
-                        key,
-                        value.as_ref(),
-                    );
-                }
-                BatchOp::Delete { cf, key } => {
-                    fjall_batch.remove(cached_keyspace(self, &mut keyspaces, cf)?, key);
-                }
-                BatchOp::DeleteRange { cf, start, end } => {
-                    let keyspace = cached_keyspace(self, &mut keyspaces, cf)?;
-                    let keys = keyspace
-                        .range(start..end)
-                        .map(|guard| {
-                            guard
-                                .key()
-                                .map(|key| key.to_vec())
-                                .map_err(StorageError::backend)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    for key in keys {
-                        fjall_batch.remove(keyspace, key);
-                    }
-                }
-            }
-        }
-        fjall_batch.commit().map_err(StorageError::backend)
+        self.write_with_durability(batch, None)
+    }
+
+    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Some(PersistMode::SyncAll))
     }
 
     fn flush(&self) -> Result<(), StorageError> {

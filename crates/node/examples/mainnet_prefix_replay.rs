@@ -36,6 +36,8 @@ use sha2::{Digest as _, Sha256};
 /// maximum block weight (BIP 141). No valid serialized block can be larger.
 #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
 const MAX_SERIALIZED_BLOCK_SIZE: u32 = Weight::MAX_BLOCK.to_wu() as u32;
+const TXINDEX_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const TXINDEX_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A reader that hashes every byte it yields.
 ///
@@ -387,6 +389,11 @@ fn main() -> Result<()> {
         file_inputs.as_ref().map(|inputs| &inputs.manifest),
         &apply_handles,
     )?;
+    let txindex_catchup = if args.txindex {
+        Some(wait_for_txindex(&state)?)
+    } else {
+        None
+    };
     // The full UTXO scan is opt-in and starts after the internal replay timer.
     // Performance custody runs must omit it because process wall and CPU still
     // include the scan; separate validation runs pass this option.
@@ -398,8 +405,14 @@ fn main() -> Result<()> {
             totals.stop_hash.as_deref(),
         )?;
     }
-    let artifact =
-        build_replay_artifact(&args, &state, file_inputs.as_ref(), &totals, metrics_handle)?;
+    let artifact = build_replay_artifact(
+        &args,
+        &state,
+        file_inputs.as_ref(),
+        &totals,
+        txindex_catchup,
+        metrics_handle,
+    )?;
     let rendered = serde_json::to_string_pretty(&artifact).context("render artifact JSON")?;
     if let Some(output) = args.output {
         std::fs::write(&output, rendered + "\n")
@@ -416,6 +429,8 @@ struct ArtifactMetrics {
     window_verify_success_total: u64,
     stage_seconds: Vec<serde_json::Value>,
     rss_high_water_bytes: Option<u64>,
+    txindex_worker_catchup_seconds: Option<f64>,
+    txindex_total_elapsed_seconds: Option<f64>,
 }
 
 fn build_replay_artifact(
@@ -423,6 +438,7 @@ fn build_replay_artifact(
     state: &NodeState,
     file_inputs: Option<&FileInputs>,
     totals: &ReplayTotals,
+    txindex_catchup: Option<Duration>,
     metrics_handle: Option<bitcoin_rs_node::metrics::MetricsHandle>,
 ) -> Result<serde_json::Value> {
     let snapshot = metrics_handle
@@ -438,6 +454,9 @@ fn build_replay_artifact(
         window_verify_success_total: counter_value(&snapshot, "node.window.verify_success_total"),
         stage_seconds: stage_decomposition(metrics_handle),
         rss_high_water_bytes: rss_high_water_bytes(),
+        txindex_worker_catchup_seconds: txindex_catchup.map(|elapsed| elapsed.as_secs_f64()),
+        txindex_total_elapsed_seconds: txindex_catchup
+            .map(|catchup| totals.elapsed.saturating_add(catchup).as_secs_f64()),
     };
     let Some(inputs) = file_inputs else {
         return Ok(legacy_replay_artifact(args, totals, &metrics));
@@ -506,6 +525,8 @@ fn file_replay_artifact(
         "decode_seconds": totals.decode_time.as_secs_f64(),
         "stage_seconds": &metrics.stage_seconds,
         "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "txindex_worker_catchup_seconds": metrics.txindex_worker_catchup_seconds,
+        "txindex_total_elapsed_seconds": metrics.txindex_total_elapsed_seconds,
         "block_source": "file",
         "data_dir": &args.data_dir,
     })
@@ -543,6 +564,8 @@ fn legacy_replay_artifact(
         "decode_seconds": totals.decode_time.as_secs_f64(),
         "stage_seconds": &metrics.stage_seconds,
         "rss_high_water_bytes": metrics.rss_high_water_bytes,
+        "txindex_worker_catchup_seconds": metrics.txindex_worker_catchup_seconds,
+        "txindex_total_elapsed_seconds": metrics.txindex_total_elapsed_seconds,
         "bitcoin_cli": &args.bitcoin_cli,
         "bitcoin_cli_args": &args.bitcoin_cli_args,
         "block_source": block_source,
@@ -1384,6 +1407,36 @@ fn update_prev_checkpoint(
     *prev = Some(next);
     Ok(())
 }
+
+fn wait_for_txindex(state: &NodeState) -> Result<Duration> {
+    let query = state
+        .tx_index_query()
+        .context("txindex query missing while --txindex is enabled")?;
+    let started = Instant::now();
+    let mut last_height = None;
+    let mut last_progress = Instant::now();
+
+    loop {
+        let info = query
+            .index_info()
+            .map_err(|error| anyhow::anyhow!("txindex catch-up failed: {error}"))?;
+        if info.synced {
+            return Ok(started.elapsed());
+        }
+        if last_height != Some(info.best_block_height) {
+            last_height = Some(info.best_block_height);
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= TXINDEX_NO_PROGRESS_TIMEOUT {
+            bail!(
+                "txindex made no progress for {} seconds at height {}",
+                TXINDEX_NO_PROGRESS_TIMEOUT.as_secs(),
+                info.best_block_height
+            );
+        }
+        std::thread::sleep(TXINDEX_POLL_INTERVAL);
+    }
+}
+
 fn print_usage() {
     println!(
         "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex] [--blockfilterindex]"
