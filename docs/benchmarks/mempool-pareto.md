@@ -55,29 +55,62 @@ silently vanish from the priority index. Entry ids are unique, so no two distinc
 entries can compare equal. `entries_with_identical_priority_fields_are_all_retained`
 pins it.
 
-## The quadratic is not closed by this change
+## Closing the outer quadratic
 
-`Mempool::insert_entry` is still superlinear, because `recompute_all_metadata`
-walks every entry on every insert regardless of how fast the index is:
+Replacing the index was not enough. `Mempool::insert_entry` called
+`recompute_all_metadata`, which walked every entry on every insert, and then
+consulted `total_vsize()`, which folded every entry again. With the index fixed
+and nothing else changed, `insert_entry` still measured an exponent of **2.17**.
 
-| Transactions | fill | per transaction |
-|---:|---:|---:|
-| 200 | 2.572 ms | 12.9 µs |
-| 800 | 51.27 ms | 64.1 µs |
-| 3,200 | **1.057 s** | **330 µs** |
+Two further changes removed both terms:
 
-That is a measured exponent of **2.17** across the span, *with this change
-already applied*. Extrapolating to a Core-default mempool (`-maxmempool=300MB`,
-on the order of 10^5 transactions) puts a full fill around **30 minutes**.
+**The metadata refresh is incremental.** Linking one transaction into the spend
+graph changes package totals for its transitive ancestors, itself, and its
+transitive descendants — and nothing else. An entry `x` outside that set gains no
+new ancestor, because `x` is not a descendant of the seed; and gains no new
+descendant, because every new path runs through the seed, which would put `x`
+among its ancestors. So `insert_entry` and `remove_entries` now recompute exactly
+that closure. Its size is bounded by the ancestor and descendant *policy* limits
+— 25 each by default — not by the number of entries in the pool.
 
-So this change removes one quadratic term and leaves the outer one. It is
-reported here rather than claimed as fixed. The follow-up is to make
-`recompute_all_metadata` incremental: inserting one transaction changes only its
-own ancestor totals — which `insert_entry` already computes at lines 153-165 and
-then throws away — and the `descendant_size`/`descendant_fee` of its ancestors,
-which are bounded by the ancestor-count policy limit. Note that an ancestor's
-*ancestor* fee rate does not change when a child arrives, so the priority keys of
-existing entries do not need reindexing at all.
+The closure is taken *after* the entry enters the spend indexes on an insertion,
+because a transaction can arrive after something that already spends its outputs;
+and *before* the removal on a removal, because a removed entry's ancestors cannot
+be walked once it is gone.
+
+**`total_vsize` and `aggregate_fees` are running sums.** Both were folds over the
+whole pool. `insert_entry` consults `total_vsize()` on every acceptance to decide
+whether the pool is over its size limit, so that fold alone made insertion
+quadratic. They are now maintained by the mutation methods and guarded by
+`debug_assert`s against the folds they replaced.
+
+| Transactions | before | after | ratio | per transaction, after |
+|---:|---:|---:|---:|---:|
+| 200 | 2.572 ms | 373.0 µs | **6.9x** | 1.87 µs |
+| 800 | 51.27 ms | 1.760 ms | **29.1x** | 2.20 µs |
+| 3,200 | 1.057 s | 7.079 ms | **149.3x** | 2.21 µs |
+| 12,800 | *not measurable* | 37.87 ms | — | 2.96 µs |
+| 51,200 | *not measurable* | **211.5 ms** | — | **4.13 µs** |
+
+The last two sizes could not be measured before: at an exponent of 2.17, 51,200
+transactions would have taken around seven minutes per sample. The per-transaction
+cost is now nearly flat — 1.87 µs to 4.13 µs across 256x the entries — and the
+measured exponent over the final leg is **1.24**, which is `n log n` for the fill
+and therefore about `O(log n)` per accepted transaction.
+
+Extrapolating from 51,200 to a Core-default mempool (~10^5 transactions) puts a
+full fill near **half a second**, against the ~30 minutes the previous revision of
+this page projected.
+
+## A defect fixed on the way
+
+`prioritise` applied its fee delta to each descendant's `ancestor_fee` by hand and
+then never reindexed those descendants, so a descendant kept the priority key it
+had before its ancestor was bumped. Since `prioritisetransaction` exists to move
+transactions in the miner's template, leaving descendants ranked on the pre-bump
+figure defeated it for exactly the packages it was aimed at. The three hand-applied
+delta loops are now one call to the same refresh an insertion does, which both
+fixes the staleness and deletes the duplicate accounting.
 
 ## Correctness, and how the tests were checked
 
@@ -88,6 +121,11 @@ equivalence tests compare the *whole* index rather than a prefix — a `top_n(10
 check passes while everything below the tenth entry is misordered, and
 `mining::policy` reads the whole index via `top_n(len())`.
 
+The incremental refresh is checked the same way: `recompute_all_metadata` is kept
+under `cfg(test)` as the oracle. Nothing in the pool calls it any more, so
+production cannot drift away from it. Each equivalence test drives the
+incremental path, then runs the full recompute, and asserts nothing moved.
+
 The tests were then audited by mutation:
 
 | Mutation | Expected | Result |
@@ -96,6 +134,27 @@ The tests were then audited by mutation:
 | the ordering drops its entry-id tiebreak | red | 3 tests failed |
 | the ordering puts the lowest fee rate first | red | 3 tests failed |
 | `remove` forgets the ordered set | red | 2 tests failed |
+| the refresh closure names only the seed | red | 5 tests failed |
+| the closure forgets descendants | red | 3 tests failed |
+| the closure forgets ancestors | red | 2 tests failed |
+| a removal takes its closure after the removal | red | 1 test failed |
+| descendant totals count only the entry itself | red | 5 tests failed |
+| the refresh skips the priority reindex | red | 2 tests failed |
+| an insertion forgets the running vsize total | red | 29 tests failed |
+| a removal forgets the running fee total | red | 1 test failed |
+| `prioritise` forgets the running fee total | red | 1 test failed |
+
+The last two **survived the first pass**, and that is a finding rather than a
+footnote. `total_vsize` and `aggregate_fees` each guard themselves with a
+`debug_assert` against a fold of the entries they summarize — but a guard only
+fires when something calls it. `insert_entry` consults `total_vsize()` on every
+acceptance, so its bookkeeping was covered by accident, and the 29 failures above
+are that accident. `aggregate_fees()` is only reached through `stats()`, and no
+test called it after a removal or a fee bump, so deleting the bookkeeping in both
+of those paths turned nothing red. `running_totals_track_inserts_removals_and_prioritise`
+now calls both accessors after every kind of mutation and compares against an
+independent fold, so the check survives a release build where the `debug_assert`s
+are compiled out.
 
 The audit found a real defect in the tests themselves. `SortedParetoFront`
 originally shared `ParetoKey`'s `Ord` with the replacement, which looked tidy and
@@ -119,7 +178,15 @@ re-run against `--test pareto_ordering` directly.
 - **The fixture is synthetic.** Fees and sizes are generated, not sampled from a
   real mempool; it establishes the shape of the cost, not its value on real
   traffic.
-- **The 30-minute figure is an extrapolation**, from an exponent measured over
-  200-3,200 transactions, and is quoted to say "the outer term still matters",
-  not as a prediction. See
+- **The half-second figure is an extrapolation** from an exponent measured over
+  200-51,200 transactions, quoted to say the quadratic is gone, not as a
+  prediction of behaviour on a real mempool. See
   `docs/solutions/best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md`.
+- **The ancestor and descendant walks are bounded by policy, not by the code.**
+  A node configured with `max_ancestors`/`max_descendants` in the millions would
+  make the refresh closure large again. The claim is that the cost no longer
+  depends on *mempool size*, which is what an attacker controls.
+- **`Mempool::entries` is still a public field.** The running totals assume every
+  mutation goes through the pool's own methods, which is true of every caller in
+  this workspace today. The `debug_assert`s are there because that is an
+  assumption, not a guarantee.

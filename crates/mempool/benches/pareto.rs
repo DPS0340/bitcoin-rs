@@ -36,10 +36,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 /// there in reasonable time, which is itself the finding.
 const FILL_SIZES: [usize; 4] = [1_000, 4_000, 16_000, 50_000];
 
-/// End-to-end sizes, an order of magnitude smaller: `insert_entry` rebuilds the
-/// entire index per transaction, so its cost is the index fill cost multiplied
-/// by the number of transactions.
-const POOL_SIZES: [usize; 3] = [200, 800, 3_200];
+/// End-to-end sizes.
+///
+/// The first three are the sizes the quadratic `insert_entry` could be measured
+/// at before the metadata refresh was made incremental — 3,200 transactions took
+/// a second — and are kept so the two revisions of this page compare directly.
+/// The last two are only reachable now, and are what pins the exponent.
+const POOL_SIZES: [usize; 5] = [200, 800, 3_200, 12_800, 51_200];
 
 fn spread_fee(seed: u64) -> u64 {
     // Not monotonic in the seed: an index fed entries already in priority order
