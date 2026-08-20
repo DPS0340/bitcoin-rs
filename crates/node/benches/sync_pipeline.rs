@@ -21,10 +21,10 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
+use bitcoin_rs_index::BlockSource as _;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
-    BlockSync, Config, Network, NoOpZmqPublisher,
+    BlockSync, Config, Network, NoOpZmqPublisher, TxIndexRuntime,
     apply::ApplyHandles,
     state::NodeState,
     sync::{SyncBudget, default_sync_budget},
@@ -38,9 +38,6 @@ use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 use tempfile::TempDir;
-
-type TxIndexHandle = Arc<Mutex<Box<dyn IndexerLike>>>;
-type TxIndexFixture = (Option<TxIndexHandle>, Option<TempDir>);
 
 const PROXY_BLOCKS: u32 = 32;
 const SYNC_PROXY_BLOCKS: u32 = 128;
@@ -455,7 +452,6 @@ struct SyncFixture {
     /// path so the timed region measures only the channel handoff plus `tick`.
     prebuilt_inbound: Vec<bitcoin_rs_p2p::InboundBlock>,
     received_scan_expected: Vec<BlockHash>,
-    _tx_index_dir: Option<TempDir>,
 }
 
 #[derive(Clone, Copy)]
@@ -494,12 +490,12 @@ impl SyncFixture {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             unbounded::<bitcoin_rs_p2p::InboundBlock>();
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-        let (tx_index, tx_index_dir) = tx_index_for_mode(tx_index_mode);
+        let tx_index_runtime = tx_index_for_mode(tx_index_mode);
         let handles = apply_handles(
             Arc::clone(&chain_tip),
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
-            tx_index,
+            tx_index_runtime,
         );
         let sync = BlockSync::new(
             handles,
@@ -521,7 +517,6 @@ impl SyncFixture {
             blocks,
             prebuilt_inbound: Vec::new(),
             received_scan_expected,
-            _tx_index_dir: tx_index_dir,
         }
     }
 
@@ -1065,7 +1060,7 @@ fn apply_handles(
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     block_tree: Arc<RwLock<BlockTree>>,
-    tx_index: Option<Arc<Mutex<Box<dyn IndexerLike>>>>,
+    tx_index_runtime: Option<Arc<TxIndexRuntime>>,
 ) -> ApplyHandles {
     let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
     let mut utxo = UtxoSet::new();
@@ -1078,7 +1073,7 @@ fn apply_handles(
         block_tree,
         utxo,
         coin_stats,
-        tx_index,
+        tx_index_runtime,
         noop_filter_index(),
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
         Arc::new(RwLock::new(Vec::new())),
@@ -1087,44 +1082,19 @@ fn apply_handles(
     )
 }
 
-fn tx_index_for_mode(mode: TxIndexMode) -> TxIndexFixture {
+fn tx_index_for_mode(mode: TxIndexMode) -> Option<Arc<TxIndexRuntime>> {
     match mode {
-        TxIndexMode::Disabled => (None, None),
-        TxIndexMode::Noop => (Some(noop_tx_index()), None),
+        TxIndexMode::Disabled => None,
+        TxIndexMode::Noop => {
+            let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+            Some(Arc::new(TxIndexRuntime::new(wake_tx)))
+        }
         #[cfg(feature = "rocksdb")]
         TxIndexMode::RocksDb => {
-            let dir = tempfile::tempdir()
-                .unwrap_or_else(|error| panic!("txindex tempdir failed: {error}"));
-            let store = Arc::new(
-                bitcoin_rs_storage::RocksDbStore::open(dir.path())
-                    .unwrap_or_else(|error| panic!("txindex rocksdb open failed: {error}")),
-            );
-            let indexer: Box<dyn IndexerLike> =
-                Box::new(bitcoin_rs_index::Indexer::new(Arc::clone(&store)));
-            (Some(Arc::new(Mutex::new(indexer))), Some(dir))
+            let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+            Some(Arc::new(TxIndexRuntime::new(wake_tx)))
         }
     }
-}
-
-struct NoopIndexer;
-
-impl IndexerLike for NoopIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
-    }
-
-    fn resolve_outpoint_value(
-        &self,
-        _outpoint: bitcoin::OutPoint,
-        _source: &dyn BlockSource,
-    ) -> Result<Option<u64>, IndexError> {
-        Ok(None)
-    }
-}
-
-fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-    let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-    Arc::new(Mutex::new(indexer))
 }
 
 struct NoopFilterIndex;

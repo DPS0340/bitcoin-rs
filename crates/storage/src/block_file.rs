@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, BufReader, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +21,7 @@ const BLOCK_FILE_SUFFIX: &str = ".dat";
 const FILE_MAX_HEIGHT_PREFIX: &[u8; 7] = b"blkfile";
 const RECORD_HEADER_LEN: usize = 44;
 const RECORD_HEADER_LEN_U64: u64 = 44;
+const BLOCK_READER_BUFFER_BYTES: usize = 256 << 10;
 
 /// A fixed-width pointer to a framed block body in a flat file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +98,18 @@ struct WriterState {
     file_no: u32,
     append_offset: u64,
     directory_dirty: bool,
+}
+/// Reusable reader for framed block bodies.
+pub struct FlatFileBlockReader {
+    blocks_dir: PathBuf,
+    state: Option<ReaderState>,
+}
+
+struct ReaderState {
+    file_no: u32,
+    file_len: u64,
+    reader: BufReader<File>,
+    cursor: Option<u64>,
 }
 
 impl FlatFileBlockStore {
@@ -200,6 +213,15 @@ impl FlatFileBlockStore {
         Ok(())
     }
 
+    /// Creates a reusable block-body reader.
+    #[must_use]
+    pub fn reader(&self) -> FlatFileBlockReader {
+        FlatFileBlockReader {
+            blocks_dir: self.blocks_dir.clone(),
+            state: None,
+        }
+    }
+
     /// Loads a body only when its frame completely matches the requested height and hash.
     ///
     /// `hash` is the 32-byte consensus little-endian hash representation.
@@ -211,24 +233,7 @@ impl FlatFileBlockStore {
         height: u32,
         hash: [u8; 32],
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let Some(mut file) = self.open_for_read(position.file_no)? else {
-            return Ok(None);
-        };
-        if !record_matches(&mut file, position, height, hash)? {
-            return Ok(None);
-        }
-
-        let Some(body_offset) = body_offset(position.offset) else {
-            return Ok(None);
-        };
-        let body_len = usize::try_from(position.len)
-            .map_err(|_| StorageError::InvalidOperation("block body length does not fit usize"))?;
-        let mut body = vec![0_u8; body_len];
-        file.seek(SeekFrom::Start(body_offset))?;
-        if !read_exact_or_none(&mut file, &mut body)? {
-            return Ok(None);
-        }
-        Ok(Some(body))
+        self.reader().load(position, height, hash)
     }
 
     /// Loads at most `limit` body bytes after validating the complete frame header.
@@ -242,24 +247,7 @@ impl FlatFileBlockStore {
         hash: [u8; 32],
         limit: usize,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let Some(mut file) = self.open_for_read(position.file_no)? else {
-            return Ok(None);
-        };
-        if !record_matches(&mut file, position, height, hash)? {
-            return Ok(None);
-        }
-
-        let Some(body_offset) = body_offset(position.offset) else {
-            return Ok(None);
-        };
-        let body_len = usize::try_from(position.len)
-            .map_err(|_| StorageError::InvalidOperation("block body length does not fit usize"))?;
-        let mut prefix = vec![0_u8; body_len.min(limit)];
-        file.seek(SeekFrom::Start(body_offset))?;
-        if !read_exact_or_none(&mut file, &mut prefix)? {
-            return Ok(None);
-        }
-        Ok(Some(prefix))
+        self.reader().load_prefix(position, height, hash, limit)
     }
 
     /// Loads `len` body bytes starting `offset` bytes into the body.
@@ -284,33 +272,8 @@ impl FlatFileBlockStore {
         offset: u32,
         len: u32,
     ) -> Result<Option<Vec<u8>>, StorageError> {
-        let Some(end) = offset.checked_add(len) else {
-            return Ok(None);
-        };
-        if end > position.len {
-            return Ok(None);
-        }
-        let Some(mut file) = self.open_for_read(position.file_no)? else {
-            return Ok(None);
-        };
-        if !record_matches(&mut file, position, height, hash)? {
-            return Ok(None);
-        }
-
-        let Some(body_offset) = body_offset(position.offset) else {
-            return Ok(None);
-        };
-        let Some(range_offset) = body_offset.checked_add(u64::from(offset)) else {
-            return Ok(None);
-        };
-        let range_len = usize::try_from(len)
-            .map_err(|_| StorageError::InvalidOperation("block range length does not fit usize"))?;
-        let mut range = vec![0_u8; range_len];
-        file.seek(SeekFrom::Start(range_offset))?;
-        if !read_exact_or_none(&mut file, &mut range)? {
-            return Ok(None);
-        }
-        Ok(Some(range))
+        self.reader()
+            .load_range(position, height, hash, offset, len)
     }
 
     /// Returns the file currently receiving appends.
@@ -390,13 +353,199 @@ impl FlatFileBlockStore {
             }),
         })
     }
+}
 
-    fn open_for_read(&self, file_no: u32) -> Result<Option<File>, StorageError> {
-        match File::open(block_file_path(&self.blocks_dir, file_no)) {
-            Ok(file) => Ok(Some(file)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+impl FlatFileBlockReader {
+    /// Loads a body only when its frame completely matches the requested height and hash.
+    pub fn load(
+        &mut self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        self.load_bytes(position, height, hash, 0, None)
+    }
+
+    /// Loads at most `limit` body bytes after validating the complete frame header.
+    pub fn load_prefix(
+        &mut self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let take = u64::try_from(limit)
+            .map_err(|_| StorageError::InvalidOperation("block prefix limit does not fit u64"))?;
+        self.load_bytes(position, height, hash, 0, Some(take))
+    }
+
+    /// Loads `len` body bytes starting `offset` bytes into the body.
+    ///
+    /// `offset` is relative to the **body**, not to the record header, so a
+    /// caller holding a transaction's offset within the serialized block passes
+    /// it unchanged.
+    ///
+    /// The complete frame is validated first, exactly as [`Self::load`] does, so
+    /// a range is never served out of a record that does not belong to `height`
+    /// and `hash`. A range extending past the body's end returns `Ok(None)`
+    /// rather than a short read.
+    ///
+    /// Missing files, malformed frames, mismatched targets, out-of-bounds ranges
+    /// and short reads all return `Ok(None)`.
+    pub fn load_range(
+        &mut self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        offset: u32,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(end) = offset.checked_add(len) else {
+            return Ok(None);
+        };
+        if end > position.len {
+            return Ok(None);
         }
+        self.load_bytes(
+            position,
+            height,
+            hash,
+            u64::from(offset),
+            Some(u64::from(len)),
+        )
+    }
+
+    fn load_bytes(
+        &mut self,
+        position: BlockFilePosition,
+        height: u32,
+        hash: [u8; 32],
+        skip: u64,
+        take: Option<u64>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        if !self.select_file(position.file_no)? {
+            return Ok(None);
+        }
+        let Some(state) = self.state.as_mut() else {
+            unreachable!("selected file has reader state");
+        };
+        let Some(record_end) = record_end(position) else {
+            return Ok(None);
+        };
+        if record_end > state.file_len {
+            state.file_len = state.reader.get_ref().metadata()?.len();
+            if record_end > state.file_len {
+                return Ok(None);
+            }
+        }
+        if state.cursor != Some(position.offset) {
+            if let Err(error) = state.reader.seek(SeekFrom::Start(position.offset)) {
+                state.cursor = None;
+                return Err(error.into());
+            }
+            state.cursor = Some(position.offset);
+        }
+
+        let Some(body_offset) = body_offset(position.offset) else {
+            return Ok(None);
+        };
+        let mut header = [0_u8; RECORD_HEADER_LEN];
+        let header_complete = match read_exact_or_none(&mut state.reader, &mut header) {
+            Ok(complete) => complete,
+            Err(error) => {
+                state.cursor = None;
+                return Err(error);
+            }
+        };
+        if !header_complete {
+            state.cursor = None;
+            return Ok(None);
+        }
+        state.cursor = Some(body_offset);
+        if header[..4] != BLOCK_FILE_MAGIC
+            || header[4..8] != position.len.to_le_bytes()
+            || header[8..12] != height.to_le_bytes()
+            || header[12..] != hash
+        {
+            return Ok(None);
+        }
+
+        let body_len = u64::from(position.len);
+        if skip > body_len {
+            return Ok(None);
+        }
+        let max_len = body_len - skip;
+        let read_len = take.map_or(max_len, |take| take.min(max_len));
+
+        let target = if skip == 0 {
+            body_offset
+        } else {
+            let Some(target) = body_offset.checked_add(skip) else {
+                return Ok(None);
+            };
+            target
+        };
+
+        if state.cursor != Some(target) {
+            if let Err(error) = state.reader.seek(SeekFrom::Start(target)) {
+                state.cursor = None;
+                return Err(error.into());
+            }
+            state.cursor = Some(target);
+        }
+
+        if read_len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let read_len_usize = usize::try_from(read_len)
+            .map_err(|_| StorageError::InvalidOperation("block read length does not fit usize"))?;
+        let mut bytes = vec![0_u8; read_len_usize];
+        let body_complete = match read_exact_or_none(&mut state.reader, &mut bytes) {
+            Ok(complete) => complete,
+            Err(error) => {
+                state.cursor = None;
+                return Err(error);
+            }
+        };
+        if !body_complete {
+            state.cursor = None;
+            return Ok(None);
+        }
+        state.cursor = Some(
+            target
+                .checked_add(read_len)
+                .ok_or(StorageError::InvalidOperation("block read end overflow"))?,
+        );
+        Ok(Some(bytes))
+    }
+
+    fn select_file(&mut self, file_no: u32) -> Result<bool, StorageError> {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.file_no == file_no)
+        {
+            return Ok(true);
+        }
+
+        let path = block_file_path(&self.blocks_dir, file_no);
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.state = None;
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let file_len = file.metadata()?.len();
+        self.state = Some(ReaderState {
+            file_no,
+            file_len,
+            reader: BufReader::with_capacity(BLOCK_READER_BUFFER_BYTES, file),
+            cursor: None,
+        });
+        Ok(true)
     }
 }
 
@@ -434,29 +583,6 @@ fn record_end(position: BlockFilePosition) -> Option<u64> {
     body_offset(position.offset)?.checked_add(u64::from(position.len))
 }
 
-fn record_matches(
-    file: &mut File,
-    position: BlockFilePosition,
-    height: u32,
-    hash: [u8; 32],
-) -> Result<bool, StorageError> {
-    let Some(record_end) = record_end(position) else {
-        return Ok(false);
-    };
-    if record_end > file.metadata()?.len() {
-        return Ok(false);
-    }
-    let mut header = [0_u8; RECORD_HEADER_LEN];
-    file.seek(SeekFrom::Start(position.offset))?;
-    if !read_exact_or_none(file, &mut header)? {
-        return Ok(false);
-    }
-    Ok(header[..4] == BLOCK_FILE_MAGIC
-        && header[4..8] == position.len.to_le_bytes()
-        && header[8..12] == height.to_le_bytes()
-        && header[12..] == hash)
-}
-
 fn recover_append_offset(file: &mut File, file_len: u64) -> Result<u64, StorageError> {
     let mut offset = 0_u64;
     while offset < file_len {
@@ -486,8 +612,8 @@ fn recover_append_offset(file: &mut File, file_len: u64) -> Result<u64, StorageE
     Ok(offset)
 }
 
-fn read_exact_or_none(file: &mut File, bytes: &mut [u8]) -> Result<bool, StorageError> {
-    match file.read_exact(bytes) {
+fn read_exact_or_none(reader: &mut impl io::Read, bytes: &mut [u8]) -> Result<bool, StorageError> {
+    match reader.read_exact(bytes) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
         Err(error) => Err(error.into()),
@@ -644,6 +770,68 @@ mod tests {
             store.load_range(position, 5, hash(5), 9, 1)?,
             Some(b"9".to_vec())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reader_matches_one_shot_across_order_and_rollover() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+        let first = store.persist(None, 1, hash(1), b"first")?;
+        let second = store.persist(None, 2, hash(2), b"a longer second body")?;
+        let third = store.persist(None, 3, hash(3), b"third")?;
+        let mut reader = store.reader();
+
+        assert_eq!(reader.load(first, 1, hash(1))?, Some(b"first".to_vec()));
+        assert_eq!(
+            reader.load(second, 2, hash(2))?,
+            Some(b"a longer second body".to_vec())
+        );
+        assert_eq!(reader.load(third, 3, hash(3))?, Some(b"third".to_vec()));
+        assert_eq!(
+            reader.load(second, 2, hash(2))?,
+            store.load(second, 2, hash(2))?
+        );
+        assert_eq!(
+            reader.load_prefix(second, 2, hash(2), 4)?,
+            Some(b"a lo".to_vec())
+        );
+        assert_eq!(reader.load(first, 2, hash(1))?, None);
+        assert_eq!(reader.load(first, 1, hash(1))?, Some(b"first".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_observes_a_later_append_to_the_open_file() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let first = store.append(1, hash(1), b"first")?;
+        let mut reader = store.reader();
+        assert_eq!(reader.load(first, 1, hash(1))?, Some(b"first".to_vec()));
+
+        let second = store.append(2, hash(2), b"second")?;
+        assert_eq!(reader.load(second, 2, hash(2))?, Some(b"second".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn reader_and_one_shot_reject_a_short_record() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let position = store.append(11, hash(1), b"expected")?;
+        let record_end = position
+            .offset
+            .checked_add(RECORD_HEADER_LEN_U64 + u64::from(position.len))
+            .ok_or(crate::StorageError::InvalidOperation(
+                "test record end overflow",
+            ))?;
+        OpenOptions::new()
+            .write(true)
+            .open(store.file_path(position.file_no))?
+            .set_len(record_end - 1)?;
+
+        assert_eq!(store.load(position, 11, hash(1))?, None);
+        assert_eq!(store.reader().load(position, 11, hash(1))?, None);
         Ok(())
     }
 
