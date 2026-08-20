@@ -217,19 +217,26 @@ that were scaling; only issuing fewer, larger dispatches does. See
 
 ### Window script batching
 
-Verifying the input scripts of several consecutive blocks in one parallel
-dispatch, so the fan-out is amortised over a run of blocks rather than paid per
-block. The window prepares each block against an ordered overlay, dispatches
-once, and issues a per-block proof; the blocks then commit one at a time and in
-order, so every rule needing committed state still sees the real chain. On
-mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
-558.4s, with the dispatch itself falling from 44.08s to 12.55s. The proof binds
-the block hash, its predecessor, the height, the flags, and the locktime cutoff,
-travels bundled with the prepared state it covers, and is re-checked against
-what the apply derives; a window that cannot be proven yields nothing and every
-block verifies normally. The historical pre-batching capture measured 78.4s /
-643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
-not one interleaved run. See
+Verifying the ordered transaction unit of several consecutive blocks in one
+parallel dispatch, so the fan-out is amortized over a run of blocks rather than
+paid per block. The unit includes transaction pre-checks, every input script,
+and transaction post-checks. The window prepares each block against an ordered
+overlay, dispatches once, and issues a private, single-use
+`BlockValidationProof`; the blocks then commit one at a time and in order, so
+every rule needing committed state still sees the real chain. The proof owns
+the `PreparedApply` it certifies and binds the block hash, predecessor, height,
+flags, and locktime cutoff. Commit re-derives all five fields. A mismatch
+discards both proof and prepared state and rebuilds from the live UTXO set.
+Assume-valid produces a distinct `AssumeValidSkipped` state, which re-reads the
+live trust gate and never takes the proof bypass.
+
+The initial batching change took mainnet 0..150,000 from 78.4s / 643.4s CPU to
+69.6s / 558.4s, with the dispatch itself falling from 44.08s to 12.55s. A later
+three-run interleaved attribution panel showed that deleting the duplicate
+commit-time transaction pass for matching proofs cut replay medians from
+48.414266s / 406.954276s CPU to 30.438702s / 254.642286s. The proof bypass
+applies only at the transaction-validation slot: block rules and BIP30 remain
+before it; coinbase maturity and BIP68 remain after it. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
 ### Script-check floor

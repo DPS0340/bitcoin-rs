@@ -279,6 +279,54 @@ untouched until step 6 and a go/no-go measurement gate at step 5 requiring an
 identical tip hash, an identical UTXO digest, and an identical coinstats MuHash
 between `--window 1` and `--window 64`.
 
+## Delete the repeated transaction pass
+
+The shipped split still repeated one complete transaction-validation pass at
+commit. `prepare_block_script_checks` and `verify_prepared_units` had already
+run each transaction's ordered pre-checks, every input script, and ordered
+post-checks. A matching proof then called `run_non_script_checks_only`, which
+resolved and checked the same transaction unit again.
+
+An attribution probe removed only that repeated call. Three interleaved
+mainnet 0..150,000 runs per arm, pinned to CPUs 0-31 with fresh fjall state,
+measured these medians:
+
+| measurement | control | probe | change |
+|---|---:|---:|---:|
+| replay wall | 48.414266s | 30.438702s | 1.590550x |
+| process wall | 52.216643s | 34.105452s | 1.531035x |
+| CPU | 406.954276s | 254.642286s | 1.598141x |
+
+Every run reached height 150,000 and block
+`0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b`.
+The result is too large to be scheduler noise: it removes 17.98 seconds from
+the replay median and 152.31 CPU-seconds.
+Full commands, binary and corpus hashes, run order, every run value, and
+identity fields are retained in
+`docs/benchmarks/data/end-to-end-sync/window-validation-proof-custody-v1.json`.
+
+The production change makes the evidence precise instead of widening a
+script-only proof:
+
+1. `BlockValidationProof` is private and non-cloneable. It owns the exact
+   `PreparedApply` whose ordered transaction unit passed.
+2. The proof binds hash, predecessor, height, flags, and locktime cutoff.
+   Commit re-derives all five. A mismatch discards the proof-owned prepared
+   state and rebuilds it from the live UTXO set.
+3. `ProvenApply` distinguishes `Proven` from `AssumeValidSkipped`. The latter
+   re-enters ordinary validation and re-reads the live trust gate.
+4. A matching proof bypasses only the transaction-validation slot. Block rules,
+   BIP30/BIP34, and PoW continuity stay before it. Coinbase maturity and BIP68
+   stay after it.
+5. `prove_window` still returns no proofs after any pre-check, script,
+   post-check, layout, or context failure.
+
+Mutation checks pin the two dangerous fallbacks. Reusing proof-owned prepared
+state after a context mismatch makes the five-field fallback test accept a
+block whose live prevout was removed. Treating `AssumeValidSkipped` as proof
+makes a trusted-to-untrusted gate flip accept a bad script. Both mutations fail
+their tests.
+
 ## Also corrected
 
 The BIP30 duplicate-coinbase blocks are **91,842 and 91,880**. 91,722 and
