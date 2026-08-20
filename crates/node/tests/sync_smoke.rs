@@ -14,7 +14,6 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
-use bitcoin_rs_index::{BlockSource, IndexError, IndexRowCounts, IndexerLike};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
     BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
@@ -570,7 +569,7 @@ fn apply_handles_with_coin_stats_and_utxo(
         block_tree,
         Arc::clone(&utxo),
         Arc::clone(&coin_stats),
-        Some(noop_tx_index()),
+        None,
         noop_filter_index(),
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
         Arc::new(RwLock::new(Vec::new())),
@@ -578,27 +577,6 @@ fn apply_handles_with_coin_stats_and_utxo(
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),
     );
     (handles, coin_stats, utxo)
-}
-
-struct NoopIndexer;
-
-impl IndexerLike for NoopIndexer {
-    fn ingest_block(&mut self, _block: &[u8], _height: u32) -> Result<IndexRowCounts, IndexError> {
-        Ok(IndexRowCounts::default())
-    }
-
-    fn resolve_outpoint_value(
-        &self,
-        _outpoint: bitcoin::OutPoint,
-        _source: &dyn BlockSource,
-    ) -> Result<Option<u64>, IndexError> {
-        Ok(None)
-    }
-}
-
-fn noop_tx_index() -> Arc<Mutex<Box<dyn IndexerLike>>> {
-    let indexer: Box<dyn IndexerLike> = Box::new(NoopIndexer);
-    Arc::new(Mutex::new(indexer))
 }
 
 struct NoopFilterIndex;
@@ -610,17 +588,18 @@ impl FilterIndexLike for NoopFilterIndex {
 
     fn put_filter(
         &self,
-        _block_hash: bitcoin_rs_primitives::Hash256,
-        _prev_header: bitcoin_rs_primitives::Hash256,
+        _block_hash: Hash256,
+        _prev_header: Hash256,
         _filter_bytes: &[u8],
-    ) -> Result<bitcoin_rs_primitives::Hash256, FilterIndexError> {
-        Ok(bitcoin_rs_primitives::Hash256::default())
+    ) -> Result<Hash256, FilterIndexError> {
+        Ok(Hash256::default())
     }
 
-    fn filter_header(
-        &self,
-        _block_hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<bitcoin_rs_primitives::Hash256>, FilterIndexError> {
+    fn filter_header(&self, _block_hash: Hash256) -> Result<Option<Hash256>, FilterIndexError> {
+        Ok(None)
+    }
+
+    fn filter(&self, _block_hash: Hash256) -> Result<Option<Vec<u8>>, FilterIndexError> {
         Ok(None)
     }
 }

@@ -5,14 +5,14 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex, FromHex as _};
-use bitcoin::{Block, Transaction, Txid};
+use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_primitives::{Hash256, Network};
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 
@@ -354,6 +354,57 @@ fn noop_filter_index() -> Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>> {
     Arc::new(filter_index)
 }
 
+/// Actual progress reported by the node-owned transaction index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxIndexInfo {
+    /// Whether the index has completely caught up to the authoritative chain tip.
+    pub synced: bool,
+    /// Height of the best block completely covered by the index.
+    pub best_block_height: u32,
+}
+
+/// Failure from a complete transaction-index query.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TxQueryError {
+    /// The query raced index or chain progress and should be retried.
+    #[error("transaction index changed during query; retry")]
+    Retry,
+    /// The index cannot currently prove a complete answer.
+    #[error("transaction index unavailable: {0}")]
+    Unavailable(CompactString),
+    /// Durable index storage failed.
+    #[error("transaction index storage error: {0}")]
+    Storage(CompactString),
+}
+
+/// Lockless read-only adapter for complete transaction-index queries.
+pub trait TxIndexQuery: Send + Sync {
+    /// Resolves a confirmed transaction, returning `None` only after complete absence is proven.
+    fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError>;
+    /// Resolves a confirmed prevout value, returning `None` only after complete absence is proven.
+    fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError>;
+    /// Returns the transaction index's actual durable progress.
+    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
+}
+
+impl TxQueryError {
+    /// Maps a transaction-index failure to an explicit JSON-RPC error.
+    #[must_use]
+    pub fn into_rpc_error(self) -> crate::error::RpcError {
+        match self {
+            Self::Retry => crate::error::RpcError::Internal(
+                "transaction index is still catching up; retry later".to_owned(),
+            ),
+            Self::Unavailable(reason) => {
+                crate::error::RpcError::Internal(format!("transaction index unavailable: {reason}"))
+            }
+            Self::Storage(reason) => crate::error::RpcError::Internal(format!(
+                "transaction index storage error: {reason}"
+            )),
+        }
+    }
+}
+
 /// Shared state consumed by JSON-RPC handlers.
 pub struct Context {
     /// Best-chain tip snapshot published by chain validation.
@@ -376,9 +427,9 @@ pub struct Context {
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
     pub chain_control: Option<Arc<dyn ChainControl>>,
-    /// Optional shared confirmed-block indexer used to resolve prevout values for fee statistics.
-    /// `None` for embedded/test callers without txindex.
-    pub indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
+    /// Optional node-owned complete transaction-index query adapter.
+    /// `None` when transaction indexing is disabled.
+    pub tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
@@ -453,7 +504,7 @@ impl Context {
             utxo: Arc::new(utxo),
             coin_stats,
             filter_index: noop_filter_index(),
-            indexer: None,
+            tx_index: None,
             prune_service: None,
             chain_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
@@ -497,7 +548,7 @@ impl Context {
         p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
         banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
         added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
-        indexer: Option<Arc<Mutex<Box<dyn bitcoin_rs_index::IndexerLike>>>>,
+        tx_index: Option<Arc<dyn TxIndexQuery>>,
     ) -> Self {
         let (mining_sender, mining_notifications) = unbounded();
         Self {
@@ -509,7 +560,7 @@ impl Context {
             utxo,
             coin_stats,
             filter_index,
-            indexer,
+            tx_index,
             network,
             chain_network,
             peers,
@@ -847,14 +898,6 @@ impl Context {
     }
 }
 
-impl bitcoin_rs_index::BlockSource for Context {
-    fn block_at_height(&self, height: u32) -> Option<bitcoin::Block> {
-        let record = self.block_by_height(height)?;
-        let bytes = self.block_body_bytes(&record)?;
-        bitcoin::consensus::encode::deserialize::<bitcoin::Block>(&bytes).ok()
-    }
-}
-
 fn bitcoin_network(network: Network) -> bitcoin::Network {
     match network {
         Network::Mainnet => bitcoin::Network::Bitcoin,
@@ -1112,7 +1155,8 @@ mod tests {
         assert!(ctx.height_for_hash(unknown).is_none());
     }
     #[test]
-    fn block_by_height_prefers_tree_identity_over_stale_cache() {
+    fn block_by_height_prefers_tree_identity_over_stale_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::block::Version;
         use bitcoin::hashes::Hash as _;
         use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
@@ -1129,9 +1173,7 @@ mod tests {
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             };
-            let genesis_id = tree
-                .insert_node(None, genesis, NodeStatus::Active)
-                .expect("genesis inserts");
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
             let mut child = bitcoin::block::Header {
                 version: Version::ONE,
                 prev_blockhash: genesis.block_hash(),
@@ -1141,11 +1183,11 @@ mod tests {
                 nonce: 0,
             };
             child.nonce = 1;
-            let child_id = tree
-                .insert_node(Some(genesis_id), child, NodeStatus::Active)
-                .expect("child inserts");
-            let child_hash = tree.node(child_id).expect("child node").hash;
-            let applied_tip = tree.tip().expect("child tip");
+            let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::Active)?;
+            let child_hash = tree.node(child_id)?.hash;
+            let applied_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing child tip"))?;
             ctx.set_applied_tip((*applied_tip).clone());
             // Stale cache entry at the SAME height as the tree child but with a
             // different hash. The active-tree identity must win over this cache.
@@ -1157,12 +1199,13 @@ mod tests {
         assert_ne!(child_hash, stale_hash, "test fixture hashes must differ");
         let found = ctx
             .block_by_height(1)
-            .expect("tree child should resolve at height 1");
+            .ok_or_else(|| std::io::Error::other("tree child missing at height 1"))?;
         assert_eq!(
             found.hash, child_hash,
             "active-tree identity must win over a stale cached hash"
         );
         assert_eq!(found.height, 1);
+        Ok(())
     }
 
     #[test]

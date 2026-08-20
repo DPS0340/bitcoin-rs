@@ -153,14 +153,18 @@ fn spawn_electrum_listener(
         bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
         bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
     };
-    let Some(index) = state.electrum_index_handle() else {
+    let Some(query) = state.tx_index_electrum_adapter() else {
         bail!("electrum listener requires txindex");
     };
-    let Some(history_reader) = state.electrum_history_reader() else {
-        bail!("electrum listener requires txindex history reader");
-    };
-    let index = index
-        .with_history_reader(history_reader)
+    let chain: Arc<dyn bitcoin_rs_electrum::methods::BlockTreeAdapter> = Arc::new(
+        crate::NodeBlockSource::new(state.blocks())
+            .with_block_body_source(state.block_body_source())
+            .with_block_tree(state.block_tree())
+            .with_applied_tip(state.applied_tip()),
+    );
+    let index = bitcoin_rs_electrum::IndexHandle::new()
+        .with_history_reader(query)
+        .with_chain(chain)
         .with_network(network);
     let mempool = bitcoin_rs_electrum::MempoolHandle::from_arc(state.mempool());
     let cfg = bitcoin_rs_electrum::ServerConfig::default();
@@ -643,7 +647,7 @@ pub fn run(mut config: Config) -> Result<()> {
         Some(state.p2p_outbound_sender()),
         Arc::clone(&banned),
         Arc::new(parking_lot::RwLock::new(Vec::new())),
-        state.tx_index(),
+        state.tx_index_query(),
     );
     rpc_context = rpc_context.with_block_body_source(block_body_source);
     if let Some(prune_service) = state.prune_service() {

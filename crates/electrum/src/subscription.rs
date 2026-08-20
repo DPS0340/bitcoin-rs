@@ -25,10 +25,10 @@ impl SessionSubscriptions {
         index: &IndexHandle,
         mempool: &MempoolHandle,
         scripthash: ScriptHash,
-    ) -> Value {
-        let status = status_string(index, mempool, scripthash);
+    ) -> Result<Value, ElectrumError> {
+        let status = status_string(index, mempool, scripthash)?;
         self.scripthashes.insert(scripthash, status.clone());
-        status_value(status)
+        Ok(status_value(status))
     }
 
     /// Removes the subscription for `scripthash`. Returns `true` if the
@@ -52,7 +52,11 @@ impl SessionSubscriptions {
     ) -> Result<Vec<Value>, ElectrumError> {
         let mut notifications = Vec::new();
         for (scripthash, old_status) in &mut self.scripthashes {
-            let new_status = status_string(index, mempool, *scripthash);
+            let new_status = match status_string(index, mempool, *scripthash) {
+                Ok(status) => status,
+                Err(ElectrumError::Unavailable(_)) => continue,
+                Err(error) => return Err(error),
+            };
             if *old_status != new_status {
                 old_status.clone_from(&new_status);
                 notifications.push(json!({
