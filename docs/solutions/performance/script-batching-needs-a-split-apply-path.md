@@ -355,6 +355,41 @@ fjall, RocksDB, and redb. The full panel, external wall values, artifact
 digests, and backend proofs are in
 `docs/benchmarks/data/end-to-end-sync/checkpoint-write-buffer-custody-v1.json`.
 
+## Enlarge exact checkpoint MuHash batches
+
+The buffered writer left 2.660571s in the checkpoint tail. An attribution-only
+probe kept the CoinStats traversal but disabled its independent MuHash
+calculation. The tail fell to 1.235707s, which assigns 1.424864s to MuHash. The
+probe was reverted because it makes the listener-versus-traversal check
+tautological.
+
+The exact path was spending that time on small partial values. It flushed at
+16,384 coins or 2 MiB and created up to 16 MuHash lanes each time. A bounded
+sweep tested 8, 16, and 32 MiB arenas under both the benchmark pool and the
+production-equivalent four-thread pool. In the default pool, the 32 MiB point
+bought less than the 1.02 marginal floor over 16 MiB while doubling eager arena
+memory, so it was reverted.
+
+The retained configuration flushes at 262,144 coins or 16 MiB, caps at 32
+lanes, and also bounds lane count by the active Rayon pool. The final panels
+measured:
+
+| pool | checkpoint tail before | after | speedup | process wall before | after |
+|---|---:|---:|---:|---:|---:|
+| affinity-limited default | 2.638363s | 1.721588s | 1.532517x | 34.407571s | 33.699045s |
+| production-equivalent 4 threads | 3.862094s | 2.635227s | 1.465564x | 36.598228s | 35.221993s |
+
+The final combined interleaved panel compares the pre-buffer binary directly
+with both checkpoint changes. Process wall fell from 35.104562s to 33.095760s,
+a 1.060697x win, while replay stayed flat at 31.346029s versus 31.449878s.
+Checkpoint tail fell from 3.736965s to 1.645882s, or 2.270494x. All checkpoint
+artifact hashes remain byte-identical. The exact MuHash and serialized
+CoinStats match the serial oracle at one and four Rayon threads. Fjall,
+RocksDB, and redb also pass the reorg and two-reopen durability proof. Full
+experiments, interleaved wall values, run hashes, artifact digests, and backend
+proofs are in
+`docs/benchmarks/data/end-to-end-sync/checkpoint-muhash-batching-custody-v1.json`.
+
 ## Also corrected
 
 The BIP30 duplicate-coinbase blocks are **91,842 and 91,880**. 91,722 and

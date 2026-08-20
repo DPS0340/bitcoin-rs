@@ -144,6 +144,17 @@ not the checkpoint format or durability boundary. Its `finish` operation owns
 the checked flush so a caller cannot publish a digest for buffered bytes that
 were not handed to the file.
 
+### Checkpoint MuHash batch
+
+The independent checkpoint traversal derives CoinStats and MuHash again instead
+of trusting the rolling listener that supplies live state. It encodes exact coin
+preimages into a bounded arena and computes insert-only partial MuHash values in
+parallel. The arena holds at most 262,144 coins or 16 MiB. Each flush uses no
+more lanes than the active Rayon pool or the 32-lane cap. The larger batch
+reduces partial-value construction and combination. It does not remove the
+listener-versus-traversal check, change preimage bytes, change snapshot bytes,
+or weaken checkpoint durability.
+
 ### Coalesced TxIndex wake
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
 
