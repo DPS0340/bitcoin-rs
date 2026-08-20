@@ -133,6 +133,17 @@ The versioned durable `(height, block hash)` cursor that identifies the exact ac
 ### Complete derived-index query
 A query returns a result only when one snapshot proves that the derived index covers the exact applied tip. A `TxIndex` query captures the applied tip and process-local revision, opens one typed storage snapshot, requires the snapshot watermark to equal that tip by height and hash, and rechecks the tip and revision before it returns. Aggregate row, byte, scan, and body-load budgets bound the work. Index lag, worker failure, a missing block body, a truncated scan, budget exhaustion, a tip change, and an ABA revision change return `Retry` or `Unavailable`; none can become a false absence. Electrum keeps an existing subscription and emits no update during transient unavailability.
 
+### Checkpoint write batching
+
+The checkpoint serializer writes many small record fields before it makes each
+artifact durable. `HashingWriter` batches those writes in a 64 KiB userspace
+buffer, then flushes the buffer before it returns the byte count and digest.
+The following file `fsync`, directory sync, generation rename, and `CURRENT`
+publication barriers do not change. The buffer changes syscall granularity,
+not the checkpoint format or durability boundary. Its `finish` operation owns
+the checked flush so a caller cannot publish a digest for buffered bytes that
+were not handed to the file.
+
 ### Coalesced TxIndex wake
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
 

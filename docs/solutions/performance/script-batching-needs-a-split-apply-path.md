@@ -327,6 +327,34 @@ block whose live prevout was removed. Treating `AssumeValidSkipped` as proof
 makes a trusted-to-untrusted gate flip accept a bad script. Both mutations fail
 their tests.
 
+## Batch checkpoint writes before durability
+
+After the transaction proof landed, a reversible probe disabled only final
+checkpoint publication. Three pinned runs per arm left replay time unchanged
+but reduced the median process tail from 3.741312s to 0.469396s. The
+checkpoint path therefore owned 3.271917s outside the measured replay.
+
+`HashingWriter` was forwarding every serializer field directly to the file.
+The UTXO snapshot emits a 45-byte record header, a 19-byte output header, and a
+separate script write for each stored item. The artifact still needs one
+durability barrier, but it does not need one syscall per field.
+
+The production writer now uses one 64 KiB `BufWriter`. `finish` performs a
+checked flush before it returns the byte count and SHA-256 digest. Each existing
+file `fsync`, directory sync, generation rename, and `CURRENT` publication
+barrier remains in the same order.
+
+The final interleaved fjall panel measured process-wall medians of 35.933007s
+before and 34.550456s after, a 1.040015x whole-process win. The checkpoint tail
+fell from 3.910030s to 2.660571s, a 1.469621x improvement and the acceptance
+metric for this checkpoint-specific change. Every run reached the same height
+and hash. A separate baseline/candidate pair produced byte-identical
+`headers-v1.dat`, `utxo-v4.dat`, `coinstats-v1.dat`, `manifest-v1.json`, and
+`CURRENT` artifacts. Reorg and two-reopen durability proofs also matched across
+fjall, RocksDB, and redb. The full panel, external wall values, artifact
+digests, and backend proofs are in
+`docs/benchmarks/data/end-to-end-sync/checkpoint-write-buffer-custody-v1.json`.
+
 ## Also corrected
 
 The BIP30 duplicate-coinbase blocks are **91,842 and 91,880**. 91,722 and
