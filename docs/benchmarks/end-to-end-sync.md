@@ -70,6 +70,35 @@ Later code changed both failed bitcoin-rs paths, but no completed rerun is attac
 
 The ignored `g14_perf_budgets` gate must remain unclaimed.
 
+## Bounded current evidence
+
+A disk-bounded campaign at commit `de8001e83bd4e09077d4cebbbdd23d0cebade194`
+used the exact mainnet range 0–150,000. Both implementations used full validation,
+the same stop hash, and CPU set 0–31. Core used three byte-identical restores;
+bitcoin-rs used one immutable framed archive and a fresh output directory per run.
+The bitcoin-rs processing runs enforced active 16 GiB RSS and disk-reserve guards.
+
+| Workload | bitcoin-rs median | Bitcoin Core 31.1 median | Core / bitcoin-rs | Result |
+|---|---:|---:|---:|---|
+| Full-validation local replay / chainstate reindex | 39.251s | 64.922s | 1.654× | Faster, below the 2× target |
+| Whole benchmark process wall | 42.025s | 67.023s | 1.595× | Faster, below the 2× target |
+| Historical transaction-index catch-up | 18.416s | 15.064s | 0.818× | Context only; the indexed contracts differ |
+
+The transaction-index comparison is not workload parity. Bitcoin Core stores
+transaction lookup positions. bitcoin-rs also stores confirmed headers, funding,
+spending, and script-history rows for RPC and Electrum queries. A nine-run bitcoin-rs
+row-limit sweep retained the 1,000,000-row limit. The 250,000-, 500,000-, 2,000,000-,
+and 4,000,000-row candidates, plus the Fjall `bytes_1` feature-only and
+`bytes_1`-plus-owned-value candidates, failed the required 1.05× throughput gate.
+Every bitcoin-rs TxIndex run produced the same logical digest.
+
+The full corpus, treatment, binary, timing, memory, free-space, restore, and rejected
+candidate custody is in
+[`bounded-performance-custody-v1.json`](data/end-to-end-sync/bounded-performance-custody-v1.json).
+The campaign retained one canonical corpus and deleted each disposable fixture before
+the next run. These bounded results do not satisfy the live-IBD, full-tip RSS, or
+Electrum-history gates above.
+
 ## Raw artifact integrity
 
 | Artifact | SHA-256 |
@@ -79,6 +108,7 @@ The ignored `g14_perf_budgets` gate must remain unclaimed.
 | `rs-spendable-local-nobody-a014.json` | `a464e6f6d7c29037c451720e0cbe924340ed7d85c51634c01ecfd25c3ee70339` |
 | `rs-replay-150k-parverify.json` | `f1704f895a958afcf5fcce2f829954056e9864af87bf4f0483c29af36599ac29` |
 | `rs-replay-150k-kernel.json` | `d722ab149c39c5f13e18c6358ab999f4c1f44ce46b37a9d0eb87bfd45e0b91a9` |
+| `bounded-performance-custody-v1.json` | `665c310a9ea939efbec8187ce4cb0ab76a50b1d2048909201cc4515e17a7b29c` |
 
 ## Full recorded stage timers
 
