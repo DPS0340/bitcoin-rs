@@ -6753,6 +6753,8 @@ fn fake_bitcoin_rs_daemon_script_head(
         r#"#!/usr/bin/env python3
 import base64, json, os, pathlib, signal, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+if any(arg == "--network" or arg.startswith("--network=") for arg in sys.argv[1:]):
+    raise SystemExit("daemon wrapper must not override the config-file network layer")
 
 PORT = {rpc_port}
 RPC_USER = {rpc_user:?}

@@ -487,7 +487,6 @@ command = (
     + [
         f"--config={config}",
         f"--data-dir={datadir}",
-        "--network=mainnet",
         f"--rpc-bind={rpc_bind}",
         f"--rpc-user={rpc_user}",
         f"--rpc-password={rpc_password}",
