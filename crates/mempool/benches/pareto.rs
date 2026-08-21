@@ -16,7 +16,9 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction};
+use bitcoin::{
+    Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute, transaction,
+};
 use bitcoin_rs_mempool::{MempoolEntry, ParetoFront};
 use criterion::{Criterion, criterion_group, criterion_main};
 
