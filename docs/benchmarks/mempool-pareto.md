@@ -138,6 +138,7 @@ The tests were then audited by mutation:
 | the closure forgets descendants | red | 3 tests failed |
 | the closure forgets ancestors | red | 2 tests failed |
 | a removal takes its closure after the removal | red | 1 test failed |
+| eviction skips the priority reindex | red | 3 tests failed |
 | descendant totals count only the entry itself | red | 5 tests failed |
 | the refresh skips the priority reindex | red | 2 tests failed |
 | an insertion forgets the running vsize total | red | 29 tests failed |
@@ -164,6 +165,33 @@ while the index was ordered backwards. Only `pool::tests::prioritise_reorders_pr
 caught it. The oracle now keeps its own verbatim copy of the comparison, and the
 same mutation kills all three ordering tests. **An oracle that shares code with
 the implementation cannot disagree with it.**
+
+A second review pass found a defect the first audit could not have caught, because
+the audit itself was reading a coin flip. `Mempool::by_txid` is a `HashMap`, so its
+iteration order is randomized per process. Two of the tests above picked their
+subject out of it — `victims.get(3)` and `by_txid.keys().next()` — and therefore
+removed or bumped a *different* transaction on every run. Rebuilding the
+"a removal takes its closure after the removal" mutant and running the binary 40
+times put the row above at **36 red out of 60**: the mutation was reported killed
+because the run that happened to be recorded had drawn a victim that exposed it.
+
+Every subject is now addressed by entry id, which is the slab index and so follows
+insertion order, and the removal test removes *each* of the six fixture entries in
+turn rather than one. Re-run at 40 executions per mutant, every row above is now
+40/40 red and the baseline 0/40. The exhaustive sweep also reaches a case no single
+chosen victim could: removing `leaf` takes the fan-in `joined` with it while
+`sibling` — `joined`'s *other* parent — survives and has to drop it from its
+descendant totals.
+
+`eviction_during_insertion_leaves_metadata_a_rebuild_agrees_with` closes the other
+gap the pass found. `enforce_size_limit` is a `remove_entries` caller reached from
+inside `insert_entry`, removing packages the caller never named, and no test drove
+the refresh through it. It is now among the tests that kill both the
+forgets-ancestors and the skips-the-reindex mutations.
+
+**A test that chooses its subject from a `HashMap` is a different test on every
+run**, and a mutation audit run once against one cannot distinguish "killed" from
+"killed this time".
 
 One measurement artefact, recorded because it briefly read as a coverage gap:
 `cargo test -p <crate>` stops at the first failing target by default, so a

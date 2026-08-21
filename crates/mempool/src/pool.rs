@@ -1797,29 +1797,104 @@ mod tests {
 
     /// The same, after a removal that leaves surviving relatives behind.
     ///
-    /// Removing the middle of a chain is the case the closure has to get right:
-    /// the parent loses descendants it still has to account for, and the child
-    /// loses an ancestor while remaining in the pool.
+    /// Every entry in the fixture is removed in turn, from a fresh pool each
+    /// time, rather than one chosen entry. Each victim exercises a different
+    /// shape: removing the middle of the chain leaves a parent that must forget
+    /// descendants and a child that must forget an ancestor, and removing
+    /// `leaf` takes the fan-in `joined` with it while `sibling` — `joined`'s
+    /// *other* parent — survives and has to drop it from its descendant totals.
+    /// That last one is not reachable by removing any single entry the closure
+    /// names directly, and is the case a chosen victim is most likely to miss.
+    ///
+    /// The victim is addressed by entry id, which is the slab index and so
+    /// follows insertion order. An earlier revision picked it out of
+    /// `pool.by_txid`, a `HashMap` whose iteration order is randomized per
+    /// process: the test removed a different entry on every run, and under a
+    /// mutation that took the closure after the removal instead of before it,
+    /// it went red in only 36 of 60 runs.
     #[test]
     fn incremental_metadata_matches_the_full_recompute_after_removals() -> Result<(), MempoolError>
     {
-        let (mut pool, _outs) = graph_pool()?;
+        for victim in 0..6_u32 {
+            let (mut pool, _outs) = graph_pool()?;
+            let removed = pool.remove_entry_and_descendants(victim);
+            assert!(
+                !removed.is_empty(),
+                "entry {victim} must be present in the fixture"
+            );
 
-        // `sibling` (label 4) is the second entry funded by root; removing it
-        // takes its own descendant `joined` with it and leaves root and the
-        // chain behind.
-        let victims = pool.by_txid.values().copied().collect::<Vec<_>>();
-        let Some(target) = victims.get(3).copied() else {
-            panic!("fixture must hold at least four entries");
+            let incremental = totals(&pool);
+            pool.recompute_all_metadata();
+            assert_eq!(
+                incremental,
+                totals(&pool),
+                "incremental removal metadata diverged from the full recompute \
+                 after removing entry {victim}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The eviction path is a `remove_entries` caller nothing else drives.
+    ///
+    /// `insert_entry` calls `enforce_size_limit` when an acceptance puts the
+    /// pool over `max_total_bytes`, and that removes packages the caller never
+    /// named. The refresh has to leave both the package totals and the priority
+    /// index in the state a full rebuild would, from inside the insertion that
+    /// triggered it.
+    #[test]
+    fn eviction_during_insertion_leaves_metadata_a_rebuild_agrees_with() -> Result<(), MempoolError>
+    {
+        let limits = MempoolLimits {
+            max_total_bytes: 400,
+            ..MempoolLimits::default()
         };
-        let _removed = pool.remove_entry_and_descendants(target);
+        let mut pool = Mempool::new(limits);
+
+        let root = tx(31, vec![OutPoint::null()]);
+        let root_out = OutPoint::new(root.compute_txid(), 0);
+        pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 500, 0, 1))?;
+        let child = tx(32, vec![root_out]);
+        let child_out = OutPoint::new(child.compute_txid(), 0);
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 1))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(tx(33, vec![child_out])),
+            100,
+            100_000,
+            2,
+            1,
+        ))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(tx(34, vec![OutPoint::null()])),
+            100,
+            200,
+            3,
+            1,
+        ))?;
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(tx(35, vec![OutPoint::null()])),
+            100,
+            300,
+            4,
+            1,
+        ))?;
+        assert!(
+            pool.len() < 5,
+            "the fixture must actually cross the size limit"
+        );
 
         let incremental = totals(&pool);
+        let index = pool.pareto.top_n(pool.pareto.len()).collect::<Vec<_>>();
         pool.recompute_all_metadata();
         assert_eq!(
             incremental,
             totals(&pool),
-            "incremental removal metadata diverged from the full recompute"
+            "eviction left package totals a full recompute disagrees with"
+        );
+        assert_eq!(
+            index,
+            pool.pareto.top_n(pool.pareto.len()).collect::<Vec<_>>(),
+            "eviction left a stale priority index behind"
         );
         Ok(())
     }
@@ -1856,22 +1931,28 @@ mod tests {
             assert_eq!(stats.total_fee, fee, "stats.total_fee wrong after {stage}");
         }
 
-        let (mut pool, _outs) = graph_pool()?;
+        let (mut pool, outs) = graph_pool()?;
         check(&pool, "inserts");
 
-        let Some(&txid) = pool.by_txid.keys().next() else {
+        // Addressed through the fixture's own handles, in insertion order.
+        // `pool.by_txid` is a `HashMap`, so picking from it would choose a
+        // different subject on every run — see
+        // `incremental_metadata_matches_the_full_recompute_after_removals`.
+        let Some(root) = outs.first().map(|out| out.txid) else {
             panic!("fixture must hold entries");
         };
-        assert!(pool.prioritise(txid, 250_000), "prioritise up must apply");
+        assert!(pool.prioritise(root, 250_000), "prioritise up must apply");
         check(&pool, "a positive fee delta");
 
         assert!(
-            pool.prioritise(txid, -100_000),
+            pool.prioritise(root, -100_000),
             "prioritise down must apply"
         );
         check(&pool, "a negative fee delta");
 
-        let Some(&victim_txid) = pool.by_txid.keys().find(|candidate| **candidate != txid) else {
+        // `mid`: removing it takes the rest of the chain with it and leaves
+        // both a surviving parent and an unrelated entry behind.
+        let Some(victim_txid) = outs.get(1).map(|out| out.txid) else {
             panic!("fixture must hold a second entry");
         };
         let removed = pool.remove_by_txid(&victim_txid);
@@ -1893,15 +1974,10 @@ mod tests {
     /// stale.
     #[test]
     fn prioritise_reindexes_the_descendants_it_lifts() -> Result<(), MempoolError> {
-        let (mut pool, _outs) = graph_pool()?;
+        let (mut pool, outs) = graph_pool()?;
 
         // Lift the chain root, which every entry in the chain descends from.
-        let Some((&txid, _)) = pool
-            .by_txid
-            .iter()
-            .min_by_key(|(_, id)| **id)
-            .map(|(txid, id)| (txid, id))
-        else {
+        let Some(txid) = outs.first().map(|out| out.txid) else {
             panic!("fixture must hold entries");
         };
         assert!(pool.prioritise(txid, 5_000_000), "prioritise must apply");
