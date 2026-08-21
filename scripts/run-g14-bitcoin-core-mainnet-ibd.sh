@@ -340,10 +340,10 @@ try:
 
     require_hash(bitcoin_cli_command, datadir, config, start_height, start_hash, "start")
     require_hash(bitcoin_cli_command, datadir, config, stop_height, stop_hash, "stop")
+    elapsed = time.monotonic() - started
     run_cli(bitcoin_cli_command, datadir, config, ["stop"])
     stopped = True
     wait_for_stop(process, SHUTDOWN_TIMEOUT_SECONDS)
-    elapsed = time.monotonic() - started
 finally:
     if not stopped and process.poll() is None:
         cleanup_after_failure(process, bitcoin_cli_command, datadir, config)

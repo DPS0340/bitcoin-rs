@@ -1747,6 +1747,19 @@ fn bitcoin_core_mainnet_ibd_wrapper_shutdown_wait_is_not_startup_timeout()
     let elapsed = started.elapsed();
 
     assert_success(&output);
+    let stdout = String::from_utf8(output.stdout)?;
+    let reported_elapsed = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("bitcoin-core/mainnet-ibd   time:   [")
+                .and_then(|values| values.split_whitespace().nth(2))
+        })
+        .ok_or("missing reported Bitcoin Core IBD elapsed time")?
+        .parse::<f64>()?;
+    assert!(
+        elapsed.as_secs_f64() - reported_elapsed >= 0.45,
+        "reported IBD time must exclude shutdown wait, elapsed={elapsed:?}, reported={reported_elapsed}s"
+    );
     assert!(
         elapsed >= Duration::from_millis(450),
         "expected shutdown wait to exceed startup timeout, elapsed={elapsed:?}"
