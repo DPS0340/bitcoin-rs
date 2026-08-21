@@ -2363,6 +2363,27 @@ fn apply_block_admitted(
             &block_bytes,
             handles.cache_block_bodies_in_memory,
         );
+        // The record carries no header. `BlockRecord`'s is filled from the block
+        // tree when a caller resolves one, which is sound only because the
+        // header is already in the tree by the time the record is in the log —
+        // `applied_header_tip` above, through these same handles, is what puts
+        // it there.
+        //
+        // That ordering is the whole of the argument, and until this assertion
+        // nothing enforced it. Reverse the two and every `getblock` /
+        // `getblockheader` answer for a freshly applied block loses its header,
+        // with nothing failing at the point the mistake is made.
+        //
+        // The tree lock is free here: `applied_header_tip` released its write
+        // guard before returning. The check is one hash-table lookup, and it is
+        // compiled out of release builds — so this is a guard for the test
+        // suite, where it runs on every block any node test applies.
+        debug_assert!(
+            handles.block_tree.read().node_by_hash(block_hash).is_some(),
+            "block {} is entering the record log with no block-tree node; \
+             its header would be unrecoverable",
+            block_hash.to_string_be()
+        );
         handles.blocks.write().push(block_record);
     }
     let block_record_dur = block_record_started.elapsed();

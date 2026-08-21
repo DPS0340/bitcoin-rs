@@ -61,6 +61,44 @@ It is not reachable in a running node:
 `Context::header_record` (`context.rs:704`) was already the precedent: it builds
 a record whose header comes from `tree.node_by_hash(hash)`, an O(1) hash lookup.
 
+One of these needed checking rather than assuming. A reorg calls
+`invalidate_subtree`, and if `lookup` filtered on node status then an
+invalidated block's header would become unreachable while its record was still
+in the log — a hole straight through the argument. `lookup` (`tree.rs:146-154`)
+matches on hash alone, and `by_hash` is only ever `insert_unique`d (`:615`), so a
+hash resolves for the life of the process whatever happens to the branch it is
+on. Reorged-out blocks in fact answer *better* than before: the record is popped
+on disconnect, but the tree node stays, so `getblockheader` still serves a
+header.
+
+### The ordering is enforced, not just argued
+
+Everything above rests on one ordering: the header is in the tree before the
+record is in the log. Nothing checked it. The push site now does:
+
+```rust
+debug_assert!(
+    handles.block_tree.read().node_by_hash(block_hash).is_some(),
+    "block {} is entering the record log with no block-tree node; \
+     its header would be unrecoverable",
+    block_hash.to_string_be()
+);
+```
+
+The tree lock is free at that point — `applied_header_tip` released its write
+guard before returning — and the check is one hash-table lookup, compiled out of
+release builds.
+
+It is not a lone test. Moving the record push above the tree insert, which is
+exactly the mistake it defends against, fails **52 node tests**, each on this
+assertion naming the block that would have lost its header. Every node test that
+applies a block now exercises the invariant.
+
+This is still weaker than Bitcoin Core, where `CBlockIndex` holds the header
+*and* the payload facts in one structure, so "a record with no index entry" is
+not representable. Here they are two structures held in step by an ordering.
+Merging them is the Core-shaped end state and a separate change.
+
 ## What changed
 
 Every constructor leaves `header: None`. `header_record` is the only thing that
@@ -119,6 +157,7 @@ an invalid mutation once already.
 | `applied_block_record` stores the header again | red | 1 test failed |
 | `from_block_bytes` stores the header again | red | 4 tests failed |
 | the header is un-boxed | red | 1 test failed |
+| the record is pushed before the header reaches the tree | red | 52 tests failed |
 
 Baseline and restored: green across all 14 test targets.
 
