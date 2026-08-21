@@ -52,3 +52,7 @@ criterion.workspace = true
 [[bench]]
 name = "chaininfo"
 harness = false
+
+[[bench]]
+name = "blocklookup"
+harness = false

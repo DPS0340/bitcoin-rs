@@ -186,6 +186,72 @@ impl BlockLog {
     pub fn total_tx_count(&self) -> u64 {
         self.tx_count_before(self.cumulative_tx_count.len())
     }
+
+    /// The first record at `height`, or `None` when the log has none.
+    ///
+    /// The log is appended in height order and only ever popped from the tail
+    /// (`apply::disconnect_block` checks the tail's hash before popping), so it
+    /// is non-decreasing by height and can be searched rather than scanned.
+    ///
+    /// The direct index is tried first because a log with no gaps and no
+    /// duplicate heights — every log, until a reorg leaves one — has the record
+    /// for height `h` at index `h`. It is accepted only when the record and its
+    /// predecessor both agree, so a log that *has* drifted falls through to the
+    /// search rather than answering with the wrong record.
+    #[must_use]
+    pub fn record_at_height(&self, height: u32) -> Option<&BlockRecord> {
+        if let Ok(index) = usize::try_from(height)
+            && let Some(record) = self.records.get(index)
+            && record.height == height
+            && index
+                .checked_sub(1)
+                .and_then(|previous| self.records.get(previous))
+                .is_none_or(|previous| previous.height < height)
+        {
+            return Some(record);
+        }
+        let index = self.first_index_at_height(height)?;
+        self.records.get(index)
+    }
+
+    /// The record at `height` whose hash is `hash`.
+    ///
+    /// A reorg can leave more than one record at a height, so the search finds
+    /// the run and then walks it. The run is the number of times that height has
+    /// been connected, not a function of chain length.
+    ///
+    /// This is what `getblock`, `getblockheader`, `getblockstats`, the REST block
+    /// endpoint and `getrawtransaction` with a blockhash resolve through. Each
+    /// used to scan the whole log for it, with the height already in hand from
+    /// the block tree.
+    #[must_use]
+    pub fn record_at_height_hash(&self, height: u32, hash: Hash256) -> Option<&BlockRecord> {
+        let mut index = self.first_index_at_height(height)?;
+        while index < self.records.len() && self.records[index].height == height {
+            if self.records[index].hash == hash {
+                return self.records.get(index);
+            }
+            index = index.saturating_add(1);
+        }
+        None
+    }
+
+    /// Index of the first record at `height`.
+    fn first_index_at_height(&self, height: u32) -> Option<usize> {
+        debug_assert!(
+            self.records
+                .windows(2)
+                .all(|pair| pair[0].height <= pair[1].height),
+            "the block log must be non-decreasing by height to be searched"
+        );
+        let index = self
+            .records
+            .partition_point(|record| record.height < height);
+        self.records
+            .get(index)
+            .filter(|record| record.height == height)?;
+        Some(index)
+    }
 }
 
 impl core::ops::Deref for BlockLog {
@@ -1013,11 +1079,14 @@ impl Context {
         //    identity wins; enrich with a height-matched cached payload, else
         //    with durable body metadata.
         if let Some(mut record) = self.header_record(hash) {
+            // The tree has already answered with the height, and the log is
+            // ordered by height, so this is a search. Scanning it made every
+            // `getblock` and `getblockheader` cost time linear in chain length —
+            // and `verifychain` one such scan per block it checked.
             if let Some(cached) = self
                 .blocks
                 .read()
-                .iter()
-                .find(|candidate| candidate.hash == hash && candidate.height == record.height)
+                .record_at_height_hash(record.height, hash)
             {
                 return Some(cached.clone());
             }
@@ -1082,11 +1151,10 @@ impl Context {
             let hash = self.hash_at_height_from_tip(&tip, height)?;
             return self.record_for_hash(hash);
         }
-        self.blocks
-            .read()
-            .iter()
-            .find(|candidate| candidate.height == height)
-            .cloned()
+        // No applied tip: the log is the only authority on which record is at
+        // this height, and it is ordered by height, so search it. The first
+        // record at a duplicated height is what the scan this replaces returned.
+        self.blocks.read().record_at_height(height).cloned()
     }
 
     /// Returns serialized block bytes from the record or durable storage.
@@ -1164,6 +1232,137 @@ fn bitcoin_network(network: Network) -> bitcoin::Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log whose heights are non-decreasing but not a clean `0..n`.
+    ///
+    /// Height 3 is recorded three times, as two reorgs leave it; the log starts
+    /// at height 1, as a restored or pruned log may; and heights 6 and 7 are
+    /// missing. All three break the "record for height `h` is at index `h`"
+    /// assumption `record_at_height` tries first, so the fixture exercises the
+    /// search rather than the shortcut.
+    ///
+    /// The starting height is load-bearing, not decoration. With the log
+    /// starting at zero, index 3 holds the *first* record at height 3, so a
+    /// shortcut that skipped the "is the predecessor lower?" check would answer
+    /// correctly anyway. Starting at one puts a duplicate at index 3 and the run
+    /// head at index 2, which is where the two disagree — the mutation that
+    /// removes that check survived the first version of this fixture.
+    fn shaped_log() -> BlockLog {
+        const HEIGHTS: [u32; 8] = [1, 2, 3, 3, 3, 4, 8, 9];
+        HEIGHTS
+            .into_iter()
+            .enumerate()
+            .map(|(index, height)| {
+                let mut hash = [0_u8; 32];
+                // Distinct per record, not per height: the duplicates have to be
+                // distinguishable by hash or the walk has nothing to walk.
+                hash[0] = u8::try_from(index).unwrap_or(0);
+                BlockRecord {
+                    hash: Hash256::from_le_bytes(&hash),
+                    height,
+                    block_hex: String::new(),
+                    body_size: 100 + index,
+                    header_hex: String::new(),
+                    tx_count: 1 + index,
+                    time: 1_000 + u32::try_from(index).unwrap_or(0),
+                }
+            })
+            .collect()
+    }
+
+    /// The search must land on exactly what a linear scan of the log finds.
+    ///
+    /// `record_for_hash` had the height from the block tree and scanned the log
+    /// for the matching pair anyway. The scan made no assumption about ordering;
+    /// the search assumes the log is non-decreasing by height. This holds the
+    /// search to the scan over every height in and around the fixture, and over
+    /// every hash in it — including hashes at the wrong height, which must find
+    /// nothing.
+    #[test]
+    fn record_at_height_hash_matches_the_scan_it_replaced() {
+        let log = shaped_log();
+        let hashes = log.iter().map(|record| record.hash).collect::<Vec<_>>();
+
+        for height in 0_u32..11 {
+            for hash in &hashes {
+                let scanned = log
+                    .iter()
+                    .find(|candidate| candidate.hash == *hash && candidate.height == height);
+                assert_eq!(
+                    log.record_at_height_hash(height, *hash).map(|r| r.time),
+                    scanned.map(|r| r.time),
+                    "search and scan disagree at height {height}"
+                );
+            }
+        }
+    }
+
+    /// The same for the height-only lookup, which has to pick the *first*
+    /// record at a duplicated height because that is what the scan returned.
+    #[test]
+    fn record_at_height_matches_the_scan_it_replaced() {
+        let log = shaped_log();
+        for height in 0_u32..12 {
+            let scanned = log.iter().find(|candidate| candidate.height == height);
+            assert_eq!(
+                log.record_at_height(height).map(|r| r.time),
+                scanned.map(|r| r.time),
+                "search and scan disagree at height {height}"
+            );
+        }
+    }
+
+    /// `block_by_height` with no applied tip reads the log directly.
+    ///
+    /// That fallback used to scan for the first record at the height and now
+    /// searches for it. It is the path a Context takes before the first tip is
+    /// published, and nothing covered it: a mutation replacing it with "the last
+    /// record in the log" stayed green.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn block_by_height_without_an_applied_tip_reads_the_log() {
+        let ctx = Context::new();
+        for record in shaped_log().iter() {
+            ctx.add_block(record.clone());
+        }
+
+        for height in 0_u32..12 {
+            let expected = shaped_log()
+                .iter()
+                .find(|candidate| candidate.height == height)
+                .map(|record| record.hash);
+            assert_eq!(
+                ctx.block_by_height(height).map(|record| record.hash),
+                expected,
+                "block_by_height disagrees with the log at height {height}"
+            );
+        }
+    }
+
+    /// Every record at a duplicated height must be reachable by its own hash.
+    ///
+    /// This is the case the duplicate-height walk exists for: a reorg leaves
+    /// more than one record at a height, and a search that stopped at the first
+    /// would answer `None` for the others — turning `getblock` on a stale branch
+    /// into "block not found".
+    #[test]
+    fn every_record_at_a_duplicated_height_is_reachable() {
+        let log = shaped_log();
+        let duplicates = log
+            .iter()
+            .filter(|record| record.height == 3)
+            .map(|record| (record.hash, record.time))
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 3, "the fixture must duplicate height 3");
+
+        for (hash, time) in duplicates {
+            assert_eq!(
+                log.record_at_height_hash(3, hash).map(|r| r.time),
+                Some(time),
+                "a record at a duplicated height was not reachable by its hash"
+            );
+        }
+    }
 
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
