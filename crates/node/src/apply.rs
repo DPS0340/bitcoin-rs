@@ -3604,20 +3604,17 @@ fn applied_block_record(
     } else {
         String::new()
     };
-    let header = block_bytes
-        .get(..SERIALIZED_BLOCK_HEADER_LEN)
-        .and_then(|prefix| prefix.try_into().ok())
-        .or_else(|| {
-            bitcoin::consensus::encode::serialize(&block.header)
-                .try_into()
-                .ok()
-        });
     BlockRecord {
         hash: block_hash,
         height,
         block_hex,
         body_size: block_bytes.len(),
-        header,
+        // Not stored. `applied_header_tip` above has already put this block's
+        // header in the block tree — the record is pushed after that, through
+        // the same handles — and the tree never drops a node. Keeping a second
+        // copy here kept it for every block on the chain, for the life of the
+        // process.
+        header: None,
         tx_count: block.txdata.len(),
         time: block.header.time,
     }
