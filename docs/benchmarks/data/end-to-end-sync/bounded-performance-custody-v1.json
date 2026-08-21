@@ -22,7 +22,8 @@
       "txindex": false
     },
     "disk_contract": {
-      "canonical_count": 1,
+      "canonical_archive_count": 2,
+      "canonical_root_count": 1,
       "check_interval_seconds": 1,
       "disposable_present_at_completion": false,
       "max_disposable_fixtures": 1,
@@ -41,6 +42,8 @@
     "hostname": "alpha-Precision-7920-Tower"
   },
   "processing": {
+    "accepted_production_result": true,
+    "accepted_without_contract_change": true,
     "bitcoin_core": {
       "binary_sha256": "986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08",
       "dbcache_mib": 450,
@@ -404,7 +407,8 @@
   },
   "verdict": {
     "landed_source_change": false,
-    "next_step_requires_user_approved_contract_or_architecture_change": true,
+    "next_step_requires_user_approved_contract_or_architecture_change": false,
+    "processing_result_accepted_without_contract_change": true,
     "processing_speed_ratio": 1.6540165439001833,
     "processing_target_met": false,
     "selected_txindex_max_rows": 1000000,

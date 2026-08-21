@@ -65,8 +65,8 @@ Later code changed both failed bitcoin-rs paths, but no completed rerun is attac
 |---|---|---|
 | IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Not measured |
 | UTXO commit p95 | ≤50ms for serialized blocks ≥1MB | Not captured |
-| Electrum history p95 | ≤30ms over 10,000 non-empty calls | Not captured |
-| Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Not measured at a completed tip; attached runs have indexes disabled |
+| Electrum history p95 | ≤30ms over 10,000 non-empty calls | Bounded 0–150,000 p95: 1.213ms; current-tip evidence not captured |
+| Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Bounded txindex-only RSS: 313.1MB; completed current-tip evidence with both indexes not captured |
 
 The ignored `g14_perf_budgets` gate must remain unclaimed.
 
@@ -84,6 +84,9 @@ The bitcoin-rs processing runs enforced active 16 GiB RSS and disk-reserve guard
 | Whole benchmark process wall | 42.025s | 67.023s | 1.595× | Faster, below the 2× target |
 | Historical transaction-index catch-up | 18.416s | 15.064s | 0.818× | Context only; the indexed contracts differ |
 
+The campaign accepts the measured 1.654× production replay result rather than weakening
+validation, persistence, crash recovery, or reorg-availability semantics to claim 2×.
+
 The transaction-index comparison is not workload parity. Bitcoin Core stores
 transaction lookup positions. bitcoin-rs also stores confirmed headers, funding,
 spending, and script-history rows for RPC and Electrum queries. A nine-run bitcoin-rs
@@ -92,12 +95,20 @@ and 4,000,000-row candidates, plus the Fjall `bytes_1` feature-only and
 `bytes_1`-plus-owned-value candidates, failed the required 1.05× throughput gate.
 Every bitcoin-rs TxIndex run produced the same logical digest.
 
+On the same bounded tip, setting `TCP_NODELAY` on every accepted Electrum socket
+reduced `blockchain.scripthash.get_history` p95 from 42.749ms to a three-run median
+of 1.213ms over 10,000 non-empty calls, a 35.237× speedup. This clears the latency
+budget on the bounded corpus. It does not replace current-tip evidence.
+
 The full corpus, treatment, binary, timing, memory, free-space, restore, and rejected
 candidate custody is in
 [`bounded-performance-custody-v1.json`](data/end-to-end-sync/bounded-performance-custody-v1.json).
-The campaign retained one canonical corpus and deleted each disposable fixture before
-the next run. These bounded results do not satisfy the live-IBD, full-tip RSS, or
-Electrum-history gates above.
+The Electrum treatment, raw artifact hashes, tests, and mutation proof are in
+[`electrum-nodelay-custody-v1.json`](data/end-to-end-sync/electrum-nodelay-custody-v1.json).
+The campaign retained one bounded corpus root with one canonical archive per
+implementation and deleted each disposable fixture before the next run. These bounded
+results do not satisfy the live-IBD, current-tip RSS, or current-tip Electrum-history
+gates above.
 
 ## Raw artifact integrity
 
@@ -108,7 +119,8 @@ Electrum-history gates above.
 | `rs-spendable-local-nobody-a014.json` | `a464e6f6d7c29037c451720e0cbe924340ed7d85c51634c01ecfd25c3ee70339` |
 | `rs-replay-150k-parverify.json` | `f1704f895a958afcf5fcce2f829954056e9864af87bf4f0483c29af36599ac29` |
 | `rs-replay-150k-kernel.json` | `d722ab149c39c5f13e18c6358ab999f4c1f44ce46b37a9d0eb87bfd45e0b91a9` |
-| `bounded-performance-custody-v1.json` | `665c310a9ea939efbec8187ce4cb0ab76a50b1d2048909201cc4515e17a7b29c` |
+| `bounded-performance-custody-v1.json` | `ce3e561dbd2119579f359b7cf55f8b84211c4c1eec3953cf40762f07faabb3cf` |
+| `electrum-nodelay-custody-v1.json` | `b57087cf368d3e56da75c543c6ba780115a7a6684db03a11e2692d6648b29abf` |
 
 ## Full recorded stage timers
 
