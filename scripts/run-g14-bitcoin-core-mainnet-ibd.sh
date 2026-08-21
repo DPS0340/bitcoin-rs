@@ -5,7 +5,7 @@ usage() {
   printf '%s\n' \
     'usage: run-g14-bitcoin-core-mainnet-ibd.sh --ibd-start-height <height> --ibd-stop-height <height> --ibd-start-hash <hash> --ibd-stop-hash <hash> --datadir <path> --bitcoin-core-config <path> [--bitcoind-command <command>] [--bitcoin-cli-command <command>] [--command-output <path>] [--poll-interval-seconds <seconds>] [--startup-timeout-seconds <seconds>] [--ibd-timeout-seconds <seconds> (default: 86400)] [--force] [-- <bitcoind-arg>...]' \
     '' \
-    'Runs a Bitcoin Core mainnet IBD command, validates the measured Core node reaches the requested window, then emits canonical Criterion-style bitcoin-core/mainnet-ibd timing for G14 evidence capture.'
+    'Creates a fresh datadir, runs Bitcoin Core network-active over P2P v1, requires the exact mainnet IBD endpoint, then emits canonical Criterion-style bitcoin-core/mainnet-ibd timing for G14 evidence capture.'
 }
 
 if (($# == 0)); then
@@ -35,6 +35,7 @@ RESERVED_BITCOIND_ARGS = (
     "-signet",
     "-testnet",
     "-testnet4",
+    "-v2transport",
 )
 
 
@@ -176,18 +177,18 @@ def chain_blocks_headers(data: dict) -> tuple[int, int]:
     return blocks, headers
 
 
-def require_chain_start(data: dict, start_height: int) -> None:
-    blocks, _headers = chain_blocks_headers(data)
-    if blocks > start_height:
-        die(
-            "measured Bitcoin Core node starts past requested IBD start height "
-            f"{start_height}: blocks={blocks}"
-        )
-
-
 def require_chain_tip(data: dict, stop_height: int) -> bool:
     blocks, headers = chain_blocks_headers(data)
     return blocks >= stop_height and headers >= stop_height
+
+
+def require_exact_tip(data: dict, stop_height: int) -> None:
+    blocks, headers = chain_blocks_headers(data)
+    if blocks != stop_height or headers != stop_height:
+        die(
+            "measured Bitcoin Core node must end exactly at IBD stop height "
+            f"{stop_height}: blocks={blocks}, headers={headers}"
+        )
 
 
 def require_hash(
@@ -301,11 +302,23 @@ command = (
         f"-datadir={datadir}",
         f"-conf={config}",
         "-chain=main",
-        "-networkactive=0",
+        "-networkactive=1",
+        "-v2transport=0",
         "-daemon=0",
         *bitcoind_args,
     ]
 )
+
+# The absent path is the start-state proof. Network is active from process
+# launch, so first-RPC height cannot be used as a race-free start attestation.
+if datadir.exists():
+    die(f"--datadir already exists; refusing to reuse state: {datadir}")
+try:
+    datadir.mkdir()
+except FileExistsError:
+    die(f"--datadir already exists; refusing to reuse state: {datadir}")
+except FileNotFoundError:
+    die(f"--datadir parent directory does not exist: {datadir.parent}")
 started = time.monotonic()
 with command_output.open("w", encoding="utf-8") as output:
     process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
@@ -328,8 +341,6 @@ try:
             time.sleep(poll_interval)
             continue
         if not observed_start:
-            require_chain_start(info, start_height)
-            run_cli(bitcoin_cli_command, datadir, config, ["setnetworkactive", "true"])
             observed_start = True
             ibd_deadline = time.monotonic() + ibd_timeout
         if require_chain_tip(info, stop_height):
@@ -340,6 +351,8 @@ try:
 
     require_hash(bitcoin_cli_command, datadir, config, start_height, start_hash, "start")
     require_hash(bitcoin_cli_command, datadir, config, stop_height, stop_hash, "stop")
+    info = read_chain_info(bitcoin_cli_command, datadir, config)
+    require_exact_tip(info, stop_height)
     elapsed = time.monotonic() - started
     run_cli(bitcoin_cli_command, datadir, config, ["stop"])
     stopped = True
