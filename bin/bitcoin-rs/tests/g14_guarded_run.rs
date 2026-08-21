@@ -385,6 +385,64 @@ pathlib.Path(sys.argv[1]).write_bytes(b"digest")
 }
 
 #[test]
+fn repeated_unit_teardown_never_becomes_guard_error() -> Result<(), Box<dyn std::error::Error>> {
+    require_systemd_user_units()?;
+
+    let temp = tempfile::tempdir()?;
+    for iteration in 0..64 {
+        let root = temp.path().join(iteration.to_string());
+        fs::create_dir(&root)?;
+        let run = GuardRun::new(&root, root.join("fixture"), unique_unit("rapid-exit"));
+        let output = run.execute(1024, 1 << 40, &["/bin/sleep".as_ref(), "0.05".as_ref()])?;
+        assert!(output.status.success(), "{}", diagnostics(&output));
+        let verdict = run.verdict()?;
+        assert_eq!(verdict["exit_code"], 0);
+        assert!(verdict["breach_reason"].is_null());
+    }
+    Ok(())
+}
+
+#[test]
+fn disappearing_cgroup_member_is_not_a_guard_error() -> Result<(), Box<dyn std::error::Error>> {
+    require_systemd_user_units()?;
+
+    let temp = tempfile::tempdir()?;
+    fs::write(
+        temp.path().join("sitecustomize.py"),
+        r#"import errno
+from pathlib import Path
+
+original_open = Path.open
+injected = False
+
+def open_with_enodev(path, *args, **kwargs):
+    global injected
+    if not injected and path.name == "cgroup.procs":
+        injected = True
+        raise OSError(errno.ENODEV, "injected cgroup teardown")
+    return original_open(path, *args, **kwargs)
+
+Path.open = open_with_enodev
+"#,
+    )?;
+    let run = GuardRun::new(
+        temp.path(),
+        temp.path().join("fixture"),
+        unique_unit("enodev"),
+    );
+    let output = run
+        .command(1024, 0, 1 << 40, &["/bin/sleep".as_ref(), "0.05".as_ref()])
+        .env("PYTHONPATH", temp.path())
+        .output()?;
+
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    let verdict = run.verdict()?;
+    assert_eq!(verdict["exit_code"], 0);
+    assert!(verdict["breach_reason"].is_null());
+    Ok(())
+}
+
+#[test]
 fn child_failure_removes_fixture_and_propagates_status() -> Result<(), Box<dyn std::error::Error>> {
     require_systemd_user_units()?;
 

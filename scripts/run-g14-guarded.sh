@@ -14,6 +14,7 @@ fi
 
 exec python3 - "$@" <<'PY'
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ BREACH_EXIT = 75
 SENSITIVE_OPTIONS = frozenset(("--rpc-password",))
 INTERNAL_ERROR_EXIT = 70
 UNIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+VOLATILE_MEMBER_ERRNOS = frozenset((errno.ENODEV, errno.ENOENT, errno.ESRCH))
 
 
 def die(message: str, status: int = 2) -> None:
@@ -139,7 +141,10 @@ def cgroup_pids(path: Path) -> set[int]:
                     except ValueError:
                         continue
             pending.extend(entry for entry in directory.iterdir() if entry.is_dir())
-        except (FileNotFoundError, PermissionError):
+        except OSError as error:
+            # A systemd cgroup can go offline between enumeration syscalls.
+            if error.errno not in VOLATILE_MEMBER_ERRNOS:
+                raise
             continue
     return pids
 
@@ -155,7 +160,12 @@ def aggregate_rss_bytes(path: Path) -> int:
                         if len(fields) >= 2:
                             total_kib += int(fields[1])
                         break
-        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        except ValueError:
+            continue
+        except OSError as error:
+            # Processes can exit while their live RSS sample is being read.
+            if error.errno not in VOLATILE_MEMBER_ERRNOS:
+                raise
             continue
     return total_kib * 1024
 
