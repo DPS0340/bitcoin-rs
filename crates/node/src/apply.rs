@@ -6210,8 +6210,7 @@ mod consensus_rule_tests {
     /// success here.
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
-    fn apply_rejects_a_coinbase_that_pays_more_than_the_subsidy()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_rejects_a_coinbase_that_pays_more_than_the_subsidy() {
         let subsidy =
             bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
         assert_eq!(
@@ -6236,7 +6235,6 @@ mod consensus_rule_tests {
             exact.is_ok(),
             "the same block claiming exactly the subsidy must apply, got {exact:?}"
         );
-        Ok(())
     }
 
     /// The allowance includes the fees the block actually earned.
@@ -6246,8 +6244,7 @@ mod consensus_rule_tests {
     /// that collects fees, and it would let a block claim fees it never earned.
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
-    fn the_coinbase_allowance_counts_the_fees_the_block_earned()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn the_coinbase_allowance_counts_the_fees_the_block_earned() {
         let subsidy =
             bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
         // The seeded output is 1000 sats and the spend pays 1 sat onward.
@@ -6269,7 +6266,6 @@ mod consensus_rule_tests {
             ),
             "one satoshi past the fee must be refused, got {over:?}"
         );
-        Ok(())
     }
 
     /// Applies a height-1 regtest block whose only transaction is a coinbase
