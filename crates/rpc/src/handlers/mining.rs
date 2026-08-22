@@ -1204,13 +1204,23 @@ mod getblocktemplate_tests {
     }
 
     /// Data that is not a block is a decode error, not an invalid block.
+    ///
+    /// Both halves of the decode are covered: `zz` is not hexadecimal at all,
+    /// and `deadbeef` is perfectly good hexadecimal that is not a block. They
+    /// fail on different lines and must answer the same way.
     #[test]
     fn a_proposal_whose_data_is_not_a_block_is_a_decode_error() {
         let ctx = context_with_chain(Network::Regtest, 1_700_000_000);
-        let error = getblocktemplate(&ctx, &json!([{"mode": "proposal", "data": "deadbeef"}]))
-            .err()
-            .unwrap_or_else(|| panic!("undecodable data must be refused"));
-        assert_eq!(error.code(), RpcError::CORE_DESERIALIZATION_ERROR);
+        for data in ["zz", "deadbeef"] {
+            let error = getblocktemplate(&ctx, &json!([{"mode": "proposal", "data": data}]))
+                .err()
+                .unwrap_or_else(|| panic!("undecodable data must be refused: {data}"));
+            assert_eq!(
+                error.code(),
+                RpcError::CORE_DESERIALIZATION_ERROR,
+                "for {data}"
+            );
+        }
     }
 
     /// With no validator installed the node says so rather than approving.
