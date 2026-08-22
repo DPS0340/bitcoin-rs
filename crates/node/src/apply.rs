@@ -1875,6 +1875,21 @@ struct PreparedApply {
     resolved: Arc<ResolvedUtxoView>,
 }
 
+/// Per-check durations, for the `apply_block: profile` trace.
+///
+/// `pow_self` is zero when the caller asked for [`PowCheck::Skipped`]; the check
+/// did not run, so there is no time to report.
+#[derive(Clone, Copy, Debug, Default)]
+struct ValidationTimings {
+    pow_self: core::time::Duration,
+    block_rules: core::time::Duration,
+    bip30_bip34: core::time::Duration,
+    pow_limit: core::time::Duration,
+    script_verify: core::time::Duration,
+    coinbase_maturity: core::time::Duration,
+    bip68: core::time::Duration,
+}
+
 /// Parses a block and resolves the outputs it spends.
 ///
 /// `source` is where prevouts come from. Today that is always the committed
@@ -1999,28 +2014,55 @@ fn apply_block_inner(
     apply_block_admitted(handles, block, provided_serialized, None, &transition)
 }
 
-/// The apply itself, with the admission permit and the transition lock held.
+/// Whether a block's own proof of work must satisfy its declared target.
 ///
-/// Callers MUST hold both. `handles.chain_transition` is what serializes this
-/// against another connect or a disconnect; the admission permit only keeps a
-/// checkpoint close from cutting across it.
+/// Bitcoin Core's `TestBlockValidity` takes `fCheckPOW = false` when it answers
+/// a `getblocktemplate` proposal: a proposal is a block whose nonce has not been
+/// searched for yet, so demanding one would reject every honest proposal. The
+/// *declared* difficulty is a separate question and stays checked either way --
+/// `check_pow_limit_and_continuity` is below this switch, not behind it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PowCheck {
+    /// The header hash must meet its declared target. Every connected block.
+    Required,
+    /// Skip the hash-versus-target test. Proposals only.
+    Skipped,
+}
+
+/// What the validation half of an apply established, for the half that mutates.
 ///
-/// Split from [`apply_block_inner`] so a window can take both once across its
-/// preparation and all of its ordered commits. Re-entering per block would be
-/// two read guards on the same lock, which deadlocks against a shutdown waiting
-/// on the write side, and would leave gaps in which another applier could move
-/// the chain out from under prepared state.
+/// Every other local the checks build -- the verify flags, the kernel block, the
+/// softfork state -- is consumed by those checks and does not outlive them.
+struct ValidatedBlock {
+    prior: Option<Arc<TipSnapshot>>,
+    height: u32,
+    block_hash: bitcoin_rs_primitives::Hash256,
+    tx_plan: BlockTxPlan,
+    resolved: Arc<ResolvedUtxoView>,
+    timings: ValidationTimings,
+}
+
+/// Runs every consensus check an apply performs, and mutates nothing.
+///
+/// This is the whole of `apply_block_admitted` up to its first write. It is a
+/// separate function so that `test_block_validity` -- the `getblocktemplate`
+/// proposal path -- runs *these* checks rather than a second set written to
+/// resemble them. A proposal validator that drifted from the connect path would
+/// answer "valid" for blocks the node then rejects, which is worse than
+/// answering nothing at all.
+///
+/// Deliberately one straight run of checks: the order is consensus-significant
+/// and splitting it into named halves would hide that.
 #[allow(clippy::too_many_lines)]
-fn apply_block_admitted(
+fn validate_block_for_apply(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply>,
-    _transition: &ChainTransition<'_>,
-) -> core::result::Result<TipSnapshot, ApplyError> {
+    pow_check: PowCheck,
+) -> core::result::Result<ValidatedBlock, ApplyError> {
     use bitcoin::hashes::Hash as _;
 
-    let total_started = quanta::Instant::now();
     let block_hash =
         bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
     let prev_hash =
@@ -2032,14 +2074,17 @@ fn apply_block_admitted(
     // any structural checks. Contextual difficulty-adjustment validation
     // (verifying the declared target matches the network's expected
     // difficulty at this height) requires `BlockTree` state — deferred.
-    let pow_self_started = quanta::Instant::now();
-    let declared_target = block.header.target();
-    let pow_self_result = block.header.validate_pow(declared_target);
-    let pow_self_dur = pow_self_started.elapsed();
-    metrics::histogram!("node.apply_block.pow_self_consistency_seconds")
-        .record(pow_self_dur.as_secs_f64());
-    if pow_self_result.is_err() {
-        return Err(ApplyError::ProofOfWork { hash: block_hash });
+    let mut pow_self_dur = core::time::Duration::ZERO;
+    if pow_check == PowCheck::Required {
+        let pow_self_started = quanta::Instant::now();
+        let declared_target = block.header.target();
+        let pow_self_result = block.header.validate_pow(declared_target);
+        pow_self_dur = pow_self_started.elapsed();
+        metrics::histogram!("node.apply_block.pow_self_consistency_seconds")
+            .record(pow_self_dur.as_secs_f64());
+        if pow_self_result.is_err() {
+            return Err(ApplyError::ProofOfWork { hash: block_hash });
+        }
     }
 
     let (prev_tip_state, softfork_state) = if let Some(tip) = prior.as_deref() {
@@ -2098,7 +2143,7 @@ fn apply_block_admitted(
         }
         Some(ProvenApply::AssumeValidSkipped(prepared)) => (prepared, false),
         Some(ProvenApply::Proven(_)) | None => (
-            prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
+            prepare_apply(block, provided_serialized, handles.utxo.as_ref())?,
             false,
         ),
     };
@@ -2206,6 +2251,138 @@ fn apply_block_admitted(
     metrics::histogram!("node.apply_block.bip68_seconds").record(bip68_dur.as_secs_f64());
     bip68_result?;
 
+    Ok(ValidatedBlock {
+        prior,
+        height,
+        block_hash,
+        tx_plan,
+        resolved,
+        timings: ValidationTimings {
+            pow_self: pow_self_dur,
+            block_rules: block_rules_dur,
+            bip30_bip34: bip30_bip34_dur,
+            pow_limit: pow_limit_dur,
+            script_verify: script_verify_dur,
+            coinbase_maturity: coinbase_maturity_dur,
+            bip68: bip68_dur,
+        },
+    })
+}
+
+/// Rejects a coinbase that claims more than the block earned.
+///
+/// Genesis is skipped for the same reason its transactions are not connected.
+/// Shared with `test_block_validity` so a proposal is weighed on the same
+/// arithmetic a connected block is.
+fn check_coinbase_amount(
+    handles: &ApplyHandles,
+    height: u32,
+    value_totals: BlockValueTotals,
+) -> core::result::Result<(), ApplyError> {
+    if height == 0 {
+        return Ok(());
+    }
+    let fees = value_totals
+        .fees()
+        .ok_or(ApplyError::BlockOutputsExceedInputs)?;
+    bitcoin_rs_consensus::verify_coinbase_amount(
+        value_totals.coinbase_out,
+        fees,
+        height,
+        handles.network.subsidy_halving_interval(),
+    )
+    .map_err(ApplyError::from)
+}
+
+/// Validates a block against the current tip without connecting it.
+///
+/// Bitcoin Core's `TestBlockValidity`, which is what `getblocktemplate`
+/// `mode: "proposal"` answers from. The block is checked exactly as an apply
+/// would check it -- the same function, not a copy of it -- and then everything
+/// it computed is dropped. Nothing is written: the first write an apply performs
+/// is `persist_undo`, and this returns before reaching it.
+///
+/// Proof of work is deliberately not checked. A proposal is a block whose nonce
+/// has not been searched for; the declared difficulty is still validated.
+///
+/// # Errors
+///
+/// Returns the [`ApplyError`] the block would have been rejected with.
+pub fn test_block_validity(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    serialized: Option<bytes::Bytes>,
+) -> core::result::Result<(), ApplyError> {
+    let ValidatedBlock {
+        height,
+        block_hash,
+        tx_plan,
+        resolved,
+        ..
+    } = validate_block_for_apply(handles, block, serialized, None, PowCheck::Skipped)?;
+
+    // The coinbase-amount gate sits past the point where an apply starts
+    // computing what it will write, so reaching it means computing the same
+    // thing. `ApplyScratch` and `build_utxo_changes` only compute; the changes
+    // and the undo record are dropped with this frame.
+    let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
+        tx_plan.into_scratch_parts();
+    let scratch = ApplyScratch::from_prepared_parts(
+        block,
+        height,
+        false,
+        false,
+        txids,
+        scratch_capacities,
+        same_block_spent,
+        same_block_spent_input_count,
+    )?;
+    let (_changes, _undo, value_totals) = build_utxo_changes(
+        block,
+        height,
+        &scratch,
+        &resolved,
+        bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
+            .then(|| handles.utxo.as_ref()),
+    )?;
+    check_coinbase_amount(handles, height, value_totals)
+}
+
+/// The apply itself, with the admission permit and the transition lock held.
+///
+/// Callers MUST hold both. `handles.chain_transition` is what serializes this
+/// against another connect or a disconnect; the admission permit only keeps a
+/// checkpoint close from cutting across it.
+///
+/// Split from [`apply_block_inner`] so a window can take both once across its
+/// preparation and all of its ordered commits. Re-entering per block would be
+/// two read guards on the same lock, which deadlocks against a shutdown waiting
+/// on the write side, and would leave gaps in which another applier could move
+/// the chain out from under prepared state.
+#[allow(clippy::too_many_lines)]
+fn apply_block_admitted(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+    provided_serialized: Option<bytes::Bytes>,
+    proven: Option<ProvenApply>,
+    _transition: &ChainTransition<'_>,
+) -> core::result::Result<TipSnapshot, ApplyError> {
+    let total_started = quanta::Instant::now();
+    let ValidatedBlock {
+        prior,
+        height,
+        block_hash,
+        tx_plan,
+        resolved,
+        timings,
+    } = validate_block_for_apply(
+        handles,
+        block,
+        provided_serialized.clone(),
+        proven,
+        PowCheck::Required,
+    )?;
+
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
     let wants_rawblock = handles.zmq_publisher.wants_rawblock();
     let wants_filters = handles.filter_index.wants_filters();
@@ -2258,17 +2435,7 @@ fn apply_block_admitted(
     // free, and still before `persist_undo` -- the first write of any kind --
     // so a rejected block leaves nothing behind. Genesis is skipped for the
     // same reason its transactions are not connected.
-    if height > 0 {
-        let fees = value_totals
-            .fees()
-            .ok_or(ApplyError::BlockOutputsExceedInputs)?;
-        bitcoin_rs_consensus::verify_coinbase_amount(
-            value_totals.coinbase_out,
-            fees,
-            height,
-            handles.network.subsidy_halving_interval(),
-        )?;
-    }
+    check_coinbase_amount(handles, height, value_totals)?;
 
     // Persist undo before the block body, the index, and the UTXO commit. All
     // three are derived state for a block that is about to apply; if the undo
@@ -2438,13 +2605,13 @@ fn apply_block_admitted(
         height,
         %block_hash,
         tx_count = block.txdata.len(),
-        pow_self_us = pow_self_dur.as_micros(),
-        pow_limit_us = pow_limit_dur.as_micros(),
-        block_rules_us = block_rules_dur.as_micros(),
-        bip30_bip34_us = bip30_bip34_dur.as_micros(),
-        script_verify_us = script_verify_dur.as_micros(),
-        coinbase_maturity_us = coinbase_maturity_dur.as_micros(),
-        bip68_us = bip68_dur.as_micros(),
+        pow_self_us = timings.pow_self.as_micros(),
+        pow_limit_us = timings.pow_limit.as_micros(),
+        block_rules_us = timings.block_rules.as_micros(),
+        bip30_bip34_us = timings.bip30_bip34.as_micros(),
+        script_verify_us = timings.script_verify.as_micros(),
+        coinbase_maturity_us = timings.coinbase_maturity.as_micros(),
+        bip68_us = timings.bip68.as_micros(),
         utxo_commit_us = utxo_commit_dur.as_micros(),
         block_body_persist_us = block_body_persist_dur.as_micros(),
         block_record_us = block_record_dur.as_micros(),
@@ -6298,6 +6465,34 @@ mod consensus_rule_tests {
         extra: Vec<Transaction>,
         coinbase_value: u64,
     ) -> Result<TipSnapshot, ApplyError> {
+        let (handles, block) = height_one_fixture(extra, coinbase_value, Pow::Mined);
+        apply_block(&handles, &block)
+    }
+
+    /// Whether the fixture hands back a block whose nonce satisfies the target.
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Pow {
+        /// A block a peer could have sent.
+        Mined,
+        /// A block a miner is still working on -- what a proposal carries.
+        ///
+        /// Searched for just as deliberately as `Mined`: the regtest target is
+        /// met by roughly every other hash, so an unsearched header is a coin
+        /// flip and a test that wants an invalid nonce has to ask for one.
+        Unmined,
+    }
+
+    /// A regtest node whose tip is genesis, and a height-1 block for it.
+    ///
+    /// The UTXO set is seeded with a mature 1000-satoshi output at
+    /// `[0x71; 32]:0`, so a caller can hand `extra` a transaction that spends it
+    /// and the block earns a fee.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn height_one_fixture(
+        extra: Vec<Transaction>,
+        coinbase_value: u64,
+        pow: Pow,
+    ) -> (ApplyHandles, bitcoin::Block) {
         let funded = bitcoin::OutPoint {
             txid: bitcoin::Txid::from_byte_array([0x71; 32]),
             vout: 0,
@@ -6310,7 +6505,9 @@ mod consensus_rule_tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
         let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
-        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        let Ok(genesis_tip) = applied_header_tip(&handles, genesis_hash, &genesis, 0) else {
+            panic!("seeding the fixture genesis tip must succeed");
+        };
         handles.applied_tip.store(Some(Arc::new(genesis_tip)));
 
         let mut coinbase = coinbase_transaction_with_height(1);
@@ -6329,10 +6526,145 @@ mod consensus_rule_tests {
 
         let mut block = block_with_prev_hash_and_transactions(genesis.block_hash(), txdata);
         let target = block.header.target();
-        while block.header.validate_pow(target).is_err() {
+        let wanted_valid = pow == Pow::Mined;
+        while block.header.validate_pow(target).is_ok() != wanted_valid {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
-        apply_block(&handles, &block)
+        (handles, block)
+    }
+
+    /// The 999-satoshi fee spend the block-value tests use.
+    fn fee_paying_spend() -> Transaction {
+        let funded = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x71; 32]),
+            vout: 0,
+        };
+        spending_transaction_to_script(funded, Sequence::MAX.to_consensus_u32(), op_true_script())
+    }
+
+    /// A proposal is answered without connecting the block.
+    ///
+    /// The claim is that nothing was written, and the proof is that the same
+    /// block still applies afterwards: a dry run that had spent the seeded coin
+    /// or moved the tip would make the second answer differ from the first.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_is_validated_without_connecting_the_block() {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, block) =
+            height_one_fixture(vec![fee_paying_spend()], subsidy + 999, Pow::Mined);
+
+        let first = test_block_validity(&handles, &block, None);
+        assert!(
+            first.is_ok(),
+            "a valid proposal must be accepted: {first:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(0),
+            "answering a proposal must leave the tip where it was"
+        );
+
+        let second = test_block_validity(&handles, &block, None);
+        assert!(
+            second.is_ok(),
+            "the same proposal must answer the same way twice: {second:?}"
+        );
+        let applied = apply_block(&handles, &block);
+        assert!(
+            applied.is_ok(),
+            "the proposed block must still apply after being proposed: {applied:?}"
+        );
+    }
+
+    /// A proposal carries no proof of work, and is not asked for one.
+    ///
+    /// Core passes `fCheckPOW = false` here. Demanding a nonce would reject
+    /// every honest proposal, since finding one is the work the miner is asking
+    /// whether to start.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_needs_no_proof_of_work() {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, block) = height_one_fixture(vec![], subsidy, Pow::Unmined);
+        let target = block.header.target();
+        assert!(
+            block.header.validate_pow(target).is_err(),
+            "the fixture must hand this test a block with no valid nonce"
+        );
+
+        let proposed = test_block_validity(&handles, &block, None);
+        assert!(
+            proposed.is_ok(),
+            "a proposal without a nonce must be accepted: {proposed:?}"
+        );
+
+        // The paired rejection: the connect path still demands the nonce, so
+        // the acceptance above is the proposal switch and not a missing check.
+        let applied = apply_block(&handles, &block);
+        assert!(
+            matches!(&applied, Err(ApplyError::ProofOfWork { .. })),
+            "the same block must not connect without a nonce, got {applied:?}"
+        );
+    }
+
+    /// A proposal is weighed on every rule a connected block is weighed on.
+    ///
+    /// The coinbase amount is the last gate in the sequence and the one that
+    /// needs the resolved prevouts, so reaching it proves the dry run runs the
+    /// whole path and not the cheap structural prefix of it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_that_overpays_its_coinbase_is_refused() {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, block) =
+            height_one_fixture(vec![fee_paying_spend()], subsidy + 1000, Pow::Unmined);
+
+        let outcome = test_block_validity(&handles, &block, None);
+        assert!(
+            matches!(
+                &outcome,
+                Err(ApplyError::Consensus(
+                    bitcoin_rs_consensus::ConsensusError::CoinbaseAmount { paid, allowed }
+                )) if *paid == subsidy + 1000 && *allowed == subsidy + 999
+            ),
+            "one satoshi past the fee must be refused, got {outcome:?}"
+        );
+
+        let (handles, exact) =
+            height_one_fixture(vec![fee_paying_spend()], subsidy + 999, Pow::Unmined);
+        let accepted = test_block_validity(&handles, &exact, None);
+        assert!(
+            accepted.is_ok(),
+            "the same proposal claiming exactly the fee must be accepted: {accepted:?}"
+        );
+    }
+
+    /// The merkle root is checked, unlike the proof of work.
+    ///
+    /// Core takes `fCheckMerkleRoot = true` for a proposal: a miner may not
+    /// have a nonce yet, but the transaction set it proposes is fixed.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_whose_merkle_root_is_wrong_is_refused() {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, mut block) = height_one_fixture(vec![], subsidy, Pow::Unmined);
+        block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x5a; 32]);
+
+        let outcome = test_block_validity(&handles, &block, None);
+        assert!(
+            matches!(
+                &outcome,
+                Err(ApplyError::Consensus(
+                    bitcoin_rs_consensus::ConsensusError::MerkleRoot
+                ))
+            ),
+            "a proposal must be refused when its merkle root does not match, got {outcome:?}"
+        );
     }
 
     /// Timestamp rules must hold on the apply path, not only in header sync.
