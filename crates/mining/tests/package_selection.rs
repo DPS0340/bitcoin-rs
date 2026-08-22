@@ -130,7 +130,11 @@ fn entry_ids_are_not_a_dependency_order() -> Result<(), Box<dyn Error>> {
 
     let parent = tx_spending(confirmed_outpoint(1), 1);
     let parent_txid = parent.compute_txid();
-    let parent_id = insert(&mut pool, parent, 1_000, 1)?;
+    // Cheap parent, rich child, so the child is reached first and its package
+    // is built as one unit containing both. With a parent cheap enough to be
+    // visited on its own turn instead, the two land in separate one-element
+    // packages and no ordering inside a package is ever exercised.
+    let parent_id = insert(&mut pool, parent, 1, 1)?;
 
     // Free the low slots, then insert the child into one of them.
     for filler in fillers {
@@ -139,7 +143,7 @@ fn entry_ids_are_not_a_dependency_order() -> Result<(), Box<dyn Error>> {
     let child_id = insert(
         &mut pool,
         tx_spending(OutPoint::new(parent_txid, 0), 2),
-        1_000,
+        1_000_000,
         2,
     )?;
 
@@ -260,6 +264,149 @@ fn the_sigop_budget_excludes_what_does_not_fit() -> Result<(), Box<dyn Error>> {
         position(&tight, heavy).is_none(),
         "the five-thousand-sigop transaction must not: {tight:?}"
     );
+    Ok(())
+}
+
+/// Candidates are ordered by **ancestor** fee rate, not by their own.
+///
+/// For a plain two-transaction chain the two orders agree, so this needs the
+/// case where they do not: a rich child whose parent is large and cheap. The
+/// child's own fee rate is the highest in the pool, but the package it drags
+/// along pays poorly per weight unit — and taking it costs the room several
+/// better-paying independent transactions would have used.
+///
+/// Ordering by own fee rate takes the package and earns less from the same
+/// space. That is the whole reason Core sorts by ancestor fee rate.
+#[test]
+fn candidates_are_ordered_by_ancestor_fee_rate() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+
+    // Large and cheap.
+    let mut parent = tx_spending(confirmed_outpoint(1), 1);
+    for tag in 40_u8..95 {
+        parent.output.push(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51, tag]),
+        });
+    }
+    let parent_txid = parent.compute_txid();
+    let parent_id = insert(&mut pool, parent, 800, 0)?;
+    // Small and rich: the highest own fee rate in the pool.
+    let child_id = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(parent_txid, 0), 2),
+        110_000,
+        1,
+    )?;
+
+    // Independent transactions that beat the package per weight unit.
+    let mut rivals = Vec::new();
+    for tag in 2_u8..10 {
+        rivals.push(insert(
+            &mut pool,
+            tx_spending(confirmed_outpoint(tag), tag),
+            22_000,
+            u64::from(tag),
+        )?);
+    }
+
+    let package_weight = weight_of(&pool, parent_id) + weight_of(&pool, child_id);
+    let rivals_weight = rivals.iter().map(|id| weight_of(&pool, *id)).sum::<u64>();
+    assert!(
+        rivals_weight <= package_weight,
+        "the rivals must fit in the package's room ({rivals_weight} vs {package_weight})"
+    );
+    let rivals_fee = 22_000_u64 * 8;
+    assert!(
+        rivals_fee > 110_800,
+        "the rivals must out-earn the package or the ordering is not the point"
+    );
+
+    let budget = u32::try_from(package_weight)?;
+    let selected = MiningPolicy.select_transactions(&pool, budget, SIGOP_BUDGET);
+
+    assert!(
+        position(&selected, child_id).is_none() && position(&selected, parent_id).is_none(),
+        "the poorly-paying package must lose its place: {selected:?}"
+    );
+    for rival in rivals {
+        assert!(
+            position(&selected, rival).is_some(),
+            "every better-paying transaction must be taken: {selected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A package too big for the remaining room is skipped, not a stop signal.
+///
+/// Core's assembler keeps going: a smaller candidate further down the order
+/// can still fill what is left. Stopping at the first miss silently drops
+/// every transaction behind it, and no ordering assertion can see that — the
+/// block simply comes out smaller than it should.
+#[test]
+fn a_package_that_does_not_fit_does_not_end_selection() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+    // Highest ancestor fee rate, and deliberately the widest.
+    let mut wide = tx_spending(confirmed_outpoint(1), 1);
+    for tag in 20_u8..40 {
+        wide.output.push(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51, tag]),
+        });
+    }
+    let wide_id = insert(&mut pool, wide, 1_000_000, 0)?;
+    let narrow_id = insert(&mut pool, tx_spending(confirmed_outpoint(2), 2), 1_000, 1)?;
+
+    let wide_weight = weight_of(&pool, wide_id);
+    let narrow_weight = weight_of(&pool, narrow_id);
+    assert!(
+        narrow_weight < wide_weight,
+        "the second candidate must be the smaller one or the case is empty"
+    );
+
+    // Room for the narrow transaction but not the wide one, which sorts first.
+    let budget = u32::try_from(wide_weight - 1)?;
+    let selected = MiningPolicy.select_transactions(&pool, budget, SIGOP_BUDGET);
+
+    assert!(
+        position(&selected, wide_id).is_none(),
+        "the wide transaction does not fit: {selected:?}"
+    );
+    assert!(
+        position(&selected, narrow_id).is_some(),
+        "selection must continue past it and take the one that does fit"
+    );
+    Ok(())
+}
+
+/// The template reports the sigop cost it selected against.
+///
+/// The budget being enforced internally is not the same claim as the miner
+/// being told the number: `sigops` was hardcoded to zero, and a miner cannot
+/// budget against `sigoplimit` from a list that says every transaction is free.
+#[test]
+fn the_template_reports_each_transaction_sigop_cost() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+    let id = insert_with_sigops(
+        &mut pool,
+        tx_spending(confirmed_outpoint(1), 1),
+        10_000,
+        0,
+        42,
+    )?;
+    assert_eq!(pool.entry(id).map(|entry| entry.sigop_cost), Some(42));
+
+    let template = BlockTemplate::from_mempool(&pool, &MiningPolicy, params(4_000_000))?;
+
+    let Some(entry) = template.transactions.first() else {
+        panic!("the transaction must be selected");
+    };
+    assert_eq!(
+        entry.sigops, 42,
+        "the template must carry the count acceptance derived"
+    );
+    assert_eq!(template.sigoplimit, SIGOP_BUDGET);
     Ok(())
 }
 
