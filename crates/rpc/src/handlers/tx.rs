@@ -916,4 +916,39 @@ mod acceptance_tests {
             Some(tx.compute_wtxid().to_string().as_str())
         );
     }
+
+    /// Standardness is relay policy, and Core relaxes it only on regtest.
+    ///
+    /// The mempool crate tests the gate itself; this covers the wiring that
+    /// decides the flag, which is the half that can silently invert.
+    #[test]
+    fn standardness_is_relaxed_on_regtest_only() {
+        let non_standard = || {
+            let mut tx = spending_tx(1, 90_000);
+            // Consensus-valid, non-standard.
+            tx.version = Version(4);
+            tx
+        };
+
+        let mainnet = Arc::new(Context::new());
+        assert_eq!(
+            mainnet.chain_network,
+            bitcoin_rs_primitives::Network::Mainnet,
+            "the fixture assumes the default context is mainnet"
+        );
+        seed_utxo(&mainnet, 1, 100_000);
+        assert!(
+            sendrawtransaction(&mainnet, &json!([hex_of(&non_standard())])).is_err(),
+            "mainnet must enforce standardness"
+        );
+
+        let mut regtest = Context::new();
+        regtest.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        let regtest = Arc::new(regtest);
+        seed_utxo(&regtest, 1, 100_000);
+        assert!(
+            sendrawtransaction(&regtest, &json!([hex_of(&non_standard())])).is_ok(),
+            "regtest must accept the same transaction"
+        );
+    }
 }
