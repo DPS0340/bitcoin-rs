@@ -318,6 +318,11 @@ fn run_outbound_connection(
         .map_err(crate::wire::PeerError::Io)?;
 
     let nonce = generate_nonce(addr);
+    // Wrapped before the handshake, so the bytes it spends are counted too.
+    let counters = std::sync::Arc::new(crate::PeerCounters::default());
+    let stream = crate::CountingStream::new(stream, counters);
+    let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
+    let counters = std::sync::Arc::clone(stream.counters());
     let mut peer = Peer::new(stream, magic);
     run_outbound_handshake(&mut peer, nonce, 0)?;
 
@@ -329,7 +334,13 @@ fn run_outbound_connection(
     let conn_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
-    let info = crate::PeerInfo::outbound_from_version(addr, remote_version, conn_time);
+    let info = crate::PeerInfo::outbound_from_version(
+        addr,
+        addr_bind,
+        remote_version,
+        conn_time,
+        counters,
+    );
 
     let writer_stream = peer
         .stream
@@ -472,6 +483,11 @@ fn run_handshake(
         .map_err(crate::wire::PeerError::Io)?;
 
     let nonce = generate_nonce(peer_addr);
+    // Wrapped before the handshake, so the bytes it spends are counted too.
+    let counters = std::sync::Arc::new(crate::PeerCounters::default());
+    let stream = crate::CountingStream::new(stream, counters);
+    let addr_bind = stream.local_addr().map_err(crate::wire::PeerError::Io)?;
+    let counters = std::sync::Arc::clone(stream.counters());
     let mut peer = Peer::new(stream, magic);
     run_inbound_handshake(&mut peer, nonce, 0)?;
 
@@ -483,7 +499,13 @@ fn run_handshake(
     let conn_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
-    let info = crate::PeerInfo::inbound_from_version(peer_addr, remote_version, conn_time);
+    let info = crate::PeerInfo::inbound_from_version(
+        peer_addr,
+        addr_bind,
+        remote_version,
+        conn_time,
+        counters,
+    );
 
     let writer_stream = peer
         .stream
@@ -618,7 +640,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
 /// read ensures a momentarily silent peer can never delay outbound sends (the
 /// next `getdata` during IBD). Exits when every sender drops or a write fails.
 fn spawn_connection_writer(
-    mut stream: TcpStream,
+    mut stream: crate::CountingStream<TcpStream>,
     magic: Magic,
     outbound_rx: crossbeam_channel::Receiver<crate::Message>,
     peer_addr: SocketAddr,
@@ -725,6 +747,9 @@ mod lease_tests {
             start_height: 0,
             conn_time,
             inbound: false,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: Arc::new(crate::PeerCounters::default()),
         }
     }
 

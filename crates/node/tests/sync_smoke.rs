@@ -742,6 +742,9 @@ fn synthetic_peer(addr: SocketAddr, start_height: i32) -> PeerInfo {
         start_height,
         conn_time: 0,
         inbound: true,
+        addr_bind: addr,
+        time_offset: 0,
+        counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
     }
 }
 

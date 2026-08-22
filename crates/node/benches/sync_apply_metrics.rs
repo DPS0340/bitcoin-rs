@@ -645,6 +645,9 @@ fn synthetic_peer(addr: SocketAddr) -> PeerInfo {
         start_height: SYNC_PROXY_START_HEIGHT,
         conn_time: 0,
         inbound: false,
+        addr_bind: addr,
+        time_offset: 0,
+        counters: std::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
     }
 }
 

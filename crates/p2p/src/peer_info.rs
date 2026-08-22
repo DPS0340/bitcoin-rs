@@ -1,8 +1,11 @@
 //! Public peer metadata published after a successful handshake.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bitcoin::p2p::message_network::VersionMessage;
+
+use crate::counters::PeerCounters;
 
 /// Information collected during a successful Bitcoin v1 handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +24,20 @@ pub struct PeerInfo {
     pub conn_time: u64,
     /// Whether this connection was inbound (`true` for listener-accepted peers).
     pub inbound: bool,
+    /// Local socket address this connection is bound to.
+    ///
+    /// Bitcoin Core reports it as `addrbind`, and it is the node's own address
+    /// on this connection -- not the peer's. Reporting the peer's address
+    /// twice, as this used to, tells an operator listening on several
+    /// interfaces nothing about which one carried the connection.
+    pub addr_bind: SocketAddr,
+    /// Seconds the peer's clock is ahead of this node's, from its version.
+    ///
+    /// Bitcoin Core's `timeoffset`, measured once at handshake as the peer's
+    /// declared time minus local time.
+    pub time_offset: i64,
+    /// Live traffic counters for the connection.
+    pub counters: Arc<PeerCounters>,
 }
 
 impl PeerInfo {
@@ -28,8 +45,10 @@ impl PeerInfo {
     #[must_use]
     pub fn inbound_from_version(
         addr: SocketAddr,
+        addr_bind: SocketAddr,
         version: &VersionMessage,
         conn_time: u64,
+        counters: Arc<PeerCounters>,
     ) -> Self {
         Self {
             addr,
@@ -39,6 +58,15 @@ impl PeerInfo {
             start_height: version.start_height,
             conn_time,
             inbound: true,
+            addr_bind,
+            // The peer states its own clock in the version message. Core takes
+            // the difference against local time at that moment and never
+            // revisits it, so a long-lived connection reports the offset as it
+            // was at handshake.
+            time_offset: version
+                .timestamp
+                .saturating_sub(i64::try_from(conn_time).unwrap_or(i64::MAX)),
+            counters,
         }
     }
 
@@ -46,8 +74,10 @@ impl PeerInfo {
     #[must_use]
     pub fn outbound_from_version(
         addr: SocketAddr,
+        addr_bind: SocketAddr,
         version: &VersionMessage,
         conn_time: u64,
+        counters: Arc<PeerCounters>,
     ) -> Self {
         Self {
             addr,
@@ -57,6 +87,15 @@ impl PeerInfo {
             start_height: version.start_height,
             conn_time,
             inbound: false,
+            addr_bind,
+            // The peer states its own clock in the version message. Core takes
+            // the difference against local time at that moment and never
+            // revisits it, so a long-lived connection reports the offset as it
+            // was at handshake.
+            time_offset: version
+                .timestamp
+                .saturating_sub(i64::try_from(conn_time).unwrap_or(i64::MAX)),
+            counters,
         }
     }
 
@@ -122,11 +161,43 @@ mod tests {
         }
     }
 
+    fn counters() -> Arc<PeerCounters> {
+        Arc::new(PeerCounters::default())
+    }
+
+    /// The offset is what the peer claimed, against the clock we read it at.
+    ///
+    /// A peer two minutes ahead must read as `+120`, not as an absolute time
+    /// and not as zero -- the placeholder this replaced.
+    #[test]
+    fn time_offset_is_the_peers_clock_against_ours() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let mut version = fake_version();
+        version.timestamp = 1_700_000_120;
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, counters());
+        assert_eq!(info.time_offset, 120);
+
+        version.timestamp = 1_699_999_940;
+        let behind =
+            PeerInfo::inbound_from_version(addr, addr, &version, 1_700_000_000, counters());
+        assert_eq!(behind.time_offset, -60);
+    }
+
+    /// The bind address is the node's own end of the connection.
+    #[test]
+    fn addr_bind_is_kept_apart_from_the_peer_address() {
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 51_234);
+        let info = PeerInfo::inbound_from_version(peer, local, &fake_version(), 0, counters());
+        assert_eq!(info.addr, peer);
+        assert_eq!(info.addr_bind, local);
+    }
+
     #[test]
     fn outbound_from_version_sets_inbound_false() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let version = fake_version();
-        let info = PeerInfo::outbound_from_version(addr, &version, 100);
+        let info = PeerInfo::outbound_from_version(addr, addr, &version, 100, counters());
         assert!(!info.inbound);
         assert_eq!(info.start_height, 7);
         assert_eq!(info.conn_time, 100);
@@ -136,7 +207,7 @@ mod tests {
     fn inbound_from_version_sets_inbound_true() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
         let version = fake_version();
-        let info = PeerInfo::inbound_from_version(addr, &version, 100);
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 100, counters());
         assert!(info.inbound);
     }
 
@@ -144,11 +215,8 @@ mod tests {
     fn services_names_decodes_inbound_peer_with_network_witness() {
         let mut version = fake_version();
         version.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let info = PeerInfo::inbound_from_version(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            &version,
-            0,
-        );
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, counters());
         assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
     }
 
@@ -156,11 +224,8 @@ mod tests {
     fn services_names_empty_for_no_flags() {
         let mut version = fake_version();
         version.services = ServiceFlags::NONE;
-        let info = PeerInfo::inbound_from_version(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333),
-            &version,
-            0,
-        );
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let info = PeerInfo::inbound_from_version(addr, addr, &version, 0, counters());
         assert!(info.services_names().is_empty());
     }
 }

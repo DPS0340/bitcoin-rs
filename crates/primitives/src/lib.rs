@@ -29,4 +29,4 @@ pub use network::Network;
 pub use outpoint::OutPoint;
 pub use sighash::{Sighash, SighashError};
 pub use tx::{Tx, TxIn, TxOut};
-pub use version::{PKG_VERSION, USER_AGENT};
+pub use version::{PKG_VERSION, USER_AGENT, client_version};

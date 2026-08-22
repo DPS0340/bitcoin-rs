@@ -531,6 +531,9 @@ fn network_peer_methods_read_shared_peer_registry() -> Result<(), Box<dyn std::e
         start_height: 0,
         conn_time: 0,
         inbound: true,
+        addr_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333),
+        time_offset: 0,
+        counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
     }]));
     let handler = Handler::new(context_with_peers(peers));
 

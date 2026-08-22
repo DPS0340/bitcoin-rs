@@ -305,3 +305,40 @@ position while keeping the rest. See the *All-or-scan position fallback* concept
 in `CONCEPTS.md`. The residual accepted: a stale offset landing exactly on a
 transaction boundary whose transaction also matches, while a different
 transaction in that block matches too.
+
+## §11 — `getpeerinfo` and `getnetworkinfo`: what is measured and what is not
+
+`getpeerinfo` used to answer `bytessent`, `bytesrecv`, `lastsend`, `lastrecv`,
+`timeoffset`, `pingtime` and `minping` with zeros, and `addrbind` with a copy of
+the peer's own address. Every one of those is a field-shaped placeholder: an
+operator reading it gets a number where Bitcoin Core would give a measurement,
+with nothing to say the two are different.
+
+**Now measured.** The byte counts and activity times come from a counting
+wrapper around the connection's socket, so they cover the handshake, the reader
+loop and the writer thread alike. `addrbind` is the local end of the connection.
+`timeoffset` is the peer's declared time against local time at handshake, which
+is how Core computes it, and `getnetworkinfo.timeoffset` is the median of those
+per-peer offsets. `getnetworkinfo.version` is derived from the released package
+version by Core's `CLIENT_VERSION` arithmetic instead of being a fixed `10000`.
+
+**Now omitted rather than faked.** `pingtime`, `minping` and `pingwait` are
+absent: this node does not send pings, so it has never measured a round trip,
+and Core omits all three until it has one. A `0.0` there is not merely wrong,
+it is the best latency a peer could possibly have.
+
+**Still placeholders**, listed so they are not mistaken for measurements:
+
+| field | reported | Bitcoin Core |
+| --- | --- | --- |
+| `bytessent_per_msg`, `bytesrecv_per_msg` | `{}` | per-command byte totals |
+| `minfeefilter` | `0.0` | the peer's last `feefilter` |
+| `addr_processed`, `addr_rate_limited` | `0` | counted per peer |
+| `permissions` | `[]` | whitelist permissions |
+| `relaytxes` | `true` | the peer's version relay flag |
+| `connection_type` | `inbound` / `outbound` | also `manual`, `feeler`, `block-relay-only`, `addr-fetch` |
+| `getnetworkinfo.localaddresses` | `[]` | discovered local addresses |
+| `getnetworkinfo.networks` | fixed table | per-network reachability and proxy |
+
+`presynced_headers`, `synced_headers` and `synced_blocks` report `-1`, which is
+Core's own value for a peer it has no figure for, so those are not on the list.

@@ -114,13 +114,15 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let inbound = peers.iter().filter(|p| p.inbound).count();
     let outbound = total.saturating_sub(inbound);
     Ok(json!({
-        "version": 10000,
+        // Core reports its own `CLIENT_VERSION` here. The 10000 this replaced
+        // was a constant that named no release and never moved.
+        "version": bitcoin_rs_primitives::client_version(),
         "subversion": USER_AGENT,
         "protocolversion": 70016_i64,
         "localservices": LOCAL_SERVICES_HEX,
         "localservicesnames": services_names_from_flags(LOCAL_SERVICES_FLAGS),
         "localrelay": true,
-        "timeoffset": 0,
+        "timeoffset": median_time_offset(&peers),
         "networkactive": true,
         "connections": total,
         "connections_in": inbound,
@@ -137,6 +139,31 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     }))
 }
 
+/// The node's clock offset, as the median of what its peers claim.
+///
+/// Bitcoin Core samples each peer's declared time at handshake and reports the
+/// median of those samples. A single peer cannot move it, which is the point:
+/// the figure exists to warn an operator that their own clock is wrong, and one
+/// peer lying about the time must not produce that warning.
+///
+/// With no peers there is nothing to compare against, so the offset is zero --
+/// the same answer Core gives, and there the zero really is the measurement.
+fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
+    if peers.is_empty() {
+        return 0;
+    }
+    let mut offsets: Vec<i64> = peers.iter().map(|peer| peer.time_offset).collect();
+    offsets.sort_unstable();
+    let middle = offsets.len() / 2;
+    if offsets.len() % 2 == 1 {
+        return offsets.get(middle).copied().unwrap_or(0);
+    }
+    // Even sample count: Core averages the two middle values.
+    let lower = offsets.get(middle.saturating_sub(1)).copied().unwrap_or(0);
+    let upper = offsets.get(middle).copied().unwrap_or(0);
+    lower.saturating_add(upper) / 2
+}
+
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let peers = ctx.peers.read();
@@ -145,18 +172,21 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
         array.push(json!({
             "id": id,
             "addr": peer.addr.to_string(),
-            "addrbind": peer.addr.to_string(),
+            "addrbind": peer.addr_bind.to_string(),
             "services": format!("{:016x}", peer.services),
             "servicesnames": peer.services_names().into_iter().map(str::to_owned).collect::<Vec<_>>(),
             "relaytxes": true,
-            "lastsend": 0,
-            "lastrecv": 0,
-            "bytessent": 0,
-            "bytesrecv": 0,
+            "lastsend": peer.counters.last_send(),
+            "lastrecv": peer.counters.last_recv(),
+            "bytessent": peer.counters.bytes_sent(),
+            "bytesrecv": peer.counters.bytes_recv(),
             "conntime": peer.conn_time,
-            "timeoffset": 0,
-            "pingtime": 0.0,
-            "minping": 0.0,
+            "timeoffset": peer.time_offset,
+            // No `pingtime`, `minping` or `pingwait`. This node never sends a
+            // ping, so it has never measured a round trip, and Core omits all
+            // three until it has one. Reporting `0.0` would state a round trip
+            // of zero seconds -- a placeholder in the shape of a measurement,
+            // and the best-looking latency a peer could possibly have.
             "version": peer.version,
             "subver": peer.user_agent.clone(),
             "inbound": peer.inbound,
@@ -440,6 +470,9 @@ mod tests {
             start_height: 0,
             conn_time: 0,
             inbound: false,
+            addr_bind: "127.0.0.1:8333".parse().unwrap_or_else(|_| panic!("addr")),
+            time_offset: 0,
+            counters: Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
         };
 
         assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
@@ -814,5 +847,197 @@ mod ban_state_tests {
             panic!("expected array: {result:?}");
         };
         assert_eq!(arr.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod peer_counter_tests {
+    use alloc::sync::Arc;
+    use std::io::{Read as _, Write as _};
+    use std::net::SocketAddr;
+
+    use bitcoin_rs_p2p::{CountingStream, PeerCounters, PeerInfo};
+    use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
+
+    use super::{getnetworkinfo, getpeerinfo};
+    use crate::context::Context;
+
+    fn peer(addr: &str, bind: &str, time_offset: i64, counters: Arc<PeerCounters>) -> PeerInfo {
+        let parse = |text: &str| -> SocketAddr {
+            text.parse()
+                .unwrap_or_else(|_| panic!("test address {text} must parse"))
+        };
+        PeerInfo {
+            addr: parse(addr),
+            version: 70_016,
+            services: 0,
+            user_agent: "/test/".to_owned(),
+            start_height: 0,
+            conn_time: 0,
+            inbound: true,
+            addr_bind: parse(bind),
+            time_offset,
+            counters,
+        }
+    }
+
+    fn context_with(peers: Vec<PeerInfo>) -> Arc<Context> {
+        let ctx = Arc::new(Context::new());
+        ctx.peers.write().extend(peers);
+        ctx
+    }
+
+    fn first_peer(ctx: &Arc<Context>) -> sonic_rs::Value {
+        let result = getpeerinfo(ctx, &json!(null))
+            .unwrap_or_else(|err| panic!("getpeerinfo failed: {err}"));
+        let Some(entry) = result.as_array().and_then(|array| array.first()) else {
+            panic!("getpeerinfo returned no peers: {result:?}");
+        };
+        entry.clone()
+    }
+
+    /// The byte counts are the connection's own, not a placeholder.
+    ///
+    /// The traffic is put through a `CountingStream`, the way a real connection
+    /// does it, so this covers the wiring and not just the rendering.
+    #[test]
+    fn getpeerinfo_reports_what_the_connection_actually_moved() {
+        let counters = Arc::new(PeerCounters::default());
+        {
+            let mut sent = CountingStream::new(Vec::new(), Arc::clone(&counters));
+            let _written = sent
+                .write(&[0_u8; 42])
+                .unwrap_or_else(|error| panic!("write failed: {error}"));
+            let mut received =
+                CountingStream::new(std::io::Cursor::new(vec![1_u8; 7]), Arc::clone(&counters));
+            let mut buffer = [0_u8; 7];
+            let _read = received
+                .read(&mut buffer)
+                .unwrap_or_else(|error| panic!("read failed: {error}"));
+        }
+
+        let ctx = context_with(vec![peer(
+            "127.0.0.1:8333",
+            "10.0.0.2:51234",
+            0,
+            Arc::clone(&counters),
+        )]);
+        let entry = first_peer(&ctx);
+
+        assert_eq!(
+            entry.get("bytessent").and_then(JsonValueTrait::as_u64),
+            Some(42)
+        );
+        assert_eq!(
+            entry.get("bytesrecv").and_then(JsonValueTrait::as_u64),
+            Some(7)
+        );
+        assert_ne!(
+            entry.get("lastsend").and_then(JsonValueTrait::as_u64),
+            Some(0),
+            "a connection that sent something has a last-send time"
+        );
+        assert_ne!(
+            entry.get("lastrecv").and_then(JsonValueTrait::as_u64),
+            Some(0)
+        );
+    }
+
+    /// `addrbind` is this node's end of the connection.
+    ///
+    /// It used to repeat `addr`, which told an operator listening on several
+    /// interfaces nothing at all about which one carried the peer.
+    #[test]
+    fn getpeerinfo_reports_the_bind_address_not_the_peer_address() {
+        let ctx = context_with(vec![peer(
+            "203.0.113.7:8333",
+            "10.0.0.2:51234",
+            0,
+            Arc::new(PeerCounters::default()),
+        )]);
+        let entry = first_peer(&ctx);
+
+        assert_eq!(
+            entry.get("addr").and_then(JsonValueTrait::as_str),
+            Some("203.0.113.7:8333")
+        );
+        assert_eq!(
+            entry.get("addrbind").and_then(JsonValueTrait::as_str),
+            Some("10.0.0.2:51234")
+        );
+    }
+
+    /// A peer's clock offset is reported with its sign.
+    #[test]
+    fn getpeerinfo_reports_the_peers_clock_offset() {
+        for offset in [-90_i64, 0, 120] {
+            let ctx = context_with(vec![peer(
+                "127.0.0.1:8333",
+                "127.0.0.1:1234",
+                offset,
+                Arc::new(PeerCounters::default()),
+            )]);
+            assert_eq!(
+                first_peer(&ctx)
+                    .get("timeoffset")
+                    .and_then(JsonValueTrait::as_i64),
+                Some(offset)
+            );
+        }
+    }
+
+    /// The node's own offset is the median, so one peer cannot move it.
+    ///
+    /// The figure exists to tell an operator their clock is wrong. A single
+    /// peer claiming an absurd time must not be able to raise that alarm, which
+    /// is exactly what a mean would let it do.
+    #[test]
+    fn getnetworkinfo_timeoffset_is_the_median_of_its_peers() {
+        let counters = || Arc::new(PeerCounters::default());
+        let ctx = context_with(vec![
+            peer("127.0.0.1:1", "127.0.0.1:1000", 10, counters()),
+            peer("127.0.0.1:2", "127.0.0.1:1001", 20, counters()),
+            peer("127.0.0.1:3", "127.0.0.1:1002", 100_000, counters()),
+        ]);
+
+        let result = getnetworkinfo(&ctx, &json!(null))
+            .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
+
+        assert_eq!(
+            result.get("timeoffset").and_then(JsonValueTrait::as_i64),
+            Some(20),
+            "the outlier must not move the median"
+        );
+    }
+
+    /// A round trip that was never measured is not reported as zero.
+    ///
+    /// Core omits `pingtime` and `minping` until it has a measurement. These
+    /// used to be `0.0`, which is not merely wrong but flattering: zero is the
+    /// best latency a peer could possibly have.
+    #[test]
+    fn getpeerinfo_omits_ping_times_it_has_never_measured() {
+        let ctx = context_with(vec![peer(
+            "127.0.0.1:8333",
+            "127.0.0.1:1234",
+            0,
+            Arc::new(PeerCounters::default()),
+        )]);
+        let entry = first_peer(&ctx);
+
+        assert!(entry.get("pingtime").is_none(), "{entry:?}");
+        assert!(entry.get("minping").is_none(), "{entry:?}");
+        assert!(entry.get("pingwait").is_none(), "{entry:?}");
+    }
+
+    /// With no peers there is nothing to compare against.
+    #[test]
+    fn getnetworkinfo_timeoffset_is_zero_without_peers() {
+        let result = getnetworkinfo(&Arc::new(Context::new()), &json!(null))
+            .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
+        assert_eq!(
+            result.get("timeoffset").and_then(JsonValueTrait::as_i64),
+            Some(0)
+        );
     }
 }

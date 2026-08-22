@@ -7754,6 +7754,9 @@ mod tests {
             start_height,
             conn_time: 0,
             inbound: true,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: alloc::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
         }
     }
 
@@ -7820,6 +7823,9 @@ mod tests {
         PeerInfo {
             services: bitcoin::p2p::ServiceFlags::WITNESS.to_u64() | 1,
             inbound: false,
+            addr_bind: addr,
+            time_offset: 0,
+            counters: std::sync::Arc::new(bitcoin_rs_p2p::PeerCounters::default()),
             ..synthetic_peer(addr, start_height)
         }
     }
