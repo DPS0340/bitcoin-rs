@@ -2154,9 +2154,8 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let dir = tempfile::tempdir()?;
-        let data_dir = dir.path().join("node");
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
+        config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
 
         let expected = {
