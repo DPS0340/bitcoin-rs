@@ -210,9 +210,9 @@ mod tests {
         assert_eq!(counters.bytes_recv(), 0);
     }
 
-    /// Reads accumulate, and stamp the time only when something arrived.
+    /// Reads accumulate rather than replacing the previous count.
     #[test]
-    fn reads_accumulate_and_an_empty_read_stamps_nothing() {
+    fn reads_accumulate() {
         let counters = Arc::new(PeerCounters::default());
         let mut stream =
             CountingStream::new(std::io::Cursor::new(vec![7_u8; 5]), Arc::clone(&counters));
@@ -225,19 +225,70 @@ mod tests {
             assert_eq!(counters.bytes_recv(), expected);
         }
         assert_ne!(counters.last_recv(), 0, "a read must stamp the time");
+    }
 
-        // The cursor is empty now, so this read moves nothing.
-        let stamped = counters.last_recv();
+    /// A read that moves nothing is not activity.
+    ///
+    /// Asserted against a *fresh* counter rather than against a timestamp taken
+    /// a moment earlier: both readings would fall in the same second, so a
+    /// stamp-on-every-read bug would compare equal and survive.
+    #[test]
+    fn an_empty_read_stamps_nothing() {
+        let counters = Arc::new(PeerCounters::default());
+        let mut stream =
+            CountingStream::new(std::io::Cursor::new(Vec::new()), Arc::clone(&counters));
+
+        let mut buffer = [0_u8; 4];
         let read = stream
             .read(&mut buffer)
             .unwrap_or_else(|error| panic!("read failed: {error}"));
+
         assert_eq!(read, 0);
-        assert_eq!(counters.bytes_recv(), 5);
+        assert_eq!(counters.bytes_recv(), 0);
+        assert_eq!(counters.last_recv(), 0, "an empty read is not activity");
+    }
+
+    /// A cloned socket counts into the same place as the original.
+    ///
+    /// The writer thread owns a clone, so if the clone carried its own counters
+    /// `bytessent` would report the handshake and nothing after it -- the exact
+    /// under-count this wrapper exists to avoid.
+    #[test]
+    fn a_cloned_socket_counts_into_the_same_place() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("bind failed: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("local_addr failed: {error}"));
+        let accepting = std::thread::spawn(move || listener.accept());
+
+        let client =
+            TcpStream::connect(addr).unwrap_or_else(|error| panic!("connect failed: {error}"));
+        let counters = Arc::new(PeerCounters::default());
+        let mut original = CountingStream::new(client, Arc::clone(&counters));
+        let mut clone = original
+            .try_clone()
+            .unwrap_or_else(|error| panic!("try_clone failed: {error}"));
+
+        let _written = original
+            .write(&[0_u8; 4])
+            .unwrap_or_else(|error| panic!("write failed: {error}"));
+        let _written = clone
+            .write(&[0_u8; 6])
+            .unwrap_or_else(|error| panic!("clone write failed: {error}"));
+
         assert_eq!(
-            counters.last_recv(),
-            stamped,
-            "an empty read is not activity"
+            counters.bytes_sent(),
+            10,
+            "both halves must land in one count"
         );
+        assert_eq!(clone.counters().bytes_sent(), 10);
+
+        drop(original);
+        drop(clone);
+        let _accepted = accepting.join();
     }
 
     /// Nothing sent means no timestamp, which is what Core reports as zero.

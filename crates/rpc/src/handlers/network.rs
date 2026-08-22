@@ -1030,6 +1030,35 @@ mod peer_counter_tests {
         assert!(entry.get("pingwait").is_none(), "{entry:?}");
     }
 
+    /// The reported client version follows the release, not a constant.
+    ///
+    /// The expected number is derived here from the package version rather than
+    /// read back from the function under test, which could not disagree with
+    /// itself.
+    #[test]
+    fn getnetworkinfo_version_tracks_the_release() {
+        let mut expected = 0_i64;
+        for (field, scale) in bitcoin_rs_primitives::PKG_VERSION
+            .split('.')
+            .zip([10_000_i64, 100, 1])
+        {
+            let digits: String = field.chars().take_while(char::is_ascii_digit).collect();
+            expected += digits.parse::<i64>().unwrap_or(0) * scale;
+        }
+        assert_ne!(
+            expected, 10_000,
+            "the fixture must not match the old constant"
+        );
+
+        let result = getnetworkinfo(&Arc::new(Context::new()), &json!(null))
+            .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
+
+        assert_eq!(
+            result.get("version").and_then(JsonValueTrait::as_i64),
+            Some(expected)
+        );
+    }
+
     /// With no peers there is nothing to compare against.
     #[test]
     fn getnetworkinfo_timeoffset_is_zero_without_peers() {
