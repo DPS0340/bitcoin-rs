@@ -6212,8 +6212,13 @@ mod consensus_rule_tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn apply_rejects_a_coinbase_that_pays_more_than_the_subsidy()
     -> Result<(), Box<dyn std::error::Error>> {
-        let subsidy = bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
-        assert_eq!(subsidy, 50 * 100_000_000, "regtest height 1 pays the full subsidy");
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        assert_eq!(
+            subsidy,
+            50 * 100_000_000,
+            "regtest height 1 pays the full subsidy"
+        );
 
         let over = apply_coinbase_only_block(subsidy + 1);
         assert!(
@@ -6243,7 +6248,8 @@ mod consensus_rule_tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn the_coinbase_allowance_counts_the_fees_the_block_earned()
     -> Result<(), Box<dyn std::error::Error>> {
-        let subsidy = bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
         // The seeded output is 1000 sats and the spend pays 1 sat onward.
         let fee = 999_u64;
 

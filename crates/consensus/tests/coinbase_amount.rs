@@ -64,7 +64,10 @@ fn a_coinbase_may_claim_the_subsidy_plus_the_fees() {
 /// pre-halving subsidy.
 #[test]
 fn the_allowance_follows_the_halving() {
-    assert_eq!(verify_coinbase_amount(FIFTY_BTC, 0, 209_999, MAINNET), Ok(()));
+    assert_eq!(
+        verify_coinbase_amount(FIFTY_BTC, 0, 209_999, MAINNET),
+        Ok(())
+    );
     assert_eq!(
         verify_coinbase_amount(FIFTY_BTC, 0, 210_000, MAINNET),
         Err(ConsensusError::CoinbaseAmount {
