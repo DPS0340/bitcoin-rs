@@ -28,9 +28,9 @@ const NARROW_EVENT_CHUNK_SIZE: usize = 16;
 const WIDE_EVENT_CHUNK_SIZE: usize = 4;
 const INLINE_EVENT_CHUNKS: usize = 64;
 
-const PARALLEL_MUHASH_MAX_COINS: usize = 16_384;
-const PARALLEL_MUHASH_MAX_BYTES: usize = 2 * 1024 * 1024;
-const PARALLEL_MUHASH_MAX_LANES: usize = 16;
+const PARALLEL_MUHASH_MAX_COINS: usize = 262_144;
+const PARALLEL_MUHASH_MAX_BYTES: usize = 16 * 1024 * 1024;
+const PARALLEL_MUHASH_MAX_LANES: usize = 32;
 
 /// Exact byte length of the stable `CoinStats` encoding.
 pub const COIN_STATS_ENCODED_LEN: usize = 804;
@@ -292,7 +292,11 @@ impl EncodedPreimageArena {
                 muhash.insert(&self.bytes[start..self.ends[index]]);
             }
         } else {
-            let lane_count = self.ends.len().min(PARALLEL_MUHASH_MAX_LANES);
+            let lane_count = self
+                .ends
+                .len()
+                .min(PARALLEL_MUHASH_MAX_LANES)
+                .min(rayon::current_num_threads());
             let lane_len = self.ends.len().div_ceil(lane_count);
             // Rayon collects scoped jobs before returning or propagating a panic,
             // so no lane can retain arena slices after this flush.
@@ -1251,6 +1255,18 @@ mod tests {
         let mut serial = super::CoinStatsAccumulator::with_muhash(77);
         observe_all(&mut serial, &coins);
         assert_eq!(stats.to_bytes(), serial.into_stats().to_bytes());
+    }
+
+    #[test]
+    fn parallel_muhash_matches_serial_at_configured_pool_widths() {
+        let coins = generated_coins(2_049, &[0, 1, 252, 253, 65_535]);
+        for width in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("build test pool")
+                .install(|| assert_parallel_serialized_match(&coins));
+        }
     }
 
     proptest! {
