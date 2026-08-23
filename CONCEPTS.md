@@ -107,14 +107,11 @@ The check in `scripts/measure-g14-electrum-rss.sh` that the measured PID really 
 The rule that a branch is green only against the commands in `.github/workflows/ci.yml`, never against a local approximation of them. Three differences bite: `-D warnings` on the `clippy` and `kernel-parity` lanes promotes every warning the workspace lint job merely reports (`dead_code`, `needless_borrow`, `doc_markdown`, `needless_collect`, `too_many_lines`); a virtual workspace silently drops `--workspace --features`, so the four-backend and kernel surface is only reached through `-p bitcoin-rs --no-default-features --features "$FULL_NODE_FEATURES"` plus a separate `-p bitcoin-rs-node` pass for its test targets; and `kernel-parity` adds `--include-ignored` on a debug profile. `cargo deny` belongs in the same sweep and is a bug report, not lint noise. See `docs/solutions/best-practices/workspace-clippy-does-not-predict-the-d-warnings-lanes.md`.
 
 ### CPU-seconds as a first-class metric
-The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name. On the loopback P2P sync to 150k, bitcoin-rs takes 76.3s wall and **318.4s CPU** against Core's 42.5s and **65.0s** — a 1.77× wall gap concealing a 4.9× CPU gap, which becomes wall time on the 4-8 core machines most nodes run on. The excess is broad rather than one hot spot: collapsing `SCRIPT_VERIFY_POOL` to a single thread still burns 230.1s, so rayon spin is a minority of it and no pool width converges. This also puts a caveat on every wall-only sweep in the performance note, `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 most of all, since pushing more blocks through the pool is exactly the shape of change that trades CPU for wall.
+The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name.
 
-The matched local-file processing panel at commit `ff2615a` supersedes the
-older processing-bound CPU deficit: production-matched bitcoin-rs measured
-56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The loopback
-P2P result above remains valid for its network regime; it cannot be carried
-into the local replay regime. See
-`docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
+The controlled one-peer daemon IBD panel in [`docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json`](docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json) establishes the current bounded network-regime baseline across mainnet 0–150,000: Bitcoin Core median elapsed time is 73.459s against bitcoin-rs 89.576s. Core's elapsed time was 0.820× bitcoin-rs's elapsed time, so Core delivered 1.219× bitcoin-rs throughput. The 2× throughput target is unmet on this bounded daemon workload. This benchmark measures single-peer requester and apply behavior over loopback P2P on early blocks; it does not generalize to current-tip blocks or multi-peer Internet IBD. Earlier uncontrolled loopback measurements (such as 76.3s wall / 318.4s CPU vs Core 42.5s / 65.0s) showed a wider CPU gap that highlighted rayon spin and oversubscription risks before pool capping.
+
+The matched local-file processing panel at commit `ff2615a` supersedes the older processing-bound CPU deficit: production-matched bitcoin-rs measured 56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The network-bound daemon IBD results remain valid for their download-and-apply regime; they cannot be carried into the local replay regime. See `docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
 
 The final AVX2 panel adds the same proof after the Merkle change: bitcoin-rs beat Core by 1.315× wall and 1.232× CPU while using 1.042× its peak RSS. The CPU result rules out a wall-only win bought by extra parallel work; the kernel batches eight hashes in SIMD lanes inside one task.
 
@@ -125,10 +122,38 @@ The process-wide rayon pool is capped at `GLOBAL_RAYON_THREADS` (4) by `cap_glob
 The failure mode where a parallelism constant is tuned while the benchmark harness competes with the node for CPU, so the measured optimum is a property of the contention rather than of the code. In this repo it produced two wrong constants. `MIN_PARALLEL_SCRIPT_CHECKS` was walked down to 4 by a sweep whose harness fetched every block over REST from a second `bitcoind` on the same cores; the inflated serial path made ever-finer fan-out look free and the curve read as monotonic. Re-measured against local block files the ordering **inverts** — 4 becomes the worst point tested on both wall and CPU, and the optimum is 32 (75.5s / 649.6s versus 84.4s / 946.6s). The global rayon pool was the same mistake in a different guise: uncapped, it cost nothing measurable in wall time on an idle many-core host. Two rules follow: never tune a parallelism constant against a harness that shares CPU with the node, because contention changes the shape of the curve and not merely its offset; and never tune one on wall alone, because both bad constants were wall-optimal on the host that chose them. See also `CPU-seconds as a first-class metric` and `Global rayon pool cap`.
 
 ### Commit point (multi-store mutation)
-The mutation that publishes a multi-store operation: the point after which readers see it as done. It marks where the operation becomes visible, not where it becomes atomic, and everything after it is cleanup. For block disconnect the commit point is the `applied_tip` rollback, which is why it runs last, after index rollback and UTXO undo. Naming it first shows which steps need atomicity. The index rollback is one disk batch. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. What does not follow is that every step before the commit point is safe to re-enter. The UTXO undo walks shards and can fail after other shards committed, leaving the set partly undone with the tip still describing the block. Retry is ruled out because the commit fires the set's change listener and coinstats is one listener, so a second pass double-counts where the set converges. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (partly rolled back). An in-flight marker in `UndoData` is armed and flushed before the first mutation. A fatal outcome closes apply admission and triggers the shared process shutdown. Startup then refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
+The mutation that makes a multi-store operation visible. It identifies the state transition that readers treat as complete; it does not make every preceding mutation atomic. For an authoritative block disconnect, the commit point is the `applied_tip` rollback. It runs after the UTXO undo and the block-level coinstats rewind. `TxIndex` is derived state outside this transaction: publishing the applied tip increments its revision and wakes its worker, which later reconciles a separate durable watermark. The UTXO set is RAM-resident and becomes durable only at a clean checkpoint. A checkpoint flushes the shared storage backend before it publishes the matching UTXO state. The UTXO undo can fail after some shards changed, so it cannot be retried. `DisconnectError` therefore splits `Refused` (nothing touched) from `Fatal` (the authoritative state can be partly rolled back). An in-flight marker in `UndoData` is armed before the first authoritative mutation. A fatal outcome closes apply admission and triggers process shutdown. Startup refuses to serve the torn state. See *Disconnect marker phase* and `docs/solutions/architecture-patterns/node-reorg-execution-design.md`.
 
-### Refusing default (trait participation)
-A trait method whose default returns success lets an implementation that never opted in be mistaken for one that did. Where a consumer must participate in an invariant, the default must refuse. `IndexerLike::rollback_block` returns `IndexError::UnsupportedRollback` rather than zeroed counts: a silent no-op would let the node advance its tip believing a stale index is consistent, which is the exact failure the method exists to prevent. The eight existing implementations still compile untouched, and only fail if a reorg is genuinely driven through one that cannot handle it.
+### TxIndex watermark
+The versioned durable `(height, block hash)` cursor that identifies the exact active-chain prefix represented by `TxIndex` rows. Each forward commit writes one bounded batch's rows and final watermark in one storage batch. The worker can retain an uncommitted batch while the applied tip moves through strict descendants. If the tip becomes rival, lower, or absent, the worker can commit the complete prepared prefix; the next pass rolls it back or extends it to the current tip. Each rollback deletes one block's rows and replaces or removes the watermark in one storage batch. Height alone cannot prove identity across a reorg. Tables that contain index rows without the versioned watermark are cursorless legacy state and must be rebuilt.
+
+### Complete derived-index query
+A query returns a result only when one snapshot proves that the derived index covers the exact applied tip. A `TxIndex` query captures the applied tip and process-local revision, opens one typed storage snapshot, requires the snapshot watermark to equal that tip by height and hash, and rechecks the tip and revision before it returns. Aggregate row, byte, scan, and body-load budgets bound the work. Index lag, worker failure, a missing block body, a truncated scan, budget exhaustion, a tip change, and an ABA revision change return `Retry` or `Unavailable`; none can become a false absence. Electrum keeps an existing subscription and emits no update during transient unavailability.
+
+### Checkpoint write batching
+
+The checkpoint serializer writes many small record fields before it makes each
+artifact durable. `HashingWriter` batches those writes in a 64 KiB userspace
+buffer, then flushes the buffer before it returns the byte count and digest.
+The following file `fsync`, directory sync, generation rename, and `CURRENT`
+publication barriers do not change. The buffer changes syscall granularity,
+not the checkpoint format or durability boundary. Its `finish` operation owns
+the checked flush so a caller cannot publish a digest for buffered bytes that
+were not handed to the file.
+
+### Checkpoint MuHash batch
+
+The independent checkpoint traversal derives CoinStats and MuHash again instead
+of trusting the rolling listener that supplies live state. It encodes exact coin
+preimages into a bounded arena and computes insert-only partial MuHash values in
+parallel. The arena holds at most 262,144 coins or 16 MiB. Each flush uses no
+more lanes than the active Rayon pool or the 32-lane cap. The larger batch
+reduces partial-value construction and combination. It does not remove the
+listener-versus-traversal check, change preimage bytes, change snapshot bytes,
+or weaken checkpoint durability.
+
+### Coalesced TxIndex wake
+The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
 
 ### Undo record
 
@@ -143,17 +168,11 @@ disconnect because flip-flop between competing branches is normal.
 
 ### Owed derived state
 
-State that connection writes and disconnection must account for. Naming the
-whole set is what turns "disconnect works" into a checkable claim, and the
-answers are not uniform, which is why the list is kept rather than summarised.
+State that connection writes and disconnection must account for. The required action depends on how that state is addressed and published.
 
-Handled, in three different ways. `coin_stats` needed an explicit inverse for
-its block-level fields only, because the per-coin ones ride the UTXO change
-listener and the undo already reverses them. The filter index needed no
-rollback, because its rows are hash-addressed like block bodies and stay valid
-for a block that left the chain; only its last-tip cache is repointed, and that
-cache and the `blocks` RPC pop are best-effort refreshes rather than atomic
-inverses. `transactions` needed nothing, because connection never populates it.
+`coin_stats` needs an explicit inverse for its block-level fields. Its per-coin fields use the UTXO change listener, so the UTXO undo already reverses them. The filter index needs no row rollback because its rows are block-hash-addressed like block bodies; disconnection only repoints its last-tip cache. That cache and the `blocks` RPC pop are best-effort in-process refreshes.
+
+`TxIndex` is durable derived state outside the authoritative disconnect transaction. After `applied_tip` moves, the node publishes a revision and a coalesced wake. The worker compares its exact watermark with applied-tip ancestry, rolls back one block per atomic batch until it reaches the common ancestor, and then commits count-and-byte-bounded forward batches. It can assemble one pending batch across strict descendant tip revisions. A rival, lower, or absent tip can make the worker commit the complete prepared prefix before the next pass repairs it. Queries use one exact snapshot-plus-tip gate and refuse incomplete answers while the watermark lags or the worker is unavailable.
 
 `switch_to_branch` (`crates/node/src/reorg.rs`) is the production disconnect
 caller. Sync drives it when the header and applied tips diverge. Each attempt
@@ -217,19 +236,26 @@ that were scaling; only issuing fewer, larger dispatches does. See
 
 ### Window script batching
 
-Verifying the input scripts of several consecutive blocks in one parallel
-dispatch, so the fan-out is amortised over a run of blocks rather than paid per
-block. The window prepares each block against an ordered overlay, dispatches
-once, and issues a per-block proof; the blocks then commit one at a time and in
-order, so every rule needing committed state still sees the real chain. On
-mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
-558.4s, with the dispatch itself falling from 44.08s to 12.55s. The proof binds
-the block hash, its predecessor, the height, the flags, and the locktime cutoff,
-travels bundled with the prepared state it covers, and is re-checked against
-what the apply derives; a window that cannot be proven yields nothing and every
-block verifies normally. The historical pre-batching capture measured 78.4s /
-643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
-not one interleaved run. See
+Verifying the ordered transaction unit of several consecutive blocks in one
+parallel dispatch, so the fan-out is amortized over a run of blocks rather than
+paid per block. The unit includes transaction pre-checks, every input script,
+and transaction post-checks. The window prepares each block against an ordered
+overlay, dispatches once, and issues a private, single-use
+`BlockValidationProof`; the blocks then commit one at a time and in order, so
+every rule needing committed state still sees the real chain. The proof owns
+the `PreparedApply` it certifies and binds the block hash, predecessor, height,
+flags, and locktime cutoff. Commit re-derives all five fields. A mismatch
+discards both proof and prepared state and rebuilds from the live UTXO set.
+Assume-valid produces a distinct `AssumeValidSkipped` state, which re-reads the
+live trust gate and never takes the proof bypass.
+
+The initial batching change took mainnet 0..150,000 from 78.4s / 643.4s CPU to
+69.6s / 558.4s, with the dispatch itself falling from 44.08s to 12.55s. A later
+three-run interleaved attribution panel showed that deleting the duplicate
+commit-time transaction pass for matching proofs cut replay medians from
+48.414266s / 406.954276s CPU to 30.438702s / 254.642286s. The proof bypass
+applies only at the transaction-validation slot: block rules and BIP30 remain
+before it; coinbase maturity and BIP68 remain after it. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
 ### Script-check floor
@@ -263,7 +289,7 @@ is splitting the sequential path into a prepare half and a commit half so the
 preparation happens once.
 
 ### Disconnect marker phase
-The durable record that a block disconnect started, and how far it got. Armed and flushed BEFORE the first mutation, not written on the error path: a process that dies mid-rollback writes no error anywhere, and that is the case the marker exists for. Armed above the index rollback too, because that rollback commits a delete batch, so a crash between the two would leave the index rolled back while the UTXO set and tip still name the block. It carries a phase because two different callers clear it and they know different things. `InFlight` means mutation started and never reported finishing; a checkpoint refuses to clear it, since checkpointing a half-finished rollback captures the damage instead of repairing it. `RolledBack` means the rollback completed in memory and is owed durability; only this may be cleared, and only by the checkpoint that makes it durable. Both phases refuse a startup. The refusal path has a third operation, `cancel_disconnect`, because an index rollback that failed touched nothing and must clear unconditionally — routing it through the checkpoint's guarded clear would no-op on an `InFlight` marker and strand a false poison on an undamaged node. What this does not close: the UTXO set and tip live behind periodic checkpoints while the index persists immediately, so a crash after a clean disconnect but before the next checkpoint still restores a tip whose index rows are gone. Closing that needs a replay path this node does not have.
+The durable record that an authoritative block disconnect started and how far it got. It is armed and flushed before the UTXO mutation, not written on the error path: a process that dies during rollback writes no error, which is the case the marker must detect. `TxIndex` is outside this transaction and recovers from its own atomic watermark. `InFlight` means the authoritative rollback started and did not report completion; a checkpoint must not clear it because that would make a torn UTXO set durable. `RolledBack` means the in-memory UTXO set and applied tip moved together and still need one clean checkpoint. Startup refuses either phase. Only the checkpoint that publishes the rolled-back authoritative state may remove the marker.
 
 ### Count-and-byte bound
 A window sized by whichever of two caps binds first. A count alone is wrong wherever item size varies by orders of magnitude: early-chain blocks average 4.6 KB, so 1024 of them is 5 MB, while at the tip the same 1024 is 2 GB. A byte cap alone is wrong in the other direction, letting a window hold tens of thousands of tiny items. Taking the minimum makes the batch large exactly where items are small and per-batch overhead dominates, and small where items are large and it does not. The script window uses it, and the same shape is owed by the sync staging budget, whose count is still sized for tip-scale blocks. One item larger than the whole byte cap still goes through alone: refusing it would stall the chain rather than process it.
@@ -272,10 +298,10 @@ A window sized by whichever of two caps binds first. A count alone is wrong wher
 A key that distinguishes which producer wrote a row, as opposed to one that merely locates it. The index's funding, spending, and txid keys are an 8-byte prefix plus a height, so two blocks at one height that share an output script derive identical keys, and rolling the first back a second time deletes the second's rows. The block-header row is identity-bearing because its key is the 80-byte serialized header and the block hash is the double-SHA256 of exactly those bytes. Checking it before deleting is a proxy for rekeying the other three families, taken because rekeying breaks the electrs-compatible layout and forces a reindex.
 
 ### Prefix-row rescan cost
-The cost shape of every lossy-prefix index resolver: read the block once per matching row, deserialize it whole, then hash every output script in it to recover what the 8-byte prefix threw away. Measured, not asserted — `resolve_script_history` rises 63.9x for a 64x rise in funding rows and 3.6x for 4x the block bytes, so the two terms are linear and they multiply. The consequence is that per-row work is bounded by block size rather than by how many transactions actually matched, which is why an address funded at 64 heights costs 86.53 ms end-to-end against a 30 ms budget. `resolve_unspent_outputs` pays roughly double because it computes a txid for every transaction before checking any script, while `resolve_script_history` computes one only after a match. The fix is not a cheaper scan: it is carrying the matching transactions' byte positions in the row value, which is unused today, so resolution reads only those ranges and the exact-check survives untouched. See *Identity-bearing key* for what the same lossy prefix costs on the rollback side.
+The former cost shape of every lossy-prefix index resolver: read the block once per matching row, deserialize it whole, then hash every output script in it to recover what the 8-byte prefix threw away. Measurements established the problem: `resolve_script_history` rose 63.9x for a 64x rise in funding rows and 3.6x for 4x the block bytes, so the two terms were linear and multiplied. An address funded at 64 heights therefore cost 86.53 ms end to end against a 30 ms budget. `resolve_unspent_outputs` paid roughly double because it computed a txid for every transaction before checking any script. The index now stores each matching transaction's byte position in the row value. Both `Indexer` and the snapshot-gated `TxIndexQueryEngine` read those exact ranges and retain the full txid or scripthash check. The async path charges one bounded body-read operation and the returned bytes for every range attempt. It scans the full block only when the value or exact check is unusable. See *All-or-scan position fallback* for the completeness rule and *Identity-bearing key* for the same lossy prefix on the rollback side.
 
 ### All-or-scan position fallback
-The invariant that lets index row values carry transaction byte positions without carrying block identity. Funding and txid keys are an 8-byte prefix plus a height, so a superseded block at the same height leaves rows whose positions point into a different block's body — and because the reader exact-checks what it decodes, the failure is a silently short result rather than an error, which is the worst shape a read path can have. Rather than pay 8 bytes per row for a block tag (measured: 0.66x on top of the 1.67x the positions already cost), the reader **falls back to a full block scan the moment any single position fails to resolve**, and trusts the position list only when every one of them matches. Stale offsets land at arbitrary points in unrelated bytes and essentially never decode to a matching transaction, so they take the fallback; an 8-byte prefix collision between two scripthashes takes it too, correctly, once per 2^64 pairs. The rule that makes this safe is that a failed position is never *skipped* — skipping one and keeping the rest is exactly how a partial result gets reported as a complete one. Accepts one residual: a stale offset landing precisely on a transaction boundary whose transaction also matches, while a different transaction in that block matches too. See *Prefix-row rescan cost* for what the positions buy and *Identity-bearing key* for the same lossy prefix on the write side.
+The invariant that lets index row values carry transaction byte positions without a block tag. The valid-state prerequisite is strict: the single writer atomically commits every row mutation with the exact full-hash watermark, rolls rows back before a replacement, and snapshot queries accept a result only when the watermark equals the applied tip and both revision and tip remain stable. The reader validates the complete position list before I/O: it must be nonempty, strictly increasing, unique, nonoverlapping, within the block bound, and free of arithmetic overflow. It then reads each range from the current canonical `(height, full hash)` and exact-checks the decoded txid or scripthash. If any position fails, the reader discards every tentative result for that row and scans the full block; it never skips one position and keeps the rest. This also handles ordinary 8-byte prefix collisions. A stale row under an accepted watermark requires manual mutation, broken backend atomicity, or storage corruption and is outside the valid index-state contract; a full scan cannot make an arbitrarily corrupted row key authoritative. A per-row block tag was rejected because it measured 0.66x on top of the 1.67x position cost. See *Prefix-row rescan cost* for the range-read gain and *Identity-bearing key* for the write-side rollback guard.
 
 ### Paired-arm benchmark
 A Criterion group holding the before and after implementations of one change over one identical fixture, so the ratio comes from a single run. Adopted because a stored baseline cannot be trusted across a rebuild, and because the before implementation is wanted anyway as the equivalence oracle — the same function serves both roles. Its second use is diagnostic: while both arms still call the same code, their spread *is* the harness noise floor, measured rather than assumed. That reading is what disqualified the 64-height `subscribe` and `get_balance` groups, whose identical arms differ by 2.0-2.4x on a laptop and therefore cannot resolve a 1.05x gate, while `get_history` held within 1%. A group that cannot resolve the gate does not get to report a win.

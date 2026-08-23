@@ -70,6 +70,16 @@ impl KvStore for MdbxStore {
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
 
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        let txn = self.env.begin_ro_sync().map_err(StorageError::backend)?;
+        scan_prefix(&txn, self.database(cf)?, prefix, limit)
+    }
+
     fn new_batch(&self) -> Self::WriteBatch {
         MdbxWriteBatch::default()
     }
@@ -110,6 +120,12 @@ impl KvStore for MdbxStore {
             }
         }
         txn.commit().map_err(StorageError::backend)
+    }
+
+    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        // MDBX environments are opened with default durable sync flags, so a normal
+        // synchronous write transaction already returns after the data is fsynced.
+        self.write(batch)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -222,6 +238,51 @@ impl KvSnapshot for MdbxSnapshot {
         let rows = collect_prefix(&self.txn, self.database(cf)?, prefix)?;
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
+
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        scan_prefix(&self.txn, self.database(cf)?, prefix, limit)
+    }
+}
+
+fn scan_prefix<'tx>(
+    txn: &'tx RoTxSync,
+    database: Database,
+    prefix: &[u8],
+    limit: crate::PrefixScanLimit,
+) -> Result<crate::PrefixScan, StorageError> {
+    use std::borrow::Cow;
+
+    let mut cursor = txn.cursor(database).map_err(StorageError::backend)?;
+    let mut iter = cursor
+        .iter_from::<Cow<'tx, [u8]>, Cow<'tx, [u8]>>(prefix)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    while let Some((key, value)) = iter.borrow_next().map_err(StorageError::backend)? {
+        if !key.starts_with(prefix) {
+            // Native forward ordering means no later key can match.
+            return Ok(crate::PrefixScan {
+                rows,
+                complete: true,
+            });
+        }
+        if !crate::trait_::push_bounded_row(&mut rows, &mut bytes, &key, &value, limit) {
+            // Stop before copying the first row that exceeds limits.
+            return Ok(crate::PrefixScan {
+                rows,
+                complete: false,
+            });
+        }
+    }
+    Ok(crate::PrefixScan {
+        rows,
+        complete: true,
+    })
 }
 
 fn collect_prefix(

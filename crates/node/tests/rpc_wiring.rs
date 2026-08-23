@@ -45,8 +45,8 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let p2p_outbound = Some(state.p2p_outbound_sender());
     let banned = state.banned_subnets();
     let added_nodes = Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let Some(tx_index) = state.tx_index() else {
-        panic!("txindex handle missing when enabled");
+    let Some(tx_index) = state.tx_index_query() else {
+        panic!("txindex query engine missing when enabled");
     };
     let ctx = Context::from_handles(
         Arc::clone(&chain_tip),
@@ -104,7 +104,10 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         Arc::ptr_eq(&ctx.filter_index, &filter_index),
         "filter_index must share identity"
     );
-    assert!(ctx.indexer.is_some(), "indexer handle must be wired");
+    assert!(
+        ctx.tx_index.is_some(),
+        "txindex query adapter must be wired"
+    );
     assert!(
         Arc::ptr_eq(&ctx.network, &network),
         "network must share identity"
@@ -153,6 +156,6 @@ fn rpc_context_omits_indexer_when_node_txindex_is_disabled() -> Result<()> {
     config.txindex = false;
     let state = NodeState::open(config)?;
 
-    assert!(state.tx_index().is_none());
+    assert!(state.tx_index_query().is_none());
     Ok(())
 }

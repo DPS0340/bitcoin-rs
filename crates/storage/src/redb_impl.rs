@@ -8,6 +8,17 @@ use redb::{
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
 
 type ByteTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
+type FixedTable<const N: usize> = TableDefinition<'static, &'static [u8; N], ()>;
+type TxIndexValueTable = TableDefinition<'static, &'static [u8; 12], &'static [u8]>;
+
+const TXINDEX_TX_CONFIRMED: FixedTable<12> = TableDefinition::new("txindex_v1_tx_confirmed");
+const TXINDEX_TX_CONFIRMED_VALUES: TxIndexValueTable =
+    TableDefinition::new("txindex_v1_tx_confirmed_values");
+const TXINDEX_FUNDING: FixedTable<12> = TableDefinition::new("txindex_v1_funding");
+const TXINDEX_FUNDING_VALUES: TxIndexValueTable = TableDefinition::new("txindex_v1_funding_values");
+const TXINDEX_SPENDING: FixedTable<12> = TableDefinition::new("txindex_v1_spending");
+const TXINDEX_BLOCK_HEADERS: FixedTable<80> = TableDefinition::new("txindex_v1_block_headers");
+const TXINDEX_META: ByteTable = TableDefinition::new("txindex_v1_meta");
 
 /// redb-backed key-value store.
 pub struct RedbStore {
@@ -75,8 +86,18 @@ impl KvStore for RedbStore {
         prefix: &[u8],
     ) -> Result<crate::trait_::KvIter<'a>, StorageError> {
         let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
-        let rows = collect_prefix(&read_txn, cf, prefix)?;
+        let rows = collect_prefix(&read_txn, table_for(cf), prefix)?;
         Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
+        scan_prefix(&read_txn, table_for(cf), prefix, limit)
     }
 
     fn new_batch(&self) -> Self::WriteBatch {
@@ -102,6 +123,10 @@ impl KvStore for RedbStore {
         self.write_with_durability(batch, Durability::None)
     }
 
+    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Durability::Immediate)
+    }
+
     fn flush(&self) -> Result<(), StorageError> {
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         // An empty Immediate commit makes all earlier None commits durable.
@@ -113,6 +138,175 @@ impl KvStore for RedbStore {
 
     fn snapshot(&self) -> Result<Box<dyn KvSnapshot + '_>, StorageError> {
         Ok(Box::new(RedbSnapshot {
+            read_txn: self.db.begin_read().map_err(StorageError::backend)?,
+        }))
+    }
+}
+
+/// redb-backed transaction-index store using fixed-width physical tables.
+pub struct RedbTxIndexStore {
+    db: Database,
+}
+
+impl RedbTxIndexStore {
+    /// Opens or creates a transaction-index store at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let db_path = database_path(path.as_ref())?;
+        let db = Database::create(db_path).map_err(StorageError::backend)?;
+        let write_txn = db.begin_write().map_err(StorageError::backend)?;
+        drop(
+            write_txn
+                .open_table(TXINDEX_TX_CONFIRMED)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_TX_CONFIRMED_VALUES)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_FUNDING)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_FUNDING_VALUES)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_SPENDING)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_BLOCK_HEADERS)
+                .map_err(StorageError::backend)?,
+        );
+        drop(
+            write_txn
+                .open_table(TXINDEX_META)
+                .map_err(StorageError::backend)?,
+        );
+        write_txn.commit().map_err(StorageError::backend)?;
+        Ok(Self { db })
+    }
+
+    fn write_with_durability(
+        &self,
+        batch: RedbWriteBatch,
+        durability: Durability,
+    ) -> Result<(), StorageError> {
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        write_txn
+            .set_durability(durability)
+            .map_err(StorageError::backend)?;
+        let mut ops = batch.ops.into_iter().peekable();
+        while let Some(op) = ops.next() {
+            match op.cf() {
+                ColumnFamily::TxConfirmed => {
+                    apply_fixed_value_run(
+                        &write_txn,
+                        TXINDEX_TX_CONFIRMED,
+                        TXINDEX_TX_CONFIRMED_VALUES,
+                        op,
+                        &mut ops,
+                    )?;
+                }
+                ColumnFamily::Funding => {
+                    apply_fixed_value_run(
+                        &write_txn,
+                        TXINDEX_FUNDING,
+                        TXINDEX_FUNDING_VALUES,
+                        op,
+                        &mut ops,
+                    )?;
+                }
+                ColumnFamily::Spending => {
+                    apply_fixed_run(&write_txn, TXINDEX_SPENDING, op, &mut ops)?;
+                }
+                ColumnFamily::BlockHeaders => {
+                    apply_fixed_run(&write_txn, TXINDEX_BLOCK_HEADERS, op, &mut ops)?;
+                }
+                ColumnFamily::UtxoMeta => {
+                    apply_byte_run(&write_txn, TXINDEX_META, op, &mut ops)?;
+                }
+                _ => return Err(invalid_txindex_cf()),
+            }
+        }
+        write_txn.commit().map_err(StorageError::backend)
+    }
+}
+
+impl KvStore for RedbTxIndexStore {
+    type WriteBatch = RedbWriteBatch;
+
+    fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
+        match cf {
+            ColumnFamily::TxConfirmed => fixed_value_get(
+                &read_txn,
+                TXINDEX_TX_CONFIRMED,
+                TXINDEX_TX_CONFIRMED_VALUES,
+                key,
+            ),
+            ColumnFamily::Funding => {
+                fixed_value_get(&read_txn, TXINDEX_FUNDING, TXINDEX_FUNDING_VALUES, key)
+            }
+            ColumnFamily::Spending => fixed_get(&read_txn, TXINDEX_SPENDING, key),
+            ColumnFamily::BlockHeaders => fixed_get(&read_txn, TXINDEX_BLOCK_HEADERS, key),
+            ColumnFamily::UtxoMeta => byte_get(&read_txn, TXINDEX_META, key),
+            _ => Err(invalid_txindex_cf()),
+        }
+    }
+
+    fn iter_prefix<'a>(
+        &'a self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<crate::trait_::KvIter<'a>, StorageError> {
+        let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
+        let rows = collect_txindex_prefix(&read_txn, cf, prefix)?;
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        let read_txn = self.db.begin_read().map_err(StorageError::backend)?;
+        scan_txindex_prefix(&read_txn, cf, prefix, limit)
+    }
+
+    fn new_batch(&self) -> Self::WriteBatch {
+        RedbWriteBatch::default()
+    }
+
+    fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Durability::Immediate)
+    }
+
+    fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Durability::None)
+    }
+
+    fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        self.write_with_durability(batch, Durability::Immediate)
+    }
+
+    fn flush(&self) -> Result<(), StorageError> {
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(StorageError::backend)?;
+        write_txn.commit().map_err(StorageError::backend)
+    }
+
+    fn snapshot(&self) -> Result<Box<dyn KvSnapshot + '_>, StorageError> {
+        Ok(Box::new(RedbTxIndexSnapshot {
             read_txn: self.db.begin_read().map_err(StorageError::backend)?,
         }))
     }
@@ -231,9 +425,120 @@ impl KvSnapshot for RedbSnapshot {
         cf: ColumnFamily,
         prefix: &[u8],
     ) -> Result<crate::trait_::KvIter<'a>, StorageError> {
-        let rows = collect_prefix(&self.read_txn, cf, prefix)?;
+        let rows = collect_prefix(&self.read_txn, table_for(cf), prefix)?;
         Ok(Box::new(rows.into_iter().map(Ok)))
     }
+
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        scan_prefix(&self.read_txn, table_for(cf), prefix, limit)
+    }
+}
+
+struct RedbTxIndexSnapshot {
+    read_txn: ReadTransaction,
+}
+
+impl KvSnapshot for RedbTxIndexSnapshot {
+    fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+        match cf {
+            ColumnFamily::TxConfirmed => fixed_value_get(
+                &self.read_txn,
+                TXINDEX_TX_CONFIRMED,
+                TXINDEX_TX_CONFIRMED_VALUES,
+                key,
+            ),
+            ColumnFamily::Funding => {
+                fixed_value_get(&self.read_txn, TXINDEX_FUNDING, TXINDEX_FUNDING_VALUES, key)
+            }
+            ColumnFamily::Spending => fixed_get(&self.read_txn, TXINDEX_SPENDING, key),
+            ColumnFamily::BlockHeaders => fixed_get(&self.read_txn, TXINDEX_BLOCK_HEADERS, key),
+            ColumnFamily::UtxoMeta => byte_get(&self.read_txn, TXINDEX_META, key),
+            _ => Err(invalid_txindex_cf()),
+        }
+    }
+
+    fn iter_prefix<'a>(
+        &'a self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<crate::trait_::KvIter<'a>, StorageError> {
+        let rows = collect_txindex_prefix(&self.read_txn, cf, prefix)?;
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
+
+    fn scan_prefix_bounded(
+        &self,
+        cf: ColumnFamily,
+        prefix: &[u8],
+        limit: crate::PrefixScanLimit,
+    ) -> Result<crate::PrefixScan, StorageError> {
+        scan_txindex_prefix(&self.read_txn, cf, prefix, limit)
+    }
+}
+
+fn scan_prefix(
+    read_txn: &redb::ReadTransaction,
+    table_def: ByteTable,
+    prefix: &[u8],
+    limit: crate::PrefixScanLimit,
+) -> Result<crate::PrefixScan, StorageError> {
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    match prefix_end(prefix) {
+        Some(end) => {
+            for item in table
+                .range(prefix..end.as_slice())
+                .map_err(StorageError::backend)?
+            {
+                let (key, value) = item.map_err(StorageError::backend)?;
+                if !crate::trait_::push_bounded_row(
+                    &mut rows,
+                    &mut bytes,
+                    key.value(),
+                    value.value(),
+                    limit,
+                ) {
+                    // Stop before copying the first row that exceeds limits.
+                    return Ok(crate::PrefixScan {
+                        rows,
+                        complete: false,
+                    });
+                }
+            }
+        }
+        None => {
+            for item in table.range(prefix..).map_err(StorageError::backend)? {
+                let (key, value) = item.map_err(StorageError::backend)?;
+                if !key.value().starts_with(prefix) {
+                    break;
+                }
+                if !crate::trait_::push_bounded_row(
+                    &mut rows,
+                    &mut bytes,
+                    key.value(),
+                    value.value(),
+                    limit,
+                ) {
+                    return Ok(crate::PrefixScan {
+                        rows,
+                        complete: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(crate::PrefixScan {
+        rows,
+        complete: true,
+    })
 }
 
 fn database_path(path: &Path) -> Result<PathBuf, StorageError> {
@@ -267,11 +572,11 @@ const fn table_for(cf: ColumnFamily) -> ByteTable {
 
 fn collect_prefix(
     read_txn: &ReadTransaction,
-    cf: ColumnFamily,
+    table_def: ByteTable,
     prefix: &[u8],
 ) -> Result<Vec<crate::trait_::KvPair>, StorageError> {
     let table = read_txn
-        .open_table(table_for(cf))
+        .open_table(table_def)
         .map_err(StorageError::backend)?;
     let mut rows = Vec::new();
     match prefix_end(prefix) {
@@ -308,4 +613,392 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+fn invalid_txindex_cf() -> StorageError {
+    StorageError::InvalidOperation("column family not supported by RedbTxIndexStore")
+}
+
+fn fixed_key_error() -> StorageError {
+    StorageError::InvalidOperation("fixed-width key length mismatch")
+}
+
+fn fixed_value_error() -> StorageError {
+    StorageError::InvalidOperation("fixed-width value must be empty")
+}
+
+fn fixed_prefix_error() -> StorageError {
+    StorageError::InvalidOperation("fixed-width prefix exceeds key width")
+}
+
+fn fixed_key<const N: usize>(key: &[u8]) -> Result<[u8; N], StorageError> {
+    if key.len() != N {
+        return Err(fixed_key_error());
+    }
+    let mut array = [0u8; N];
+    array.copy_from_slice(key);
+    Ok(array)
+}
+
+fn fixed_prefix_bounds<const N: usize>(prefix: &[u8]) -> Result<([u8; N], [u8; N]), StorageError> {
+    if prefix.len() > N {
+        return Err(fixed_prefix_error());
+    }
+    let mut start = [0u8; N];
+    let mut end = [0xffu8; N];
+    start[..prefix.len()].copy_from_slice(prefix);
+    end[..prefix.len()].copy_from_slice(prefix);
+    Ok((start, end))
+}
+
+fn fixed_get<const N: usize>(
+    read_txn: &ReadTransaction,
+    table_def: FixedTable<N>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let array = fixed_key::<N>(key)?;
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    table
+        .get(&array)
+        .map(|value| value.map(|_| Vec::new()))
+        .map_err(StorageError::backend)
+}
+
+fn fixed_value_get(
+    read_txn: &ReadTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let key = fixed_key::<12>(key)?;
+    let main = read_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    if main.get(&key).map_err(StorageError::backend)?.is_none() {
+        return Ok(None);
+    }
+    let values = read_txn
+        .open_table(value_def)
+        .map_err(StorageError::backend)?;
+    values
+        .get(&key)
+        .map(|value| value.map_or_else(Vec::new, |bytes| bytes.value().to_vec()))
+        .map(Some)
+        .map_err(StorageError::backend)
+}
+
+fn byte_get(
+    read_txn: &ReadTransaction,
+    table_def: ByteTable,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, StorageError> {
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    table
+        .get(key)
+        .map(|value| value.map(|bytes| bytes.value().to_vec()))
+        .map_err(StorageError::backend)
+}
+
+fn fixed_prefix_collect<const N: usize>(
+    read_txn: &ReadTransaction,
+    table_def: FixedTable<N>,
+    prefix: &[u8],
+) -> Result<Vec<crate::trait_::KvPair>, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<N>(prefix)?;
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    for item in table
+        .range::<&[u8; N]>(&start..=&end)
+        .map_err(StorageError::backend)?
+    {
+        let (key, _) = item.map_err(StorageError::backend)?;
+        rows.push((key.value().to_vec(), Vec::new()));
+    }
+    Ok(rows)
+}
+
+fn fixed_value_prefix_collect(
+    read_txn: &ReadTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    prefix: &[u8],
+) -> Result<Vec<crate::trait_::KvPair>, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<12>(prefix)?;
+    let main = read_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    let values = read_txn
+        .open_table(value_def)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    for item in main
+        .range::<&[u8; 12]>(&start..=&end)
+        .map_err(StorageError::backend)?
+    {
+        let (key, _) = item.map_err(StorageError::backend)?;
+        let key = key.value();
+        let value = values
+            .get(key)
+            .map_err(StorageError::backend)?
+            .map_or_else(Vec::new, |bytes| bytes.value().to_vec());
+        rows.push((key.to_vec(), value));
+    }
+    Ok(rows)
+}
+
+fn fixed_prefix_scan<const N: usize>(
+    read_txn: &ReadTransaction,
+    table_def: FixedTable<N>,
+    prefix: &[u8],
+    limit: crate::PrefixScanLimit,
+) -> Result<crate::PrefixScan, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<N>(prefix)?;
+    let table = read_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    for item in table
+        .range::<&[u8; N]>(&start..=&end)
+        .map_err(StorageError::backend)?
+    {
+        let (key, _) = item.map_err(StorageError::backend)?;
+        if !crate::trait_::push_bounded_row(&mut rows, &mut bytes, key.value(), &[], limit) {
+            return Ok(crate::PrefixScan {
+                rows,
+                complete: false,
+            });
+        }
+    }
+    Ok(crate::PrefixScan {
+        rows,
+        complete: true,
+    })
+}
+
+fn fixed_value_prefix_scan(
+    read_txn: &ReadTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    prefix: &[u8],
+    limit: crate::PrefixScanLimit,
+) -> Result<crate::PrefixScan, StorageError> {
+    let (start, end) = fixed_prefix_bounds::<12>(prefix)?;
+    let main = read_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    let values = read_txn
+        .open_table(value_def)
+        .map_err(StorageError::backend)?;
+    let mut rows = Vec::new();
+    let mut bytes = 0;
+    for item in main
+        .range::<&[u8; 12]>(&start..=&end)
+        .map_err(StorageError::backend)?
+    {
+        let (key, _) = item.map_err(StorageError::backend)?;
+        let key = key.value();
+        let value = values
+            .get(key)
+            .map_err(StorageError::backend)?
+            .map_or_else(Vec::new, |bytes| bytes.value().to_vec());
+        if !crate::trait_::push_bounded_row(&mut rows, &mut bytes, key, &value, limit) {
+            return Ok(crate::PrefixScan {
+                rows,
+                complete: false,
+            });
+        }
+    }
+    Ok(crate::PrefixScan {
+        rows,
+        complete: true,
+    })
+}
+
+fn collect_txindex_prefix(
+    read_txn: &ReadTransaction,
+    cf: ColumnFamily,
+    prefix: &[u8],
+) -> Result<Vec<crate::trait_::KvPair>, StorageError> {
+    match cf {
+        ColumnFamily::TxConfirmed => fixed_value_prefix_collect(
+            read_txn,
+            TXINDEX_TX_CONFIRMED,
+            TXINDEX_TX_CONFIRMED_VALUES,
+            prefix,
+        ),
+        ColumnFamily::Funding => {
+            fixed_value_prefix_collect(read_txn, TXINDEX_FUNDING, TXINDEX_FUNDING_VALUES, prefix)
+        }
+        ColumnFamily::Spending => fixed_prefix_collect::<12>(read_txn, TXINDEX_SPENDING, prefix),
+        ColumnFamily::BlockHeaders => {
+            fixed_prefix_collect::<80>(read_txn, TXINDEX_BLOCK_HEADERS, prefix)
+        }
+        ColumnFamily::UtxoMeta => collect_prefix(read_txn, TXINDEX_META, prefix),
+        _ => Err(invalid_txindex_cf()),
+    }
+}
+
+fn scan_txindex_prefix(
+    read_txn: &ReadTransaction,
+    cf: ColumnFamily,
+    prefix: &[u8],
+    limit: crate::PrefixScanLimit,
+) -> Result<crate::PrefixScan, StorageError> {
+    match cf {
+        ColumnFamily::TxConfirmed => fixed_value_prefix_scan(
+            read_txn,
+            TXINDEX_TX_CONFIRMED,
+            TXINDEX_TX_CONFIRMED_VALUES,
+            prefix,
+            limit,
+        ),
+        ColumnFamily::Funding => fixed_value_prefix_scan(
+            read_txn,
+            TXINDEX_FUNDING,
+            TXINDEX_FUNDING_VALUES,
+            prefix,
+            limit,
+        ),
+        ColumnFamily::Spending => {
+            fixed_prefix_scan::<12>(read_txn, TXINDEX_SPENDING, prefix, limit)
+        }
+        ColumnFamily::BlockHeaders => {
+            fixed_prefix_scan::<80>(read_txn, TXINDEX_BLOCK_HEADERS, prefix, limit)
+        }
+        ColumnFamily::UtxoMeta => scan_prefix(read_txn, TXINDEX_META, prefix, limit),
+        _ => Err(invalid_txindex_cf()),
+    }
+}
+
+fn apply_fixed_op<const N: usize>(
+    table: &mut redb::Table<'_, &'static [u8; N], ()>,
+    op: BatchOp,
+) -> Result<(), StorageError> {
+    match op {
+        BatchOp::Put { key, value, .. } => {
+            if !value.is_empty() {
+                return Err(fixed_value_error());
+            }
+            let key = fixed_key::<N>(&key)?;
+            table
+                .insert(&key, ())
+                .map(|_| ())
+                .map_err(StorageError::backend)
+        }
+        BatchOp::Delete { key, .. } => {
+            let key = fixed_key::<N>(&key)?;
+            table
+                .remove(&key)
+                .map(|_| ())
+                .map_err(StorageError::backend)
+        }
+        BatchOp::DeleteRange { start, end, .. } => {
+            let start = fixed_key::<N>(&start)?;
+            let end = fixed_key::<N>(&end)?;
+            table
+                .retain_in::<&[u8; N], _>(&start..&end, |_, ()| false)
+                .map_err(StorageError::backend)
+        }
+    }
+}
+
+fn apply_fixed_value_op(
+    main: &mut redb::Table<'_, &'static [u8; 12], ()>,
+    values: &mut redb::Table<'_, &'static [u8; 12], &'static [u8]>,
+    op: BatchOp,
+) -> Result<(), StorageError> {
+    match op {
+        BatchOp::Put { key, value, .. } => {
+            let key = fixed_key::<12>(&key)?;
+            main.insert(&key, ()).map_err(StorageError::backend)?;
+            if value.is_empty() {
+                values.remove(&key).map_err(StorageError::backend)?;
+            } else {
+                values
+                    .insert(&key, value.as_ref())
+                    .map_err(StorageError::backend)?;
+            }
+            Ok(())
+        }
+        BatchOp::Delete { key, .. } => {
+            let key = fixed_key::<12>(&key)?;
+            main.remove(&key).map_err(StorageError::backend)?;
+            values.remove(&key).map_err(StorageError::backend)?;
+            Ok(())
+        }
+        BatchOp::DeleteRange { start, end, .. } => {
+            let start = fixed_key::<12>(&start)?;
+            let end = fixed_key::<12>(&end)?;
+            main.retain_in::<&[u8; 12], _>(&start..&end, |_, ()| false)
+                .map_err(StorageError::backend)?;
+            values
+                .retain_in::<&[u8; 12], _>(&start..&end, |_, _| false)
+                .map_err(StorageError::backend)
+        }
+    }
+}
+
+fn apply_fixed_value_run(
+    write_txn: &redb::WriteTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    first: BatchOp,
+    ops: &mut std::iter::Peekable<std::vec::IntoIter<BatchOp>>,
+) -> Result<(), StorageError> {
+    let cf = first.cf();
+    let mut main = write_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    let mut values = write_txn
+        .open_table(value_def)
+        .map_err(StorageError::backend)?;
+    apply_fixed_value_op(&mut main, &mut values, first)?;
+    while ops.peek().is_some_and(|next| next.cf() == cf) {
+        let Some(op) = ops.next() else { break };
+        apply_fixed_value_op(&mut main, &mut values, op)?;
+    }
+    Ok(())
+}
+
+fn apply_fixed_run<const N: usize>(
+    write_txn: &redb::WriteTransaction,
+    table_def: FixedTable<N>,
+    first: BatchOp,
+    ops: &mut std::iter::Peekable<std::vec::IntoIter<BatchOp>>,
+) -> Result<(), StorageError> {
+    let cf = first.cf();
+    let mut table = write_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    apply_fixed_op(&mut table, first)?;
+    while ops.peek().is_some_and(|next| next.cf() == cf) {
+        let Some(op) = ops.next() else { break };
+        apply_fixed_op(&mut table, op)?;
+    }
+    Ok(())
+}
+
+fn apply_byte_run(
+    write_txn: &redb::WriteTransaction,
+    table_def: ByteTable,
+    first: BatchOp,
+    ops: &mut std::iter::Peekable<std::vec::IntoIter<BatchOp>>,
+) -> Result<(), StorageError> {
+    let cf = first.cf();
+    let mut table = write_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    apply_redb_batch_op(&mut table, first)?;
+    while ops.peek().is_some_and(|next| next.cf() == cf) {
+        let Some(op) = ops.next() else { break };
+        apply_redb_batch_op(&mut table, op)?;
+    }
+    Ok(())
 }

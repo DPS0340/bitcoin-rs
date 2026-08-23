@@ -1,0 +1,245 @@
+{
+  "corpus": {
+    "bitcoin_rs_backend": "fjall",
+    "indexes": {
+      "blockfilterindex": false,
+      "txindex": false
+    },
+    "network": "mainnet",
+    "seed_bytes_warmed_per_arm": 747001853,
+    "source": "one warmed Bitcoin Core seed at 127.0.0.1:18444",
+    "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "start_height": 0,
+    "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+    "stop_height": 150000,
+    "transport": "P2P v1",
+    "validation": "full; assume-valid disabled"
+  },
+  "git_head": "9dae9e0d7b9f88937953517f8d0b4aa102e0437a",
+  "host": {
+    "architecture": "x86_64",
+    "benchmark_cpu_set": "0-31",
+    "cpu": "Intel Xeon Gold 6138",
+    "hostname": "alpha-Precision-7920-Tower",
+    "seed_cpu_set": "32-39"
+  },
+  "limitations": [
+    "The range ends at height 150000 and does not represent later script eras or current-tip peer conditions.",
+    "Both nodes downloaded from one local warmed seed, so the result measures one-peer requester and apply behavior, not Internet bandwidth aggregation.",
+    "The checked-in custody condenses the full external raw summary; hashes bind the omitted raw arm files.",
+    "ARM parity remains unmeasured because no OpenSSH ARM host alias was available."
+  ],
+  "measured_followups": {
+    "eight_proxy_same_seed": {
+      "candidate_seconds": 115.429379346,
+      "custody_path_at_capture": "/home/alpha/bitcoin-rs-bench/results/attribution-eight-peer-1787356643062473536-eight-reconnaissance.json",
+      "custody_sha256": "c46d0eaf1b463c4860ddcdf0657d16e2b722d11cc0fe2b97ecace63be36caa02",
+      "landed": false,
+      "reason": "28.861922467% slower than the trusted one-peer median; topology reconnaissance only"
+    },
+    "pgo": {
+      "candidate_seconds": 89.266232737,
+      "custody_path_at_capture": "/home/alpha/bitcoin-rs-bench/pgo/w128-daemon-v1/screen.json",
+      "custody_sha256": "e2304fe5595b075fdfae9213bf91e682bb63e189a7b65fb9006f9bf2873792fd",
+      "landed": false,
+      "reason": "below the 1.05 continuation threshold",
+      "trusted_baseline_over_candidate_wall": 1.003470356343061
+    },
+    "w256": {
+      "candidate_seconds": 59.225400502,
+      "control_over_candidate_wall": 1.519151046483201,
+      "control_seconds": 89.972329151,
+      "custody_path_at_capture": "/home/alpha/bitcoin-rs-bench/results/daemon-w256-screen-w256-1787359662333118128.json",
+      "custody_sha256": "b977aa3bb64bb24d08773c71b7f00522efa2d6d65bd032770760e79a64b501c7",
+      "landed": false,
+      "reason": "temporary w256 experiment lacked an effective required safety gate and missed the predeclared first-position header-read threshold"
+    }
+  },
+  "policy": {
+    "arms_per_implementation": 3,
+    "cooldown_seconds_per_arm": 30,
+    "discard_whole_block_on_rustc_or_resource_contamination": true,
+    "disk_reserve_bytes": 68719476736,
+    "exact_height_hash_and_header_tip_required": true,
+    "fixture_limit_bytes": 8589934592,
+    "fresh_output_state_per_arm": true,
+    "matched_blocks": 3,
+    "rss_limit_bytes": 17179869184
+  },
+  "raw_source": {
+    "bytes": 33272,
+    "campaign_launch_id": "1787313177601766199-1393003",
+    "path_at_capture": "/home/alpha/bitcoin-rs-bench/results/daemon-ibd-pairs-summary.json",
+    "seed_process_start_ticks": "3816521",
+    "sha256": "844180a9922dccb8d741fc7751d95e18e1137a0705b1853f72204c245aa496f7"
+  },
+  "results": {
+    "bitcoin_core_median_seconds": 73.458771289,
+    "bitcoin_core_seconds": [
+      73.456286688,
+      73.458771289,
+      73.462707674
+    ],
+    "bitcoin_rs_median_seconds": 89.576018374,
+    "bitcoin_rs_over_core_wall": 1.2194053453683817,
+    "bitcoin_rs_seconds": [
+      89.695885374,
+      89.576018374,
+      88.464853861
+    ],
+    "core_over_bitcoin_rs_wall": 0.8200718520697484,
+    "twofold_target_core_over_bitcoin_rs": 2.0,
+    "twofold_target_met": false,
+    "verdict": "Bitcoin Core is 1.219405345x faster on this bounded one-peer daemon IBD workload; the twofold target is not met"
+  },
+  "runs": [
+    {
+      "adapter_elapsed_seconds": 89.695885374,
+      "binary_sha256": "2fbbf0709a9e2b2ab167f919fa93f283de4d452fba0e3572da8f3ecf6da68472",
+      "config_sha256": "0936bae8836cf699d2288413d15017f8c23ebe6641f4077b434f38e7966773ad",
+      "endpoint": {
+        "applied_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "best_header_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "current_sha256": "11a67430e324b42fa6a8b9a44dbabc8b044eddc65548f98b62d4ca8435f91684",
+        "manifest_sha256": "45a27b30fe32ddd820c922012ae1f429fc60b4689b05d097ecb26fa1245d36bc"
+      },
+      "guard_sha256": "01e642d3dcb1d84c8020499d0d7c719cef640e12afc6f689c33d89950101fe14",
+      "implementation": "bitcoin-rs",
+      "peak_fixture_bytes": 1453907642,
+      "peak_rss_bytes": 564789248,
+      "run_id": "block1-rs",
+      "runner_sha256": "4cc02b6550abe5ea319208b71cd55adc4c34c8ca092dcbb0eb71c35e89f70272",
+      "sequence": 1,
+      "summary_sha256": "836e4c12956637a74e694f685b12c1ca7b8c4067e2ef1d39add9f411354950bd"
+    },
+    {
+      "adapter_elapsed_seconds": 73.456286688,
+      "binary_sha256": "986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08",
+      "config_sha256": "ebbd70606c8288c7f9070946484778a0390f27ea917d9257678f623d4ebe7fc5",
+      "endpoint": {
+        "bestblockhash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "blocks": 150000,
+        "chain": "main",
+        "headers": 150000,
+        "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "validation_process_exit_code": 0
+      },
+      "guard_sha256": "63a5c6c37bafa9ebdef6669f4bd40517d3f1e4cf1679a765b48f6ce483fd625e",
+      "implementation": "bitcoin-core",
+      "peak_fixture_bytes": 915213631,
+      "peak_rss_bytes": 400109568,
+      "run_id": "block1-core",
+      "runner_sha256": "18fddd97a312b06fce722710db28e39fdbf82d8632f93e703d53c2d8008cebe4",
+      "sequence": 2,
+      "summary_sha256": "58885618fe9c44d7ead0c6b7c10e322fbf278959ef4bacdc88894cdf98912268"
+    },
+    {
+      "adapter_elapsed_seconds": 73.458771289,
+      "binary_sha256": "986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08",
+      "config_sha256": "ebbd70606c8288c7f9070946484778a0390f27ea917d9257678f623d4ebe7fc5",
+      "endpoint": {
+        "bestblockhash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "blocks": 150000,
+        "chain": "main",
+        "headers": 150000,
+        "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "validation_process_exit_code": 0
+      },
+      "guard_sha256": "6ac23e450ceb6a7df79dc395d32ba41970ee01f0cb45f94661b569109e8092d9",
+      "implementation": "bitcoin-core",
+      "peak_fixture_bytes": 914854116,
+      "peak_rss_bytes": 401387520,
+      "run_id": "block2-core",
+      "runner_sha256": "18fddd97a312b06fce722710db28e39fdbf82d8632f93e703d53c2d8008cebe4",
+      "sequence": 3,
+      "summary_sha256": "cae8eec8eb593e6839f53466ad5eb18b9738d03dfa4fc3019ade9a7ec51d214f"
+    },
+    {
+      "adapter_elapsed_seconds": 89.576018374,
+      "binary_sha256": "2fbbf0709a9e2b2ab167f919fa93f283de4d452fba0e3572da8f3ecf6da68472",
+      "config_sha256": "0936bae8836cf699d2288413d15017f8c23ebe6641f4077b434f38e7966773ad",
+      "endpoint": {
+        "applied_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "best_header_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "current_sha256": "11a67430e324b42fa6a8b9a44dbabc8b044eddc65548f98b62d4ca8435f91684",
+        "manifest_sha256": "45a27b30fe32ddd820c922012ae1f429fc60b4689b05d097ecb26fa1245d36bc"
+      },
+      "guard_sha256": "6eeaa8cb3d0ebbcfeb24c785e570bc7bd9ac7740fcce010bab13d6eab8eb8aa7",
+      "implementation": "bitcoin-rs",
+      "peak_fixture_bytes": 1453907642,
+      "peak_rss_bytes": 545689600,
+      "run_id": "block2-rs",
+      "runner_sha256": "4cc02b6550abe5ea319208b71cd55adc4c34c8ca092dcbb0eb71c35e89f70272",
+      "sequence": 4,
+      "summary_sha256": "dfce8765238136c4285b3df74ae9135ddc97ef0d32f811ec2374a0abfde81056"
+    },
+    {
+      "adapter_elapsed_seconds": 88.464853861,
+      "binary_sha256": "2fbbf0709a9e2b2ab167f919fa93f283de4d452fba0e3572da8f3ecf6da68472",
+      "config_sha256": "0936bae8836cf699d2288413d15017f8c23ebe6641f4077b434f38e7966773ad",
+      "endpoint": {
+        "applied_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "best_header_tip": {
+          "chainwork": "0000000000000000000000000000000000000000000000080560a73313fe59c2",
+          "hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+          "height": 150000
+        },
+        "current_sha256": "11a67430e324b42fa6a8b9a44dbabc8b044eddc65548f98b62d4ca8435f91684",
+        "manifest_sha256": "45a27b30fe32ddd820c922012ae1f429fc60b4689b05d097ecb26fa1245d36bc"
+      },
+      "guard_sha256": "ead62c48b7eea156e55f035cc7a332f5283f19ba4dfc3454955691c18075db25",
+      "implementation": "bitcoin-rs",
+      "peak_fixture_bytes": 1453907642,
+      "peak_rss_bytes": 567611392,
+      "run_id": "block3-rs",
+      "runner_sha256": "4cc02b6550abe5ea319208b71cd55adc4c34c8ca092dcbb0eb71c35e89f70272",
+      "sequence": 5,
+      "summary_sha256": "02574bc34c48b57c3d8f430be18ff62c105ff85c732698f1ac7dca7a877bf46a"
+    },
+    {
+      "adapter_elapsed_seconds": 73.462707674,
+      "binary_sha256": "986e63b3c8770f08d0059820ad3dd085d1ab9e1bea23946c243f858a06888a08",
+      "config_sha256": "ebbd70606c8288c7f9070946484778a0390f27ea917d9257678f623d4ebe7fc5",
+      "endpoint": {
+        "bestblockhash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "blocks": 150000,
+        "chain": "main",
+        "headers": 150000,
+        "start_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "stop_hash": "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b",
+        "validation_process_exit_code": 0
+      },
+      "guard_sha256": "956f7a1a43a634d1c6e00cdef906779cd0d831e63783e7a35c5d2a141278dfcd",
+      "implementation": "bitcoin-core",
+      "peak_fixture_bytes": 915932231,
+      "peak_rss_bytes": 433774592,
+      "run_id": "block3-core",
+      "runner_sha256": "18fddd97a312b06fce722710db28e39fdbf82d8632f93e703d53c2d8008cebe4",
+      "sequence": 6,
+      "summary_sha256": "4261185a9bc5457db10c96931c874e2adf3fe96ec7d90126238ea9fedebb4002"
+    }
+  ],
+  "schema": "bitcoin-rs-daemon-ibd-custody-v1"
+}
