@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use bitcoin::hex::DisplayHex as _;
 use hashbrown::HashMap;
-use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, Value, json};
+use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
@@ -12,54 +12,117 @@ const _: fn() -> Value = invalid_psbt;
 
 pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let descriptor = required_str(params, 0, "descriptor is required")?;
-    // Strip any existing #XXXXXXXX checksum suffix.
-    let payload = if let Some((body, _)) = descriptor.rsplit_once('#') {
-        body
-    } else {
-        descriptor
-    };
+    // The checksum Core reports is of the input, whatever the descriptor turns
+    // out to be, so it is computed from the text and not from the parse.
+    let payload = strip_checksum(descriptor);
     let checksum = descriptor_checksum(payload).ok_or(RpcError::InvalidParams(
         "descriptor contains invalid characters",
     ))?;
-    Ok(json!({
-        "descriptor": format!("{payload}#{checksum}"),
-        "checksum": checksum,
-        "isrange": payload.contains('*'),
-        "issolvable": false,
-        "hasprivatekeys": false
-    }))
-}
 
-pub(crate) fn deriveaddresses(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    let descriptor = required_str(params, 0, "descriptor is required")?;
-    // Strip optional #checksum suffix.
-    let payload = descriptor
-        .rsplit_once('#')
-        .map_or(descriptor, |(body, _)| body);
-    // Match addr(...) wrapper.
-    if let Some(inner) = strip_addr_wrapper(payload) {
-        if inner.contains('*') {
-            // TODO(miniscript): support ranged addr() once miniscript+derivation
-            // is wired. For now return empty since we cannot enumerate.
-            return Ok(json!([]));
-        }
-        return Ok(json!([inner]));
+    let info = bitcoin_rs_wallet::analyse(descriptor).map_err(descriptor_error)?;
+
+    let mut response = sonic_rs::Object::new();
+    // The canonical form comes from the parse, so a descriptor handed to this
+    // call with an `xprv` in it does not get one back.
+    let _ = response.insert(&"descriptor", info.canonical.as_str());
+    if !info.multipath_expansion.is_empty() {
+        let _ = response.insert(&"multipath_expansion", json!(info.multipath_expansion));
     }
-    // TODO(miniscript): other wrappers (pkh, sh, wpkh, tr, wsh, multi, ...) need
-    // miniscript-based key derivation. Return empty until then.
-    Ok(json!([]))
+    let _ = response.insert(&"checksum", checksum.as_str());
+    let _ = response.insert(&"isrange", info.is_range);
+    let _ = response.insert(&"issolvable", info.is_solvable);
+    let _ = response.insert(&"hasprivatekeys", info.has_private_keys);
+    Ok(Value::from(response))
 }
 
-fn strip_addr_wrapper(payload: &str) -> Option<&str> {
-    let stripped = payload.strip_prefix("addr(")?;
-    let stripped = stripped.strip_suffix(')')?;
-    Some(stripped)
+/// Maps a descriptor failure onto the code Bitcoin Core answers it with.
+///
+/// A descriptor that does not parse is `-5`; a range that does not match a
+/// descriptor that parsed fine is `-8`. They are different questions and Core
+/// keeps them apart, so a client can tell "I sent you nonsense" from "I asked
+/// the wrong thing about something valid".
+fn descriptor_error(error: bitcoin_rs_wallet::WalletError) -> RpcError {
+    match error {
+        bitcoin_rs_wallet::WalletError::DescriptorRange(message) => {
+            RpcError::InvalidParameter(message.to_owned())
+        }
+        other => RpcError::InvalidAddressOrKey(other.to_string()),
+    }
+}
+
+fn strip_checksum(descriptor: &str) -> &str {
+    descriptor
+        .rsplit_once('#')
+        .map_or(descriptor, |(body, _)| body)
+}
+
+pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let array = params_array(params)?;
+    let descriptor = required_str(params, 0, "descriptor is required")?;
+    let range = array
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(parse_derivation_range)
+        .transpose()?;
+
+    let expansions =
+        bitcoin_rs_wallet::derive_addresses(descriptor, bitcoin_network(ctx.chain_network), range)
+            .map_err(descriptor_error)?;
+
+    // Core returns a flat array for a single-path descriptor and an array per
+    // expansion for a multipath one.
+    match <[Vec<String>; 1]>::try_from(expansions) {
+        Ok([single]) => Ok(json!(single)),
+        Err(many) => Ok(json!(many)),
+    }
+}
+
+/// Bitcoin Core's `ParseDescriptorRange`: an end, or an inclusive `[begin,end]`.
+fn parse_derivation_range(value: &Value) -> Result<(u32, u32), RpcError> {
+    const RANGE_TOO_LARGE: &str = "Range is too large";
+
+    if let Some(end) = value.as_u64() {
+        let end = u32::try_from(end)
+            .map_err(|_| RpcError::InvalidParameter(RANGE_TOO_LARGE.to_owned()))?;
+        return Ok((0, end));
+    }
+    let Some(pair) = value.as_array().filter(|pair| pair.len() == 2) else {
+        return Err(RpcError::InvalidParameter(
+            "Range must be specified as end or as [begin,end]".to_owned(),
+        ));
+    };
+    let bound = |index: usize| -> Result<u32, RpcError> {
+        pair.get(index)
+            .and_then(JsonValueTrait::as_u64)
+            .ok_or_else(|| {
+                RpcError::InvalidParameter("Range should be greater or equal than 0".to_owned())
+            })
+            .and_then(|value| {
+                u32::try_from(value)
+                    .map_err(|_| RpcError::InvalidParameter(RANGE_TOO_LARGE.to_owned()))
+            })
+    };
+    let begin = bound(0)?;
+    let end = bound(1)?;
+    if end < begin {
+        return Err(RpcError::InvalidParameter(
+            "Range specified as [begin,end] must not have begin after end".to_owned(),
+        ));
+    }
+    Ok((begin, end))
 }
 
 #[derive(Clone, Debug)]
 struct ScanScript {
     script_pubkey: bitcoin::ScriptBuf,
     desc: String,
+}
+
+/// Returns the address inside an `addr(...)` wrapper.
+fn strip_addr_wrapper(payload: &str) -> Option<&str> {
+    let stripped = payload.strip_prefix("addr(")?;
+    let stripped = stripped.strip_suffix(')')?;
+    Some(stripped)
 }
 
 pub(crate) fn scantxoutset(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -918,18 +981,109 @@ mod descriptor_checksum_tests {
         }
     }
 
+    const ADDRESS: &str = "1111111111111111111114oLvT2";
+
+    /// The checksum describes the input; the descriptor describes the parse.
     #[test]
-    fn getdescriptorinfo_strips_existing_checksum() {
+    fn getdescriptorinfo_reports_the_checksum_of_what_it_was_given() {
         let ctx = Arc::new(Context::new());
-        let result = getdescriptorinfo(&ctx, &json!(["addr(x)#whatever"]))
+        let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})#whatever")]))
             .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
-        let Some(desc) = result.get("descriptor").and_then(|v| v.as_str()) else {
+
+        assert_eq!(
+            result.get("descriptor").and_then(JsonValueTrait::as_str),
+            Some(format!("addr({ADDRESS})").as_str()),
+            "the canonical form carries no checksum: {result:?}"
+        );
+        let Some(checksum) = result.get("checksum").and_then(JsonValueTrait::as_str) else {
+            panic!("checksum missing: {result:?}");
+        };
+        assert_eq!(checksum.len(), 8, "got {checksum}");
+        assert_ne!(checksum, "whatever", "the checksum is computed, not echoed");
+    }
+
+    /// A descriptor that names an output cannot produce a spend for it.
+    #[test]
+    fn an_address_descriptor_is_not_solvable() {
+        let ctx = Arc::new(Context::new());
+        let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})")]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+
+        assert_eq!(
+            result.get("issolvable").and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            result.get("isrange").and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+    }
+
+    /// A descriptor with keys in it *is* solvable, and this used to say no.
+    ///
+    /// `issolvable` was hardcoded `false`, so every descriptor -- including one
+    /// carrying the key needed to spend -- reported that it could not be spent.
+    #[test]
+    fn a_key_descriptor_is_solvable() {
+        let ctx = Arc::new(Context::new());
+        let descriptor = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
+        let result = getdescriptorinfo(&ctx, &json!([descriptor]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+
+        assert_eq!(
+            result.get("issolvable").and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .get("hasprivatekeys")
+                .and_then(JsonValueTrait::as_bool),
+            Some(false),
+            "a public key is not a private one"
+        );
+    }
+
+    /// A private key is reported as one, and is not handed back.
+    ///
+    /// `hasprivatekeys` was hardcoded `false`. Someone checking whether a
+    /// descriptor they were about to share carried their key was told it did
+    /// not -- and the response echoed the descriptor, key included.
+    #[test]
+    fn a_private_key_is_reported_and_not_echoed_back() {
+        let ctx = Arc::new(Context::new());
+        // BIP32 test vector 1, master private key.
+        let xprv = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
+        let with_key = format!("wpkh({xprv}/0/0)");
+        let result = getdescriptorinfo(&ctx, &json!([with_key]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+
+        assert_eq!(
+            result
+                .get("hasprivatekeys")
+                .and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        let Some(canonical) = result.get("descriptor").and_then(JsonValueTrait::as_str) else {
             panic!("descriptor missing: {result:?}");
         };
         assert!(
-            desc.starts_with("addr(x)#"),
-            "expected addr(x)# prefix: {desc}"
+            !canonical.contains(xprv),
+            "the private key must not come back out: {canonical}"
         );
+        assert!(
+            canonical.contains("xpub"),
+            "the canonical form carries the public key: {canonical}"
+        );
+    }
+
+    /// Text that is not a descriptor is refused with Core's code.
+    #[test]
+    fn a_descriptor_that_does_not_parse_is_refused() {
+        let ctx = Arc::new(Context::new());
+        let error = getdescriptorinfo(&ctx, &json!(["addr(x)"]))
+            .err()
+            .unwrap_or_else(|| panic!("addr(x) is not an address"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND, "{error:?}");
     }
 }
 
@@ -939,41 +1093,82 @@ mod deriveaddresses_tests {
 
     use super::*;
 
+    const ADDRESS: &str = "1111111111111111111114oLvT2";
+
+    /// An `addr()` descriptor derives the address it names.
     #[test]
-    fn deriveaddresses_returns_addr_argument_for_single_addr_descriptor() {
+    fn an_address_descriptor_derives_its_own_address() {
         let ctx = Arc::new(Context::new());
-        let result = deriveaddresses(&ctx, &json!(["addr(1111111111111111111114oLvT2)"]))
+        let result = deriveaddresses(&ctx, &json!([format!("addr({ADDRESS})")]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
-        let Some(arr) = result.as_array() else {
-            panic!("expected array: {result:?}");
-        };
-        assert_eq!(arr.len(), 1);
-        let Some(first) = arr.first().and_then(Value::as_str) else {
-            panic!("expected string element: {result:?}");
-        };
-        assert_eq!(first, "1111111111111111111114oLvT2");
+
+        assert_eq!(result, json!([ADDRESS]));
     }
 
+    /// A key descriptor derives a real address, where this used to answer `[]`.
+    ///
+    /// Every descriptor but `addr()` returned an empty array -- not an error,
+    /// an empty answer, which reads as "this descriptor describes no
+    /// addresses" rather than "this node did not look".
     #[test]
-    fn deriveaddresses_handles_checksum_suffix() {
+    fn a_key_descriptor_derives_an_address() {
         let ctx = Arc::new(Context::new());
-        let result = deriveaddresses(&ctx, &json!(["addr(bc1qfoo)#aaaaaaaa"]))
+        let descriptor = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
+        let result = deriveaddresses(&ctx, &json!([descriptor]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
-        let Some(arr) = result.as_array() else {
-            panic!("expected array: {result:?}");
+
+        let Some(addresses) = result.as_array() else {
+            panic!("expected an array: {result:?}");
         };
-        assert_eq!(arr.len(), 1);
+        assert_eq!(addresses.len(), 1);
+        let Some(address) = addresses.first().and_then(JsonValueTrait::as_str) else {
+            panic!("expected a string: {result:?}");
+        };
+        assert!(
+            address.starts_with("bc1q"),
+            "a mainnet v0 segwit address: {address}"
+        );
     }
 
+    /// A ranged descriptor derives one address per index, inclusive at both ends.
     #[test]
-    fn deriveaddresses_empty_for_ranged_descriptors() {
+    fn a_ranged_descriptor_derives_one_address_per_index() {
         let ctx = Arc::new(Context::new());
-        let result = deriveaddresses(&ctx, &json!(["wpkh(xpub.../0/*)"]))
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let descriptor = format!("wpkh({xpub}/0/*)");
+        let result = deriveaddresses(&ctx, &json!([descriptor, [0, 2]]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
-        let Some(arr) = result.as_array() else {
-            panic!("expected array: {result:?}");
+
+        let Some(addresses) = result.as_array() else {
+            panic!("expected an array: {result:?}");
         };
-        assert!(arr.is_empty());
+        assert_eq!(addresses.len(), 3, "0, 1 and 2: {result:?}");
+        let distinct: std::collections::BTreeSet<&str> = addresses
+            .iter()
+            .filter_map(JsonValueTrait::as_str)
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "each index is its own address: {result:?}"
+        );
+    }
+
+    /// A range is required for a ranged descriptor, and refused for a fixed one.
+    #[test]
+    fn the_range_argument_must_match_the_descriptor() {
+        let ctx = Arc::new(Context::new());
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+        let missing = deriveaddresses(&ctx, &json!([format!("wpkh({xpub}/0/*)")]))
+            .err()
+            .unwrap_or_else(|| panic!("a ranged descriptor needs a range"));
+        assert_eq!(missing.code(), RpcError::CORE_INVALID_PARAMETER);
+
+        let unwanted = deriveaddresses(&ctx, &json!([format!("addr({ADDRESS})"), [0, 2]]))
+            .err()
+            .unwrap_or_else(|| panic!("a fixed descriptor takes no range"));
+        assert_eq!(unwanted.code(), RpcError::CORE_INVALID_PARAMETER);
     }
 }
 

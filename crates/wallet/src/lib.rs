@@ -26,7 +26,7 @@ pub mod signer_iface;
 pub mod watcher;
 
 pub use coin_selection::{Candidate, SelectStrategy, Selection, Target, select_coins};
-pub use descriptor::{BIP32Derivation, Descriptor};
+pub use descriptor::{BIP32Derivation, Descriptor, DescriptorInfo, analyse, derive_addresses};
 pub use fee_bump::{FeeBumpPlan, bump_fee, bump_psbt, bump_psbt_with_rate_sat_per_kvb};
 pub use finalize::{FinalizeError, finalize_signed};
 pub use psbt::{PrevUtxo, PsbtBuilder};
@@ -41,6 +41,13 @@ pub enum WalletError {
     /// Descriptor parsing or derivation failed.
     #[error("descriptor error: {0}")]
     Descriptor(String),
+    /// The derivation range does not match the descriptor.
+    ///
+    /// Separate from [`WalletError::Descriptor`] because the descriptor is
+    /// fine: the caller asked for the wrong thing about it. Bitcoin Core
+    /// answers the two with different RPC error codes for the same reason.
+    #[error("{0}")]
+    DescriptorRange(&'static str),
     /// PSBT construction failed.
     #[error("psbt error: {0}")]
     Psbt(String),

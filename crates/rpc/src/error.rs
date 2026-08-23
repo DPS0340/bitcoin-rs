@@ -27,6 +27,17 @@ pub enum RpcError {
     /// A method is intentionally disabled by policy.
     #[error("{0}")]
     MethodDisabled(&'static str),
+    /// A parameter's value is unacceptable, as opposed to malformed.
+    ///
+    /// Bitcoin Core's `RPC_INVALID_PARAMETER` (-8). Distinct from
+    /// [`RpcError::InvalidParams`], which is the JSON-RPC shape error.
+    #[error("{0}")]
+    InvalidParameter(String),
+    /// An address, key or descriptor was rejected by the thing that parses it.
+    ///
+    /// Bitcoin Core's `RPC_INVALID_ADDRESS_OR_KEY` (-5).
+    #[error("{0}")]
+    InvalidAddressOrKey(String),
     /// Internal server failure.
     #[error("internal error: {0}")]
     Internal(String),
@@ -65,7 +76,8 @@ impl RpcError {
             Self::MethodNotFound(_) => Self::METHOD_NOT_FOUND,
             Self::InvalidParams(_) => Self::INVALID_PARAMS,
             Self::InvalidType(_) => Self::CORE_INVALID_TYPE,
-            Self::NotFound(_) => Self::CORE_NOT_FOUND,
+            Self::NotFound(_) | Self::InvalidAddressOrKey(_) => Self::CORE_NOT_FOUND,
+            Self::InvalidParameter(_) => Self::CORE_INVALID_PARAMETER,
             Self::MethodDisabled(_) | Self::Internal(_) => Self::INTERNAL_ERROR,
         }
     }
