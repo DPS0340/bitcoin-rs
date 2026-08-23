@@ -89,7 +89,7 @@ impl ElectrumServer {
     pub fn run(self) -> Result<(), ElectrumError> {
         for accepted in self.listener.incoming() {
             let stream = accepted?;
-            stream.set_read_timeout(Some(READ_TIMEOUT))?;
+            configure_stream(&stream)?;
             if self.permits.try_recv().is_err() {
                 warn!(peer = ?stream.peer_addr().ok(), "rejecting electrum session: capacity reached");
                 continue;
@@ -127,7 +127,7 @@ impl ElectrumServer {
             match self.listener.accept() {
                 Ok((stream, _peer)) => {
                     stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+                    configure_stream(&stream)?;
                     if self.permits.try_recv().is_err() {
                         warn!(peer = ?stream.peer_addr().ok(), "rejecting electrum session: capacity reached");
                         continue;
@@ -154,6 +154,11 @@ impl ElectrumServer {
         }
         Ok(())
     }
+}
+
+fn configure_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))
 }
 
 fn serve_stream(
@@ -210,8 +215,12 @@ impl Write for MaybeTlsStream {
 mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
+    use std::net::{TcpListener, TcpStream};
 
-    use super::{ElectrumError, ElectrumServer, IndexHandle, MempoolHandle, ServerConfig};
+    use super::{
+        ElectrumError, ElectrumServer, IndexHandle, MempoolHandle, READ_TIMEOUT, ServerConfig,
+        configure_stream,
+    };
 
     #[test]
     #[allow(clippy::expect_used)]
@@ -230,6 +239,19 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(150));
         shutdown.store(true, Ordering::Release);
         handle.join().expect("join thread")?;
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_streams_disable_nagle() -> Result<(), ElectrumError> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (stream, _) = listener.accept()?;
+        configure_stream(&stream)?;
+
+        assert!(stream.nodelay()?);
+        assert_eq!(stream.read_timeout()?, Some(READ_TIMEOUT));
+        drop(client);
         Ok(())
     }
 }
