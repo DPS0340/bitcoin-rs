@@ -51,6 +51,7 @@ pub mod signal;
 pub mod state;
 /// Block download orchestrator.
 pub mod sync;
+mod txindex_worker;
 /// UTXO view adapter for consensus transaction checks.
 pub mod utxo_view;
 /// Prevout lookups across a window of consecutive blocks.
@@ -66,6 +67,7 @@ pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;
 pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
+pub use txindex_worker::TxIndexRuntime;
 pub use utxo_view::UtxoSetView;
 pub use zmq_publisher::{
     NoOpZmqPublisher, SequenceEvent, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher,

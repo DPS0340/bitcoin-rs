@@ -1,5 +1,5 @@
 ---
-title: Node-level reorg execution — the design, and why the two stores differ
+title: "Node-level reorg execution: authoritative chainstate and derived indexes"
 date: 2026-08-08
 category: docs/solutions/architecture-patterns
 module: crates/node (apply path), crates/index, crates/utxo, crates/chain
@@ -9,7 +9,7 @@ severity: high
 applies_when:
   - "Implementing block disconnect / chain reorganization in the node"
   - "Deciding where the commit point of a multi-store mutation sits"
-  - "Adding a consumer that must roll back when a block is disconnected"
+  - "Adding derived state that follows committed applied-tip changes"
 related_components:
   - apply_path
   - utxo
@@ -21,7 +21,7 @@ tags:
   - commit-point
 ---
 
-# Node-level reorg execution — the design, and why the two stores differ
+# Node-level reorg execution: authoritative chainstate and derived indexes
 
 ## Status
 
@@ -33,10 +33,11 @@ Done:
 * `ColumnFamily::UndoData` across all four backends, and a versioned undo codec
   bound to the block hash (`crates/utxo/src/undo_codec.rs`).
 * Undo generation in the same pass as the forward UTXO changes. The undo write
-  is queued before the block body, the index, and the UTXO commit. A clean
-  checkpoint makes the queued record durable.
-* `disconnect_block`, which restores the UTXO set, the transaction index, and
-  `applied_tip`. Its ordering claims are mutation-verified.
+  is queued before the block body and UTXO commit. A clean checkpoint makes the
+  queued record durable.
+* `disconnect_block`, which restores the UTXO set, rewinds block-level
+  coinstats, publishes the parent `applied_tip`, and wakes the derived TxIndex
+  worker. Its authoritative ordering claims are mutation-verified.
 * Node-owned `invalidateblock` control, which invalidates the named header
   subtree and uses the normal branch-switch/disconnect path rather than
   mutating chainstate in the RPC crate. It previews the replacement tip and
@@ -56,8 +57,13 @@ Done:
   failures preserve both branch eligibility and ownership.
 * Fork-aware download requests start at the common ancestor's child. A target
   change discards pending ownership from the losing branch.
+* A node-owned supervised TxIndex worker reconciles a versioned `(height, hash)`
+  watermark to exact applied-tip ancestry. It can retain one bounded forward
+  batch across strict descendant tip revisions. A rival, lower, or absent tip
+  can commit the complete prepared prefix; the next pass repairs it. Each
+  commit and one-block rollback updates rows and watermark atomically.
 * A fatal disconnect closes apply admission and sets the process shutdown token.
-  The durable marker prevents a restart on torn state.
+  The durable marker prevents a restart on torn authoritative state.
 
 Still open: transaction reconsideration, filter-index backfill, real crash
 replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
@@ -73,42 +79,49 @@ A Bitcoin full node that cannot disconnect a block cannot follow the most-work
 chain. Everything else — sync throughput, index correctness, mempool policy —
 is downstream of being on the right chain.
 
-## The two stores have different crash models
+## The authoritative store and derived index have different crash models
 
-This is the load-bearing insight and the one most likely to be got wrong. Do
-not reach for a single mechanism.
+This distinction is load-bearing. Do not force both states into one transaction.
 
-| | UTXO set | Index |
+| | Authoritative UTXO set and applied tip | Derived TxIndex |
 |---|---|---|
-| Lives in | RAM, 256 shards | On disk |
-| Durability | checkpoints, not per-block writes | every write batch |
-| A crash mid-mutation | discards ALL uncommitted mutation | leaves partial state |
-| Recovery | reload checkpoint, replay forward | must be atomic per block |
+| Lives in | UTXO set in RAM; tip published in process | On disk |
+| Durability | clean checkpoints | each atomic rows-plus-watermark batch |
+| A crash during mutation | can leave a torn UTXO set; marker blocks restart | leaves the previous or next complete watermark; an uncommitted pending batch disappears |
+| Recovery | refuse torn state; otherwise load the checkpoint | reconcile the exact durable watermark to the applied tip; queries remain unavailable until they match |
 
 Consequences:
 
 1. **Undo records serve live reorgs, not per-block crash recovery.** Connection
    queues each record before later apply mutations. The backend write is
-   deferred. A clean checkpoint flushes block and index storage, publishes the
-   matching UTXO state, and then advances the durable horizon. The record is not
-   a per-block fsync boundary.
-2. **The durable disconnect marker is implemented.** `InFlight` is flushed
-   before the first rollback mutation. A completed rollback changes the marker
+   deferred. A clean checkpoint flushes storage, publishes the matching UTXO
+   state, and then advances the durable horizon. The record is not a per-block
+   fsync boundary.
+2. **The durable disconnect marker covers authoritative state only.** `InFlight`
+   is flushed before the UTXO mutation. A completed rollback changes the marker
    to `RolledBack`; only a clean checkpoint can clear it after publication. A
    checkpoint refuses `InFlight`, and startup refuses either phase. The marker
-   prevents service on inconsistent state. It does not repair that state.
-3. **Index rollback is one atomic write batch.** A partial index rollback can
-   survive a crash, so one batch is the required boundary.
+   prevents service on inconsistent authoritative state. It does not repair it.
+3. **TxIndex recovery starts from its own atomic watermark.** The worker can
+   retain one bounded forward batch while the applied tip moves through strict
+   descendants. A rival, lower, or absent tip can make it commit the complete
+   prepared prefix before the next pass repairs it. Every commit writes rows
+   and the final watermark together. Every rollback deletes one block's rows
+   and replaces or removes the watermark in one batch. A crash drops an
+   uncommitted batch or leaves one complete watermark, so exact query gating
+   cannot publish partial coverage as complete.
 
 ## Disconnect order
 
-1. `tx_index.rollback_block(&block, height)` when present
-2. `utxo.undo_block(&undo)`
+1. `utxo.undo_block(&undo)`
+2. refresh block-level coinstats and best-effort caches
 3. roll `applied_tip` back to the parent
-4. *(no step 4 — see retention below)*
+4. increment the TxIndex revision and send a nonblocking, coalesced wake
 
-Step 3 is the commit point. A failure before it leaves the node believing the
-block is still connected, which is a recoverable state.
+Step 3 is the authoritative commit point. Preflight failures before the marker
+refuse without mutation. Failures after the UTXO mutation are fatal because the
+sharded undo can stop part-way. After step 3, TxIndex may lag safely; complete
+queries remain unavailable until its exact watermark reaches the applied tip.
 
 ## Do not assume undo is idempotent
 
@@ -144,13 +157,14 @@ Done:
 | `ColumnFamily::UndoData` | enum, its `ALL` list, and all four backends |
 | Versioned undo codec | first byte a format version; keyed by height **and** block hash, with 10 rejection tests |
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
-| Persistence | queued before the block body, index, and UTXO commit; flushed with a clean checkpoint, not per block |
-| `disconnect_block` | restores UTXO, index, and tip, in that order, all four orderings mutation-verified |
+| Persistence | queued before the block body and UTXO commit; flushed with a clean checkpoint, not per block |
+| `disconnect_block` | restores the UTXO set, coinstats, and applied tip; then publishes a TxIndex wake |
+| TxIndex reconciliation | node-owned worker rolls its exact watermark back to the common ancestor one atomic block at a time, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Rival, lower, or absent tips can commit a complete prepared prefix; the next pass repairs it. Exact snapshot-plus-tip gating keeps queries unavailable until the watermark matches. |
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
 | `DisconnectError` | splits `Refused` (nothing touched) from `Fatal` (partly rolled back, carries hash and height), plus `MarkerStuck` (rolled back, but the interlock would not clear) |
-| Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the first mutation and above the index rollback; startup refuses while it is set. See *Disconnect marker phase* in `CONCEPTS.md` |
+| Durable interlock | a phased in-flight marker in `UndoData`, armed and flushed before the UTXO mutation; startup refuses while it is set. TxIndex is outside this marker. See *Disconnect marker phase* in `CONCEPTS.md` |
 | Chain-transition serialization | `ChainTransition` proves that admission and the exclusive transition lock were acquired in that order. One witness covers authoritative replanning, all disconnects, and the available contiguous connect prefix. |
 | Branch switching | `switch_to_branch` recomputes the complete ordered `plan_reorg` result under the transition guard and mutates only when it equals the optimistic plan. A shorter branch is eligible when its accumulated work is greater. A permanent connect failure invalidates its subtree and selects the best valid tip. |
 | Body acquisition | Each attempt loads all disconnect bodies and the contiguous connect prefix available from bounded staging, durable storage, or the applied body cache. The first missing connect body prevents mutation. A later missing body follows a coherent committed prefix. Each committed connect retires its exact staging and download-window entry; invalid subtree ownership is purged. |
@@ -189,6 +203,7 @@ normal shutdown path.
    the durable boundary for disconnect. Keep `InFlight` until rollback completes,
    keep `RolledBack` until a clean checkpoint is durable, and refuse to clear an
    incomplete operation.
-3. **A trait default that returns success is a silent-corruption path.** When a
-   consumer must participate in rollback, make the default refuse. See
-   `IndexError::UnsupportedRollback`.
+3. **Keep derived durable state outside the authoritative rollback.** Give each
+   derived index an exact atomic watermark and make every query prove complete
+   coverage of the applied tip. A wake is only a scheduling hint; the watermark
+   is the recovery and correctness boundary.

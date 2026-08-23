@@ -112,3 +112,9 @@ impl From<fmt::Error> for RpcError {
         Self::Internal(error.to_string())
     }
 }
+
+impl From<crate::context::TxQueryError> for RpcError {
+    fn from(error: crate::context::TxQueryError) -> Self {
+        error.into_rpc_error()
+    }
+}
