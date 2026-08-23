@@ -357,60 +357,113 @@ fn now_seconds() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// Minimum feerate a transaction must pay to be selected, in BTC/kvB.
+///
+/// Bitcoin Core's `DEFAULT_BLOCK_MIN_TX_FEE` is 1 satoshi per kvB, and it is
+/// configurable there (`-blockmintxfee`). It is not configurable here, so this
+/// reports the default this node's selection actually applies.
+const BLOCK_MIN_TX_FEE_BTC_PER_KVB: f64 = 0.000_000_01;
+
 pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    let (current_block_weight, current_block_tx) = estimate_current_block(ctx);
 
-    let blocks = ctx.applied_height();
-    let pooledtx = ctx.mempool.read().stats().txs;
+    let tip = ctx.applied_tip.load_full();
     let tip_bits = {
         let tree = ctx.block_tree.read();
-        let snapshot = ctx.applied_tip.load_full();
-        snapshot.and_then(|tip| tree.node(tip.tip_id).ok().map(|node| node.header.bits))
+        tip.as_ref()
+            .and_then(|tip| tree.node(tip.tip_id).ok().map(|node| node.header.bits))
     };
-    let difficulty = tip_bits.map_or(0.0, |bits| ctx.difficulty_for_bits(bits));
-    let chain = match ctx.chain_network {
+
+    let mut response = sonic_rs::Object::new();
+    let _ = response.insert(&"blocks", ctx.applied_height());
+
+    // Core reports the weight and transaction count of the block it last
+    // assembled, and omits both when it has never assembled one. It does not
+    // guess: `getmininginfo` is how a miner checks what its own last template
+    // came to, and a fresh estimate would answer a different question -- while
+    // running a full package selection under the mempool lock to do it.
+    if let Some(cached) = ctx.mining_template_cache.read().as_ref() {
+        let (weight, count) = assembled_block_totals(&cached.template);
+        let _ = response.insert(&"currentblockweight", weight);
+        let _ = response.insert(&"currentblocktx", count);
+    }
+
+    if let Some(bits) = tip_bits {
+        let _ = response.insert(&"bits", format!("{:08x}", bits.to_consensus()).as_str());
+    }
+    let _ = response.insert(
+        &"difficulty",
+        json!(tip_bits.map_or(0.0, |bits| ctx.difficulty_for_bits(bits))),
+    );
+    if let Some(bits) = tip_bits {
+        let _ = response.insert(&"target", target_hex(bits).as_str());
+    }
+    let _ = response.insert(&"networkhashps", json!(estimate_network_hashps(ctx)));
+    let _ = response.insert(&"pooledtx", ctx.mempool.read().stats().txs);
+    let _ = response.insert(&"blockmintxfee", json!(BLOCK_MIN_TX_FEE_BTC_PER_KVB));
+    let _ = response.insert(&"chain", chain_name(ctx.chain_network));
+
+    // The next block's difficulty, which is the number a miner is actually
+    // about to work against. Asked of the same function header validation asks,
+    // so this can never advertise a target the node would then reject.
+    if let Some(tip) = tip.as_ref() {
+        let min_time = median_time_past(ctx).map_or(0, |mtp| mtp.saturating_add(1));
+        let candidate_time = u32::try_from(now_seconds())
+            .unwrap_or(u32::MAX)
+            .max(min_time);
+        let next_bits = {
+            let tree = ctx.block_tree.read();
+            bitcoin_rs_chain::expected_next_bits(
+                ctx.chain_network,
+                &tree,
+                tip.tip_id,
+                candidate_time,
+            )
+            .ok()
+        };
+        if let Some(bits) = next_bits {
+            let mut next = sonic_rs::Object::new();
+            let _ = next.insert(&"height", tip.height.saturating_add(1));
+            let _ = next.insert(&"bits", format!("{:08x}", bits.to_consensus()).as_str());
+            let _ = next.insert(&"difficulty", json!(ctx.difficulty_for_bits(bits)));
+            let _ = next.insert(&"target", target_hex(bits).as_str());
+            let _ = response.insert(&"next", Value::from(next));
+        }
+    }
+
+    // Core reports warnings as an array. The string form is its deprecated
+    // shape, kept behind `-deprecatedrpc=warnings`.
+    let _ = response.insert(&"warnings", json!(Vec::<String>::new()));
+    Ok(Value::from(response))
+}
+
+/// The weight and transaction count of an assembled template.
+///
+/// The count excludes the coinbase, as Core's does: `m_last_block_num_txs` is
+/// the number of transactions the assembler selected. The weight includes the
+/// reserve held back for the header, the transaction count and the coinbase,
+/// because that is the weight the assembled block will have.
+fn assembled_block_totals(template: &BlockTemplate) -> (u64, u64) {
+    let selected: u64 = template
+        .transactions
+        .iter()
+        .map(|tx| u64::from(tx.weight))
+        .sum();
+    let weight =
+        selected.saturating_add(u64::from(bitcoin_rs_mining::DEFAULT_BLOCK_RESERVED_WEIGHT));
+    let count = u64::try_from(template.transactions.len()).unwrap_or(u64::MAX);
+    (weight, count)
+}
+
+const fn chain_name(network: bitcoin_rs_primitives::Network) -> &'static str {
+    match network {
         bitcoin_rs_primitives::Network::Mainnet => "main",
         bitcoin_rs_primitives::Network::Testnet3 | bitcoin_rs_primitives::Network::Testnet4 => {
             "test"
         }
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
-    };
-
-    Ok(json!({
-        "blocks": blocks,
-        "currentblockweight": current_block_weight,
-        "currentblocktx": current_block_tx,
-        "difficulty": difficulty,
-        "networkhashps": estimate_network_hashps(ctx),
-        "pooledtx": pooledtx,
-        "chain": chain,
-        "warnings": ""
-    }))
-}
-
-fn estimate_current_block(ctx: &Context) -> (u64, u64) {
-    const MAX_BLOCK_WEIGHT: u32 = 4_000_000;
-    const MAX_BLOCK_SIGOPS_COST: u32 = 80_000;
-
-    let policy = bitcoin_rs_mining::MiningPolicy;
-    let pool = ctx.mempool.read();
-    let selected = policy.select_transactions(
-        &pool,
-        MAX_BLOCK_WEIGHT.saturating_sub(bitcoin_rs_mining::DEFAULT_BLOCK_RESERVED_WEIGHT),
-        MAX_BLOCK_SIGOPS_COST,
-    );
-    let mut weight: u64 = 0;
-    let mut count: u64 = 0;
-    for entry_id in &selected {
-        let Some(entry) = pool.entry(*entry_id) else {
-            continue;
-        };
-        weight = weight.saturating_add(u64::from(entry.vsize).saturating_mul(4));
-        count = count.saturating_add(1);
     }
-    (weight, count)
 }
 
 fn estimate_network_hashps(ctx: &Context) -> f64 {
@@ -578,8 +631,14 @@ mod getmininginfo_tests {
         assert_eq!(pooledtx, 0);
     }
 
+    /// The block-assembly fields are absent until a block has been assembled.
+    ///
+    /// Core reports the weight and transaction count of the block it *last
+    /// assembled*, and omits both when it never has. This used to run a fresh
+    /// package selection over the mempool on every call and report that -- a
+    /// different question, answered under the mempool lock.
     #[test]
-    fn getmininginfo_currentblockweight_reflects_mempool_when_populated() {
+    fn currentblock_fields_are_absent_until_a_template_is_assembled() {
         use bitcoin_rs_mempool::MempoolEntry;
 
         let ctx = Arc::new(Context::new());
@@ -598,42 +657,132 @@ mod getmininginfo_tests {
 
         let result = getmininginfo(&ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
-        let Some(weight) = result
-            .get("currentblockweight")
-            .and_then(JsonValueTrait::as_u64)
-        else {
-            panic!("currentblockweight missing: {result:?}");
-        };
-        let Some(tx_count) = result
-            .get("currentblocktx")
-            .and_then(JsonValueTrait::as_u64)
-        else {
-            panic!("currentblocktx missing: {result:?}");
-        };
 
-        assert_eq!(weight, 1_000);
-        assert_eq!(tx_count, 1);
+        // A populated mempool is not an assembled block.
+        assert!(result.get("currentblockweight").is_none(), "{result:?}");
+        assert!(result.get("currentblocktx").is_none(), "{result:?}");
     }
 
+    /// Once a template exists, the fields describe *that* template.
     #[test]
-    fn getmininginfo_currentblocktx_zero_when_mempool_empty() {
+    fn currentblock_fields_report_the_last_assembled_template() {
+        let ctx = super::getblocktemplate_tests::context_with_chain(
+            bitcoin_rs_primitives::Network::Regtest,
+            1_700_000_000,
+        );
+        let template = getblocktemplate(&ctx, &json!([{"rules": ["segwit"]}]))
+            .unwrap_or_else(|err| panic!("getblocktemplate failed: {err}"));
+        let selected = template
+            .get("transactions")
+            .and_then(sonic_rs::JsonContainerTrait::as_array)
+            .map_or(0, sonic_rs::Array::len);
+
+        let result = getmininginfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+
+        assert_eq!(
+            result
+                .get("currentblocktx")
+                .and_then(JsonValueTrait::as_u64),
+            Some(u64::try_from(selected).unwrap_or(u64::MAX))
+        );
+        // The reserve for the header, the transaction count and the coinbase is
+        // part of the weight the assembled block will have.
+        assert_eq!(
+            result
+                .get("currentblockweight")
+                .and_then(JsonValueTrait::as_u64),
+            Some(u64::from(bitcoin_rs_mining::DEFAULT_BLOCK_RESERVED_WEIGHT))
+        );
+    }
+
+    /// The tip's own difficulty target, which the old response never carried.
+    #[test]
+    fn bits_and_target_describe_the_tip() {
+        let ctx = super::getblocktemplate_tests::context_with_chain(
+            bitcoin_rs_primitives::Network::Regtest,
+            1_700_000_000,
+        );
+        let result = getmininginfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+
+        assert_eq!(
+            result.get("bits").and_then(JsonValueTrait::as_str),
+            Some("207fffff"),
+            "the regtest fixture's nBits: {result:?}"
+        );
+        let Some(target) = result.get("target").and_then(JsonValueTrait::as_str) else {
+            panic!("target missing: {result:?}");
+        };
+        assert_eq!(target.len(), 64, "a target is 32 bytes of hex: {target}");
+        assert!(
+            target.starts_with("7fffff"),
+            "regtest's target is the pow limit: {target}"
+        );
+    }
+
+    /// The next block's difficulty is the number a miner works against.
+    ///
+    /// Answered from the same function header validation asks, so the response
+    /// can never advertise a target this node would then reject.
+    #[test]
+    fn next_describes_the_block_about_to_be_mined() {
+        let ctx = super::getblocktemplate_tests::context_with_chain(
+            bitcoin_rs_primitives::Network::Regtest,
+            1_700_000_000,
+        );
+        let result = getmininginfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+
+        let Some(next) = result.get("next") else {
+            panic!("next missing: {result:?}");
+        };
+        assert_eq!(
+            next.get("height").and_then(JsonValueTrait::as_u64),
+            Some(11),
+            "the fixture's tip is height 10"
+        );
+        assert_eq!(
+            next.get("bits").and_then(JsonValueTrait::as_str),
+            Some("207fffff"),
+            "regtest never retargets: {next:?}"
+        );
+        assert!(next.get("difficulty").is_some(), "{next:?}");
+        assert_eq!(
+            next.get("target").and_then(JsonValueTrait::as_str),
+            result.get("target").and_then(JsonValueTrait::as_str),
+            "no retarget means the next target equals the tip's"
+        );
+    }
+
+    /// `warnings` is a list, not the deprecated string.
+    #[test]
+    fn warnings_is_an_array() {
         let ctx = Arc::new(Context::new());
         let result = getmininginfo(&ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
-        let Some(weight) = result
-            .get("currentblockweight")
-            .and_then(JsonValueTrait::as_u64)
+        let Some(warnings) = result
+            .get("warnings")
+            .and_then(sonic_rs::JsonContainerTrait::as_array)
         else {
-            panic!("currentblockweight missing");
+            panic!("warnings is not an array: {result:?}");
         };
-        let Some(count) = result
-            .get("currentblocktx")
-            .and_then(JsonValueTrait::as_u64)
-        else {
-            panic!("currentblocktx missing");
+        assert!(warnings.is_empty());
+    }
+
+    /// The feerate floor selection actually applies.
+    #[test]
+    fn blockmintxfee_is_the_floor_selection_applies() {
+        let ctx = Arc::new(Context::new());
+        let result = getmininginfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+        let Some(fee) = result.get("blockmintxfee").and_then(JsonValueTrait::as_f64) else {
+            panic!("blockmintxfee missing: {result:?}");
         };
-        assert_eq!(weight, 0);
-        assert_eq!(count, 0);
+        assert!(
+            (fee - 0.000_000_01).abs() < f64::EPSILON,
+            "Core's DEFAULT_BLOCK_MIN_TX_FEE is one satoshi per kvB, got {fee}"
+        );
     }
 
     #[test]
@@ -680,7 +829,7 @@ mod getblocktemplate_tests {
     ///
     /// Eleven so the median-time-past window is full: a shorter chain would
     /// let a `mintime` bug hide behind a degenerate median.
-    fn context_with_chain(network: Network, tip_time: u32) -> Arc<Context> {
+    pub(super) fn context_with_chain(network: Network, tip_time: u32) -> Arc<Context> {
         context_with_chain_and_control(network, tip_time, None)
     }
 
