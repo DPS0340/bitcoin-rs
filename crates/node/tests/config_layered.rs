@@ -155,6 +155,41 @@ fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<(
 }
 
 #[test]
+fn toml_p2p_topology_survives_cli_operational_overrides() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let toml_path = temp.path().join("bounded-sync.toml");
+    fs::write(
+        &toml_path,
+        r#"
+storage_backend = "fjall"
+p2p_listen = []
+dns_seeds_enabled = false
+connect = ["127.0.0.1:18444"]
+"#,
+    )?;
+
+    let config = Config::from_layered_sources(
+        Some(&toml_path),
+        None,
+        core::iter::empty::<EnvPair>(),
+        [
+            "bitcoin-rs-node",
+            "--rpc-bind",
+            "127.0.0.1:18445",
+            "--rpc-user",
+            "benchmark",
+        ],
+    )?;
+
+    assert_eq!(config.network, Network::Mainnet);
+    assert!(config.p2p_listen.is_empty());
+    assert!(!config.dns_seeds_enabled);
+    assert_eq!(config.connect, vec!["127.0.0.1:18444"]);
+    assert_eq!(config.rpc_bind, "127.0.0.1:18445".parse()?);
+    Ok(())
+}
+
+#[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {
     let config = Config::from_layered_sources(
         None,

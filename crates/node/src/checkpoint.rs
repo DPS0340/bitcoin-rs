@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use bitcoin::block::Header;
@@ -52,6 +52,8 @@ const COINSTATS_PAYLOAD_LEN: u32 = 804;
 const COINSTATS_ARTIFACT_LEN: u64 = 820;
 const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 64_u64 * 1024 * 1024 * 1024;
 const MAX_CHECKPOINT_METADATA_BYTES: u64 = 1024 * 1024;
+
+const CHECKPOINT_WRITE_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HeaderCheckpointConfig {
@@ -592,7 +594,7 @@ struct GenerationPaths {
 }
 
 struct HashingWriter<'a> {
-    file: &'a mut File,
+    file: BufWriter<&'a mut File>,
     hasher: Sha256,
     bytes: u64,
     fail: bool,
@@ -605,15 +607,16 @@ impl<'a> HashingWriter<'a> {
         boundary: CheckpointFailpoint,
     ) -> Self {
         Self {
-            file,
+            file: BufWriter::with_capacity(CHECKPOINT_WRITE_BUFFER_SIZE, file),
             hasher: Sha256::new(),
             bytes: 0,
             fail: configured == Some(boundary),
         }
     }
 
-    fn finish(self) -> (u64, [u8; 32]) {
-        (self.bytes, self.hasher.finalize().into())
+    fn finish(mut self) -> std::io::Result<(u64, [u8; 32])> {
+        self.file.flush()?;
+        Ok((self.bytes, self.hasher.finalize().into()))
     }
 }
 
@@ -855,8 +858,7 @@ fn write_checkpoint_inner(
         } else {
             write_selected_headers(&mut writer, &tree, config, best_tip_id, applied_point)?
         };
-        writer.flush()?;
-        let (bytes, digest) = writer.finish();
+        let (bytes, digest) = writer.finish()?;
         sync_file(&file, failpoint, CheckpointFailpoint::HeadersSync)?;
         (metadata, bytes, digest)
     };
@@ -871,8 +873,7 @@ fn write_checkpoint_inner(
         &mut utxo_writer,
         CoinStatsAccumulator::with_parallel_muhash(applied_tip.height),
     )?;
-    utxo_writer.flush()?;
-    let (utxo_bytes, utxo_sha256) = utxo_writer.finish();
+    let (utxo_bytes, utxo_sha256) = utxo_writer.finish()?;
     sync_file(&utxo_file, failpoint, CheckpointFailpoint::UtxoSync)?;
 
     let listener_stats = coin_stats.snapshot();
@@ -921,8 +922,7 @@ fn write_checkpoint_inner(
     coinstats_writer.write_all(&COINSTATS_VERSION.to_le_bytes())?;
     coinstats_writer.write_all(&COINSTATS_PAYLOAD_LEN.to_le_bytes())?;
     coinstats_writer.write_all(&persisted_stats.to_bytes())?;
-    coinstats_writer.flush()?;
-    let (coinstats_bytes, coinstats_sha256) = coinstats_writer.finish();
+    let (coinstats_bytes, coinstats_sha256) = coinstats_writer.finish()?;
     sync_file(
         &coinstats_file,
         failpoint,
