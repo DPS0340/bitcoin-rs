@@ -279,6 +279,117 @@ untouched until step 6 and a go/no-go measurement gate at step 5 requiring an
 identical tip hash, an identical UTXO digest, and an identical coinstats MuHash
 between `--window 1` and `--window 64`.
 
+## Delete the repeated transaction pass
+
+The shipped split still repeated one complete transaction-validation pass at
+commit. `prepare_block_script_checks` and `verify_prepared_units` had already
+run each transaction's ordered pre-checks, every input script, and ordered
+post-checks. A matching proof then called `run_non_script_checks_only`, which
+resolved and checked the same transaction unit again.
+
+An attribution probe removed only that repeated call. Three interleaved
+mainnet 0..150,000 runs per arm, pinned to CPUs 0-31 with fresh fjall state,
+measured these medians:
+
+| measurement | control | probe | change |
+|---|---:|---:|---:|
+| replay wall | 48.414266s | 30.438702s | 1.590550x |
+| process wall | 52.216643s | 34.105452s | 1.531035x |
+| CPU | 406.954276s | 254.642286s | 1.598141x |
+
+Every run reached height 150,000 and block
+`0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b`.
+The result is too large to be scheduler noise: it removes 17.98 seconds from
+the replay median and 152.31 CPU-seconds.
+Full commands, binary and corpus hashes, run order, every run value, and
+identity fields are retained in
+`docs/benchmarks/data/end-to-end-sync/window-validation-proof-custody-v1.json`.
+
+The production change makes the evidence precise instead of widening a
+script-only proof:
+
+1. `BlockValidationProof` is private and non-cloneable. It owns the exact
+   `PreparedApply` whose ordered transaction unit passed.
+2. The proof binds hash, predecessor, height, flags, and locktime cutoff.
+   Commit re-derives all five. A mismatch discards the proof-owned prepared
+   state and rebuilds it from the live UTXO set.
+3. `ProvenApply` distinguishes `Proven` from `AssumeValidSkipped`. The latter
+   re-enters ordinary validation and re-reads the live trust gate.
+4. A matching proof bypasses only the transaction-validation slot. Block rules,
+   BIP30/BIP34, and PoW continuity stay before it. Coinbase maturity and BIP68
+   stay after it.
+5. `prove_window` still returns no proofs after any pre-check, script,
+   post-check, layout, or context failure.
+
+Mutation checks pin the two dangerous fallbacks. Reusing proof-owned prepared
+state after a context mismatch makes the five-field fallback test accept a
+block whose live prevout was removed. Treating `AssumeValidSkipped` as proof
+makes a trusted-to-untrusted gate flip accept a bad script. Both mutations fail
+their tests.
+
+## Batch checkpoint writes before durability
+
+After the transaction proof landed, a reversible probe disabled only final
+checkpoint publication. Three pinned runs per arm left replay time unchanged
+but reduced the median process tail from 3.741312s to 0.469396s. The
+checkpoint path therefore owned 3.271917s outside the measured replay.
+
+`HashingWriter` was forwarding every serializer field directly to the file.
+The UTXO snapshot emits a 45-byte record header, a 19-byte output header, and a
+separate script write for each stored item. The artifact still needs one
+durability barrier, but it does not need one syscall per field.
+
+The production writer now uses one 64 KiB `BufWriter`. `finish` performs a
+checked flush before it returns the byte count and SHA-256 digest. Each existing
+file `fsync`, directory sync, generation rename, and `CURRENT` publication
+barrier remains in the same order.
+
+The final interleaved fjall panel measured process-wall medians of 35.933007s
+before and 34.550456s after, a 1.040015x whole-process win. The checkpoint tail
+fell from 3.910030s to 2.660571s, a 1.469621x improvement and the acceptance
+metric for this checkpoint-specific change. Every run reached the same height
+and hash. A separate baseline/candidate pair produced byte-identical
+`headers-v1.dat`, `utxo-v4.dat`, `coinstats-v1.dat`, `manifest-v1.json`, and
+`CURRENT` artifacts. Reorg and two-reopen durability proofs also matched across
+fjall, RocksDB, and redb. The full panel, external wall values, artifact
+digests, and backend proofs are in
+`docs/benchmarks/data/end-to-end-sync/checkpoint-write-buffer-custody-v1.json`.
+
+## Enlarge exact checkpoint MuHash batches
+
+The buffered writer left 2.660571s in the checkpoint tail. An attribution-only
+probe kept the CoinStats traversal but disabled its independent MuHash
+calculation. The tail fell to 1.235707s, which assigns 1.424864s to MuHash. The
+probe was reverted because it makes the listener-versus-traversal check
+tautological.
+
+The exact path was spending that time on small partial values. It flushed at
+16,384 coins or 2 MiB and created up to 16 MuHash lanes each time. A bounded
+sweep tested 8, 16, and 32 MiB arenas under both the benchmark pool and the
+production-equivalent four-thread pool. In the default pool, the 32 MiB point
+bought less than the 1.02 marginal floor over 16 MiB while doubling eager arena
+memory, so it was reverted.
+
+The retained configuration flushes at 262,144 coins or 16 MiB, caps at 32
+lanes, and also bounds lane count by the active Rayon pool. The final panels
+measured:
+
+| pool | checkpoint tail before | after | speedup | process wall before | after |
+|---|---:|---:|---:|---:|---:|
+| affinity-limited default | 2.638363s | 1.721588s | 1.532517x | 34.407571s | 33.699045s |
+| production-equivalent 4 threads | 3.862094s | 2.635227s | 1.465564x | 36.598228s | 35.221993s |
+
+The final combined interleaved panel compares the pre-buffer binary directly
+with both checkpoint changes. Process wall fell from 35.104562s to 33.095760s,
+a 1.060697x win, while replay stayed flat at 31.346029s versus 31.449878s.
+Checkpoint tail fell from 3.736965s to 1.645882s, or 2.270494x. All checkpoint
+artifact hashes remain byte-identical. The exact MuHash and serialized
+CoinStats match the serial oracle at one and four Rayon threads. Fjall,
+RocksDB, and redb also pass the reorg and two-reopen durability proof. Full
+experiments, interleaved wall values, run hashes, artifact digests, and backend
+proofs are in
+`docs/benchmarks/data/end-to-end-sync/checkpoint-muhash-batching-custody-v1.json`.
+
 ## Also corrected
 
 The BIP30 duplicate-coinbase blocks are **91,842 and 91,880**. 91,722 and

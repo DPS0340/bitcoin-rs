@@ -5,7 +5,7 @@ usage() {
   printf '%s\n' \
     'usage: run-g14-bitcoin-rs-daemon-mainnet-ibd.sh --ibd-start-height <height> --ibd-stop-height <height> --ibd-start-hash <hash> --ibd-stop-hash <hash> --datadir <path> --bitcoin-rs-config <path> --rpc-url <url> --rpc-user <user> --rpc-password <password> [--bitcoin-rs-command <command>] [--command-output <path>] [--poll-interval-seconds <seconds>] [--startup-timeout-seconds <seconds>] [--ibd-timeout-seconds <seconds> (default: 86400)] [--utxo-commit-samples-output <path>] [--utxo-commit-measurement-output <path>] [--force] [-- <bitcoin-rs-arg>...]' \
     '' \
-    'Runs a bitcoin-rs mainnet daemon, polls JSON-RPC until applied blocks reach the requested window, validates start/stop block hashes, then emits canonical Criterion-style bitcoin-rs/mainnet-ibd timing for G14 evidence capture.'
+    'Creates a fresh datadir, runs a bitcoin-rs mainnet daemon network-active over P2P v1, requires the exact IBD endpoint, then emits canonical Criterion-style bitcoin-rs/mainnet-ibd timing for G14 evidence capture.'
 }
 
 if (($# == 0)); then
@@ -296,27 +296,31 @@ def parse_chain_info(result: object) -> dict:
     return result
 
 
-def chain_blocks(data: dict) -> int:
+def chain_blocks_headers(data: dict) -> tuple[int, int]:
     chain = data.get("chain")
     if chain != "main":
         die("measured bitcoin-rs node must be on mainnet")
     blocks = data.get("blocks")
+    headers = data.get("headers")
     if not isinstance(blocks, int) or isinstance(blocks, bool):
         die("JSON-RPC getblockchaininfo blocks must be an integer")
-    return blocks
-
-
-def require_chain_start(data: dict, start_height: int) -> None:
-    blocks = chain_blocks(data)
-    if blocks > start_height:
-        die(
-            "measured bitcoin-rs node starts past requested IBD start height "
-            f"{start_height}: blocks={blocks}"
-        )
+    if not isinstance(headers, int) or isinstance(headers, bool):
+        die("JSON-RPC getblockchaininfo headers must be an integer")
+    return blocks, headers
 
 
 def require_chain_tip(data: dict, stop_height: int) -> bool:
-    return chain_blocks(data) >= stop_height
+    blocks, headers = chain_blocks_headers(data)
+    return blocks >= stop_height and headers >= stop_height
+
+
+def require_exact_tip(data: dict, stop_height: int) -> None:
+    blocks, headers = chain_blocks_headers(data)
+    if blocks != stop_height or headers != stop_height:
+        die(
+            "measured bitcoin-rs node must end exactly at IBD stop height "
+            f"{stop_height}: blocks={blocks}, headers={headers}"
+        )
 
 
 def require_hash(
@@ -475,13 +479,14 @@ if utxo_measurement_output is not None:
         "--utxo-commit-measurement-output",
         args.force,
     )
+    if utxo_measurement_output.exists():
+        utxo_measurement_output.unlink()
 
 command = (
     shlex.split(bitcoin_rs_command)
     + [
         f"--config={config}",
         f"--data-dir={datadir}",
-        "--network=mainnet",
         f"--rpc-bind={rpc_bind}",
         f"--rpc-user={rpc_user}",
         f"--rpc-password={rpc_password}",
@@ -562,7 +567,6 @@ try:
             continue
         info = parse_chain_info(info_result)
         if not observed_start:
-            require_chain_start(info, start_height)
             observed_start = True
             ibd_deadline = time.monotonic() + ibd_timeout
         if require_chain_tip(info, stop_height):
@@ -573,6 +577,10 @@ try:
 
     require_hash(rpc_url, rpc_user, rpc_password, start_height, start_hash, "start")
     require_hash(rpc_url, rpc_user, rpc_password, stop_height, stop_hash, "stop")
+    info = parse_chain_info(
+        rpc_call(rpc_url, rpc_user, rpc_password, "getblockchaininfo", [])
+    )
+    require_exact_tip(info, stop_height)
     elapsed = time.monotonic() - started
 finally:
     if process is not None and pgid is not None:

@@ -107,14 +107,11 @@ The check in `scripts/measure-g14-electrum-rss.sh` that the measured PID really 
 The rule that a branch is green only against the commands in `.github/workflows/ci.yml`, never against a local approximation of them. Three differences bite: `-D warnings` on the `clippy` and `kernel-parity` lanes promotes every warning the workspace lint job merely reports (`dead_code`, `needless_borrow`, `doc_markdown`, `needless_collect`, `too_many_lines`); a virtual workspace silently drops `--workspace --features`, so the four-backend and kernel surface is only reached through `-p bitcoin-rs --no-default-features --features "$FULL_NODE_FEATURES"` plus a separate `-p bitcoin-rs-node` pass for its test targets; and `kernel-parity` adds `--include-ignored` on a debug profile. `cargo deny` belongs in the same sweep and is a bug report, not lint noise. See `docs/solutions/best-practices/workspace-clippy-does-not-predict-the-d-warnings-lanes.md`.
 
 ### CPU-seconds as a first-class metric
-The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name. On the loopback P2P sync to 150k, bitcoin-rs takes 76.3s wall and **318.4s CPU** against Core's 42.5s and **65.0s** — a 1.77× wall gap concealing a 4.9× CPU gap, which becomes wall time on the 4-8 core machines most nodes run on. The excess is broad rather than one hot spot: collapsing `SCRIPT_VERIFY_POOL` to a single thread still burns 230.1s, so rayon spin is a minority of it and no pool width converges. This also puts a caveat on every wall-only sweep in the performance note, `MIN_PARALLEL_SCRIPT_CHECKS` 16→4 most of all, since pushing more blocks through the pool is exactly the shape of change that trades CPU for wall.
+The rule that a throughput change is measured against CPU time as well as wall time, because a many-core idle benchmark host lets wall-clock tuning spend cores for free. Sampling `utime+stime` from `/proc/<pid>/stat` while polling height is enough; no profiler or metrics plumbing is required, and per-thread attribution comes from summing `/proc/<pid>/task/*/stat` by thread name.
 
-The matched local-file processing panel at commit `ff2615a` supersedes the
-older processing-bound CPU deficit: production-matched bitcoin-rs measured
-56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The loopback
-P2P result above remains valid for its network regime; it cannot be carried
-into the local replay regime. See
-`docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
+The controlled one-peer daemon IBD panel in [`docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json`](docs/benchmarks/data/end-to-end-sync/daemon-ibd-custody-v1.json) establishes the current bounded network-regime baseline across mainnet 0–150,000: Bitcoin Core median elapsed time is 73.459s against bitcoin-rs 89.576s. Core's elapsed time was 0.820× bitcoin-rs's elapsed time, so Core delivered 1.219× bitcoin-rs throughput. The 2× throughput target is unmet on this bounded daemon workload. This benchmark measures single-peer requester and apply behavior over loopback P2P on early blocks; it does not generalize to current-tip blocks or multi-peer Internet IBD. Earlier uncontrolled loopback measurements (such as 76.3s wall / 318.4s CPU vs Core 42.5s / 65.0s) showed a wider CPU gap that highlighted rayon spin and oversubscription risks before pool capping.
+
+The matched local-file processing panel at commit `ff2615a` supersedes the older processing-bound CPU deficit: production-matched bitcoin-rs measured 56.16s / 396.50 CPU-s against Core 31.0 at 64.74s / 477.82 CPU-s. The network-bound daemon IBD results remain valid for their download-and-apply regime; they cannot be carried into the local replay regime. See `docs/solutions/performance/allocator-parity-changes-wall-not-cpu.md`.
 
 The final AVX2 panel adds the same proof after the Merkle change: bitcoin-rs beat Core by 1.315× wall and 1.232× CPU while using 1.042× its peak RSS. The CPU result rules out a wall-only win bought by extra parallel work; the kernel batches eight hashes in SIMD lanes inside one task.
 
@@ -132,6 +129,28 @@ The versioned durable `(height, block hash)` cursor that identifies the exact ac
 
 ### Complete derived-index query
 A query returns a result only when one snapshot proves that the derived index covers the exact applied tip. A `TxIndex` query captures the applied tip and process-local revision, opens one typed storage snapshot, requires the snapshot watermark to equal that tip by height and hash, and rechecks the tip and revision before it returns. Aggregate row, byte, scan, and body-load budgets bound the work. Index lag, worker failure, a missing block body, a truncated scan, budget exhaustion, a tip change, and an ABA revision change return `Retry` or `Unavailable`; none can become a false absence. Electrum keeps an existing subscription and emits no update during transient unavailability.
+
+### Checkpoint write batching
+
+The checkpoint serializer writes many small record fields before it makes each
+artifact durable. `HashingWriter` batches those writes in a 64 KiB userspace
+buffer, then flushes the buffer before it returns the byte count and digest.
+The following file `fsync`, directory sync, generation rename, and `CURRENT`
+publication barriers do not change. The buffer changes syscall granularity,
+not the checkpoint format or durability boundary. Its `finish` operation owns
+the checked flush so a caller cannot publish a digest for buffered bytes that
+were not handed to the file.
+
+### Checkpoint MuHash batch
+
+The independent checkpoint traversal derives CoinStats and MuHash again instead
+of trusting the rolling listener that supplies live state. It encodes exact coin
+preimages into a bounded arena and computes insert-only partial MuHash values in
+parallel. The arena holds at most 262,144 coins or 16 MiB. Each flush uses no
+more lanes than the active Rayon pool or the 32-lane cap. The larger batch
+reduces partial-value construction and combination. It does not remove the
+listener-versus-traversal check, change preimage bytes, change snapshot bytes,
+or weaken checkpoint durability.
 
 ### Coalesced TxIndex wake
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
@@ -217,19 +236,26 @@ that were scaling; only issuing fewer, larger dispatches does. See
 
 ### Window script batching
 
-Verifying the input scripts of several consecutive blocks in one parallel
-dispatch, so the fan-out is amortised over a run of blocks rather than paid per
-block. The window prepares each block against an ordered overlay, dispatches
-once, and issues a per-block proof; the blocks then commit one at a time and in
-order, so every rule needing committed state still sees the real chain. On
-mainnet 0..150_000 this took the replay from 78.4s / 643.4s CPU to 69.6s /
-558.4s, with the dispatch itself falling from 44.08s to 12.55s. The proof binds
-the block hash, its predecessor, the height, the flags, and the locktime cutoff,
-travels bundled with the prepared state it covers, and is re-checked against
-what the apply derives; a window that cannot be proven yields nothing and every
-block verifies normally. The historical pre-batching capture measured 78.4s /
-643.4s CPU. The separate shipped capture measured 69.6s / 558.4s CPU; these are
-not one interleaved run. See
+Verifying the ordered transaction unit of several consecutive blocks in one
+parallel dispatch, so the fan-out is amortized over a run of blocks rather than
+paid per block. The unit includes transaction pre-checks, every input script,
+and transaction post-checks. The window prepares each block against an ordered
+overlay, dispatches once, and issues a private, single-use
+`BlockValidationProof`; the blocks then commit one at a time and in order, so
+every rule needing committed state still sees the real chain. The proof owns
+the `PreparedApply` it certifies and binds the block hash, predecessor, height,
+flags, and locktime cutoff. Commit re-derives all five fields. A mismatch
+discards both proof and prepared state and rebuilds from the live UTXO set.
+Assume-valid produces a distinct `AssumeValidSkipped` state, which re-reads the
+live trust gate and never takes the proof bypass.
+
+The initial batching change took mainnet 0..150,000 from 78.4s / 643.4s CPU to
+69.6s / 558.4s, with the dispatch itself falling from 44.08s to 12.55s. A later
+three-run interleaved attribution panel showed that deleting the duplicate
+commit-time transaction pass for matching proofs cut replay medians from
+48.414266s / 406.954276s CPU to 30.438702s / 254.642286s. The proof bypass
+applies only at the transaction-validation slot: block rules and BIP30 remain
+before it; coinbase maturity and BIP68 remain after it. See
 `docs/solutions/performance/script-batching-needs-a-split-apply-path.md`.
 
 ### Script-check floor
