@@ -305,3 +305,36 @@ position while keeping the rest. See the *All-or-scan position fallback* concept
 in `CONCEPTS.md`. The residual accepted: a stale offset landing exactly on a
 transaction boundary whose transaction also matches, while a different
 transaction in that block matches too.
+
+## §12 — `getchaintips` status vocabulary
+
+Bitcoin Core answers each tip's `status` from its block index entry, which
+records how far validation got: `BLOCK_FAILED_MASK`, `HaveNumChainTxs()`,
+`IsValid(BLOCK_VALID_SCRIPTS)`, `IsValid(BLOCK_VALID_TREE)`.
+
+`BlockTree`'s `NodeStatus` is not that. `insert_node` stamps whichever node
+carries the most work `Active` and demotes the one it displaced to `Stale`, so
+on a header-first node **every accepted header on the best chain is `Active`
+while its block sits unconnected**. It is a position marker in the best *header*
+chain, not a validation record.
+
+What this node can decide is narrower, and the mapping is built from that: a
+block is connected exactly when it is the applied tip or an ancestor of it, and
+a leaf is never an ancestor of anything.
+
+| status | Bitcoin Core | here |
+| --- | --- | --- |
+| `active` | the block is in the active chain | the tip this node has **applied** |
+| `invalid` | the block or an ancestor failed | `NodeStatus::Invalid` |
+| `valid-fork` | fully validated, no longer on the active chain | `NodeStatus::Stale` — displaced from the best chain, the one thing the tree records about a branch it stopped following |
+| `headers-only` | no block data for it or an ancestor | every other leaf: its block is not connected, because the connected tip is elsewhere |
+| `valid-headers` | data present, never validated | **never emitted** — this node applies a block as it arrives, so the state does not exist |
+| `unknown` | none of the above | never emitted |
+
+The residual: a branch that was *followed* but never *connected* — a header that
+was briefly the most work and lost a race — is reported `valid-fork` where Core
+would say `headers-only`. Telling those apart needs a per-block record of how
+far validation got, which the tree does not keep. It is a narrower error than
+the one it replaces: before this, an unvalidated header tip reported itself as
+the active chain, and the chain the node had actually validated was not listed
+at all.
