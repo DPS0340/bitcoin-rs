@@ -1165,10 +1165,19 @@ mod deriveaddresses_tests {
             .unwrap_or_else(|| panic!("a ranged descriptor needs a range"));
         assert_eq!(missing.code(), RpcError::CORE_INVALID_PARAMETER);
 
-        let unwanted = deriveaddresses(&ctx, &json!([format!("addr({ADDRESS})"), [0, 2]]))
-            .err()
-            .unwrap_or_else(|| panic!("a fixed descriptor takes no range"));
-        assert_eq!(unwanted.code(), RpcError::CORE_INVALID_PARAMETER);
+        // Both kinds of fixed descriptor: one miniscript parses, and one it
+        // does not model at all. They take separate paths to the same refusal.
+        let fixed_key = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
+        for fixed in [fixed_key.to_owned(), format!("addr({ADDRESS})")] {
+            let unwanted = deriveaddresses(&ctx, &json!([fixed.clone(), [0, 2]]))
+                .err()
+                .unwrap_or_else(|| panic!("a fixed descriptor takes no range: {fixed}"));
+            assert_eq!(
+                unwanted.code(),
+                RpcError::CORE_INVALID_PARAMETER,
+                "for {fixed}"
+            );
+        }
     }
 }
 
