@@ -1657,7 +1657,7 @@ fn prove_window(
             let Some(node_id) = tree.lookup(hash) else {
                 return Vec::new();
             };
-            contexts.push(ScriptProof {
+            contexts.push(BlockValidationContext {
                 hash,
                 parent: parent_hash,
                 height,
@@ -1818,27 +1818,23 @@ fn prove_window(
         .into_iter()
         .zip(contexts)
         .zip(skipped)
-        .map(|((prepared, proof), skipped)| ProvenApply {
-            prepared,
-            // No proof for a block whose scripts this window skipped. A
-            // `ScriptProof` asserts the scripts ran, and handing one back for a
-            // skipped block would do more than lie: the commit would take the
-            // proof branch instead of re-reading the trust gate, so a gate that
-            // flipped to untrusted between here and the commit would let the
-            // block through unverified. `None` sends it down the per-block path,
-            // which makes that decision against the gate as it stands then.
-            proof: (!skipped).then_some(proof),
+        .map(|((prepared, context), skipped)| {
+            if skipped {
+                ProvenApply::AssumeValidSkipped(prepared)
+            } else {
+                ProvenApply::Proven(BlockValidationProof { prepared, context })
+            }
         })
         .collect()
 }
 
-/// Evidence that a block's input scripts were executed and passed as part of a
-/// batch spanning several consecutive blocks.
+/// Chain context that determines the ordered transaction checks for one block.
 ///
-/// Bound to more than the block hash on purpose. The verdict also depends on
-/// the height, the rule flags, the median-time-past cutoff, and the block this
-/// one extends, and a reorg can change all four while the hash stays the same.
-struct ScriptProof {
+/// A window captures this before it applies any block. The commit path derives
+/// it again from the live chain and accepts a proof only when every field still
+/// agrees.
+#[derive(Debug, Eq, PartialEq)]
+struct BlockValidationContext {
     hash: Hash256,
     parent: Hash256,
     height: u32,
@@ -1846,35 +1842,24 @@ struct ScriptProof {
     locktime_cutoff: u32,
 }
 
-impl ScriptProof {
-    fn matches(
-        &self,
-        hash: Hash256,
-        parent: Hash256,
-        height: u32,
-        flags: bitcoin_rs_script::VerifyFlags,
-        locktime_cutoff: u32,
-    ) -> bool {
-        self.hash == hash
-            && self.parent == parent
-            && self.height == height
-            && self.flags == flags
-            && self.locktime_cutoff == locktime_cutoff
-    }
+/// Evidence that every ordered transaction pre-check, input script, and
+/// transaction post-check passed for this exact prepared block state.
+///
+/// The proof is private, single-use, and owns the prepared state it certifies.
+/// It is constructed only after the whole window verifier succeeds, so callers
+/// cannot pair a block's verdict with foreign resolved prevouts.
+struct BlockValidationProof {
+    prepared: PreparedApply,
+    context: BlockValidationContext,
 }
 
-/// One block's prepared state together with the proof covering it.
+/// Prepared state returned by a successful window attempt.
 ///
-/// Deliberately one value rather than two parameters. Passed separately, a
-/// caller could hand over block A's proof beside block B's prepared prevouts:
-/// the proof would still match the block being applied, and the scripts skipped
-/// would be the ones verified against different data. Pairing them at
-/// construction makes that unrepresentable.
-struct ProvenApply {
-    prepared: PreparedApply,
-    /// `None` when the window skipped this block's scripts under assume-valid.
-    /// The preparation is still reused; only the script evidence is absent.
-    proof: Option<ScriptProof>,
+/// Assume-valid is not proof. A skipped block must re-enter the ordinary
+/// transaction path at commit so it reads the trust gate in its current state.
+enum ProvenApply {
+    Proven(BlockValidationProof),
+    AssumeValidSkipped(PreparedApply),
 }
 
 /// Everything a block's application needs that depends only on the block and
@@ -2090,18 +2075,31 @@ fn apply_block_admitted(
     } else {
         block.header.time
     };
+    let verify_flags = compute_verify_flags(handles.network, height, block_hash, softfork_state);
+    let validation_context = BlockValidationContext {
+        hash: block_hash,
+        parent: prev_hash,
+        height,
+        flags: verify_flags,
+        locktime_cutoff,
+    };
     // Parse the block once with the kernel and take its txids. Core's
     // `CTransaction` hashes itself while deserializing with the SHA-256
     // implementation selected at runtime, so this one parse replaces the
     // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
     // that script preparation used to perform.
     // A window prepares several blocks against one overlay and hands the result
-    // back, so the kernel parse and the prevout resolution happen once.
-    let (prepared, proof) = match proven {
-        Some(ProvenApply { prepared, proof }) => (prepared, proof),
-        None => (
+    // back, so the kernel parse and the prevout resolution happen once. A proof
+    // whose context no longer matches is discarded together with its prepared
+    // view; the ordinary path rebuilds both from the live UTXO set.
+    let (prepared, transactions_proven) = match proven {
+        Some(ProvenApply::Proven(proof)) if proof.context == validation_context => {
+            (proof.prepared, true)
+        }
+        Some(ProvenApply::AssumeValidSkipped(prepared)) => (prepared, false),
+        Some(ProvenApply::Proven(_)) | None => (
             prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
-            None,
+            false,
         ),
     };
     let PreparedApply {
@@ -2148,21 +2146,11 @@ fn apply_block_admitted(
     pow_limit_result?;
 
     let script_verify_started = quanta::Instant::now();
-    let verify_flags = compute_verify_flags(handles.network, height, block_hash, softfork_state);
-    // A batch already executed these scripts under exactly the context derived
-    // here. Every bound field is compared, so a proof reached under different
-    // rules simply does not apply and the block verifies in full.
-    let script_verify_result = if proof.is_some_and(|proof| {
-        proof.matches(block_hash, prev_hash, height, verify_flags, locktime_cutoff)
-    }) {
-        run_non_script_checks_only(
-            block,
-            &tx_plan,
-            Arc::clone(&resolved),
-            tx_plan.txids(),
-            height,
-            locktime_cutoff,
-        )
+    // A matching proof certifies exactly this transaction-validation slot.
+    // Block rules and BIP30/BIP34 remain above it; coinbase maturity and BIP68
+    // remain below it. Every other state uses the ordinary verifier.
+    let script_verify_result = if transactions_proven {
+        Ok(())
     } else {
         verify_block_transactions(
             handles,
@@ -2979,12 +2967,8 @@ fn resolve_block_prevouts(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation
 )]
-/// Runs every non-script transaction check for a block whose scripts do not
-/// need executing here.
-///
-/// Two callers reach this: assume-valid, which trusts the scripts, and a batch
-/// proof, which already ran them. One implementation for both, because a second
-/// copy is how a trusted path and a proven path drift apart.
+/// Runs every non-script transaction check for a block whose scripts are
+/// skipped by the live assume-valid gate.
 fn run_non_script_checks_only(
     block: &bitcoin::Block,
     tx_plan: &BlockTxPlan,
@@ -6298,6 +6282,194 @@ mod consensus_rule_tests {
         assert_eq!(window_len([]), 0, "an empty window is empty");
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn one_block_window_fixture(
+        utxo: Arc<UtxoSet>,
+        txdata: Vec<Transaction>,
+        assume_valid_height: u32,
+    ) -> Result<(ApplyHandles, bitcoin::Block, bytes::Bytes), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut handles = apply_handles_for_network(Network::Regtest, utxo);
+        handles.assume_valid_height = assume_valid_height;
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(genesis.block_hash(), txdata)?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        applied_header_tip(&handles, block_hash, &block, 1)?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        Ok((handles, block, raw))
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn every_validation_context_mismatch_rebuilds_from_live_utxo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone, Copy, Debug)]
+        enum Field {
+            Hash,
+            Parent,
+            Height,
+            Flags,
+            LocktimeCutoff,
+        }
+
+        for field in [
+            Field::Hash,
+            Field::Parent,
+            Field::Height,
+            Field::Flags,
+            Field::LocktimeCutoff,
+        ] {
+            let prevout = bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x72; 32]),
+                vout: 0,
+            };
+            let utxo = utxo_with_output(prevout, 0)?;
+            let spend = spending_transaction_to_script(
+                prevout,
+                Sequence::MAX.to_consensus_u32(),
+                op_true_script(),
+            );
+            let (handles, block, raw) = one_block_window_fixture(
+                Arc::clone(&utxo),
+                vec![coinbase_transaction(1), spend],
+                0,
+            )?;
+            let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
+            let Some(ProvenApply::Proven(mut proof)) = entries.pop() else {
+                panic!("valid fixture did not produce a proof for {field:?}");
+            };
+
+            match field {
+                Field::Hash => proof.context.hash = Hash256::from_le_bytes(&[0x81; 32]),
+                Field::Parent => proof.context.parent = Hash256::from_le_bytes(&[0x82; 32]),
+                Field::Height => proof.context.height = proof.context.height.saturating_add(1),
+                Field::Flags => {
+                    proof.context.flags =
+                        if proof.context.flags == bitcoin_rs_script::VerifyFlags::NONE {
+                            bitcoin_rs_script::VerifyFlags::MANDATORY
+                        } else {
+                            bitcoin_rs_script::VerifyFlags::NONE
+                        };
+                }
+                Field::LocktimeCutoff => {
+                    proof.context.locktime_cutoff = proof.context.locktime_cutoff.saturating_add(1);
+                }
+            }
+
+            let mut remove = BlockChanges::default();
+            remove.remove(OutPoint::new(
+                Hash256::from_le_bytes(prevout.txid.as_byte_array()),
+                prevout.vout,
+            ));
+            utxo.commit_block(&remove, &Hash256::from_le_bytes(&[0x83; 32]))?;
+
+            let transition = handles.begin_chain_transition()?;
+            let error = apply_block_admitted(
+                &handles,
+                &block,
+                Some(raw),
+                Some(ProvenApply::Proven(proof)),
+                &transition,
+            )
+            .expect_err("a mismatched proof must re-read the now-missing live prevout");
+            assert!(
+                matches!(
+                    error,
+                    ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::MissingPrevout {
+                        input_index: 0
+                    })
+                ),
+                "{field:?} mismatch used stale prepared state instead of ordinary validation: {error:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_window_never_proves_non_script_invalidity() -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            DuplicateInput,
+            MissingPrevout,
+            NonFinalLocktime,
+            OutputsGreaterThanInputs,
+            CoinbaseScriptSigLength,
+            SigopOverflow,
+        }
+
+        for (index, case) in [
+            Case::DuplicateInput,
+            Case::MissingPrevout,
+            Case::NonFinalLocktime,
+            Case::OutputsGreaterThanInputs,
+            Case::CoinbaseScriptSigLength,
+            Case::SigopOverflow,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let prevout = bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x90 + u8::try_from(index)?; 32]),
+                vout: 0,
+            };
+            let mut utxo = Arc::new(UtxoSet::new());
+            let txdata = match case {
+                Case::CoinbaseScriptSigLength => {
+                    let mut coinbase = coinbase_transaction(1);
+                    coinbase.input[0].script_sig = ScriptBuf::from_bytes(vec![1]);
+                    vec![coinbase]
+                }
+                Case::SigopOverflow => {
+                    utxo = utxo_with_output(prevout, 0)?;
+                    let output_script = ScriptBuf::from_bytes(vec![
+                        0xac;
+                        usize::try_from(
+                            bitcoin_rs_consensus::MAX_BLOCK_SIGOPS_COST / 4 + 1
+                        )?
+                    ]);
+                    let spend = spending_transaction_to_script(
+                        prevout,
+                        Sequence::MAX.to_consensus_u32(),
+                        output_script,
+                    );
+                    vec![coinbase_transaction(1), spend]
+                }
+                _ => {
+                    if !matches!(case, Case::MissingPrevout) {
+                        utxo = utxo_with_output(prevout, 0)?;
+                    }
+                    let mut spend = spending_transaction_to_script(
+                        prevout,
+                        Sequence::MAX.to_consensus_u32(),
+                        op_true_script(),
+                    );
+                    match case {
+                        Case::DuplicateInput => spend.input.push(spend.input[0].clone()),
+                        Case::MissingPrevout => {}
+                        Case::NonFinalLocktime => {
+                            spend.lock_time = bitcoin::absolute::LockTime::from_height(2)?;
+                            spend.input[0].sequence = Sequence::ZERO;
+                        }
+                        Case::OutputsGreaterThanInputs => {
+                            spend.output[0].value = Amount::from_sat(2_000);
+                        }
+                        Case::CoinbaseScriptSigLength | Case::SigopOverflow => unreachable!(),
+                    }
+                    vec![coinbase_transaction(1), spend]
+                }
+            };
+            let (handles, block, raw) = one_block_window_fixture(utxo, txdata, 0)?;
+            assert!(
+                prove_window(&handles, &[&block], &[raw]).is_empty(),
+                "{case:?} must not produce a validation proof"
+            );
+        }
+        Ok(())
+    }
+
     /// The window must make the same assume-valid decision the single-block path
     /// makes, and must not hand back script evidence for a block it skipped.
     ///
@@ -6363,22 +6535,23 @@ mod consensus_rule_tests {
         };
 
         // Height 1 is covered, and with no anchor pinned the gate is trusted.
-        let (handles, block, raw) = build(100)?;
-        let proven =
-            metrics::with_local_recorder(&recorder, || prove_window(&handles, &[&block], &[raw]));
+        let (mut handles, block, raw) = build(100)?;
+        let mut proven = metrics::with_local_recorder(&recorder, || {
+            prove_window(&handles, &[&block], core::slice::from_ref(&raw))
+        });
         assert_eq!(
             proven.len(),
             1,
             "a trusted block must not be failed by a script the window should never have run"
         );
-        let Some(entry) = proven.first() else {
+        let Some(skipped) = proven.pop() else {
             panic!("window returned no entry for the only block");
         };
         assert!(
-            entry.proof.is_none(),
-            "a skipped block must carry no script proof: the proof branch bypasses the \
-             trust-gate re-read at commit, so a gate that flips in between would let an \
-             unverified block through"
+            matches!(skipped, ProvenApply::AssumeValidSkipped(_)),
+            "a skipped block must carry AssumeValidSkipped, not script proof: the proof branch \
+             bypasses the trust-gate re-read at commit, so a gate that flips in between would let \
+             an unverified block through"
         );
         assert_eq!(
             metrics_handle
@@ -6386,6 +6559,28 @@ mod consensus_rule_tests {
                 .get("node.window.verify_success_total"),
             None,
             "an empty verification dispatch must not count as script verification",
+        );
+        let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
+        let skipped = entries
+            .pop()
+            .expect("the trusted assume-valid window returned one entry above");
+        handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(Some((
+            1,
+            Hash256::from_le_bytes(&[0xff; 32]),
+        ))));
+        assert!(!handles.assume_valid_gate.trusted());
+        let transition = handles.begin_chain_transition()?;
+        let error = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition)
+            .expect_err("an untrusted gate at commit must run and reject the bad script");
+        assert!(
+            matches!(
+                error,
+                ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
+                    input_index: 0,
+                    ..
+                })
+            ),
+            "trust-gate flip must re-enter ordinary script validation, got {error:?}"
         );
 
         // Full verification must be completely unaffected.
