@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -283,12 +283,12 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
         let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
         let record = BlockRecord::synthetic(synthetic_height, hash);
         if !verbose {
-            return Ok(json!(record.header_hex));
+            return Ok(json!(record.header_hex()));
         }
         return Ok(synthetic_block_json(ctx, &record, false));
     };
     if !verbose {
-        return Ok(json!(record.header_hex));
+        return Ok(json!(record.header_hex()));
     }
     block_json_verbose(ctx, &record, false, 1)
 }
@@ -911,18 +911,8 @@ fn block_json_verbose(
 }
 
 fn decode_header(record: &BlockRecord) -> Option<bitcoin::block::Header> {
-    let bytes = match Vec::<u8>::from_hex(&record.header_hex) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(
-                block_hash = %record.hash.to_string_be(),
-                %error,
-                "stored block header hex is invalid"
-            );
-            return None;
-        }
-    };
-    match deserialize(&bytes) {
+    let bytes = record.header_bytes()?;
+    match deserialize(bytes.as_slice()) {
         Ok(header) => Some(header),
         Err(error) => {
             tracing::warn!(
@@ -942,7 +932,7 @@ fn decode_block(
     let Some(bytes) = ctx.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
-    match deserialize(&bytes) {
+    match deserialize(bytes.as_slice()) {
         Ok(block) => Ok(Some((bytes, block))),
         Err(error) => {
             tracing::warn!(
@@ -1054,6 +1044,22 @@ mod tests {
         ctx
     }
 
+    /// Makes `ctx` know `block` the way a running node does: header in the block
+    /// tree, record in the log.
+    ///
+    /// A record on its own is not a node's state. `apply_block` puts the header
+    /// in the tree first and pushes the record after, through the same handles,
+    /// and the record carries no header of its own — the tree is where one
+    /// lives. A fixture that pushes only a record is asking `getblock` to answer
+    /// from half the state a node would have.
+    fn seed_block(ctx: &Arc<Context>, block: &bitcoin::Block, record: BlockRecord) {
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, NodeStatus::Active);
+        }
+        ctx.add_block(record);
+    }
+
     #[test]
     fn subsidy_at_height_genesis_is_50_btc() {
         assert_eq!(subsidy_at_height(0), 5_000_000_000);
@@ -1138,7 +1144,7 @@ mod tests {
         let block_hash_hex = record.hash.to_string_be();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let block_json = getblock(&ctx, &json!([block_hash_hex.as_str(), 1]))?;
         let header_json = getblockheader(&ctx, &json!([block_hash_hex.as_str(), true]))?;
@@ -1223,7 +1229,7 @@ mod tests {
         });
         let calls = Arc::clone(&source);
         let ctx = Arc::new(Context::new().with_block_body_source(source));
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let expected_hex = body.to_lower_hex_string();
         assert_eq!(
@@ -1251,7 +1257,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        seed_block(&ctx, &genesis, BlockRecord::from_block(0, &genesis));
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -1549,7 +1555,7 @@ mod tests {
                 height,
                 block_hex: String::new(),
                 body_size: usize::try_from(100_u32.saturating_add(height))?,
-                header_hex: String::new(),
+                header: None,
                 tx_count: usize::try_from(height.saturating_add(1))?,
                 time: 1_000_u32.saturating_add(height.saturating_mul(10)),
             });
@@ -1559,7 +1565,7 @@ mod tests {
             height: 4,
             block_hex: String::new(),
             body_size: 104,
-            header_hex: String::new(),
+            header: None,
             tx_count: 100,
             time: 1,
         });
@@ -1611,7 +1617,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 200,
         });
@@ -1620,7 +1626,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 300,
         });
