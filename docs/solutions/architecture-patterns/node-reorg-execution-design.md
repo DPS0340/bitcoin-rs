@@ -115,10 +115,12 @@ Consequences:
    old all-family watermark to both capability watermarks without reindexing.
 
    A disabled capability keeps its cursor and the shared ancestor identities it
-   may still need. On re-enable the worker reconciles from that cursor. If a
-   disconnected body or rollback identity is gone, a durable reset marker first
-   makes the affected capability unavailable, then bounded deletion and rebuild
-   replace its derived rows. Startup resumes an interrupted reset.
+   may still need. Competing-branch rows can coexist in `BlockHeaders`, so its
+   iteration order and row count are not an active chain or tip; authoritative
+   header queries use `BlockTree`. On re-enable the worker reconciles from that
+   cursor. If a disconnected body or rollback identity is gone, a durable reset
+   marker first makes the affected capability unavailable, then bounded deletion
+   and rebuild replace its derived rows. Startup resumes an interrupted reset.
 
 ## Disconnect order
 

@@ -242,53 +242,6 @@ fn sync_gate() -> (SyncGate, Receiver<()>, Sender<()>) {
 }
 
 #[test]
-fn divergent_capability_stops_at_convergence_then_advances_together() {
-    let (_temp, writer) = fjall_writer();
-    let f = fork_fixture();
-    let tree = Arc::new(RwLock::new(f.tree));
-    let applied_tip = make_applied_tip();
-    let target = tip_for(&tree.read(), f.a2_id);
-    let body_store: Arc<dyn PruneBodyStore> = Arc::new(MapBodyStore::new(HashMap::new(), None));
-    let (_runtime, worker) = make_worker(
-        &writer,
-        &applied_tip,
-        &tree,
-        body_store,
-        DEFAULT_BATCH_LIMITS,
-    );
-    let a1 = IndexWatermark {
-        height: 1,
-        hash: f.a1.1.to_le_bytes(),
-    };
-
-    let (capabilities, watermark, stop_height) = worker
-        .forward_selection(
-            IndexWatermarks {
-                tx_lookup: Some(a1),
-                electrum_history: None,
-            },
-            &target,
-        )
-        .expect("electrum catch-up selection");
-    assert_eq!(capabilities, IndexCapabilities::ELECTRUM_HISTORY);
-    assert_eq!(watermark, None);
-    assert_eq!(stop_height, 1);
-
-    let (capabilities, watermark, stop_height) = worker
-        .forward_selection(
-            IndexWatermarks {
-                tx_lookup: Some(a1),
-                electrum_history: Some(a1),
-            },
-            &target,
-        )
-        .expect("joint catch-up selection");
-    assert_eq!(capabilities, IndexCapabilities::ALL);
-    assert_eq!(watermark, Some(a1));
-    assert_eq!(stop_height, 2);
-}
-
-#[test]
 fn forward_commit_overlapping_tip_extension_repairs_on_next_pass() {
     let (_temp, writer) = fjall_writer();
     let f = fork_fixture();
@@ -602,6 +555,108 @@ fn missing_disconnected_body_resets_and_rebuilds_selected_capabilities() {
     });
     assert_eq!(watermarks.tx_lookup, expected);
     assert_eq!(watermarks.electrum_history, expected);
+}
+
+#[test]
+fn stale_electrum_reset_preserves_ready_tx_lookup_then_rebuilds() {
+    let (_temp, writer) = fjall_writer();
+    let f = fork_fixture();
+    let bodies = Arc::new(MapBodyStore::new(
+        bodies_map(&[
+            (0, f.genesis.1, &f.genesis.0),
+            (1, f.a1.1, &f.a1.0),
+            (2, f.a2.1, &f.a2.0),
+            (1, f.b1.1, &f.b1.0),
+            (2, f.b2.1, &f.b2.0),
+        ]),
+        None,
+    ));
+    let body_store: Arc<dyn PruneBodyStore> = bodies.clone();
+    let tree = Arc::new(RwLock::new(f.tree));
+    let applied_tip = make_applied_tip();
+    let a2_tip = Arc::new(tip_for(&tree.read(), f.a2_id));
+    applied_tip.store(Some(Arc::clone(&a2_tip)));
+    let (_runtime, mut worker) = make_worker(
+        &writer,
+        &applied_tip,
+        &tree,
+        body_store,
+        DEFAULT_BATCH_LIMITS,
+    );
+    let mut pending = None;
+
+    assert!(matches!(
+        worker
+            .catch_up_to(&a2_tip, None, IndexCapabilities::ALL, &mut pending)
+            .expect("initial catch-up"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle A2"),
+        ReconcileAction::CaughtUp
+    ));
+
+    worker.enabled = IndexCapabilities::TX_LOOKUP;
+    let b2_tip = Arc::new(tip_for(&tree.read(), f.b2_id));
+    applied_tip.store(Some(Arc::clone(&b2_tip)));
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("move tx lookup to B2"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("settle tx lookup at B2"),
+        ReconcileAction::CaughtUp
+    ));
+    let a2 = Some(IndexWatermark {
+        height: 2,
+        hash: f.a2.1.to_le_bytes(),
+    });
+    let b2 = Some(IndexWatermark {
+        height: 2,
+        hash: f.b2.1.to_le_bytes(),
+    });
+    assert_eq!(
+        writer.watermarks().expect("divergent watermarks"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            electrum_history: a2,
+        }
+    );
+
+    bodies.bodies.lock().remove(&(2, f.a2.1.to_le_bytes()));
+    worker.enabled = IndexCapabilities::ALL;
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("selectively reset Electrum and prepare B2"),
+        ReconcileAction::Buffered
+    ));
+    assert_eq!(
+        writer.watermarks().expect("watermarks during rebuild"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            electrum_history: None,
+        },
+        "TxLookup must remain ready while the Electrum rebuild is pending"
+    );
+
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("commit Electrum rebuild"),
+        ReconcileAction::CaughtUp
+    ));
+    assert_eq!(
+        writer.watermarks().expect("rebuilt watermarks"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            electrum_history: b2,
+        }
+    );
 }
 
 #[test]

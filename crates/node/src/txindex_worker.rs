@@ -349,8 +349,6 @@ struct Worker {
 struct PendingForward {
     capabilities: IndexCapabilities,
     durable: Option<IndexWatermark>,
-    stop_height: u32,
-    commit_at_stop: bool,
     batch: PreparedBatch,
     deadline: Instant,
 }
@@ -563,19 +561,10 @@ impl Worker {
         let Some(target) = target else {
             return Ok(ReconcileAction::CaughtUp);
         };
-        let Some((capabilities, watermark, stop_height)) =
-            self.forward_selection(watermarks, &target)
-        else {
+        let Some((capabilities, watermark)) = self.forward_selection(watermarks, &target) else {
             return Ok(ReconcileAction::CaughtUp);
         };
-        self.catch_up_to_height(
-            &target,
-            watermark,
-            capabilities,
-            stop_height,
-            stop_height < target.height,
-            pending,
-        )
+        self.catch_up_to(&target, watermark, capabilities, pending)
     }
 
     fn reconcile_pending(
@@ -601,16 +590,6 @@ impl Worker {
             };
         };
 
-        if state.commit_at_stop
-            && (endpoint.height >= state.stop_height || target.height < state.stop_height)
-        {
-            return if self.commit_pending(pending)? {
-                Ok(ReconcileAction::Progressed)
-            } else {
-                Ok(ReconcileAction::Stalled)
-            };
-        }
-
         if endpoint.height == target.height && endpoint.hash == target.hash.to_le_bytes() {
             if Instant::now() < state.deadline {
                 return Ok(ReconcileAction::Buffered);
@@ -629,18 +608,7 @@ impl Worker {
                     Ok(ReconcileAction::Stalled)
                 };
             }
-            return self.catch_up_to_height(
-                target,
-                state.durable,
-                state.capabilities,
-                if state.commit_at_stop {
-                    state.stop_height
-                } else {
-                    target.height
-                },
-                state.commit_at_stop,
-                pending,
-            );
+            return self.catch_up_to(target, state.durable, state.capabilities, pending);
         }
 
         if self.commit_pending(pending)? {
@@ -697,7 +665,7 @@ impl Worker {
         &self,
         watermarks: IndexWatermarks,
         target: &TipSnapshot,
-    ) -> Option<(IndexCapabilities, Option<IndexWatermark>, u32)> {
+    ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
         let tx = self.enabled.tx_lookup.then_some(watermarks.tx_lookup);
         let electrum = self
             .enabled
@@ -725,16 +693,6 @@ impl Worker {
                 .flatten()
                 .find(|watermark| watermark.height == height)
         };
-        let stop_height = [tx, electrum]
-            .into_iter()
-            .flatten()
-            .filter(|watermark| needs_forward(*watermark))
-            .map(start_height)
-            .filter(|start| *start > selected_start)
-            .map(|start| start - 1)
-            .min()
-            .unwrap_or(target.height)
-            .min(target.height);
         Some((
             IndexCapabilities {
                 tx_lookup: tx.is_some_and(|watermark| {
@@ -745,7 +703,6 @@ impl Worker {
                 }),
             },
             selected_watermark,
-            stop_height,
         ))
     }
 
@@ -803,31 +760,11 @@ impl Worker {
         Ok(identities)
     }
 
-    #[cfg(test)]
     fn catch_up_to(
         &self,
         target: &TipSnapshot,
         watermark: Option<IndexWatermark>,
         capabilities: IndexCapabilities,
-        pending: &mut Option<PendingForward>,
-    ) -> Result<ReconcileAction, TxIndexWorkerError> {
-        self.catch_up_to_height(
-            target,
-            watermark,
-            capabilities,
-            target.height,
-            false,
-            pending,
-        )
-    }
-
-    fn catch_up_to_height(
-        &self,
-        target: &TipSnapshot,
-        watermark: Option<IndexWatermark>,
-        capabilities: IndexCapabilities,
-        stop_height: u32,
-        commit_at_stop: bool,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
         if self.runtime.should_stop() {
@@ -837,24 +774,17 @@ impl Worker {
         let mut state = pending.take().unwrap_or_else(|| PendingForward {
             capabilities,
             durable: watermark,
-            stop_height,
-            commit_at_stop,
             batch: PreparedBatch::new(self.batch_limits),
             deadline: Instant::now() + self.batch_delay,
         });
-        if state.durable != watermark
-            || state.capabilities != capabilities
-            || state.commit_at_stop != commit_at_stop
-            || (state.commit_at_stop && state.stop_height != stop_height)
-        {
+        if state.durable != watermark || state.capabilities != capabilities {
             return Err(TxIndexWorkerError::PendingDurableChanged);
         }
-        state.stop_height = stop_height;
         let start_height = state.batch.watermark().map_or_else(
             || watermark.map_or(0, |w| w.height.saturating_add(1)),
             |endpoint| endpoint.height.saturating_add(1),
         );
-        if start_height > state.stop_height {
+        if start_height > target.height {
             return if self.sync_and_commit(state.batch)?.is_some() {
                 Ok(ReconcileAction::CaughtUp)
             } else {
@@ -864,7 +794,7 @@ impl Worker {
 
         let chunk_end = start_height
             .saturating_add(IDENTITY_CHUNK_BLOCKS - 1)
-            .min(state.stop_height);
+            .min(target.height);
         let identities = self.collect_target_chain(target, start_height, chunk_end)?;
         if self.runtime.should_stop() {
             return Ok(ReconcileAction::Stalled);
@@ -935,26 +865,19 @@ impl Worker {
             }
         }
 
-        self.finish_catch_up(state, chunk_end, pending)
+        self.finish_catch_up(state, chunk_end, target, pending)
     }
 
     fn finish_catch_up(
         &self,
         state: PendingForward,
         chunk_end: u32,
+        target: &TipSnapshot,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
-        if chunk_end < state.stop_height {
+        if chunk_end < target.height {
             *pending = Some(state);
             return Ok(ReconcileAction::Progressed);
-        }
-
-        if state.commit_at_stop {
-            return if self.sync_and_commit(state.batch)?.is_some() {
-                Ok(ReconcileAction::Progressed)
-            } else {
-                Ok(ReconcileAction::Stalled)
-            };
         }
 
         let endpoint = state.endpoint();
