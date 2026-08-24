@@ -1,7 +1,7 @@
 # bitcoin-rs-index
 
 Owns the confirmed-transaction index: electrs-shaped rows over the workspace key-value
-store, the versioned TxIndex watermark that pins rows to an exact active-chain prefix,
+store, the versioned `TxIndex` watermark that pins rows to an exact active-chain prefix,
 and Electrum scripthash status hashing.
 
 `Indexer<S: KvStore>` walks a serialized block once (`ingest_block`) and writes txid,
@@ -19,7 +19,7 @@ values carry transaction positions. Around the rows sit the stable types (`Scrip
 unconfirmed rows, and `compute_status_hash` over ordered `HistoryEntry`s.
 
 ## Features
-- `rocksdb`: enables the RocksDB backend in `bitcoin-rs-storage`
+- `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
 - `fjall`: enables the fjall backend in `bitcoin-rs-storage`
 - `redb`: enables the redb backend in `bitcoin-rs-storage`
 - `mdbx`: enables the MDBX backend in `bitcoin-rs-storage`
