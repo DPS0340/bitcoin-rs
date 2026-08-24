@@ -63,11 +63,13 @@ This is unbounded work for one authenticated RPC call, not a remote
 denial-of-service. It still stalls the node for the duration and evicts
 everything else from cache.
 
-**The fix is already in the tree.** `Context.indexer`
-(`crates/rpc/src/context.rs:302`) is the txindex, and the read-path campaign's
-`resolve_transaction` answers exactly "which block contains this txid" in one
-lookup. Bitcoin Core takes the same route: its `gettxoutproof` requires a block
-hash *unless* txindex is enabled.
+**The current tree lacks the required lookup.** `Context.tx_index`
+(`crates/rpc/src/context.rs:372`) exposes `TxIndexQuery::transaction`, but that
+contract returns only the transaction. It does not identify the block that
+contains it. Add a txid-to-block-location query to the durable transaction
+index and expose it through `TxIndexQuery`; then the handler can replace its
+chain scan with one index lookup. Bitcoin Core takes the same route: its
+`gettxoutproof` requires a block hash *unless* txindex is enabled.
 
 **Before implementing:** time the current handler on a fixture of a few thousand
 blocks and extrapolate, so the fix has a `before` arm. The refactor-set contract
