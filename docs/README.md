@@ -41,7 +41,10 @@ is useful, not because they describe current behaviour. Do not treat either as
 a description of how the node works today.
 
 - [plans/](plans/) holds design blueprints for multi-step campaigns, each dated
-  and scoped to the work that prompted it.
+  and scoped to the work that prompted it, plus the historical records moved out
+  of `PLAN.md`: the
+  [2026-06-05 performance campaign ledger](plans/2026-06-05-performance-campaign-ledger.md)
+  and the [2026-05-19 Ultrareview log](plans/2026-05-19-ultrareview-log.md).
 - [brainstorms/](brainstorms/) holds exploratory requirements from before a
   direction was settled.
 
