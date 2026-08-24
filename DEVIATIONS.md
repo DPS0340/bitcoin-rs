@@ -11,7 +11,7 @@ Rust toolchain `1.85.0` (the MSRV declared by `PLAN.md`).
 
 The `PLAN.md` "Dependency audit 2026-05-19" section overstated several version
 numbers. The corrections below preserve the audit's intent (latest stable line
-compatible with MSRV 1.85) while reflecting the actual registry state.
+compatible with the Rust 1.85 MSRV) while reflecting the actual registry state.
 
 ### Crate-name fix
 
@@ -24,14 +24,23 @@ compatible with MSRV 1.85) while reflecting the actual registry state.
 | Crate | `PLAN.md` floor | Latest stable | Floor we use |
 |---|---|---|---|
 | `parking_lot` | `>=0.13` | `0.12.5` | `>=0.12.5, <0.13` |
-| `rust-rocksdb` | `>=0.49` | `0.44.2` | `>=0.44, <0.45` |
-| `fjall` | `>=3.1` | `2.11.2` | `>=2.11, <3.0` |
-| `redb` | `>=4.1` | `2.6.3` | `>=2.6, <3.0` |
-| `criterion` | `>=0.8` | `0.7.0` (MSRV-bound) | `>=0.7, <0.8` |
-| `bitcoinkernel` | `>=0.1` | `0.2.0` | `>=0.2, <0.3` |
+| `bitcoinkernel` | `>=0.1` | `0.2.1` | `>=0.2, <0.3` |
 
-`criterion 0.8.2` exists but requires Rust 1.86; under our MSRV 1.85 the
-registry resolves to `0.7.0`.
+### Resolved version-floor deviations
+
+Upstream caught up and the workspace moved with it. Kept as a record so a reader does
+not re-derive the original downgrade.
+
+| Crate | Historical downgrade | Now pinned | What resolved it |
+|---|---|---|---|
+| `rust-rocksdb` | `>=0.44, <0.45` (0.44.2) | `>=0.50, <0.51` (0.50.0) | upstream released the floor `PLAN.md` asked for |
+| `fjall` | `>=2.11, <3.0` (2.11.2) | `>=3.1.4, <4` (3.1.8) | upstream released 3.1 |
+| `redb` | `>=2.6, <3.0` (2.6.3) | `>=4.1, <5` (4.2.0) | upstream released 4.x |
+| `criterion` | `>=0.7, <0.8` (0.7.0, MSRV-bound) | `>=0.8.2, <0.9` (0.8.2) | toolchain moved from 1.85 to 1.95.0 |
+| `sha2` | `>=0.10.9, <0.11` | `>=0.11, <0.12` (0.11.0) | 0.11 exposes no `asm` feature, and the workspace sets `default-features = false` |
+
+`criterion 0.8.2` requires Rust 1.86. The workspace toolchain is 1.95.0
+(`rust-toolchain.toml`), so `>=0.8.2, <0.9` resolves to `0.8.2`.
 
 ### Feature-name fixes
 
@@ -46,16 +55,15 @@ registry resolves to `0.7.0`.
 
 | Crate | Latest on crates.io | We pin | Why |
 |---|---|---|---|
-| `sha2` | `0.11.0` | `>=0.10.9, <0.11` | `0.11` removed the `asm` cargo feature; PLAN.md audit explicitly stays on `0.10`. |
 | `bitcoin` | `0.33.0-beta` | `>=0.32.9, <0.33` | `0.33` is still beta; PLAN.md stays on stable `0.32.x`. |
-| `bitcoin_hashes` | `0.20.0` | `>=0.14.1, <0.15` | Aligned with `bitcoin 0.32` transitive pin. |
+| `bitcoin_hashes` | `0.20.0` | `>=0.14, <0.15` | Aligned with `bitcoin 0.32` transitive pin. |
 | `secp256k1` | `0.32.0-beta.2` | `>=0.31.1, <0.32` | Stable `0.31.x`; `0.32` still beta. |
 | `smallvec` | `2.0.0-alpha.12` | `>=1.15, <2` | Stable `1.x`; `2.0` still alpha. |
 | `zerocopy` | `0.9.0-alpha.0` | `>=0.8, <0.9` | Stable `0.8.x`; `0.9` still alpha. |
 
 ## Validation evidence
 
-`cargo metadata --format-version 1` on the resulting `Cargo.toml` resolves
+Historical (Task 0 bootstrap, Rust 1.85.0): `cargo metadata --format-version 1` on the resulting `Cargo.toml` resolves
 **305 packages** to "latest Rust 1.85.0 compatible versions". `cargo check
 --workspace --all-targets` and `cargo clippy --workspace --all-targets --
 -D warnings` both exit 0. `cargo fmt --all --check` is clean.
@@ -66,7 +74,7 @@ One workspace dependency still needs host packages beyond a clean Rust toolchain
 
 | Crate | Failure mode | Root cause | Resolution |
 |---|---|---|---|
-| `bitcoinkernel` (`libbitcoinkernel-sys` 0.2.0) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. Default build skips the kernel; CI installs `libboost-dev` only in the `kernel-only` job and enables the feature explicitly. |
+| `bitcoinkernel` (`libbitcoinkernel-sys` 0.3.0, via `bitcoinkernel` 0.2.1) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. `kernel` is now a default feature (`crates/consensus/Cargo.toml` `default = ["kernel"]`), CI installs `cmake` and `libboost-dev` up front for the standard jobs, `kernel-parity` replaced the obsolete `kernel-only` and `kernel-node` jobs, and `portable-check` covers `--no-default-features`. |
 
 ### MDBX un-gated after MSRV 1.92
 
@@ -85,7 +93,7 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 
 - **G3 (kernel parity)** is exercised on the default build via `kernel-parity`; default builds validate all script classes through bitcoinkernel.
 - **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
-- All other gates (G1, G2, G4, G5, G6, G8 – G14) are unaffected.
+- All other gates (G1, G2, G4, G5, G6, G8 – G15) are unaffected.
 ## 2. Task 3 — script interpreter v1 wraps bitcoin crate
 
 Task 3 Step 2 calls for a hand-rolled per-opcode dispatcher. The v1 script
@@ -174,8 +182,8 @@ resolvable.
 
 ## §6 — T20 gates scaffold + integration-layer deferral
 
-G1..G14 acceptance tests are scaffolded under
-`bin/bitcoin-rs/tests/gates/`. Live-infrastructure gates (G1, G2, G3,
+G1..G15 acceptance tests are scaffolded under
+`bin/bitcoin-rs/tests/gates/`. G15 (`bin/bitcoin-rs/tests/gates/g15_workspace_version_sync.rs`) asserts internal workspace dependency versions match `[workspace.package].version`. Live-infrastructure gates (G1, G2, G3,
 G5, G6, G8, G9, G14) are `#[ignore]`d with run instructions in
 doc-comments. Wrapper gates (G4, G7, G10, G11, G12) shell out to
 in-tree crate tests. G13 (lints clean) is `#[ignore]`d because CI
@@ -187,7 +195,7 @@ be validated in-session — it requires multi-day mainnet IBD benchmarks
 against a reference bitcoind. The gate is scaffolded as a structural
 placeholder. Live infrastructure runs are operator responsibilities.
 
-- Files: `bin/bitcoin-rs/{Cargo.toml,tests/gates/g{01..14}_*.rs}`
+- Files: `bin/bitcoin-rs/{Cargo.toml,tests/gates/g{01..15}_*.rs}`
 - Commit: 144e2c1 + 61ae824
 
 ## §7 — Integration layer: NodeState wiring + listeners + synthetic apply_block
@@ -251,7 +259,7 @@ serving remains deferred.
 - **No historical DAA fixture parity.** Header acceptance and active-chain retarget calculation are unit-covered, but they are not yet checked against historical mainnet/testnet retarget windows.
 - **Contextual transaction checks remain node-local.** BIP113 MTP nLocktime, BIP68 sequence locks, and BIP9 CSV/Segwit activation are wired through the node apply path, but the lower-level consensus crate still exposes `verify_transaction(tx, prevouts, height, flags)` rather than a reusable context-rich transaction API.
 - **No persisted block-body serving path for P2P.** P2P `getdata` can serve bodies still present in the in-memory `BlockRecord` cache, but it does not read persisted pruned-body rows after restart or cache eviction; unavailable inventory is reported with `notfound`.
-- **No index / filter / coinstats updates triggered by tip advance.** Electrum index, BIP158 filter generation, and coinstats remain stale until a follow-up wires the listener side.
+- **Electrum index updates are not triggered by tip advance.** Coinstats (`handles.coin_stats.finish_block`) and BIP158 filter generation (`handles.filter_index.put_filter`) are wired into `apply_block` (`crates/node/src/apply.rs`); only the Electrum index still waits on a listener.
 - **G14 empirical validation still deferred.** The `faster than Bitcoin
   Core` claim requires multi-day same-window live mainnet IBD against
   `bitcoin-rs` and `bitcoind`. Operator responsibility.
