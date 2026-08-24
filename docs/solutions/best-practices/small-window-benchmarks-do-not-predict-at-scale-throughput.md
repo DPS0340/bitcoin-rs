@@ -62,12 +62,11 @@ refresh.
    at height 938343 (block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`),
    skipping historical script checks once the active header chain validates the anchor.
    Full script verification requires explicit opt-in (`--assume-valid-height 0` or
-   `mainnet_prefix_replay`, which defaults to 0). The node's optimized default posture pairs
-   this mainnet assume-valid anchor with the `fjall` storage backend, multi-peer block
-   download (outbound peer target 8, pending budget 128, 16 in-flight per peer), 450 MiB
-   database cache (`dbcache`), and disabled secondary indexes/pruning. When running head-to-head
-   benchmarks, pin both sides explicitly (for full validation, `-assumevalid=0` ↔
-   `--assume-valid-height 0`) and record the posture in the artifact.
+   `mainnet_prefix_replay`, which defaults to 0). The rest of the node's shipped tuning is the
+   [*Optimized default posture*](../../../CONCEPTS.md#optimized-default-posture); a benchmark
+   that does not match it is not measuring the shipped node. For head-to-head benchmarks,
+   pin both sides explicitly (`-assumevalid=0` ↔ `--assume-valid-height 0`) and record
+   the posture in the artifact.
 Single-machine criterion trust (rebuild codegen drift, CLI baseline flags, allocator parity)
 is its own note: [criterion-bench-trust-rebuild-drift-baselines-allocator](criterion-bench-trust-rebuild-drift-baselines-allocator.md).
 Process hygiene for stale blockers is in

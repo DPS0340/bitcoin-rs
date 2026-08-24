@@ -151,31 +151,18 @@ All runs pinned to `taskset -c 0-31`:
     25.782138 µs/check (35.0194%), still above the 27.7291% threshold.
 
 Because $r = 46.5889\% \ge 27.7291\%$, the verdict is **OPEN**.
+
 ## Replay durability proof and storage custody
 
-Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`) proves state stability and reorg safety across all three storage backends (`fjall`, `rocksdb`, `redb`). The harness uses disposable reflink copies (`cp --reflink=always -a`), guaranteeing that original store contents remain untouched and byte-identical.
-
-### Immutable Original Store Custody
-
-Original store digests use deterministic POSIX-path file framing (`sha256(u64le(path_len)||path||u64le(file_size)||file_bytes)`):
-
-| Backend | File Count | Total Bytes | Original Store SHA-256 (Pre == Post) |
-|---|---|---|---|
-| `fjall` | 50 | 1,119,730,063 | `5ea0d8ef6f473a5809e06e6ebc9dc9cfc3a9ed8abe4d92488ca68ebce88d3409` |
-| `rocksdb` | 28 | 1,000,273,901 | `97cec9bc615d040a518f71179ddadd27e7d91effe86cd46f3cdfe502b0f336d0` |
-| `redb` | 12 | 1,317,885,356 | `ecd80f3ada801a66e26090bedfb346f5654c2a497dcc1a0da1c22aebd2d1af15` |
-
-Custody Summary: `/home/alpha/bench-g14/corpora/c150/durability-sdd/custody-summary.json`.
-
-### Durability Proof Invariants
-
-All three proof JSONs in `/home/alpha/bench-g14/corpora/c150/durability-sdd/` pass with checkpoint generation 2, two reopens, and exact invariant equality (`before == after`):
-
-1. **`proof-fjall.json`**: 1,224 B, SHA256 `7fd144699bf714c5b1d7b34b45b0a77790210710056c9f04b6e6f1a6a324bb9b`
-2. **`proof-rocksdb.json`**: 1,226 B, SHA256 `f64786a191597cb1099e3f42e08a21de8dd08a1903dee547d51f2baa4e921a78`
-3. **`proof-redb.json`**: 1,223 B, SHA256 `40a585ff8f1c146b7899f5d62a91d7ce487b9c43ac307d1a1f11e792519b917d`
-
-Each backend executes production `switch_to_branch` to the parent block and back to the original tip using durable bodies and undo records, publishes a clean checkpoint, reopens twice, and confirms zero state drift.
+The census replays rest on stores proven stable across reorg and reopen, so a
+census counter cannot be an artifact of a corrupted or drifting chainstate.
+Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`)
+covers `fjall`, `rocksdb`, and `redb`, and leaves the original stores
+byte-identical. The store digests, per-backend file counts and byte totals,
+proof-artifact sizes and SHA-256 values, the digest framing, and the custody
+summary path are in
+[`tools/checksig-census/README.md`](../../../tools/checksig-census/README.md),
+section *Durability proofs and custody*.
 
 ## Scope and limits
 

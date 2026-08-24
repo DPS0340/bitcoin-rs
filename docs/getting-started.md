@@ -3,12 +3,9 @@
 From a clone to a syncing node. Each step says what you should see, so you can
 tell it worked before moving on.
 
-Before you start: this node reorganises off a losing branch, but several
-things around that still do not work. A disconnected block's transactions are
-dropped rather than returned to the mempool, and the filter index is not
-backfilled across a gap. ZMQ `pubsequence` publishes block connect/disconnect
-events but intentionally omits mempool `A`/`R` events. Do not make it the node
-you depend on. See [README.md](README.md) for the rest of the gaps.
+Before you start: do not run this on mainnet as your only node. Reorganisation
+handling, transaction relay, and indexing have known limitations documented in
+[README.md](README.md#known-gaps).
 
 ## Prerequisites
 
@@ -122,8 +119,8 @@ curl -s --user bitcoin-rs:bitcoin-rs \
 
 The full list of implemented methods is the dispatch table in
 `crates/rpc/src/handlers.rs`. Signing methods are present but always return
--32603, "wallet has no private keys", because the wallet holds no keys by
-design.
+-32603, "wallet has no private keys; use external signer", because the wallet
+holds no keys by design.
 
 ## Verifying everything yourself
 

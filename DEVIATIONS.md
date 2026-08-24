@@ -3,9 +3,11 @@
 `PLAN.md` is the spec. This file records places where implementation reality
 forced corrections, with sources.
 
-Every entry below was verified against the crates.io registry via
-`cargo info <crate>` and `cargo info <crate>@<version>` on **2026-05-19** under
-Rust toolchain `1.85.0` (the MSRV declared by `PLAN.md`).
+The Task 0 audit corrections in section 0 were verified against the crates.io
+registry via `cargo info <crate>` and `cargo info <crate>@<version>` on
+**2026-05-19** under Rust toolchain `1.85.0` (the MSRV declared by `PLAN.md`).
+Later sections carry their own dates and toolchains; the *Resolved
+version-floor deviations* table below postdates that audit.
 
 ## 0. Workspace bootstrap (Task 0) — dependency audit corrections
 
@@ -94,7 +96,15 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 - **G3 (kernel parity)** is exercised on the default build via `kernel-parity`; default builds validate all script classes through bitcoinkernel.
 - **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
 - All other gates (G1, G2, G4, G5, G6, G8 – G15) are unaffected.
+
 ## 2. Task 3 — script interpreter v1 wraps bitcoin crate
+
+**Superseded — historical record.** The delegation and the Taproot coverage gap
+described in this section were resolved by *Current State Cutover (Tasks 16–18)*
+below, which made `bitcoinkernel` the default production consensus engine. The
+present-tense text is retained as the record of the pre-cutover state and does
+not describe current behavior. The `hand-rolled` cargo feature it anticipates is
+not present in any workspace manifest.
 
 Task 3 Step 2 calls for a hand-rolled per-opcode dispatcher. The v1 script
 crate instead exposes the planned `Interpreter` surface while delegating legacy
@@ -127,7 +137,6 @@ Multi-input taproot and tapscript spends require the `kernel` feature
 (libbitcoinkernel). Future work, behind a `hand-rolled` feature in
 `crates/script`, ships the missing BIP341/BIP342 interpreter coverage.
 
-
 ### Current State Cutover (Tasks 16–18)
 
 The pre-cutover delegation to `bitcoinconsensus` and its associated Taproot coverage gap were resolved by making `bitcoinkernel` (`libbitcoinkernel`) the default production consensus engine across consensus, node, and binary crates. The `bitcoinconsensus` feature chain and backend were removed.
@@ -135,6 +144,7 @@ The pre-cutover delegation to `bitcoinconsensus` and its associated Taproot cove
 - **Forcing Event:** Mainnet IBD twice stopped at block 938344 under the pre-cutover default (first due to missing complete prevouts, then due to unsupported Taproot script-path witness validation in the Rust/bitcoinconsensus path).
 - **Landed Posture:** Default builds link `bitcoinkernel` and require system dependencies (`cmake` and `libboost-dev`). `bitcoinkernel` validates all script classes (legacy, segwit, and Taproot key-path and script-path spends).
 - **Portable Posture:** The Rust interpreter is retained under `--no-default-features` as an explicit portable posture for differential testing without C++ dependencies, but cannot validate mainnet Taproot script-path scripts.
+
 ### v1 legacy sighash + `OP_CODESEPARATOR`
 
 `bitcoin::sighash::SighashCache::legacy_signature_hash` rejects scripts that
@@ -156,6 +166,12 @@ Task 9 acceptance test explicitly requires byte-identical filter and header
 matches against `bitcoin/src/test/data/blockfilters.json`.
 
 ## §4 — T18 node lifecycle scaffold
+
+**Superseded — historical record.** The unwired subsystems and stub tick
+handlers described here were resolved by *§7 — Integration layer* below, which
+wired the subsystem handles into the node lifecycle. The present-tense text is
+retained as the record of the T18 scaffold state and does not describe current
+behavior.
 
 The `bitcoin-rs-node` crate landed with the lifecycle skeleton (config
 layering, tracing, metrics in-process, signal-bridge, graceful drain,
