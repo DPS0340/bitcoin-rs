@@ -754,12 +754,20 @@ where
     })
 }
 
+fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
+    bitcoin_rs_index::IndexCapabilities {
+        tx_lookup: config.txindex || config.electrum_bind.is_some(),
+        electrum_history: config.electrum_bind.is_some(),
+    }
+}
+
 fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
-    if !config.txindex {
+    let enabled = tx_index_capabilities(config);
+    if enabled.is_empty() {
         return Ok(None);
     }
     if config.prune_target_mb > 0 {
-        bail!("-txindex is not compatible with -prune");
+        bail!("transaction lookup indexing is not compatible with -prune");
     }
 
     let txindex_dir = config.data_dir.join("txindex");
@@ -1085,6 +1093,7 @@ impl NodeState {
                     Arc::clone(&block_tree),
                     Some(Arc::clone(&block_body_store)),
                     open.batch_limits,
+                    tx_index_capabilities(&config),
                     wake_rx,
                 )
                 .context("spawn txindex worker")?;
@@ -1266,7 +1275,7 @@ impl NodeState {
         )?;
         // Remove the marker only after this checkpoint publishes the matching
         // UTXO set and applied tip. TxIndex is outside the authoritative
-        // disconnect transaction and recovers from its own atomic watermark.
+        // disconnect transaction and recovers from its own atomic capability watermarks.
         self.apply_handles
             .undo_store
             .disarm_disconnect()
@@ -1301,6 +1310,9 @@ impl NodeState {
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
     pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+        if !self.config.txindex {
+            return None;
+        }
         self.tx_index_query.as_ref().map(|query| {
             let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
             adapter
@@ -1312,6 +1324,7 @@ impl NodeState {
     pub(crate) fn tx_index_electrum_adapter(
         &self,
     ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
+        self.config.electrum_bind?;
         self.tx_index_query.as_ref().map(|query| {
             let adapter: Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> =
                 query.clone();
@@ -1652,6 +1665,25 @@ mod tests {
     }
 
     #[test]
+    fn electrum_only_builds_internal_lookup_without_advertising_core_txindex() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.txindex = false;
+        config.electrum_bind = Some("127.0.0.1:50001".parse()?);
+
+        let state = NodeState::open(config)?;
+
+        assert!(state.apply_handles().tx_index_runtime.is_some());
+        assert!(state.tx_index_query().is_none());
+        assert!(state.tx_index_electrum_adapter().is_some());
+        assert!(state.data_dir().join("txindex").exists());
+        Ok(())
+    }
+
+    #[test]
     fn drop_joins_txindex_worker_before_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
@@ -1685,7 +1717,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("-txindex is not compatible with -prune"),
+                .contains("transaction lookup indexing is not compatible with -prune"),
             "unexpected error: {error:#}"
         );
         Ok(())
@@ -1722,7 +1754,7 @@ mod tests {
         );
         assert_eq!(
             store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?,
-            Some(vec![1, 0, 0, 0])
+            Some(vec![2, 0, 0, 0])
         );
         Ok(())
     }
