@@ -97,7 +97,10 @@ fn sighup_stops_unit_kills_descendant_and_writes_failure_verdict()
 import pathlib
 import sys
 import time
-pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding="ascii")
+pid_path = pathlib.Path(sys.argv[1])
+pending_pid_path = pid_path.with_suffix(".tmp")
+pending_pid_path.write_text(str(os.getpid()), encoding="ascii")
+pending_pid_path.replace(pid_path)
 pathlib.Path(sys.argv[2]).mkdir()
 time.sleep(30)
 "#,
