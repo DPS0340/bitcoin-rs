@@ -17,7 +17,7 @@ connection, bounded by `ServerConfig::max_sessions`, with optional TLS — and
 `run_with_shutdown` stops it on an atomic flag.
 
 ## Features
-- `rocksdb`: enables the RocksDB backend in `bitcoin-rs-storage`
+- `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
 - `fjall`: enables the fjall backend in `bitcoin-rs-storage`
 - `redb`: enables the redb backend in `bitcoin-rs-storage`
 - `mdbx`: enables the MDBX backend in `bitcoin-rs-storage`

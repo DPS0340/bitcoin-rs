@@ -19,7 +19,7 @@ parent, height, and header hash with a `NodeStatus` (header-valid, active, or
 off-best-chain), and every failure surfaces as a structured `ChainError` variant.
 
 ## Features
-- `rocksdb`: enables the RocksDB backend in `bitcoin-rs-storage`
+- `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`
 - `fjall`: enables the fjall backend in `bitcoin-rs-storage`
 - `redb`: enables the redb backend in `bitcoin-rs-storage`
 
