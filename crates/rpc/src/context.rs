@@ -27,8 +27,20 @@ pub struct BlockRecord {
     pub block_hex: String,
     /// Serialized block byte length.
     pub body_size: usize,
-    /// Serialized block header bytes as lowercase hex.
-    pub header_hex: String,
+    /// Serialized block header bytes, when the record carries a header.
+    ///
+    /// **The log never carries one.** A record is held for every applied block
+    /// for the life of the process, and the `BlockTree` already holds that
+    /// block's header — so storing it here stored it twice. Every constructor
+    /// leaves this `None`; [`Context::header_record`] is the only thing that
+    /// fills it, from the tree node it resolved, on the way out to a caller.
+    ///
+    /// Boxed rather than inline for the same reason. An `Option<[u8; 80]>`
+    /// costs its full 80 bytes in every record even when it is `None`, so
+    /// leaving the log's records empty would have saved nothing. Boxing makes
+    /// an absent header cost 8 bytes and allocates only where one is actually
+    /// produced, which is once per RPC answer rather than once per block.
+    pub header: Option<Box<[u8; SERIALIZED_BLOCK_HEADER_LEN]>>,
     /// Transaction count in the block.
     pub tx_count: usize,
     /// Block header timestamp (UNIX seconds).
@@ -151,14 +163,15 @@ impl BlockRecord {
     pub fn from_block_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
         let block_hash = block.block_hash();
         let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let header_hex = header_hex_from_block_bytes(block, block_bytes);
         let block_hex = block_bytes.to_lower_hex_string();
         Self {
             hash,
             height,
             block_hex,
             body_size: block_bytes.len(),
-            header_hex,
+            // Not stored: the block tree holds this block's header, and
+            // `Context::header_record` supplies it on the way out.
+            header: None,
             tx_count: block.txdata.len(),
             time: block.header.time,
         }
@@ -176,13 +189,13 @@ impl BlockRecord {
     pub fn from_block_metadata_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
         let block_hash = block.block_hash();
         let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let header_hex = header_hex_from_block_bytes(block, block_bytes);
         Self {
             hash,
             height,
             block_hex: String::new(),
             body_size: block_bytes.len(),
-            header_hex,
+            // See `from_block_bytes`.
+            header: None,
             tx_count: block.txdata.len(),
             time: block.header.time,
         }
@@ -196,18 +209,33 @@ impl BlockRecord {
             height,
             block_hex: String::new(),
             body_size: 0,
-            header_hex: String::new(),
+            header: None,
             tx_count: 0,
             time: 0,
         }
     }
-}
 
-fn header_hex_from_block_bytes(block: &Block, block_bytes: &[u8]) -> String {
-    block_bytes.get(..SERIALIZED_BLOCK_HEADER_LEN).map_or_else(
-        || serialize(&block.header).to_lower_hex_string(),
-        DisplayHex::to_lower_hex_string,
-    )
+    /// The serialized block header, when the record carries one.
+    ///
+    /// A record read straight out of the log never does. One resolved through
+    /// [`Context::record_for_hash`] does, because that fills it from the block
+    /// tree.
+    #[must_use]
+    pub fn header_bytes(&self) -> Option<&[u8; SERIALIZED_BLOCK_HEADER_LEN]> {
+        self.header.as_deref()
+    }
+
+    /// The serialized block header as lowercase hex, empty when absent.
+    ///
+    /// Encoded on demand. The record is stored for every block for the life of
+    /// the process; this is read by one RPC call, and the other two readers want
+    /// the bytes back anyway.
+    #[must_use]
+    pub fn header_hex(&self) -> String {
+        self.header
+            .as_ref()
+            .map_or_else(String::new, |bytes| bytes.to_lower_hex_string())
+    }
 }
 
 /// Network counters and peer metadata exposed by network RPCs.
@@ -383,6 +411,16 @@ pub trait TxIndexQuery: Send + Sync {
     fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError>;
     /// Resolves a confirmed prevout value, returning `None` only after complete absence is proven.
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError>;
+    /// Resolves the height of the block confirming `txid`, without materializing the transaction.
+    ///
+    /// Callers that only need to locate the block — `gettxoutproof` is the one —
+    /// would otherwise deserialize a transaction and throw it away. The default
+    /// answers `None`, which every caller must already handle as "the index
+    /// cannot say", so an implementor that does not track heights keeps working.
+    fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+        let _ = txid;
+        Ok(None)
+    }
     /// Returns the transaction index's actual durable progress.
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
@@ -745,7 +783,10 @@ impl Context {
             height: node.height,
             block_hex: String::new(),
             body_size: 0,
-            header_hex: serialize(&node.header).to_lower_hex_string(),
+            // The one place a header is produced. Every constructor leaves the
+            // field empty, so the tree node reached here is the single source of
+            // truth for what a block's header is.
+            header: serialize(&node.header).try_into().ok().map(Box::new),
             tx_count: 0,
             time: node.header.time,
         })
@@ -770,7 +811,17 @@ impl Context {
             // over a height-ordered log rather than a walk of every record on
             // the chain. `getblock` and `getblockheader` both land here.
             if let Some(cached) = record_at_height_hash(&self.blocks.read(), record.height, hash) {
-                return Some(cached.clone());
+                // The cached record supplies the payload facts — body hex, size,
+                // transaction count — and the tree supplies the header, because
+                // the log does not store one. Returning the cached record as it
+                // stands would answer with no header at all.
+                //
+                // Costs no extra lock: `header_record` has already taken and
+                // released the tree guard, and the header it produced outlives
+                // it.
+                let mut cached = cached.clone();
+                cached.header = record.header.take();
+                return Some(cached);
             }
             if let Some(metadata) = self
                 .block_body_source
@@ -1214,7 +1265,7 @@ mod tests {
         assert_eq!(from_bytes.height, from_block.height);
         assert_eq!(from_bytes.block_hex, from_block.block_hex);
         assert_eq!(from_bytes.body_size, from_block.body_size);
-        assert_eq!(from_bytes.header_hex, from_block.header_hex);
+        assert_eq!(from_bytes.header, from_block.header);
         assert_eq!(from_bytes.tx_count, from_block.tx_count);
         assert_eq!(from_bytes.time, from_block.time);
     }
@@ -1257,6 +1308,159 @@ mod tests {
         );
     }
 
+    /// Pins the cost this change exists to remove.
+    ///
+    /// One `BlockRecord` is held per applied block for the life of the process
+    /// and nothing removes one, so the record's own footprint *is* the cost.
+    ///
+    /// The field was 104 bytes inline plus a 160-byte heap `String` of hex —
+    /// 264 bytes and an allocation per block. Storing the raw header inline took
+    /// that to 168 with no allocation. Not storing it at all takes it to **88**:
+    /// a further **80 bytes per block**, about **73.5 MiB** at a mainnet-sized
+    /// chain, on top of the 88 MiB the inline change saved.
+    ///
+    /// The boxing is what buys those 80 bytes and is easy to undo by accident.
+    /// An `Option<[u8; 80]>` costs its full width in every record even when it
+    /// is `None`, so emptying the log's records would have saved nothing at all.
+    /// This test is here so that reverting the box fails loudly.
+    #[test]
+    fn a_record_costs_88_bytes_and_carries_no_header() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+
+        assert_eq!(
+            core::mem::size_of::<BlockRecord>(),
+            88,
+            "BlockRecord footprint changed; re-measure the per-block saving"
+        );
+        for record in [
+            BlockRecord::from_block(0, &block),
+            BlockRecord::from_block_metadata(0, &block),
+            BlockRecord::synthetic(0, Hash256::default()),
+        ] {
+            assert!(
+                record.header_bytes().is_none(),
+                "a constructed record must not carry a header; the tree holds it"
+            );
+        }
+    }
+
+    /// The hex a caller sees must be byte-identical to what the stored `String`
+    /// used to hold; only where it is produced changed.
+    ///
+    /// Read through a resolved record now, because that is where a header comes
+    /// from: the tree, via `record_for_hash`. A record built straight from a
+    /// block has none.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let ctx = Arc::new(Context::new());
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
+        }
+        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let Some(record) = ctx.record_for_hash(hash) else {
+            panic!("the tree knows this hash");
+        };
+
+        assert_eq!(
+            record.header_hex(),
+            serialize(&block.header).to_lower_hex_string()
+        );
+        assert_eq!(record.header_hex().len(), SERIALIZED_BLOCK_HEADER_LEN * 2);
+    }
+
+    /// The tree's header must reach a caller even when the log has the block.
+    ///
+    /// `record_for_hash` returns the cached record for its payload facts — body
+    /// hex, size, transaction count — and that record has no header. Returning
+    /// it unchanged would answer with none, which is what an earlier revision of
+    /// this change did until this test caught it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let ctx = Arc::new(Context::new());
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
+        }
+        let cached = BlockRecord::from_block(0, &block);
+        let hash = cached.hash;
+        let expected_body = cached.block_hex.clone();
+        assert!(cached.header_bytes().is_none(), "the log stores no header");
+        ctx.add_block(cached);
+
+        let Some(record) = ctx.record_for_hash(hash) else {
+            panic!("the tree knows this hash");
+        };
+        assert_eq!(
+            record.header_bytes().map(<[u8; 80]>::as_slice),
+            Some(serialize(&block.header).as_slice()),
+            "the resolved record must carry the tree's header"
+        );
+        assert_eq!(
+            record.block_hex, expected_body,
+            "the cached payload must survive the header splice"
+        );
+    }
+
+    /// A record with no header must render as the empty string, the way an empty
+    /// `String` field did, so callers that inspected it for emptiness still see
+    /// what they saw.
+    #[test]
+    fn synthetic_record_has_no_header_and_renders_empty_hex() {
+        let record = BlockRecord::synthetic(7, Hash256::from_le_bytes(&[3_u8; 32]));
+
+        assert!(record.header_bytes().is_none());
+        assert!(record.header_hex().is_empty());
+    }
+
+    /// Covers the record the block tree derives, which had no test at all.
+    ///
+    /// `header_record` builds its header with `try_into().ok()`, so a length that
+    /// does not fit yields `None` and the header vanishes silently — where the
+    /// old `String` field would at least have carried something. A mutation that
+    /// dropped the header from this path failed no test before this one existed.
+    #[test]
+    fn tree_derived_record_carries_the_header() {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
+
+        let ctx = Context::new();
+        let header = bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 7,
+        };
+        let hash = {
+            let mut tree = ctx.block_tree.write();
+            let id = tree
+                .insert_node(None, header, NodeStatus::Active)
+                .expect("genesis inserts");
+            tree.node(id).expect("inserted node").hash
+        };
+
+        // Nothing was pushed into `blocks`, so the record can only come from the
+        // tree.
+        let record = ctx.record_for_hash(hash).expect("tree resolves the hash");
+
+        assert_eq!(
+            record.header_bytes().map(|bytes| bytes.as_slice()),
+            Some(serialize(&header).as_slice()),
+            "the tree-derived record must carry the header the tree holds"
+        );
+        assert_eq!(
+            record.header_hex(),
+            serialize(&header).to_lower_hex_string()
+        );
+    }
     #[test]
     fn block_by_height_returns_record_after_add_block() {
         use bitcoin_rs_primitives::Hash256;

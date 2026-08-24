@@ -52,3 +52,8 @@ criterion.workspace = true
 [[bench]]
 name = "blocklookup"
 harness = false
+
+[[bench]]
+name = "txoutproof"
+harness = false
+required-features = ["rocksdb"]
