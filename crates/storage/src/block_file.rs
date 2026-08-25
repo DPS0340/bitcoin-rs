@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
@@ -108,6 +108,11 @@ pub struct FlatFileBlockStore {
     /// undo that. `disk_usage` checks the running figure against a real walk
     /// under `debug_assert`.
     usage: AtomicU64,
+    /// Set only when a failed append could not restore the old file length.
+    ///
+    /// Normal reads remain lock-free. Recovery reads take `writer` once and
+    /// replace `usage` with a directory measurement.
+    usage_dirty: AtomicBool,
 }
 
 struct WriterState {
@@ -115,6 +120,7 @@ struct WriterState {
     file_no: u32,
     append_offset: u64,
     directory_dirty: bool,
+    rollback_offset: Option<u64>,
 }
 /// Reusable reader for framed block bodies.
 pub struct FlatFileBlockReader {
@@ -171,6 +177,7 @@ impl FlatFileBlockStore {
         let len = body_len(body)?;
         let record_len = record_len(len)?;
         let mut writer = self.writer.lock();
+        self.recover_failed_append(&mut writer)?;
 
         if writer.append_offset > 0
             && writer
@@ -208,14 +215,37 @@ impl FlatFileBlockStore {
         header[12..].copy_from_slice(&hash);
 
         writer.file.seek(SeekFrom::Start(position.offset))?;
-        writer.file.write_all(&header)?;
-        writer.file.write_all(body)?;
-        writer.file.flush()?;
-        writer.append_offset = writer
-            .append_offset
+        let next_offset = position
+            .offset
             .checked_add(record_len)
             .ok_or(StorageError::InvalidOperation("block file offset overflow"))?;
-        // After the write, so a failed append does not inflate the figure.
+        let append_result = writer
+            .file
+            .write_all(&header)
+            .and_then(|()| writer.file.write_all(body))
+            .and_then(|()| writer.file.flush());
+        if let Err(append_error) = append_result {
+            writer.rollback_offset = Some(position.offset);
+            self.usage_dirty.store(true, Ordering::Release);
+            if let Err(rollback_error) = writer
+                .file
+                .set_len(position.offset)
+                .and_then(|()| writer.file.seek(SeekFrom::Start(position.offset)).map(drop))
+            {
+                return Err(io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "failed to roll back block file after append error ({append_error}): \
+                         {rollback_error}"
+                    ),
+                )
+                .into());
+            }
+            writer.rollback_offset = None;
+            self.usage_dirty.store(false, Ordering::Release);
+            return Err(append_error.into());
+        }
+        writer.append_offset = next_offset;
         let _ = self.usage.fetch_add(record_len, Ordering::Relaxed);
         Ok(position)
     }
@@ -233,18 +263,39 @@ impl FlatFileBlockStore {
     /// files in the same number and this does not.
     #[must_use]
     pub fn disk_usage(&self) -> u64 {
-        debug_assert_eq!(
-            self.usage.load(Ordering::Relaxed),
-            measure_blocks_dir(&self.blocks_dir)
-                .unwrap_or_else(|_| self.usage.load(Ordering::Relaxed)),
-            "running block-file usage drifted from the files on disk"
-        );
-        self.usage.load(Ordering::Relaxed)
+        if self.usage_dirty.load(Ordering::Acquire) {
+            let _writer = self.writer.lock();
+            if self.usage_dirty.load(Ordering::Relaxed) {
+                if let Ok(usage) = measure_blocks_dir(&self.blocks_dir) {
+                    self.usage.store(usage, Ordering::Relaxed);
+                    self.usage_dirty.store(false, Ordering::Release);
+                    return usage;
+                }
+                return self.usage.load(Ordering::Relaxed);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let _writer = self.writer.lock();
+            let usage = self.usage.load(Ordering::Relaxed);
+            debug_assert_eq!(
+                usage,
+                measure_blocks_dir(&self.blocks_dir).unwrap_or(usage),
+                "running block-file usage drifted from the files on disk"
+            );
+            usage
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.usage.load(Ordering::Relaxed)
+        }
     }
 
     /// Flushes the current append file to stable storage.
     pub fn sync(&self) -> Result<(), StorageError> {
         let mut writer = self.writer.lock();
+        self.recover_failed_append(&mut writer)?;
         writer.file.flush()?;
         writer.file.sync_data()?;
         if writer.directory_dirty {
@@ -355,6 +406,21 @@ impl FlatFileBlockStore {
         }
     }
 
+    fn recover_failed_append(&self, writer: &mut WriterState) -> Result<(), StorageError> {
+        let Some(offset) = writer.rollback_offset else {
+            return Ok(());
+        };
+        self.usage_dirty.store(true, Ordering::Release);
+        writer.file.set_len(offset)?;
+        writer.file.seek(SeekFrom::Start(offset))?;
+        let usage = measure_blocks_dir(&self.blocks_dir)?;
+        writer.append_offset = offset;
+        writer.rollback_offset = None;
+        self.usage.store(usage, Ordering::Relaxed);
+        self.usage_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
     fn open_with_max_file_bytes(
         data_dir: &Path,
         max_file_bytes: u64,
@@ -406,8 +472,10 @@ impl FlatFileBlockStore {
                 file_no,
                 append_offset: recovered_offset,
                 directory_dirty: false,
+                rollback_offset: None,
             }),
             usage,
+            usage_dirty: AtomicBool::new(false),
         })
     }
 }
@@ -798,6 +866,57 @@ mod tests {
             after_prune < after_rollover,
             "pruning a file must reduce the reported size, which is the whole \
              reason this is not a sum of block lengths"
+        );
+        Ok(())
+    }
+
+    /// A failed rollback must not leave a later append behind a torn frame.
+    #[test]
+    fn retry_recovers_an_append_whose_rollback_failed() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let read_only = std::fs::File::open(store.file_path(0))?;
+        let writable = {
+            let mut writer = store.writer.lock();
+            std::mem::replace(&mut writer.file, read_only)
+        };
+
+        let error = match store.append(1, hash(1), b"fails") {
+            Ok(position) => panic!(
+                "the read-only file accepted an append at {}:{}",
+                position.file_no, position.offset
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("failed to roll back block file"),
+            "the rollback failure must be reported: {error}"
+        );
+        assert_eq!(
+            store.disk_usage(),
+            0,
+            "a dirty counter must be reconciled against the file"
+        );
+
+        {
+            let mut writer = store.writer.lock();
+            assert_eq!(
+                writer.rollback_offset,
+                Some(0),
+                "the retry must know where the valid prefix ends"
+            );
+            writer.file = writable;
+        }
+
+        let position = store.append(2, hash(2), b"retry")?;
+        assert_eq!(position.offset, 0, "the retry must replace the torn frame");
+        assert_eq!(
+            store.load(position, 2, hash(2))?.as_deref(),
+            Some(b"retry".as_slice())
+        );
+        assert_eq!(
+            store.disk_usage(),
+            super::measure_blocks_dir(&store.blocks_dir)?
         );
         Ok(())
     }
