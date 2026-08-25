@@ -414,15 +414,23 @@ const BLOCK_MIN_TX_FEE_BTC_PER_KVB: f64 = 0.000_000_01;
 pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
 
+    // One tip, one tree view. Every chain-dependent field below -- the height,
+    // the current difficulty, the hash-rate estimate, the next block's target
+    // -- is read from the same `TipSnapshot` under the same guard. Reloading
+    // the applied tip per field lets a connect land between two of them and
+    // answer with one block's bits beside another block's height; across a
+    // retarget boundary that pairs a difficulty with the height at which it
+    // stopped applying.
     let tip = ctx.applied_tip.load_full();
-    let tip_bits = {
+    let chain = tip.as_ref().map(|tip| {
         let tree = ctx.block_tree.read();
-        tip.as_ref()
-            .and_then(|tip| tree.node(tip.tip_id).ok().map(|node| node.header.bits))
-    };
+        ChainFields::read(ctx, &tree, tip)
+    });
+
+    let tip_bits = chain.as_ref().and_then(|chain| chain.bits);
 
     let mut response = sonic_rs::Object::new();
-    let _ = response.insert(&"blocks", ctx.applied_height());
+    let _ = response.insert(&"blocks", tip.as_ref().map_or(0, |tip| tip.height));
 
     // Core reports the weight and transaction count of the block it last
     // assembled, and omits both when it has never assembled one. It does not
@@ -445,37 +453,29 @@ pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     if let Some(bits) = tip_bits {
         let _ = response.insert(&"target", target_hex(bits).as_str());
     }
-    let _ = response.insert(&"networkhashps", json!(estimate_network_hashps(ctx)));
+    let _ = response.insert(
+        &"networkhashps",
+        json!(chain.as_ref().map_or(0.0, |chain| chain.network_hashps)),
+    );
     let _ = response.insert(&"pooledtx", ctx.mempool.read().stats().txs);
     let _ = response.insert(&"blockmintxfee", json!(BLOCK_MIN_TX_FEE_BTC_PER_KVB));
     let _ = response.insert(&"chain", chain_name(ctx.chain_network));
 
     // The next block's difficulty, which is the number a miner is actually
     // about to work against. Asked of the same function header validation asks,
-    // so this can never advertise a target the node would then reject.
-    if let Some(tip) = tip.as_ref() {
-        let min_time = median_time_past(ctx).map_or(0, |mtp| mtp.saturating_add(1));
-        let candidate_time = u32::try_from(now_seconds())
-            .unwrap_or(u32::MAX)
-            .max(min_time);
-        let next_bits = {
-            let tree = ctx.block_tree.read();
-            bitcoin_rs_chain::expected_next_bits(
-                ctx.chain_network,
-                &tree,
-                tip.tip_id,
-                candidate_time,
-            )
-            .ok()
-        };
-        if let Some(bits) = next_bits {
-            let mut next = sonic_rs::Object::new();
-            let _ = next.insert(&"height", tip.height.saturating_add(1));
-            let _ = next.insert(&"bits", format!("{:08x}", bits.to_consensus()).as_str());
-            let _ = next.insert(&"difficulty", json!(ctx.difficulty_for_bits(bits)));
-            let _ = next.insert(&"target", target_hex(bits).as_str());
-            let _ = response.insert(&"next", Value::from(next));
-        }
+    // so this can never advertise a target the node would then reject -- and
+    // read from the same tree view as `bits` above, so `next.height` cannot
+    // belong to a different block than the difficulty it is paired with.
+    if let (Some(tip), Some(bits)) = (
+        tip.as_ref(),
+        chain.as_ref().and_then(|chain| chain.next_bits),
+    ) {
+        let mut next = sonic_rs::Object::new();
+        let _ = next.insert(&"height", tip.height.saturating_add(1));
+        let _ = next.insert(&"bits", format!("{:08x}", bits.to_consensus()).as_str());
+        let _ = next.insert(&"difficulty", json!(ctx.difficulty_for_bits(bits)));
+        let _ = next.insert(&"target", target_hex(bits).as_str());
+        let _ = response.insert(&"next", Value::from(next));
     }
 
     // Core reports warnings as an array. The string form is its deprecated
@@ -487,9 +487,23 @@ pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 /// The weight and transaction count of an assembled template.
 ///
 /// The count excludes the coinbase, as Core's does: `m_last_block_num_txs` is
-/// the number of transactions the assembler selected. The weight includes the
-/// reserve held back for the header, the transaction count and the coinbase,
-/// because that is the weight the assembled block will have.
+/// the number of transactions the assembler selected.
+///
+/// The weight is the selected weight **plus the reserve**, which is what Core
+/// reports and is deliberately not the finished block's serialized weight. In
+/// `node/miner.cpp` `nBlockWeight` starts at `block_reserved_weight` (8000 by
+/// default, `DEFAULT_BLOCK_RESERVED_WEIGHT` in `policy/policy.h`), each
+/// selected transaction adds its own weight, and `m_last_block_weight` is
+/// snapshotted *before* the coinbase is built -- so the coinbase's real weight
+/// never enters it. Core's own RPC help says so in as many words: "The block
+/// weight (including reserved weight for block header, txs count and coinbase
+/// tx) of the last assembled block".
+///
+/// So this is an upper bound on what the block will serialize to, not a
+/// measurement of it, and reporting the measurement instead would make a miner
+/// comparing the two nodes see a number Core never produces. Anyone tempted to
+/// "correct" it should read `getmininginfo_reports_the_weight_core_reports`
+/// first.
 fn assembled_block_totals(template: &BlockTemplate) -> (u64, u64) {
     let selected: u64 = template
         .transactions
@@ -513,12 +527,62 @@ const fn chain_name(network: bitcoin_rs_primitives::Network) -> &'static str {
     }
 }
 
-fn estimate_network_hashps(ctx: &Context) -> f64 {
-    let tree = ctx.block_tree.read();
-    let Some(tip_snapshot) = ctx.applied_tip.load_full() else {
-        return 0.0;
-    };
-    let tip_id = tip_snapshot.tip_id;
+/// Every `getmininginfo` field that depends on the chain, read at one tip.
+///
+/// Held together in one struct so the handler cannot read half of them, let a
+/// connect land, and read the other half: the fields are produced by a single
+/// [`ChainFields::read`] under a single tree guard, or not at all.
+struct ChainFields {
+    /// The tip's own compact target. `None` if the tip is not in the tree.
+    bits: Option<bitcoin::CompactTarget>,
+    /// The compact target the next block must satisfy.
+    next_bits: Option<bitcoin::CompactTarget>,
+    /// Network hash-rate estimate over the trailing window.
+    network_hashps: f64,
+}
+
+impl ChainFields {
+    /// Reads every chain-dependent field from `tip` under `tree`.
+    ///
+    /// Takes the tree guard by reference rather than acquiring it, so the
+    /// caller decides the scope and there is exactly one for the whole answer.
+    fn read(
+        ctx: &Context,
+        tree: &bitcoin_rs_chain::BlockTree,
+        tip: &bitcoin_rs_chain::TipSnapshot,
+    ) -> Self {
+        let bits = tree.node(tip.tip_id).ok().map(|node| node.header.bits);
+        let min_time = tree
+            .median_time_past_at(tip.tip_id, MEDIAN_TIME_SPAN)
+            .map_or(0, |mtp| mtp.saturating_add(1));
+        let candidate_time = u32::try_from(now_seconds())
+            .unwrap_or(u32::MAX)
+            .max(min_time);
+        let next_bits = bitcoin_rs_chain::expected_next_bits(
+            ctx.chain_network,
+            tree,
+            tip.tip_id,
+            candidate_time,
+        )
+        .ok();
+        Self {
+            bits,
+            next_bits,
+            network_hashps: estimate_network_hashps(tree, tip),
+        }
+    }
+}
+
+/// Network hash rate over the trailing window ending at `tip`.
+///
+/// Takes the tip and the tree view its caller already holds. Loading the
+/// applied tip here would let the estimate describe a different block than the
+/// difficulty reported beside it.
+fn estimate_network_hashps(
+    tree: &bitcoin_rs_chain::BlockTree,
+    tip: &bitcoin_rs_chain::TipSnapshot,
+) -> f64 {
+    let tip_id = tip.tip_id;
     let Ok(tip_node) = tree.node(tip_id) else {
         return 0.0;
     };
@@ -855,7 +919,7 @@ mod getblocktemplate_tests {
     use bitcoin_rs_primitives::{Hash256, Network};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
-    use super::{active_rules, getblocktemplate};
+    use super::{active_rules, getblocktemplate, getmininginfo};
     use crate::context::Context;
     use crate::error::RpcError;
 
@@ -1053,6 +1117,167 @@ mod getblocktemplate_tests {
         );
         // Nothing is signalling, so claiming a version bit would be an invention.
         assert_eq!(value.get("vbrequired").as_u64(), Some(0));
+    }
+
+    /// `getmininginfo` describes one tip, even while the chain is moving.
+    ///
+    /// The handler captured a tip and then reloaded applied state for the
+    /// height, for the hash-rate estimate and for the median time behind the
+    /// next difficulty. A connect landing between two of those reads pairs one
+    /// block's height with another block's difficulty — and at a retarget
+    /// boundary that is a difficulty beside the height at which it stopped
+    /// applying.
+    ///
+    /// Two exact assertions, both about pairs of fields that come from the same
+    /// block or from nothing:
+    ///
+    /// - `next.height` must be one past `blocks`.
+    /// - `networkhashps` is zero exactly when the tip is genesis, because the
+    ///   window has no second block to span. So `blocks == 0` and a non-zero
+    ///   hash rate is a torn read, and so is `blocks > 0` with a zero one.
+    ///
+    /// The endpoints are checked before the race so a fixture that stopped
+    /// supporting the second invariant would fail loudly rather than pass
+    /// vacuously.
+    #[test]
+    fn getmininginfo_pairs_every_field_with_the_tip_it_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctx = context_with_chain(Network::Regtest, now_seconds());
+        let tips = {
+            let tree = ctx.block_tree.read();
+            (0..=10_u32)
+                .filter_map(|height| {
+                    let node = tree.active_node_at_height(height)?;
+                    let tip_id = tree.lookup(node.hash)?;
+                    Some(bitcoin_rs_chain::TipSnapshot {
+                        tip_id,
+                        height,
+                        chainwork: node.chainwork,
+                        hash: node.hash,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tips.len(), 11, "the fixture builds eleven blocks");
+
+        // The endpoints, before anything races: the invariant the loop leans on
+        // has to actually discriminate, or the loop proves nothing.
+        for (index, expect_hashps) in [(0_usize, false), (10, true)] {
+            let Some(tip) = tips.get(index) else {
+                panic!("the fixture must have a block at index {index}");
+            };
+            ctx.set_applied_tip(tip.clone());
+            let info = getmininginfo(&ctx, &json!([]))
+                .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+            let hashps = info
+                .get("networkhashps")
+                .and_then(sonic_rs::JsonValueTrait::as_f64)
+                .unwrap_or(-1.0);
+            assert_eq!(
+                hashps > 0.0,
+                expect_hashps,
+                "at height {index} the hash rate must{} be positive: {info:?}",
+                if expect_hashps { "" } else { " not" }
+            );
+        }
+
+        let rounds = 400;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mover = {
+            let ctx = Arc::clone(&ctx);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut index = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(tip) = tips.get(index % tips.len()) else {
+                        break;
+                    };
+                    ctx.set_applied_tip(tip.clone());
+                    index = index.wrapping_add(1);
+                }
+            })
+        };
+
+        for _round in 0..rounds {
+            let info = getmininginfo(&ctx, &json!([]))
+                .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+            let Some(blocks) = info
+                .get("blocks")
+                .and_then(sonic_rs::JsonValueTrait::as_u64)
+            else {
+                panic!("blocks missing: {info:?}");
+            };
+            let Some(next_height) = info
+                .get("next")
+                .and_then(|next| next.get("height"))
+                .and_then(sonic_rs::JsonValueTrait::as_u64)
+            else {
+                panic!("next.height missing: {info:?}");
+            };
+            assert_eq!(
+                next_height,
+                blocks.saturating_add(1),
+                "the next block must be the one after the height reported beside it"
+            );
+            let Some(hashps) = info
+                .get("networkhashps")
+                .and_then(sonic_rs::JsonValueTrait::as_f64)
+            else {
+                panic!("networkhashps missing: {info:?}");
+            };
+            assert_eq!(
+                hashps > 0.0,
+                blocks > 0,
+                "the hash rate must describe the same tip the height does"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _joined = mover.join();
+    }
+
+    /// `currentblockweight` is the number Core reports, reserve included.
+    ///
+    /// Core starts `nBlockWeight` at `block_reserved_weight` — 8000 by default
+    /// — adds each selected transaction, and snapshots `m_last_block_weight`
+    /// *before* it builds the coinbase, so the coinbase's real weight never
+    /// enters the figure. Its RPC help says as much: "The block weight
+    /// (including reserved weight for block header, txs count and coinbase tx)
+    /// of the last assembled block".
+    ///
+    /// This is therefore an upper bound and not a measurement, on purpose.
+    /// Reporting the finished block's serialized weight instead would be a
+    /// smaller number than Core ever prints for the same template, and a miner
+    /// comparing the two would read the difference as a bug in one of them.
+    /// The test exists so that swap fails rather than looking like a fix.
+    #[test]
+    fn getmininginfo_reports_the_weight_core_reports() {
+        let ctx = context_with_chain(Network::Regtest, now_seconds());
+        let template = getblocktemplate(&ctx, &json!([{"rules": ["segwit"]}]))
+            .unwrap_or_else(|err| panic!("getblocktemplate failed: {err}"));
+        assert_eq!(
+            template
+                .get("transactions")
+                .and_then(|txs| txs.as_array().map(sonic_rs::Array::len)),
+            Some(0),
+            "the fixture mempool is empty, so nothing is selected"
+        );
+
+        let info = getmininginfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getmininginfo failed: {err}"));
+        assert_eq!(
+            info.get("currentblockweight")
+                .and_then(sonic_rs::JsonValueTrait::as_u64),
+            Some(u64::from(bitcoin_rs_mining::DEFAULT_BLOCK_RESERVED_WEIGHT)),
+            "an empty template weighs exactly the reserve, as Core reports it"
+        );
+        assert_eq!(
+            info.get("currentblocktx")
+                .and_then(sonic_rs::JsonValueTrait::as_u64),
+            Some(0),
+            "the count excludes the coinbase, as Core's `m_last_block_num_txs` does"
+        );
     }
 
     /// A template describes one tip, even while the chain is moving.
