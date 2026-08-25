@@ -11,6 +11,9 @@
     clippy::unnecessary_semicolon
 )]
 
+mod model;
+mod projection;
+
 use core::ops::Bound;
 use core::str::FromStr as _;
 
@@ -18,35 +21,37 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash as _, sha256d};
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
+#[cfg(test)]
 use bitcoin_rs_primitives::Hash256;
-use serde_json::{Value, json};
+use serde_json::json;
 use sonic_rs::{JsonValueTrait as _, json as sonic_json};
 
 use crate::context::{Context, ScriptHistoryRecord, ScriptIndexRecord, TxQueryError};
 use crate::handlers::Handler;
 use crate::rest::Response;
 
+use self::model::{
+    AddressTransactionSummary, BlockStatus, MempoolSummary, MerkleProof, Outspend,
+    RecentTransaction, ScriptSummary, TransactionValue,
+};
+use self::projection::{Confirmation, Projection};
+
 const CHAIN_PAGE: usize = 25;
 const MEMPOOL_PAGE: usize = 50;
 
-#[derive(Clone, Copy)]
-struct Status {
-    height: u32,
-    hash: Hash256,
-    time: u32,
-}
-
 /// Routes a read-only Esplora request from the node HTTP listener.
 #[must_use]
-pub fn route(handler: &Handler, path: &str) -> Response {
+pub fn route(handler: &Handler, path: &str, query: &str) -> Response {
     let ctx = handler.context();
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     match parts.as_slice() {
         ["blocks", "tip", "height"] => text(ctx.applied_height().to_string()),
         ["blocks", "tip", "hash"] => text(ctx.applied_hash().to_string_be()),
+        ["internal", "mempool", "txs"] => internal_mempool_txs(&ctx, None, query),
+        ["internal", "mempool", "txs", last] => internal_mempool_txs(&ctx, Some(last), query),
+        ["internal", "block", hash, "txs"] => internal_block_txs(&ctx, hash),
         ["tx", id, "hex"] => tx_hex(&ctx, id),
         ["tx", id, "raw"] => tx_raw(&ctx, id),
         ["tx", id, "status"] => tx_status(&ctx, id),
@@ -66,11 +71,13 @@ pub fn route(handler: &Handler, path: &str) -> Response {
         ["block", hash, "txids"] => block_txids(&ctx, hash),
         ["block", hash, "txid", index] => block_txid(&ctx, hash, index),
         ["block", hash] => block(&ctx, hash),
-        ["block-height", height] => height
-            .parse::<u32>()
-            .ok()
-            .and_then(|h| ctx.block_hash_at_height(h))
-            .map_or_else(not_found, |h| text(h.to_string_be())),
+        ["block-height", height] => height.parse::<u32>().map_or_else(
+            |_| bad("height must be an unsigned integer"),
+            |height| {
+                ctx.block_hash_at_height(height)
+                    .map_or_else(not_found, |hash| text(hash.to_string_be()))
+            },
+        ),
         ["blocks"] => blocks(&ctx, None),
         ["blocks", height] => height.parse::<u32>().map_or_else(
             |_| bad("start height must be an unsigned integer"),
@@ -101,6 +108,12 @@ pub fn route(handler: &Handler, path: &str) -> Response {
         }
         ["address", address, "txs"] => {
             address_hash(&ctx, address).map_or_else(|r| r, |h| history(&ctx, h, None, true))
+        }
+        ["scripthash", hash, "txs", "summary"] => {
+            parse_script(hash).map_or_else(|r| r, |h| address_transaction_summary(&ctx, h))
+        }
+        ["address", address, "txs", "summary"] => {
+            address_hash(&ctx, address).map_or_else(|r| r, |h| address_transaction_summary(&ctx, h))
         }
         ["scripthash", hash, "txs", "mempool"] => {
             parse_script(hash).map_or_else(|r| r, |h| history(&ctx, h, Some(""), true))
@@ -143,43 +156,49 @@ pub fn route_post(handler: &Handler, path: &str, body: &[u8]) -> Option<Response
                 },
             )
         }
-        "/txs/package" => Some(broadcast_package(handler, body)),
+        "/internal/txs" => Some(internal_transactions(
+            handler.context().as_ref(),
+            body,
+            false,
+        )),
+        "/internal/mempool/txs" => Some(internal_transactions(
+            handler.context().as_ref(),
+            body,
+            true,
+        )),
+        "/internal/txs/outspends/by-txid" => {
+            Some(internal_outspends_by_txid(handler.context().as_ref(), body))
+        }
+        "/internal/txs/outspends/by-outpoint" => Some(internal_outspends_by_outpoint(
+            handler.context().as_ref(),
+            body,
+        )),
+        // API.md makes package relay conditional on a package-admission
+        // backend. Returning 404 is preferable to pretending that sequential
+        // sendrawtransaction calls are atomic package evaluation.
+        "/txs/package" => Some(not_found()),
         _ => None,
     }
 }
 
-fn broadcast_package(handler: &Handler, body: &[u8]) -> Response {
-    let Ok(raw_transactions) = serde_json::from_slice::<Vec<String>>(body) else {
-        return bad("package body must be a JSON array of transaction hex strings");
-    };
-    if raw_transactions.is_empty() {
-        return bad("transaction package must not be empty");
-    }
-    let mut results = serde_json::Map::new();
-    for raw in raw_transactions {
-        let result = match handler.dispatch("sendrawtransaction", &sonic_json!([raw])) {
-            Ok(value) => value,
-            Err(error) => return dispatch_error(error),
-        };
-        let Some(txid) = result.as_str() else {
-            return internal("transaction broadcast did not return a txid");
-        };
-        results.insert(txid.to_owned(), json!({"txid":txid}));
-    }
-    json_response(json!({"package_msg":"success","tx-results":results}))
-}
-
 fn tx(ctx: &Context, id: &str) -> Response {
-    lookup(ctx, id).map_or_else(
+    let projection = Projection::new(ctx);
+    projection.required_transaction(id).map_or_else(
         |r| r,
-        |(tx, status)| tx_value(ctx, &tx, status).map_or_else(|r| r, json_response),
+        |(tx, status)| {
+            projection
+                .transaction_value(&tx, status)
+                .map_or_else(|r| r, json_response)
+        },
     )
 }
 fn tx_hex(ctx: &Context, id: &str) -> Response {
-    lookup(ctx, id).map_or_else(|r| r, |(tx, _)| text(serialize(&tx).to_lower_hex_string()))
+    Projection::new(ctx)
+        .required_transaction(id)
+        .map_or_else(|r| r, |(tx, _)| text(serialize(&tx).to_lower_hex_string()))
 }
 fn tx_raw(ctx: &Context, id: &str) -> Response {
-    lookup(ctx, id).map_or_else(
+    Projection::new(ctx).required_transaction(id).map_or_else(
         |r| r,
         |(tx, _)| Response {
             status: 200,
@@ -190,7 +209,10 @@ fn tx_raw(ctx: &Context, id: &str) -> Response {
     )
 }
 fn tx_status(ctx: &Context, id: &str) -> Response {
-    lookup(ctx, id).map_or_else(|r| r, |(_, status)| json_response(status_value(status)))
+    Projection::new(ctx).required_transaction(id).map_or_else(
+        |r| r,
+        |(_, status)| json_response(Projection::status_value(status)),
+    )
 }
 
 fn tx_merkleblock_proof(ctx: &Context, id: &str) -> Response {
@@ -217,7 +239,11 @@ fn tx_merkle_proof(ctx: &Context, id: &str) -> Response {
                 return internal("confirmed transaction is absent from its block");
             };
             let proof = merkle_proof(txids, position);
-            json_response(json!({"block_height":record.height,"merkle":proof,"pos":position}))
+            json_response(MerkleProof {
+                block_height: record.height,
+                merkle: proof,
+                pos: position,
+            })
         },
     )
 }
@@ -226,10 +252,10 @@ fn confirmed_block(
     ctx: &Context,
     id: &str,
 ) -> Result<(crate::context::BlockRecord, Block, Txid), Response> {
-    let txid = Txid::from_str(id).map_err(|_| bad("txid must be 64 hex characters"))?;
-    let (_, Some(status)) = lookup(ctx, id)? else {
+    let (transaction, Some(status)) = Projection::new(ctx).required_transaction(id)? else {
         return Err(not_found());
     };
+    let txid = transaction.compute_txid();
     let record = ctx
         .block_by_height(status.height)
         .ok_or_else(|| unavailable("confirming block unavailable"))?;
@@ -267,7 +293,8 @@ fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
     let Ok(vout) = vout.parse::<u32>() else {
         return bad("vout must be an unsigned integer");
     };
-    lookup(ctx, id).map_or_else(
+    let projection = Projection::new(ctx);
+    projection.required_transaction(id).map_or_else(
         |r| r,
         |(transaction, _)| {
             let Some(output) = transaction
@@ -277,7 +304,7 @@ fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
                 return not_found();
             };
             outspend(
-                ctx,
+                &projection,
                 OutPoint::new(transaction.compute_txid(), vout),
                 &output.script_pubkey,
             )
@@ -287,33 +314,40 @@ fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
 }
 
 fn tx_outspends(ctx: &Context, id: &str) -> Response {
-    lookup(ctx, id).map_or_else(
+    let projection = Projection::new(ctx);
+    projection.required_transaction(id).map_or_else(
         |r| r,
         |(transaction, _)| {
-            transaction
-                .output
-                .iter()
-                .enumerate()
-                .map(|(vout, output)| {
-                    let vout =
-                        u32::try_from(vout).map_err(|_| internal("output index is too large"))?;
-                    outspend(
-                        ctx,
-                        OutPoint::new(transaction.compute_txid(), vout),
-                        &output.script_pubkey,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_or_else(|r| r, json_response)
+            outspends_for_transaction(&projection, &transaction).map_or_else(|r| r, json_response)
         },
     )
 }
 
+fn outspends_for_transaction(
+    projection: &Projection<'_>,
+    transaction: &Transaction,
+) -> Result<Vec<Outspend>, Response> {
+    transaction
+        .output
+        .iter()
+        .enumerate()
+        .map(|(vout, output)| {
+            let vout = u32::try_from(vout).map_err(|_| internal("output index is too large"))?;
+            outspend(
+                projection,
+                OutPoint::new(transaction.compute_txid(), vout),
+                &output.script_pubkey,
+            )
+        })
+        .collect()
+}
+
 fn outspend(
-    ctx: &Context,
+    projection: &Projection<'_>,
     outpoint: OutPoint,
     script: &bitcoin::ScriptBuf,
-) -> Result<Value, Response> {
+) -> Result<Outspend, Response> {
+    let ctx = projection.ctx;
     let pool = ctx.mempool.read();
     if let Some((_, entry_id)) = pool
         .spending
@@ -330,9 +364,12 @@ fn outspend(
                 .iter()
                 .position(|input| input.previous_output == outpoint)
                 .ok_or_else(|| internal("mempool spending index is inconsistent"))?;
-            return Ok(
-                json!({"spent":true,"txid":entry.txid.to_string(),"vin":vin,"status":{"confirmed":false}}),
-            );
+            return Ok(Outspend {
+                spent: true,
+                txid: Some(entry.txid.to_string()),
+                vin: Some(u32::try_from(vin).unwrap_or(u32::MAX)),
+                status: Some(Projection::status_value(None)),
+            });
         }
     }
     drop(pool);
@@ -346,114 +383,65 @@ fn outspend(
         .map_err(query_error)?
         .history
     {
-        let transaction = ctx
-            .esplora_tx_index
-            .as_ref()
-            .ok_or_else(|| unavailable("transaction lookup index is disabled"))?
-            .transaction(&history.txid)
-            .map_err(query_error)?
-            .ok_or_else(|| unavailable("indexed transaction unavailable"))?;
+        let transaction = projection.confirmed_transaction(&history.txid)?;
         if let Some(vin) = transaction
             .input
             .iter()
             .position(|input| input.previous_output == outpoint)
         {
-            return Ok(
-                json!({"spent":true,"txid":history.txid.to_string(),"vin":vin,"status":status_value(status(ctx,history.height))}),
-            );
+            let confirmation = projection
+                .confirmation_at_height(history.height)
+                .ok_or_else(|| unavailable("spending block unavailable"))?;
+            return Ok(Outspend {
+                spent: true,
+                txid: Some(history.txid.to_string()),
+                vin: Some(u32::try_from(vin).unwrap_or(u32::MAX)),
+                status: Some(Projection::status_value(Some(confirmation))),
+            });
         }
     }
-    Ok(json!({"spent":false}))
-}
-
-fn lookup(ctx: &Context, id: &str) -> Result<(Transaction, Option<Status>), Response> {
-    let id = Txid::from_str(id).map_err(|_| bad("txid must be 64 hex characters"))?;
-    if let Some(tx) = ctx.mempool.read().transaction_by_txid(&id) {
-        return Ok(((*tx).clone(), None));
-    }
-    let index = ctx
-        .esplora_tx_index
-        .as_ref()
-        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
-    let tx = index
-        .transaction(&id)
-        .map_err(query_error)?
-        .ok_or_else(not_found)?;
-    let status = current_confirmation_status(ctx, &id)?;
-    Ok((tx, status))
-}
-
-/// Resolves a transaction's confirmation only against the current applied chain.
-fn current_confirmation_status(ctx: &Context, id: &Txid) -> Result<Option<Status>, Response> {
-    if ctx.mempool.read().transaction_by_txid(id).is_some() {
-        return Ok(None);
-    }
-    let index = ctx
-        .esplora_tx_index
-        .as_ref()
-        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
-    Ok(index
-        .transaction_height(id)
-        .map_err(query_error)?
-        .and_then(|height| status(ctx, height)))
+    Ok(Outspend::unspent())
 }
 
 fn block(ctx: &Context, text_hash: &str) -> Response {
-    let Ok(hash) = Hash256::from_str(text_hash) else {
-        return bad("block hash must be 64 hex characters");
+    let projection = Projection::new(ctx);
+    let record = match projection.required_block_record(text_hash) {
+        Ok(record) => record,
+        Err(response) => return response,
     };
-    let Some(record) = ctx.block_by_hash(hash) else {
-        return not_found();
-    };
-    block_value(ctx, &record).map_or_else(|r| r, json_response)
-}
-fn block_value(ctx: &Context, record: &crate::context::BlockRecord) -> Result<Value, Response> {
-    let Some(header) = record
-        .header_bytes()
-        .and_then(|b| deserialize::<bitcoin::block::Header>(b).ok())
-    else {
-        return Err(unavailable("block header unavailable"));
-    };
-    let Some(bytes) = ctx.block_body_bytes(&record) else {
-        return Err(unavailable("block body unavailable"));
-    };
-    let Ok(decoded) = deserialize::<Block>(&bytes) else {
-        return Err(internal("stored block body is corrupt"));
-    };
-    Ok(
-        json!({"id":record.hash.to_string_be(),"height":record.height,"version":header.version.to_consensus(),"timestamp":header.time,"mediantime":ctx.median_time_past_for_hash(record.hash).unwrap_or(0),"bits":header.bits.to_consensus(),"nonce":header.nonce,"difficulty":ctx.difficulty_for_bits(header.bits),"merkle_root":header.merkle_root.to_string(),"tx_count":decoded.txdata.len(),"size":bytes.len(),"weight":decoded.weight().to_wu(),"previousblockhash":header.prev_blockhash.to_string()}),
-    )
+    projection
+        .block_value(&record)
+        .map_or_else(|r| r, json_response)
 }
 fn block_header(ctx: &Context, h: &str) -> Response {
-    let Ok(hash) = Hash256::from_str(h) else {
-        return bad("block hash must be 64 hex characters");
+    let record = match Projection::new(ctx).required_block_record(h) {
+        Ok(record) => record,
+        Err(response) => return response,
     };
-    ctx.block_by_hash(hash)
-        .and_then(|r| r.header_bytes().map(|b| text(b.to_lower_hex_string())))
-        .unwrap_or_else(not_found)
+    record.header_bytes().map_or_else(
+        || unavailable("block header unavailable"),
+        |bytes| text(bytes.to_lower_hex_string()),
+    )
 }
 fn block_status(ctx: &Context, text_hash: &str) -> Response {
-    let Ok(hash) = Hash256::from_str(text_hash) else {
-        return bad("block hash must be 64 hex characters");
+    let record = match Projection::new(ctx).required_block_record(text_hash) {
+        Ok(record) => record,
+        Err(response) => return response,
     };
-    let Some(record) = ctx.block_by_hash(hash) else {
-        return not_found();
-    };
-    let in_best_chain = ctx.active_hash_at_height(record.height) == Some(hash);
-    let mut value = json!({"in_best_chain":in_best_chain});
-    if in_best_chain {
-        if let Some(next) = ctx.block_hash_at_height(record.height.saturating_add(1)) {
-            value["next_best"] = json!(next.to_string_be());
-        }
-    }
-    json_response(value)
+    let in_best_chain = ctx.active_hash_at_height(record.height) == Some(record.hash);
+    json_response(BlockStatus {
+        in_best_chain,
+        height: record.height,
+        next_best: in_best_chain
+            .then(|| ctx.block_hash_at_height(record.height.saturating_add(1)))
+            .flatten()
+            .map(|hash| hash.to_string_be()),
+    })
 }
 fn block_raw(ctx: &Context, text_hash: &str) -> Response {
-    let Ok(hash) = Hash256::from_str(text_hash) else {
-        return bad("block hash must be 64 hex characters");
-    };
-    let Some(record) = ctx.block_by_hash(hash) else {
-        return not_found();
+    let record = match Projection::new(ctx).required_block_record(text_hash) {
+        Ok(record) => record,
+        Err(response) => return response,
     };
     let Some(bytes) = ctx.block_body_bytes(&record) else {
         return unavailable("block body unavailable");
@@ -466,35 +454,47 @@ fn block_raw(ctx: &Context, text_hash: &str) -> Response {
     }
 }
 fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
-    let Some((record, block)) = decode_block(ctx, h) else {
-        return not_found();
+    let (record, block) = match Projection::new(ctx).required_block(h) {
+        Ok(value) => value,
+        Err(response) => return response,
     };
+    block_transaction_values(
+        ctx,
+        &record,
+        block.txdata.iter().skip(start).take(CHAIN_PAGE),
+    )
+    .map_or_else(|r| r, json_response)
+}
+
+fn block_transaction_values<'a>(
+    ctx: &Context,
+    record: &crate::context::BlockRecord,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Result<Vec<TransactionValue>, Response> {
     // A record fetched by hash can be from a losing branch. Do not reuse the
     // active block at the same height for its transactions' confirmation data.
     let block_status =
-        (ctx.active_hash_at_height(record.height) == Some(record.hash)).then_some(Status {
+        (ctx.active_hash_at_height(record.height) == Some(record.hash)).then_some(Confirmation {
             height: record.height,
             hash: record.hash,
             time: record.time,
         });
-    block
-        .txdata
-        .iter()
-        .skip(start)
-        .take(CHAIN_PAGE)
+    let projection = Projection::new(ctx);
+    transactions
+        .into_iter()
         .map(|tx| {
             let state = match block_status {
                 Some(state) => Some(state),
-                None => current_confirmation_status(ctx, &tx.compute_txid())?,
+                None => projection.confirmation(&tx.compute_txid())?,
             };
-            tx_value(ctx, tx, state)
+            projection.transaction_value(tx, state)
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_or_else(|r| r, json_response)
 }
 fn block_txids(ctx: &Context, h: &str) -> Response {
-    let Some((_, block)) = decode_block(ctx, h) else {
-        return not_found();
+    let (_, block) = match Projection::new(ctx).required_block(h) {
+        Ok(value) => value,
+        Err(response) => return response,
     };
     json_response(
         block
@@ -508,8 +508,9 @@ fn block_txid(ctx: &Context, h: &str, index: &str) -> Response {
     let Ok(index) = index.parse::<usize>() else {
         return bad("transaction index must be an unsigned integer");
     };
-    let Some((_, block)) = decode_block(ctx, h) else {
-        return not_found();
+    let (_, block) = match Projection::new(ctx).required_block(h) {
+        Ok(value) => value,
+        Err(response) => return response,
     };
     block
         .txdata
@@ -518,12 +519,16 @@ fn block_txid(ctx: &Context, h: &str, index: &str) -> Response {
 }
 fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
     let start = start_height.unwrap_or_else(|| ctx.applied_height());
+    if ctx.block_by_height(start).is_none() {
+        return not_found();
+    }
     let mut values = Vec::with_capacity(10);
+    let projection = Projection::new(ctx);
     for height in (0..=start).rev().take(10) {
         let Some(record) = ctx.block_by_height(height) else {
             continue;
         };
-        let value = match block_value(ctx, &record) {
+        let value = match projection.block_value(&record) {
             Ok(value) => value,
             Err(response) => return response,
         };
@@ -531,10 +536,140 @@ fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
     }
     json_response(values)
 }
-fn decode_block(ctx: &Context, h: &str) -> Option<(crate::context::BlockRecord, Block)> {
-    let hash = Hash256::from_str(h).ok()?;
-    let r = ctx.block_by_hash(hash)?;
-    Some((r.clone(), deserialize(&ctx.block_body_bytes(&r)?).ok()?))
+fn internal_block_txs(ctx: &Context, hash: &str) -> Response {
+    let (record, block) = match Projection::new(ctx).required_block(hash) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    block_transaction_values(ctx, &record, block.txdata.iter()).map_or_else(|r| r, json_response)
+}
+
+fn internal_mempool_txs(ctx: &Context, last: Option<&str>, query: &str) -> Response {
+    let max_txs = query_limit(query, "max_txs").unwrap_or(usize::MAX);
+    let transactions = {
+        let pool = ctx.mempool.read();
+        let mut transactions = pool
+            .entries
+            .iter()
+            .map(|(_, entry)| (entry.time, entry.txid, (*entry.tx).clone()))
+            .collect::<Vec<_>>();
+        transactions.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        if let Some(last) = last
+            && let Some(position) = transactions
+                .iter()
+                .position(|(_, txid, _)| txid.to_string() == last)
+        {
+            transactions.drain(..=position);
+        }
+        transactions
+            .into_iter()
+            .map(|(_, _, transaction)| transaction)
+            .collect::<Vec<_>>()
+    };
+    let projection = Projection::new(ctx);
+    transactions
+        .into_iter()
+        .take(max_txs)
+        .map(|transaction| projection.transaction_value(&transaction, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_or_else(|r| r, json_response)
+}
+
+fn internal_transactions(ctx: &Context, body: &[u8], mempool_only: bool) -> Response {
+    let Ok(text_ids) = serde_json::from_slice::<Vec<String>>(body) else {
+        return bad("transaction request body must be a JSON array of txids");
+    };
+    let ids = match text_ids
+        .into_iter()
+        .map(|id| Txid::from_str(&id).map_err(|_| bad("txid must be 64 hex characters")))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(ids) => ids,
+        Err(response) => return response,
+    };
+    let projection = Projection::new(ctx);
+    ids.into_iter()
+        .filter_map(|id| {
+            let transaction = if mempool_only {
+                ctx.mempool
+                    .read()
+                    .transaction_by_txid(&id)
+                    .map(|transaction| ((*transaction).clone(), None))
+            } else {
+                match projection.transaction(&id) {
+                    Ok(transaction) => transaction,
+                    Err(response) => return Some(Err(response)),
+                }
+            };
+            transaction
+                .map(|(transaction, status)| projection.transaction_value(&transaction, status))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_or_else(|r| r, json_response)
+}
+
+fn internal_outspends_by_txid(ctx: &Context, body: &[u8]) -> Response {
+    let Ok(text_ids) = serde_json::from_slice::<Vec<String>>(body) else {
+        return bad("outspend request body must be a JSON array of txids");
+    };
+    let projection = Projection::new(ctx);
+    text_ids
+        .into_iter()
+        .map(|id| {
+            Txid::from_str(&id).ok().map_or(Ok(Vec::new()), |id| {
+                projection
+                    .transaction(&id)?
+                    .map_or(Ok(Vec::new()), |(transaction, _)| {
+                        outspends_for_transaction(&projection, &transaction)
+                    })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_or_else(|r| r, json_response)
+}
+
+fn internal_outspends_by_outpoint(ctx: &Context, body: &[u8]) -> Response {
+    let Ok(outpoints) = serde_json::from_slice::<Vec<String>>(body) else {
+        return bad("outspend request body must be a JSON array of outpoints");
+    };
+    let projection = Projection::new(ctx);
+    outpoints
+        .into_iter()
+        .map(|outpoint| internal_outspend(&projection, &outpoint))
+        .collect::<Result<Vec<_>, _>>()
+        .map_or_else(|r| r, json_response)
+}
+
+fn internal_outspend(
+    projection: &Projection<'_>,
+    text_outpoint: &str,
+) -> Result<Outspend, Response> {
+    let Some((text_txid, text_vout)) = text_outpoint.split_once(':') else {
+        return Ok(Outspend::unspent());
+    };
+    let Ok(txid) = Txid::from_str(text_txid) else {
+        return Ok(Outspend::unspent());
+    };
+    let Ok(vout) = text_vout.parse::<u32>() else {
+        return Ok(Outspend::unspent());
+    };
+    let Some((transaction, _)) = projection.transaction(&txid)? else {
+        return Ok(Outspend::unspent());
+    };
+    let Some(output) = transaction
+        .output
+        .get(usize::try_from(vout).unwrap_or(usize::MAX))
+    else {
+        return Ok(Outspend::unspent());
+    };
+    outspend(projection, OutPoint::new(txid, vout), &output.script_pubkey)
+}
+
+fn query_limit(query: &str, name: &str) -> Option<usize> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then(|| value.parse().ok()).flatten()
+    })
 }
 
 fn mempool(ctx: &Context) -> Response {
@@ -544,15 +679,40 @@ fn mempool(ctx: &Context) -> Response {
     for (_, entry) in &pool.entries {
         *bins.entry(entry.fee_rate).or_insert(0_u64) += u64::from(entry.vsize);
     }
-    json_response(
-        json!({"count":stats.txs,"vsize":stats.bytes,"total_fee":stats.total_fee,"fee_histogram":bins.into_iter().rev().map(|(r,s)|json!([r as f64/1000.0,s])).collect::<Vec<_>>() }),
-    )
+    json_response(MempoolSummary {
+        count: stats.txs,
+        vsize: stats.bytes,
+        total_fee: stats.total_fee,
+        fee_histogram: bins
+            .into_iter()
+            .rev()
+            .map(|(rate, size)| (rate as f64 / 1000.0, size))
+            .collect(),
+    })
 }
 fn mempool_recent(ctx: &Context) -> Response {
     let pool = ctx.mempool.read();
     let mut entries = pool.entries.iter().map(|(_, e)| e).collect::<Vec<_>>();
-    entries.sort_by_key(|e| core::cmp::Reverse(e.time));
-    json_response(entries.into_iter().take(10).map(|e|json!({"txid":e.txid.to_string(),"fee":e.fee,"vsize":e.vsize,"value":e.tx.output.iter().fold(0_u64,|n,o|n.saturating_add(o.value.to_sat()))})).collect::<Vec<_>>())
+    entries.sort_by(|left, right| {
+        right
+            .time
+            .cmp(&left.time)
+            .then_with(|| right.txid.cmp(&left.txid))
+    });
+    json_response(
+        entries
+            .into_iter()
+            .take(10)
+            .map(|entry| RecentTransaction {
+                txid: entry.txid.to_string(),
+                fee: entry.fee,
+                vsize: entry.vsize,
+                value: entry.tx.output.iter().fold(0_u64, |sum, output| {
+                    sum.saturating_add(output.value.to_sat())
+                }),
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 fn fee_estimates(handler: &Handler) -> Response {
     let mut values = serde_json::Map::new();
@@ -577,73 +737,62 @@ fn summary(ctx: &Context, text: &str, address: Option<&str>) -> Response {
     parse_script(text).map_or_else(|r| r, |h| summary_for(ctx, h, address))
 }
 fn summary_for(ctx: &Context, h: ScriptHash, address: Option<&str>) -> Response {
-    let confirmed = match confirmed(ctx, h) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let projection = Projection::new(ctx);
+    let activity = match projection.script_activity(h) {
+        Ok(activity) => activity,
+        Err(response) => return response,
     };
-    let confirmed_unspent = match confirmed_unspent(ctx, h) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let chain_stats = match activity.chain_stats(&projection, h) {
+        Ok(stats) => stats,
+        Err(response) => return response,
     };
-    let mem = mempool_activity(ctx, h, &confirmed_unspent);
-    let (cc, cs) = funded(&confirmed, h);
-    let (mc, ms) = funded_mempool(&mem, h);
-    let (csc, css) = spent_confirmed(cc, cs, &confirmed_unspent);
-    let (msc, mss) = spent_mempool(&mem, h, &confirmed_unspent);
-    let mut v = json!({"chain_stats":{"tx_count":confirmed.len(),"funded_txo_count":cc,"funded_txo_sum":cs,"spent_txo_count":csc,"spent_txo_sum":css},"mempool_stats":{"tx_count":mem.len(),"funded_txo_count":mc,"funded_txo_sum":ms,"spent_txo_count":msc,"spent_txo_sum":mss}});
-    if let Some(a) = address {
-        v["address"] = json!(a)
-    } else {
-        v["scripthash"] = json!(h.to_byte_array().to_lower_hex_string())
-    };
-    json_response(v)
+    json_response(ScriptSummary {
+        address: address.map(str::to_owned),
+        scripthash: address
+            .is_none()
+            .then(|| h.to_byte_array().to_lower_hex_string()),
+        chain_stats,
+        mempool_stats: activity.mempool_stats(h),
+    })
 }
 fn utxos(ctx: &Context, h: ScriptHash) -> Response {
-    confirmed_unspent(ctx, h).map_or_else(
-        |r| r,
-        |confirmed| {
-            let v = combined_utxos(ctx, h, &confirmed);
-            json_response(v.into_iter().map(|r|json!({"txid":r.txid.to_string(),"vout":r.vout,"value":r.value,"status":if r.height==0{json!({"confirmed":false})}else{status_value(status(ctx,r.height))}})).collect::<Vec<_>>())
-        },
-    )
+    let projection = Projection::new(ctx);
+    projection
+        .script_activity(h)
+        .and_then(|activity| activity.utxos(&projection, h))
+        .map_or_else(|response| response, json_response)
 }
 fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bool) -> Response {
-    let confirmed = match confirmed(ctx, h) {
-        Ok(v) => v,
-        Err(r) => return r,
+    let projection = Projection::new(ctx);
+    let activity = match projection.script_activity(h) {
+        Ok(activity) => activity,
+        Err(response) => return response,
     };
-    let confirmed_unspent = match confirmed_unspent(ctx, h) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let mut chain = confirmed.into_iter().collect::<Vec<_>>();
-    chain.sort_by(|a, b| {
-        b.0.height
-            .cmp(&a.0.height)
-            .then_with(|| b.0.txid.cmp(&a.0.txid))
-    });
     if last == Some("") {
-        return mempool_activity(ctx, h, &confirmed_unspent)
+        return activity
+            .mempool
             .into_iter()
             .take(MEMPOOL_PAGE)
-            .map(|t| tx_value(ctx, &t, None))
+            .map(|t| projection.transaction_value(&t, None))
             .collect::<Result<Vec<_>, _>>()
             .map_or_else(|r| r, json_response);
     };
     let start = last.and_then(|x| {
-        chain
+        activity
+            .confirmed
             .iter()
-            .position(|v| v.0.txid.to_string() == x)
+            .position(|entry| entry.record.txid.to_string() == x)
             .map(|n| n + 1)
     });
     if last.is_some() && start.is_none() {
         return not_found();
     }
     let out = if include_mempool {
-        mempool_activity(ctx, h, &confirmed_unspent)
-            .into_iter()
+        activity
+            .mempool
+            .iter()
             .take(MEMPOOL_PAGE)
-            .map(|t| tx_value(ctx, &t, None))
+            .map(|t| projection.transaction_value(t, None))
             .collect::<Result<Vec<_>, _>>()
     } else {
         Ok(Vec::new())
@@ -652,11 +801,18 @@ fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bo
         Ok(out) => out,
         Err(r) => return r,
     };
-    let chain = match chain
+    let chain = match activity
+        .confirmed
         .into_iter()
         .skip(start.unwrap_or(0))
         .take(CHAIN_PAGE)
-        .map(|(_, t, s)| tx_value(ctx, &t, Some(s)))
+        .map(|entry| {
+            projection
+                .confirmed_transaction(&entry.record.txid)
+                .and_then(|transaction| {
+                    projection.transaction_value(&transaction, Some(entry.confirmation))
+                })
+        })
         .collect::<Result<Vec<_>, _>>()
     {
         Ok(chain) => chain,
@@ -665,245 +821,37 @@ fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bo
     out.extend(chain);
     json_response(out)
 }
-fn confirmed(
-    ctx: &Context,
-    h: ScriptHash,
-) -> Result<Vec<(ScriptHistoryRecord, Transaction, Status)>, Response> {
-    let index = ctx
-        .script_index
-        .as_ref()
-        .ok_or_else(|| unavailable("script index is disabled"))?;
-    index
-        .history_snapshot(h)
-        .map_err(query_error)?
-        .history
+
+fn address_transaction_summary(ctx: &Context, h: ScriptHash) -> Response {
+    let projection = Projection::new(ctx);
+    let activity = match projection.script_activity(h) {
+        Ok(activity) => activity,
+        Err(response) => return response,
+    };
+    activity
+        .confirmed
         .into_iter()
-        .map(|r| {
-            let s =
-                status(ctx, r.height).ok_or_else(|| unavailable("confirming block unavailable"))?;
-            let tx = ctx
-                .esplora_tx_index
-                .as_ref()
-                .ok_or_else(|| unavailable("transaction lookup index is disabled"))?
-                .transaction(&r.txid)
-                .map_err(query_error)?
-                .ok_or_else(|| unavailable("confirming transaction unavailable"))?;
-            Ok((r, tx, s))
+        .map(|entry| {
+            let transaction = projection.confirmed_transaction(&entry.record.txid)?;
+            let value = transaction
+                .output
+                .iter()
+                .filter(|output| ScriptHash::new(&output.script_pubkey) == h)
+                .fold(0_u64, |sum, output| {
+                    sum.saturating_add(output.value.to_sat())
+                });
+            Ok(AddressTransactionSummary {
+                txid: entry.record.txid.to_string(),
+                value,
+                height: entry.confirmation.height,
+                time: entry.confirmation.time,
+            })
         })
-        .collect()
-}
-fn confirmed_unspent(ctx: &Context, h: ScriptHash) -> Result<Vec<ScriptIndexRecord>, Response> {
-    let index = ctx
-        .script_index
-        .as_ref()
-        .ok_or_else(|| unavailable("script index is disabled"))?;
-    index.unspent_outputs(h).map_err(query_error)
-}
-fn combined_utxos(
-    ctx: &Context,
-    h: ScriptHash,
-    confirmed_unspent: &[ScriptIndexRecord],
-) -> Vec<ScriptIndexRecord> {
-    let mut v = confirmed_unspent.to_vec();
-    let pool = ctx.mempool.read();
-    v.retain(|r| !pool.is_outpoint_spent(&OutPoint::new(r.txid, r.vout)));
-    let mh = MempoolScriptHash::from_byte_array(h.to_byte_array());
-    for (_, id) in pool
-        .funding
-        .range((Bound::Included((mh, 0)), Bound::Included((mh, u32::MAX))))
-    {
-        let Some(e) = pool.entry(*id) else { continue };
-        for (n, o) in e.tx.output.iter().enumerate() {
-            let Ok(n) = u32::try_from(n) else { continue };
-            if MempoolScriptHash::from_script(&o.script_pubkey) == mh
-                && !pool.is_outpoint_spent(&OutPoint::new(e.txid, n))
-            {
-                v.push(ScriptIndexRecord {
-                    txid: e.txid,
-                    height: 0,
-                    value: o.value.to_sat(),
-                    vout: n,
-                })
-            }
-        }
-    }
-    v
-}
-fn mempool_activity(
-    ctx: &Context,
-    h: ScriptHash,
-    confirmed_unspent: &[ScriptIndexRecord],
-) -> Vec<Transaction> {
-    let pool = ctx.mempool.read();
-    let mh = MempoolScriptHash::from_byte_array(h.to_byte_array());
-    let mut ids = std::collections::BTreeSet::new();
-    let mut ops = confirmed_unspent
-        .iter()
-        .map(|r| OutPoint::new(r.txid, r.vout))
-        .collect::<std::collections::BTreeSet<_>>();
-    for (_, id) in pool
-        .funding
-        .range((Bound::Included((mh, 0)), Bound::Included((mh, u32::MAX))))
-    {
-        if let Some(e) = pool.entry(*id) {
-            ids.insert(e.txid);
-            for (n, o) in e.tx.output.iter().enumerate() {
-                if MempoolScriptHash::from_script(&o.script_pubkey) == mh {
-                    if let Ok(n) = u32::try_from(n) {
-                        ops.insert(OutPoint::new(e.txid, n));
-                    }
-                }
-            }
-        }
-    }
-    for (_, e) in &pool.entries {
-        if e.tx.input.iter().any(|i| ops.contains(&i.previous_output)) {
-            ids.insert(e.txid);
-        }
-    }
-    ids.into_iter()
-        .filter_map(|id| pool.transaction_by_txid(&id).map(|t| (*t).clone()))
-        .collect()
-}
-fn funded(h: &[(ScriptHistoryRecord, Transaction, Status)], s: ScriptHash) -> (u64, u64) {
-    h.iter()
-        .flat_map(|(_, t, _)| &t.output)
-        .filter(|o| ScriptHash::new(&o.script_pubkey) == s)
-        .fold((0, 0), |(c, v), o| {
-            (c + 1, v.saturating_add(o.value.to_sat()))
-        })
-}
-fn funded_mempool(h: &[Transaction], s: ScriptHash) -> (u64, u64) {
-    h.iter()
-        .flat_map(|t| &t.output)
-        .filter(|o| ScriptHash::new(&o.script_pubkey) == s)
-        .fold((0, 0), |(c, v), o| {
-            (c + 1, v.saturating_add(o.value.to_sat()))
-        })
-}
-fn spent_confirmed(
-    funded_count: u64,
-    funded_sum: u64,
-    confirmed_unspent: &[ScriptIndexRecord],
-) -> (u64, u64) {
-    let unspent_count = u64::try_from(confirmed_unspent.len()).unwrap_or(u64::MAX);
-    let unspent_sum = confirmed_unspent
-        .iter()
-        .fold(0_u64, |sum, output| sum.saturating_add(output.value));
-    (
-        funded_count.saturating_sub(unspent_count),
-        funded_sum.saturating_sub(unspent_sum),
-    )
-}
-fn spent_mempool(
-    transactions: &[Transaction],
-    script_hash: ScriptHash,
-    confirmed_unspent: &[ScriptIndexRecord],
-) -> (u64, u64) {
-    let mut target_outputs = std::collections::BTreeMap::new();
-    for output in confirmed_unspent {
-        target_outputs.insert(OutPoint::new(output.txid, output.vout), output.value);
-    }
-    for transaction in transactions {
-        for (vout, output) in transaction.output.iter().enumerate() {
-            let Ok(vout) = u32::try_from(vout) else {
-                continue;
-            };
-            if ScriptHash::new(&output.script_pubkey) == script_hash {
-                target_outputs.insert(
-                    OutPoint::new(transaction.compute_txid(), vout),
-                    output.value.to_sat(),
-                );
-            }
-        }
-    }
-    transactions
-        .iter()
-        .flat_map(|transaction| &transaction.input)
-        .filter_map(|input| target_outputs.remove(&input.previous_output))
-        .fold((0, 0), |(count, sum), value| {
-            (count + 1, sum.saturating_add(value))
-        })
-}
-fn tx_value(ctx: &Context, tx: &Transaction, status: Option<Status>) -> Result<Value, Response> {
-    let mut input_value = 0_u64;
-    let vin = tx
-        .input
-        .iter()
-        .map(|input| {
-            let coinbase = input.previous_output.is_null();
-            let prevout = if coinbase {
-                None
-            } else {
-                let output = prevout(ctx, &input.previous_output)?
-                    .ok_or_else(|| unavailable("previous transaction unavailable"))?;
-                input_value = input_value.saturating_add(output.value.to_sat());
-                Some(out_value(ctx, &output))
-            };
-            Ok(json!({"txid":(!coinbase).then(||input.previous_output.txid.to_string()),"vout":(!coinbase).then_some(input.previous_output.vout),"is_coinbase":coinbase,"scriptsig":input.script_sig.as_bytes().to_lower_hex_string(),"scriptsig_asm":input.script_sig.to_asm_string(),"sequence":input.sequence.to_consensus_u32(),"witness":input.witness.iter().map(|w|w.to_lower_hex_string()).collect::<Vec<_>>(),"prevout":prevout}))
-        })
-        .collect::<Result<Vec<_>, Response>>()?;
-    let out = tx
-        .output
-        .iter()
-        .map(|o| out_value(ctx, o))
-        .collect::<Vec<_>>();
-    let output_value = tx.output.iter().fold(0_u64, |sum, output| {
-        sum.saturating_add(output.value.to_sat())
-    });
-    Ok(
-        json!({"txid":tx.compute_txid().to_string(),"version":tx.version.0,"locktime":tx.lock_time.to_consensus_u32(),"size":serialize(tx).len(),"weight":tx.weight().to_wu(),"fee":input_value.saturating_sub(output_value),"vin":vin,"vout":out,"status":status_value(status)}),
-    )
-}
-fn prevout(ctx: &Context, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
-    if let Some(tx) = ctx.mempool.read().transaction_by_txid(&outpoint.txid) {
-        return Ok(tx
-            .output
-            .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
-            .cloned());
-    }
-    let index = ctx
-        .esplora_tx_index
-        .as_ref()
-        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
-    let Some(tx) = index.transaction(&outpoint.txid).map_err(query_error)? else {
-        return Ok(None);
-    };
-    Ok(tx
-        .output
-        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
-        .cloned())
-}
-fn out_value(ctx: &Context, o: &TxOut) -> Value {
-    let s = &o.script_pubkey;
-    let n = match ctx.chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    };
-    json!({"scriptpubkey":s.as_bytes().to_lower_hex_string(),"scriptpubkey_asm":s.to_asm_string(),"scriptpubkey_type":if s.is_p2tr(){"v1_p2tr"}else if s.is_p2wsh(){"v0_p2wsh"}else if s.is_p2wpkh(){"v0_p2wpkh"}else if s.is_p2sh(){"p2sh"}else if s.is_p2pkh(){"p2pkh"}else if s.is_op_return(){"op_return"}else{"unknown"},"scriptpubkey_address":bitcoin::Address::from_script(s,n).ok().map(|a|a.to_string()),"value":o.value.to_sat()})
-}
-fn status(ctx: &Context, h: u32) -> Option<Status> {
-    let r = ctx.block_by_height(h)?;
-    Some(Status {
-        height: h,
-        hash: r.hash,
-        time: r.time,
-    })
-}
-fn status_value(s: Option<Status>) -> Value {
-    s.map_or_else(||json!({"confirmed":false}),|s|json!({"confirmed":true,"block_height":s.height,"block_hash":s.hash.to_string_be(),"block_time":s.time}))
+        .collect::<Result<Vec<AddressTransactionSummary>, Response>>()
+        .map_or_else(|response| response, json_response)
 }
 fn address_hash(ctx: &Context, a: &str) -> Result<ScriptHash, Response> {
-    let n = match ctx.chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    };
+    let n = Projection::new(ctx).bitcoin_network();
     let a = bitcoin::Address::from_str(a)
         .map_err(|_| bad("invalid address"))?
         .require_network(n)
@@ -983,13 +931,15 @@ fn internal(m: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::{
-        Amount, Block, BlockHash, CompactTarget, ScriptBuf, TxIn, TxMerkleNode, Witness, absolute,
-        block::Version, hashes::Hash as _, transaction,
+        Amount, Block, BlockHash, CompactTarget, ScriptBuf, TxIn, TxMerkleNode, TxOut, Witness,
+        absolute, block::Version, hashes::Hash as _, transaction,
     };
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_mempool::MempoolEntry;
+    use serde_json::Value;
 
     use super::*;
 
@@ -1054,18 +1004,597 @@ mod tests {
         }
     }
 
+    struct CountingTxIndex {
+        transactions: Vec<Transaction>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::context::TxIndexQuery for CountingTxIndex {
+        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .transactions
+                .iter()
+                .find(|transaction| transaction.compute_txid() == *txid)
+                .cloned())
+        }
+
+        fn outpoint_value(&self, _outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
+            Ok(None)
+        }
+
+        fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
+            Ok(crate::context::TxIndexInfo {
+                synced: true,
+                best_block_height: 0,
+            })
+        }
+    }
+
+    struct FixtureTxIndex(Vec<(Transaction, u32)>);
+
+    impl crate::context::TxIndexQuery for FixtureTxIndex {
+        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(transaction, _)| transaction.compute_txid() == *txid)
+                .map(|(transaction, _)| transaction.clone()))
+        }
+
+        fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(transaction, _)| transaction.compute_txid() == outpoint.txid)
+                .and_then(|(transaction, _)| {
+                    transaction
+                        .output
+                        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+                })
+                .map(|output| output.value.to_sat()))
+        }
+
+        fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(transaction, _)| transaction.compute_txid() == *txid)
+                .map(|(_, height)| *height))
+        }
+
+        fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
+            Ok(crate::context::TxIndexInfo {
+                synced: true,
+                best_block_height: self.0.iter().map(|(_, height)| *height).max().unwrap_or(0),
+            })
+        }
+    }
+
+    struct StaticScriptIndex {
+        history: Vec<ScriptHistoryRecord>,
+        unspent: Vec<ScriptIndexRecord>,
+    }
+
+    impl crate::context::ScriptIndexQuery for StaticScriptIndex {
+        fn unspent_outputs(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+            Ok(self.unspent.clone())
+        }
+
+        fn history_snapshot(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<crate::context::ScriptIndexSnapshot, TxQueryError> {
+            Ok(crate::context::ScriptIndexSnapshot {
+                history: self.history.clone(),
+            })
+        }
+    }
+
+    fn contract_fixture()
+    -> Result<(Handler, Transaction, Block, String), Box<dyn std::error::Error>> {
+        let target = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([2; 20]));
+        let address =
+            bitcoin::Address::from_script(&target, bitcoin::Network::Regtest)?.to_string();
+        let mut transaction = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: target,
+            },
+        );
+        transaction.input.push(TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+            sequence: bitcoin::Sequence::MAX,
+            witness: Witness::new(),
+        });
+        let mut block = Block {
+            header: bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            },
+            txdata: vec![transaction.clone()],
+        };
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .ok_or_else(|| std::io::Error::other("fixture merkle root missing"))?;
+        let record = crate::context::BlockRecord::from_block(0, &block);
+        let txid = transaction.compute_txid();
+        let mut context = Context::new();
+        context.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        context.add_block(record);
+        let tip = {
+            let mut tree = context.block_tree.write();
+            tree.insert_node(None, block.header, NodeStatus::Active)?;
+            tree.tip()
+                .ok_or_else(|| std::io::Error::other("fixture tip missing"))?
+                .as_ref()
+                .clone()
+        };
+        context.set_applied_tip(tip);
+        context.esplora_tx_index = Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
+        context.script_index = Some(Arc::new(StaticScriptIndex {
+            history: vec![ScriptHistoryRecord { txid, height: 0 }],
+            unspent: vec![ScriptIndexRecord {
+                txid,
+                height: 0,
+                value: 5_000_000_000,
+                vout: 0,
+            }],
+        }));
+        Ok((Handler::new(Arc::new(context)), transaction, block, address))
+    }
+
     #[test]
     fn tip_routes_remain_available_without_script_index() {
         let handler = Handler::new(Arc::new(Context::new()));
-        assert_eq!(route(&handler, "/blocks/tip/height").status, 200);
+        assert_eq!(route(&handler, "/blocks/tip/height", "").status, 200);
         assert_eq!(
             route(
                 &handler,
-                "/scripthash/0000000000000000000000000000000000000000000000000000000000000000/utxo"
+                "/scripthash/0000000000000000000000000000000000000000000000000000000000000000/utxo",
+                ""
             )
             .status,
             503
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
+    fn bitcoin_esplora_surface_matches_documented_routes_and_content_types()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handler, transaction, block, address) = contract_fixture()?;
+        let txid = transaction.compute_txid().to_string();
+        let block_hash = block.block_hash().to_string();
+        let script_hash = ScriptHash::new(&transaction.output[0].script_pubkey)
+            .to_byte_array()
+            .to_lower_hex_string();
+        let routes = [
+            (format!("/tx/{txid}"), 200, "application/json"),
+            (format!("/tx/{txid}/status"), 200, "application/json"),
+            (format!("/tx/{txid}/hex"), 200, "text/plain"),
+            (format!("/tx/{txid}/raw"), 200, "application/octet-stream"),
+            (format!("/tx/{txid}/merkleblock-proof"), 200, "text/plain"),
+            (format!("/tx/{txid}/merkle-proof"), 200, "application/json"),
+            (format!("/tx/{txid}/outspend/0"), 200, "application/json"),
+            (format!("/tx/{txid}/outspends"), 200, "application/json"),
+            (format!("/address/{address}"), 200, "application/json"),
+            (format!("/address/{address}/txs"), 200, "application/json"),
+            (
+                format!("/address/{address}/txs/chain"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/address/{address}/txs/chain/{txid}"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/address/{address}/txs/mempool"),
+                200,
+                "application/json",
+            ),
+            (format!("/address/{address}/utxo"), 200, "application/json"),
+            (
+                format!("/scripthash/{script_hash}"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/scripthash/{script_hash}/txs"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/scripthash/{script_hash}/txs/chain"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/scripthash/{script_hash}/txs/chain/{txid}"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/scripthash/{script_hash}/txs/mempool"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/scripthash/{script_hash}/utxo"),
+                200,
+                "application/json",
+            ),
+            (format!("/block/{block_hash}"), 200, "application/json"),
+            (format!("/block/{block_hash}/header"), 200, "text/plain"),
+            (
+                format!("/block/{block_hash}/status"),
+                200,
+                "application/json",
+            ),
+            (format!("/block/{block_hash}/txs"), 200, "application/json"),
+            (
+                format!("/block/{block_hash}/txs/0"),
+                200,
+                "application/json",
+            ),
+            (
+                format!("/block/{block_hash}/txids"),
+                200,
+                "application/json",
+            ),
+            (format!("/block/{block_hash}/txid/0"), 200, "text/plain"),
+            (
+                format!("/block/{block_hash}/raw"),
+                200,
+                "application/octet-stream",
+            ),
+            ("/block-height/0".to_owned(), 200, "text/plain"),
+            ("/blocks".to_owned(), 200, "application/json"),
+            ("/blocks/0".to_owned(), 200, "application/json"),
+            ("/blocks/tip/height".to_owned(), 200, "text/plain"),
+            ("/blocks/tip/hash".to_owned(), 200, "text/plain"),
+            ("/mempool".to_owned(), 200, "application/json"),
+            ("/mempool/txids".to_owned(), 200, "application/json"),
+            ("/mempool/recent".to_owned(), 200, "application/json"),
+            ("/fee-estimates".to_owned(), 200, "application/json"),
+            ("/block-template".to_owned(), 200, "application/json"),
+            ("/address-prefix/bcrt1".to_owned(), 503, "text/plain"),
+        ];
+        for (path, expected_status, expected_content_type) in routes {
+            let response = route(&handler, &path, "");
+            assert_eq!(response.status, expected_status, "status for {path}");
+            assert_eq!(
+                response.content_type, expected_content_type,
+                "content type for {path}"
+            );
+        }
+
+        let raw = serialize(&transaction).to_lower_hex_string();
+        let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("POST /tx is routed");
+        assert_eq!(broadcast.status, 200);
+        assert_eq!(broadcast.content_type, "text/plain");
+
+        // Package relay is conditional in API.md (Bitcoin Core 28+). This node
+        // has no atomic package-admission capability, so it must not advertise
+        // sequential sendrawtransaction calls as that endpoint.
+        let package = route_post(&handler, "/txs/package", b"[]")
+            .expect("package path must not fall through to JSON-RPC");
+        assert_eq!(package.status, 404);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bitcoin_esplora_representations_match_the_documented_schemas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn keys(value: &Value) -> std::collections::BTreeSet<&str> {
+            value
+                .as_object()
+                .map(|object| object.keys().map(String::as_str).collect())
+                .unwrap_or_default()
+        }
+
+        let (handler, transaction, block, address) = contract_fixture()?;
+        let txid = transaction.compute_txid().to_string();
+        let block_hash = block.block_hash().to_string();
+        let transaction_value: Value =
+            serde_json::from_slice(&route(&handler, &format!("/tx/{txid}"), "").body)?;
+        assert_eq!(
+            keys(&transaction_value),
+            [
+                "fee", "locktime", "size", "status", "txid", "version", "vin", "vout", "weight",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            keys(&transaction_value["vin"][0]),
+            [
+                "is_coinbase",
+                "prevout",
+                "scriptsig",
+                "scriptsig_asm",
+                "sequence",
+                "txid",
+                "vout",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            transaction_value["vin"][0]["txid"],
+            json!(Txid::all_zeros().to_string())
+        );
+        assert_eq!(transaction_value["vin"][0]["vout"], json!(u32::MAX));
+        assert!(transaction_value["vin"][0]["prevout"].is_null());
+        assert_eq!(transaction_value["fee"], json!(0));
+        assert_eq!(
+            keys(&transaction_value["vout"][0]),
+            [
+                "scriptpubkey",
+                "scriptpubkey_address",
+                "scriptpubkey_asm",
+                "scriptpubkey_type",
+                "value",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            keys(&transaction_value["status"]),
+            ["block_hash", "block_height", "block_time", "confirmed"]
+                .into_iter()
+                .collect()
+        );
+
+        let block_value: Value =
+            serde_json::from_slice(&route(&handler, &format!("/block/{block_hash}"), "").body)?;
+        assert_eq!(
+            keys(&block_value),
+            [
+                "bits",
+                "difficulty",
+                "height",
+                "id",
+                "mediantime",
+                "merkle_root",
+                "nonce",
+                "previousblockhash",
+                "size",
+                "timestamp",
+                "tx_count",
+                "version",
+                "weight",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(block_value["previousblockhash"].is_null());
+
+        let summary: Value =
+            serde_json::from_slice(&route(&handler, &format!("/address/{address}"), "").body)?;
+        assert_eq!(
+            keys(&summary),
+            ["address", "chain_stats", "mempool_stats"]
+                .into_iter()
+                .collect()
+        );
+        let stat_keys = [
+            "funded_txo_count",
+            "funded_txo_sum",
+            "spent_txo_count",
+            "spent_txo_sum",
+            "tx_count",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys(&summary["chain_stats"]), stat_keys);
+        assert_eq!(summary["chain_stats"]["funded_txo_count"], json!(1));
+        assert_eq!(summary["chain_stats"]["spent_txo_count"], json!(0));
+
+        let utxos: Value =
+            serde_json::from_slice(&route(&handler, &format!("/address/{address}/utxo"), "").body)?;
+        assert_eq!(utxos[0]["status"]["confirmed"], json!(true));
+        assert_eq!(utxos[0]["status"]["block_height"], json!(0));
+
+        let outspend: Value =
+            serde_json::from_slice(&route(&handler, &format!("/tx/{txid}/outspend/0"), "").body)?;
+        assert_eq!(outspend, json!({"spent":false}));
+
+        let mempool: Value = serde_json::from_slice(&route(&handler, "/mempool", "").body)?;
+        assert_eq!(
+            keys(&mempool),
+            ["count", "fee_histogram", "total_fee", "vsize"]
+                .into_iter()
+                .collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitcoin_esplora_errors_distinguish_bad_missing_and_unavailable() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        assert_eq!(route(&handler, "/tx/not-a-txid", "").status, 400);
+        assert_eq!(route(&handler, "/block/not-a-hash", "").status, 400);
+        assert_eq!(
+            route(&handler, "/block-height/not-a-height", "").status,
+            400
+        );
+        assert_eq!(
+            route(
+                &handler,
+                "/block/0000000000000000000000000000000000000000000000000000000000000000",
+                ""
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            route(
+                &handler,
+                "/tx/0000000000000000000000000000000000000000000000000000000000000000",
+                ""
+            )
+            .status,
+            503
+        );
+        assert_eq!(
+            route(
+                &handler,
+                "/block/0000000000000000000000000000000000000000000000000000000000000000/txs/1",
+                ""
+            )
+            .status,
+            400
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn internal_mempool_routes_return_live_transactions() {
+        let transaction = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(125),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let txid = transaction.compute_txid();
+        let ctx = Arc::new(Context::new());
+        ctx.mempool
+            .write()
+            .insert_entry(MempoolEntry::new(Arc::new(transaction), 100, 1_000, 0, 0))
+            .expect("mempool entry accepted");
+        let handler = Handler::new(Arc::clone(&ctx));
+        let body = serde_json::to_vec(&vec![txid.to_string()]).expect("txids serialize");
+
+        let post = route_post(&handler, "/internal/mempool/txs", &body)
+            .expect("internal route is handled");
+        assert_eq!(post.status, 200);
+        let paged = route(&handler, "/internal/mempool/txs", "max_txs=1");
+        assert_eq!(paged.status, 200);
+        let values: Value = serde_json::from_slice(&paged.body).expect("mempool response json");
+        assert_eq!(values[0]["txid"], json!(txid.to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn mempool_backend_extension_surface_uses_the_same_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handler, transaction, block, address) = contract_fixture()?;
+        let txid = transaction.compute_txid().to_string();
+        let ids = serde_json::to_vec(&vec![txid.clone()])?;
+        let outpoints = serde_json::to_vec(&vec![format!("{txid}:0")])?;
+
+        for (path, body) in [
+            ("/internal/txs", ids.as_slice()),
+            ("/internal/mempool/txs", ids.as_slice()),
+            ("/internal/txs/outspends/by-txid", ids.as_slice()),
+            ("/internal/txs/outspends/by-outpoint", outpoints.as_slice()),
+        ] {
+            let response = route_post(&handler, path, body).expect("internal POST route exists");
+            assert_eq!(response.status, 200, "status for {path}");
+            assert_eq!(response.content_type, "application/json");
+        }
+
+        let block_response = route(
+            &handler,
+            &format!("/internal/block/{}/txs", block.block_hash()),
+            "",
+        );
+        assert_eq!(block_response.status, 200);
+        let summary = route(&handler, &format!("/address/{address}/txs/summary"), "");
+        assert_eq!(summary.status, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn package_broadcast_is_not_exposed_without_package_admission() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        assert_eq!(
+            route_post(&handler, "/txs/package", b"[]").map(|response| response.status),
+            Some(404)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
+        let transaction = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(125),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let txid = transaction.compute_txid();
+        let handler = Handler::new(Arc::new(Context::new()));
+        let raw = serialize(&transaction).to_lower_hex_string();
+        let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("broadcast route");
+        assert_eq!(broadcast.status, 200);
+
+        let response = route(&handler, &format!("/tx/{txid}"), "");
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body).expect("transaction json");
+        assert_eq!(value["status"], json!({"confirmed":false}));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn history_hydrates_only_the_requested_chain_page() {
+        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let transactions = (1_u64..=30)
+            .map(|value| {
+                transaction(
+                    None,
+                    TxOut {
+                        value: Amount::from_sat(value),
+                        script_pubkey: target.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let records = transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| ScriptHistoryRecord {
+                txid: transaction.compute_txid(),
+                height: u32::try_from(index + 1).expect("fixture height fits u32"),
+            })
+            .collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = Context::new();
+        for record in &records {
+            ctx.add_block(crate::context::BlockRecord::synthetic(
+                record.height,
+                Hash256::from_le_bytes(&[0; 32]),
+            ));
+        }
+        ctx.script_index = Some(Arc::new(StaticScriptIndex {
+            history: records,
+            unspent: Vec::new(),
+        }));
+        ctx.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+            transactions,
+            calls: Arc::clone(&calls),
+        }));
+
+        let response = history(&ctx, ScriptHash::new(&target), None, false);
+        assert_eq!(response.status, 200);
+        let values: Value = serde_json::from_slice(&response.body).expect("history response json");
+        assert_eq!(values.as_array().map(Vec::len), Some(CHAIN_PAGE));
+        assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE);
     }
 
     #[test]
@@ -1085,7 +1614,11 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
             },
         );
-        let ctx = Context::new();
+        let mut ctx = Context::new();
+        ctx.script_index = Some(Arc::new(StaticScriptIndex {
+            history: Vec::new(),
+            unspent: vec![confirmed],
+        }));
         ctx.mempool
             .write()
             .insert_entry(MempoolEntry::new(
@@ -1098,13 +1631,20 @@ mod tests {
             .expect("mempool entry accepted");
 
         let script_hash = ScriptHash::new(&target);
-        let activity = mempool_activity(&ctx, script_hash, &[confirmed]);
-        assert_eq!(activity, vec![spending]);
-        assert!(combined_utxos(&ctx, script_hash, &[confirmed]).is_empty());
-        assert_eq!(
-            spent_mempool(&activity, script_hash, &[confirmed]),
-            (1, 125)
+        let projection = Projection::new(&ctx);
+        let activity = projection
+            .script_activity(script_hash)
+            .expect("script activity resolves");
+        assert_eq!(activity.mempool, vec![spending]);
+        assert!(
+            activity
+                .utxos(&projection, script_hash)
+                .expect("UTXO overlay resolves")
+                .is_empty()
         );
+        let stats = activity.mempool_stats(script_hash);
+        assert_eq!(stats.spent_txo_count, 1);
+        assert_eq!(stats.spent_txo_sum, 125);
     }
 
     #[test]
@@ -1127,9 +1667,18 @@ mod tests {
         let mut ctx = Context::new();
         ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(parent)));
 
-        let rendered = tx_value(&ctx, &child, None).expect("prevout indexed");
-        assert_eq!(rendered["fee"], json!(25));
-        assert_eq!(rendered["vin"][0]["prevout"]["value"], json!(125));
+        let rendered = Projection::new(&ctx)
+            .transaction_value(&child, None)
+            .expect("prevout indexed");
+        assert_eq!(rendered.fee, 25);
+        assert_eq!(
+            rendered.vin[0]
+                .prevout
+                .as_ref()
+                .expect("rendered prevout")
+                .value,
+            125
+        );
     }
 
     #[test]

@@ -158,7 +158,7 @@ fn serve_connection(
             let response = if path.starts_with("/rest/") {
                 crate::rest::route(handler.context(), path, query, rest_enabled)
             } else {
-                crate::esplora::route(handler, path)
+                crate::esplora::route(handler, path, query)
             };
             write_response(reader.get_mut(), &response, keep_alive)?;
             if !keep_alive {
