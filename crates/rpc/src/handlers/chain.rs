@@ -3206,7 +3206,8 @@ mod stripped_size_tests {
         // header-derived field reads as zero.
         {
             let mut tree = ctx.block_tree.write();
-            let Ok(_id) = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active)
+            let Ok(_id) =
+                tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active)
             else {
                 panic!("seeding the fixture header must succeed");
             };

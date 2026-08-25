@@ -341,17 +341,35 @@ impl Mempool {
     /// The figure is Core's *shape*, not Core's number: it counts this node's
     /// structures, which are not Core's.
     ///
-    /// Counted here: the entry arena at its allocated capacity, each
-    /// transaction's own heap, and the four indexes keyed off those entries.
+    /// Counted here: the entry arena and the txid map at their **allocated
+    /// capacity**, each live transaction's own heap, and the indexes keyed off
+    /// those entries -- with the priority index answering for itself, because
+    /// it stores every entry twice.
+    ///
+    /// Capacity rather than length for the two that retain it. Neither the slab
+    /// nor the hash map hands its allocation back on removal or on `clear`, so
+    /// a pool that peaked and then drained is still holding the memory, and a
+    /// figure read off `len()` answers "nothing" at exactly the moment someone
+    /// is asking where it went.
     #[must_use]
     pub fn dynamic_memory_usage(&self) -> u64 {
         use core::mem::size_of;
 
+        // The arena is charged at **capacity**, not at length. `slab::Slab`
+        // keeps its backing allocation across removals and across `clear`, so a
+        // pool that grew to a million entries and then emptied still holds the
+        // arena -- and charging `len()` reported that retained memory as zero,
+        // which is exactly the moment an operator looks at `usage` to find out
+        // where it went. Core charges its own pool the same way: `mapTx`'s
+        // allocator does not return nodes to the OS either.
+        //
+        // Everything below stays keyed to live entries. They are payload terms
+        // -- the transactions and the index keys -- and a removed entry's
+        // payload really is gone.
         let live = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
-
-        // Per live entry, as in Core, whose term is
-        // `MallocUsage(sizeof(CTxMemPoolEntry) + 9 * sizeof(void*)) * mapTx.size()`.
-        let arena = live.saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
+        let arena = u64::try_from(self.entries.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
 
         let transactions = self
             .entries
@@ -370,7 +388,11 @@ impl Mempool {
         let spending = u64::try_from(self.spending.len())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(size_of::<(OutPoint, EntryId)>()).unwrap_or(0));
-        let pareto = live.saturating_mul(u64::try_from(size_of::<EntryId>()).unwrap_or(0));
+        // The priority index stores every entry twice -- once ordered by
+        // priority, once keyed by id so a removal need not search for what to
+        // remove -- so it answers for itself rather than being charged one
+        // `EntryId` per transaction here.
+        let pareto = self.pareto.dynamic_memory_usage();
 
         arena
             .saturating_add(transactions)
@@ -2428,6 +2450,7 @@ mod dynamic_memory_usage_tests {
         );
     }
 
+    /// Clearing releases the payload. It does not release the arena.
     #[test]
     fn usage_falls_when_the_pool_is_cleared() {
         let mut pool = pool_with(4, 64);
@@ -2435,6 +2458,101 @@ mod dynamic_memory_usage_tests {
         pool.clear();
         let after = pool.dynamic_memory_usage();
         assert!(after < before, "{after} vs {before}");
+    }
+
+    /// A grown-then-emptied pool still holds its arena, and still says so.
+    ///
+    /// `slab::Slab` keeps its backing allocation across removals and across
+    /// `clear`; nothing here hands it back. Charging the arena from `len()`
+    /// therefore reported that retained memory as **zero** at exactly the
+    /// moment an operator reads `usage` to find out where the memory went --
+    /// a pool that peaked at a million transactions and then drained answers
+    /// "nothing", while the process RSS says otherwise.
+    ///
+    /// The bound below is the arena alone: after `clear` there are no live
+    /// entries, so every other term is zero and what remains is the arena or
+    /// nothing.
+    #[test]
+    fn the_arena_is_charged_after_the_pool_is_cleared() {
+        use core::mem::size_of;
+
+        let mut pool = pool_with(64, 64);
+        pool.clear();
+
+        let capacity = u64::try_from(pool.entries.capacity()).unwrap_or(0);
+        assert!(
+            capacity > 0,
+            "the fixture must leave a grown arena behind, or this proves nothing"
+        );
+        let arena = capacity.saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));
+
+        let cleared = pool.dynamic_memory_usage();
+        // Strictly above the arena, not merely at it: the txid map is a hash
+        // map and keeps its capacity across `clear` for the same reason the
+        // slab does, so both retentions have to be counted or this fails.
+        assert!(
+            cleared > arena,
+            "the retained arena and txid map must both be counted: {cleared} vs {arena}"
+        );
+
+        // Against a pool that never grew, which is the difference the old
+        // accounting erased: both have no live entries, and only one of them is
+        // holding memory.
+        let fresh = Mempool::new(MempoolLimits {
+            max_total_bytes: 0,
+            ..MempoolLimits::default()
+        })
+        .dynamic_memory_usage();
+        assert_eq!(fresh, 0, "a pool that never grew holds nothing");
+        assert!(
+            cleared > fresh,
+            "a drained pool and a fresh one must not report the same footprint"
+        );
+    }
+
+    /// The priority index is charged for both copies of every entry.
+    ///
+    /// `ParetoFront` stores each entry in an ordered set *and* in a map from
+    /// id, because a removal is given an id and the set is keyed by priority.
+    /// Charging one `EntryId` per transaction, as this did, counted four bytes
+    /// where the index holds two whole keys -- an under-report on every
+    /// non-empty pool, growing with the pool.
+    ///
+    /// A lower bound, not a measurement: a B-tree leaves its nodes partly
+    /// filled, so the real footprint is above this and depends on insertion
+    /// order. The bound is what a test can state; that it scales with what is
+    /// stored is what the old term did not do.
+    #[test]
+    fn the_priority_index_is_charged_for_both_of_its_key_collections() {
+        use core::mem::size_of;
+
+        const COUNT: u64 = 32;
+
+        let mut pool = pool_with(u8::try_from(COUNT).unwrap_or(0), 64);
+        let index = pool.pareto.dynamic_memory_usage();
+
+        // The floor on what two key collections cost lives in `pareto.rs`,
+        // beside the private key type it is stated in terms of. This is the
+        // half that belongs here: that the pool charges what the index says.
+        let one_id_each = COUNT.saturating_mul(u64::try_from(size_of::<EntryId>()).unwrap_or(0));
+        assert!(
+            index > one_id_each.saturating_mul(4),
+            "the index holds two keys per entry, not one id: {index} vs {one_id_each}"
+        );
+
+        // What the pool's total actually attributes to the index: empty the
+        // index and leave everything else standing. Asserting only that the
+        // total is *at least* the index term would pass while the total was
+        // still computing its own figure from the entry count and ignoring the
+        // index entirely, which is the term this replaces.
+        let with_index = pool.dynamic_memory_usage();
+        pool.pareto = ParetoFront::new();
+        let without_index = pool.dynamic_memory_usage();
+        assert_eq!(
+            with_index.saturating_sub(without_index),
+            index,
+            "the pool must charge the index what the index says it costs"
+        );
     }
 }
 
