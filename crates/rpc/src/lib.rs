@@ -13,6 +13,8 @@ extern crate alloc;
 
 /// HTTP Basic and cookie authentication.
 pub mod auth;
+/// The Bitcoin Core compatibility manifest, and the checks that keep it true.
+pub mod compat;
 /// Dependency-injected RPC state.
 pub mod context;
 /// JSON-RPC error mapping.
@@ -25,6 +27,7 @@ pub mod rest;
 pub mod server;
 
 pub use auth::Auth;
+pub use compat::{MANIFEST_TOML, Status as CompatStatus};
 pub use context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, BlockRecord, ChainControl, ChainControlError,
     ChainStats, Context, FoldedBlockRecords, NetworkState, PruneResult, PruneService,
