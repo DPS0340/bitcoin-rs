@@ -30,7 +30,7 @@ pub use accept::{
 };
 pub use entry::{EntryId, MempoolEntry};
 pub use eviction::evict_lowest_fee_packages;
-pub use pareto::ParetoFront;
+pub use pareto::{ParetoFront, SortedParetoFront};
 pub use policy::{MempoolLimits, PolicyError};
 pub use pool::{Mempool, MempoolError, MempoolStats, ScriptHash};
 pub use rbf::{RbfError, ReplacementCandidate, ReplacementPlan};

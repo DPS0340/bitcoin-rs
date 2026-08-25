@@ -82,12 +82,18 @@ impl BlockTemplate {
         policy: &MiningPolicy,
         params: BlockTemplateParams,
     ) -> Result<Self, MiningError> {
-        // Select against the budget minus the coinbase reserve; `weightlimit`
-        // still advertises the full limit, as Core does.
-        let budget = params
+        // Select against the budgets minus the coinbase reserves; `weightlimit`
+        // and `sigoplimit` still advertise the full limits, as Core does. The
+        // miner is told what a block may contain, and the room its own coinbase
+        // needs -- weight for the transaction, sigops for a payout script that
+        // may carry CHECKSIG -- is kept out of what we hand it.
+        let weight_budget = params
             .max_weight
             .saturating_sub(crate::policy::DEFAULT_BLOCK_RESERVED_WEIGHT);
-        let selected = policy.select_transactions(mempool, budget, params.max_sigops);
+        let sigop_budget = params
+            .max_sigops
+            .saturating_sub(crate::policy::DEFAULT_COINBASE_RESERVED_SIGOPS);
+        let selected = policy.select_transactions(mempool, weight_budget, sigop_budget);
         Self::from_selected(mempool, selected, params)
     }
 
@@ -101,7 +107,7 @@ impl BlockTemplate {
             let entry = mempool
                 .entry(id)
                 .ok_or(MiningError::MissingMempoolEntry(id))?;
-            tx_positions.insert(entry.tx.compute_txid(), index + 1);
+            tx_positions.insert(entry.txid, index + 1);
         }
 
         let mut fees = 0_u64;
