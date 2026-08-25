@@ -619,7 +619,6 @@ pub fn run(mut config: Config) -> Result<()> {
     )?;
     let rpc_local_addr = rpc_server.local_addr()?;
     tracing::info!(addr = %rpc_local_addr, "rpc listener bound");
-    // TODO(rpc_smoke): cover the RPC listener once the test ergonomics improve.
     let rpc_shutdown = Arc::clone(&shutdown);
     let rpc_thread = std::thread::Builder::new()
         .name("bitcoin-rs-rpc".into())

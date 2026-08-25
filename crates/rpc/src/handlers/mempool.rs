@@ -229,7 +229,6 @@ fn sats_to_btc(sats: u64) -> f64 {
     bitcoin::Amount::from_sat(sats).to_btc()
 }
 
-// TODO(refactor): share fee-unit helpers via handlers::common.
 fn sat_per_kvb_to_btc(sat: u64) -> f64 {
     if let Ok(small) = u32::try_from(sat) {
         f64::from(small) / 100_000_000.0_f64
