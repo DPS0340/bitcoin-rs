@@ -61,7 +61,7 @@ impl HashPrefixRow {
     }
 }
 
-/// Electrum protocol scripthash, defined as SHA256(scriptPubKey bytes).
+/// Protocol-neutral SHA256 identifier for a scriptPubKey.
 #[derive(
     Copy,
     Clone,
@@ -84,12 +84,12 @@ pub struct ScriptHash {
 }
 
 impl ScriptHash {
-    /// Hashes a Bitcoin script into its Electrum scripthash.
+    /// Hashes a Bitcoin script into its script-index identifier.
     pub fn new(script: &bitcoin::Script) -> Self {
         Self::from_script_bytes(script.as_bytes())
     }
 
-    /// Hashes raw script bytes into their Electrum scripthash.
+    /// Hashes raw script bytes into their script-index identifier.
     pub fn from_script_bytes(script: &[u8]) -> Self {
         Self {
             bytes: sha256::Hash::hash(script).to_byte_array(),
@@ -106,7 +106,7 @@ impl ScriptHash {
         self.bytes
     }
 
-    /// Returns the electrs scan prefix.
+    /// Returns the compact index scan prefix.
     pub const fn prefix(self) -> HashPrefix {
         let bytes = self.bytes;
         [

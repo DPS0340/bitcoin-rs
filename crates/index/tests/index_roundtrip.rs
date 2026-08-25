@@ -417,17 +417,17 @@ fn format_version_rejection() -> Result<(), Box<dyn std::error::Error>> {
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'V'],
-        &[3, 0, 0, 0],
+        &[4, 0, 0, 0],
     )?;
     assert!(matches!(
         IndexWriter::open(store),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 3 })
+        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 4 })
     ));
     Ok(())
 }
 
 #[test]
-fn legacy_rows_rejected_and_reset_initializes_version() -> Result<(), Box<dyn std::error::Error>> {
+fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let mut indexer = Indexer::new(Arc::clone(&store));
     let body = read_fixture(0)?;
@@ -437,18 +437,33 @@ fn legacy_rows_rejected_and_reset_initializes_version() -> Result<(), Box<dyn st
         IndexWriter::open(Arc::clone(&store)),
         Err(IndexError::LegacyCursorlessIndex)
     ));
+    Ok(())
+}
 
-    IndexWriter::reset_legacy(store.as_ref())?;
-    let writer = IndexWriter::open(Arc::clone(&store))?;
-    assert!(writer.watermark()?.is_none());
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::BlockHeaders),
-        0
-    );
+#[test]
+fn reset_index_replaces_an_incompatible_derived_format() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryStore::default());
+    store.put(
+        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+        &[0x00, b'V'],
+        &2_u32.to_le_bytes(),
+    )?;
+    store.put(
+        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
+        b"old",
+        b"row",
+    )?;
+
+    IndexWriter::reset_index(store.as_ref())?;
+
     assert!(
-        store
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
+        IndexWriter::open(Arc::clone(&store))?
+            .watermark()?
+            .is_none()
+    );
+    assert_eq!(
+        store.count(bitcoin_rs_storage::ColumnFamily::TxConfirmed),
+        0
     );
     Ok(())
 }
@@ -459,7 +474,7 @@ fn invalid_watermark_rejected() -> Result<(), Box<dyn std::error::Error>> {
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'V'],
-        &[2, 0, 0, 0],
+        &[3, 0, 0, 0],
     )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
@@ -636,7 +651,7 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
-            electrum_history: None,
+            script_history: None,
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -644,21 +659,21 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
     assert_eq!(store.count(ColumnFamily::Spending), 0);
     assert_eq!(store.count(ColumnFamily::BlockHeaders), 1);
 
-    let electrum_block =
-        writer.prepare_block_for(IndexCapabilities::ELECTRUM_HISTORY, 0, hash, &body)?;
+    let script_index_block =
+        writer.prepare_block_for(IndexCapabilities::SCRIPT_HISTORY, 0, hash, &body)?;
     assert_eq!(
-        electrum_block.row_count, 2,
+        script_index_block.row_count, 2,
         "funding row plus shared block identity"
     );
-    let mut electrum_batch = PreparedBatch::new(limits);
-    assert!(electrum_batch.try_push(electrum_block).is_ok());
-    writer.commit_forward(electrum_batch)?;
+    let mut script_index_batch = PreparedBatch::new(limits);
+    assert!(script_index_batch.try_push(script_index_block).is_ok());
+    writer.commit_forward(script_index_batch)?;
 
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
-            electrum_history: Some(watermark),
+            script_history: Some(watermark),
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -689,42 +704,15 @@ fn aligned_capabilities_share_one_atomic_commit() -> Result<(), Box<dyn std::err
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
-            electrum_history: Some(watermark),
+            script_history: Some(watermark),
         }
     );
     Ok(())
 }
 
 #[test]
-fn version_one_watermark_migrates_to_both_capabilities() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    let watermark = IndexWatermark {
-        height: 42,
-        hash: [0x42; 32],
-    };
-    store.put(ColumnFamily::UtxoMeta, &[0x00, b'V'], &[1, 0, 0, 0])?;
-    store.put(ColumnFamily::UtxoMeta, &[0x00, b'W'], &watermark.to_bytes())?;
-
-    let writer = IndexWriter::open(Arc::clone(&store))?;
-
-    assert_eq!(
-        writer.watermarks()?,
-        bitcoin_rs_index::IndexWatermarks {
-            tx_lookup: Some(watermark),
-            electrum_history: Some(watermark),
-        }
-    );
-    assert_eq!(
-        store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?,
-        Some(vec![2, 0, 0, 0])
-    );
-    assert!(store.get(ColumnFamily::UtxoMeta, &[0x00, b'W'])?.is_none());
-    Ok(())
-}
-
-#[test]
-fn electrum_reset_preserves_tx_lookup_and_shared_identity() -> Result<(), Box<dyn std::error::Error>>
-{
+fn script_index_reset_preserves_tx_lookup_and_shared_identity()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
@@ -737,13 +725,13 @@ fn electrum_reset_preserves_tx_lookup_and_shared_identity() -> Result<(), Box<dy
     assert!(batch.try_push(block).is_ok());
     writer.commit_forward(batch)?;
 
-    writer.reset_capabilities(IndexCapabilities::ELECTRUM_HISTORY)?;
+    writer.reset_capabilities(IndexCapabilities::SCRIPT_HISTORY)?;
 
     assert_eq!(
         writer.watermarks()?,
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(IndexWatermark { height: 0, hash }),
-            electrum_history: None,
+            script_history: None,
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -776,12 +764,8 @@ fn rollback_preserves_shared_ancestors_for_a_disabled_capability()
     writer.commit_rollback_one_for(IndexCapabilities::TX_LOOKUP, None, &body0)?;
     assert_eq!(store.count(ColumnFamily::BlockHeaders), 2);
 
-    writer.commit_rollback_one_for(
-        IndexCapabilities::ELECTRUM_HISTORY,
-        Some(watermark0),
-        &body1,
-    )?;
-    writer.commit_rollback_one_for(IndexCapabilities::ELECTRUM_HISTORY, None, &body0)?;
+    writer.commit_rollback_one_for(IndexCapabilities::SCRIPT_HISTORY, Some(watermark0), &body1)?;
+    writer.commit_rollback_one_for(IndexCapabilities::SCRIPT_HISTORY, None, &body0)?;
     assert_eq!(store.count(ColumnFamily::BlockHeaders), 0);
     Ok(())
 }
@@ -824,13 +808,13 @@ fn open_resumes_interrupted_capability_reset() -> Result<(), Box<dyn std::error:
 
     let mut interrupted = store.new_batch();
     interrupted.put(ColumnFamily::UtxoMeta, &[0x00, b'R'], &[0b10]);
-    interrupted.delete(ColumnFamily::UtxoMeta, &[0x00, b'E']);
+    interrupted.delete(ColumnFamily::UtxoMeta, &[0x00, b'S']);
     store.write_durable(interrupted)?;
 
     let writer = IndexWriter::open(Arc::clone(&store))?;
 
     assert!(writer.watermarks()?.tx_lookup.is_some());
-    assert!(writer.watermarks()?.electrum_history.is_none());
+    assert!(writer.watermarks()?.script_history.is_none());
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
     assert_eq!(store.count(ColumnFamily::Funding), 0);
     assert_eq!(store.count(ColumnFamily::Spending), 0);
@@ -889,44 +873,17 @@ fn batch_caps_admit_oversized_first_block() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn reset_legacy_deletes_many_rows_in_batches() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    for i in 0..2000_u32 {
-        let mut header = [0_u8; 80];
-        header[..4].copy_from_slice(&i.to_le_bytes());
-        store.put(bitcoin_rs_storage::ColumnFamily::BlockHeaders, &header, &[])?;
-    }
-
-    IndexWriter::reset_legacy(store.as_ref())?;
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::BlockHeaders),
-        0
-    );
-    assert!(
-        store
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
-    );
-    assert!(
-        store
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'W'])?
-            .is_none()
-    );
-    Ok(())
-}
-
-#[test]
 fn format_version_requires_exact_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
-    // Extra trailing byte must be rejected even though the prefix is version 1.
+    // Extra trailing byte must be rejected even though the prefix is version 3.
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'V'],
-        &[1, 0, 0, 0, 0],
+        &[3, 0, 0, 0, 0],
     )?;
     assert!(matches!(
         IndexWriter::open(store),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 1 })
+        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 3 })
     ));
     Ok(())
 }
@@ -941,18 +898,19 @@ fn commit_forward_accepts_terminal_height() -> Result<(), Box<dyn std::error::Er
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'V'],
-        &[1, 0, 0, 0],
+        &[3, 0, 0, 0],
     )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'W'],
+        &[0x00, b'T'],
         &current.to_bytes(),
     )?;
 
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
     let expected_hash = block_hash(&body);
-    let block = writer.prepare_block(u32::MAX, expected_hash, &body)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::TX_LOOKUP, u32::MAX, expected_hash, &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -980,17 +938,18 @@ fn commit_forward_rejects_height_overflow() -> Result<(), Box<dyn std::error::Er
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'V'],
-        &[1, 0, 0, 0],
+        &[3, 0, 0, 0],
     )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'W'],
+        &[0x00, b'T'],
         &overflow.to_bytes(),
     )?;
 
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
-    let block = writer.prepare_block(0, block_hash(&body), &body)?;
+    let block =
+        writer.prepare_block_for(IndexCapabilities::TX_LOOKUP, 0, block_hash(&body), &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -1063,70 +1022,5 @@ fn redb_snapshot_preserves_position_values() -> Result<(), Box<dyn std::error::E
         TxPositionValue::decode(&transaction_rows.rows[0].value).map(<[TxPosition]>::len),
         Some(1)
     );
-    Ok(())
-}
-
-#[cfg(feature = "redb")]
-#[test]
-fn redb_cursorless_header_reset_in_bounded_batches() -> Result<(), Box<dyn std::error::Error>> {
-    const MAX_SCAN: bitcoin_rs_storage::PrefixScanLimit = bitcoin_rs_storage::PrefixScanLimit {
-        max_rows: 10_000,
-        max_bytes: 10_000_000,
-    };
-    let temp = tempfile::TempDir::new()?;
-    let store = Arc::new(bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?);
-
-    // Seed >1000 cursorless fixed rows in one write.
-    let mut batch = store.new_batch();
-    for height in 0..1001_u32 {
-        let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&height.to_le_bytes());
-        batch.put(bitcoin_rs_storage::ColumnFamily::BlockHeaders, &header, b"");
-    }
-    for counter in 1..=3_u32 {
-        let mut key = [0u8; 12];
-        key[0..4].copy_from_slice(&counter.to_le_bytes());
-        batch.put(bitcoin_rs_storage::ColumnFamily::TxConfirmed, &key, b"");
-        batch.put(bitcoin_rs_storage::ColumnFamily::Funding, &key, b"");
-        batch.put(bitcoin_rs_storage::ColumnFamily::Spending, &key, b"");
-    }
-    store.write(batch)?;
-
-    // IndexWriter rejects the legacy cursorless format.
-    assert!(matches!(
-        IndexWriter::open(Arc::clone(&store)),
-        Err(IndexError::LegacyCursorlessIndex)
-    ));
-
-    // reset_legacy removes every index row in bounded batches, then writes version metadata.
-    IndexWriter::reset_legacy(store.as_ref())?;
-
-    // After reset, opening succeeds with no watermark.
-    let writer = IndexWriter::open(Arc::clone(&store))?;
-    assert!(writer.watermark()?.is_none());
-
-    // All index rows are gone.
-    for cf in [
-        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
-        bitcoin_rs_storage::ColumnFamily::Funding,
-        bitcoin_rs_storage::ColumnFamily::Spending,
-        bitcoin_rs_storage::ColumnFamily::BlockHeaders,
-    ] {
-        let scan = store.as_ref().scan_prefix_bounded(cf, &[], MAX_SCAN)?;
-        assert!(
-            scan.rows.is_empty(),
-            "{cf:?} still has {} rows after reset",
-            scan.rows.len()
-        );
-    }
-
-    // The format-version key exists in UtxoMeta.
-    assert!(
-        store
-            .as_ref()
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
-    );
-
     Ok(())
 }

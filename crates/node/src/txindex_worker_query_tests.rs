@@ -8,7 +8,7 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_index::{ScriptHashRow, SpendingPrefixRow, TxidRow};
-use bitcoin_rs_rpc::BlockRecord;
+use bitcoin_rs_rpc::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
 
 use super::*;
@@ -23,13 +23,13 @@ struct ScanResponse {
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
-    electrum_watermark: ElectrumWatermark,
+    script_history_watermark: ScriptHistoryWatermark,
     scans: Vec<ScanResponse>,
     aba: Option<Arc<AbaMutation>>,
 }
 
 #[derive(Clone, Copy)]
-enum ElectrumWatermark {
+enum ScriptHistoryWatermark {
     MatchTx,
     Override(Option<IndexWatermark>),
 }
@@ -92,9 +92,9 @@ impl TxIndexSnapshot for QuerySnapshot {
     ) -> Result<Option<IndexWatermark>, IndexError> {
         Ok(match capability {
             IndexCapability::TxLookup => Some(self.watermark),
-            IndexCapability::ElectrumHistory => match self.electrum_watermark {
-                ElectrumWatermark::MatchTx => Some(self.watermark),
-                ElectrumWatermark::Override(watermark) => watermark,
+            IndexCapability::ScriptHistory => match self.script_history_watermark {
+                ScriptHistoryWatermark::MatchTx => Some(self.watermark),
+                ScriptHistoryWatermark::Override(watermark) => watermark,
             },
         })
     }
@@ -206,12 +206,12 @@ impl BlockBodySource for CountingBodySource {
 
 impl QueryFixture {
     fn new(config: FixtureConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_electrum_watermark(config, ElectrumWatermark::MatchTx)
+        Self::new_with_script_history_watermark(config, ScriptHistoryWatermark::MatchTx)
     }
 
-    fn new_with_electrum_watermark(
+    fn new_with_script_history_watermark(
         config: FixtureConfig,
-        electrum_watermark: ElectrumWatermark,
+        script_history_watermark: ScriptHistoryWatermark,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip_id = tree.insert_header(config.block.header, NodeStatus::HeaderValid)?;
@@ -250,7 +250,7 @@ impl QueryFixture {
         let reader = Arc::new(QueryReader {
             snapshot: QuerySnapshot {
                 watermark,
-                electrum_watermark,
+                script_history_watermark,
                 scans: config.scans,
                 aba,
             },
@@ -270,11 +270,11 @@ impl QueryFixture {
 }
 
 #[test]
-fn tx_queries_can_be_ready_while_electrum_history_is_backfilling()
+fn tx_queries_can_be_ready_while_script_history_is_backfilling()
 -> Result<(), Box<dyn std::error::Error>> {
     let block = genesis_block(Network::Regtest);
     let txid = block.txdata[0].compute_txid();
-    let fixture = QueryFixture::new_with_electrum_watermark(
+    let fixture = QueryFixture::new_with_script_history_watermark(
         FixtureConfig {
             block,
             retain_body: true,
@@ -282,15 +282,15 @@ fn tx_queries_can_be_ready_while_electrum_history_is_backfilling()
             aba_trigger: None,
             watermark: None,
         },
-        ElectrumWatermark::Override(None),
+        ScriptHistoryWatermark::Override(None),
     )?;
 
     assert!(TxIndexQuery::transaction(&fixture.engine, &txid)?.is_none());
     assert!(matches!(
         fixture
             .engine
-            .confirmed_history_snapshot(ScriptHash::from_script_bytes(&[])),
-        Err(ElectrumError::Unavailable(_))
+            .history_snapshot(ScriptHash::from_script_bytes(&[])),
+        Err(TxQueryError::Retry)
     ));
     Ok(())
 }
@@ -568,10 +568,9 @@ fn funding_history_uses_positioned_range_without_full_body_load()
         bytes: bitcoin::consensus::serialize(&block),
     }));
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(snapshot.unspent, snapshot.history);
     assert_eq!(range_calls.load(Ordering::Acquire), 1);
     assert_eq!(full_calls.load(Ordering::Acquire), 0);
     Ok(())
@@ -616,10 +615,9 @@ fn wrong_positioned_funding_falls_back_to_complete_block() -> Result<(), Box<dyn
         bytes: bitcoin::consensus::serialize(&block),
     }));
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(snapshot.unspent, snapshot.history);
     assert_eq!(range_calls.load(Ordering::Acquire), 1);
     assert_eq!(full_calls.load(Ordering::Acquire), 1);
     Ok(())
@@ -794,18 +792,17 @@ fn unspent_outputs_reject_aggregate_scan_budget_exhaustion()
 
     assert!(matches!(
         fixture.engine.unspent_outputs(scripthash),
-        Err(ElectrumError::Unavailable(_))
+        Err(TxQueryError::Unavailable(_))
     ));
     Ok(())
 }
 
 #[test]
-fn confirmed_history_snapshot_matches_history_and_unspent_for_funding()
+fn confirmed_history_snapshot_includes_funding_transaction()
 -> Result<(), Box<dyn std::error::Error>> {
     let block = genesis_block(Network::Regtest);
     let txid = block.txdata[0].compute_txid();
     let script = block.txdata[0].output[0].script_pubkey.clone();
-    let value = block.txdata[0].output[0].value.to_sat();
     let scripthash = ScriptHash::new(&script);
     let funding_row = ScriptHashRow::row(scripthash, 0).to_db_row().to_vec();
     let fixture = QueryFixture::new(FixtureConfig {
@@ -821,24 +818,15 @@ fn confirmed_history_snapshot_matches_history_and_unspent_for_funding()
         watermark: None,
     })?;
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
-    assert_eq!(snapshot.unspent.len(), 1);
-
-    let expected = bitcoin_rs_electrum::methods::HistoryRecord {
-        txid,
-        height: 0,
-        value,
-        vout: 0,
-        spent: false,
-    };
+    let expected = ScriptHistoryRecord { txid, height: 0 };
     assert_eq!(snapshot.history[0], expected);
-    assert_eq!(snapshot.unspent[0], expected);
     Ok(())
 }
 
 #[test]
-fn confirmed_history_snapshot_omits_spent_output_from_unspent()
+fn confirmed_history_snapshot_includes_the_spending_transaction()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut block = genesis_block(Network::Regtest);
     let coinbase = &mut block.txdata[0];
@@ -893,23 +881,21 @@ fn confirmed_history_snapshot_omits_spent_output_from_unspent()
         watermark: None,
     })?;
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
-    assert!(snapshot.unspent.is_empty());
+    let spender = fixture
+        .engine
+        .spender(OutPoint { txid, vout: 0 })?
+        .ok_or_else(|| std::io::Error::other("indexed spender missing"))?;
+    assert_eq!(spender.txid, spend_txid);
+    assert_eq!(spender.height, 0);
+    assert_eq!(spender.vin, 0);
+
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 2);
 
-    let funding_record = bitcoin_rs_electrum::methods::HistoryRecord {
-        txid,
-        height: 0,
-        value,
-        vout: 0,
-        spent: false,
-    };
-    let spending_record = bitcoin_rs_electrum::methods::HistoryRecord {
+    let funding_record = ScriptHistoryRecord { txid, height: 0 };
+    let spending_record = ScriptHistoryRecord {
         txid: spend_txid,
         height: 0,
-        value: 0,
-        vout: 0,
-        spent: true,
     };
     assert!(snapshot.history.contains(&funding_record));
     assert!(snapshot.history.contains(&spending_record));
@@ -961,8 +947,8 @@ fn confirmed_history_snapshot_retries_after_aba_on_spending_scan()
     })?;
 
     assert!(matches!(
-        fixture.engine.confirmed_history_snapshot(scripthash),
-        Err(ElectrumError::Unavailable(_))
+        fixture.engine.history_snapshot(scripthash),
+        Err(TxQueryError::Retry)
     ));
     Ok(())
 }
