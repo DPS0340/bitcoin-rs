@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use bitcoin::hashes::{Hash as _, sha256d};
+use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 use bitcoin_rs_primitives::Hash256;
 use hashbrown::HashMap;
@@ -36,9 +36,17 @@ impl ScriptHash {
     /// Hashes a script into an index key.
     #[must_use]
     pub fn from_script(script: &ScriptBuf) -> Self {
-        let hash = sha256d::Hash::hash(script.as_bytes());
+        let hash = sha256::Hash::hash(script.as_bytes());
         Self {
             hash: Hash256::from_le_bytes(hash.as_byte_array()),
+        }
+    }
+
+    /// Creates a script hash from the standard SHA256 digest bytes.
+    #[must_use]
+    pub const fn from_byte_array(bytes: [u8; 32]) -> Self {
+        Self {
+            hash: Hash256::from_le_bytes(&bytes),
         }
     }
 }

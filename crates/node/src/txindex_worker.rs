@@ -1,7 +1,7 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
 //! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
-//! ScriptIndex enables an index capability. The runtime holds a process-local revision counter and a bounded
+//! `ScriptIndex` enables an index capability. The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The single writer may atomically
 //! publish a complete formerly authoritative prefix while the applied chain
@@ -9,7 +9,7 @@
 //! the next worker pass repairs it. Independent durable capability watermarks
 //! let aligned row families share one parse and commit while divergent families
 //! backfill separately. A snapshot-gated query engine serves
-//! `bitcoin_rs_rpc::TxIndexQuery` and the generic `ScriptIndexQuery`
+//! `bitcoin_rs_rpc::TxIndexQuery` and the generic [`ScriptIndexQuery`]
 //! without raw index mutex paths.
 
 use std::sync::Arc;
@@ -1077,7 +1077,7 @@ impl QueryBudget {
 
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
-/// Implements `bitcoin_rs_rpc::TxIndexQuery` and `ScriptIndexQuery` as the
+/// Implements `bitcoin_rs_rpc::TxIndexQuery` and [`ScriptIndexQuery`] as the
 /// only public read paths for the transaction index. Every query runs against
 /// one typed point-in-time snapshot, captures
 /// health/shutdown/revision/tip before and after work, and returns typed
@@ -1717,6 +1717,7 @@ mod body_reader_tests {
     use bitcoin::Network;
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin_rs_chain::NodeStatus;
+    use bitcoin_rs_storage::StorageError;
 
     use super::*;
     use crate::apply::{PruneBodyReader, PruneBodyStore};

@@ -441,6 +441,34 @@ fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn reset_index_replaces_an_incompatible_derived_format() -> Result<(), Box<dyn std::error::Error>> {
+    let store = Arc::new(MemoryStore::default());
+    store.put(
+        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
+        &[0x00, b'V'],
+        &2_u32.to_le_bytes(),
+    )?;
+    store.put(
+        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
+        b"old",
+        b"row",
+    )?;
+
+    IndexWriter::reset_index(store.as_ref())?;
+
+    assert!(
+        IndexWriter::open(Arc::clone(&store))?
+            .watermark()?
+            .is_none()
+    );
+    assert_eq!(
+        store.count(bitcoin_rs_storage::ColumnFamily::TxConfirmed),
+        0
+    );
+    Ok(())
+}
+
+#[test]
 fn invalid_watermark_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     store.put(

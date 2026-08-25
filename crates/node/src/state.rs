@@ -738,7 +738,21 @@ fn open_writer<S>(
 where
     S: bitcoin_rs_storage::KvStore,
 {
-    bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
+    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
+        Ok(writer) => Ok(writer),
+        Err(
+            error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
+            | bitcoin_rs_index::IndexError::UnsupportedTxIndexFormatVersion { .. }),
+        ) => {
+            tracing::warn!(
+                %error,
+                "resetting incompatible derived transaction index for rebuild"
+            );
+            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref())?;
+            bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn open_tx_index_store<S>(

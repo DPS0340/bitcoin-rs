@@ -1991,6 +1991,48 @@ impl<S: KvStore> IndexWriter<S> {
         self.indexer.watermarks()
     }
 
+    /// Deletes every derived index row in bounded batches and initializes the
+    /// current format marker so startup can rebuild it from the active chain.
+    ///
+    /// This is intentionally limited to derived `TxLookup`/`ScriptIndex` data;
+    /// it never touches the UTXO set or block bodies.
+    pub fn reset_index(store: &S) -> Result<(), IndexError> {
+        for cf in [
+            ColumnFamily::TxConfirmed,
+            ColumnFamily::Funding,
+            ColumnFamily::Spending,
+            ColumnFamily::BlockHeaders,
+        ] {
+            loop {
+                let scan = store.scan_prefix_bounded(cf, &[], RESET_SCAN_LIMIT)?;
+                if scan.rows.is_empty() {
+                    break;
+                }
+                let mut batch = store.new_batch();
+                for (key, _) in scan.rows {
+                    batch.delete(cf, &key);
+                }
+                store.write_deferred(batch)?;
+                if scan.complete {
+                    break;
+                }
+            }
+        }
+        store.flush()?;
+
+        let mut batch = store.new_batch();
+        batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
+        batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
+        batch.delete(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY);
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
+        store.write_durable(batch)?;
+        Ok(())
+    }
+
     /// Marks selected derived rows unavailable, deletes them in bounded batches,
     /// and leaves their durable cursors empty so the worker can rebuild from genesis.
     ///

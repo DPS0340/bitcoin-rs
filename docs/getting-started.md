@@ -94,9 +94,9 @@ Address and scripthash routes return `503` until `--scriptindex` catches up, or
 when it is disabled. These index modes are incompatible with pruning
 because backfill and reorg repair require durable block bodies.
 
-The ScriptIndex format does not migrate an existing legacy index. Remove
-the old derived index data and let the node rebuild it before enabling
-`--scriptindex`.
+The ScriptIndex format does not migrate an existing legacy index. At startup,
+the node deletes incompatible derived index data in bounded batches and rebuilds
+it before exposing `--scriptindex` or `--txindex` queries.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style
