@@ -1127,7 +1127,58 @@ mod peer_counter_tests {
         );
     }
 
-    /// An even sample count takes the upper middle, as Core does.
+    /// Offsets at the extremes of `i64` are reported, not halved.
+    ///
+    /// The even-count branch used to average the two middle samples as
+    /// `lower.saturating_add(upper) / 2`. With both near `i64::MAX` the sum
+    /// saturates *before* the division, so the answer comes back at roughly
+    /// half the magnitude -- and these are values a peer can simply put in its
+    /// version message, so an attacker controlling two outbound peers could
+    /// pick what the node reported about its own clock.
+    ///
+    /// There is no averaging any more: Core indexes `sorted[size / 2]` and so
+    /// does this, which removes the arithmetic rather than making it
+    /// overflow-safe. This test is what says the class is gone rather than
+    /// relocated -- an extreme value must arrive at the output unchanged, at
+    /// both ends of the range.
+    #[test]
+    fn extreme_offsets_are_reported_at_their_own_magnitude() {
+        for extreme in [i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1] {
+            // Six samples, so the even-count path is the one taken, with both
+            // middle values at the extreme.
+            let ctx = context_with(outbound_peers(&[
+                i64::MIN,
+                i64::MIN,
+                extreme,
+                extreme,
+                i64::MAX,
+                i64::MAX,
+            ]));
+            let reported = getnetworkinfo(&ctx, &json!(null))
+                .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"))
+                .get("timeoffset")
+                .and_then(JsonValueTrait::as_i64);
+
+            // Sorted, `[MIN, MIN, extreme, extreme, MAX, MAX]` puts an extreme
+            // at index 3 whichever way `extreme` sorts, except when it *is* an
+            // endpoint -- in which case the value at index 3 is that endpoint
+            // too. Either way the answer is a sample, never a computed number.
+            let Some(reported) = reported else {
+                panic!("timeoffset missing for {extreme}");
+            };
+            assert!(
+                [i64::MIN, i64::MAX, extreme].contains(&reported),
+                "{reported} is not one of the offsets any peer reported"
+            );
+            assert_ne!(
+                reported,
+                extreme / 2,
+                "an extreme offset must not come back halved"
+            );
+        }
+    }
+
+    /// An even sample count takes the upper middle, as Core does.    /// An even sample count takes the upper middle, as Core does.
     ///
     /// Core indexes `sorted[size / 2]` whatever the parity, and says why it
     /// does not interpolate: "approximate median is good enough, keep it
