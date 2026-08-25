@@ -2,11 +2,11 @@
 mod enabled {
     use bitcoin::consensus::encode;
     use bitcoin::{Network, OutPoint, TxOut};
-    use bitcoin_rs_primitives::{Block, Tx};
+    use bitcoin_rs_primitives::Tx;
     use bitcoin_rs_script::VerifyFlags;
 
     use crate::ConsensusError;
-    use crate::rust_path::{BlockState, TipState, UtxoView};
+    use crate::rust_path::UtxoView;
 
     /// Verifies every input script of `tx` through bitcoinkernel.
     ///
@@ -184,20 +184,6 @@ mod enabled {
             let _ = &self.ctx;
             let spent = collect_spent_outputs(tx, prevouts)?;
             verify_tx_scripts(&tx.0, &spent, flags)
-        }
-
-        /// Connects block-level rules through the kernel path shape.
-        pub fn connect_block(
-            &self,
-            block: &Block,
-            prev_tip: &TipState,
-        ) -> Result<BlockState, ConsensusError> {
-            let _ = &self.ctx;
-            Ok(BlockState {
-                height: prev_tip.next_height(),
-                block_hash: block.0.block_hash(),
-                tx_count: block.0.txdata.len(),
-            })
         }
     }
 

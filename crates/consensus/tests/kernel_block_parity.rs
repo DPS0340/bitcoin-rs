@@ -15,9 +15,9 @@
 //! ## The differential is interpreter-vs-kernel, not kernel-vs-kernel (ADV-1)
 //!
 //! The Rust side of the differential calls `bitcoin_rs_script::Interpreter`
-//! **directly**. It must never route through `RustValidator::verify_tx` /
-//! `verify_transaction`: under `feature = "kernel"` those dispatch script
-//! verdicts to the very same `kernel::verify_tx_scripts` as the kernel side
+//! **directly**. It must not route through `verify_transaction`: under
+//! `feature = "kernel"`, that function dispatches script verdicts to the same
+//! `kernel::verify_tx_scripts` path as the kernel side
 //! (by design, per R2/KTD5 of plan 2026-06-10-001), which would silently turn
 //! this differential into kernel-vs-kernel and make it unable to detect any
 //! interpreter divergence. That cfg structure is production-correct and is
@@ -54,12 +54,12 @@
 //! ## Block-level parity (tracking note, KTD1)
 //!
 //! An earlier scaffold here carried a `block_verdict_parity` test comparing
-//! `RustValidator::connect_block` against `KernelContext::connect_block`. It
-//! was deleted, not env-gated: the kernel side it needed
-//! (`ChainstateManager::process_block`) is **rejected** by KTD1 of plan
-//! 2026-06-10-001 (kernel-owned chainstate would duplicate storage and invert
-//! the storage-equivalence gate), and the in-tree `connect_block` is a stub
-//! that cannot reject — the comparison could never red. Re-entry condition:
+//! portable and kernel block-connection wrappers. It was deleted, not
+//! env-gated: the kernel side it needed (`ChainstateManager::process_block`) is
+//! **rejected** by KTD1 of plan 2026-06-10-001 because kernel-owned chainstate
+//! would duplicate storage and invert the storage-equivalence gate. The
+//! synthetic connection wrappers were later deleted as dead code. Re-entry
+//! condition:
 //! if the KTD1 full-block alternative is ever adopted, reintroduce block-level
 //! accept/reject parity against `process_block`. Until then, block-level
 //! coverage rests on the portable block rules tests plus the R3 0→150k
@@ -136,8 +136,8 @@ fn kernel_result(
 
 /// Rust-interpreter verdict for every input of `tx`, calling
 /// `bitcoin_rs_script::Interpreter` directly. Deliberately does NOT go through
-/// `RustValidator::verify_tx` / `verify_transaction`: under the kernel feature
-/// those route script verdicts into the kernel (see module docs, ADV-1), which
+/// `verify_transaction`: under the kernel feature that function routes script
+/// verdicts into the kernel (see module docs, ADV-1), which
 /// would make the differential kernel-vs-kernel. Returns the first failing
 /// input's error, `Ok` when all inputs pass.
 fn interpreter_result(

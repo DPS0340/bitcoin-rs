@@ -9,12 +9,11 @@ Rule checks live in small per-subject modules (`bip9`, `bip30`, `bip34`, `bip65`
 `bip66`, `bip68`, `bip112`, `bip113`, `bip141`, `bip143`, `bip341`, `bip342`), surfaced
 through the `verify_transaction` family (with median-time-past and borrowed variants),
 `is_final_tx`, and the `verify_block_rules` family including Merkle-root verification.
-`connect_block_dual_path` connects a block through both the kernel and `RustValidator`
-and returns the kernel verdict, logging any disagreement between the two.
 `kernel::KernelBlock` parses a serialized block exactly once with
 `bitcoinkernel::Block::new`, yielding the txids and borrowed transaction objects that
-script preparation reuses; the portable side is `RustValidator` over a `UtxoView`,
-producing a `BlockState` from the previous `TipState`. BIP9 activation is `compute_state`
+script preparation reuses, and `kernel::KernelContext::verify_tx` verifies a
+transaction's inputs through bitcoinkernel over any `UtxoView`. BIP9 activation is
+`compute_state`
 over a `DeploymentContext` with `DeploymentParams`. Consensus bounds are exported as
 `MAX_SCRIPT_SIZE`, `MAX_MONEY`, and `MAX_BLOCK_SIGOPS_COST`; failures are `ConsensusError`
 variants.

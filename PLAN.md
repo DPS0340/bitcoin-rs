@@ -250,17 +250,17 @@ git commit -am "feat(primitives): hash + outpoint + tx + block + sighash" -m "Op
 ### Task 2: `crates/consensus` — kernel-authoritative validator + parallel Rust path
 
 **Files:**
-- Create: `crates/consensus/src/{lib,kernel,rust_path,verify_tx,verify_block,connect_block,bip9,bip30,bip34,bip65,bip66,bip68,bip112,bip113,bip141,bip143,bip341,bip342}.rs`
+- Create: `crates/consensus/src/{lib,kernel,rust_path,verify_tx,verify_block,bip9,bip30,bip34,bip65,bip66,bip68,bip112,bip113,bip141,bip143,bip341,bip342}.rs`
 - Test: `crates/consensus/tests/{kernel_parity,vectors}.rs`
 - Vendor: `crates/consensus/tests/vectors/{tx_valid,tx_invalid,script_tests,sighash}.json` (from Bitcoin Core `src/test/data/`)
 
 - [ ] **Step 1: Vendor consensus vectors.** Copy from `~/dev/bitcoin-rs/bitcoin/src/test/data/{tx_valid,tx_invalid,script_tests,sighash}.json`. Commit verbatim with original SHA-256 documented in the commit body.
 
-- [ ] **Step 2: `crates/consensus/src/kernel.rs`** — thin wrapper around `bitcoinkernel::*`: `KernelContext::new(network)`, `KernelContext::verify_tx(&Tx, &UtxoView, height, flags)`, `KernelContext::connect_block(&Block, &PrevTip)`. Errors map to `thiserror`-tagged `ConsensusError`.
+- [x] **Step 2: kernel transaction verification.** `KernelContext::new` and `KernelContext::verify_tx` remain the live bitcoinkernel harness Interface. The synthetic block-connection method was deleted after KTD1 rejected kernel-owned chainstate.
 
-- [ ] **Step 3: `crates/consensus/src/rust_path.rs`** — `RustValidator { /* sigops counter, BIP9 state, BIP30 dupe-tx table, etc */ }`. Mirrors kernel's contract. Internally uses `crates/script` for script verification, `crates/primitives` for sighash, `rustreexo` for utreexo-mode proof verification.
+- [x] **Step 3: portable verification.** Stateless free functions in `verify_tx` and `verify_block` own portable validation; `rust_path` retains only the shared UTXO and tip-state contracts. The zero-caller object wrapper was deleted.
 
-- [ ] **Step 4: `connect_block`** — runs *both* kernel and Rust path. On disagreement: log structured error with both error states, the offending block hash, height, and the disagreeing assertion; *return kernel's verdict*. CI hard-fails on any disagreement during the first 100 000 blocks of mainnet IBD.
+- [x] **Step 4: reject dual block connection.** KTD1 rejected the kernel/Rust `connect_block` comparison because kernel-owned chainstate would duplicate storage and invert the storage-equivalence gate. The dead dual-path module and both synthetic connection methods were deleted.
 
 - [ ] **Step 5: BIP implementations.**
   - BIP9 versionbits state machine; thresholds + period from `Network`.

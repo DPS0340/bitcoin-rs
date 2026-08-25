@@ -39,8 +39,6 @@ pub mod bip9;
 /// Non-terminal CHECKSIG census checkpoint ABI wrapper.
 #[cfg(feature = "checksig-census")]
 pub mod census_checkpoint;
-/// Dual-path block connection.
-pub mod connect_block;
 /// Feature-gated bitcoinkernel wrapper.
 pub mod kernel;
 /// Portable Rust validator.
@@ -53,8 +51,7 @@ pub mod verify_block;
 pub mod verify_tx;
 
 pub use bip9::{DeploymentContext, DeploymentParams, DeploymentState, compute_state};
-pub use connect_block::connect_block_dual_path;
-pub use rust_path::{BlockState, RustValidator, TipState, UtxoView};
+pub use rust_path::{TipState, UtxoView};
 pub use verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_borrowed,
     verify_block_rules_borrowed_contextual, verify_block_rules_borrowed_contextual_with_txids,
