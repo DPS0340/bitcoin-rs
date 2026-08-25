@@ -45,8 +45,10 @@ const MEMPOOL_PAGE: usize = 50;
 #[must_use]
 pub fn route(handler: &Handler, path: &str, query: &str) -> Response {
     let ctx = handler.context();
+    let projection = Projection::new(&ctx);
+    let chain_view = projection.capture_chain_view();
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
-    match parts.as_slice() {
+    let response = match parts.as_slice() {
         ["blocks", "tip", "height"] => text(ctx.applied_height().to_string()),
         ["blocks", "tip", "hash"] => text(ctx.applied_hash().to_string_be()),
         ["internal", "mempool", "txs"] => internal_mempool_txs(&ctx, None, query),
@@ -135,6 +137,10 @@ pub fn route(handler: &Handler, path: &str, query: &str) -> Response {
         }
         ["address-prefix", _] => unavailable("address prefix search requires an address index"),
         _ => not_found(),
+    };
+    match projection.ensure_chain_view(chain_view.as_ref()) {
+        Ok(()) => response,
+        Err(response) => response,
     }
 }
 
@@ -297,18 +303,14 @@ fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
     projection.required_transaction(id).map_or_else(
         |r| r,
         |(transaction, _)| {
-            let Some(output) = transaction
+            let Some(_) = transaction
                 .output
                 .get(usize::try_from(vout).unwrap_or(usize::MAX))
             else {
                 return not_found();
             };
-            outspend(
-                &projection,
-                OutPoint::new(transaction.compute_txid(), vout),
-                &output.script_pubkey,
-            )
-            .map_or_else(|r| r, json_response)
+            outspend(&projection, OutPoint::new(transaction.compute_txid(), vout))
+                .map_or_else(|r| r, json_response)
         },
     )
 }
@@ -331,22 +333,14 @@ fn outspends_for_transaction(
         .output
         .iter()
         .enumerate()
-        .map(|(vout, output)| {
+        .map(|(vout, _)| {
             let vout = u32::try_from(vout).map_err(|_| internal("output index is too large"))?;
-            outspend(
-                projection,
-                OutPoint::new(transaction.compute_txid(), vout),
-                &output.script_pubkey,
-            )
+            outspend(projection, OutPoint::new(transaction.compute_txid(), vout))
         })
         .collect()
 }
 
-fn outspend(
-    projection: &Projection<'_>,
-    outpoint: OutPoint,
-    script: &bitcoin::ScriptBuf,
-) -> Result<Outspend, Response> {
+fn outspend(projection: &Projection<'_>, outpoint: OutPoint) -> Result<Outspend, Response> {
     let ctx = projection.ctx;
     let pool = ctx.mempool.read();
     if let Some((_, entry_id)) = pool
@@ -378,29 +372,18 @@ fn outspend(
         .script_index
         .as_ref()
         .ok_or_else(|| unavailable("script index is disabled"))?;
-    for history in index
-        .history_snapshot(ScriptHash::new(script))
-        .map_err(query_error)?
-        .history
-    {
-        let transaction = projection.confirmed_transaction(&history.txid)?;
-        if let Some(vin) = transaction
-            .input
-            .iter()
-            .position(|input| input.previous_output == outpoint)
-        {
-            let confirmation = projection
-                .confirmation_at_height(history.height)
-                .ok_or_else(|| unavailable("spending block unavailable"))?;
-            return Ok(Outspend {
-                spent: true,
-                txid: Some(history.txid.to_string()),
-                vin: Some(u32::try_from(vin).unwrap_or(u32::MAX)),
-                status: Some(Projection::status_value(Some(confirmation))),
-            });
-        }
-    }
-    Ok(Outspend::unspent())
+    let Some(spender) = index.spender(outpoint).map_err(query_error)? else {
+        return Ok(Outspend::unspent());
+    };
+    let confirmation = projection
+        .confirmation_at_height(spender.height)
+        .ok_or_else(|| unavailable("spending block unavailable"))?;
+    Ok(Outspend {
+        spent: true,
+        txid: Some(spender.txid.to_string()),
+        vin: Some(spender.vin),
+        status: Some(Projection::status_value(Some(confirmation))),
+    })
 }
 
 fn block(ctx: &Context, text_hash: &str) -> Response {
@@ -656,13 +639,13 @@ fn internal_outspend(
     let Some((transaction, _)) = projection.transaction(&txid)? else {
         return Ok(Outspend::unspent());
     };
-    let Some(output) = transaction
+    let Some(_) = transaction
         .output
         .get(usize::try_from(vout).unwrap_or(usize::MAX))
     else {
         return Ok(Outspend::unspent());
     };
-    outspend(projection, OutPoint::new(txid, vout), &output.script_pubkey)
+    outspend(projection, OutPoint::new(txid, vout))
 }
 
 fn query_limit(query: &str, name: &str) -> Option<usize> {
@@ -756,10 +739,8 @@ fn summary_for(ctx: &Context, h: ScriptHash, address: Option<&str>) -> Response 
     })
 }
 fn utxos(ctx: &Context, h: ScriptHash) -> Response {
-    let projection = Projection::new(ctx);
-    projection
-        .script_activity(h)
-        .and_then(|activity| activity.utxos(&projection, h))
+    Projection::new(ctx)
+        .script_utxos(h)
         .map_or_else(|response| response, json_response)
 }
 fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bool) -> Response {
@@ -1076,6 +1057,68 @@ mod tests {
         unspent: Vec<ScriptIndexRecord>,
     }
 
+    struct CountingScriptIndex {
+        history_calls: Arc<AtomicUsize>,
+        unspent_calls: Arc<AtomicUsize>,
+        spender_calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::context::ScriptIndexQuery for CountingScriptIndex {
+        fn unspent_outputs(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+            self.unspent_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn history_snapshot(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<crate::context::ScriptIndexSnapshot, TxQueryError> {
+            self.history_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::context::ScriptIndexSnapshot::default())
+        }
+
+        fn spender(
+            &self,
+            _outpoint: OutPoint,
+        ) -> Result<Option<crate::context::SpendingRecord>, TxQueryError> {
+            self.spender_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    struct RepublishTipScriptIndex {
+        applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
+    }
+
+    impl crate::context::ScriptIndexQuery for RepublishTipScriptIndex {
+        fn unspent_outputs(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+            Ok(Vec::new())
+        }
+
+        fn history_snapshot(
+            &self,
+            _script_hash: ScriptHash,
+        ) -> Result<crate::context::ScriptIndexSnapshot, TxQueryError> {
+            if let Some(tip) = self.applied_tip.load_full() {
+                self.applied_tip.store(Some(Arc::new((*tip).clone())));
+            }
+            Ok(crate::context::ScriptIndexSnapshot::default())
+        }
+
+        fn spender(
+            &self,
+            _outpoint: OutPoint,
+        ) -> Result<Option<crate::context::SpendingRecord>, TxQueryError> {
+            Ok(None)
+        }
+    }
+
     impl crate::context::ScriptIndexQuery for StaticScriptIndex {
         fn unspent_outputs(
             &self,
@@ -1091,6 +1134,13 @@ mod tests {
             Ok(crate::context::ScriptIndexSnapshot {
                 history: self.history.clone(),
             })
+        }
+
+        fn spender(
+            &self,
+            _outpoint: OutPoint,
+        ) -> Result<Option<crate::context::SpendingRecord>, TxQueryError> {
+            Ok(None)
         }
     }
 
@@ -1462,6 +1512,32 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
+    fn composed_response_retries_when_the_applied_tip_identity_changes() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut context = Context::new();
+        context.add_block(crate::context::BlockRecord::from_block(0, &block));
+        let tip = {
+            let mut tree = context.block_tree.write();
+            tree.insert_node(None, block.header, NodeStatus::Active)
+                .expect("insert applied tip");
+            tree.tip().expect("applied tip")
+        };
+        context.applied_tip.store(Some(tip));
+        context.script_index = Some(Arc::new(RepublishTipScriptIndex {
+            applied_tip: Arc::clone(&context.applied_tip),
+        }));
+        let handler = Handler::new(Arc::new(context));
+
+        let response = route(
+            &handler,
+            "/scripthash/0000000000000000000000000000000000000000000000000000000000000000",
+            "",
+        );
+        assert_eq!(response.status, 503);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
     fn internal_mempool_routes_return_live_transactions() {
         let transaction = transaction(
             None,
@@ -1637,14 +1713,45 @@ mod tests {
             .expect("script activity resolves");
         assert_eq!(activity.mempool, vec![spending]);
         assert!(
-            activity
-                .utxos(&projection, script_hash)
+            projection
+                .script_utxos(script_hash)
                 .expect("UTXO overlay resolves")
                 .is_empty()
         );
         let stats = activity.mempool_stats(script_hash);
         assert_eq!(stats.spent_txo_count, 1);
         assert_eq!(stats.spent_txo_sum, 125);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn utxo_and_outspend_use_their_dedicated_index_queries() {
+        let history_calls = Arc::new(AtomicUsize::new(0));
+        let unspent_calls = Arc::new(AtomicUsize::new(0));
+        let spender_calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = Context::new();
+        ctx.script_index = Some(Arc::new(CountingScriptIndex {
+            history_calls: Arc::clone(&history_calls),
+            unspent_calls: Arc::clone(&unspent_calls),
+            spender_calls: Arc::clone(&spender_calls),
+        }));
+        let projection = Projection::new(&ctx);
+        let script_hash = ScriptHash::from_script_bytes(&[]);
+
+        assert!(
+            projection
+                .script_utxos(script_hash)
+                .expect("UTXO query")
+                .is_empty()
+        );
+        assert!(
+            !outspend(&projection, OutPoint::null())
+                .expect("outspend query")
+                .spent
+        );
+        assert_eq!(unspent_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(spender_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(history_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

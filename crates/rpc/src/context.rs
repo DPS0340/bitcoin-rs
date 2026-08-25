@@ -778,6 +778,17 @@ pub struct ScriptHistoryRecord {
     pub height: u32,
 }
 
+/// One confirmed transaction spending an indexed outpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpendingRecord {
+    /// Spending transaction identifier.
+    pub txid: Txid,
+    /// Confirming block height.
+    pub height: u32,
+    /// Input index that spends the outpoint.
+    pub vin: u32,
+}
+
 /// A point-in-time script-history answer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScriptIndexSnapshot {
@@ -801,6 +812,8 @@ pub trait ScriptIndexQuery: Send + Sync {
         &self,
         script_hash: ScriptHash,
     ) -> Result<ScriptIndexSnapshot, TxQueryError>;
+    /// Returns the confirmed transaction spending `outpoint`, if any.
+    fn spender(&self, outpoint: OutPoint) -> Result<Option<SpendingRecord>, TxQueryError>;
 }
 
 impl TxQueryError {

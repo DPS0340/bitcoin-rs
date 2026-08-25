@@ -2,12 +2,14 @@
 
 use core::ops::Bound;
 use core::str::FromStr as _;
+use std::sync::Arc;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::DisplayHex as _;
 use bitcoin::script::Instruction;
 use bitcoin::{Block, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
 
@@ -112,58 +114,6 @@ impl ScriptActivity {
             }
         }
         stats
-    }
-
-    pub(super) fn utxos(
-        &self,
-        projection: &Projection<'_>,
-        script_hash: ScriptHash,
-    ) -> Result<Vec<UtxoValue>, Response> {
-        let mut confirmed = self.confirmed_unspent.clone();
-        let pool = projection.ctx.mempool.read();
-        confirmed
-            .retain(|record| !pool.is_outpoint_spent(&OutPoint::new(record.txid, record.vout)));
-        let mut outputs = confirmed
-            .into_iter()
-            .map(|record| {
-                let status = projection
-                    .confirmation_at_height(record.height)
-                    .map(TransactionStatus::from)
-                    .ok_or_else(|| unavailable("funding block unavailable"))?;
-                Ok(UtxoValue {
-                    txid: record.txid.to_string(),
-                    vout: record.vout,
-                    status,
-                    value: record.value,
-                })
-            })
-            .collect::<Result<Vec<_>, Response>>()?;
-        let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
-        for (_, entry_id) in pool.funding.range((
-            Bound::Included((mempool_hash, 0)),
-            Bound::Included((mempool_hash, u32::MAX)),
-        )) {
-            let Some(entry) = pool.entry(*entry_id) else {
-                continue;
-            };
-            for (vout, output) in entry.tx.output.iter().enumerate() {
-                let Ok(vout) = u32::try_from(vout) else {
-                    continue;
-                };
-                if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
-                    && !pool.is_outpoint_spent(&OutPoint::new(entry.txid, vout))
-                {
-                    outputs.push(UtxoValue {
-                        txid: entry.txid.to_string(),
-                        vout,
-                        status: TransactionStatus::unconfirmed(),
-                        value: output.value.to_sat(),
-                    });
-                }
-            }
-        }
-        drop(pool);
-        Ok(outputs)
     }
 }
 
@@ -462,6 +412,81 @@ impl<'a> Projection<'a> {
             confirmed_unspent,
             mempool,
         })
+    }
+
+    pub(super) fn script_utxos(&self, script_hash: ScriptHash) -> Result<Vec<UtxoValue>, Response> {
+        let mut confirmed = self
+            .ctx
+            .script_index
+            .as_ref()
+            .ok_or_else(|| unavailable("script index is disabled"))?
+            .unspent_outputs(script_hash)
+            .map_err(query_error)?;
+        let pool = self.ctx.mempool.read();
+        confirmed
+            .retain(|record| !pool.is_outpoint_spent(&OutPoint::new(record.txid, record.vout)));
+        let mut outputs = confirmed
+            .into_iter()
+            .map(|record| {
+                let status = self
+                    .confirmation_at_height(record.height)
+                    .map(TransactionStatus::from)
+                    .ok_or_else(|| unavailable("funding block unavailable"))?;
+                Ok(UtxoValue {
+                    txid: record.txid.to_string(),
+                    vout: record.vout,
+                    status,
+                    value: record.value,
+                })
+            })
+            .collect::<Result<Vec<_>, Response>>()?;
+        let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
+        for (_, entry_id) in pool.funding.range((
+            Bound::Included((mempool_hash, 0)),
+            Bound::Included((mempool_hash, u32::MAX)),
+        )) {
+            let Some(entry) = pool.entry(*entry_id) else {
+                continue;
+            };
+            for (vout, output) in entry.tx.output.iter().enumerate() {
+                let Ok(vout) = u32::try_from(vout) else {
+                    continue;
+                };
+                if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
+                    && !pool.is_outpoint_spent(&OutPoint::new(entry.txid, vout))
+                {
+                    outputs.push(UtxoValue {
+                        txid: entry.txid.to_string(),
+                        vout,
+                        status: TransactionStatus::unconfirmed(),
+                        value: output.value.to_sat(),
+                    });
+                }
+            }
+        }
+        drop(pool);
+        Ok(outputs)
+    }
+
+    pub(super) fn capture_chain_view(&self) -> Option<Arc<TipSnapshot>> {
+        self.ctx.applied_tip.load_full()
+    }
+
+    pub(super) fn ensure_chain_view(
+        &self,
+        expected: Option<&Arc<TipSnapshot>>,
+    ) -> Result<(), Response> {
+        let current = self.ctx.applied_tip.load_full();
+        let unchanged = match (expected, current.as_ref()) {
+            (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            Ok(())
+        } else {
+            Err(query_error(super::TxQueryError::Retry))
+        }
     }
 
     fn mempool_activity(

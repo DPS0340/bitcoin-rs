@@ -881,6 +881,14 @@ fn confirmed_history_snapshot_includes_the_spending_transaction()
         watermark: None,
     })?;
 
+    let spender = fixture
+        .engine
+        .spender(OutPoint { txid, vout: 0 })?
+        .ok_or_else(|| std::io::Error::other("indexed spender missing"))?;
+    assert_eq!(spender.txid, spend_txid);
+    assert_eq!(spender.height, 0);
+    assert_eq!(spender.vin, 0);
+
     let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 2);
 

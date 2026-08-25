@@ -9,6 +9,14 @@ The optional, unauthenticated Bitcoin Core-compatible HTTP surface served on
 the existing JSON-RPC listener. It is enabled with `rest=1`; JSON-RPC requests
 on the same listener retain their configured authentication.
 
+### Esplora request chain view
+The applied-tip identity captured when an Esplora GET request begins. Generic
+index queries keep their own snapshot, watermark, and revision validation, but
+one Esplora response may compose several such queries with mempool and block
+metadata. The router therefore returns `503` if the applied-tip identity is not
+the same when composition finishes, rather than mixing independently valid
+answers from opposite sides of a reorg.
+
 ## Initial Block Download
 
 ### Initial Block Download (IBD)

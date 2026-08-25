@@ -30,7 +30,7 @@ use bitcoin_rs_index::{
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::{
     BlockBodySource, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
-    TxIndexInfo, TxIndexQuery, TxQueryError,
+    SpendingRecord, TxIndexInfo, TxIndexQuery, TxQueryError,
 };
 use bitcoin_rs_storage::PrefixScanLimit;
 use compact_str::CompactString;
@@ -1488,6 +1488,42 @@ impl TxIndexQueryEngine {
         Ok(outputs)
     }
 
+    fn spender_for(
+        &self,
+        snapshot: &dyn TxIndexSnapshot,
+        tip: &TipSnapshot,
+        budget: &mut QueryBudget,
+        outpoint: &OutPoint,
+    ) -> Result<Option<SpendingRecord>, TxQueryError> {
+        let spend_rows = Self::scan_spending_rows(snapshot, budget, outpoint)?;
+        let mut last_height = None;
+        for row in spend_rows {
+            let height = row.height();
+            if last_height == Some(height) {
+                continue;
+            }
+            last_height = Some(height);
+            let hash = self.resolve_hash_at_height(height, tip)?;
+            let block = self.resolve_block(budget, height, hash)?;
+            for transaction in &block.txdata {
+                let Some(vin) = transaction
+                    .input
+                    .iter()
+                    .position(|input| input.previous_output == *outpoint)
+                else {
+                    continue;
+                };
+                return Ok(Some(SpendingRecord {
+                    txid: transaction.compute_txid(),
+                    height,
+                    vin: u32::try_from(vin)
+                        .map_err(|_| TxQueryError::Storage("vin overflow".into()))?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     fn history_snapshot_for(
         &self,
         snapshot: &dyn TxIndexSnapshot,
@@ -1497,41 +1533,15 @@ impl TxIndexQueryEngine {
     ) -> Result<ScriptIndexSnapshot, TxQueryError> {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
 
-        let mut history = Vec::new();
-        for &(txid, _, _, height) in &funding_outputs {
+        let mut history = Vec::with_capacity(funding_outputs.len());
+        for (txid, vout, _, height) in funding_outputs {
             history.push(ScriptHistoryRecord { txid, height });
-        }
-
-        // Resolve every funding record to discover the transactions that
-        // spend it.
-        for (txid, vout, _, _) in funding_outputs {
             let outpoint = OutPoint { txid, vout };
-            let spend_rows = Self::scan_spending_rows(snapshot, budget, &outpoint)?;
-            let mut last_spend_height: Option<u32> = None;
-            let mut cached_spend_block: Option<Block> = None;
-            for row in spend_rows {
-                let spend_height = row.height();
-                if last_spend_height != Some(spend_height) {
-                    let hash = self.resolve_hash_at_height(spend_height, tip)?;
-                    cached_spend_block = Some(self.resolve_block(budget, spend_height, hash)?);
-                    last_spend_height = Some(spend_height);
-                }
-                let block = cached_spend_block.as_ref().ok_or_else(|| {
-                    TxQueryError::Unavailable("missing block during history query".into())
-                })?;
-                for tx in &block.txdata {
-                    if tx
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == outpoint)
-                    {
-                        history.push(ScriptHistoryRecord {
-                            txid: tx.compute_txid(),
-                            height: spend_height,
-                        });
-                        break;
-                    }
-                }
+            if let Some(spender) = self.spender_for(snapshot, tip, budget, &outpoint)? {
+                history.push(ScriptHistoryRecord {
+                    txid: spender.txid,
+                    height: spender.height,
+                });
             }
         }
 
@@ -1552,31 +1562,10 @@ impl TxIndexQueryEngine {
         let mut records = Vec::new();
         for (txid, vout, value, height) in funding_outputs {
             let outpoint = OutPoint { txid, vout };
-            let spend_rows = Self::scan_spending_rows(snapshot, budget, &outpoint)?;
-            let mut spent = false;
-            let mut last_spend_height = None;
-            let mut cached_spend_block = None;
-            for row in spend_rows {
-                let spend_height = row.height();
-                if last_spend_height != Some(spend_height) {
-                    let hash = self.resolve_hash_at_height(spend_height, tip)?;
-                    cached_spend_block = Some(self.resolve_block(budget, spend_height, hash)?);
-                    last_spend_height = Some(spend_height);
-                }
-                let block = cached_spend_block.as_ref().ok_or_else(|| {
-                    TxQueryError::Unavailable("missing block during unspent query".into())
-                })?;
-                if block.txdata.iter().any(|transaction| {
-                    transaction
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == outpoint)
-                }) {
-                    spent = true;
-                    break;
-                }
-            }
-            if !spent {
+            if self
+                .spender_for(snapshot, tip, budget, &outpoint)?
+                .is_none()
+            {
                 records.push(ScriptIndexRecord {
                     txid,
                     height,
@@ -1706,6 +1695,13 @@ impl ScriptIndexQuery for TxIndexQueryEngine {
         self.with_snapshot(
             IndexCapabilities::SCRIPT_HISTORY,
             |snapshot, tip, budget| self.unspent_outputs_for(snapshot, tip, budget, scripthash),
+        )
+    }
+
+    fn spender(&self, outpoint: OutPoint) -> Result<Option<SpendingRecord>, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.spender_for(snapshot, tip, budget, &outpoint),
         )
     }
 }
