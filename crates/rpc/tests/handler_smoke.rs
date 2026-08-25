@@ -66,8 +66,10 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
             json!(["addr(1111111111111111111114oLvT2)"]),
         ),
         (
+            // Core requires a checksum on this call and only this call, so the
+            // smoke fixture carries one.
             "deriveaddresses",
-            json!(["addr(1111111111111111111114oLvT2)"]),
+            json!(["addr(1111111111111111111114oLvT2)#ula7cdg0"]),
         ),
         (
             "scantxoutset",

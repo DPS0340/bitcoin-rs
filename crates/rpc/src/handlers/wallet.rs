@@ -12,12 +12,10 @@ const _: fn() -> Value = invalid_psbt;
 
 pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let descriptor = required_str(params, 0, "descriptor is required")?;
-    // The checksum Core reports is of the input, whatever the descriptor turns
-    // out to be, so it is computed from the text and not from the parse.
-    let payload = strip_checksum(descriptor);
-    let checksum = descriptor_checksum(payload).ok_or(RpcError::InvalidParams(
-        "descriptor contains invalid characters",
-    ))?;
+    // Optional here, as in Core: `Parse` is called without `require_checksum`,
+    // so a bare descriptor is analysed and one carrying a checksum has it
+    // checked.
+    let checksum = checked_checksum(descriptor, ChecksumRequirement::Optional)?;
 
     let info = bitcoin_rs_wallet::analyse(descriptor).map_err(descriptor_error)?;
 
@@ -50,15 +48,85 @@ fn descriptor_error(error: bitcoin_rs_wallet::WalletError) -> RpcError {
     }
 }
 
-fn strip_checksum(descriptor: &str) -> &str {
-    descriptor
-        .rsplit_once('#')
-        .map_or(descriptor, |(body, _)| body)
+/// Whether a descriptor must carry a checksum to be accepted.
+///
+/// Core decides this per call site, and the two answers are not arbitrary.
+/// `getdescriptorinfo` analyses whatever it is handed, so a checksum is
+/// optional there. `deriveaddresses` turns a descriptor into addresses someone
+/// will send money to, so Core passes `require_checksum = true` -- a mistyped
+/// descriptor derives perfectly good addresses that nobody holds the keys for,
+/// and the checksum is the only thing standing between a typo and that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChecksumRequirement {
+    /// Accept a descriptor with no checksum; verify one that is present.
+    Optional,
+    /// Refuse a descriptor with no checksum.
+    Required,
+}
+
+/// Verifies a descriptor's checksum and returns the computed one.
+///
+/// Bitcoin Core's `CheckChecksum` in `script/descriptor.cpp`, rule for rule.
+/// The previous implementation split the text on its last `#` and threw the
+/// supplied checksum away, which meant a *wrong* checksum was accepted and
+/// silently replaced with the right one in the response. The checksum exists to
+/// catch a mistyped descriptor; discarding it defeats the entire mechanism, and
+/// the caller is told their typo is fine.
+///
+/// The three refusals, in Core's order:
+///
+/// - more than one `#`, which is a malformed descriptor rather than a
+///   descriptor with an odd checksum;
+/// - a checksum that is present but not exactly eight characters;
+/// - a checksum that does not match the one the payload computes.
+fn checked_checksum(
+    descriptor: &str,
+    requirement: ChecksumRequirement,
+) -> Result<String, RpcError> {
+    let mut parts = descriptor.split('#');
+    let Some(payload) = parts.next() else {
+        return Err(RpcError::InvalidAddressOrKey(
+            "Invalid characters in payload".to_owned(),
+        ));
+    };
+    let supplied = parts.next();
+    if parts.next().is_some() {
+        return Err(RpcError::InvalidAddressOrKey(
+            "Multiple '#' symbols".to_owned(),
+        ));
+    }
+    if supplied.is_none() && requirement == ChecksumRequirement::Required {
+        return Err(RpcError::InvalidAddressOrKey("Missing checksum".to_owned()));
+    }
+    if let Some(supplied) = supplied
+        && supplied.len() != 8
+    {
+        return Err(RpcError::InvalidAddressOrKey(format!(
+            "Expected 8 character checksum, not {} characters",
+            supplied.len()
+        )));
+    }
+
+    let computed = descriptor_checksum(payload)
+        .ok_or_else(|| RpcError::InvalidAddressOrKey("Invalid characters in payload".to_owned()))?;
+    if let Some(supplied) = supplied
+        && supplied != computed
+    {
+        return Err(RpcError::InvalidAddressOrKey(format!(
+            "Provided checksum '{supplied}' does not match computed checksum '{computed}'"
+        )));
+    }
+    Ok(computed)
 }
 
 pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let array = params_array(params)?;
     let descriptor = required_str(params, 0, "descriptor is required")?;
+    // Core passes `require_checksum = true` here, and only here. These
+    // addresses are what someone will send money to; a mistyped descriptor
+    // derives perfectly good addresses that nobody holds the keys for, and the
+    // checksum is the only thing between a typo and that.
+    let _checksum = checked_checksum(descriptor, ChecksumRequirement::Required)?;
     let range = array
         .get(1)
         .filter(|value| !value.is_null())
@@ -983,23 +1051,89 @@ mod descriptor_checksum_tests {
 
     const ADDRESS: &str = "1111111111111111111114oLvT2";
 
-    /// The checksum describes the input; the descriptor describes the parse.
+    /// The BIP380 vector, so the checksum is not certified by its own output.
+    ///
+    /// Every other test here compares this implementation against itself. This
+    /// one compares it against the specification: the descriptor and checksum
+    /// are the worked example in BIP380, and Core answers the same eight
+    /// characters for it.
     #[test]
-    fn getdescriptorinfo_reports_the_checksum_of_what_it_was_given() {
-        let ctx = Arc::new(Context::new());
-        let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})#whatever")]))
-            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+    fn the_checksum_matches_the_bip380_vector() {
+        const DESCRIPTOR: &str = "raw(deadbeef)";
+        const CHECKSUM: &str = "89f8spxm";
 
+        let ctx = Arc::new(Context::new());
+        let result = getdescriptorinfo(&ctx, &json!([DESCRIPTOR]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+        assert_eq!(
+            result.get("checksum").and_then(JsonValueTrait::as_str),
+            Some(CHECKSUM)
+        );
+
+        // And the same descriptor with its checksum attached is accepted.
+        let with_checksum = getdescriptorinfo(&ctx, &json!([format!("{DESCRIPTOR}#{CHECKSUM}")]))
+            .unwrap_or_else(|err| panic!("a correct checksum must be accepted: {err}"));
+        assert_eq!(
+            with_checksum
+                .get("checksum")
+                .and_then(JsonValueTrait::as_str),
+            Some(CHECKSUM)
+        );
+    }
+
+    /// A checksum that does not match is refused, not replaced.
+    ///
+    /// This used to split the text on its last `#`, throw the supplied checksum
+    /// away, and answer with a freshly computed one -- so a caller who mistyped
+    /// a descriptor was told it was fine and handed a different descriptor than
+    /// the one they meant. Catching that typo is the checksum's entire purpose.
+    ///
+    /// Core's three refusals, from `CheckChecksum` in `script/descriptor.cpp`,
+    /// each with the message Core gives.
+    #[test]
+    fn a_checksum_that_does_not_match_is_refused() {
+        let ctx = Arc::new(Context::new());
+
+        for (input, expected) in [
+            // Right length, wrong value.
+            (format!("addr({ADDRESS})#qqqqqqqq"), "does not match"),
+            // Present but not eight characters.
+            (
+                format!("addr({ADDRESS})#short"),
+                "Expected 8 character checksum",
+            ),
+            // More than one `#` is a malformed descriptor, not an odd checksum.
+            (
+                format!("addr({ADDRESS})#aaaaaaaa#bbbbbbbb"),
+                "Multiple '#' symbols",
+            ),
+        ] {
+            let error = getdescriptorinfo(&ctx, &json!([input.clone()]))
+                .err()
+                .unwrap_or_else(|| panic!("`{input}` must be refused"));
+            assert_eq!(error.code(), RpcError::CORE_NOT_FOUND, "for `{input}`");
+            assert!(
+                error.to_string().contains(expected),
+                "`{input}` must say why: got {error}"
+            );
+        }
+    }
+
+    /// A descriptor with no checksum is still analysed.
+    ///
+    /// Core calls `Parse` without `require_checksum` here, so the field is
+    /// optional -- unlike `deriveaddresses`, where it is not. The two call
+    /// sites differ on purpose and this pins that they still do.
+    #[test]
+    fn getdescriptorinfo_does_not_require_a_checksum() {
+        let ctx = Arc::new(Context::new());
+        let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})")]))
+            .unwrap_or_else(|err| panic!("a bare descriptor must be analysed: {err}"));
         assert_eq!(
             result.get("descriptor").and_then(JsonValueTrait::as_str),
             Some(format!("addr({ADDRESS})").as_str()),
             "the canonical form carries no checksum: {result:?}"
         );
-        let Some(checksum) = result.get("checksum").and_then(JsonValueTrait::as_str) else {
-            panic!("checksum missing: {result:?}");
-        };
-        assert_eq!(checksum.len(), 8, "got {checksum}");
-        assert_ne!(checksum, "whatever", "the checksum is computed, not echoed");
     }
 
     /// A descriptor that names an output cannot produce a spend for it.
@@ -1095,14 +1229,54 @@ mod deriveaddresses_tests {
 
     const ADDRESS: &str = "1111111111111111111114oLvT2";
 
+    /// `descriptor#checksum`, because this call requires one.
+    ///
+    /// These tests are about derivation, not about the checksum, so they append
+    /// the computed one rather than hard-coding eight characters per fixture.
+    /// The checksum's own correctness is pinned against the BIP380 vector in
+    /// `descriptor_checksum_tests`, and its enforcement by the refusals there.
+    fn checksummed(descriptor: &str) -> String {
+        let Some(checksum) = descriptor_checksum(descriptor) else {
+            panic!("the fixture descriptor `{descriptor}` must have a checksum");
+        };
+        format!("{descriptor}#{checksum}")
+    }
+
     /// An `addr()` descriptor derives the address it names.
     #[test]
     fn an_address_descriptor_derives_its_own_address() {
         let ctx = Arc::new(Context::new());
-        let result = deriveaddresses(&ctx, &json!([format!("addr({ADDRESS})")]))
+        let result = deriveaddresses(&ctx, &json!([checksummed(&format!("addr({ADDRESS})"))]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
 
         assert_eq!(result, json!([ADDRESS]));
+    }
+
+    /// A descriptor with no checksum does not derive an address.
+    ///
+    /// Core passes `require_checksum = true` here and only here, and the reason
+    /// is what these addresses are for: someone sends money to them. A mistyped
+    /// descriptor derives perfectly good addresses that nobody holds the keys
+    /// for, and the checksum is the only thing between a typo and that. This
+    /// used to accept the bare descriptor and derive from it.
+    #[test]
+    fn deriveaddresses_requires_a_checksum() {
+        let ctx = Arc::new(Context::new());
+
+        let error = deriveaddresses(&ctx, &json!([format!("addr({ADDRESS})")]))
+            .err()
+            .unwrap_or_else(|| panic!("a descriptor with no checksum must be refused"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+        assert!(
+            error.to_string().contains("Missing checksum"),
+            "got {error}"
+        );
+
+        // The paired acceptance, so the refusal is the missing checksum and not
+        // something else about the descriptor.
+        let accepted = deriveaddresses(&ctx, &json!([checksummed(&format!("addr({ADDRESS})"))]))
+            .unwrap_or_else(|err| panic!("the same descriptor with a checksum: {err}"));
+        assert_eq!(accepted, json!([ADDRESS]));
     }
 
     /// A key descriptor derives a real address, where this used to answer `[]`.
@@ -1113,7 +1287,8 @@ mod deriveaddresses_tests {
     #[test]
     fn a_key_descriptor_derives_an_address() {
         let ctx = Arc::new(Context::new());
-        let descriptor = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
+        let descriptor =
+            checksummed("wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)");
         let result = deriveaddresses(&ctx, &json!([descriptor]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
 
@@ -1135,7 +1310,7 @@ mod deriveaddresses_tests {
     fn a_ranged_descriptor_derives_one_address_per_index() {
         let ctx = Arc::new(Context::new());
         let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let descriptor = format!("wpkh({xpub}/0/*)");
+        let descriptor = checksummed(&format!("wpkh({xpub}/0/*)"));
         let result = deriveaddresses(&ctx, &json!([descriptor, [0, 2]]))
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
 
@@ -1160,15 +1335,16 @@ mod deriveaddresses_tests {
         let ctx = Arc::new(Context::new());
         let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
 
-        let missing = deriveaddresses(&ctx, &json!([format!("wpkh({xpub}/0/*)")]))
+        let missing = deriveaddresses(&ctx, &json!([checksummed(&format!("wpkh({xpub}/0/*)"))]))
             .err()
             .unwrap_or_else(|| panic!("a ranged descriptor needs a range"));
         assert_eq!(missing.code(), RpcError::CORE_INVALID_PARAMETER);
 
         // Both kinds of fixed descriptor: one miniscript parses, and one it
         // does not model at all. They take separate paths to the same refusal.
-        let fixed_key = "wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)";
-        for fixed in [fixed_key.to_owned(), format!("addr({ADDRESS})")] {
+        let fixed_key =
+            checksummed("wpkh(02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9)");
+        for fixed in [fixed_key, checksummed(&format!("addr({ADDRESS})"))] {
             let unwanted = deriveaddresses(&ctx, &json!([fixed.clone(), [0, 2]]))
                 .err()
                 .unwrap_or_else(|| panic!("a fixed descriptor takes no range: {fixed}"));
