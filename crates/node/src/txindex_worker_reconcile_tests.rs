@@ -554,11 +554,11 @@ fn missing_disconnected_body_resets_and_rebuilds_selected_capabilities() {
         hash: f.b2.1.to_le_bytes(),
     });
     assert_eq!(watermarks.tx_lookup, expected);
-    assert_eq!(watermarks.electrum_history, expected);
+    assert_eq!(watermarks.script_history, expected);
 }
 
 #[test]
-fn stale_electrum_reset_preserves_ready_tx_lookup_then_rebuilds() {
+fn stale_script_index_reset_preserves_ready_tx_lookup_then_rebuilds() {
     let (_temp, writer) = fjall_writer();
     let f = fork_fixture();
     let bodies = Arc::new(MapBodyStore::new(
@@ -623,7 +623,7 @@ fn stale_electrum_reset_preserves_ready_tx_lookup_then_rebuilds() {
         writer.watermarks().expect("divergent watermarks"),
         IndexWatermarks {
             tx_lookup: b2,
-            electrum_history: a2,
+            script_history: a2,
         }
     );
 
@@ -632,29 +632,29 @@ fn stale_electrum_reset_preserves_ready_tx_lookup_then_rebuilds() {
     assert!(matches!(
         worker
             .reconcile_once(&mut pending)
-            .expect("selectively reset Electrum and prepare B2"),
+            .expect("selectively reset ScriptIndex and prepare B2"),
         ReconcileAction::Buffered
     ));
     assert_eq!(
         writer.watermarks().expect("watermarks during rebuild"),
         IndexWatermarks {
             tx_lookup: b2,
-            electrum_history: None,
+            script_history: None,
         },
-        "TxLookup must remain ready while the Electrum rebuild is pending"
+        "TxLookup must remain ready while the ScriptIndex rebuild is pending"
     );
 
     assert!(matches!(
         worker
             .reconcile_once(&mut pending)
-            .expect("commit Electrum rebuild"),
+            .expect("commit ScriptIndex rebuild"),
         ReconcileAction::CaughtUp
     ));
     assert_eq!(
         writer.watermarks().expect("rebuilt watermarks"),
         IndexWatermarks {
             tx_lookup: b2,
-            electrum_history: b2,
+            script_history: b2,
         }
     );
 }
@@ -727,7 +727,7 @@ fn missing_rollback_identity_resets_and_rebuilds_selected_capabilities() {
     });
     let watermarks = writer.watermarks().expect("watermarks");
     assert_eq!(watermarks.tx_lookup, expected);
-    assert_eq!(watermarks.electrum_history, expected);
+    assert_eq!(watermarks.script_history, expected);
 }
 
 #[test]

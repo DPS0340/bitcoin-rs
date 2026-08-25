@@ -1,7 +1,9 @@
 # Implementation Deviations from PLAN.md
 
-`PLAN.md` is the spec. This file records places where implementation reality
-forced corrections, with sources.
+This is a historical deviation ledger for the original plan, not a statement of
+the current architecture. It retains audit evidence for superseded Electrum work;
+the current architecture and supported configuration are defined by `CONCEPTS.md`
+and `docs/getting-started.md`.
 
 The Task 0 audit corrections in section 0 were verified against the crates.io
 registry via `cargo info <crate>` and `cargo info <crate>@<version>` on
@@ -303,7 +305,7 @@ for an address funded at 64 heights, against a G14 budget of 30 ms.
 With positions the resolver reads only the named byte ranges. The block-size term
 disappears: at 8 funding heights the same call costs 8.95 µs over 250 KB blocks
 and 9.12 µs over 1 MB blocks. Full numbers, method, and mutation coverage are in
-[`docs/benchmarks/index-read-path.md`](docs/benchmarks/index-read-path.md).
+The former benchmark artifact was retired with the superseded Electrum interface.
 
 ### What this costs
 

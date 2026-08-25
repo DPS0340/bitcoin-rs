@@ -190,7 +190,7 @@
         "run_count": 3
       },
       "schema": "bitcoin-rs-core-txindex-comparison-v1",
-      "semantic_note": "Bitcoin Core txindex stores transaction lookup positions; bitcoin-rs additionally builds confirmed headers, funding, spending, and script-history rows for RPC and Electrum queries.",
+      "semantic_note": "Bitcoin Core txindex stores transaction lookup positions; bitcoin-rs additionally builds confirmed headers, funding, spending, and script-history rows for RPC and ScriptIndex queries.",
       "target_speed_ratio": 2.0,
       "workloads_semantically_equivalent": false
     },

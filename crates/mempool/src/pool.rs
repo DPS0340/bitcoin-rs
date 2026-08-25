@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 
-use bitcoin::hashes::{Hash as _, sha256d};
+use bitcoin::hashes::{Hash as _, sha256};
 use bitcoin::{OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid};
 use bitcoin_rs_primitives::Hash256;
 use hashbrown::HashMap;
@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::entry::fee_rate;
 use crate::{EntryId, MempoolEntry, MempoolLimits, ParetoFront, PolicyError};
 
-/// Electrum-compatible script hash key for funding index range scans.
+/// Script-index key for funding index range scans.
 #[derive(
     Clone,
     Copy,
@@ -36,9 +36,17 @@ impl ScriptHash {
     /// Hashes a script into an index key.
     #[must_use]
     pub fn from_script(script: &ScriptBuf) -> Self {
-        let hash = sha256d::Hash::hash(script.as_bytes());
+        let hash = sha256::Hash::hash(script.as_bytes());
         Self {
             hash: Hash256::from_le_bytes(hash.as_byte_array()),
+        }
+    }
+
+    /// Creates a script hash from the standard SHA256 digest bytes.
+    #[must_use]
+    pub const fn from_byte_array(bytes: [u8; 32]) -> Self {
+        Self {
+            hash: Hash256::from_le_bytes(&bytes),
         }
     }
 }
@@ -91,7 +99,7 @@ pub struct Mempool {
     sequence: core::sync::atomic::AtomicU64,
 }
 /// Aggregate mempool counters surfaced through the JSON-RPC `getmempoolinfo`
-/// and Electrum `mempool.get_fee_histogram` surfaces.
+/// and Esplora fee-estimate surfaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MempoolStats {
     /// Number of transactions in the mempool.
@@ -224,7 +232,7 @@ impl Mempool {
     /// transaction is not in the pool.
     ///
     /// Composite of `self.by_txid.get(txid)` and `self.entry(*id)`. Saves the
-    /// 2-step lookup pattern at electrum/rpc handler callsites.
+    /// 2-step lookup pattern at HTTP/RPC handler callsites.
     #[must_use]
     pub fn entry_by_txid(&self, txid: &bitcoin::Txid) -> Option<&MempoolEntry> {
         let id = *self.by_txid.get(txid)?;
@@ -366,7 +374,6 @@ impl Mempool {
         // Everything below stays keyed to live entries. They are payload terms
         // -- the transactions and the index keys -- and a removed entry's
         // payload really is gone.
-        let live = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         let arena = u64::try_from(self.entries.capacity())
             .unwrap_or(u64::MAX)
             .saturating_mul(u64::try_from(size_of::<MempoolEntry>()).unwrap_or(0));

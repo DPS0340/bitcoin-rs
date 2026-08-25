@@ -57,7 +57,7 @@ retires staged accounting after each committed connect. A fatal partial
 transition stops the process.
 
 Reorg handling still does not return disconnected transactions to the mempool.
-That requires one production admission pipeline shared by Electrum, P2P relay,
+That requires one production admission pipeline shared by Esplora broadcast, P2P relay,
 and reorg handling. Production transaction relay is also incomplete. The ZMQ
 `pubsequence` stream publishes block connect/disconnect events, but intentionally
 does not emit mempool `A`/`R` events until mempool event sequencing is redesigned.
