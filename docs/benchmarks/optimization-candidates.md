@@ -1,4 +1,4 @@
-# Optimization candidates not yet taken
+# Optimization candidate survey and outcomes
 
 The two-phase performance campaign finished what `PLAN.md` scheduled. Everything
 in it either landed — the index read path, the v5 record codec — or was
@@ -12,11 +12,10 @@ only examined crates that already had benchmarks — `consensus`, `coinstats`,
 ones that have none: `rpc` (9,137 LOC), `mempool` (4,254), `p2p` (3,295),
 `chain` (3,010), `filters` (771).
 
-Six candidates, and the negative results, so the next reader does not re-derive
-either. **Nothing here is implemented.** Each item names what would have to be
-measured before it is worth doing, because two of them are structural findings
-whose magnitude is unknown, and one is a projection from a number that has not
-converged.
+Six candidates and the negative results are retained so the next reader does not
+re-derive the survey. Candidates A, B, and C have since landed; their result
+documents are linked below. Candidates D, E, and F remain survey findings whose
+implementation or value is unresolved.
 
 Every `file:line` below is against the tree this page lands on and was
 re-verified there. The cross-references *out* of it are forward-looking:
@@ -244,10 +243,10 @@ Checked during the survey and cleared. Recorded so nobody re-checks them.
 
 ## What blocks what
 
-- **A, B, C** — implementable now, each under the refactor-set contract: keep the
-  old path as the oracle and the benchmark's `before` arm, prove equivalence,
-  prove the win in one run.
-- **D** — needs a decision on what `dbcache_mb` should mean per backend first.
+- **A** — landed; see `docs/benchmarks/gettxoutproof.md`.
+- **B** — landed; see `docs/benchmarks/block-record-footprint.md`.
+- **C** — landed; see `docs/benchmarks/mempool-pareto.md`.
+- **D** — still needs a decision on what `dbcache_mb` should mean per backend first.
 - **E** — gate on a production ScriptIndex measurement. Do not build it against
   synthetic fixtures.
 - **F** — the height half is gated on the BIP30 investigation; the script half is

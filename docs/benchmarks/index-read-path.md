@@ -70,8 +70,7 @@ flat-file store moved 64 heights from 65.21 ms to 65.644 ms.
 | 64 heights, 250 KB | 65.21 ms | 136.50 ms | 0.92 ms | 0.91 ms |
 | 8 heights, 1 MB | 33.52 ms | 82.04 ms | 4.48 ms | 3.75 ms |
 
-**The cost is O(funding rows x block size), and the measurement is clean enough
-to say so without hedging.** `resolve_script_history` goes 1.02 -> 9.33 -> 65.21 ms
+**The cost is O(funding rows × block size).** `resolve_script_history` goes 1.02 -> 9.33 -> 65.21 ms
 across 1 -> 8 -> 64 heights: a 63.9x rise for a 64x rise in rows. Holding rows at
 8 and taking block size from 250 KB to 1 MB moves it 9.33 -> 33.52 ms, a 3.6x
 rise for 4x the bytes. Both terms are linear and they multiply, because the
@@ -147,13 +146,9 @@ throttle mid-group.
 `get_balance` at 64 heights could not — a win claimed there would have needed a
 quiet host, more samples, or both.
 
-That constraint is no longer binding, and the reason is worth stating rather than
-quietly dropping: those two groups were noisy because each iteration ran >70 ms,
-long enough for this host to throttle mid-group. The `after` arm now runs in
-under a millisecond, so the group finishes before throttling starts. The measured
-ratios there are 71.6x and 76.5x — three orders of magnitude past a noise floor
-that was never worse than 2.4x, so the conclusion does not depend on the floor
-having improved.
+That constraint is no longer binding: the `after` arm now runs in under a
+millisecond. The measured 71.6x and 76.5x ratios are about 30x the largest
+observed 2.4x spread, so the conclusion does not depend on the spread improving.
 
 ## Landed: lazy txid in the unspent-output resolvers
 
@@ -199,8 +194,8 @@ noise floor above; on this run their identical arms disagreed by 1.7x.
 **Reference retention.** The `_scan` functions stay in the crate as the
 equivalence oracle and the `before` arm. They deliberately keep the eager txid:
 an oracle that shares an optimization with the implementation it checks cannot
-catch a fault in that optimization. They are not a fallback path — the optimized
-resolvers are always correct and always faster.
+catch a fault in that optimization. They are not the fallback path; the measured
+fixtures show the positioned resolvers were faster.
 
 ## Landed: transaction byte positions in row values
 
@@ -263,8 +258,9 @@ untested branch was the only one that matters in production.
 **Change.** `resolve_script_history`, `resolve_unspent_outputs{,_with_height}`
 and `resolve_transaction` now read each row's `TxPosition` list, fetch only
 those byte ranges through `BlockSource::block_bytes_at_height`, and decode only
-those transactions. The naive whole-block scan survives as
-`*_scan` — oracle, benchmark `before` arm, and the live fallback.
+those transactions. The public `*_scan` methods survive as correctness oracles
+and benchmark `before` arms; production resolvers use private per-height full-scan
+helpers when positioned resolution fails.
 
 **The all-or-scan rule is what makes this safe.** A resolver falls back to a full
 block scan the moment any single position fails to resolve; it never skips a
