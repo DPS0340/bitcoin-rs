@@ -2165,7 +2165,7 @@ mod tests {
                 height,
                 block_hex: "00".to_owned(),
                 body_size: 1,
-                header_hex: String::new(),
+                header: None,
                 tx_count: 0,
                 time: 0,
             });
@@ -2225,7 +2225,7 @@ mod tests {
                 height,
                 block_hex: "00".to_owned(),
                 body_size: 1,
-                header_hex: String::new(),
+                header: None,
                 tx_count: 0,
                 time: 0,
             });

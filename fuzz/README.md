@@ -27,7 +27,7 @@ Replace `p2p_message` with any of:
 | `block_decode`  | Block consensus deserialization                      |
 | `tx_decode`     | Transaction consensus deserialization                |
 | `script_eval`   | Portable script interpreter (`Interpreter::execute`) |
-| `utxo_snapshot` | UTXO snapshot deserializer (`read_snapshot`)         |
+| `utxo_snapshot` | UTXO snapshot deserializer (`read_snapshot_strict_v4`)     |
 
 To limit the number of iterations:
 
