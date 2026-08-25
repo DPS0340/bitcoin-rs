@@ -502,10 +502,10 @@ never run against a mainnet-tip node.
    real 64-hex scripthashes, one per line, with at least 10,000 non-empty
    histories.
 
-The invocation, for whoever has that host:
+The retired invocation is not a current reproduction command:
 
 ```
-the retired measurement script \
+# retired command; retained arguments are historical only
   --output <measurement.json> --host <host> --port <port> \
   --pid <bitcoin-rs-pid> --tip-height <height> --tip-hash <64-hex> \
   --scripthashes <corpus-path> --sample-size 10000
