@@ -7985,6 +7985,7 @@ mod consensus_rule_tests {
             Arc::clone(&handles.block_tree),
             None,
             crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+            bitcoin_rs_index::IndexCapabilities::ALL,
             wake_rx,
         )?;
 

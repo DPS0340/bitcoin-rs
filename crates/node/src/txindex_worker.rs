@@ -1,13 +1,15 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
-//! The node creates and owns exactly one `TxIndexRuntime` when `txindex` is
-//! enabled. The runtime holds a process-local revision counter and a bounded
+//! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
+//! `ScriptIndex` enables an index capability. The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The single writer may atomically
 //! publish a complete formerly authoritative prefix while the applied chain
 //! advances or reorganizes; exact query gating refuses that temporary lag and
-//! the next worker pass repairs it. A snapshot-gated query engine serves
-//! `bitcoin_rs_rpc::TxIndexQuery` and the Electrum `ConfirmedHistoryReader`
+//! the next worker pass repairs it. Independent durable capability watermarks
+//! let aligned row families share one parse and commit while divergent families
+//! backfill separately. A snapshot-gated query engine serves
+//! `bitcoin_rs_rpc::TxIndexQuery` and the generic [`ScriptIndexQuery`]
 //! without raw index mutex paths.
 
 use std::sync::Arc;
@@ -15,23 +17,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::DisplayHex as _;
 use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
-use bitcoin_rs_electrum::methods::{
-    ConfirmedHistoryReader, ConfirmedHistorySnapshot, ElectrumError, HistoryRecord,
-    TxIndexInfo as ElectrumTxIndexInfo,
-};
 use bitcoin_rs_index::{
-    HashPrefixRow, IndexError, IndexReader, IndexWatermark, IndexWriter, PreparedBatch,
-    PreparedBatchLimits, PreparedBlock, ScriptHash, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    HashPrefixRow, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
+    IndexWatermarks, IndexWriter, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHash,
+    TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockBodySource, TxIndexInfo, TxIndexQuery, TxQueryError};
-use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
+use bitcoin_rs_rpc::{
+    BlockBodySource, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
+    SpendingRecord, TxIndexInfo, TxIndexQuery, TxQueryError,
+};
+use bitcoin_rs_storage::PrefixScanLimit;
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
@@ -161,6 +162,7 @@ impl TxIndexWorker {
         block_tree: Arc<RwLock<BlockTree>>,
         body_store: Option<Arc<dyn PruneBodyStore>>,
         batch_limits: PreparedBatchLimits,
+        enabled: IndexCapabilities,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
         let worker = Worker {
@@ -170,6 +172,7 @@ impl TxIndexWorker {
             block_tree,
             body_store,
             batch_limits,
+            enabled,
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
             batch_delay: FORWARD_BATCH_DELAY,
@@ -224,18 +227,48 @@ impl Drop for TxIndexWorker {
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
+    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        let watermark = self.watermark()?;
+        Ok(IndexWatermarks {
+            tx_lookup: watermark,
+            script_history: watermark,
+        })
+    }
     fn prepare_block(
         &self,
         height: u32,
         hash: [u8; 32],
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError>;
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        let _ = capabilities;
+        self.prepare_block(height, hash, body)
+    }
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError>;
     fn commit_rollback_one(
         &self,
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError>;
+    fn commit_rollback_one_for(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+    ) -> Result<(), IndexError> {
+        let _ = capabilities;
+        self.commit_rollback_one(prev, body)
+    }
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        let _ = capabilities;
+        Err(IndexError::UnsupportedRollback)
+    }
 }
 
 impl<S> TxIndexWriter for Mutex<IndexWriter<S>>
@@ -246,6 +279,10 @@ where
         self.lock().watermark()
     }
 
+    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        self.lock().watermarks()
+    }
+
     fn prepare_block(
         &self,
         height: u32,
@@ -253,6 +290,17 @@ where
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError> {
         self.lock().prepare_block(height, hash, body)
+    }
+
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.lock()
+            .prepare_block_for(capabilities, height, hash, body)
     }
 
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
@@ -266,6 +314,20 @@ where
     ) -> Result<(), IndexError> {
         self.lock().commit_rollback_one(prev, body)
     }
+
+    fn commit_rollback_one_for(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+    ) -> Result<(), IndexError> {
+        self.lock()
+            .commit_rollback_one_for(capabilities, prev, body)
+    }
+
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        self.lock().reset_capabilities(capabilities)
+    }
 }
 
 struct Worker {
@@ -275,6 +337,7 @@ struct Worker {
     block_tree: Arc<RwLock<BlockTree>>,
     body_store: Option<Arc<dyn PruneBodyStore>>,
     batch_limits: PreparedBatchLimits,
+    enabled: IndexCapabilities,
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
@@ -282,6 +345,7 @@ struct Worker {
 
 /// Uncommitted contiguous rows based on one unchanged durable watermark.
 struct PendingForward {
+    capabilities: IndexCapabilities,
     durable: Option<IndexWatermark>,
     batch: PreparedBatch,
     deadline: Instant,
@@ -293,6 +357,26 @@ impl PendingForward {
             unreachable!("pending forward batch is nonempty");
         };
         watermark
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SelectedWatermark {
+    Valid(Option<IndexWatermark>),
+    Invalid,
+}
+
+fn selected_watermark(
+    watermarks: IndexWatermarks,
+    capabilities: IndexCapabilities,
+) -> SelectedWatermark {
+    match (capabilities.tx_lookup, capabilities.script_history) {
+        (true, false) => SelectedWatermark::Valid(watermarks.tx_lookup),
+        (false, true) => SelectedWatermark::Valid(watermarks.script_history),
+        (true, true) if watermarks.tx_lookup == watermarks.script_history => {
+            SelectedWatermark::Valid(watermarks.tx_lookup)
+        }
+        (true, true) | (false, false) => SelectedWatermark::Invalid,
     }
 }
 
@@ -438,90 +522,186 @@ impl Worker {
         &self,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
-        let (target, watermark) = self.capture_target_watermark()?;
+        let (target, watermarks) = self.capture_target_watermarks()?;
 
-        if let Some(state) = pending.as_ref() {
-            if state.durable != watermark {
-                return Err(TxIndexWorkerError::PendingDurableChanged);
-            }
-            let endpoint = state.endpoint();
-            let Some(target) = target.as_deref() else {
-                return if self.commit_pending(pending)? {
-                    Ok(ReconcileAction::Progressed)
-                } else {
-                    Ok(ReconcileAction::Stalled)
-                };
+        if pending.is_some() {
+            return self.reconcile_pending(pending, watermarks, target.as_deref());
+        }
+
+        let mut watermarks = watermarks;
+        while let Some((capabilities, watermark)) =
+            self.rollback_selection(watermarks, target.as_deref())
+        {
+            let previous = match self.rollback_one(capabilities, watermark) {
+                Ok(previous) => previous,
+                Err(error) if error.requires_capability_rebuild() => {
+                    tracing::warn!(
+                        error = %error,
+                        tx_lookup = capabilities.tx_lookup,
+                        script_history = capabilities.script_history,
+                        "index cursor cannot be rolled back; rebuilding selected capabilities"
+                    );
+                    self.writer
+                        .reset_capabilities(capabilities)
+                        .map_err(TxIndexWorkerError::Index)?;
+                    None
+                }
+                Err(error) => return Err(error),
             };
-
-            if endpoint.height == target.height && endpoint.hash == target.hash.to_le_bytes() {
-                if Instant::now() < state.deadline {
-                    return Ok(ReconcileAction::Buffered);
-                }
-                return if self.commit_pending(pending)? {
-                    Ok(ReconcileAction::CaughtUp)
-                } else {
-                    Ok(ReconcileAction::Stalled)
-                };
+            if capabilities.tx_lookup {
+                watermarks.tx_lookup = previous;
             }
-            if endpoint.height < target.height
-                && self.watermark_is_on_target_chain(endpoint, target)
-            {
-                if Instant::now() >= state.deadline {
-                    return if self.commit_pending(pending)? {
-                        Ok(ReconcileAction::Progressed)
-                    } else {
-                        Ok(ReconcileAction::Stalled)
-                    };
-                }
-                return self.catch_up_to(target, watermark, pending);
+            if capabilities.script_history {
+                watermarks.script_history = previous;
             }
+        }
 
+        let Some(target) = target else {
+            return Ok(ReconcileAction::CaughtUp);
+        };
+        let Some((capabilities, watermark)) = self.forward_selection(watermarks, &target) else {
+            return Ok(ReconcileAction::CaughtUp);
+        };
+        self.catch_up_to(&target, watermark, capabilities, pending)
+    }
+
+    fn reconcile_pending(
+        &self,
+        pending: &mut Option<PendingForward>,
+        watermarks: IndexWatermarks,
+        target: Option<&TipSnapshot>,
+    ) -> Result<ReconcileAction, TxIndexWorkerError> {
+        let Some(state) = pending.as_ref() else {
+            return Err(TxIndexWorkerError::PendingDurableChanged);
+        };
+        if selected_watermark(watermarks, state.capabilities)
+            != SelectedWatermark::Valid(state.durable)
+        {
+            return Err(TxIndexWorkerError::PendingDurableChanged);
+        }
+        let endpoint = state.endpoint();
+        let Some(target) = target else {
             return if self.commit_pending(pending)? {
                 Ok(ReconcileAction::Progressed)
             } else {
                 Ok(ReconcileAction::Stalled)
             };
-        }
-
-        let Some(watermark) = watermark else {
-            let Some(target) = target else {
-                return Ok(ReconcileAction::CaughtUp);
-            };
-            return self.catch_up_to(&target, None, pending);
         };
 
-        let Some(target) = target else {
-            return match self.rollback_to_none(watermark) {
-                Ok(()) => Ok(ReconcileAction::CaughtUp),
-                Err(TxIndexWorkerError::MissingBody { .. }) => Ok(ReconcileAction::Stalled),
-                Err(error) => Err(error),
+        if endpoint.height == target.height && endpoint.hash == target.hash.to_le_bytes() {
+            if Instant::now() < state.deadline {
+                return Ok(ReconcileAction::Buffered);
+            }
+            return if self.commit_pending(pending)? {
+                Ok(ReconcileAction::CaughtUp)
+            } else {
+                Ok(ReconcileAction::Stalled)
             };
-        };
-
-        if !self.watermark_is_on_target_chain(watermark, &target) {
-            let new_watermark = match self.rollback_to_target(watermark, &target) {
-                Ok(watermark) => watermark,
-                Err(TxIndexWorkerError::MissingBody { .. }) => {
-                    return Ok(ReconcileAction::Stalled);
-                }
-                Err(error) => return Err(error),
-            };
-            return self.catch_up_to(&target, new_watermark, pending);
+        }
+        if endpoint.height < target.height && self.watermark_is_on_target_chain(endpoint, target) {
+            if Instant::now() >= state.deadline {
+                return if self.commit_pending(pending)? {
+                    Ok(ReconcileAction::Progressed)
+                } else {
+                    Ok(ReconcileAction::Stalled)
+                };
+            }
+            return self.catch_up_to(target, state.durable, state.capabilities, pending);
         }
 
-        if watermark.height == target.height {
-            return Ok(ReconcileAction::CaughtUp);
+        if self.commit_pending(pending)? {
+            Ok(ReconcileAction::Progressed)
+        } else {
+            Ok(ReconcileAction::Stalled)
         }
-
-        self.catch_up_to(&target, Some(watermark), pending)
     }
 
-    fn capture_target_watermark(
+    fn capture_target_watermarks(
         &self,
-    ) -> Result<(Option<Arc<TipSnapshot>>, Option<IndexWatermark>), TxIndexWorkerError> {
+    ) -> Result<(Option<Arc<TipSnapshot>>, IndexWatermarks), TxIndexWorkerError> {
         let target = self.applied_tip.load_full();
-        let watermark = self.writer.watermark().map_err(TxIndexWorkerError::Index)?;
-        Ok((target, watermark))
+        let watermarks = self
+            .writer
+            .watermarks()
+            .map_err(TxIndexWorkerError::Index)?;
+        Ok((target, watermarks))
+    }
+
+    fn rollback_selection(
+        &self,
+        watermarks: IndexWatermarks,
+        target: Option<&TipSnapshot>,
+    ) -> Option<(IndexCapabilities, IndexWatermark)> {
+        let tx = self
+            .enabled
+            .tx_lookup
+            .then_some(watermarks.tx_lookup)
+            .flatten();
+        let script_index = self
+            .enabled
+            .script_history
+            .then_some(watermarks.script_history)
+            .flatten();
+        let needs_rollback = |watermark: IndexWatermark| {
+            target.is_none_or(|target| !self.watermark_is_on_target_chain(watermark, target))
+        };
+        let selected = [tx, script_index]
+            .into_iter()
+            .flatten()
+            .filter(|watermark| needs_rollback(*watermark))
+            .max_by_key(|watermark| watermark.height)?;
+        Some((
+            IndexCapabilities {
+                tx_lookup: tx == Some(selected) && needs_rollback(selected),
+                script_history: script_index == Some(selected) && needs_rollback(selected),
+            },
+            selected,
+        ))
+    }
+
+    fn forward_selection(
+        &self,
+        watermarks: IndexWatermarks,
+        target: &TipSnapshot,
+    ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
+        let tx = self.enabled.tx_lookup.then_some(watermarks.tx_lookup);
+        let script_index = self
+            .enabled
+            .script_history
+            .then_some(watermarks.script_history);
+        let needs_forward = |watermark: Option<IndexWatermark>| {
+            watermark.is_none_or(|watermark| watermark.height < target.height)
+        };
+        let start_height = |watermark: Option<IndexWatermark>| {
+            watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
+        };
+        let selected_start = [tx, script_index]
+            .into_iter()
+            .flatten()
+            .filter(|watermark| needs_forward(*watermark))
+            .map(start_height)
+            .min()?;
+        let selected_watermark = if selected_start == 0 {
+            None
+        } else {
+            let height = selected_start - 1;
+            [tx, script_index]
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|watermark| watermark.height == height)
+        };
+        Some((
+            IndexCapabilities {
+                tx_lookup: tx.is_some_and(|watermark| {
+                    needs_forward(watermark) && start_height(watermark) == selected_start
+                }),
+                script_history: script_index.is_some_and(|watermark| {
+                    needs_forward(watermark) && start_height(watermark) == selected_start
+                }),
+            },
+            selected_watermark,
+        ))
     }
 
     fn watermark_is_on_target_chain(
@@ -582,6 +762,7 @@ impl Worker {
         &self,
         target: &TipSnapshot,
         watermark: Option<IndexWatermark>,
+        capabilities: IndexCapabilities,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
         if self.runtime.should_stop() {
@@ -589,11 +770,12 @@ impl Worker {
         }
 
         let mut state = pending.take().unwrap_or_else(|| PendingForward {
+            capabilities,
             durable: watermark,
             batch: PreparedBatch::new(self.batch_limits),
             deadline: Instant::now() + self.batch_delay,
         });
-        if state.durable != watermark {
+        if state.durable != watermark || state.capabilities != capabilities {
             return Err(TxIndexWorkerError::PendingDurableChanged);
         }
         let start_height = state.batch.watermark().map_or_else(
@@ -652,7 +834,7 @@ impl Worker {
 
                 let prepared = self
                     .writer
-                    .prepare_block(identity.height, identity.hash, &body)
+                    .prepare_block_for(capabilities, identity.height, identity.hash, &body)
                     .map_err(TxIndexWorkerError::Index)?;
                 drop(body);
                 if self.runtime.should_stop() {
@@ -718,42 +900,10 @@ impl Worker {
             Ok(ReconcileAction::Stalled)
         }
     }
-    /// Rolls the index back until the watermark is an ancestor of `target` or
-    /// `None`.
-    fn rollback_to_target(
-        &self,
-        mut watermark: IndexWatermark,
-        target: &TipSnapshot,
-    ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
-        while !self.watermark_is_on_target_chain(watermark, target) {
-            if self.runtime.should_stop() {
-                return Err(TxIndexWorkerError::Stopped);
-            }
-            let new_watermark = self.rollback_one(watermark)?;
-            watermark = match new_watermark {
-                Some(watermark) => watermark,
-                None => return Ok(None),
-            };
-        }
-        Ok(Some(watermark))
-    }
-
-    /// Rolls the index back to `None`.
-    fn rollback_to_none(&self, mut watermark: IndexWatermark) -> Result<(), TxIndexWorkerError> {
-        loop {
-            if self.runtime.should_stop() {
-                return Err(TxIndexWorkerError::Stopped);
-            }
-            match self.rollback_one(watermark)? {
-                Some(next) => watermark = next,
-                None => return Ok(()),
-            }
-        }
-    }
-
-    /// Rolls back one complete block from the single-writer index.
+    /// Rolls back one complete block for every selected capability.
     fn rollback_one(
         &self,
+        capabilities: IndexCapabilities,
         watermark: IndexWatermark,
     ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
         let watermark_hash = Hash256::from_le_bytes(&watermark.hash);
@@ -764,7 +914,7 @@ impl Worker {
         } else {
             let prepared = self
                 .writer
-                .prepare_block(watermark.height, watermark.hash, &body)
+                .prepare_block_for(capabilities, watermark.height, watermark.hash, &body)
                 .map_err(TxIndexWorkerError::Index)?;
             Some(IndexWatermark {
                 height: watermark.height.saturating_sub(1),
@@ -776,7 +926,7 @@ impl Worker {
             return Err(TxIndexWorkerError::Stopped);
         }
         self.writer
-            .commit_rollback_one(prev, &body)
+            .commit_rollback_one_for(capabilities, prev, &body)
             .map_err(TxIndexWorkerError::Index)?;
         Ok(prev)
     }
@@ -846,6 +996,15 @@ enum TxIndexWorkerError {
     NoBodyStore,
     #[error("txindex worker: target chain node missing at height {height}")]
     MissingTargetChain { height: u32 },
+}
+
+impl TxIndexWorkerError {
+    fn requires_capability_rebuild(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingBody { .. } | Self::Index(IndexError::MissingWatermarkIdentity { .. })
+        )
+    }
 }
 
 /// Aggregate work budget shared by every operation in one public query.
@@ -918,9 +1077,9 @@ impl QueryBudget {
 
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
-/// Implements `bitcoin_rs_rpc::TxIndexQuery` and `bitcoin_rs_electrum`'s
-/// `ConfirmedHistoryReader` as the only public read paths for the transaction
-/// index. Every query runs against one typed point-in-time snapshot, captures
+/// Implements `bitcoin_rs_rpc::TxIndexQuery` and [`ScriptIndexQuery`] as the
+/// only public read paths for the transaction index. Every query runs against
+/// one typed point-in-time snapshot, captures
 /// health/shutdown/revision/tip before and after work, and returns typed
 /// `Retry`/`Unavailable` when the answer cannot be proven.
 #[derive(Clone)]
@@ -974,7 +1133,7 @@ impl TxIndexQueryEngine {
         Ok(())
     }
 
-    fn with_snapshot<F, T>(&self, f: F) -> Result<T, TxQueryError>
+    fn with_snapshot<F, T>(&self, required: IndexCapabilities, f: F) -> Result<T, TxQueryError>
     where
         F: for<'s> FnOnce(
             &'s dyn TxIndexSnapshot,
@@ -999,16 +1158,21 @@ impl TxIndexQueryEngine {
 
         // Ensure the index watermark is exactly at the applied tip we are
         // answering for, otherwise the snapshot is stale.
-        let watermark = snapshot
-            .watermark()
-            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-        let Some(watermark) = watermark else {
-            return Err(TxQueryError::Retry);
-        };
-        if watermark.height != tip_before.height
-            || watermark.hash != *tip_before.hash.as_byte_array()
-        {
-            return Err(TxQueryError::Retry);
+        for capability in [IndexCapability::TxLookup, IndexCapability::ScriptHistory] {
+            if !required.contains(capability) {
+                continue;
+            }
+            let watermark = snapshot
+                .capability_watermark(capability)
+                .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
+            let Some(watermark) = watermark else {
+                return Err(TxQueryError::Retry);
+            };
+            if watermark.height != tip_before.height
+                || watermark.hash != *tip_before.hash.as_byte_array()
+            {
+                return Err(TxQueryError::Retry);
+            }
         }
 
         let mut budget = QueryBudget::new();
@@ -1324,93 +1488,81 @@ impl TxIndexQueryEngine {
         Ok(outputs)
     }
 
-    fn confirmed_history_snapshot_for(
+    fn spender_for(
+        &self,
+        snapshot: &dyn TxIndexSnapshot,
+        tip: &TipSnapshot,
+        budget: &mut QueryBudget,
+        outpoint: &OutPoint,
+    ) -> Result<Option<SpendingRecord>, TxQueryError> {
+        let spend_rows = Self::scan_spending_rows(snapshot, budget, outpoint)?;
+        let mut last_height = None;
+        for row in spend_rows {
+            let height = row.height();
+            if last_height == Some(height) {
+                continue;
+            }
+            last_height = Some(height);
+            let hash = self.resolve_hash_at_height(height, tip)?;
+            let block = self.resolve_block(budget, height, hash)?;
+            for transaction in &block.txdata {
+                let Some(vin) = transaction
+                    .input
+                    .iter()
+                    .position(|input| input.previous_output == *outpoint)
+                else {
+                    continue;
+                };
+                return Ok(Some(SpendingRecord {
+                    txid: transaction.compute_txid(),
+                    height,
+                    vin: u32::try_from(vin)
+                        .map_err(|_| TxQueryError::Storage("vin overflow".into()))?,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn history_snapshot_for(
         &self,
         snapshot: &dyn TxIndexSnapshot,
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         scripthash: ScriptHash,
-    ) -> Result<ConfirmedHistorySnapshot, TxQueryError> {
+    ) -> Result<ScriptIndexSnapshot, TxQueryError> {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
 
-        let mut history = Vec::new();
-        let mut unspent = Vec::new();
-        for &(txid, vout, value, height) in &funding_outputs {
-            history.push(HistoryRecord {
+        let mut history = Vec::with_capacity(funding_outputs.len());
+        let mut funding = Vec::with_capacity(funding_outputs.len());
+        for (txid, vout, value, height) in funding_outputs {
+            history.push(ScriptHistoryRecord { txid, height });
+            funding.push(ScriptIndexRecord {
                 txid,
-                height: i64::from(height),
+                height,
                 value,
                 vout,
-                spent: false,
             });
-        }
-
-        // Resolve every funding record, retaining it as unspent only when no
-        // indexed candidate contains a transaction that actually spends it.
-        for (txid, vout, value, height) in funding_outputs {
             let outpoint = OutPoint { txid, vout };
-            let spend_rows = Self::scan_spending_rows(snapshot, budget, &outpoint)?;
-            let mut spent = false;
-
-            let mut last_spend_height: Option<u32> = None;
-            let mut cached_spend_block: Option<Block> = None;
-            for row in spend_rows {
-                let spend_height = row.height();
-                if last_spend_height != Some(spend_height) {
-                    let hash = self.resolve_hash_at_height(spend_height, tip)?;
-                    cached_spend_block = Some(self.resolve_block(budget, spend_height, hash)?);
-                    last_spend_height = Some(spend_height);
-                }
-                let block = cached_spend_block.as_ref().ok_or_else(|| {
-                    TxQueryError::Unavailable("missing block during history query".into())
-                })?;
-                for tx in &block.txdata {
-                    if tx
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == outpoint)
-                    {
-                        spent = true;
-                        history.push(HistoryRecord {
-                            txid: tx.compute_txid(),
-                            height: i64::from(spend_height),
-                            value: 0,
-                            vout: 0,
-                            spent: true,
-                        });
-                        break;
-                    }
-                }
-            }
-
-            if !spent {
-                unspent.push(HistoryRecord {
-                    txid,
-                    height: i64::from(height),
-                    value,
-                    vout,
-                    spent: false,
+            if let Some(spender) = self.spender_for(snapshot, tip, budget, &outpoint)? {
+                history.push(ScriptHistoryRecord {
+                    txid: spender.txid,
+                    height: spender.height,
                 });
             }
         }
 
-        history.sort_by(|a, b| {
-            a.height
-                .cmp(&b.height)
-                .then_with(|| a.txid.cmp(&b.txid))
-                .then_with(|| a.vout.cmp(&b.vout))
-                .then_with(|| a.value.cmp(&b.value))
-        });
-        history.dedup_by(|a, b| a.txid == b.txid && a.height == b.height && a.vout == b.vout);
-        unspent.sort_by(|a, b| {
+        history.sort_by(|a, b| a.height.cmp(&b.height).then_with(|| a.txid.cmp(&b.txid)));
+        history.dedup_by(|a, b| a.txid == b.txid && a.height == b.height);
+        funding.sort_by(|a, b| {
             a.height
                 .cmp(&b.height)
                 .then_with(|| a.txid.cmp(&b.txid))
                 .then_with(|| a.vout.cmp(&b.vout))
         });
-        unspent.dedup_by(|a, b| a.txid == b.txid && a.height == b.height && a.vout == b.vout);
+        funding.dedup();
 
-        Ok(ConfirmedHistorySnapshot { history, unspent })
+        Ok(ScriptIndexSnapshot { history, funding })
     }
 
     fn unspent_outputs_for(
@@ -1419,42 +1571,20 @@ impl TxIndexQueryEngine {
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         scripthash: ScriptHash,
-    ) -> Result<Vec<HistoryRecord>, TxQueryError> {
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
         let mut records = Vec::new();
         for (txid, vout, value, height) in funding_outputs {
             let outpoint = OutPoint { txid, vout };
-            let spend_rows = Self::scan_spending_rows(snapshot, budget, &outpoint)?;
-            let mut spent = false;
-            let mut last_spend_height = None;
-            let mut cached_spend_block = None;
-            for row in spend_rows {
-                let spend_height = row.height();
-                if last_spend_height != Some(spend_height) {
-                    let hash = self.resolve_hash_at_height(spend_height, tip)?;
-                    cached_spend_block = Some(self.resolve_block(budget, spend_height, hash)?);
-                    last_spend_height = Some(spend_height);
-                }
-                let block = cached_spend_block.as_ref().ok_or_else(|| {
-                    TxQueryError::Unavailable("missing block during unspent query".into())
-                })?;
-                if block.txdata.iter().any(|transaction| {
-                    transaction
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == outpoint)
-                }) {
-                    spent = true;
-                    break;
-                }
-            }
-            if !spent {
-                records.push(HistoryRecord {
+            if self
+                .spender_for(snapshot, tip, budget, &outpoint)?
+                .is_none()
+            {
+                records.push(ScriptIndexRecord {
                     txid,
-                    height: i64::from(height),
+                    height,
                     value,
                     vout,
-                    spent: false,
                 });
             }
         }
@@ -1469,7 +1599,10 @@ impl TxIndexQueryEngine {
         Ok(records)
     }
 
-    fn index_info_internal(&self) -> Result<TxIndexInfo, TxQueryError> {
+    fn index_info_internal(
+        &self,
+        required: IndexCapabilities,
+    ) -> Result<TxIndexInfo, TxQueryError> {
         self.query_health()?;
 
         let tip_before = self
@@ -1484,17 +1617,34 @@ impl TxIndexQueryEngine {
         let snapshot = reader
             .snapshot()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-        let watermark = snapshot
-            .watermark()
-            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-
-        // Synced means the durable index watermark is exactly at the published
-        // applied chainstate tip.
-        let synced = watermark.as_ref().is_some_and(|watermark| {
-            watermark.height == tip_before.height
-                && watermark.hash == *tip_before.hash.as_byte_array()
-        });
-        let best_block_height = watermark.map_or(0, |w| w.height);
+        let tx = required
+            .tx_lookup
+            .then(|| snapshot.capability_watermark(IndexCapability::TxLookup))
+            .transpose()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
+            .flatten();
+        let script_index = required
+            .script_history
+            .then(|| snapshot.capability_watermark(IndexCapability::ScriptHistory))
+            .transpose()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
+            .flatten();
+        let at_tip = |watermark: Option<IndexWatermark>| {
+            watermark.is_some_and(|watermark| {
+                watermark.height == tip_before.height
+                    && watermark.hash == *tip_before.hash.as_byte_array()
+            })
+        };
+        let synced = (!required.tx_lookup || at_tip(tx))
+            && (!required.script_history || at_tip(script_index));
+        let best_block_height = match (required.tx_lookup, required.script_history) {
+            (true, true) => tx
+                .map_or(0, |watermark| watermark.height)
+                .min(script_index.map_or(0, |watermark| watermark.height)),
+            (true, false) => tx.map_or(0, |watermark| watermark.height),
+            (false, true) => script_index.map_or(0, |watermark| watermark.height),
+            (false, false) => 0,
+        };
 
         self.query_health()?;
         let tip_after = self.applied_tip.load();
@@ -1517,19 +1667,19 @@ impl TxIndexQueryEngine {
 
 impl TxIndexQuery for TxIndexQueryEngine {
     fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             self.transaction_for(snapshot, tip, budget, txid)
         })
     }
 
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             self.outpoint_value_for(snapshot, tip, budget, outpoint)
         })
     }
 
     fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             Ok(self
                 .locate_transaction_for(snapshot, tip, budget, txid)?
                 .map(|(height, _)| height))
@@ -1537,58 +1687,36 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
-        self.index_info_internal()
+        self.index_info_internal(IndexCapabilities::TX_LOOKUP)
     }
 }
 
-impl ConfirmedHistoryReader for TxIndexQueryEngine {
-    fn confirmed_history_snapshot(
+impl ScriptIndexQuery for TxIndexQueryEngine {
+    fn history_snapshot(
         &self,
         scripthash: ScriptHash,
-    ) -> Result<ConfirmedHistorySnapshot, ElectrumError> {
-        self.with_snapshot(|snapshot, tip, budget| {
-            self.confirmed_history_snapshot_for(snapshot, tip, budget, scripthash)
-        })
-        .map_err(tx_query_error_to_electrum)
+    ) -> Result<ScriptIndexSnapshot, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.history_snapshot_for(snapshot, tip, budget, scripthash),
+        )
     }
 
-    fn unspent_outputs(&self, scripthash: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
-        self.with_snapshot(|snapshot, tip, budget| {
-            self.unspent_outputs_for(snapshot, tip, budget, scripthash)
-        })
-        .map_err(tx_query_error_to_electrum)
+    fn unspent_outputs(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.unspent_outputs_for(snapshot, tip, budget, scripthash),
+        )
     }
 
-    fn transaction_hex(&self, txid: &Txid) -> Result<String, ElectrumError> {
-        let tx = self
-            .transaction(txid)
-            .map_err(tx_query_error_to_electrum)?
-            .ok_or(ElectrumError::NotFound("transaction not found"))?;
-        Ok(serialize(&tx).to_lower_hex_string())
-    }
-
-    fn outpoint_value(&self, op: &OutPoint) -> Result<Option<u64>, ElectrumError> {
-        TxIndexQuery::outpoint_value(self, op).map_err(tx_query_error_to_electrum)
-    }
-
-    fn index_info(&self) -> Result<ElectrumTxIndexInfo, ElectrumError> {
-        let info = TxIndexQuery::index_info(self).map_err(tx_query_error_to_electrum)?;
-        Ok(ElectrumTxIndexInfo {
-            synced: info.synced,
-            best_block_height: info.best_block_height,
-        })
-    }
-}
-
-fn tx_query_error_to_electrum(error: TxQueryError) -> ElectrumError {
-    match error {
-        TxQueryError::Retry => {
-            ElectrumError::Unavailable("transaction index changed during query; retry".into())
-        }
-        TxQueryError::Unavailable(reason) => ElectrumError::Unavailable(reason),
-        TxQueryError::Storage(reason) => {
-            ElectrumError::Storage(StorageError::Backend(reason.to_string()))
-        }
+    fn spender(&self, outpoint: OutPoint) -> Result<Option<SpendingRecord>, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.spender_for(snapshot, tip, budget, &outpoint),
+        )
     }
 }
 
@@ -1599,6 +1727,7 @@ mod body_reader_tests {
     use bitcoin::Network;
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin_rs_chain::NodeStatus;
+    use bitcoin_rs_storage::StorageError;
 
     use super::*;
     use crate::apply::{PruneBodyReader, PruneBodyStore};
@@ -1724,6 +1853,7 @@ mod body_reader_tests {
             block_tree: tree,
             body_store: Some(body_store.clone()),
             batch_limits: DEFAULT_BATCH_LIMITS,
+            enabled: IndexCapabilities::ALL,
             wake_rx,
             quiet_period: Duration::ZERO,
             batch_delay: Duration::ZERO,
@@ -1731,7 +1861,7 @@ mod body_reader_tests {
         let mut pending = None;
 
         assert!(matches!(
-            worker.catch_up_to(&tip, None, &mut pending)?,
+            worker.catch_up_to(&tip, None, IndexCapabilities::ALL, &mut pending)?,
             ReconcileAction::Buffered
         ));
         assert_eq!(body_store.readers.load(Ordering::Acquire), 1);

@@ -28,6 +28,19 @@ tags:
 
 # Multi-peer block download is the only IBD wall-time lever and requires Core-style stalling-disconnect
 
+## Status
+
+**The design this document prescribes has since landed.** `crates/node/src/sync.rs` now
+carries `MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16`, `MIN_PEERS_FOR_FANOUT = PENDING_BUDGET / 16`
+(single-peer-128 depth as the sub-threshold fallback), window-blocked staller detection
+(`DownloadWindow::window_blocked_on`, not raw `applied_tip+1` stagnation), and the adaptive
+`BLOCK_STALLING_TIMEOUT` 2s→`BLOCK_STALLING_TIMEOUT_MAX` 64s with a `STALLER_COOLDOWN`
+eligibility exclusion. Staging was resized with it: `PENDING_BLOCK_BYTE_ESTIMATE` is 2 MiB, so
+`RECEIVED_BLOCK_BYTE_BUDGET` is 128 × 2 MiB, and a build assertion pins it against
+`MAX_SERIALIZED_BLOCK_SIZE`. The guidance below is the reasoning that produced that design and
+the failure modes it must keep avoiding — `sync.rs` cites this document as their pin. Read it as
+the rationale record, not as pending work.
+
 ## Context
 
 Goal: make bitcoin-rs end-to-end mainnet IBD at least as fast as Bitcoin Core C++. An extended
@@ -49,8 +62,13 @@ multi-peer attempt starts from the correct design and validation plan instead of
 2. **The only lever for the binding regime is multi-peer bandwidth aggregation.** At high height
    (1-2 MB blocks) a single peer is *serving-rate-limited* by its per-connection upload cap, so on a fast
    local link single-peer download leaves bandwidth on the table. Multi-peer is *doubly* necessary: it is
-   the only way to (a) not lose to Core on download, and (b) make bitcoin-rs's faster processing the
-   deciding factor instead of single-peer input starvation.
+   the only way to (a) not lose to Core on download, and (b) make bitcoin-rs's processing the deciding
+   factor instead of single-peer input starvation. Clause (b) was written on the premise that bitcoin-rs
+   processes faster than Core; the at-scale matched-validation run disproved that (Core 67 s vs
+   bitcoin-rs 389.7 s to height 150,000 — see
+   [small-window-benchmarks-do-not-predict-at-scale-throughput](../best-practices/small-window-benchmarks-do-not-predict-at-scale-throughput.md)).
+   Aggregating download bandwidth is still the download-regime lever; it just removes input starvation
+   rather than handing the decision to a processing advantage that is not currently demonstrated.
 
 3. **Naive multi-peer collapses — this was built, live-tested, and reverted.** Commit `5608279`
    (opt-in parallel download, per-peer inflight cap = 3) collapsed in 2/3 block-downloading live runs
@@ -76,10 +94,11 @@ multi-peer attempt starts from the correct design and validation plan instead of
    *under-fills* the window versus single-peer-128 -> early-height regression. A correct design must
    preserve single-peer-128 depth and fan out only when enough eligible peers AND staging capacity exist.
 
-6. **Staging budgets must be resized for high-height fan-out.** `RECEIVED_BLOCK_BYTE_BUDGET = 128*256KiB`
-   (~32 MB) is far below 128 high-height blocks at 1-2 MB (128-256 MB). Multi-peer fan-out re-creates the
-   eviction/retry churn from failure mode (3) unless staging budgets (or disk-backed staging) are
-   redesigned first.
+6. **Staging budgets must be resized for high-height fan-out.** At the time of writing
+   `RECEIVED_BLOCK_BYTE_BUDGET` was `128*256KiB` (~32 MB), far below 128 high-height blocks at
+   1-2 MB (128-256 MB); multi-peer fan-out re-creates the eviction/retry churn from failure mode
+   (3) unless staging is sized for the blocks it will actually hold. Resolved: the estimate is now
+   2 MiB per slot, and the in-flight and staged byte bounds are one constant.
 
 7. **Deterministic simulations give dangerously false confidence for net-scheduler changes.** A prior
    discrete-event simulator (`.outline/sim/agg_sim.rs`) reported 82-88% aggregation efficiency; live
@@ -147,7 +166,7 @@ PENDING_BUDGET = 128            // in-flight getdata window
 PEER_INFLIGHT_BUDGET = 128      // default per-peer cap == global (single fast peer fills window)
 RECEIVED_BLOCK_BUDGET = 128     // staged-out-of-order cap
 PENDING_TIMEOUT = 1 min         // re-request timeout (too slow for a stalled frontier peer)
-RECEIVED_BLOCK_BYTE_BUDGET = 128 * 256 KiB   // << 128 * 1-2 MB high-height blocks
+RECEIVED_BLOCK_BYTE_BUDGET = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIMATE = 128 * 2 MiB
 ```
 
 Scheduler entry points: `BlockSync` (sync.rs), `DownloadWindow::next_peer_request`,

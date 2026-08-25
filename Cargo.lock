@@ -334,32 +334,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcoin-rs-electrum"
-version = "0.4.0"
-dependencies = [
- "arc-swap",
- "bitcoin",
- "bitcoin-rs-index",
- "bitcoin-rs-mempool",
- "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
- "compact_str",
- "criterion",
- "crossbeam-channel",
- "hashbrown 0.17.1",
- "parking_lot",
- "proptest",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sonic-rs",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "bitcoin-rs-filters"
 version = "0.4.0"
 dependencies = [
@@ -444,7 +418,6 @@ dependencies = [
  "bitcoin-rs-chain",
  "bitcoin-rs-coinstats",
  "bitcoin-rs-consensus",
- "bitcoin-rs-electrum",
  "bitcoin-rs-filters",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
@@ -2497,20 +2470,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cadadef317c2f20755a64d7fdc48f9e7178ee6b0e1f7fce33fa60f1d68a276e6"
 
 [[package]]
-name = "ring"
-version = "0.17.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
-dependencies = [
- "cc",
- "cfg-if",
- "getrandom 0.2.17",
- "libc",
- "untrusted",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "rkyv"
 version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2615,41 +2574,6 @@ checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
  "rustix",
-]
-
-[[package]]
-name = "rustls"
-version = "0.23.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
-dependencies = [
- "log",
- "once_cell",
- "ring",
- "rustls-pki-types",
- "rustls-webpki",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "rustls-pki-types"
-version = "1.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
-dependencies = [
- "zeroize",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.103.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
-dependencies = [
- "ring",
- "rustls-pki-types",
- "untrusted",
 ]
 
 [[package]]
@@ -3009,12 +2933,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
-name = "subtle"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3335,12 +3253,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "untrusted"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "utf8parse"

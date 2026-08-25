@@ -57,11 +57,12 @@ Done:
   failures preserve both branch eligibility and ownership.
 * Fork-aware download requests start at the common ancestor's child. A target
   change discards pending ownership from the losing branch.
-* A node-owned supervised TxIndex worker reconciles a versioned `(height, hash)`
-  watermark to exact applied-tip ancestry. It can retain one bounded forward
-  batch across strict descendant tip revisions. A rival, lower, or absent tip
-  can commit the complete prepared prefix; the next pass repairs it. Each
-  commit and one-block rollback updates rows and watermark atomically.
+* A node-owned supervised TxIndex worker reconciles independent versioned
+  `TxLookup` and `ScriptHistory` `(height, hash)` watermarks to exact
+  applied-tip ancestry. Equal cursors share one body scan and one atomic commit;
+  divergent cursors move only the lagging capability. It can retain one bounded
+  forward batch across strict descendant tip revisions. A rival, lower, or
+  absent tip can commit the complete prepared prefix; the next pass repairs it.
 * A fatal disconnect closes apply admission and sets the process shutdown token.
   The durable marker prevents a restart on torn authoritative state.
 
@@ -70,7 +71,7 @@ replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
 disconnect notifications through `pubsequence`, but mempool `A`/`R` events remain
 intentionally open.
 Transaction reconsideration requires one production admission pipeline shared
-by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
+by Esplora broadcast, P2P relay, and reorg handling. Raw mempool insertion cannot supply
 the required fee, policy, conflict, and ancestry metadata.
 
 ## Why it matters
@@ -86,9 +87,9 @@ This distinction is load-bearing. Do not force both states into one transaction.
 | | Authoritative UTXO set and applied tip | Derived TxIndex |
 |---|---|---|
 | Lives in | UTXO set in RAM; tip published in process | On disk |
-| Durability | clean checkpoints | each atomic rows-plus-watermark batch |
-| A crash during mutation | can leave a torn UTXO set; marker blocks restart | leaves the previous or next complete watermark; an uncommitted pending batch disappears |
-| Recovery | refuse torn state; otherwise load the checkpoint | reconcile the exact durable watermark to the applied tip; queries remain unavailable until they match |
+| Durability | clean checkpoints | each atomic rows-plus-capability-watermark batch |
+| A crash during mutation | can leave a torn UTXO set; marker blocks restart | leaves each selected capability at its previous or next complete watermark; an uncommitted pending batch disappears |
+| Recovery | refuse torn state; otherwise load the checkpoint | reconcile each enabled durable watermark to the applied tip; queries remain unavailable until every capability they consume matches |
 
 Consequences:
 
@@ -102,14 +103,24 @@ Consequences:
    to `RolledBack`; only a clean checkpoint can clear it after publication. A
    checkpoint refuses `InFlight`, and startup refuses either phase. The marker
    prevents service on inconsistent authoritative state. It does not repair it.
-3. **TxIndex recovery starts from its own atomic watermark.** The worker can
-   retain one bounded forward batch while the applied tip moves through strict
-   descendants. A rival, lower, or absent tip can make it commit the complete
-   prepared prefix before the next pass repairs it. Every commit writes rows
-   and the final watermark together. Every rollback deletes one block's rows
-   and replaces or removes the watermark in one batch. A crash drops an
-   uncommitted batch or leaves one complete watermark, so exact query gating
-   cannot publish partial coverage as complete.
+3. **TxIndex recovery starts from atomic capability watermarks.** `TxLookup`
+   owns `TxConfirmed`; `ScriptHistory` owns `Funding` and `Spending`; the
+   identity-bearing `BlockHeaders` rows are shared rollback metadata. The worker
+   can retain one bounded forward batch while the applied tip moves through
+   strict descendants. Equal cursors prepare both families in one block scan
+   and write their rows and final watermarks together. Divergent cursors commit
+   and roll back independently. A crash drops an uncommitted batch or leaves
+   each selected capability at one complete watermark, so exact query gating
+   cannot publish partial coverage as complete. Version-one stores promote the
+   old all-family watermark to both capability watermarks without reindexing.
+
+   A disabled capability keeps its cursor and the shared ancestor identities it
+   may still need. Competing-branch rows can coexist in `BlockHeaders`, so its
+   iteration order and row count are not an active chain or tip; authoritative
+   header queries use `BlockTree`. On re-enable the worker reconciles from that
+   cursor. If a disconnected body or rollback identity is gone, a durable reset
+   marker first makes the affected capability unavailable, then bounded deletion
+   and rebuild replace its derived rows. Startup resumes an interrupted reset.
 
 ## Disconnect order
 
@@ -121,7 +132,8 @@ Consequences:
 Step 3 is the authoritative commit point. Preflight failures before the marker
 refuse without mutation. Failures after the UTXO mutation are fatal because the
 sharded undo can stop part-way. After step 3, TxIndex may lag safely; complete
-queries remain unavailable until its exact watermark reaches the applied tip.
+queries remain unavailable until their required capability watermarks reach the
+applied tip.
 
 ## Do not assume undo is idempotent
 
@@ -159,7 +171,7 @@ Done:
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
 | Persistence | queued before the block body and UTXO commit; flushed with a clean checkpoint, not per block |
 | `disconnect_block` | restores the UTXO set, coinstats, and applied tip; then publishes a TxIndex wake |
-| TxIndex reconciliation | node-owned worker rolls its exact watermark back to the common ancestor one atomic block at a time, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Rival, lower, or absent tips can commit a complete prepared prefix; the next pass repairs it. Exact snapshot-plus-tip gating keeps queries unavailable until the watermark matches. |
+| TxIndex reconciliation | one node-owned worker rolls enabled capability watermarks back to the common ancestor, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Equal cursors share one body parse and atomic commit; divergent cursors move independently. `--scriptindex` enables generic script UTXO, history, and outpoint-spender queries, while only explicit `--txindex` advertises Core txindex semantics. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Exact capability snapshot-plus-tip gating keeps individual queries unavailable until every consumed watermark matches. Esplora additionally captures the applied-tip identity around each GET response so independently safe index reads cannot be combined across a reorg. |
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
@@ -175,7 +187,7 @@ Open:
 
 | Piece | Notes |
 |---|---|
-| Mempool reconsideration | Block transactions need the same production admission pipeline as Electrum and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
+| Mempool reconsideration | Block transactions need the same production admission pipeline as Esplora broadcast and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
 | Mempool sequence events | Mempool `A`/`R` notifications remain intentionally absent until event sequencing and removal reasons are redesigned |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
 | Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
@@ -204,6 +216,7 @@ normal shutdown path.
    keep `RolledBack` until a clean checkpoint is durable, and refuse to clear an
    incomplete operation.
 3. **Keep derived durable state outside the authoritative rollback.** Give each
-   derived index an exact atomic watermark and make every query prove complete
-   coverage of the applied tip. A wake is only a scheduling hint; the watermark
-   is the recovery and correctness boundary.
+   derived row family an exact atomic capability watermark and make every query
+   prove complete coverage of the applied tip for all families it consumes. A
+   wake is only a scheduling hint; the watermarks are the recovery and
+   correctness boundary.

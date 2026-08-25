@@ -6,7 +6,7 @@
 
 ## Ultrareview Log (oracles + web research applied)
 
-Recorded so subsequent reviewers can see what changed during the original plan's external review and why. Findings from the adversarial critic pass (`task: critic`) and four parallel web-research probes were folded back into the plan above.
+Recorded so subsequent reviewers can see what changed during the original plan's external review and why. Findings from the adversarial critic pass (`task: critic`) and four parallel web-research probes were folded back into [`PLAN.md`](../../PLAN.md).
 
 ### CRITICAL — fixed
 
@@ -39,7 +39,7 @@ Triggered by user feedback: *"RocksDB is also previous generation. Use better on
 
 | Backend | Floor | Production users | Why added/kept | Source |
 | --- | --- | --- | --- | --- |
-| `rust-rocksdb` | `>=0.49` | Bitcoin Core, electrs, many indexers | Battle-tested explicit backend; zaidoon1 fork actively maintained (0.49.1 2026-05-18) | https://github.com/zaidoon1/rust-rocksdb |
+| `rust-rocksdb` | `>=0.49` | Bitcoin Core, electrs, many indexers | Explicit production backend; zaidoon1 fork actively maintained (0.49.1 2026-05-18) | https://github.com/zaidoon1/rust-rocksdb |
 | `signet-libmdbx` | `>=0.8` | **Reth (Paradigm's Rust Ethereum execution client), Erigon, Silkworm, Akula** — all use libmdbx as primary blockchain storage at mainnet scale (∼1.7 TiB) | Memory-mapped CoW B+tree, wait-free readers, no WAL, deterministic crash recovery | https://crates.io/crates/signet-libmdbx · https://github.com/init4tech/mdbx · https://reth.rs/ |
 | `fjall` | `>=3.1` | Growing embedded use (axum/actix services) | Default backend; pure-Rust LSM with native column families + `WriteBatch` + serializable txns | https://github.com/fjall-rs/fjall |
 | `redb` | `>=4.1` | electrs and other indexers | Pure-Rust single-file CoW B+tree with typed `TableDefinition` | https://github.com/cberner/redb |
@@ -103,13 +103,13 @@ Triggered by user feedback: *"RocksDB is also previous generation. Use better on
 - **Channels:** `flume` and `kanal` are fast but lack crossbeam-channel's `Select` macro — non-negotiable for the single-threaded event loop.
 - **Allocators:** `snmalloc-rs` and `tikv-jemallocator` remain unadjudicated alternates; they are not current workspace dependencies and require a dedicated G14 alloc-comparison follow-up before any default change.
 - **Thread pool:** `chili` is faster on micro-tasks but `rayon`'s work-stealing maturity wins for block-parallel script verify.
-- **Self-ref pin:** `ouroboros` is heavier and exposes Pin; `self_cell`'s proc-macro-free shape is optimal.
+- **Self-ref pin:** `ouroboros` is heavier and exposes Pin; `self_cell` avoids proc-macro overhead.
 - **Coin selection:** porting Core's C++ `coinselection.cpp` was the original plan; `bdk_coin_select` supersedes it (audited, BIP-aligned, Rust-native).
-- **JSON-RPC framework:** every modern framework (`jsonrpsee`, `tower-jsonrpc`) requires tokio; `jsonrpc-core` is deprecated. Hand-rolled minimal sync HTTP/1.1 is the only honest path.
+- **JSON-RPC framework:** every modern framework (`jsonrpsee`, `tower-jsonrpc`) requires tokio; `jsonrpc-core` is deprecated. Hand-rolled minimal sync HTTP/1.1 avoids async runtime dependencies.
 - **Compact string:** `smartstring` is abandoned (2022); `flexstr` is interesting but `compact_str` is the established choice.
 - **Stale crates rejected outright:** `arrayvec` (frozen since 2024-08), `base58` (frozen 2021), `usync` (dead 2022), `typed-arena` (2023), `rpmalloc-rs` (abandoned), `Speedb rust binding` (2 years stale).
 
-**Architectural impact:** Goal, Architecture, Workspace Layout, Tech Stack table, Verification Gate G7, Task 4 (storage), Task 8 (index), Task 14 (wallet), Task 16 (rpc), Task 17 (electrum) all updated above to reflect this audit.
+**Architectural impact:** Goal, Architecture, Workspace Layout, Tech Stack table, Verification Gate G7, Task 4 (storage), Task 8 (index), Task 14 (wallet), Task 16 (rpc), Task 17 (electrum) all changed in [`PLAN.md`](../../PLAN.md) after this audit.
 
 ### Findings deliberately NOT actioned (with rationale)
 

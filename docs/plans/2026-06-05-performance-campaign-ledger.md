@@ -6,8 +6,8 @@
 
 ## Current Performance Campaign Status (2026-06-05)
 
-This section tracks the aggressive sync/UTXO performance campaign that has landed on `origin/main`.
-It is a status addendum to the roadmap below, not a replacement for the all-up shippability gates.
+This section tracks the sync/UTXO performance campaign that has landed on `origin/main`.
+It is a status addendum to the roadmap in [`PLAN.md`](../../PLAN.md), not a replacement for the all-up shippability gates.
 Do not mark the broad roadmap tasks complete from these slices alone unless the named gate evidence exists.
 
 **Consensus verifier cutover note (Tasks 16–18):**
@@ -275,4 +275,4 @@ The historical entries below record evidence commands from the 2026-06-05 campai
 - [ ] Prove G14 initial block sync throughput is faster than Bitcoin Core on identical mainnet IBD hardware and configuration.
 - [ ] Prove all G14 budgets, not just proxy workloads: UTXO commit p95 <= 50 ms per serialized block of at least 1 MB, Electrum history p95 <= 30 ms over the required sample, and RSS <= 16 GiB at mainnet tip with fjall default plus indexes.
 - [ ] Run and preserve full gate evidence for G1-G15 across two consecutive `main` CI runs before declaring bitcoin-rs shippable.
-- [ ] Keep Task 5, Task 18, and Task 20 below pending as broad roadmap tasks until their complete step lists and gate evidence are satisfied.
+- [ ] Keep Task 5, Task 18, and Task 20 in [`PLAN.md`](../../PLAN.md) pending as broad roadmap tasks until their complete step lists and gate evidence are satisfied.

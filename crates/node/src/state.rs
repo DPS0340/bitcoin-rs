@@ -3,7 +3,7 @@
 //! V1 keeps this deliberately minimal: it owns the resolved [`Config`], the
 //! data-directory path, the open chainstate storage backend, and the replay log
 //! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
-//! / index / p2p / rpc / electrum) parks here as the integration point matures.
+//! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
@@ -502,7 +502,7 @@ impl BlockBodySource for StoredBlockBodySource {
         // `None` is overloaded here: it means both "this store cannot slice"
         // and "the read failed". Callers must treat either as a reason to fall
         // back to the whole body, so the return type stays — but this is the
-        // hot path for every Electrum history call now, and an I/O error that
+        // hot path for every ScriptIndex history call now, and an I/O error that
         // silently degrades into a full block scan is exactly the failure that
         // would otherwise show up only as unexplained latency.
         match self.store.load_block_body_range(height, hash, offset, len) {
@@ -740,8 +740,15 @@ where
 {
     match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
         Ok(writer) => Ok(writer),
-        Err(bitcoin_rs_index::IndexError::LegacyCursorlessIndex) => {
-            bitcoin_rs_index::IndexWriter::reset_legacy(store.as_ref())?;
+        Err(
+            error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
+            | bitcoin_rs_index::IndexError::UnsupportedTxIndexFormatVersion { .. }),
+        ) => {
+            tracing::warn!(
+                %error,
+                "resetting incompatible derived transaction index for rebuild"
+            );
+            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref())?;
             bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
         }
         Err(error) => Err(error),
@@ -767,12 +774,24 @@ where
     })
 }
 
+fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
+    bitcoin_rs_index::IndexCapabilities {
+        // ScriptIndex-backed Esplora responses need exact historical
+        // transactions to render prevouts and calculate fees. This is an
+        // internal dependency; `tx_index_query` below still exposes it to Core
+        // RPCs only for an explicit --txindex configuration.
+        tx_lookup: config.txindex || config.script_index,
+        script_history: config.script_index,
+    }
+}
+
 fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
-    if !config.txindex {
+    let enabled = tx_index_capabilities(config);
+    if enabled.is_empty() {
         return Ok(None);
     }
     if config.prune_target_mb > 0 {
-        bail!("-txindex is not compatible with -prune");
+        bail!("transaction and script indexing are not compatible with -prune");
     }
 
     let txindex_dir = config.data_dir.join("txindex");
@@ -1106,6 +1125,7 @@ impl NodeState {
                     Arc::clone(&block_tree),
                     Some(Arc::clone(&block_body_store)),
                     open.batch_limits,
+                    tx_index_capabilities(&config),
                     wake_rx,
                 )
                 .context("spawn txindex worker")?;
@@ -1291,7 +1311,7 @@ impl NodeState {
         )?;
         // Remove the marker only after this checkpoint publishes the matching
         // UTXO set and applied tip. TxIndex is outside the authoritative
-        // disconnect transaction and recovers from its own atomic watermark.
+        // disconnect transaction and recovers from its own atomic capability watermarks.
         self.apply_handles
             .undo_store
             .disarm_disconnect()
@@ -1326,20 +1346,35 @@ impl NodeState {
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
     pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+        if !self.config.txindex {
+            return None;
+        }
         self.tx_index_query.as_ref().map(|query| {
             let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
             adapter
         })
     }
 
-    /// Returns the node-owned complete transaction-index adapter for Electrum.
+    /// Returns transaction lookup for internal Esplora projections.
+    ///
+    /// `--scriptindex` builds this dependency as well, but that does not
+    /// enable or advertise the Core `--txindex` contract.
     #[must_use]
-    pub(crate) fn tx_index_electrum_adapter(
-        &self,
-    ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
+    pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> =
-                query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
+            adapter
+        })
+    }
+
+    /// Returns the node-owned complete generic script-index query adapter.
+    #[must_use]
+    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
+        if !self.config.script_index {
+            return None;
+        }
+        self.tx_index_query.as_ref().map(|query| {
+            let adapter: Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery> = query.clone();
             adapter
         })
     }
@@ -1684,6 +1719,25 @@ mod tests {
     }
 
     #[test]
+    fn script_index_builds_without_advertising_core_txindex() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.txindex = false;
+        config.script_index = true;
+
+        let state = NodeState::open(config)?;
+
+        assert!(state.apply_handles().tx_index_runtime.is_some());
+        assert!(state.tx_index_query().is_none());
+        assert!(state.esplora_tx_index_query().is_some());
+        assert!(state.script_index_query().is_some());
+        assert!(state.data_dir().join("txindex").exists());
+        Ok(())
+    }
+
+    #[test]
     fn drop_joins_txindex_worker_before_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
@@ -1717,44 +1771,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("-txindex is not compatible with -prune"),
+                .contains("transaction and script indexing are not compatible with -prune"),
             "unexpected error: {error:#}"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn open_rebuilds_legacy_cursorless_txindex() -> anyhow::Result<()> {
-        use bitcoin_rs_storage::{ColumnFamily, KvStore as _};
-
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.storage_backend = "fjall".to_owned();
-        config.txindex = true;
-
-        let txindex_dir = config.data_dir.join("txindex");
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        store.put(ColumnFamily::TxConfirmed, b"legacy-row", &[])?;
-        drop(store);
-
-        let state = NodeState::open(config)?;
-        assert!(state.tx_index_query().is_some());
-        drop(state);
-
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        assert!(
-            store
-                .iter_prefix(ColumnFamily::TxConfirmed, &[])?
-                .next()
-                .is_none(),
-            "legacy rows must be removed before rebuilding"
-        );
-        assert_eq!(
-            store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?,
-            Some(vec![1, 0, 0, 0])
         );
         Ok(())
     }

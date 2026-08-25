@@ -20,8 +20,8 @@ over a `DeploymentContext` with `DeploymentParams`. Consensus bounds are exporte
 variants.
 
 ## Features
-- `kernel` (default): routes script verification through bitcoinkernel, Bitcoin Core's
-  native consensus engine
+- `kernel` (default): routes script verification through
+  [bitcoinkernel](../../CONCEPTS.md#bitcoinkernel)
 - `checksig-census`: enables the `census_checkpoint` module, the non-terminal CHECKSIG
   census checkpoint ABI wrapper; implies `kernel`
 - `rocksdb`, `fjall`, `redb`: empty in this crate, accepted so workspace-wide feature
