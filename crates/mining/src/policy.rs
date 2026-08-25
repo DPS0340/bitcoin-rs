@@ -129,8 +129,11 @@ impl MiningPolicy {
                 continue;
             }
             // A superseded copy of a candidate that has since been re-scored.
-            // Acting on it would take the package at a price that is no longer
-            // true, and would take it twice.
+            // Taking it twice is already impossible -- `included` above sees to
+            // that -- so this only saves re-attempting a package at a price
+            // that has been replaced. A mutation audit could not distinguish
+            // dropping it, which is recorded rather than hidden: the guard is
+            // there to keep the queue honest, not to hold a property up.
             if current.get(&ranked.id) != Some(&ranked) {
                 continue;
             }
