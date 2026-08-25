@@ -2122,6 +2122,12 @@ struct ValidatedBlock {
 ///
 /// Deliberately one straight run of checks: the order is consensus-significant
 /// and splitting it into named halves would hide that.
+///
+/// Takes the [`ChainTransition`] proof rather than reading a flag: every read
+/// below -- the predecessor, the activation heights, the difficulty target, the
+/// committed prevouts -- must come from one chainstate, and the borrow is what
+/// makes the compiler say so. A caller that has not taken the lock cannot
+/// produce the argument, and one that drops it early stops compiling.
 #[allow(clippy::too_many_lines)]
 fn validate_block_for_apply(
     handles: &ApplyHandles,
@@ -2129,6 +2135,7 @@ fn validate_block_for_apply(
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply>,
     pow_check: PowCheck,
+    _transition: &ChainTransition<'_>,
 ) -> core::result::Result<ValidatedBlock, ApplyError> {
     use bitcoin::hashes::Hash as _;
 
@@ -2343,10 +2350,16 @@ fn validate_block_for_apply(
 /// Genesis is skipped for the same reason its transactions are not connected.
 /// Shared with `test_block_validity` so a proposal is weighed on the same
 /// arithmetic a connected block is.
+///
+/// Takes the [`ChainTransition`] proof for the same reason the checks above it
+/// do: the fees it weighs were computed against prevouts read under that lock,
+/// and a verdict reached after it was released would be arithmetic over a
+/// chainstate that had already moved.
 fn check_coinbase_amount(
     handles: &ApplyHandles,
     height: u32,
     value_totals: BlockValueTotals,
+    _transition: &ChainTransition<'_>,
 ) -> core::result::Result<(), ApplyError> {
     if height == 0 {
         return Ok(());
@@ -2374,21 +2387,44 @@ fn check_coinbase_amount(
 /// Proof of work is deliberately not checked. A proposal is a block whose nonce
 /// has not been searched for; the declared difficulty is still validated.
 ///
+/// The chain-transition lock is held for the whole answer, exactly as a connect
+/// holds it. Without it a connect or a disconnect landing mid-validation moves
+/// the applied tip and the committed UTXO set between the predecessor and
+/// activation reads, the prevout and script checks, and the coinbase-fee
+/// arithmetic -- so the verdict describes no chainstate that ever existed. It
+/// can say a proposal built on the old parent is valid against the new parent's
+/// UTXO set, which is the one answer a miner cannot afford to be given. The
+/// handler's `applied_hash` comparison narrows the window and cannot close it;
+/// only holding the lock the connect path holds does that.
+///
 /// # Errors
 ///
-/// Returns the [`ApplyError`] the block would have been rejected with.
+/// Returns the [`ApplyError`] the block would have been rejected with, or
+/// [`ApplyError::Shutdown`] if admission closed before the guard was taken.
 pub fn test_block_validity(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<(), ApplyError> {
+    // Same order a connect takes them in: admission permit, then the transition
+    // lock. Taking them in any other order here would invert the node's lock
+    // order against every applier.
+    let transition = handles.begin_chain_transition()?;
+
     let ValidatedBlock {
         height,
         block_hash,
         tx_plan,
         resolved,
         ..
-    } = validate_block_for_apply(handles, block, serialized, None, PowCheck::Skipped)?;
+    } = validate_block_for_apply(
+        handles,
+        block,
+        serialized,
+        None,
+        PowCheck::Skipped,
+        &transition,
+    )?;
 
     // The coinbase-amount gate sits past the point where an apply starts
     // computing what it will write, so reaching it means computing the same
@@ -2414,7 +2450,7 @@ pub fn test_block_validity(
         bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
             .then(|| handles.utxo.as_ref()),
     )?;
-    check_coinbase_amount(handles, height, value_totals)
+    check_coinbase_amount(handles, height, value_totals, &transition)
 }
 
 /// The apply itself, with the admission permit and the transition lock held.
@@ -2434,7 +2470,7 @@ fn apply_block_admitted(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply>,
-    _transition: &ChainTransition<'_>,
+    transition: &ChainTransition<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let total_started = quanta::Instant::now();
     let ValidatedBlock {
@@ -2450,6 +2486,7 @@ fn apply_block_admitted(
         provided_serialized.clone(),
         proven,
         PowCheck::Required,
+        transition,
     )?;
 
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
@@ -2504,7 +2541,7 @@ fn apply_block_admitted(
     // free, and still before `persist_undo` -- the first write of any kind --
     // so a rejected block leaves nothing behind. Genesis is skipped for the
     // same reason its transactions are not connected.
-    check_coinbase_amount(handles, height, value_totals)?;
+    check_coinbase_amount(handles, height, value_totals, transition)?;
 
     // Persist undo before the block body, the index, and the UTXO commit. All
     // three are derived state for a block that is about to apply; if the undo
@@ -6757,6 +6794,78 @@ mod consensus_rule_tests {
             ),
             "a proposal must be refused when its merkle root does not match, got {outcome:?}"
         );
+    }
+
+    /// A proposal waits for an in-flight chain transition instead of reading
+    /// across it.
+    ///
+    /// The connect path takes `chain_transition` for the whole of a connect or
+    /// a disconnect. Answering a proposal without it lets a transition land
+    /// between the predecessor read, the prevout and script checks, and the
+    /// coinbase-fee arithmetic -- and the verdict then describes no chainstate
+    /// that ever existed. The dangerous case is the flattering one: an
+    /// old-parent proposal called valid against the new parent's UTXO set.
+    ///
+    /// The test is deterministic in the direction that matters. A transition is
+    /// held open, a proposal is asked for, and the answer must not arrive; only
+    /// once the transition is released may it. Without the guard the proposal
+    /// answers immediately and the first assertion fails every run -- there is
+    /// no window to lose, because the lock is held for the whole of it.
+    ///
+    /// The guard being retained to the end of the answer is not tested here; it
+    /// is a borrow. `validate_block_for_apply` and `check_coinbase_amount` both
+    /// take `&ChainTransition`, so releasing it early does not compile.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_waits_for_an_in_flight_chain_transition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, block) =
+            height_one_fixture(vec![fee_paying_spend()], subsidy + 999, Pow::Mined);
+
+        let proposer_handles = handles.clone();
+        let (asked_tx, asked_rx) = std::sync::mpsc::sync_channel(1);
+        let (answered_tx, answered_rx) = std::sync::mpsc::sync_channel(1);
+
+        // Stands in for a connect or a disconnect in flight: the same lock, the
+        // same order, taken through the same constructor.
+        let transition = handles.begin_chain_transition()?;
+
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let proposer = scope.spawn(move || {
+                let _ = asked_tx.send(());
+                let verdict = test_block_validity(&proposer_handles, &block, None);
+                let _ = answered_tx.send(verdict.is_ok());
+                verdict
+            });
+
+            asked_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+            assert!(
+                matches!(
+                    answered_rx.recv_timeout(std::time::Duration::from_millis(200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a proposal was answered while a chain transition was in flight"
+            );
+
+            drop(transition);
+            assert!(
+                answered_rx.recv_timeout(std::time::Duration::from_secs(5))?,
+                "the proposal must be answered once the transition completes"
+            );
+            proposer
+                .join()
+                .map_err(|_| std::io::Error::other("proposal worker panicked"))??;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(0),
+            "answering a proposal must leave the tip where it was"
+        );
+        Ok(())
     }
 
     /// Timestamp rules must hold on the apply path, not only in header sync.
