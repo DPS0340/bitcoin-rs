@@ -801,10 +801,24 @@ fn parse_hash(value: &str) -> Result<Hash256, RpcError> {
 /// keeps headers ahead of it; a block whose header is known but which has not
 /// been connected is not in it, so it is `-1` rather than `0`.
 fn confirmations(ctx: &Context, hash: Hash256, height: u32) -> i64 {
-    if ctx.active_hash_at_height(height) != Some(hash) {
+    // Membership and depth must come from the same published applied-tip state.
+    let Some(tip) = ctx.applied_tip.load_full() else {
+        return -1;
+    };
+    if height > tip.height {
         return -1;
     }
-    i64::from(ctx.applied_height())
+    let active_hash = if height == tip.height {
+        Some(tip.hash)
+    } else {
+        let tree = ctx.block_tree.read();
+        tree.node_at_height_from(tip.tip_id, height)
+            .and_then(|id| tree.node(id).ok().map(|node| node.hash))
+    };
+    if active_hash != Some(hash) {
+        return -1;
+    }
+    i64::from(tip.height)
         .saturating_sub(i64::from(height))
         .saturating_add(1)
 }
@@ -1442,13 +1456,11 @@ mod tests {
         BlockRecord::from_block_bytes(1, &block, &bytes)
     }
 
-    /// `getblock` and `getblockheader` render `confirmations` through three
-    /// different branches depending on what the record holds, and each one
-    /// spells the field out separately. A record with no decodable header takes
-    /// the synthetic branch for both methods — so a fixture built only from
-    /// `BlockRecord::synthetic` leaves the header-bearing branch unrendered,
-    /// and a mutation that reverts *it* to the old height-only formula survives.
-    /// Both fixtures run the same assertions.
+    /// `getblock` and `getblockheader` both render `confirmations` when a body
+    /// is available. A pruned body still leaves enough tree state for
+    /// `getblockheader`, while Core-compatible `getblock` rejects that request
+    /// as unavailable. The body-less fixture therefore checks the header RPC;
+    /// the complete fixture checks both rendering paths.
     fn assert_reorged_block_reports_negative_confirmations(
         with_body: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1477,13 +1489,26 @@ mod tests {
                     })
             };
 
-        for method in ["getblockheader", "getblock"] {
+        let methods = if with_body {
+            &["getblockheader", "getblock"][..]
+        } else {
+            &["getblockheader"][..]
+        };
+        for method in methods {
             assert_eq!(confirmations_of(method, applied_hash)?, 1, "{method}");
             assert_eq!(
                 confirmations_of(method, fork_hash)?,
                 -1,
                 "{method} must carry the -1 through, not clamp it"
             );
+        }
+        if !with_body {
+            for hash in [applied_hash, fork_hash] {
+                assert!(matches!(
+                    handler.dispatch("getblock", &json!([hash.to_string_be(), true])),
+                    Err(RpcError::NotFound("block data pruned"))
+                ));
+            }
         }
         Ok(())
     }
