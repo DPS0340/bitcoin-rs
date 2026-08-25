@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -9,7 +9,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
+use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError, chain_stats};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -41,10 +41,20 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
-    let block_stats = {
-        let blocks = ctx.blocks.read();
-        fold_block_records(&blocks, applied, None)
-    };
+    // Bytes on disk, from whatever owns them.
+    //
+    // The block store knows what its files occupy and shrinks when pruning
+    // deletes one. The record log can only offer the sum of the block sizes it
+    // has seen: records outlive the bodies they describe, so that sum goes on
+    // counting bytes that are gone — under a field name people read to check
+    // that pruning worked. It stays as the fallback for a context with no
+    // durable storage behind it, which is every test fixture and nothing else.
+    //
+    // Either way the read is O(1) and the log's lock — the one block
+    // application takes to append — is released immediately.
+    let size_on_disk = ctx
+        .block_storage_disk_usage()
+        .unwrap_or_else(|| ctx.blocks.read().size_on_disk());
     let prune_status = ctx.prune_status();
     let bestblockhash = applied_tip
         .as_ref()
@@ -64,7 +74,7 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let _ = response.insert(&"verificationprogress", json!(verification_progress));
     let _ = response.insert(&"initialblockdownload", applied < headers);
     let _ = response.insert(&"chainwork", chainwork.as_str());
-    let _ = response.insert(&"size_on_disk", block_stats.size_on_disk);
+    let _ = response.insert(&"size_on_disk", size_on_disk);
     let _ = response.insert(&"pruned", prune_status.pruned);
     if let Some(pruneheight) = prune_status.pruneheight {
         let _ = response.insert(&"pruneheight", pruneheight);
@@ -169,7 +179,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         .saturating_sub(window_block_count);
     let block_stats = {
         let blocks_guard = ctx.blocks.read();
-        fold_block_records(&blocks_guard, applied_height, Some(lowest_window_height))
+        chain_stats(&blocks_guard, applied_height, lowest_window_height)
     };
     let total_tx_count = block_stats.total_tx_count;
     let window_tx_count = block_stats.window_tx_count;
@@ -193,48 +203,6 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         "window_interval": window_interval,
         "txrate": txrate
     }))
-}
-
-#[derive(Default)]
-struct FoldedBlockRecords {
-    size_on_disk: u64,
-    total_tx_count: u64,
-    window_tx_count: u64,
-    tip_time: Option<u32>,
-    earliest_window_time: Option<u32>,
-}
-
-fn fold_block_records(
-    blocks: &[BlockRecord],
-    applied_height: u32,
-    lowest_window_height: Option<u64>,
-) -> FoldedBlockRecords {
-    let mut stats = FoldedBlockRecords::default();
-    for record in blocks {
-        stats.size_on_disk = stats
-            .size_on_disk
-            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
-        if record.height > applied_height {
-            continue;
-        }
-        stats.total_tx_count = stats
-            .total_tx_count
-            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-        if record.height == applied_height && stats.tip_time.is_none() {
-            stats.tip_time = Some(record.time);
-        }
-        if lowest_window_height.is_some_and(|lowest| u64::from(record.height) >= lowest) {
-            stats.window_tx_count = stats
-                .window_tx_count
-                .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-            stats.earliest_window_time = Some(
-                stats
-                    .earliest_window_time
-                    .map_or(record.time, |earliest| earliest.min(record.time)),
-            );
-        }
-    }
-    stats
 }
 
 pub(crate) fn getblockcount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -283,12 +251,12 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
         let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
         let record = BlockRecord::synthetic(synthetic_height, hash);
         if !verbose {
-            return Ok(json!(record.header_hex));
+            return Ok(json!(record.header_hex()));
         }
         return Ok(synthetic_block_json(ctx, &record, false));
     };
     if !verbose {
-        return Ok(json!(record.header_hex));
+        return Ok(json!(record.header_hex()));
     }
     block_json_verbose(ctx, &record, false, 1)
 }
@@ -925,18 +893,8 @@ fn block_json_verbose(
 }
 
 fn decode_header(record: &BlockRecord) -> Option<bitcoin::block::Header> {
-    let bytes = match Vec::<u8>::from_hex(&record.header_hex) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(
-                block_hash = %record.hash.to_string_be(),
-                %error,
-                "stored block header hex is invalid"
-            );
-            return None;
-        }
-    };
-    match deserialize(&bytes) {
+    let bytes = record.header_bytes()?;
+    match deserialize(bytes.as_slice()) {
         Ok(header) => Some(header),
         Err(error) => {
             tracing::warn!(
@@ -956,7 +914,7 @@ fn decode_block(
     let Some(bytes) = ctx.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
-    match deserialize(&bytes) {
+    match deserialize(bytes.as_slice()) {
         Ok(block) => Ok(Some((bytes, block))),
         Err(error) => {
             tracing::warn!(
@@ -1023,6 +981,7 @@ mod tests {
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
+    use crate::context::{BlockLog, fold_block_records};
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
     fn context_with_tip(
@@ -1066,6 +1025,22 @@ mod tests {
         ctx.set_chain_tip(tip.clone());
         ctx.set_applied_tip(tip);
         ctx
+    }
+
+    /// Makes `ctx` know `block` the way a running node does: header in the block
+    /// tree, record in the log.
+    ///
+    /// A record on its own is not a node's state. `apply_block` puts the header
+    /// in the tree first and pushes the record after, through the same handles,
+    /// and the record carries no header of its own — the tree is where one
+    /// lives. A fixture that pushes only a record is asking `getblock` to answer
+    /// from half the state a node would have.
+    fn seed_block(ctx: &Arc<Context>, block: &bitcoin::Block, record: BlockRecord) {
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, NodeStatus::Active);
+        }
+        ctx.add_block(record);
     }
 
     #[test]
@@ -1152,7 +1127,7 @@ mod tests {
         let block_hash_hex = record.hash.to_string_be();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let block_json = getblock(&ctx, &json!([block_hash_hex.as_str(), 1]))?;
         let header_json = getblockheader(&ctx, &json!([block_hash_hex.as_str(), true]))?;
@@ -1237,7 +1212,7 @@ mod tests {
         });
         let calls = Arc::clone(&source);
         let ctx = Arc::new(Context::new().with_block_body_source(source));
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let expected_hex = body.to_lower_hex_string();
         assert_eq!(
@@ -1265,7 +1240,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        seed_block(&ctx, &genesis, BlockRecord::from_block(0, &genesis));
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -1684,6 +1659,44 @@ mod tests {
         );
     }
 
+    /// `size_on_disk` reports what the block store says, not the record sum.
+    ///
+    /// The record sum keeps counting blocks whose bytes pruning has deleted, so
+    /// it cannot be what a field named "size on disk" reports. This gives the
+    /// context a store that answers with a figure deliberately unrelated to the
+    /// records, so a handler that quietly went on summing them fails here rather
+    /// than looking right by coincidence.
+    #[test]
+    fn getblockchaininfo_size_on_disk_comes_from_the_block_store() {
+        struct SizedStore(u64);
+
+        impl crate::BlockBodySource for SizedStore {
+            fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+                None
+            }
+            fn disk_usage(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record_bytes = u64::try_from(record.body_size).unwrap_or(u64::MAX);
+        let store_bytes = record_bytes.saturating_add(4_096);
+        let ctx =
+            Arc::new(Context::new().with_block_body_source(Arc::new(SizedStore(store_bytes))));
+        ctx.add_block(record);
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("size_on_disk").and_then(JsonValueTrait::as_u64),
+            Some(store_bytes),
+            "size_on_disk must come from the store that owns the bytes"
+        );
+    }
+
     #[test]
     fn getchaintxstats_emits_core_shape_with_zero_blocks() {
         use alloc::sync::Arc;
@@ -1737,6 +1750,106 @@ mod tests {
         assert_eq!(time, u64::from(expected_time));
     }
 
+    /// A log with every shape the windowed search has to survive.
+    ///
+    /// Heights are non-decreasing, which is the invariant the binary searches
+    /// rest on, but they are not a clean `0..n`: height 3 is recorded twice, as
+    /// a reorg leaves it, so the "first record at this height" and
+    /// "records at or below this height" boundaries are not the same thing.
+    /// Timestamps dip at height 5, because block times are not monotonic and an
+    /// earliest-in-window that assumed they were would be wrong there.
+    fn shaped_log() -> BlockLog {
+        const HEIGHTS: [u32; 10] = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8];
+        const TIMES: [u32; 10] = [
+            1_000, 1_010, 1_020, 1_030, 1_031, 1_040, 1_035, 1_060, 1_070, 1_080,
+        ];
+        let mut log = BlockLog::new();
+        for (index, (height, time)) in HEIGHTS.into_iter().zip(TIMES).enumerate() {
+            log.push(BlockRecord {
+                hash: Hash256::from_le_bytes(&[u8::try_from(index).unwrap_or(0); 32]),
+                height,
+                block_hex: String::new(),
+                body_size: 100 + index * 7,
+                header: None,
+                tx_count: 1 + index * 3,
+                time,
+            });
+        }
+        log
+    }
+
+    /// The windowed search must land on exactly what the whole-log fold did.
+    ///
+    /// `getblockchaininfo` and `getchaintxstats` used to walk every record the
+    /// node holds. They now read running sums off the log and binary-search it,
+    /// which is an argument about the log being ordered by height. This checks
+    /// that argument against the implementation that made no argument and simply
+    /// looked at everything — `fold_block_records`, kept for exactly this.
+    ///
+    /// Swept over every applied height and every window length rather than one
+    /// pair, because the boundaries are where a search is wrong: at the
+    /// duplicate height, at the ends, and past both.
+    #[test]
+    fn chain_stats_matches_the_fold_it_replaced() {
+        let log = shaped_log();
+
+        for applied_height in 0_u32..11 {
+            for window in 0_u64..13 {
+                let lowest = u64::from(applied_height)
+                    .saturating_add(1)
+                    .saturating_sub(window.min(u64::from(applied_height).saturating_add(1)));
+
+                let oracle = fold_block_records(&log, applied_height, Some(lowest));
+                let actual = chain_stats(&log, applied_height, lowest);
+
+                assert_eq!(
+                    actual.total_tx_count, oracle.total_tx_count,
+                    "txcount at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.window_tx_count, oracle.window_tx_count,
+                    "window_tx_count at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.tip_time, oracle.tip_time,
+                    "tip_time at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.earliest_window_time, oracle.earliest_window_time,
+                    "earliest_window_time at applied={applied_height} window={window}"
+                );
+            }
+        }
+    }
+
+    /// `size_on_disk` is now a running sum, so it has to equal the fold's.
+    #[test]
+    fn size_on_disk_matches_the_fold_it_replaced() {
+        let mut log = shaped_log();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum disagrees with a fold of the records"
+        );
+
+        // The disconnect path: popping the tip must take its bytes back out.
+        let _popped = log.pop();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum survived a pop but stopped matching"
+        );
+        assert_eq!(
+            log.total_tx_count(),
+            fold_block_records(&log, u32::MAX, None).total_tx_count,
+            "the running tx-count sum survived a pop but stopped matching"
+        );
+
+        log.clear();
+        assert_eq!(log.size_on_disk(), 0, "clear must reset the running sums");
+        assert_eq!(log.total_tx_count(), 0, "clear must reset the running sums");
+    }
+
     #[test]
     fn getchaintxstats_two_block_window_uses_one_folded_window()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1748,7 +1861,7 @@ mod tests {
                 height,
                 block_hex: String::new(),
                 body_size: usize::try_from(100_u32.saturating_add(height))?,
-                header_hex: String::new(),
+                header: None,
                 tx_count: usize::try_from(height.saturating_add(1))?,
                 time: 1_000_u32.saturating_add(height.saturating_mul(10)),
             });
@@ -1758,7 +1871,7 @@ mod tests {
             height: 4,
             block_hex: String::new(),
             body_size: 104,
-            header_hex: String::new(),
+            header: None,
             tx_count: 100,
             time: 1,
         });
@@ -1810,7 +1923,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 200,
         });
@@ -1819,7 +1932,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 300,
         });

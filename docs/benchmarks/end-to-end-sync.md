@@ -63,7 +63,7 @@ Later code changed both failed bitcoin-rs paths, but no completed rerun is attac
 
 | Budget | Required evidence | Status in this publication |
 |---|---|---|
-| IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Not measured |
+| IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Bounded 0–150,000 one-peer daemon IBD: Core median 73.459s vs bitcoin-rs 89.576s; Core delivered 1.219× bitcoin-rs throughput; gate and 2× target failed |
 | UTXO commit p95 | ≤50ms for serialized blocks ≥1MB | Not captured |
 | Electrum history p95 | ≤30ms over 10,000 non-empty calls | Bounded 0–150,000 p95: 1.213ms; current-tip evidence not captured |
 | Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Bounded txindex-only RSS: 313.1MB; completed current-tip evidence with both indexes not captured |
@@ -110,6 +110,34 @@ implementation and deleted each disposable fixture before the next run. These bo
 results do not satisfy the live-IBD, current-tip RSS, or current-tip Electrum-history
 gates above.
 
+## Bounded daemon IBD comparison
+
+A bounded daemon IBD benchmark compared bitcoin-rs and Bitcoin Core over mainnet blocks 0–150,000. Both nodes ran under full validation (`assume_valid_height=0`), P2P v1 transport, and CPU set 0–31 on an Intel Xeon Gold 6138 host. One local Bitcoin Core seed at `127.0.0.1:18444` ran on CPU set 32–39, pre-warmed with 747,001,853 bytes per arm. The run executed three interleaved matched blocks with 30s cooldowns, fresh output directories, 16 GiB RSS limits, and 64 GiB disk-reserve guards.
+
+| Implementation | Arm 1 | Arm 2 | Arm 3 | Median | Throughput vs Core | Result |
+|---|---:|---:|---:|---:|---:|---|
+| Bitcoin Core 31.1 | 73.456s | 73.459s | 73.463s | 73.459s | 1.000× | Baseline |
+| bitcoin-rs (`9dae9e0`) | 89.696s | 89.576s | 88.465s | 89.576s | 0.820× | Core is 1.219× faster; 2× target failed |
+
+Bitcoin Core median elapsed time was 73.458771289s. bitcoin-rs median elapsed time was 89.576018374s. Core's elapsed time was 0.820071852× bitcoin-rs's elapsed time, which means Core delivered 1.219405345× bitcoin-rs throughput. The requested twofold target is not met.
+
+Every run reached the exact height 150,000 endpoint (block hash `0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b`, chainwork `0000000000000000000000000000000000000000000000080560a73313fe59c2`) and exited with code 0. All runs passed the 16 GiB RSS guard, 64 GiB disk reserve, and fixture bounds.
+
+### Limitations
+
+- The range ends at height 150,000 and does not represent SegWit, Taproot, or current-tip peer conditions.
+- Both nodes downloaded from one local warmed seed. The benchmark measures single-peer request and apply throughput, not Internet bandwidth aggregation across peers.
+- The checked-in custody condenses external raw summaries; SHA-256 digests bind omitted arm files.
+- ARM parity remains unmeasured because no OpenSSH ARM host alias was available.
+
+### Follow-up outcomes (not landed)
+
+- The `w256` window experiment measured 59.225400502s against a matched 89.972329151s control (1.519151046× speedup). It did not land because the temporary code lacked required safety gates and missed the pre-declared header-read threshold.
+- The PGO (`w128`) candidate measured 89.266232737s (1.003470356× wall ratio vs the 89.576018374s baseline) and was rejected below the 1.05× continuation threshold.
+- The eight-proxy same-seed run measured 115.429379346s (28.861922467% slower than the one-peer median) and was rejected as topology reconnaissance only.
+
+The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/end-to-end-sync/daemon-ibd-custody-v1.json).
+
 ## Raw artifact integrity
 
 | Artifact | SHA-256 |
@@ -121,6 +149,7 @@ gates above.
 | `rs-replay-150k-kernel.json` | `d722ab149c39c5f13e18c6358ab999f4c1f44ce46b37a9d0eb87bfd45e0b91a9` |
 | `bounded-performance-custody-v1.json` | `ce3e561dbd2119579f359b7cf55f8b84211c4c1eec3953cf40762f07faabb3cf` |
 | `electrum-nodelay-custody-v1.json` | `b57087cf368d3e56da75c543c6ba780115a7a6684db03a11e2692d6648b29abf` |
+| `daemon-ibd-custody-v1.json` | `3eb68821cb2e389be5ed5391f5671fae527212a0e2129fcb85fe9676e4d396c8` |
 
 ## Full recorded stage timers
 
