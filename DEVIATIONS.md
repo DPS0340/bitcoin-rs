@@ -405,17 +405,26 @@ This node keeps a durable cumulative count for its **applied tip only**, plus an
 in-memory record log that is rebuilt empty on every open. So the same fields are
 answered from a different place, and are unknown in different situations:
 
-- `txcount` comes from the durable counter. Without one it comes from the record
-  log, but only when the log still reaches genesis — a log that starts wherever
-  this process began applying sums to a number that is not a chain total. A
-  window ending anywhere but the applied tip has no cumulative count at all.
-- `window_tx_count` is summed per block over the window instead of subtracted,
-  and is reported only when the log holds every height in it.
+- `txcount` comes from the durable counter **for the applied tip**, which is the
+  only block the counter tracks. For any other block on the applied chain it
+  comes from the record log, and only when the log still reaches genesis — a log
+  that starts wherever this process began applying sums to a number that is not
+  a chain total.
+- `window_tx_count` is the difference of two of the log's prefix sums, which is
+  Core's subtraction of two `m_chain_tx_count` values by another route. It is
+  reported only when the log holds every height in the window.
+
+The counter and the applied tip are published one after the other inside the
+node's chain transition, so `getchaintxstats` reads the pair back under that
+same lock. Bitcoin Core reaches the same guarantee by holding `cs_main` across
+the whole RPC; this holds it for two loads. Read separately the two are a torn
+pair, and the answer names one block while counting through another.
 
 Where Core would answer and this node cannot, the field is **omitted**, which is
-Core's own signal for an unknown count. It is not reported as `0`: a real chain
-never has zero transactions — genesis alone contributes one — so a zero would be
-read as an empty chain rather than as an absent measurement.
+Core's own signal for an unknown count. It is never reported as `0`, including
+at a genesis applied tip with an empty log: genesis carries a coinbase, so the
+cumulative count there is one, and a zero would be a wrong measurement rather
+than an absent one.
 
 Removing the difference means storing the cumulative count per height rather
 than per tip. That is a storage change, and it is not this one.

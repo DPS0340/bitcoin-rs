@@ -244,6 +244,13 @@ impl FromIterator<BlockRecord> for BlockLog {
 /// answer it. The window is the caller's `nblocks` (~4,320 by default), not the
 /// chain.
 ///
+///
+/// No longer on the `getchaintxstats` path. That window is measured between
+/// two median times now, and may end at any block on the applied chain rather
+/// than only at the tip, so it reads the two prefix sums it still needs through
+/// [`window_tx_count`] and [`cumulative_tx_count_through`] -- the same
+/// technique, at a boundary this cannot express. Kept for the benchmark and the
+/// equivalence test, which are what make the prefix sums measurable at all.
 /// [`fold_block_records`] is the implementation this replaced, kept as
 /// the oracle `chain_stats_matches_the_fold_it_replaced` compares against.
 #[must_use]
@@ -281,6 +288,52 @@ pub fn chain_stats(log: &BlockLog, applied_height: u32, lowest_window_height: u6
         tip_time,
         earliest_window_time,
     }
+}
+
+/// Cumulative transactions through `height`, when the log can still say.
+///
+/// The log is appended in height order from wherever this process began
+/// applying, and is rebuilt empty on every open. A prefix that does not start
+/// at genesis sums to a number that is not a chain total, so the answer is
+/// `None` rather than an under-count -- a partial sum reads as a quiet chain,
+/// and a fee estimator would believe it.
+///
+/// Constant time: one binary search for the boundary, one prefix read.
+#[must_use]
+pub fn cumulative_tx_count_through(log: &BlockLog, height: u32) -> Option<u64> {
+    let blocks: &[BlockRecord] = log;
+    if blocks.first()?.height != 0 || blocks.last()?.height < height {
+        return None;
+    }
+    Some(log.tx_count_before(blocks.partition_point(|record| record.height <= height)))
+}
+
+/// Transactions in `(low_height, high_height]`, when the log holds them all.
+///
+/// This is Bitcoin Core's difference of two `m_chain_tx_count` values, taken
+/// here as a difference of two prefix sums rather than by walking the window.
+/// The previous implementation scanned every record in the log and built a
+/// `HashMap` per request, under the read lock that block application takes to
+/// append -- so a large window blocked the writer for as long as the scan.
+///
+/// `None` when the log does not reach back to `low_height + 1` or forward to
+/// `high_height`, for the same reason [`cumulative_tx_count_through`] answers
+/// `None`. A window that is not wholly held is not measured.
+#[must_use]
+pub fn window_tx_count(log: &BlockLog, low_height: u32, high_height: u32) -> Option<u64> {
+    let blocks: &[BlockRecord] = log;
+    let (first, last) = (blocks.first()?, blocks.last()?);
+    if u64::from(first.height) > u64::from(low_height).saturating_add(1)
+        || last.height < high_height
+    {
+        return None;
+    }
+    let end = blocks.partition_point(|record| record.height <= high_height);
+    let start = blocks.partition_point(|record| record.height <= low_height);
+    Some(
+        log.tx_count_before(end)
+            .saturating_sub(log.tx_count_before(start)),
+    )
 }
 
 /// The figures `getchaintxstats` reports, read from a [`BlockLog`].
@@ -786,6 +839,20 @@ pub struct Context {
     /// [`Self::chain_tx_count`], which turns Bitcoin Core's zero-means-unset
     /// encoding into an `Option`.
     chain_tx_count: Arc<core::sync::atomic::AtomicU64>,
+    /// The node's chain-transition mutex, when this context has a node behind it.
+    ///
+    /// Block application publishes the applied tip and then advances
+    /// [`Self::chain_tx_count`], both inside one transition. Read separately
+    /// the two are a torn pair: a reader landing between the store and the
+    /// advance takes the new tip's hash and height beside the previous tip's
+    /// cumulative count, and reports a chain total one block short of the tip
+    /// it names. Nothing in the response says which.
+    ///
+    /// [`Self::applied_chain`] takes this lock to read both, which is the same
+    /// serialization Bitcoin Core gets from holding `cs_main` across the whole
+    /// of `getchaintxstats`. `None` for a context with no node behind it --
+    /// every test fixture -- where nothing writes the pair concurrently.
+    chain_transition: Option<Arc<parking_lot::Mutex<()>>>,
     /// Whether this node has ever observed itself to be out of initial block
     /// download. Once set it is never cleared.
     ///
@@ -884,6 +951,7 @@ impl Context {
             chain_tip: Arc::new(ArcSwapOption::empty()),
             applied_tip: Arc::new(ArcSwapOption::empty()),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            chain_transition: None,
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
             blocks: Arc::new(RwLock::new(BlockLog::new())),
@@ -942,6 +1010,7 @@ impl Context {
             chain_tip,
             applied_tip,
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            chain_transition: None,
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
             blocks,
@@ -1080,6 +1149,34 @@ impl Context {
     pub fn with_chain_tx_count(mut self, handle: Arc<core::sync::atomic::AtomicU64>) -> Self {
         self.chain_tx_count = handle;
         self
+    }
+
+    /// Returns `self` sharing the node's chain-transition mutex.
+    ///
+    /// This is the lock block application holds across a connect or a
+    /// disconnect. Sharing it is what lets [`Self::applied_chain`] read the
+    /// applied tip and the cumulative count as one value; without it the two
+    /// can only be read one after the other, with a transition free to land in
+    /// between.
+    #[must_use]
+    pub fn with_chain_transition(mut self, handle: Arc<parking_lot::Mutex<()>>) -> Self {
+        self.chain_transition = Some(handle);
+        self
+    }
+
+    /// The applied tip and its cumulative transaction count, as one reading.
+    ///
+    /// Both come from inside the node's chain transition when this context has
+    /// one, so the count is the count *of the tip returned beside it* rather
+    /// than of whichever tip happened to be current when the second field was
+    /// read. The lock is released before the caller does anything with either.
+    ///
+    /// Bitcoin Core reaches the same guarantee by holding `cs_main` for the
+    /// whole of `getchaintxstats`; this holds strictly less, for two loads.
+    #[must_use]
+    pub fn applied_chain(&self) -> (Option<Arc<TipSnapshot>>, Option<u64>) {
+        let _transition = self.chain_transition.as_ref().map(|lock| lock.lock());
+        (self.applied_tip.load_full(), self.chain_tx_count())
     }
 
     /// Returns the cumulative transaction count of the applied chain, or `None`
