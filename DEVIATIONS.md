@@ -413,17 +413,33 @@ a leaf is never an ancestor of anything.
 
 | status | Bitcoin Core | here |
 | --- | --- | --- |
-| `active` | the block is in the active chain | the tip this node has **applied** |
-| `invalid` | the block or an ancestor failed | `NodeStatus::Invalid` |
-| `valid-fork` | fully validated, no longer on the active chain | `NodeStatus::Stale` — displaced from the best chain, the one thing the tree records about a branch it stopped following |
-| `headers-only` | no block data for it or an ancestor | every other leaf: its block is not connected, because the connected tip is elsewhere |
+| `invalid` | the block or an ancestor failed | `NodeStatus::Invalid`, **decided before anything else** |
+| `active` | the block is in the active chain | the tip this node has **applied**, when it is not invalid |
+| `headers-only` | no block data for it or an ancestor | every other leaf, including ones the tree marks `Stale` |
+| `valid-fork` | fully validated, no longer on the active chain | **never emitted** — see below |
 | `valid-headers` | data present, never validated | **never emitted** — this node applies a block as it arrives, so the state does not exist |
 | `unknown` | none of the above | never emitted |
 
-The residual: a branch that was *followed* but never *connected* — a header that
-was briefly the most work and lost a race — is reported `valid-fork` where Core
-would say `headers-only`. Telling those apart needs a per-block record of how
-far validation got, which the tree does not keep. It is a narrower error than
-the one it replaces: before this, an unvalidated header tip reported itself as
-the active chain, and the chain the node had actually validated was not listed
-at all.
+**`valid-fork` is not emitted, deliberately.** `NodeStatus::Stale` is the
+nearest thing the tree has, and it is not close enough: the tree demotes
+whichever header it displaced, whether or not the block behind it was ever
+received, let alone applied. On a header-first node most stale nodes are headers
+whose bodies never arrived. Core's `valid-fork` means "fully validated, since
+reorganised", so emitting it for those would claim a validation that never
+happened — and an operator reading `getchaintips` to find out what this node
+verified is exactly who must not be told that. Reporting `headers-only` for a
+branch Core would call `valid-fork` under-states; the reverse over-states, and
+only one of those is safe.
+
+Emitting it needs a per-block record of how far validation got, which the tree
+does not keep.
+
+**`invalid` outranks `active`.** The two can be true at once, and only briefly:
+`reorg::invalidate_block` marks the subtree invalid under the tree's write lock
+and releases it, then disconnects and republishes `applied_tip`. A call landing
+between those holds a tree view saying "invalid" and an applied tip that still
+names the block. No ordering closes that window — the two facts are published
+separately — so the vocabulary prefers the one that cannot go stale: a block
+that is invalid was invalid before the call and stays invalid after it, while
+"this is the applied tip" is precisely what the invalidation is in the middle of
+changing.

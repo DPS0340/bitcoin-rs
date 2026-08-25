@@ -245,7 +245,6 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         let Ok(node) = tree.node(leaf_id) else {
             continue;
         };
-        let is_active = Some(leaf_id) == active_tip_id;
         // `NodeStatus` is not a validation record. `BlockTree::insert_node`
         // stamps whichever node carries the most work `Active` and demotes the
         // one it displaced to `Stale`, so on a header-first node every accepted
@@ -257,22 +256,39 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         // applied tip or an ancestor of it, and a leaf is never an ancestor of
         // anything. So every leaf but the applied tip is unconnected *now*, and
         // the only question left is whether it ever was.
-        let status = if is_active {
-            "active"
-        } else {
-            match node.status {
-                // Displaced from the best chain, which is the one signal the
-                // tree keeps that this branch was once the one being followed.
-                NodeStatus::Stale => "valid-fork",
-                // Best-work header, or a header off the best chain: either way
-                // its block is not connected, because the connected tip is
-                // elsewhere. Core's "valid-headers" -- data present but never
-                // validated -- has no counterpart here, since this node applies
-                // a block as it arrives.
-                NodeStatus::Active | NodeStatus::HeaderValid => "headers-only",
-                NodeStatus::Invalid => "invalid",
-            }
+        let status = match node.status {
+            // **Invalid first, ahead of being the applied tip.** The two can
+            // both be true at once, and only for as long as it takes an
+            // invalidation to finish: `reorg::invalidate_block` marks the
+            // subtree invalid under the tree's write lock and releases it, and
+            // republishes `applied_tip` afterwards, when the disconnect has
+            // run. A call landing in between holds a tree view that says
+            // "invalid" and an applied tip that still names the block -- and
+            // deciding on the tip first labels a block the node has just
+            // rejected as the chain it is following. There is no ordering that
+            // removes the window, because the two are published separately;
+            // what removes the wrong answer is preferring the fact that cannot
+            // be stale. A block that is invalid was invalid before this call
+            // and stays invalid after it.
+            NodeStatus::Invalid => "invalid",
+            _ if Some(leaf_id) == active_tip_id => "active",
+            // Everything else is a leaf whose block is not connected now, and
+            // the tree keeps no evidence that it ever was.
+            //
+            // `Stale` is not that evidence, which is the trap: the tree demotes
+            // whichever header it displaced, whether or not the block behind it
+            // was ever received, let alone applied. On a header-first node most
+            // stale nodes are headers whose bodies never arrived. Calling those
+            // `valid-fork` -- Core's "fully validated, since reorganised" --
+            // claims a validation that never happened.
+            //
+            // So `valid-fork` is never emitted. Core's `valid-headers` is not
+            // either: it means the body is present and unvalidated, which this
+            // node cannot reach because it applies a block as it arrives. Both
+            // absences are recorded in DEVIATIONS.md.
+            NodeStatus::Stale | NodeStatus::Active | NodeStatus::HeaderValid => "headers-only",
         };
+        let is_active = status == "active";
         let branchlen = if is_active {
             0
         } else {
@@ -2827,11 +2843,12 @@ mod getchaintips_tests {
     ///
     /// This is the state a reorg leaves: the abandoned tip keeps its height and
     /// its data, and Core reports it as `valid-fork` with the distance back to
-    /// the fork point. It is the one status this node can tell apart from a
-    /// bare header, because displacing a tip is the single thing the block tree
-    /// records about a branch it stopped following.
+    /// the fork point. This node reports `headers-only`, and the assertion
+    /// below says why -- displacing a header is the only thing the block tree
+    /// records, and that is a fact about headers rather than about validation.
     #[test]
-    fn a_branch_left_behind_by_a_reorg_is_a_valid_fork() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_branch_left_behind_by_a_reorg_is_reported_as_headers_only()
+    -> Result<(), Box<dyn std::error::Error>> {
         let ctx = Arc::new(Context::new());
         let (abandoned_height, new_tip) = {
             let mut tree = ctx.block_tree.write();
@@ -2882,11 +2899,96 @@ mod getchaintips_tests {
             panic!("the abandoned tip is missing: {tips:?}");
         };
 
-        assert_eq!(field(abandoned, "status"), "valid-fork");
+        // **Not `valid-fork`.** This fixture never applied a2's block -- it
+        // only inserted headers -- and the tree kept no record that anything
+        // did. `Stale` says the header was displaced, which is a fact about the
+        // header tree and not about validation; on a header-first node most
+        // stale nodes are headers whose bodies never arrived at all. Core's
+        // `valid-fork` means "fully validated, since reorganised", so emitting
+        // it here would claim a validation that did not happen.
+        assert_eq!(field(abandoned, "status"), "headers-only");
         assert_eq!(
             abandoned.get("branchlen").and_then(JsonValueTrait::as_u64),
             Some(1),
             "one block past the fork point"
+        );
+        Ok(())
+    }
+
+    /// An invalidated block is never reported as the chain being followed.
+    ///
+    /// `reorg::invalidate_block` marks the subtree invalid under the tree's
+    /// write lock and releases it, then disconnects and republishes
+    /// `applied_tip`. Between those two a caller holds a tree view that says
+    /// "invalid" and an applied tip that still names the block, and deciding on
+    /// the tip first labels a block the node has just rejected as `active` --
+    /// an operator reading that sees the node following a chain it has thrown
+    /// away.
+    ///
+    /// The window cannot be closed by ordering, because the two facts are
+    /// published separately. What removes the wrong answer is preferring the
+    /// one that cannot go stale: a block that is invalid was invalid before
+    /// this call and stays invalid after it.
+    ///
+    /// The fixture *is* that window, reproduced exactly: the subtree is
+    /// invalidated and the applied tip is left where invalidation found it.
+    #[test]
+    fn an_invalidated_applied_tip_is_not_reported_as_active()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = Arc::new(Context::new());
+        let tip = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = synthetic_header(BlockHash::all_zeros(), 1_000_000);
+            let genesis_hash = genesis.block_hash();
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            let child = synthetic_header(genesis_hash, 1_000_600);
+            let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::Active)?;
+            let node = tree.node(child_id)?;
+            TipSnapshot {
+                tip_id: child_id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+            }
+        };
+        ctx.set_applied_tip(tip.clone());
+
+        // Before: the applied tip is the chain being followed.
+        let before = tips_of(&ctx);
+        let Some(active) = before
+            .iter()
+            .find(|reported| field(reported, "status") == "active")
+        else {
+            panic!("the applied tip must start out active: {before:?}");
+        };
+        assert_eq!(
+            active.get("height").and_then(JsonValueTrait::as_u64),
+            Some(u64::from(tip.height))
+        );
+
+        // The invalidation's first half, with the tip not yet republished.
+        {
+            let mut tree = ctx.block_tree.write();
+            tree.invalidate_subtree(tip.tip_id)?;
+        }
+
+        let after = tips_of(&ctx);
+        let Some(reported) = after.iter().find(|reported| {
+            reported.get("hash").and_then(JsonValueTrait::as_str)
+                == Some(tip.hash.to_string_be().as_str())
+        }) else {
+            panic!("the invalidated block must still be listed: {after:?}");
+        };
+        assert_eq!(
+            field(reported, "status"),
+            "invalid",
+            "an invalidated block must not be reported as the active chain"
+        );
+        assert!(
+            !after
+                .iter()
+                .any(|reported| field(reported, "status") == "active"),
+            "nothing is active while the invalidation is in flight: {after:?}"
         );
         Ok(())
     }
