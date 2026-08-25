@@ -186,9 +186,15 @@ fn template_for_tip(ctx: &Arc<Context>, now: u64) -> Result<BlockTemplate, RpcEr
 
         let template = assemble(ctx, &tip, now)?;
 
-        // The chain may have moved while this was being built. Publishing it
-        // anyway would cache a candidate for a parent that is no longer the
-        // tip, and the cache key would then claim it belongs to the new one.
+        // The chain may have moved while this was being built. The template
+        // is still internally consistent -- every field came from one snapshot
+        // -- and the cache records the tip it was built for, so nothing is
+        // mislabelled either way. What this buys is freshness: a miner asking
+        // now gets work for the tip as it is now, rather than for one that
+        // stopped being the tip while the answer was being assembled.
+        //
+        // No test here distinguishes it, because doing so needs the tip to move
+        // *during* assembly. Recorded as such rather than claimed as covered.
         if ctx.applied_tip.load_full().map(|current| current.hash) != Some(tip.hash) {
             continue;
         }
