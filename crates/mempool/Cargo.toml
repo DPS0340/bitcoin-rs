@@ -40,3 +40,6 @@ criterion.workspace = true
 [[bench]]
 name = "spentby"
 harness = false
+[[bench]]
+name = "pareto"
+harness = false
