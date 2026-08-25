@@ -11,7 +11,7 @@ use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     transaction,
 };
-use bitcoin_rs_consensus::verify_transaction_borrowed;
+use bitcoin_rs_consensus::verify_transaction;
 use bitcoin_rs_script::{Interpreter, VerifyFlags};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -22,10 +22,11 @@ fn multi_input_true_scripts(c: &mut Criterion) {
         b.iter_batched(
             fixture,
             |(tx, utxos)| {
-                verify_transaction_borrowed(
+                verify_transaction(
                     black_box(&tx),
                     black_box(&utxos),
                     1,
+                    0,
                     black_box(VerifyFlags::MANDATORY),
                 )
                 .unwrap_or_else(|error| panic!("transaction verification failed: {error}"));

@@ -3061,7 +3061,7 @@ fn run_non_script_checks_only(
                 bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
                 return Ok(());
             }
-            bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+            bitcoin_rs_consensus::verify_tx::verify_transaction_non_script(
                 tx,
                 &*resolved,
                 height,
@@ -3078,7 +3078,7 @@ fn run_non_script_checks_only(
             view.add_outputs(tx_index, *txid, tx.output.len())?;
             continue;
         }
-        bitcoin_rs_consensus::verify_tx::verify_transaction_borrowed_non_script_with_mtp(
+        bitcoin_rs_consensus::verify_tx::verify_transaction_non_script(
             tx,
             &view,
             height,

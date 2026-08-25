@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use bitcoin_rs_primitives::Tx;
 #[cfg(not(feature = "kernel"))]
 use bitcoin_rs_script::Interpreter;
 use bitcoin_rs_script::VerifyFlags;
@@ -123,74 +122,34 @@ fn is_final_tx_with_locktime_cutoff(
         .all(|input| input.sequence == sequence_final)
 }
 
-/// Verifies non-contextual and input-script transaction rules without contextual MTP checks.
+/// Verifies non-contextual and input-script transaction rules for a transaction.
+///
+/// `locktime_cutoff` is the caller-selected timestamp cutoff: block header time before
+/// BIP113 activation and previous-tip MTP after. A `locktime_cutoff` of `0` retains the
+/// old non-contextual behavior for callers that do not have an MTP.
 pub fn verify_transaction(
-    tx: &Tx,
-    prevouts: &impl UtxoView,
-    height: u32,
-    flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
-    verify_transaction_with_mtp(tx, prevouts, height, 0, flags)
-}
-
-/// Verifies non-contextual and input-script transaction rules with a caller-selected timestamp cutoff.
-///
-/// The historical `_with_mtp` suffix is retained for source compatibility. Callers pass block
-/// header time before BIP113 activation and previous-tip MTP after activation.
-pub fn verify_transaction_with_mtp(
-    tx: &Tx,
-    prevouts: &impl UtxoView,
-    height: u32,
-    locktime_cutoff: u32,
-    flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
-    verify_transaction_borrowed_with_mtp(&tx.0, prevouts, height, locktime_cutoff, flags)
-}
-
-/// Verifies non-contextual and input-script transaction rules for a borrowed transaction without contextual MTP checks.
-pub fn verify_transaction_borrowed(
-    tx: &bitcoin::Transaction,
-    prevouts: &impl UtxoView,
-    height: u32,
-    flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
-    verify_transaction_borrowed_with_mtp(tx, prevouts, height, 0, flags)
-}
-
-/// Verifies non-contextual and input-script transaction rules for a borrowed transaction.
-///
-/// The historical `_with_mtp` suffix is retained for source compatibility. Callers pass block
-/// header time before BIP113 activation and previous-tip MTP after activation.
-pub fn verify_transaction_borrowed_with_mtp(
     tx: &bitcoin::Transaction,
     prevouts: &impl UtxoView,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
 ) -> Result<(), ConsensusError> {
-    verify_transaction_borrowed_with_locktime_cutoff(
-        tx,
-        prevouts,
-        height,
-        locktime_cutoff,
-        flags,
-        false,
-    )
+    verify_transaction_with_locktime_cutoff(tx, prevouts, height, locktime_cutoff, flags, false)
 }
 
-/// Verifies non-script transaction rules for a borrowed transaction with a caller-selected
+/// Verifies non-script transaction rules for a transaction with a caller-selected
 /// timestamp cutoff.
 ///
 /// Checks finality, empty inputs/outputs, coinbase scriptSig size, duplicate inputs, null
 /// prevouts, missing prevouts, input/output value balance, and sigop limits. Skips
-/// kernel/script script execution.
-pub fn verify_transaction_borrowed_non_script_with_mtp(
+/// kernel/script script execution. This is the assume-valid entry.
+pub fn verify_transaction_non_script(
     tx: &bitcoin::Transaction,
     prevouts: &impl UtxoView,
     height: u32,
     locktime_cutoff: u32,
 ) -> Result<(), ConsensusError> {
-    verify_transaction_borrowed_with_locktime_cutoff(
+    verify_transaction_with_locktime_cutoff(
         tx,
         prevouts,
         height,
@@ -200,7 +159,7 @@ pub fn verify_transaction_borrowed_non_script_with_mtp(
     )
 }
 
-fn verify_transaction_borrowed_with_locktime_cutoff(
+fn verify_transaction_with_locktime_cutoff(
     tx: &bitcoin::Transaction,
     prevouts: &impl UtxoView,
     height: u32,
@@ -272,7 +231,7 @@ fn prepare_tx_checks(
         return Err(ConsensusError::EmptyOutputs);
     }
 
-    let output_value = total_output_value_borrowed(tx)?;
+    let output_value = total_output_value(tx)?;
     if tx.is_coinbase() {
         verify_coinbase_script_sig_size(tx)?;
         return Ok(None);
@@ -805,7 +764,7 @@ fn cached_prevout_lookup(
     Some(txout.clone())
 }
 
-fn total_output_value_borrowed(tx: &bitcoin::Transaction) -> Result<u64, ConsensusError> {
+fn total_output_value(tx: &bitcoin::Transaction) -> Result<u64, ConsensusError> {
     tx.output.iter().try_fold(0u64, |sum, output| {
         let next = sum
             .checked_add(output.value.to_sat())
@@ -830,13 +789,11 @@ mod tests {
         Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
         transaction,
     };
-    use bitcoin_rs_primitives::Tx;
     use bitcoin_rs_script::VerifyFlags;
 
     use super::{
         ScriptStageTimings, is_final_tx_with_locktime_cutoff, verify_coinbase_script_sig_size,
-        verify_transaction, verify_transaction_borrowed, verify_transaction_borrowed_with_mtp,
-        verify_transaction_with_mtp,
+        verify_transaction, verify_transaction_non_script,
     };
 
     /// Wraps `txs` in a block and parses it the way production does, so tests
@@ -860,7 +817,7 @@ mod tests {
 
     #[test]
     fn coinbase_transaction_skips_prevout_lookup() {
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -873,10 +830,10 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let utxos = BTreeMap::new();
         assert_eq!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
     }
@@ -888,9 +845,9 @@ mod tests {
             let utxos = BTreeMap::new();
             let expected = Err(ConsensusError::CoinbaseScriptSigSize { len });
 
-            assert_eq!(verify_coinbase_script_sig_size(&tx.0), expected);
+            assert_eq!(verify_coinbase_script_sig_size(&tx), expected);
             assert_eq!(
-                verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+                verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
                 expected
             );
         }
@@ -902,9 +859,9 @@ mod tests {
         for len in [2, 100] {
             let tx = coinbase_transaction_with_script_sig_len(len);
 
-            assert_eq!(verify_coinbase_script_sig_size(&tx.0), Ok(()));
+            assert_eq!(verify_coinbase_script_sig_size(&tx), Ok(()));
             assert_eq!(
-                verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+                verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
                 Ok(())
             );
         }
@@ -916,7 +873,7 @@ mod tests {
             txid: Txid::from_byte_array([1; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![spending_input(outpoint), spending_input(outpoint)],
@@ -924,7 +881,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             outpoint,
@@ -934,7 +891,7 @@ mod tests {
             },
         );
         assert_eq!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::NONE),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::NONE),
             Err(ConsensusError::DuplicateInput { input_index: 1 })
         );
     }
@@ -949,7 +906,7 @@ mod tests {
             txid: Txid::from_byte_array([2; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![true_spending_input(first), true_spending_input(second)],
@@ -957,7 +914,7 @@ mod tests {
                 value: Amount::from_sat(75),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             first,
@@ -975,7 +932,7 @@ mod tests {
         );
 
         assert_eq!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
     }
@@ -990,7 +947,7 @@ mod tests {
             txid: Txid::from_byte_array([12; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![true_spending_input(first), true_spending_input(second)],
@@ -998,7 +955,7 @@ mod tests {
                 value: Amount::from_sat(75),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             first,
@@ -1017,10 +974,10 @@ mod tests {
         let view = CountingUtxoView::new(utxos);
 
         assert_eq!(
-            verify_transaction(&tx, &view, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &view, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
-        assert_eq!(view.lookup_count(), tx.0.input.len());
+        assert_eq!(view.lookup_count(), tx.input.len());
     }
 
     #[test]
@@ -1034,7 +991,7 @@ mod tests {
             txid: Txid::from_byte_array([6; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![true_spending_input(first), true_spending_input(second)],
@@ -1042,7 +999,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             first,
@@ -1059,7 +1016,7 @@ mod tests {
             },
         );
 
-        let result = verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY);
+        let result = verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY);
 
         assert_eq!(
             result,
@@ -1139,7 +1096,7 @@ mod tests {
         }
 
         assert_eq!(
-            verify_transaction(&Tx(tx), &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
     }
@@ -1151,7 +1108,7 @@ mod tests {
             txid: Txid::from_byte_array([7; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -1164,7 +1121,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             outpoint,
@@ -1175,7 +1132,7 @@ mod tests {
         );
 
         assert_eq!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
     }
@@ -1190,7 +1147,7 @@ mod tests {
             txid: Txid::from_byte_array([8; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -1203,7 +1160,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             outpoint,
@@ -1213,7 +1170,7 @@ mod tests {
             },
         );
 
-        let result = verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY);
+        let result = verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY);
 
         assert!(matches!(
             result,
@@ -1234,7 +1191,7 @@ mod tests {
             txid: Txid::from_byte_array([9; 32]),
             vout: 0,
         };
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -1247,7 +1204,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let mut utxos = BTreeMap::new();
         utxos.insert(
             outpoint,
@@ -1258,18 +1215,18 @@ mod tests {
         );
 
         assert_eq!(
-            super::verify_transaction_borrowed_non_script_with_mtp(&tx.0, &utxos, 0, 0),
+            super::verify_transaction_non_script(&tx, &utxos, 0, 0),
             Ok(())
         );
         assert!(matches!(
-            verify_transaction(&tx, &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Err(ConsensusError::Script { input_index: 0, .. })
         ));
     }
 
     #[test]
     fn verify_transaction_rejects_non_final_height_lock() {
-        let tx = Tx(Transaction {
+        let tx = Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::from_consensus(200),
             input: vec![TxIn {
@@ -1282,10 +1239,10 @@ mod tests {
                 value: Amount::from_sat(1_000),
                 script_pubkey: ScriptBuf::new(),
             }],
-        });
+        };
         let utxos = BTreeMap::new();
 
-        let result = verify_transaction_with_mtp(&tx, &utxos, 100, 0, VerifyFlags::MANDATORY);
+        let result = verify_transaction(&tx, &utxos, 100, 0, VerifyFlags::MANDATORY);
 
         assert!(matches!(
             result,
@@ -1315,12 +1272,12 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_transaction_paths_share_locktime_and_coinbase_rules() {
+    fn transaction_paths_share_locktime_and_coinbase_rules() {
         let coinbase = coinbase_transaction_with_script_sig_len(2);
         let utxos = BTreeMap::new();
 
         assert_eq!(
-            verify_transaction_borrowed(&coinbase.0, &utxos, 0, VerifyFlags::MANDATORY),
+            verify_transaction(&coinbase, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
 
@@ -1340,13 +1297,7 @@ mod tests {
         };
 
         assert!(matches!(
-            verify_transaction_borrowed_with_mtp(
-                &non_final,
-                &utxos,
-                1,
-                500_000_100,
-                VerifyFlags::MANDATORY
-            ),
+            verify_transaction(&non_final, &utxos, 1, 500_000_100, VerifyFlags::MANDATORY),
             Err(ConsensusError::Bip { bip: "BIP113", .. })
         ));
     }
@@ -1366,19 +1317,19 @@ mod tests {
     #[test]
     #[cfg(feature = "kernel")]
     fn batched_units_report_the_earliest_failing_unit() {
-        let good_txs = vec![coinbase_transaction_with_script_sig_len(2).0];
+        let good_txs = vec![coinbase_transaction_with_script_sig_len(2)];
         let good_block = kernel_block_for(&good_txs);
 
         // Unit 0 fails on its SECOND transaction, unit 2 on its first. Block
         // order must win over position within a block.
         let first_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![true_spending_input(outpoint(1))], 50),
             spend_tx(vec![mismatch_input(outpoint(2))], 50),
         ];
         let first_block = kernel_block_for(&first_txs);
         let last_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(3))], 50),
         ];
         let last_block = kernel_block_for(&last_txs);
@@ -1419,7 +1370,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn each_unit_reads_its_own_slice_of_results() {
         let clean_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![true_spending_input(outpoint(11))], 50),
             spend_tx(vec![true_spending_input(outpoint(12))], 50),
         ];
@@ -1430,7 +1381,7 @@ mod tests {
             vec![Some(op1_txout(50))],
         ];
         let bad_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(13))], 50),
         ];
         let bad_block = kernel_block_for(&bad_txs);
@@ -1461,7 +1412,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn a_batched_unit_matches_the_single_block_path() {
         let txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(7))], 50),
         ];
         let block = kernel_block_for(&txs);
@@ -1502,7 +1453,7 @@ mod tests {
         use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
 
         let first_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![true_spending_input(outpoint(9))], 50),
         ];
         let first_block = kernel_block_for(&first_txs);
@@ -1519,7 +1470,7 @@ mod tests {
                 .into_script(),
         };
         let second_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(
                 vec![TxIn {
                     previous_output: outpoint(10),
@@ -1602,8 +1553,8 @@ mod tests {
         ScriptBuf::from_bytes(bytes)
     }
 
-    fn coinbase_transaction_with_script_sig_len(len: usize) -> Tx {
-        Tx(Transaction {
+    fn coinbase_transaction_with_script_sig_len(len: usize) -> Transaction {
+        Transaction {
             version: transaction::Version(1),
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
@@ -1616,7 +1567,7 @@ mod tests {
                 value: Amount::from_sat(50),
                 script_pubkey: ScriptBuf::new(),
             }],
-        })
+        }
     }
 
     #[cfg(feature = "kernel")]
@@ -1670,7 +1621,7 @@ mod tests {
 
     #[test]
     fn block_input_scripts_rejects_mismatched_prevout_matrix() {
-        let txs = vec![coinbase_transaction_with_script_sig_len(2).0];
+        let txs = vec![coinbase_transaction_with_script_sig_len(2)];
         assert_eq!(
             super::verify_block_input_scripts(
                 &txs,
@@ -1695,7 +1646,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn earlier_tx_script_error_beats_later_tx_missing_prevout() {
         let txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(1))], 50),
             spend_tx(vec![true_spending_input(outpoint(2))], 50),
         ];
@@ -1721,7 +1672,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn intra_tx_script_error_beats_value_and_sigop() {
         let txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(1))], 100),
         ];
         let resolved = vec![Vec::new(), vec![Some(op_equal_txout(50))]];
@@ -1746,7 +1697,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn later_pre_error_does_not_outrank_earlier_post_error() {
         let txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![true_spending_input(outpoint(1))], 100),
             spend_tx(
                 vec![
@@ -1784,7 +1735,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn parallel_script_checks_report_first_error() {
         let mut txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![mismatch_input(outpoint(1))], 50),
         ];
         let mut resolved = vec![Vec::new(), vec![Some(op_equal_txout(100))]];
@@ -1821,7 +1772,7 @@ mod tests {
         };
         let tx2 = spend_tx(vec![true_spending_input(tx1_out)], 90);
         let tx1_output = tx1.output[0].clone();
-        let txs = vec![coinbase_transaction_with_script_sig_len(2).0, tx1, tx2];
+        let txs = vec![coinbase_transaction_with_script_sig_len(2), tx1, tx2];
         let resolved = vec![
             Vec::new(),
             vec![Some(op1_txout(100))],
@@ -1848,7 +1799,7 @@ mod tests {
         let bad_tx2 = spend_tx(vec![true_spending_input(bad_out)], 90);
         let bad_tx1_output = bad_tx1.output[0].clone();
         let bad_txs = vec![
-            coinbase_transaction_with_script_sig_len(2).0,
+            coinbase_transaction_with_script_sig_len(2),
             bad_tx1,
             bad_tx2,
         ];
@@ -1959,9 +1910,10 @@ mod tests {
         }
         assert_eq!(
             verify_transaction(
-                &Tx(fixture.tx.clone()),
+                &fixture.tx,
                 &utxos,
                 fixture.height,
+                0,
                 fixture.flags
             ),
             Ok(())
@@ -1981,9 +1933,10 @@ mod tests {
             utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
         }
         let result = verify_transaction(
-            &Tx(fixture.tx.clone()),
+            &fixture.tx,
             &utxos,
             fixture.height,
+            0,
             fixture.flags,
         );
         assert!(

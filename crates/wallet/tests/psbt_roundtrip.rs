@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, Network, OutPoint, TxOut, Txid};
 use bitcoin_rs_consensus::verify_transaction;
-use bitcoin_rs_primitives::Tx;
 use bitcoin_rs_script::VerifyFlags;
 use bitcoin_rs_wallet::{Descriptor, ExternalSigner, PrevUtxo, PsbtBuilder, finalize_signed};
 
@@ -51,7 +50,7 @@ fn descriptor_psbt_signer_finalizer_roundtrips_through_consensus()
         let finalized = finalize_signed(signed)?;
         let mut prevouts = BTreeMap::new();
         prevouts.insert(outpoint, prev_txout);
-        verify_transaction(&Tx(finalized), &prevouts, 0, VerifyFlags::MANDATORY)?;
+        verify_transaction(&finalized, &prevouts, 0, 0, VerifyFlags::MANDATORY)?;
     }
 
     Ok(())
