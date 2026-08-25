@@ -22,9 +22,21 @@ pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<V
     let mut response = sonic_rs::Object::new();
     // The canonical form comes from the parse, so a descriptor handed to this
     // call with an `xprv` in it does not get one back.
-    let _ = response.insert(&"descriptor", info.canonical.as_str());
+    //
+    // It carries its own checksum, as Core's does: `DescriptorImpl::ToString`
+    // ends in `return AddChecksum(ret)`. That checksum is of the *canonical*
+    // string and the `checksum` field below is of the *input*, which is not a
+    // duplication -- the two differ whenever the parse rewrites anything, an
+    // `xprv` replaced by its `xpub` most obviously. A caller copying the
+    // canonical form back out needs the one that matches what they copied.
+    let _ = response.insert(&"descriptor", with_checksum(&info.canonical).as_str());
     if !info.multipath_expansion.is_empty() {
-        let _ = response.insert(&"multipath_expansion", json!(info.multipath_expansion));
+        let expansions: Vec<String> = info
+            .multipath_expansion
+            .iter()
+            .map(|expansion| with_checksum(expansion))
+            .collect();
+        let _ = response.insert(&"multipath_expansion", json!(expansions));
     }
     let _ = response.insert(&"checksum", checksum.as_str());
     let _ = response.insert(&"isrange", info.is_range);
@@ -46,6 +58,17 @@ fn descriptor_error(error: bitcoin_rs_wallet::WalletError) -> RpcError {
         }
         other => RpcError::InvalidAddressOrKey(other.to_string()),
     }
+}
+
+/// A canonical descriptor with its own checksum attached, as Core returns it.
+///
+/// Falls back to the bare form if the payload somehow carries a character
+/// outside BIP380's input charset. That cannot happen for a string this node
+/// just produced from a parsed descriptor, and returning a descriptor without a
+/// checksum is a better failure than refusing to answer about one that parsed.
+fn with_checksum(canonical: &str) -> String {
+    descriptor_checksum(canonical)
+        .map_or_else(|| canonical.to_owned(), |sum| format!("{canonical}#{sum}"))
 }
 
 /// Whether a descriptor must carry a checksum to be accepted.
@@ -152,6 +175,7 @@ fn parse_derivation_range(value: &Value) -> Result<(u32, u32), RpcError> {
     if let Some(end) = value.as_u64() {
         let end = u32::try_from(end)
             .map_err(|_| RpcError::InvalidParameter(RANGE_TOO_LARGE.to_owned()))?;
+        bound_derivation_work(0, end)?;
         return Ok((0, end));
     }
     let Some(pair) = value.as_array().filter(|pair| pair.len() == 2) else {
@@ -177,7 +201,39 @@ fn parse_derivation_range(value: &Value) -> Result<(u32, u32), RpcError> {
             "Range specified as [begin,end] must not have begin after end".to_owned(),
         ));
     }
+    bound_derivation_work(begin, end)?;
     Ok((begin, end))
+}
+
+/// Core's ceiling on how much work one derive request may ask for.
+///
+/// `ParseDescriptorRange` in `rpc/util.cpp` refuses `high >= low + 1000000`.
+/// Without it `[0, 4294967295]` is a legal request that derives four billion
+/// addresses and holds every one of them in memory before answering -- an
+/// unauthenticated caller turning one JSON object into an out-of-memory kill.
+/// The refusal has to happen before the work starts, which is why it lives in
+/// the parser rather than in the loop.
+const MAX_DERIVATION_COUNT: u32 = 1_000_000;
+
+/// Core's ceiling on the index itself: `(high >> 31) != 0` is refused, so the
+/// top bit is reserved and the largest derivable index is `2^31 - 1`. That is
+/// BIP32's unhardened range, and an index above it is not a large request but
+/// an impossible one.
+const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
+
+fn bound_derivation_work(begin: u32, end: u32) -> Result<(), RpcError> {
+    if end > MAX_DERIVATION_INDEX {
+        return Err(RpcError::InvalidParameter(
+            "End of range is too high".to_owned(),
+        ));
+    }
+    // Core compares `high >= low + 1000000` on `int64_t`, so the sum cannot
+    // wrap there; here both are `u32` and it can, which would turn the ceiling
+    // into a floor. Widened rather than saturated for that reason.
+    if u64::from(end) >= u64::from(begin).saturating_add(u64::from(MAX_DERIVATION_COUNT)) {
+        return Err(RpcError::InvalidParameter("Range is too large".to_owned()));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1129,11 +1185,45 @@ mod descriptor_checksum_tests {
         let ctx = Arc::new(Context::new());
         let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})")]))
             .unwrap_or_else(|err| panic!("a bare descriptor must be analysed: {err}"));
-        assert_eq!(
-            result.get("descriptor").and_then(JsonValueTrait::as_str),
-            Some(format!("addr({ADDRESS})").as_str()),
-            "the canonical form carries no checksum: {result:?}"
+        let Some(canonical) = result.get("descriptor").and_then(JsonValueTrait::as_str) else {
+            panic!("descriptor missing: {result:?}");
+        };
+        assert!(
+            canonical.starts_with(&format!("addr({ADDRESS})#")),
+            "the canonical form carries its own checksum: {canonical}"
         );
+    }
+
+    /// The canonical descriptor carries a checksum, as Core's does.
+    ///
+    /// `DescriptorImpl::ToString` ends in `return AddChecksum(ret)`, so every
+    /// descriptor Core hands back is ready to be pasted into the next call.
+    /// This returned the bare form, so a caller copying it out got something
+    /// `deriveaddresses` then refuses for having no checksum.
+    ///
+    /// The checksum on the canonical form is of the *canonical* string, and the
+    /// separate `checksum` field is of the *input*. They differ whenever the
+    /// parse rewrites anything, which is what the second half checks.
+    #[test]
+    fn the_canonical_descriptor_carries_its_own_checksum() {
+        let ctx = Arc::new(Context::new());
+        let result = getdescriptorinfo(&ctx, &json!([format!("addr({ADDRESS})")]))
+            .unwrap_or_else(|err| panic!("getdescriptorinfo failed: {err}"));
+
+        let Some(canonical) = result.get("descriptor").and_then(JsonValueTrait::as_str) else {
+            panic!("descriptor missing: {result:?}");
+        };
+        let Some((body, sum)) = canonical.rsplit_once('#') else {
+            panic!("the canonical form must carry a checksum: {canonical}");
+        };
+        assert_eq!(body, format!("addr({ADDRESS})"));
+        assert_eq!(sum.len(), 8);
+
+        // Round trip: what comes out must be accepted by the call that demands
+        // a checksum, which is the whole point of putting one there.
+        let derived = deriveaddresses(&ctx, &json!([canonical]))
+            .unwrap_or_else(|err| panic!("the canonical form must be usable as-is: {err}"));
+        assert_eq!(derived, json!([ADDRESS]));
     }
 
     /// A descriptor that names an output cannot produce a spend for it.
@@ -1250,6 +1340,90 @@ mod deriveaddresses_tests {
             .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
 
         assert_eq!(result, json!([ADDRESS]));
+    }
+
+    /// A range Core would refuse never starts deriving.
+    ///
+    /// `ParseDescriptorRange` in `rpc/util.cpp` refuses `high >= low + 1000000`
+    /// and any `high` with its top bit set. Without those, `[0, 4294967295]` is
+    /// a legal request that derives four billion addresses and holds every one
+    /// of them before answering -- one JSON object turning into an
+    /// out-of-memory kill. The refusal has to land before the work starts,
+    /// which is why it lives in the parser.
+    ///
+    /// The test asserts it is *fast* as well as refused: a bound checked inside
+    /// the loop would also return an error, eventually, having done the damage.
+    #[test]
+    fn a_range_too_large_to_serve_is_refused_before_any_work() {
+        let ctx = Arc::new(Context::new());
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let descriptor = checksummed(&format!("wpkh({xpub}/0/*)"));
+
+        let started = std::time::Instant::now();
+        for (range, expected) in [
+            // Top bit set: not a large request but an impossible index.
+            (json!([0, 4_294_967_295_u64]), "End of range is too high"),
+            (json!([0, 2_147_483_648_u64]), "End of range is too high"),
+            // `2^31 - 1` is the largest legal *index*, so it clears the check
+            // above and trips the size limit instead -- which is the order Core
+            // applies them in, and the reason both messages exist.
+            (json!([0, 2_147_483_647_u64]), "Range is too large"),
+            (json!([0, 1_000_000]), "Range is too large"),
+            (json!(1_000_000), "Range is too large"),
+        ] {
+            let error = deriveaddresses(&ctx, &json!([descriptor.clone(), range.clone()]))
+                .err()
+                .unwrap_or_else(|| panic!("{range:?} must be refused"));
+            assert_eq!(
+                error.code(),
+                RpcError::CORE_INVALID_PARAMETER,
+                "for {range:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "for {range:?}: {error}"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusals must happen before the derivation, not after it"
+        );
+
+        // One below the ceiling is served, so the bound is a ceiling and not a
+        // blanket refusal. Kept small: this is about the boundary being in the
+        // right place, and 999,999 derivations would prove it slowly.
+        let ok = deriveaddresses(&ctx, &json!([descriptor, [10, 12]]))
+            .unwrap_or_else(|err| panic!("a modest range must still work: {err}"));
+        assert_eq!(ok.as_array().map(sonic_rs::Array::len), Some(3));
+    }
+
+    /// A key from another network does not derive addresses for this one.
+    ///
+    /// Bitcoin Core never reaches this: `DecodeExtPubKey` resolves the version
+    /// bytes against the running chain's Base58 prefix, so a `tpub` on mainnet
+    /// fails to decode and the descriptor never parses. rust-bitcoin decodes
+    /// both prefixes into one type and keeps the network as a field, so the
+    /// descriptor parses and the mismatch survives to derivation -- where
+    /// `address(network)` re-encodes the key with *this* network's prefix and
+    /// hands back a `bc1...` address for a testnet key.
+    ///
+    /// That address is well-formed and nobody holds its private key. Someone
+    /// checking the descriptor by eye sees mainnet addresses and cannot tell.
+    #[test]
+    fn a_testnet_key_does_not_derive_mainnet_addresses() {
+        // A mainnet context, which is `Context::new()`'s default.
+        let ctx = Arc::new(Context::new());
+        let tpub = "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp";
+        let descriptor = checksummed(&format!("wpkh({tpub}/0/*)"));
+
+        let error = deriveaddresses(&ctx, &json!([descriptor, [0, 1]]))
+            .err()
+            .unwrap_or_else(|| panic!("a testnet key must not derive mainnet addresses"));
+        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
+        assert!(
+            error.to_string().contains("test network"),
+            "the refusal must say which network the key is for: {error}"
+        );
     }
 
     /// A descriptor with no checksum does not derive an address.

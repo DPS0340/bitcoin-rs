@@ -3,6 +3,7 @@ use core::str::FromStr;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
 use bitcoin::{Address, Network, PublicKey};
 use miniscript::Descriptor as MiniscriptDescriptor;
+use miniscript::ForEachKey as _;
 use miniscript::descriptor::{DescriptorPublicKey, DescriptorType};
 use serde::{Deserialize, Serialize};
 
@@ -208,6 +209,8 @@ pub fn derive_addresses(
         _ => {}
     }
 
+    ensure_keys_match_network(&descriptor, network)?;
+
     let paths = if descriptor.is_multipath() {
         descriptor
             .into_single_descriptors()
@@ -234,6 +237,60 @@ pub fn derive_addresses(
         expansions.push(addresses);
     }
     Ok(expansions)
+}
+
+/// Refuses a descriptor whose extended keys belong to another network.
+///
+/// Bitcoin Core never reaches this check because it cannot: `DecodeExtPubKey`
+/// resolves the version bytes against the running chain's Base58 prefix, so a
+/// `tpub` on mainnet fails to decode and the descriptor never parses.
+/// rust-bitcoin decodes both prefixes into the same type and keeps the network
+/// as a field, so the descriptor parses fine and the mismatch survives to
+/// derivation -- where `address(network)` re-encodes the key with *this*
+/// network's prefix and hands back a `bc1...` address for a testnet key.
+///
+/// That address is well-formed, and nobody holds its private key. Someone
+/// checking the descriptor by eye sees mainnet addresses and has no way to tell.
+/// So the check is here rather than absent, and it runs before any derivation.
+///
+/// `NetworkKind` is the right granularity: BIP32 has two prefix sets, one for
+/// mainnet and one shared by every test network, so a signet key and a testnet
+/// key are genuinely indistinguishable and refusing between them would refuse
+/// something valid.
+fn ensure_keys_match_network(
+    descriptor: &MiniscriptDescriptor<DescriptorPublicKey>,
+    network: Network,
+) -> Result<(), WalletError> {
+    let wanted = bitcoin::NetworkKind::from(network);
+    let mut offender = None;
+    let _all_matched = descriptor.for_each_key(|key| {
+        let found = match key {
+            DescriptorPublicKey::XPub(xkey) => Some(xkey.xkey.network),
+            DescriptorPublicKey::MultiXPub(xkey) => Some(xkey.xkey.network),
+            // A bare public key carries no network. Core does not check one
+            // either -- there is nothing in the encoding to check.
+            DescriptorPublicKey::Single(_) => None,
+        };
+        if let Some(found) = found
+            && found != wanted
+        {
+            offender = Some(found);
+            return false;
+        }
+        true
+    });
+
+    match offender {
+        None => Ok(()),
+        Some(found) => Err(WalletError::Descriptor(format!(
+            "Descriptor key is for {} but this node is on {network}",
+            if found == bitcoin::NetworkKind::Main {
+                "mainnet"
+            } else {
+                "a test network"
+            }
+        ))),
+    }
 }
 
 /// A descriptor that names an output without saying how to spend it.
