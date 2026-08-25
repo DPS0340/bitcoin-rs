@@ -15,7 +15,7 @@ const SYNC_TICK: Duration = Duration::from_secs(1);
 
 /// Central v1 event loop for process-level tick coordination.
 ///
-/// The p2p, JSON-RPC, and ScriptIndex subsystems still own their connection
+/// The p2p, JSON-RPC, and `ScriptIndex` subsystems still own their connection
 /// channels and worker threads. This loop coordinates the shared tick-style
 /// work that must stop cleanly with the process.
 pub struct EventLoop {

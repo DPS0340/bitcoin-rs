@@ -597,7 +597,8 @@ pub fn run(mut config: Config) -> Result<()> {
         Arc::new(parking_lot::RwLock::new(Vec::new())),
         state.tx_index_query(),
         state.script_index_query(),
-    );
+    )
+    .with_esplora_tx_index(state.esplora_tx_index_query());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
     rpc_context = rpc_context.with_chain_tx_count(state.chain_tx_count_handle());
     if let Some(prune_service) = state.prune_service() {

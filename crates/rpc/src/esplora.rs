@@ -132,7 +132,7 @@ pub fn route_post(handler: &Handler, path: &str, body: &[u8]) -> Option<Response
 fn tx(ctx: &Context, id: &str) -> Response {
     lookup(ctx, id).map_or_else(
         |r| r,
-        |(tx, status)| json_response(tx_value(ctx, &tx, status)),
+        |(tx, status)| tx_value(ctx, &tx, status).map_or_else(|r| r, json_response),
     )
 }
 fn tx_hex(ctx: &Context, id: &str) -> Response {
@@ -158,7 +158,10 @@ fn lookup(ctx: &Context, id: &str) -> Result<(Transaction, Option<Status>), Resp
     if let Some(tx) = ctx.mempool.read().transaction_by_txid(&id) {
         return Ok(((*tx).clone(), None));
     }
-    let index = ctx.tx_index.as_ref().ok_or_else(not_found)?;
+    let index = ctx
+        .esplora_tx_index
+        .as_ref()
+        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
     let tx = index
         .transaction(&id)
         .map_err(query_error)?
@@ -206,15 +209,14 @@ fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
         return not_found();
     };
     let state = status(ctx, record.height);
-    json_response(
-        block
-            .txdata
-            .iter()
-            .skip(start)
-            .take(CHAIN_PAGE)
-            .map(|tx| tx_value(ctx, tx, state))
-            .collect::<Vec<_>>(),
-    )
+    block
+        .txdata
+        .iter()
+        .skip(start)
+        .take(CHAIN_PAGE)
+        .map(|tx| tx_value(ctx, tx, state))
+        .collect::<Result<Vec<_>, _>>()
+        .map_or_else(|r| r, json_response)
 }
 fn block_txids(ctx: &Context, h: &str) -> Response {
     let Some((_, block)) = decode_block(ctx, h) else {
@@ -273,14 +275,16 @@ fn summary_for(ctx: &Context, h: ScriptHash, address: Option<&str>) -> Response 
         Ok(v) => v,
         Err(r) => return r,
     };
-    let us = match combined_utxos(ctx, h) {
+    let confirmed_unspent = match confirmed_unspent(ctx, h) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let mem = mempool_activity(ctx, h, &us);
+    let mem = mempool_activity(ctx, h, &confirmed_unspent);
     let (cc, cs) = funded(&confirmed, h);
     let (mc, ms) = funded_mempool(&mem, h);
-    let mut v = json!({"chain_stats":{"tx_count":confirmed.len(),"funded_txo_count":cc,"funded_txo_sum":cs,"spent_txo_count":cc.saturating_sub(us.len() as u64),"spent_txo_sum":cs.saturating_sub(us.iter().fold(0,|s,o|s.saturating_add(o.value)))},"mempool_stats":{"tx_count":mem.len(),"funded_txo_count":mc,"funded_txo_sum":ms,"spent_txo_count":0,"spent_txo_sum":0}});
+    let (csc, css) = spent_confirmed(cc, cs, &confirmed_unspent);
+    let (msc, mss) = spent_mempool(&mem, h, &confirmed_unspent);
+    let mut v = json!({"chain_stats":{"tx_count":confirmed.len(),"funded_txo_count":cc,"funded_txo_sum":cs,"spent_txo_count":csc,"spent_txo_sum":css},"mempool_stats":{"tx_count":mem.len(),"funded_txo_count":mc,"funded_txo_sum":ms,"spent_txo_count":msc,"spent_txo_sum":mss}});
     if let Some(a) = address {
         v["address"] = json!(a)
     } else {
@@ -289,14 +293,20 @@ fn summary_for(ctx: &Context, h: ScriptHash, address: Option<&str>) -> Response 
     json_response(v)
 }
 fn utxos(ctx: &Context, h: ScriptHash) -> Response {
-    combined_utxos(ctx,h).map_or_else(|r|r,|v|json_response(v.into_iter().map(|r|json!({"txid":r.txid.to_string(),"vout":r.vout,"value":r.value,"status":if r.height==0{json!({"confirmed":false})}else{status_value(status(ctx,r.height))}})).collect::<Vec<_>>()))
+    confirmed_unspent(ctx, h).map_or_else(
+        |r| r,
+        |confirmed| {
+            let v = combined_utxos(ctx, h, &confirmed);
+            json_response(v.into_iter().map(|r|json!({"txid":r.txid.to_string(),"vout":r.vout,"value":r.value,"status":if r.height==0{json!({"confirmed":false})}else{status_value(status(ctx,r.height))}})).collect::<Vec<_>>())
+        },
+    )
 }
 fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bool) -> Response {
     let confirmed = match confirmed(ctx, h) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let us = match combined_utxos(ctx, h) {
+    let confirmed_unspent = match confirmed_unspent(ctx, h) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -307,13 +317,12 @@ fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bo
             .then_with(|| b.0.txid.cmp(&a.0.txid))
     });
     if last == Some("") {
-        return json_response(
-            mempool_activity(ctx, h, &us)
-                .into_iter()
-                .take(MEMPOOL_PAGE)
-                .map(|t| tx_value(ctx, &t, None))
-                .collect::<Vec<_>>(),
-        );
+        return mempool_activity(ctx, h, &confirmed_unspent)
+            .into_iter()
+            .take(MEMPOOL_PAGE)
+            .map(|t| tx_value(ctx, &t, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_or_else(|r| r, json_response);
     };
     let start = last.and_then(|x| {
         chain
@@ -324,22 +333,30 @@ fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bo
     if last.is_some() && start.is_none() {
         return not_found();
     }
-    let mut out = if include_mempool {
-        mempool_activity(ctx, h, &us)
+    let out = if include_mempool {
+        mempool_activity(ctx, h, &confirmed_unspent)
             .into_iter()
             .take(MEMPOOL_PAGE)
             .map(|t| tx_value(ctx, &t, None))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
     } else {
-        Vec::new()
+        Ok(Vec::new())
     };
-    out.extend(
-        chain
-            .into_iter()
-            .skip(start.unwrap_or(0))
-            .take(CHAIN_PAGE)
-            .map(|(_, t, s)| tx_value(ctx, &t, Some(s))),
-    );
+    let mut out = match out {
+        Ok(out) => out,
+        Err(r) => return r,
+    };
+    let chain = match chain
+        .into_iter()
+        .skip(start.unwrap_or(0))
+        .take(CHAIN_PAGE)
+        .map(|(_, t, s)| tx_value(ctx, &t, Some(s)))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(chain) => chain,
+        Err(r) => return r,
+    };
+    out.extend(chain);
     json_response(out)
 }
 fn confirmed(
@@ -359,21 +376,29 @@ fn confirmed(
             let s =
                 status(ctx, r.height).ok_or_else(|| unavailable("confirming block unavailable"))?;
             let tx = ctx
-                .block_by_height(r.height)
-                .and_then(|b| ctx.block_body_bytes(&b))
-                .and_then(|b| deserialize::<Block>(&b).ok())
-                .and_then(|b| b.txdata.into_iter().find(|t| t.compute_txid() == r.txid))
+                .esplora_tx_index
+                .as_ref()
+                .ok_or_else(|| unavailable("transaction lookup index is disabled"))?
+                .transaction(&r.txid)
+                .map_err(query_error)?
                 .ok_or_else(|| unavailable("confirming transaction unavailable"))?;
             Ok((r, tx, s))
         })
         .collect()
 }
-fn combined_utxos(ctx: &Context, h: ScriptHash) -> Result<Vec<ScriptIndexRecord>, Response> {
+fn confirmed_unspent(ctx: &Context, h: ScriptHash) -> Result<Vec<ScriptIndexRecord>, Response> {
     let index = ctx
         .script_index
         .as_ref()
         .ok_or_else(|| unavailable("script index is disabled"))?;
-    let mut v = index.unspent_outputs(h).map_err(query_error)?;
+    index.unspent_outputs(h).map_err(query_error)
+}
+fn combined_utxos(
+    ctx: &Context,
+    h: ScriptHash,
+    confirmed_unspent: &[ScriptIndexRecord],
+) -> Vec<ScriptIndexRecord> {
+    let mut v = confirmed_unspent.to_vec();
     let pool = ctx.mempool.read();
     v.retain(|r| !pool.is_outpoint_spent(&OutPoint::new(r.txid, r.vout)));
     let mh = MempoolScriptHash::from_byte_array(h.to_byte_array());
@@ -396,13 +421,17 @@ fn combined_utxos(ctx: &Context, h: ScriptHash) -> Result<Vec<ScriptIndexRecord>
             }
         }
     }
-    Ok(v)
+    v
 }
-fn mempool_activity(ctx: &Context, h: ScriptHash, us: &[ScriptIndexRecord]) -> Vec<Transaction> {
+fn mempool_activity(
+    ctx: &Context,
+    h: ScriptHash,
+    confirmed_unspent: &[ScriptIndexRecord],
+) -> Vec<Transaction> {
     let pool = ctx.mempool.read();
     let mh = MempoolScriptHash::from_byte_array(h.to_byte_array());
     let mut ids = std::collections::BTreeSet::new();
-    let mut ops = us
+    let mut ops = confirmed_unspent
         .iter()
         .map(|r| OutPoint::new(r.txid, r.vout))
         .collect::<std::collections::BTreeSet<_>>();
@@ -446,25 +475,98 @@ fn funded_mempool(h: &[Transaction], s: ScriptHash) -> (u64, u64) {
             (c + 1, v.saturating_add(o.value.to_sat()))
         })
 }
-fn tx_value(ctx: &Context, tx: &Transaction, status: Option<Status>) -> Value {
-    let vin=tx.input.iter().map(|i|{let coinbase=i.previous_output.is_null();json!({"txid":(!coinbase).then(||i.previous_output.txid.to_string()),"vout":(!coinbase).then_some(i.previous_output.vout),"is_coinbase":coinbase,"scriptsig":i.script_sig.as_bytes().to_lower_hex_string(),"scriptsig_asm":i.script_sig.to_asm_string(),"sequence":i.sequence.to_consensus_u32(),"witness":i.witness.iter().map(|w|w.to_lower_hex_string()).collect::<Vec<_>>(),"prevout":(!coinbase).then(||prevout(ctx,&i.previous_output)).flatten()})}).collect::<Vec<_>>();
+fn spent_confirmed(
+    funded_count: u64,
+    funded_sum: u64,
+    confirmed_unspent: &[ScriptIndexRecord],
+) -> (u64, u64) {
+    let unspent_count = u64::try_from(confirmed_unspent.len()).unwrap_or(u64::MAX);
+    let unspent_sum = confirmed_unspent
+        .iter()
+        .fold(0_u64, |sum, output| sum.saturating_add(output.value));
+    (
+        funded_count.saturating_sub(unspent_count),
+        funded_sum.saturating_sub(unspent_sum),
+    )
+}
+fn spent_mempool(
+    transactions: &[Transaction],
+    script_hash: ScriptHash,
+    confirmed_unspent: &[ScriptIndexRecord],
+) -> (u64, u64) {
+    let mut target_outputs = std::collections::BTreeMap::new();
+    for output in confirmed_unspent {
+        target_outputs.insert(OutPoint::new(output.txid, output.vout), output.value);
+    }
+    for transaction in transactions {
+        for (vout, output) in transaction.output.iter().enumerate() {
+            let Ok(vout) = u32::try_from(vout) else {
+                continue;
+            };
+            if ScriptHash::new(&output.script_pubkey) == script_hash {
+                target_outputs.insert(
+                    OutPoint::new(transaction.compute_txid(), vout),
+                    output.value.to_sat(),
+                );
+            }
+        }
+    }
+    transactions
+        .iter()
+        .flat_map(|transaction| &transaction.input)
+        .filter_map(|input| target_outputs.remove(&input.previous_output))
+        .fold((0, 0), |(count, sum), value| {
+            (count + 1, sum.saturating_add(value))
+        })
+}
+fn tx_value(ctx: &Context, tx: &Transaction, status: Option<Status>) -> Result<Value, Response> {
+    let mut input_value = 0_u64;
+    let vin = tx
+        .input
+        .iter()
+        .map(|input| {
+            let coinbase = input.previous_output.is_null();
+            let prevout = if coinbase {
+                None
+            } else {
+                let output = prevout(ctx, &input.previous_output)?
+                    .ok_or_else(|| unavailable("previous transaction unavailable"))?;
+                input_value = input_value.saturating_add(output.value.to_sat());
+                Some(out_value(ctx, &output))
+            };
+            Ok(json!({"txid":(!coinbase).then(||input.previous_output.txid.to_string()),"vout":(!coinbase).then_some(input.previous_output.vout),"is_coinbase":coinbase,"scriptsig":input.script_sig.as_bytes().to_lower_hex_string(),"scriptsig_asm":input.script_sig.to_asm_string(),"sequence":input.sequence.to_consensus_u32(),"witness":input.witness.iter().map(|w|w.to_lower_hex_string()).collect::<Vec<_>>(),"prevout":prevout}))
+        })
+        .collect::<Result<Vec<_>, Response>>()?;
     let out = tx
         .output
         .iter()
         .map(|o| out_value(ctx, o))
         .collect::<Vec<_>>();
-    json!({"txid":tx.compute_txid().to_string(),"version":tx.version.0,"locktime":tx.lock_time.to_consensus_u32(),"size":serialize(tx).len(),"weight":tx.weight().to_wu(),"fee":0,"vin":vin,"vout":out,"status":status_value(status)})
+    let output_value = tx.output.iter().fold(0_u64, |sum, output| {
+        sum.saturating_add(output.value.to_sat())
+    });
+    Ok(
+        json!({"txid":tx.compute_txid().to_string(),"version":tx.version.0,"locktime":tx.lock_time.to_consensus_u32(),"size":serialize(tx).len(),"weight":tx.weight().to_wu(),"fee":input_value.saturating_sub(output_value),"vin":vin,"vout":out,"status":status_value(status)}),
+    )
 }
-fn prevout(ctx: &Context, o: &OutPoint) -> Option<Value> {
-    let tx = ctx
-        .mempool
-        .read()
-        .transaction_by_txid(&o.txid)
-        .map(|t| (*t).clone())
-        .or_else(|| ctx.tx_index.as_ref()?.transaction(&o.txid).ok().flatten())?;
-    tx.output
-        .get(usize::try_from(o.vout).ok()?)
-        .map(|x| out_value(ctx, x))
+fn prevout(ctx: &Context, outpoint: &OutPoint) -> Result<Option<TxOut>, Response> {
+    if let Some(tx) = ctx.mempool.read().transaction_by_txid(&outpoint.txid) {
+        return Ok(tx
+            .output
+            .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+            .cloned());
+    }
+    let index = ctx
+        .esplora_tx_index
+        .as_ref()
+        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
+    let Some(tx) = index.transaction(&outpoint.txid).map_err(query_error)? else {
+        return Ok(None);
+    };
+    Ok(tx
+        .output
+        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+        .cloned())
 }
 fn out_value(ctx: &Context, o: &TxOut) -> Value {
     let s = &o.script_pubkey;
@@ -576,7 +678,53 @@ fn internal(m: &str) -> Response {
 mod tests {
     use alloc::sync::Arc;
 
+    use bitcoin::{Amount, ScriptBuf, TxIn, Witness, absolute, hashes::Hash as _, transaction};
+    use bitcoin_rs_mempool::MempoolEntry;
+
     use super::*;
+
+    fn transaction(input: Option<OutPoint>, output: TxOut) -> Transaction {
+        Transaction {
+            version: transaction::Version(2),
+            lock_time: absolute::LockTime::ZERO,
+            input: input
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![output],
+        }
+    }
+
+    struct StaticTxIndex(Transaction);
+
+    impl crate::context::TxIndexQuery for StaticTxIndex {
+        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+            Ok((self.0.compute_txid() == *txid).then(|| self.0.clone()))
+        }
+
+        fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
+            Ok((self.0.compute_txid() == outpoint.txid)
+                .then(|| {
+                    self.0
+                        .output
+                        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+                })
+                .flatten()
+                .map(|output| output.value.to_sat()))
+        }
+
+        fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
+            Ok(crate::context::TxIndexInfo {
+                synced: true,
+                best_block_height: 0,
+            })
+        }
+    }
 
     #[test]
     fn tip_routes_remain_available_without_script_index() {
@@ -590,5 +738,69 @@ mod tests {
             .status,
             503
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn mempool_spender_of_a_confirmed_target_output_remains_in_activity_and_stats() {
+        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let confirmed = ScriptIndexRecord {
+            txid: Txid::from_byte_array([3; 32]),
+            height: 42,
+            value: 125,
+            vout: 0,
+        };
+        let spending = transaction(
+            Some(OutPoint::new(confirmed.txid, confirmed.vout)),
+            TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+            },
+        );
+        let ctx = Context::new();
+        ctx.mempool
+            .write()
+            .insert_entry(MempoolEntry::new(
+                Arc::new(spending.clone()),
+                100,
+                1_000,
+                0,
+                0,
+            ))
+            .expect("mempool entry accepted");
+
+        let script_hash = ScriptHash::new(&target);
+        let activity = mempool_activity(&ctx, script_hash, &[confirmed]);
+        assert_eq!(activity, vec![spending]);
+        assert!(combined_utxos(&ctx, script_hash, &[confirmed]).is_empty());
+        assert_eq!(
+            spent_mempool(&activity, script_hash, &[confirmed]),
+            (1, 125)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn transaction_projection_uses_internal_lookup_for_prevout_and_fee() {
+        let parent = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(125),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let child = transaction(
+            Some(OutPoint::new(parent.compute_txid(), 0)),
+            TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+            },
+        );
+        let mut ctx = Context::new();
+        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex(parent)));
+
+        let rendered = tx_value(&ctx, &child, None).expect("prevout indexed");
+        assert_eq!(rendered["fee"], json!(25));
+        assert_eq!(rendered["vin"][0]["prevout"]["value"], json!(125));
     }
 }

@@ -776,7 +776,11 @@ where
 
 fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
-        tx_lookup: config.txindex,
+        // ScriptIndex-backed Esplora responses need exact historical
+        // transactions to render prevouts and calculate fees. This is an
+        // internal dependency; `tx_index_query` below still exposes it to Core
+        // RPCs only for an explicit --txindex configuration.
+        tx_lookup: config.txindex || config.script_index,
         script_history: config.script_index,
     }
 }
@@ -1351,6 +1355,18 @@ impl NodeState {
         })
     }
 
+    /// Returns transaction lookup for internal Esplora projections.
+    ///
+    /// `--scriptindex` builds this dependency as well, but that does not
+    /// enable or advertise the Core `--txindex` contract.
+    #[must_use]
+    pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+        self.tx_index_query.as_ref().map(|query| {
+            let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
+            adapter
+        })
+    }
+
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
     pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
@@ -1715,6 +1731,7 @@ mod tests {
 
         assert!(state.apply_handles().tx_index_runtime.is_some());
         assert!(state.tx_index_query().is_none());
+        assert!(state.esplora_tx_index_query().is_some());
         assert!(state.script_index_query().is_some());
         assert!(state.data_dir().join("txindex").exists());
         Ok(())

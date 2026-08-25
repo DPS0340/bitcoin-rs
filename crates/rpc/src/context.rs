@@ -863,6 +863,11 @@ pub struct Context {
     /// Optional node-owned complete transaction-index query adapter.
     /// `None` when transaction indexing is disabled.
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Complete transaction lookup used internally by Esplora projections.
+    ///
+    /// This may be available with `--scriptindex` even when `tx_index` is
+    /// absent, because it does not advertise the Core `--txindex` contract.
+    pub esplora_tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Optional node-owned generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
     /// Network counters and peers.
@@ -942,6 +947,7 @@ impl Context {
             coin_stats,
             filter_index: noop_filter_index(),
             tx_index: None,
+            esplora_tx_index: None,
             script_index: None,
             prune_service: None,
             chain_control: None,
@@ -1002,6 +1008,7 @@ impl Context {
             coin_stats,
             filter_index,
             tx_index,
+            esplora_tx_index: None,
             script_index,
             network,
             chain_network,
@@ -1019,6 +1026,14 @@ impl Context {
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             mining_sender,
         }
+    }
+
+    /// Attaches the internal transaction lookup required for Esplora output
+    /// projections without exposing it to Core transaction-index RPCs.
+    #[must_use]
+    pub fn with_esplora_tx_index(mut self, tx_index: Option<Arc<dyn TxIndexQuery>>) -> Self {
+        self.esplora_tx_index = tx_index;
+        self
     }
 
     /// Returns `self` with a durable block body source.
