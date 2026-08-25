@@ -54,6 +54,11 @@ impl UtxoView for ChainUtxoView {
         self.set.get(&internal)
     }
 }
+/// How stale the applied tip may be while the node still counts as synced.
+///
+/// Bitcoin Core's `DEFAULT_MAX_TIP_AGE`, 24 hours. Core exposes it as
+/// `-maxtipage`; this node has no such option yet, so the default stands.
+const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
 
 /// Block data made available to RPC handlers without forcing storage I/O.
 #[derive(Clone, Debug)]
@@ -66,14 +71,394 @@ pub struct BlockRecord {
     pub block_hex: String,
     /// Serialized block byte length.
     pub body_size: usize,
-    /// Serialized block header bytes as lowercase hex.
-    pub header_hex: String,
+    /// Serialized block header bytes, when the record carries a header.
+    ///
+    /// **The log never carries one.** A record is held for every applied block
+    /// for the life of the process, and the `BlockTree` already holds that
+    /// block's header — so storing it here stored it twice. Every constructor
+    /// leaves this `None`; [`Context::header_record`] is the only thing that
+    /// fills it, from the tree node it resolved, on the way out to a caller.
+    ///
+    /// Boxed rather than inline for the same reason. An `Option<[u8; 80]>`
+    /// costs its full 80 bytes in every record even when it is `None`, so
+    /// leaving the log's records empty would have saved nothing. Boxing makes
+    /// an absent header cost 8 bytes and allocates only where one is actually
+    /// produced, which is once per RPC answer rather than once per block.
+    pub header: Option<Box<[u8; SERIALIZED_BLOCK_HEADER_LEN]>>,
     /// Transaction count in the block.
     pub tx_count: usize,
     /// Block header timestamp (UNIX seconds).
     pub time: u32,
 }
 
+/// The node's block-record log, with the two whole-log sums kept as it changes.
+///
+/// The log holds one record per applied block and grows for the life of the
+/// process — ~963k entries on a mainnet node at the time of writing. Two
+/// RPC-visible figures are sums over all of it: `size_on_disk` in
+/// `getblockchaininfo`, and `txcount` in `getchaintxstats`. Folding the log to
+/// answer them made a call that reports a handful of scalars cost time linear in
+/// chain length, and it was paid **under the log's read lock**, which is the
+/// lock block application takes to append. The sums are maintained here instead.
+///
+/// Deliberately not a `Vec<BlockRecord>` with the totals kept beside it: the log
+/// is appended from `apply`, from `Context::add_block`, and from tests, and a
+/// total that any of those could forget to update is a total that will drift.
+/// Mutation goes through the methods below, so it cannot.
+///
+/// Reads are unchanged. The type derefs to `[BlockRecord]`, so every existing
+/// slice, index, iterator and binary search over the log keeps working.
+#[derive(Clone, Debug, Default)]
+pub struct BlockLog {
+    records: Vec<BlockRecord>,
+    /// Sum of `body_size` over every record.
+    total_body_size: u64,
+    /// `cumulative_tx_count[i]` is the sum of `tx_count` over `records[..=i]`.
+    ///
+    /// A single running total would answer `txcount` only when the applied tip
+    /// is the log's last record, and would fall back to walking everything above
+    /// it otherwise — a cliff, not a bound. Prefix sums answer any prefix in
+    /// constant time, so the cost no longer depends on where the applied tip
+    /// sits relative to the log. Eight bytes per record, ~7.7 MB at a mainnet
+    /// tip, against ~254 MB the records themselves occupy.
+    cumulative_tx_count: Vec<u64>,
+}
+
+impl BlockLog {
+    /// Creates an empty log.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            total_body_size: 0,
+            cumulative_tx_count: Vec::new(),
+        }
+    }
+
+    /// Appends a record, extending the running body-size sum and the prefix sums.
+    pub fn push(&mut self, record: BlockRecord) {
+        self.total_body_size = self
+            .total_body_size
+            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
+        // Read the last prefix directly rather than through `total_tx_count`:
+        // that one carries a `debug_assert` which folds the log, and paying it
+        // per append would make block application quadratic in debug builds.
+        let running = self
+            .cumulative_tx_count
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
+        self.cumulative_tx_count.push(running);
+        self.records.push(record);
+    }
+
+    /// Removes the last record, taking it back out of both.
+    ///
+    /// This is the disconnect path: a reorg pops the tip's record after checking
+    /// it is the one being disconnected.
+    pub fn pop(&mut self) -> Option<BlockRecord> {
+        let record = self.records.pop()?;
+        let _ = self.cumulative_tx_count.pop();
+        self.total_body_size = self
+            .total_body_size
+            .saturating_sub(u64::try_from(record.body_size).unwrap_or(u64::MAX));
+        Some(record)
+    }
+
+    /// Empties the log.
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.cumulative_tx_count.clear();
+        self.total_body_size = 0;
+    }
+
+    /// Reserves capacity for `additional` more records.
+    pub fn reserve(&mut self, additional: usize) {
+        self.records.reserve(additional);
+        self.cumulative_tx_count.reserve(additional);
+    }
+
+    /// Mutable access to the records, for fields the running sums do not cover.
+    ///
+    /// Pruning uses this to release cached block bodies. `body_size` and
+    /// `tx_count` describe the block and do not change when its body is dropped,
+    /// so the sums stay correct — and `debug_assert`s in [`Self::size_on_disk`]
+    /// and [`Self::tx_count_before`] fail loudly if a caller ever changes them.
+    pub fn records_mut(&mut self) -> impl Iterator<Item = &mut BlockRecord> {
+        self.records.iter_mut()
+    }
+
+    /// Sum of every record's serialized block length, in bytes.
+    ///
+    /// This is `getblockchaininfo`'s `size_on_disk`. It counts the block sizes
+    /// the node has recorded, which is what the fold it replaced counted;
+    /// pruning does not remove records, so a pruned node still reports the bytes
+    /// its blocks would occupy.
+    #[must_use]
+    pub fn size_on_disk(&self) -> u64 {
+        debug_assert_eq!(
+            self.total_body_size,
+            self.records.iter().fold(0_u64, |total, record| total
+                .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX))),
+            "running body-size total drifted from the records it summarizes"
+        );
+        self.total_body_size
+    }
+
+    /// Sum of `tx_count` over the first `count` records.
+    ///
+    /// `count` is clamped to the log's length, so a caller that computed a
+    /// boundary against a longer log gets the whole sum rather than a panic.
+    #[must_use]
+    pub fn tx_count_before(&self, count: usize) -> u64 {
+        // The prefix vector is parallel to the records. Stating it here rather
+        // than relying on the clamp below is the difference between a mutation
+        // that drops a `pop` dying on the invariant it broke and dying on an
+        // out-of-range read further along.
+        debug_assert_eq!(
+            self.records.len(),
+            self.cumulative_tx_count.len(),
+            "the tx-count prefix vector is no longer parallel to the records"
+        );
+        let count = count.min(self.records.len());
+        let prefix = count
+            .checked_sub(1)
+            .and_then(|last| self.cumulative_tx_count.get(last).copied())
+            .unwrap_or(0);
+        debug_assert_eq!(
+            prefix,
+            self.records[..count]
+                .iter()
+                .fold(0_u64, |total, record| total
+                    .saturating_add(u64::try_from(record.tx_count).unwrap_or(0))),
+            "tx-count prefix sums drifted from the records they summarize"
+        );
+        prefix
+    }
+
+    /// Sum of every record's transaction count.
+    #[must_use]
+    pub fn total_tx_count(&self) -> u64 {
+        self.tx_count_before(self.cumulative_tx_count.len())
+    }
+}
+
+impl core::ops::Deref for BlockLog {
+    type Target = [BlockRecord];
+
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}
+
+impl FromIterator<BlockRecord> for BlockLog {
+    fn from_iter<I: IntoIterator<Item = BlockRecord>>(iter: I) -> Self {
+        let mut log = Self::new();
+        for record in iter {
+            log.push(record);
+        }
+        log
+    }
+}
+
+/// `getchaintxstats`'s figures, read from the log without walking all of it.
+///
+/// The log is appended in height order and only ever popped from the tail
+/// (`apply::disconnect_block` checks the tail's hash before popping), so it is
+/// non-decreasing by height. `Context::block_at_height` already relies on that
+/// and binary-searches it; this reads the same three boundaries out of it:
+///
+/// - `end`: one past the last record at or below the applied tip.
+/// - `tip_start`: the *first* record at the applied height. Duplicate heights
+///   are possible across a reorg, and the fold this replaces took the first one.
+/// - `window_start`: the first record inside the requested window.
+///
+/// Both transaction counts are differences of prefix sums across those
+/// boundaries, so neither depends on where the applied tip sits in the log.
+///
+/// Only the window is then walked, and only for `earliest_window_time`: it is a
+/// minimum over block timestamps, which are not monotonic, so no prefix sum can
+/// answer it. The window is the caller's `nblocks` (~4,320 by default), not the
+/// chain.
+///
+/// [`fold_block_records`] is the implementation this replaced, kept as
+/// the oracle `chain_stats_matches_the_fold_it_replaced` compares against.
+#[must_use]
+pub fn chain_stats(log: &BlockLog, applied_height: u32, lowest_window_height: u64) -> ChainStats {
+    let blocks: &[BlockRecord] = log;
+    debug_assert!(
+        blocks
+            .windows(2)
+            .all(|pair| pair[0].height <= pair[1].height),
+        "the block log must be non-decreasing by height for these searches"
+    );
+
+    let end = blocks.partition_point(|record| record.height <= applied_height);
+    let applied = &blocks[..end];
+
+    let tip_start = applied.partition_point(|record| record.height < applied_height);
+    let tip_time = applied
+        .get(tip_start)
+        .filter(|record| record.height == applied_height)
+        .map(|record| record.time);
+
+    let window_start =
+        applied.partition_point(|record| u64::from(record.height) < lowest_window_height);
+    let mut earliest_window_time: Option<u32> = None;
+    for record in &applied[window_start..] {
+        earliest_window_time =
+            Some(earliest_window_time.map_or(record.time, |earliest| earliest.min(record.time)));
+    }
+    let total_tx_count = log.tx_count_before(end);
+    let window_tx_count = total_tx_count.saturating_sub(log.tx_count_before(window_start));
+
+    ChainStats {
+        total_tx_count,
+        window_tx_count,
+        tip_time,
+        earliest_window_time,
+    }
+}
+
+/// The figures `getchaintxstats` reports, read from a [`BlockLog`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChainStats {
+    /// Sum of `tx_count` over records at or below the applied tip.
+    pub total_tx_count: u64,
+    /// Sum of `tx_count` over records inside the requested window.
+    pub window_tx_count: u64,
+    /// Timestamp of the first record at the applied height.
+    pub tip_time: Option<u32>,
+    /// Lowest timestamp inside the requested window.
+    pub earliest_window_time: Option<u32>,
+}
+
+/// What a whole-log fold produced for the chain-info RPCs.
+///
+/// See [`fold_block_records`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FoldedBlockRecords {
+    /// Sum of `body_size` over every record.
+    pub size_on_disk: u64,
+    /// Sum of `tx_count` over records at or below the applied tip.
+    pub total_tx_count: u64,
+    /// Sum of `tx_count` over records inside the requested window.
+    pub window_tx_count: u64,
+    /// Timestamp of the first record at the applied height.
+    pub tip_time: Option<u32>,
+    /// Lowest timestamp inside the requested window.
+    pub earliest_window_time: Option<u32>,
+}
+
+/// The whole-log fold `getblockchaininfo` and `getchaintxstats` used to run.
+///
+/// Retained deliberately, not left behind. It is the oracle the equivalence
+/// tests compare [`BlockLog`]'s running sums and the windowed search against,
+/// and the `before` arm of `benches/chaininfo.rs` — both arms have to run in one
+/// process over one fixture for the ratio to mean anything, which they cannot do
+/// if this is deleted.
+///
+/// Nothing in the node calls it. It walks every record the node holds, which is
+/// the entire reason it was replaced.
+///
+/// It makes no assumption about the log's ordering, which is the point: the
+/// replacement binary-searches, and an oracle that shared that assumption could
+/// not catch it being wrong.
+#[must_use]
+pub fn fold_block_records(
+    blocks: &[BlockRecord],
+    applied_height: u32,
+    lowest_window_height: Option<u64>,
+) -> FoldedBlockRecords {
+    let mut stats = FoldedBlockRecords::default();
+    for record in blocks {
+        stats.size_on_disk = stats
+            .size_on_disk
+            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
+        if record.height > applied_height {
+            continue;
+        }
+        stats.total_tx_count = stats
+            .total_tx_count
+            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
+        if record.height == applied_height && stats.tip_time.is_none() {
+            stats.tip_time = Some(record.time);
+        }
+        if lowest_window_height.is_some_and(|lowest| u64::from(record.height) >= lowest) {
+            stats.window_tx_count = stats
+                .window_tx_count
+                .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
+            stats.earliest_window_time = Some(
+                stats
+                    .earliest_window_time
+                    .map_or(record.time, |earliest| earliest.min(record.time)),
+            );
+        }
+    }
+    stats
+}
+
+/// Finds the record at `height`, or `None` when the log holds no such height.
+///
+/// The log is append-only in height order — `Context::add_block` pushes, and the
+/// only removal is the tail `pop` a disconnect performs on the applied tip — so
+/// it is non-decreasing by height and binary-searchable. Where several records
+/// share a height, this returns the first.
+///
+/// The direct index is tried first because the log is usually dense from height
+/// zero, which makes the common case one bounds check instead of a search. The
+/// guard on the preceding record is what keeps that fast path honest when it is
+/// not dense.
+#[must_use]
+pub fn record_at_height(records: &[BlockRecord], height: u32) -> Option<&BlockRecord> {
+    if let Ok(index) = usize::try_from(height)
+        && let Some(record) = records.get(index)
+        && record.height == height
+        && index
+            .checked_sub(1)
+            .and_then(|previous| records.get(previous))
+            .is_none_or(|previous| previous.height < height)
+    {
+        return Some(record);
+    }
+
+    let mut index = records
+        .binary_search_by_key(&height, |record| record.height)
+        .ok()?;
+    while index > 0 && records[index.saturating_sub(1)].height == height {
+        index = index.saturating_sub(1);
+    }
+    records.get(index)
+}
+
+/// Finds the record with both `height` and `hash`, or `None`.
+///
+/// Several records can share a height — a reorg leaves the losing block in the
+/// log beside the winner — so the binary search lands anywhere in that run and
+/// this walks it in both directions before comparing hashes. Returning the first
+/// record at the height without checking the hash would hand back the wrong
+/// block on exactly the chain shape this exists to handle.
+#[must_use]
+pub fn record_at_height_hash(
+    records: &[BlockRecord],
+    height: u32,
+    hash: Hash256,
+) -> Option<&BlockRecord> {
+    let mut index = records
+        .binary_search_by_key(&height, |record| record.height)
+        .ok()?;
+    while index > 0 && records[index.saturating_sub(1)].height == height {
+        index = index.saturating_sub(1);
+    }
+    while index < records.len() && records[index].height == height {
+        if records[index].hash == hash {
+            return Some(&records[index]);
+        }
+        index += 1;
+    }
+    None
+}
 /// Block payload facts available without materializing a full block body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockBodyMetadata {
@@ -91,6 +476,22 @@ pub trait BlockBodySource: Send + Sync {
     /// Returns indexed body facts. Implementations that cannot answer without
     /// I/O may leave this absent; header-only callers then remain header-only.
     fn block_body_metadata(&self, _height: u32, _hash: Hash256) -> Option<BlockBodyMetadata> {
+        None
+    }
+
+    /// Bytes this source's block storage currently occupies on disk.
+    ///
+    /// This is `getblockchaininfo`'s `size_on_disk`, and it has to come from
+    /// whatever owns the bytes. The block-record log can only offer the sum of
+    /// the block sizes it has seen, which is a different number: records outlive
+    /// the bodies they describe, so that sum keeps counting bytes pruning has
+    /// already deleted — under a field name that is read to check whether
+    /// pruning is working.
+    ///
+    /// `None` means "this source does not know", and the caller falls back to
+    /// that sum. A source with no durable storage behind it — a test fixture, a
+    /// cache-only context — has nothing better to say.
+    fn disk_usage(&self) -> Option<u64> {
         None
     }
 
@@ -130,14 +531,15 @@ impl BlockRecord {
     pub fn from_block_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
         let block_hash = block.block_hash();
         let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let header_hex = header_hex_from_block_bytes(block, block_bytes);
         let block_hex = block_bytes.to_lower_hex_string();
         Self {
             hash,
             height,
             block_hex,
             body_size: block_bytes.len(),
-            header_hex,
+            // Not stored: the block tree holds this block's header, and
+            // `Context::header_record` supplies it on the way out.
+            header: None,
             tx_count: block.txdata.len(),
             time: block.header.time,
         }
@@ -155,13 +557,13 @@ impl BlockRecord {
     pub fn from_block_metadata_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
         let block_hash = block.block_hash();
         let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let header_hex = header_hex_from_block_bytes(block, block_bytes);
         Self {
             hash,
             height,
             block_hex: String::new(),
             body_size: block_bytes.len(),
-            header_hex,
+            // See `from_block_bytes`.
+            header: None,
             tx_count: block.txdata.len(),
             time: block.header.time,
         }
@@ -175,18 +577,33 @@ impl BlockRecord {
             height,
             block_hex: String::new(),
             body_size: 0,
-            header_hex: String::new(),
+            header: None,
             tx_count: 0,
             time: 0,
         }
     }
-}
 
-fn header_hex_from_block_bytes(block: &Block, block_bytes: &[u8]) -> String {
-    block_bytes.get(..SERIALIZED_BLOCK_HEADER_LEN).map_or_else(
-        || serialize(&block.header).to_lower_hex_string(),
-        DisplayHex::to_lower_hex_string,
-    )
+    /// The serialized block header, when the record carries one.
+    ///
+    /// A record read straight out of the log never does. One resolved through
+    /// [`Context::record_for_hash`] does, because that fills it from the block
+    /// tree.
+    #[must_use]
+    pub fn header_bytes(&self) -> Option<&[u8; SERIALIZED_BLOCK_HEADER_LEN]> {
+        self.header.as_deref()
+    }
+
+    /// The serialized block header as lowercase hex, empty when absent.
+    ///
+    /// Encoded on demand. The record is stored for every block for the life of
+    /// the process; this is read by one RPC call, and the other two readers want
+    /// the bytes back anyway.
+    #[must_use]
+    pub fn header_hex(&self) -> String {
+        self.header
+            .as_ref()
+            .map_or_else(String::new, |bytes| bytes.to_lower_hex_string())
+    }
 }
 
 /// Network counters and peer metadata exposed by network RPCs.
@@ -362,6 +779,16 @@ pub trait TxIndexQuery: Send + Sync {
     fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError>;
     /// Resolves a confirmed prevout value, returning `None` only after complete absence is proven.
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError>;
+    /// Resolves the height of the block confirming `txid`, without materializing the transaction.
+    ///
+    /// Callers that only need to locate the block — `gettxoutproof` is the one —
+    /// would otherwise deserialize a transaction and throw it away. The default
+    /// answers `None`, which every caller must already handle as "the index
+    /// cannot say", so an implementor that does not track heights keeps working.
+    fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+        let _ = txid;
+        Ok(None)
+    }
     /// Returns the transaction index's actual durable progress.
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
@@ -390,10 +817,27 @@ pub struct Context {
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Best-applied-block tip snapshot published after block application.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Cumulative transaction count of the applied chain, `0` when unknown.
+    ///
+    /// Maintained by block application and restored from the chainstate
+    /// checkpoint, so it survives a restart. Read through
+    /// [`Self::chain_tx_count`], which turns Bitcoin Core's zero-means-unset
+    /// encoding into an `Option`.
+    chain_tx_count: Arc<core::sync::atomic::AtomicU64>,
+    /// Whether this node has ever observed itself to be out of initial block
+    /// download. Once set it is never cleared.
+    ///
+    /// Bitcoin Core latches the same way (`m_cached_is_ibd`, cleared once by
+    /// `UpdateIBDStatus` and never set again) and logs "Leaving
+    /// `InitialBlockDownload (latching to false)`" when it happens. Without the
+    /// latch the answer oscillates: a synced node that has not seen a block for
+    /// longer than the tip-age window would announce that it is back in initial
+    /// sync, and callers treat that as "do not trust this node's data yet".
+    left_initial_block_download: Arc<core::sync::atomic::AtomicBool>,
     /// In-memory mempool handle.
     pub mempool: Arc<RwLock<Mempool>>,
     /// Block records already available without blocking storage readers.
-    pub blocks: Arc<RwLock<Vec<BlockRecord>>>,
+    pub blocks: Arc<RwLock<BlockLog>>,
     /// Raw transactions indexed by txid for Core transaction RPCs.
     pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     /// UTXO set snapshot handle used by chain metadata RPCs.
@@ -477,8 +921,10 @@ impl Context {
         Self {
             chain_tip: Arc::new(ArcSwapOption::empty()),
             applied_tip: Arc::new(ArcSwapOption::empty()),
+            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            blocks: Arc::new(RwLock::new(Vec::new())),
+            blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
             coin_stats,
@@ -513,7 +959,7 @@ impl Context {
         chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
         mempool: Arc<RwLock<Mempool>>,
-        blocks: Arc<RwLock<Vec<BlockRecord>>>,
+        blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
         coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
@@ -533,6 +979,8 @@ impl Context {
         Self {
             chain_tip,
             applied_tip,
+            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             mempool,
             blocks,
             transactions,
@@ -662,9 +1110,10 @@ impl Context {
         &self,
         tx: Transaction,
         now: u64,
+        max_fee: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        let accept_ctx = self.accept_context(now);
+        let accept_ctx = self.accept_context(now, max_fee);
         let result = {
             let mut pool = self.mempool.write();
             accept_to_mempool(&mut pool, tx, &chain, &accept_ctx)?
@@ -686,12 +1135,14 @@ impl Context {
         now: u64,
     ) -> Result<AcceptChecks, AcceptError> {
         let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        let accept_ctx = self.accept_context(now);
+        // No ceiling: this reports what acceptance would decide, and a fee the
+        // submitter would have capped is still a fee the network would accept.
+        let accept_ctx = self.accept_context(now, None);
         let pool = self.mempool.read();
         check_acceptance(&pool, tx, &chain, &accept_ctx)
     }
 
-    fn accept_context(&self, now: u64) -> AcceptContext {
+    fn accept_context(&self, now: u64, max_fee: Option<u64>) -> AcceptContext {
         AcceptContext {
             // The next block's height: a transaction entering the mempool is a
             // candidate for the block being built, not for the tip.
@@ -704,6 +1155,7 @@ impl Context {
             },
             // Core's `-acceptnonstdtxn`, which it permits only on regtest.
             require_standard: self.chain_network != Network::Regtest,
+            max_fee,
         }
     }
 
@@ -725,6 +1177,83 @@ impl Context {
     #[must_use]
     pub fn applied_height(&self) -> u32 {
         self.applied_tip.load_full().map_or(0, |tip| tip.height)
+    }
+
+    /// Returns `self` sharing `handle` as the cumulative chain transaction count.
+    ///
+    /// The node owns the counter; the RPC surface only reads it.
+    #[must_use]
+    pub fn with_chain_tx_count(mut self, handle: Arc<core::sync::atomic::AtomicU64>) -> Self {
+        self.chain_tx_count = handle;
+        self
+    }
+
+    /// Returns the cumulative transaction count of the applied chain, or `None`
+    /// when this node cannot know it.
+    ///
+    /// This is Bitcoin Core's `CBlockIndex::m_chain_tx_count`, and `None` is its
+    /// `HaveNumChainTxs() == false`: a chain whose history was applied before
+    /// the node tracked the count cannot recover it without re-reading every
+    /// block body. Callers must treat `None` as *unknown*, never as zero — the
+    /// two differ by an entire chain.
+    #[must_use]
+    pub fn chain_tx_count(&self) -> Option<u64> {
+        match self
+            .chain_tx_count
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            count => Some(count),
+        }
+    }
+
+    /// Answers Bitcoin Core's `IsInitialBlockDownload()` for the applied tip.
+    ///
+    /// A node has left initial block download once its applied tip has at least
+    /// the network's `nMinimumChainWork` **and** carries a timestamp no older
+    /// than `max_tip_age` (Core's 24-hour default). Both are required: work
+    /// alone would trust a stale chain, and recency alone would trust a cheap
+    /// one that simply claims a recent timestamp.
+    ///
+    /// The answer latches. Once this returns `false` it returns `false` for the
+    /// life of the process, exactly as Core's `m_cached_is_ibd` does, so a
+    /// synced node that goes an hour without a block does not announce that it
+    /// is resyncing.
+    ///
+    /// `now` is UNIX seconds, taken by the caller so the decision itself stays a
+    /// pure function of observable state.
+    #[must_use]
+    pub fn is_initial_block_download(&self, now: u64) -> bool {
+        use core::sync::atomic::Ordering;
+
+        if self.left_initial_block_download.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(tip) = self.applied_tip.load_full() else {
+            return true;
+        };
+        // Big-endian, fixed width: byte order is numeric order.
+        let work: [u8; 32] = tip.chainwork.to_be_bytes();
+        if work < self.chain_network.minimum_chain_work() {
+            return true;
+        }
+        // `TipSnapshot` carries no timestamp, so the tip's header supplies it —
+        // the same route `getdifficulty` takes to the tip's `bits`.
+        let Some(tip_time) = self
+            .block_tree
+            .read()
+            .node(tip.tip_id)
+            .ok()
+            .map(|node| node.header.time)
+        else {
+            return true;
+        };
+        if u64::from(tip_time) < now.saturating_sub(MAX_TIP_AGE_SECONDS) {
+            return true;
+        }
+        self.left_initial_block_download
+            .store(true, Ordering::Relaxed);
+        false
     }
 
     /// Returns the current best-applied-block hash.
@@ -788,7 +1317,10 @@ impl Context {
             height: node.height,
             block_hex: String::new(),
             body_size: 0,
-            header_hex: serialize(&node.header).to_lower_hex_string(),
+            // The one place a header is produced. Every constructor leaves the
+            // field empty, so the tree node reached here is the single source of
+            // truth for what a block's header is.
+            header: serialize(&node.header).try_into().ok().map(Box::new),
             tx_count: 0,
             time: node.header.time,
         })
@@ -809,13 +1341,21 @@ impl Context {
         //    identity wins; enrich with a height-matched cached payload, else
         //    with durable body metadata.
         if let Some(mut record) = self.header_record(hash) {
-            if let Some(cached) = self
-                .blocks
-                .read()
-                .iter()
-                .find(|candidate| candidate.hash == hash && candidate.height == record.height)
-            {
-                return Some(cached.clone());
+            // The tree already gave us the height, so this is a binary search
+            // over a height-ordered log rather than a walk of every record on
+            // the chain. `getblock` and `getblockheader` both land here.
+            if let Some(cached) = record_at_height_hash(&self.blocks.read(), record.height, hash) {
+                // The cached record supplies the payload facts — body hex, size,
+                // transaction count — and the tree supplies the header, because
+                // the log does not store one. Returning the cached record as it
+                // stands would answer with no header at all.
+                //
+                // Costs no extra lock: `header_record` has already taken and
+                // released the tree guard, and the header it produced outlives
+                // it.
+                let mut cached = cached.clone();
+                cached.header = record.header.take();
+                return Some(cached);
             }
             if let Some(metadata) = self
                 .block_body_source
@@ -830,6 +1370,10 @@ impl Context {
         // 2. Legacy/cache-only fallback. The tree cannot resolve this identity,
         //    so accept a vector record by exact hash. Metadata-only records and
         //    pruned-body payloads pass through unchanged via their own fields.
+        //
+        //    This one stays linear on purpose: without the tree there is no
+        //    height to search on, and a hash-keyed index would have to be kept
+        //    for every block to serve a path that only legacy state reaches.
         self.blocks
             .read()
             .iter()
@@ -855,11 +1399,7 @@ impl Context {
                     .as_byte_array(),
             ));
         }
-        self.blocks
-            .read()
-            .iter()
-            .find(|candidate| candidate.height == height)
-            .map(|candidate| candidate.hash)
+        record_at_height(&self.blocks.read(), height).map(|candidate| candidate.hash)
     }
 
     /// Returns a known block by hash.
@@ -878,11 +1418,7 @@ impl Context {
             let hash = self.hash_at_height_from_tip(&tip, height)?;
             return self.record_for_hash(hash);
         }
-        self.blocks
-            .read()
-            .iter()
-            .find(|candidate| candidate.height == height)
-            .cloned()
+        record_at_height(&self.blocks.read(), height).cloned()
     }
 
     /// Returns serialized block bytes from the record or durable storage.
@@ -894,6 +1430,14 @@ impl Context {
         self.block_body_source
             .as_ref()?
             .block_body(record.height, record.hash)
+    }
+
+    /// Bytes the node's block storage occupies on disk, when it can say.
+    ///
+    /// `None` when there is no durable body source, or it does not track usage.
+    #[must_use]
+    pub fn block_storage_disk_usage(&self) -> Option<u64> {
+        self.block_body_source.as_ref()?.disk_usage()
     }
 
     /// Returns lowercase serialized block hex from the record or durable storage.
@@ -961,6 +1505,203 @@ fn bitcoin_network(network: Network) -> bitcoin::Network {
 mod tests {
     use super::*;
 
+    /// A log whose heights are non-decreasing but not a clean `0..n`.
+    ///
+    /// Height 3 is recorded three times, as two reorgs leave it; the log starts
+    /// at height 1, as a restored or pruned log may; and heights 6 and 7 are
+    /// missing. All three break the "record for height `h` is at index `h`"
+    /// assumption the direct-index fast path tries first.
+    ///
+    /// The starting height is load-bearing. With the log starting at zero, index
+    /// 3 holds the *first* record at height 3, so a fast path that skipped the
+    /// "is the predecessor lower?" guard would answer correctly anyway. Starting
+    /// at one puts a duplicate at index 3 and the run head at index 2, which is
+    /// where the two disagree.
+    fn shaped_records() -> Vec<BlockRecord> {
+        const HEIGHTS: [u32; 8] = [1, 2, 3, 3, 3, 4, 8, 9];
+        HEIGHTS
+            .into_iter()
+            .enumerate()
+            .map(|(index, height)| {
+                let mut hash = [0_u8; 32];
+                // Distinct per record, not per height: the duplicates have to be
+                // distinguishable by hash or the walk has nothing to walk.
+                hash[0] = u8::try_from(index).unwrap_or(0);
+                let mut record = BlockRecord::synthetic(height, Hash256::from_le_bytes(&hash));
+                record.time = 1_000 + u32::try_from(index).unwrap_or(0);
+                record
+            })
+            .collect()
+    }
+
+    /// The search must land on exactly what the scan it replaced found.
+    ///
+    /// `record_for_hash` had the height from the block tree and scanned the log
+    /// for the matching pair anyway. The scan made no assumption about ordering;
+    /// the search assumes the log is non-decreasing by height. This holds the
+    /// search to the scan over every height in and around the fixture, and over
+    /// every hash in it — including hashes at the wrong height, which must find
+    /// nothing.
+    ///
+    /// A sweep rather than a chosen pair: a search is wrong at its boundaries,
+    /// and a test that picks one pair picks whether it visits them.
+    #[test]
+    fn record_at_height_hash_matches_the_scan_it_replaced() {
+        let records = shaped_records();
+        let hashes = records.iter().map(|record| record.hash).collect::<Vec<_>>();
+
+        for height in 0_u32..12 {
+            for hash in &hashes {
+                let scanned = records
+                    .iter()
+                    .find(|candidate| candidate.hash == *hash && candidate.height == height);
+                assert_eq!(
+                    record_at_height_hash(&records, height, *hash).map(|r| r.time),
+                    scanned.map(|r| r.time),
+                    "search and scan disagree at height {height}"
+                );
+            }
+        }
+    }
+
+    /// The same for the height-only lookup, which has to return the *first*
+    /// record at a duplicated height because that is what the scan returned.
+    #[test]
+    fn record_at_height_matches_the_scan_it_replaced() {
+        let records = shaped_records();
+        for height in 0_u32..12 {
+            let scanned = records.iter().find(|candidate| candidate.height == height);
+            assert_eq!(
+                record_at_height(&records, height).map(|r| r.time),
+                scanned.map(|r| r.time),
+                "search and scan disagree at height {height}"
+            );
+        }
+    }
+
+    /// Every record at a duplicated height must be reachable by its own hash.
+    ///
+    /// A search that stopped at the run's first record would answer `None` for
+    /// the others, turning `getblock` on a stale branch into "block not found".
+    #[test]
+    fn every_record_at_a_duplicated_height_is_reachable() {
+        let records = shaped_records();
+        let duplicates = records
+            .iter()
+            .filter(|record| record.height == 3)
+            .map(|record| (record.hash, record.time))
+            .collect::<Vec<_>>();
+        assert_eq!(duplicates.len(), 3, "the fixture must duplicate height 3");
+
+        for (hash, time) in duplicates {
+            assert_eq!(
+                record_at_height_hash(&records, 3, hash).map(|r| r.time),
+                Some(time),
+                "a record at a duplicated height was not reachable by its hash"
+            );
+        }
+    }
+
+    /// `block_by_height` with no applied tip reads the log directly.
+    ///
+    /// That fallback used to scan for the first record at the height and now
+    /// searches for it. It is the path a Context takes before the first tip is
+    /// published, and nothing covered it: a mutation replacing it with "the last
+    /// record in the log" stayed green.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn block_by_height_without_an_applied_tip_reads_the_log() {
+        let ctx = Context::new();
+        for record in shaped_records() {
+            ctx.add_block(record);
+        }
+
+        for height in 0_u32..12 {
+            let expected = shaped_records()
+                .into_iter()
+                .find(|candidate| candidate.height == height)
+                .map(|record| record.hash);
+            assert_eq!(
+                ctx.block_by_height(height).map(|record| record.hash),
+                expected,
+                "block_by_height disagrees with the log at height {height}"
+            );
+        }
+    }
+
+    /// A reorg leaves the losing block in the log beside the winner, so a height
+    /// can address two records. The binary search lands anywhere in that run,
+    /// which is why the lookup walks it and compares hashes; returning the first
+    /// record at the height would hand back the wrong block on exactly the shape
+    /// this exists for.
+    #[test]
+    fn record_at_height_hash_picks_the_matching_hash_within_a_duplicate_height() {
+        let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
+        let second = Hash256::from_le_bytes(&[0x22_u8; 32]);
+        let records = vec![
+            BlockRecord::synthetic(0, Hash256::from_le_bytes(&[0x00_u8; 32])),
+            BlockRecord::synthetic(1, first),
+            BlockRecord::synthetic(1, second),
+            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+        ];
+
+        assert_eq!(
+            record_at_height_hash(&records, 1, second).map(|record| record.hash),
+            Some(second),
+            "the second record at the height must be reachable, not just the first"
+        );
+        assert_eq!(
+            record_at_height_hash(&records, 1, first).map(|record| record.hash),
+            Some(first)
+        );
+        assert!(
+            record_at_height_hash(&records, 1, Hash256::from_le_bytes(&[0x99_u8; 32])).is_none(),
+            "a hash absent from the height run must not resolve to a sibling"
+        );
+    }
+
+    /// Heights `[1, 1, 2]` are chosen so the dense fast path indexes straight
+    /// onto the *second* of the duplicates: `records[1]` has height 1, so the
+    /// height check alone would accept it. Only the guard on the preceding
+    /// record rejects it and sends the lookup to the search that finds the run
+    /// start. A log starting at height 0 never exercises that, which is how an
+    /// earlier version of this test passed while the guard was removed.
+    #[test]
+    fn record_at_height_returns_the_first_record_of_a_duplicate_height() {
+        let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
+        let records = vec![
+            BlockRecord::synthetic(1, first),
+            BlockRecord::synthetic(1, Hash256::from_le_bytes(&[0x22_u8; 32])),
+            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+        ];
+
+        assert_eq!(
+            record_at_height(&records, 1).map(|record| record.hash),
+            Some(first),
+            "the dense index lands on the second duplicate; the first must win"
+        );
+        assert!(record_at_height(&records, 7).is_none());
+    }
+
+    /// The dense fast path indexes straight into the log. It must not fire when
+    /// the log does not start at height zero, or it would answer with whatever
+    /// record happens to sit at that index.
+    #[test]
+    fn record_at_height_does_not_trust_the_index_on_a_sparse_log() {
+        let wanted = Hash256::from_le_bytes(&[0x44_u8; 32]);
+        let records = vec![
+            BlockRecord::synthetic(10, Hash256::from_le_bytes(&[0x0a_u8; 32])),
+            BlockRecord::synthetic(11, wanted),
+            BlockRecord::synthetic(12, Hash256::from_le_bytes(&[0x0c_u8; 32])),
+        ];
+
+        assert_eq!(
+            record_at_height(&records, 11).map(|record| record.hash),
+            Some(wanted),
+            "a log that does not start at zero must still resolve by search"
+        );
+        assert!(record_at_height(&records, 1).is_none());
+    }
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn from_handles_shares_tip_handles_with_caller() {
@@ -980,7 +1721,7 @@ mod tests {
             Arc::clone(&chain_tip),
             Arc::clone(&applied_tip),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::clone(&utxo),
             Arc::clone(&coin_stats),
@@ -1066,7 +1807,7 @@ mod tests {
         assert_eq!(from_bytes.height, from_block.height);
         assert_eq!(from_bytes.block_hex, from_block.block_hex);
         assert_eq!(from_bytes.body_size, from_block.body_size);
-        assert_eq!(from_bytes.header_hex, from_block.header_hex);
+        assert_eq!(from_bytes.header, from_block.header);
         assert_eq!(from_bytes.tx_count, from_block.tx_count);
         assert_eq!(from_bytes.time, from_block.time);
     }
@@ -1109,6 +1850,159 @@ mod tests {
         );
     }
 
+    /// Pins the cost this change exists to remove.
+    ///
+    /// One `BlockRecord` is held per applied block for the life of the process
+    /// and nothing removes one, so the record's own footprint *is* the cost.
+    ///
+    /// The field was 104 bytes inline plus a 160-byte heap `String` of hex —
+    /// 264 bytes and an allocation per block. Storing the raw header inline took
+    /// that to 168 with no allocation. Not storing it at all takes it to **88**:
+    /// a further **80 bytes per block**, about **73.5 MiB** at a mainnet-sized
+    /// chain, on top of the 88 MiB the inline change saved.
+    ///
+    /// The boxing is what buys those 80 bytes and is easy to undo by accident.
+    /// An `Option<[u8; 80]>` costs its full width in every record even when it
+    /// is `None`, so emptying the log's records would have saved nothing at all.
+    /// This test is here so that reverting the box fails loudly.
+    #[test]
+    fn a_record_costs_88_bytes_and_carries_no_header() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+
+        assert_eq!(
+            core::mem::size_of::<BlockRecord>(),
+            88,
+            "BlockRecord footprint changed; re-measure the per-block saving"
+        );
+        for record in [
+            BlockRecord::from_block(0, &block),
+            BlockRecord::from_block_metadata(0, &block),
+            BlockRecord::synthetic(0, Hash256::default()),
+        ] {
+            assert!(
+                record.header_bytes().is_none(),
+                "a constructed record must not carry a header; the tree holds it"
+            );
+        }
+    }
+
+    /// The hex a caller sees must be byte-identical to what the stored `String`
+    /// used to hold; only where it is produced changed.
+    ///
+    /// Read through a resolved record now, because that is where a header comes
+    /// from: the tree, via `record_for_hash`. A record built straight from a
+    /// block has none.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let ctx = Arc::new(Context::new());
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
+        }
+        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let Some(record) = ctx.record_for_hash(hash) else {
+            panic!("the tree knows this hash");
+        };
+
+        assert_eq!(
+            record.header_hex(),
+            serialize(&block.header).to_lower_hex_string()
+        );
+        assert_eq!(record.header_hex().len(), SERIALIZED_BLOCK_HEADER_LEN * 2);
+    }
+
+    /// The tree's header must reach a caller even when the log has the block.
+    ///
+    /// `record_for_hash` returns the cached record for its payload facts — body
+    /// hex, size, transaction count — and that record has no header. Returning
+    /// it unchanged would answer with none, which is what an earlier revision of
+    /// this change did until this test caught it.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let ctx = Arc::new(Context::new());
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
+        }
+        let cached = BlockRecord::from_block(0, &block);
+        let hash = cached.hash;
+        let expected_body = cached.block_hex.clone();
+        assert!(cached.header_bytes().is_none(), "the log stores no header");
+        ctx.add_block(cached);
+
+        let Some(record) = ctx.record_for_hash(hash) else {
+            panic!("the tree knows this hash");
+        };
+        assert_eq!(
+            record.header_bytes().map(<[u8; 80]>::as_slice),
+            Some(serialize(&block.header).as_slice()),
+            "the resolved record must carry the tree's header"
+        );
+        assert_eq!(
+            record.block_hex, expected_body,
+            "the cached payload must survive the header splice"
+        );
+    }
+
+    /// A record with no header must render as the empty string, the way an empty
+    /// `String` field did, so callers that inspected it for emptiness still see
+    /// what they saw.
+    #[test]
+    fn synthetic_record_has_no_header_and_renders_empty_hex() {
+        let record = BlockRecord::synthetic(7, Hash256::from_le_bytes(&[3_u8; 32]));
+
+        assert!(record.header_bytes().is_none());
+        assert!(record.header_hex().is_empty());
+    }
+
+    /// Covers the record the block tree derives, which had no test at all.
+    ///
+    /// `header_record` builds its header with `try_into().ok()`, so a length that
+    /// does not fit yields `None` and the header vanishes silently — where the
+    /// old `String` field would at least have carried something. A mutation that
+    /// dropped the header from this path failed no test before this one existed.
+    #[test]
+    fn tree_derived_record_carries_the_header() {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
+
+        let ctx = Context::new();
+        let header = bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 7,
+        };
+        let hash = {
+            let mut tree = ctx.block_tree.write();
+            let id = tree
+                .insert_node(None, header, NodeStatus::Active)
+                .expect("genesis inserts");
+            tree.node(id).expect("inserted node").hash
+        };
+
+        // Nothing was pushed into `blocks`, so the record can only come from the
+        // tree.
+        let record = ctx.record_for_hash(hash).expect("tree resolves the hash");
+
+        assert_eq!(
+            record.header_bytes().map(|bytes| bytes.as_slice()),
+            Some(serialize(&header).as_slice()),
+            "the tree-derived record must carry the header the tree holds"
+        );
+        assert_eq!(
+            record.header_hex(),
+            serialize(&header).to_lower_hex_string()
+        );
+    }
     #[test]
     fn block_by_height_returns_record_after_add_block() {
         use bitcoin_rs_primitives::Hash256;

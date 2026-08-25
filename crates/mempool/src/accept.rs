@@ -62,6 +62,15 @@ pub struct AcceptContext {
     /// Core's `-acceptnonstdtxn`, which defaults to off (that is, standardness
     /// enforced) everywhere except regtest.
     pub require_standard: bool,
+    /// Absolute fee ceiling for this submission, in satoshis.
+    ///
+    /// `None` means no ceiling. Bitcoin Core derives one from
+    /// `sendrawtransaction`'s `maxfeerate` and the transaction's vsize, checks
+    /// it against the fee a test-accept computed, and only then submits. The
+    /// ceiling lives here so that check happens inside the same operation that
+    /// admits the transaction: computing the fee, comparing it, and mutating
+    /// the pool must not be three separately-locked steps.
+    pub max_fee: Option<u64>,
 }
 
 /// Reason a transaction was not accepted.
@@ -95,6 +104,18 @@ pub enum AcceptError {
     /// Virtual size did not fit the entry field width.
     #[error("transaction vsize does not fit in u32")]
     VsizeOverflow,
+    /// The fee is above the ceiling the submitter set.
+    ///
+    /// Not a policy rejection: the transaction is acceptable and the caller
+    /// asked not to send it anyway. Bitcoin Core's
+    /// "Fee exceeds maximum configured by user".
+    #[error("fee {fee} exceeds the configured maximum {max_fee}")]
+    FeeExceedsMaximum {
+        /// Fee the transaction pays, in satoshis.
+        fee: u64,
+        /// Ceiling the submitter set, in satoshis.
+        max_fee: u64,
+    },
     /// Sigop cost exceeds what relay policy allows for a single transaction.
     #[error("sigop cost {cost} exceeds the standard maximum {max}")]
     TooManySigops {
@@ -296,6 +317,18 @@ where
 {
     let tx = Arc::new(tx);
     let checks = check_acceptance(pool, &tx, chain, ctx)?;
+    // Before anything is removed or inserted. The fee is only known once the
+    // prevouts are resolved, so the ceiling cannot be applied earlier -- but it
+    // must be applied before the pool is touched, or a transaction the caller
+    // capped has already replaced the originals by the time it is refused.
+    if let Some(max_fee) = ctx.max_fee
+        && checks.fee > max_fee
+    {
+        return Err(AcceptError::FeeExceedsMaximum {
+            fee: checks.fee,
+            max_fee,
+        });
+    }
     let candidate = replacement_candidate(pool, &tx, checks.vsize, checks.fee, checks.sigop_cost);
     // `replace_transaction` re-runs `check_replacement` internally. Paying for
     // one extra walk of the conflict set keeps BIP125 eviction implemented in
@@ -400,6 +433,7 @@ mod tests {
                 max_datacarrier_bytes: Some(83),
             },
             require_standard: true,
+            max_fee: None,
         }
     }
 
