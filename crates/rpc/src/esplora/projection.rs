@@ -48,37 +48,36 @@ pub(super) struct ConfirmedActivity {
 
 pub(super) struct ScriptActivity {
     pub confirmed: Vec<ConfirmedActivity>,
+    pub confirmed_funding: Vec<ScriptIndexRecord>,
     pub confirmed_unspent: Vec<ScriptIndexRecord>,
     pub mempool: Vec<Arc<Transaction>>,
 }
 
 impl ScriptActivity {
-    pub(super) fn chain_stats(
-        &self,
-        projection: &Projection<'_>,
-        script_hash: ScriptHash,
-    ) -> Result<ScriptStats, Response> {
-        let mut stats = ScriptStats::default();
-        for activity in &self.confirmed {
-            let transaction = projection.confirmed_transaction(&activity.record.txid)?;
-            for output in transaction
-                .output
-                .iter()
-                .filter(|output| ScriptHash::new(&output.script_pubkey) == script_hash)
-            {
-                stats.funded_txo_count = stats.funded_txo_count.saturating_add(1);
-                stats.funded_txo_sum = stats.funded_txo_sum.saturating_add(output.value.to_sat());
-            }
-        }
-        stats.tx_count = u64::try_from(self.confirmed.len()).unwrap_or(u64::MAX);
+    /// Sums the confirmed funding rows the script index already resolved.
+    ///
+    /// Reading one transaction per history entry would answer the same
+    /// question, but each read is a separate index query with its own budget,
+    /// so a script with a long history turns one HTTP request into unbounded
+    /// storage I/O. The rows carry the values; the snapshot is the bound.
+    pub(super) fn chain_stats(&self) -> ScriptStats {
+        let funded_txo_count = u64::try_from(self.confirmed_funding.len()).unwrap_or(u64::MAX);
+        let funded_txo_sum = self
+            .confirmed_funding
+            .iter()
+            .fold(0_u64, |sum, output| sum.saturating_add(output.value));
         let unspent_count = u64::try_from(self.confirmed_unspent.len()).unwrap_or(u64::MAX);
         let unspent_sum = self
             .confirmed_unspent
             .iter()
             .fold(0_u64, |sum, output| sum.saturating_add(output.value));
-        stats.spent_txo_count = stats.funded_txo_count.saturating_sub(unspent_count);
-        stats.spent_txo_sum = stats.funded_txo_sum.saturating_sub(unspent_sum);
-        Ok(stats)
+        ScriptStats {
+            tx_count: u64::try_from(self.confirmed.len()).unwrap_or(u64::MAX),
+            funded_txo_count,
+            funded_txo_sum,
+            spent_txo_count: funded_txo_count.saturating_sub(unspent_count),
+            spent_txo_sum: funded_txo_sum.saturating_sub(unspent_sum),
+        }
     }
 
     pub(super) fn mempool_stats(&self, script_hash: ScriptHash) -> ScriptStats {
@@ -381,9 +380,8 @@ impl<'a> Projection<'a> {
             .script_index
             .as_ref()
             .ok_or_else(|| unavailable("script index is disabled"))?;
-        let mut confirmed = index
-            .history_snapshot(script_hash)
-            .map_err(query_error)?
+        let snapshot = index.history_snapshot(script_hash).map_err(query_error)?;
+        let mut confirmed = snapshot
             .history
             .into_iter()
             .map(|record| {
@@ -409,6 +407,7 @@ impl<'a> Projection<'a> {
         let mempool = self.mempool_activity(script_hash, &confirmed_unspent);
         Ok(ScriptActivity {
             confirmed,
+            confirmed_funding: snapshot.funding,
             confirmed_unspent,
             mempool,
         })

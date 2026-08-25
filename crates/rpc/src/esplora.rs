@@ -734,10 +734,7 @@ fn summary_for(ctx: &Context, h: ScriptHash, address: Option<&str>) -> Response 
         Ok(activity) => activity,
         Err(response) => return response,
     };
-    let chain_stats = match activity.chain_stats(&projection, h) {
-        Ok(stats) => stats,
-        Err(response) => return response,
-    };
+    let chain_stats = activity.chain_stats();
     json_response(ScriptSummary {
         address: address.map(str::to_owned),
         scripthash: address
@@ -813,32 +810,27 @@ fn history(ctx: &Context, h: ScriptHash, last: Option<&str>, include_mempool: bo
 }
 
 fn address_transaction_summary(ctx: &Context, h: ScriptHash) -> Response {
-    let projection = Projection::new(ctx);
-    let activity = match projection.script_activity(h) {
+    let activity = match Projection::new(ctx).script_activity(h) {
         Ok(activity) => activity,
         Err(response) => return response,
     };
-    activity
-        .confirmed
-        .into_iter()
-        .map(|entry| {
-            let transaction = projection.confirmed_transaction(&entry.record.txid)?;
-            let value = transaction
-                .output
-                .iter()
-                .filter(|output| ScriptHash::new(&output.script_pubkey) == h)
-                .fold(0_u64, |sum, output| {
-                    sum.saturating_add(output.value.to_sat())
-                });
-            Ok(AddressTransactionSummary {
+    let mut funded = std::collections::BTreeMap::<bitcoin::Txid, u64>::new();
+    for row in &activity.confirmed_funding {
+        let total = funded.entry(row.txid).or_default();
+        *total = total.saturating_add(row.value);
+    }
+    json_response(
+        activity
+            .confirmed
+            .into_iter()
+            .map(|entry| AddressTransactionSummary {
                 txid: entry.record.txid.to_string(),
-                value,
+                value: funded.get(&entry.record.txid).copied().unwrap_or_default(),
                 height: entry.confirmation.height,
                 time: entry.confirmation.time,
             })
-        })
-        .collect::<Result<Vec<AddressTransactionSummary>, Response>>()
-        .map_or_else(|response| response, json_response)
+            .collect::<Vec<_>>(),
+    )
 }
 fn address_hash(ctx: &Context, a: &str) -> Result<ScriptHash, Response> {
     let n = Projection::new(ctx).bitcoin_network();
@@ -1063,6 +1055,7 @@ mod tests {
 
     struct StaticScriptIndex {
         history: Vec<ScriptHistoryRecord>,
+        funding: Vec<ScriptIndexRecord>,
         unspent: Vec<ScriptIndexRecord>,
     }
 
@@ -1142,6 +1135,7 @@ mod tests {
         ) -> Result<crate::context::ScriptIndexSnapshot, TxQueryError> {
             Ok(crate::context::ScriptIndexSnapshot {
                 history: self.history.clone(),
+                funding: self.funding.clone(),
             })
         }
 
@@ -1200,14 +1194,16 @@ mod tests {
         };
         context.set_applied_tip(tip);
         context.esplora_tx_index = Some(Arc::new(FixtureTxIndex(vec![(transaction.clone(), 0)])));
+        let funding = vec![ScriptIndexRecord {
+            txid,
+            height: 0,
+            value: 5_000_000_000,
+            vout: 0,
+        }];
         context.script_index = Some(Arc::new(StaticScriptIndex {
             history: vec![ScriptHistoryRecord { txid, height: 0 }],
-            unspent: vec![ScriptIndexRecord {
-                txid,
-                height: 0,
-                value: 5_000_000_000,
-                vout: 0,
-            }],
+            funding: funding.clone(),
+            unspent: funding,
         }));
         Ok((Handler::new(Arc::new(context)), transaction, block, address))
     }
@@ -1668,6 +1664,7 @@ mod tests {
         }
         ctx.script_index = Some(Arc::new(StaticScriptIndex {
             history: records,
+            funding: Vec::new(),
             unspent: Vec::new(),
         }));
         ctx.esplora_tx_index = Some(Arc::new(CountingTxIndex {
@@ -1680,6 +1677,81 @@ mod tests {
         let values: Value = serde_json::from_slice(&response.body).expect("history response json");
         assert_eq!(values.as_array().map(Vec::len), Some(CHAIN_PAGE));
         assert_eq!(calls.load(Ordering::Relaxed), CHAIN_PAGE);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn address_statistics_read_no_transactions_beyond_the_script_index() {
+        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hash = ScriptHash::new(&target);
+        let transactions = (1_u64..=30)
+            .map(|value| {
+                transaction(
+                    None,
+                    TxOut {
+                        value: Amount::from_sat(value),
+                        script_pubkey: target.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let history = transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| ScriptHistoryRecord {
+                txid: transaction.compute_txid(),
+                height: u32::try_from(index + 1).expect("fixture height fits u32"),
+            })
+            .collect::<Vec<_>>();
+        let funding = transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| ScriptIndexRecord {
+                txid: transaction.compute_txid(),
+                height: u32::try_from(index + 1).expect("fixture height fits u32"),
+                value: u64::try_from(index + 1).expect("fixture value fits u64"),
+                vout: 0,
+            })
+            .collect::<Vec<_>>();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut ctx = Context::new();
+        for record in &history {
+            ctx.add_block(crate::context::BlockRecord::synthetic(
+                record.height,
+                Hash256::from_le_bytes(&[0; 32]),
+            ));
+        }
+        ctx.script_index = Some(Arc::new(StaticScriptIndex {
+            history,
+            funding: funding.clone(),
+            unspent: vec![funding[0]],
+        }));
+        ctx.esplora_tx_index = Some(Arc::new(CountingTxIndex {
+            transactions,
+            calls: Arc::clone(&calls),
+        }));
+
+        let summary = summary(
+            &ctx,
+            &script_hash.to_byte_array().to_lower_hex_string(),
+            None,
+        );
+        assert_eq!(summary.status, 200);
+        let value: Value = serde_json::from_slice(&summary.body).expect("summary json");
+        assert_eq!(value["chain_stats"]["funded_txo_count"], json!(30));
+        assert_eq!(value["chain_stats"]["funded_txo_sum"], json!(465));
+        assert_eq!(value["chain_stats"]["spent_txo_count"], json!(29));
+        assert_eq!(value["chain_stats"]["spent_txo_sum"], json!(464));
+
+        let per_transaction = address_transaction_summary(&ctx, script_hash);
+        assert_eq!(per_transaction.status, 200);
+        let rows: Value = serde_json::from_slice(&per_transaction.body).expect("summary rows json");
+        assert_eq!(rows.as_array().map(Vec::len), Some(30));
+
+        // Both endpoints answer from index rows alone. Reading one transaction
+        // per history entry escapes the script index's per-query budget, so a
+        // long-history address turns one request into unbounded storage I/O.
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1702,6 +1774,7 @@ mod tests {
         let mut ctx = Context::new();
         ctx.script_index = Some(Arc::new(StaticScriptIndex {
             history: Vec::new(),
+            funding: vec![confirmed],
             unspent: vec![confirmed],
         }));
         ctx.mempool

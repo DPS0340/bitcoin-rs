@@ -1534,8 +1534,15 @@ impl TxIndexQueryEngine {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
 
         let mut history = Vec::with_capacity(funding_outputs.len());
-        for (txid, vout, _, height) in funding_outputs {
+        let mut funding = Vec::with_capacity(funding_outputs.len());
+        for (txid, vout, value, height) in funding_outputs {
             history.push(ScriptHistoryRecord { txid, height });
+            funding.push(ScriptIndexRecord {
+                txid,
+                height,
+                value,
+                vout,
+            });
             let outpoint = OutPoint { txid, vout };
             if let Some(spender) = self.spender_for(snapshot, tip, budget, &outpoint)? {
                 history.push(ScriptHistoryRecord {
@@ -1547,8 +1554,15 @@ impl TxIndexQueryEngine {
 
         history.sort_by(|a, b| a.height.cmp(&b.height).then_with(|| a.txid.cmp(&b.txid)));
         history.dedup_by(|a, b| a.txid == b.txid && a.height == b.height);
+        funding.sort_by(|a, b| {
+            a.height
+                .cmp(&b.height)
+                .then_with(|| a.txid.cmp(&b.txid))
+                .then_with(|| a.vout.cmp(&b.vout))
+        });
+        funding.dedup();
 
-        Ok(ScriptIndexSnapshot { history })
+        Ok(ScriptIndexSnapshot { history, funding })
     }
 
     fn unspent_outputs_for(

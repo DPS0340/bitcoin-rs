@@ -794,6 +794,14 @@ pub struct SpendingRecord {
 pub struct ScriptIndexSnapshot {
     /// All confirmed funding and spending transactions for the script.
     pub history: Vec<ScriptHistoryRecord>,
+    /// Every confirmed output paying the script, spent ones included.
+    ///
+    /// Carried out of the same budgeted storage snapshot that produced
+    /// `history`. Address statistics are sums over these rows; a caller without
+    /// them has to re-read one transaction per history entry, and each of those
+    /// reads is a fresh index query with its own budget, so the total escapes
+    /// the bound this snapshot is taken under.
+    pub funding: Vec<ScriptIndexRecord>,
 }
 
 /// Lockless query adapter for the node-owned generic script index.
