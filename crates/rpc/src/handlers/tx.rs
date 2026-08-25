@@ -119,37 +119,100 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
     // unconfirmed activity at all.
     let include_mempool = optional_bool(params, 2, true)?;
 
-    if include_mempool {
+    let outpoint = OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), vout_u32);
+
+    // One mempool-consistent observation, or none at all.
+    //
+    // The spend check and the confirmed read have to see the same mempool. Held
+    // apart, an accepted spend fits in the gap between them: the check says the
+    // outpoint is unspent, the spend lands, and the confirmed set -- which does
+    // not know about it yet -- hands back an output that is already claimed.
+    // The caller is told a coin is spendable at the moment it stopped being so,
+    // which is the one error this argument exists to prevent.
+    //
+    // **The lock order is mempool then UTXO, and it cannot invert.**
+    // `bitcoin-rs-utxo` does not depend on `bitcoin-rs-mempool` and names it
+    // nowhere, so no code path can hold a UTXO shard guard and then ask for the
+    // mempool; the shard lock is a leaf. `UtxoSet::get_entry` also returns an
+    // owned `LiveOutput` rather than a guard, so nothing of the UTXO set
+    // outlives the call. Acquiring in the other order would be the trade the
+    // review warned about; this way there is no cycle to trade into.
+    let mempool_answer = include_mempool.then(|| {
+        let pool = ctx.mempool.read();
         let mempool_outpoint = bitcoin::OutPoint {
             txid,
             vout: vout_u32,
         };
-        let pool = ctx.mempool.read();
         // Core: "an unspent output that is spent in the mempool won't appear".
         // The coin is still in the confirmed set, but a mempool transaction has
         // claimed it, so reporting it spendable would hand a caller a conflict.
         if pool.is_outpoint_spent(&mempool_outpoint) {
-            return Ok(Value::new_null());
+            return MempoolView::SpentInMempool;
         }
         if let Some(tx) = pool.transaction_by_txid(&txid)
             && let Some(txout) = usize::try_from(vout_u32)
                 .ok()
                 .and_then(|index| tx.output.get(index))
         {
-            // Core gives a mempool coin `MEMPOOL_HEIGHT`, which renders as zero
-            // confirmations. A mempool transaction is never a coinbase.
-            return Ok(txout_json(ctx, txout, 0, false));
+            return MempoolView::Unconfirmed(txout.clone());
         }
-    }
+        // Nothing in the pool bears on this outpoint. The guard stays held by
+        // the caller below while the confirmed set is read.
+        MempoolView::NotInMempool(pool)
+    });
 
-    let outpoint = OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), vout_u32);
-    let Some(live) = ctx.utxo.get_entry(&outpoint) else {
+    let confirmed = match mempool_answer {
+        Some(MempoolView::SpentInMempool) => return Ok(Value::new_null()),
+        // Core gives a mempool coin `MEMPOOL_HEIGHT`, which renders as zero
+        // confirmations. A mempool transaction is never a coinbase.
+        Some(MempoolView::Unconfirmed(txout)) => return Ok(txout_json(ctx, &txout, 0, false)),
+        // `confirmed_entry` takes a reference borrowed from the guard, so the
+        // borrow checker is what keeps the guard alive across the read. A
+        // version that released it first cannot produce the argument.
+        Some(MempoolView::NotInMempool(pool)) => confirmed_entry(ctx, &outpoint, &pool),
+        // `include_mempool = false` asks about the confirmed set alone, so
+        // there is no observation to keep consistent and no lock to hold.
+        None => ctx.utxo.get_entry(&outpoint),
+    };
+
+    let Some(live) = confirmed else {
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
     let applied = ctx.applied_height();
     let confirmations = applied.saturating_sub(live.height).saturating_add(1);
     Ok(txout_json(ctx, &live.txout, confirmations, live.coinbase))
+}
+
+/// Reads the confirmed set under a mempool observation the caller is holding.
+///
+/// Takes `&Mempool` rather than reading a flag or trusting a comment: the
+/// reference is borrowed from the read guard, so the compiler is what keeps the
+/// guard alive across this call. Releasing it first does not compile, which is
+/// the whole point -- the defect being fixed was a guard dropped one line too
+/// early, and a comment saying "do not drop this here" is exactly what failed.
+///
+/// The parameter is otherwise unused. It is a proof obligation, not an input.
+fn confirmed_entry(
+    ctx: &Context,
+    outpoint: &OutPoint,
+    _pool: &bitcoin_rs_mempool::Mempool,
+) -> Option<bitcoin_rs_utxo::LiveOutput> {
+    ctx.utxo.get_entry(outpoint)
+}
+
+/// What the mempool had to say about an outpoint, and the guard that proves it.
+///
+/// The third variant carries the read guard rather than dropping it, because
+/// "the mempool does not spend this" is only true for as long as the guard is
+/// held -- and the confirmed read that follows depends on it still being true.
+enum MempoolView<'pool> {
+    /// A pool transaction claims this outpoint; the answer is null.
+    SpentInMempool,
+    /// The outpoint is an output of an unconfirmed transaction.
+    Unconfirmed(bitcoin::TxOut),
+    /// The pool bears on neither, with the observation still held.
+    NotInMempool(parking_lot::RwLockReadGuard<'pool, bitcoin_rs_mempool::Mempool>),
 }
 
 /// Renders one output the way `gettxout` reports it.
@@ -1408,6 +1471,74 @@ mod gettxout_mempool_tests {
             params.push(json!(flag));
         }
         gettxout(ctx, &json!(params)).unwrap_or_else(|err| panic!("gettxout failed: {err}"))
+    }
+
+    /// The confirmed answer is produced under the mempool observation.
+    ///
+    /// The spend check and the confirmed read have to see one mempool. Held
+    /// apart, an accepted spend fits between them: the check says unspent, the
+    /// spend lands, and the confirmed set -- which does not know about it yet
+    /// -- hands back an output that is already claimed. The caller is told a
+    /// coin is spendable at the moment it stopped being so.
+    ///
+    /// A writer is held open, `gettxout` is asked, and the answer must not
+    /// arrive until the writer is done. Deterministic in the direction that
+    /// matters: the read guard is taken before anything is decided, so a
+    /// handler that answered without consulting the mempool at all would
+    /// return immediately and the first assertion would fail every run.
+    ///
+    /// What this cannot show is the gap itself, which needs the chain to move
+    /// *between* two operations inside one call -- a scheduling hook this
+    /// handler does not have. That half is enforced by the borrow checker
+    /// instead: `confirmed_entry` takes a `&Mempool` borrowed from the guard,
+    /// so a version that released it first does not compile.
+    #[test]
+    fn the_confirmed_read_happens_under_the_mempool_guard() {
+        let ctx = Arc::new(Context::new());
+        let parent = funding_tx(0x5c);
+        let parent_txid = parent.compute_txid();
+        insert(&ctx, parent);
+
+        let (asked_tx, asked_rx) = std::sync::mpsc::sync_channel(1);
+        let (answered_tx, answered_rx) = std::sync::mpsc::sync_channel(1);
+
+        // Stands in for transaction acceptance in flight: the same lock, taken
+        // the same way `insert` above takes it.
+        let writer = ctx.mempool.write();
+
+        std::thread::scope(|scope| {
+            let reader = {
+                let ctx = Arc::clone(&ctx);
+                scope.spawn(move || {
+                    let _ = asked_tx.send(());
+                    let value = gettxout_of(&ctx, parent_txid, 0, &Value::new_null());
+                    let _ = answered_tx.send(value.is_null());
+                })
+            };
+
+            let Ok(()) = asked_rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+                panic!("the reader thread never started");
+            };
+            assert!(
+                matches!(
+                    answered_rx.recv_timeout(std::time::Duration::from_millis(200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "gettxout answered while a mempool write was in flight"
+            );
+
+            drop(writer);
+            let Ok(was_null) = answered_rx.recv_timeout(std::time::Duration::from_secs(5)) else {
+                panic!("gettxout never answered after the write completed");
+            };
+            assert!(
+                !was_null,
+                "the parent's output is unspent, so it must still be reported"
+            );
+            let Ok(()) = reader.join() else {
+                panic!("the reader thread panicked");
+            };
+        });
     }
 
     #[test]
