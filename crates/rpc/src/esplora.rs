@@ -17,7 +17,6 @@ mod projection;
 use alloc::sync::Arc;
 
 use core::ops::Bound;
-use core::str::FromStr as _;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash as _, sha256d};
@@ -27,6 +26,7 @@ use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_index::ScriptHash;
 #[cfg(test)]
 use bitcoin_rs_primitives::Hash256;
+use core::str::FromStr as _;
 use serde_json::json;
 use sonic_rs::{JsonValueTrait as _, json as sonic_json};
 
@@ -855,6 +855,17 @@ fn dispatch_error(e: crate::RpcError) -> Response {
     match e {
         crate::RpcError::NotFound(_) => not_found(),
         crate::RpcError::InvalidParams(_) | crate::RpcError::InvalidType(_) => bad(&e.to_string()),
+        // A transaction the rules refuse is the client's problem, not the
+        // server's. `unavailable` is 503, which tells a broadcaster to retry --
+        // and the one thing a rejected transaction will not do is succeed on a
+        // retry. Esplora answers `POST /tx` with 400 and the reject reason, and
+        // a wallet reads that as "fix the transaction" rather than "come back
+        // later".
+        //
+        // Both codes reach here: `TxRejected` is what policy or consensus
+        // refused, `TxVerifyError` a guard the caller configured themselves.
+        // Neither improves with time.
+        crate::RpcError::TxRejected(_) | crate::RpcError::TxVerifyError(_) => bad(&e.to_string()),
         _ => unavailable(&e.to_string()),
     }
 }
@@ -924,6 +935,72 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+
+    /// A confirmed coin the fixtures can spend, and the outpoint naming it.
+    ///
+    /// `POST /tx` used to hand the transaction to a stub that accepted
+    /// anything, so the fixtures broadcast a transaction with no inputs at all.
+    /// It now runs real mempool acceptance, and a non-coinbase transaction with
+    /// no inputs is refused -- correctly. So a broadcast fixture has to have
+    /// something to spend.
+    fn seed_spendable_coin(ctx: &Context) -> OutPoint {
+        // A real funding transaction rather than an invented outpoint. Two
+        // things need it and neither would be satisfied by the UTXO row alone:
+        // acceptance resolves the prevout to weigh the fee, and Esplora's
+        // `/tx/{txid}` fills each input's `prevout` field, which it reads from
+        // the mempool, then the transaction cache, then the index -- never from
+        // the UTXO set, because it must answer for spent outputs too.
+        let funding = transaction(
+            Some(OutPoint::null()),
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let funding_txid = funding.compute_txid();
+        let outpoint = bitcoin_rs_primitives::OutPoint::new(
+            Hash256::from_le_bytes(&funding_txid.to_byte_array()),
+            0,
+        );
+
+        let mut changes = bitcoin_rs_utxo::BlockChanges::default();
+        changes.add(bitcoin_rs_utxo::UtxoAdd::new(
+            outpoint,
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            false,
+            7,
+        ));
+        ctx.utxo
+            .commit_block(&changes, &Hash256::default())
+            .unwrap_or_else(|err| panic!("seeding the fixture coin failed: {err}"));
+        ctx.transactions.write().insert(funding_txid, funding);
+
+        OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        }
+    }
+
+    /// A transaction spending [`seed_spendable_coin`], which acceptance admits.
+    ///
+    /// The output is P2PKH rather than the bare `OP_TRUE` the other fixtures
+    /// use, because acceptance runs standardness and a bare `OP_TRUE` output is
+    /// not a standard script type. The seeded *prevout* stays `OP_TRUE`, which
+    /// is fine: standardness looks at what a transaction creates.
+    fn spending_transaction(ctx: &Context) -> Transaction {
+        transaction(
+            Some(seed_spendable_coin(ctx)),
+            TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::from_byte_array(
+                    [9_u8; 20],
+                )),
+            },
+        )
+    }
 
     fn transaction(input: Option<OutPoint>, output: TxOut) -> Transaction {
         Transaction {
@@ -1335,9 +1412,19 @@ mod tests {
             );
         }
 
-        let raw = serialize(&transaction).to_lower_hex_string();
+        // A transaction that acceptance will admit, rather than the confirmed
+        // one above. This used to rebroadcast `transaction`, which worked only
+        // because `POST /tx` was a stub -- re-sending a transaction whose
+        // inputs are already spent is refused by the rules, and rightly.
+        let broadcastable = spending_transaction(handler.context());
+        let raw = serialize(&broadcastable).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("POST /tx is routed");
-        assert_eq!(broadcast.status, 200);
+        assert_eq!(
+            broadcast.status,
+            200,
+            "body: {}",
+            String::from_utf8_lossy(&broadcast.body)
+        );
         assert_eq!(broadcast.content_type, "text/plain");
 
         // Package relay is conditional in API.md (Bitcoin Core 28+). This node
@@ -1612,15 +1699,10 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
-        let transaction = transaction(
-            None,
-            TxOut {
-                value: Amount::from_sat(125),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            },
-        );
+        let ctx = Arc::new(Context::new());
+        let transaction = spending_transaction(&ctx);
         let txid = transaction.compute_txid();
-        let handler = Handler::new(Arc::new(Context::new()));
+        let handler = Handler::new(ctx);
         let raw = serialize(&transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("broadcast route");
         assert_eq!(broadcast.status, 200);
