@@ -405,8 +405,15 @@ with nothing to say the two are different.
 wrapper around the connection's socket, so they cover the handshake, the reader
 loop and the writer thread alike. `addrbind` is the local end of the connection.
 `timeoffset` is the peer's declared time against local time at handshake, which
-is how Core computes it, and `getnetworkinfo.timeoffset` is the median of those
-per-peer offsets. `getnetworkinfo.version` is derived from the released package
+is how Core computes it. `getnetworkinfo.timeoffset` is the median of those
+offsets **over outbound peers only**, and is zero below five samples -- both of
+which are Core's rules and both of which matter: Core takes no sample from an
+inbound peer so that "others" cannot "create false warnings about our clock
+being out of sync", and it declines to answer at all below five. The one
+difference left is the sample set. Core medians a rolling deque of the last 50
+offsets it saw, which outlives the connections that produced them; this medians
+the peers connected now, so the two agree while the peer set is stable and
+diverge after churn. `getnetworkinfo.version` is derived from the released package
 version by Core's `CLIENT_VERSION` arithmetic instead of being a fixed `10000`.
 
 **Now omitted rather than faked.** `pingtime`, `minping` and `pingwait` are

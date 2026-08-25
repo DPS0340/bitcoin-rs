@@ -139,29 +139,53 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     }))
 }
 
-/// The node's clock offset, as the median of what its peers claim.
+/// Samples below which Core does not compute an offset at all.
+///
+/// `TimeOffsets::Median` in `node/timeoffsets.cpp`: "Only calculate the median
+/// if we have 5 or more offsets". Below it the answer is zero -- not because
+/// the clocks agree, but because too few samples is not a measurement.
+const MIN_TIME_OFFSET_SAMPLES: usize = 5;
+
+/// The node's clock offset, as the median of what its outbound peers claim.
 ///
 /// Bitcoin Core samples each peer's declared time at handshake and reports the
-/// median of those samples. A single peer cannot move it, which is the point:
-/// the figure exists to warn an operator that their own clock is wrong, and one
-/// peer lying about the time must not produce that warning.
+/// median of those samples. The figure exists to warn an operator that their
+/// own clock is wrong, so what matters is that no one else can produce that
+/// warning: hence outbound peers only, and hence a floor below which there is
+/// no answer at all.
 ///
-/// With no peers there is nothing to compare against, so the offset is zero --
-/// the same answer Core gives, and there the zero really is the measurement.
+/// With too few samples the offset is zero, which is also what Core answers.
+/// The zero is "not measured", not "the clocks agree" -- the two are
+/// indistinguishable in this field, in Core as here.
+///
+/// One difference from Core worth naming: Core medians over a rolling deque of
+/// the last 50 offsets it sampled, which outlives the connections that produced
+/// them. This medians over the peers connected now. The two agree while the
+/// peer set is stable and diverge after churn, where Core still remembers a
+/// departed peer's sample and this does not.
 fn median_time_offset(peers: &[bitcoin_rs_p2p::PeerInfo]) -> i64 {
-    if peers.is_empty() {
+    // **Outbound peers only.** Core's reason, in its own words at the call
+    // site in `net_processing.cpp`: "Don't use timedata samples from inbound
+    // peers to make it harder for others to create false warnings about our
+    // clock being out of sync." Anyone can open an inbound connection and
+    // declare any time they like; medianing over all peers hands that
+    // attacker the node's reported clock offset, and with it the operator's
+    // belief about whether the machine's clock is wrong.
+    let mut offsets: Vec<i64> = peers
+        .iter()
+        .filter(|peer| !peer.inbound)
+        .map(|peer| peer.time_offset)
+        .collect();
+    if offsets.len() < MIN_TIME_OFFSET_SAMPLES {
         return 0;
     }
-    let mut offsets: Vec<i64> = peers.iter().map(|peer| peer.time_offset).collect();
     offsets.sort_unstable();
-    let middle = offsets.len() / 2;
-    if offsets.len() % 2 == 1 {
-        return offsets.get(middle).copied().unwrap_or(0);
-    }
-    // Even sample count: Core averages the two middle values.
-    let lower = offsets.get(middle.saturating_sub(1)).copied().unwrap_or(0);
-    let upper = offsets.get(middle).copied().unwrap_or(0);
-    lower.saturating_add(upper) / 2
+    // The element at `len / 2`, on an even count as on an odd one. Core takes
+    // exactly this and says why it does not interpolate: "approximate median is
+    // good enough, keep it simple". Averaging the two middle values would
+    // answer a number neither peer reported, and would differ from Core on
+    // every even sample count.
+    offsets.get(offsets.len() / 2).copied().unwrap_or(0)
 }
 
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -863,6 +887,20 @@ mod peer_counter_tests {
     use crate::context::Context;
 
     fn peer(addr: &str, bind: &str, time_offset: i64, counters: Arc<PeerCounters>) -> PeerInfo {
+        directed_peer(addr, bind, time_offset, counters, true)
+    }
+
+    /// A peer whose direction the test chooses.
+    ///
+    /// The clock offset is sampled from outbound peers only, so a fixture that
+    /// cannot make one cannot exercise the median at all.
+    fn directed_peer(
+        addr: &str,
+        bind: &str,
+        time_offset: i64,
+        counters: Arc<PeerCounters>,
+        inbound: bool,
+    ) -> PeerInfo {
         let parse = |text: &str| -> SocketAddr {
             text.parse()
                 .unwrap_or_else(|_| panic!("test address {text} must parse"))
@@ -874,11 +912,28 @@ mod peer_counter_tests {
             user_agent: "/test/".to_owned(),
             start_height: 0,
             conn_time: 0,
-            inbound: true,
+            inbound,
             addr_bind: parse(bind),
             time_offset,
             counters,
         }
+    }
+
+    /// `count` outbound peers, each declaring the offset `offsets` gives it.
+    fn outbound_peers(offsets: &[i64]) -> Vec<PeerInfo> {
+        offsets
+            .iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                directed_peer(
+                    &format!("127.0.0.1:{}", index + 1),
+                    &format!("127.0.0.1:{}", 1000 + index),
+                    *offset,
+                    Arc::new(PeerCounters::default()),
+                    false,
+                )
+            })
+            .collect()
     }
 
     fn context_with(peers: Vec<PeerInfo>) -> Arc<Context> {
@@ -993,20 +1048,103 @@ mod peer_counter_tests {
     /// is exactly what a mean would let it do.
     #[test]
     fn getnetworkinfo_timeoffset_is_the_median_of_its_peers() {
-        let counters = || Arc::new(PeerCounters::default());
-        let ctx = context_with(vec![
-            peer("127.0.0.1:1", "127.0.0.1:1000", 10, counters()),
-            peer("127.0.0.1:2", "127.0.0.1:1001", 20, counters()),
-            peer("127.0.0.1:3", "127.0.0.1:1002", 100_000, counters()),
-        ]);
+        let ctx = context_with(outbound_peers(&[10, 20, 30, 40, 100_000]));
 
         let result = getnetworkinfo(&ctx, &json!(null))
             .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
 
         assert_eq!(
             result.get("timeoffset").and_then(JsonValueTrait::as_i64),
-            Some(20),
+            Some(30),
             "the outlier must not move the median"
+        );
+    }
+
+    /// An inbound peer cannot move the node's reported clock offset.
+    ///
+    /// Core takes samples from outbound peers only, and says why at the call
+    /// site: "Don't use timedata samples from inbound peers to make it harder
+    /// for others to create false warnings about our clock being out of sync."
+    /// Anyone can open an inbound connection and declare any time they like, so
+    /// medianing over every peer hands whoever does that the operator's belief
+    /// about whether this machine's clock is wrong.
+    ///
+    /// Five outbound peers agreeing on ten seconds, and a crowd of inbound ones
+    /// declaring an hour. The inbound peers outnumber the outbound ones, so a
+    /// median over all of them lands on the inbound value and this fails.
+    #[test]
+    fn getnetworkinfo_timeoffset_ignores_inbound_peers() {
+        let mut peers = outbound_peers(&[10, 10, 10, 10, 10]);
+        for index in 0..9 {
+            peers.push(directed_peer(
+                &format!("127.0.0.2:{}", index + 1),
+                &format!("127.0.0.1:{}", 2000 + index),
+                3_600,
+                Arc::new(PeerCounters::default()),
+                true,
+            ));
+        }
+        let ctx = context_with(peers);
+
+        let result = getnetworkinfo(&ctx, &json!(null))
+            .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
+
+        assert_eq!(
+            result.get("timeoffset").and_then(JsonValueTrait::as_i64),
+            Some(10),
+            "inbound peers must not be sampled, however many of them there are"
+        );
+    }
+
+    /// Too few samples is not a measurement, and is reported as none.
+    ///
+    /// `TimeOffsets::Median` returns zero below five offsets: "Only calculate
+    /// the median if we have 5 or more offsets". Four peers all an hour ahead
+    /// used to be reported as an hour, which reads as a confident finding about
+    /// the local clock drawn from four strangers.
+    #[test]
+    fn getnetworkinfo_timeoffset_needs_five_samples() {
+        let four = context_with(outbound_peers(&[3_600, 3_600, 3_600, 3_600]));
+        assert_eq!(
+            getnetworkinfo(&four, &json!(null))
+                .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"))
+                .get("timeoffset")
+                .and_then(JsonValueTrait::as_i64),
+            Some(0),
+            "four samples is below Core's floor, so there is no offset to report"
+        );
+
+        // The paired case, so the zero above is the floor and not an inability
+        // to report anything at all.
+        let five = context_with(outbound_peers(&[3_600, 3_600, 3_600, 3_600, 3_600]));
+        assert_eq!(
+            getnetworkinfo(&five, &json!(null))
+                .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"))
+                .get("timeoffset")
+                .and_then(JsonValueTrait::as_i64),
+            Some(3_600),
+            "one more sample crosses the floor and the offset is reported"
+        );
+    }
+
+    /// An even sample count takes the upper middle, as Core does.
+    ///
+    /// Core indexes `sorted[size / 2]` whatever the parity, and says why it
+    /// does not interpolate: "approximate median is good enough, keep it
+    /// simple". Averaging the two middle values answers a number no peer
+    /// reported and differs from Core on every even count -- here 40 against
+    /// the 35 an average of the two middle samples would give.
+    #[test]
+    fn getnetworkinfo_timeoffset_does_not_interpolate() {
+        let ctx = context_with(outbound_peers(&[10, 20, 30, 40, 50, 60]));
+
+        assert_eq!(
+            getnetworkinfo(&ctx, &json!(null))
+                .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"))
+                .get("timeoffset")
+                .and_then(JsonValueTrait::as_i64),
+            Some(40),
+            "the upper of the two middle values, not their average"
         );
     }
 
