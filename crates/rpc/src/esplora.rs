@@ -14,6 +14,8 @@
 mod model;
 mod projection;
 
+use alloc::sync::Arc;
+
 use core::ops::Bound;
 use core::str::FromStr as _;
 
@@ -529,30 +531,37 @@ fn internal_block_txs(ctx: &Context, hash: &str) -> Response {
 
 fn internal_mempool_txs(ctx: &Context, last: Option<&str>, query: &str) -> Response {
     let max_txs = query_limit(query, "max_txs").unwrap_or(usize::MAX);
+    // Ordering needs every entry, the answer needs `max_txs` of them. The pool
+    // payload stays behind its `Arc` until the page is cut, so a one-transaction
+    // request no longer copies the whole mempool under the read lock.
     let transactions = {
         let pool = ctx.mempool.read();
-        let mut transactions = pool
+        let mut ordered = pool
             .entries
             .iter()
-            .map(|(_, entry)| (entry.time, entry.txid, (*entry.tx).clone()))
+            .map(|(_, entry)| (entry.time, entry.txid, Arc::clone(&entry.tx)))
             .collect::<Vec<_>>();
-        transactions.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        if let Some(last) = last
-            && let Some(position) = transactions
-                .iter()
-                .position(|(_, txid, _)| txid.to_string() == last)
-        {
-            transactions.drain(..=position);
-        }
-        transactions
+        drop(pool);
+        ordered.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let start = last
+            .and_then(|last| {
+                ordered
+                    .iter()
+                    .position(|(_, txid, _)| txid.to_string() == last)
+            })
+            .map_or(0, |position| position.saturating_add(1));
+        ordered
             .into_iter()
+            .skip(start)
+            .take(max_txs)
             .map(|(_, _, transaction)| transaction)
             .collect::<Vec<_>>()
     };
     let projection = Projection::new(ctx);
     transactions
         .into_iter()
-        .take(max_txs)
         .map(|transaction| projection.transaction_value(&transaction, None))
         .collect::<Result<Vec<_>, _>>()
         .map_or_else(|r| r, json_response)
