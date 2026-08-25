@@ -49,7 +49,7 @@ pub(super) struct ConfirmedActivity {
 pub(super) struct ScriptActivity {
     pub confirmed: Vec<ConfirmedActivity>,
     pub confirmed_unspent: Vec<ScriptIndexRecord>,
-    pub mempool: Vec<Transaction>,
+    pub mempool: Vec<Arc<Transaction>>,
 }
 
 impl ScriptActivity {
@@ -493,10 +493,14 @@ impl<'a> Projection<'a> {
         &self,
         script_hash: ScriptHash,
         confirmed_unspent: &[ScriptIndexRecord],
-    ) -> Vec<Transaction> {
+    ) -> Vec<Arc<Transaction>> {
         let pool = self.ctx.mempool.read();
         let mempool_hash = MempoolScriptHash::from_byte_array(script_hash.to_byte_array());
-        let mut ids = std::collections::BTreeSet::new();
+        // Keyed by txid so a transaction reached through both the funding index
+        // and the spend scan is selected once. The entry is captured here rather
+        // than its txid alone: resolving a txid back to an entry afterwards
+        // costs a scan of the whole pool per selected transaction.
+        let mut selected = std::collections::BTreeMap::new();
         let mut outputs = confirmed_unspent
             .iter()
             .map(|record| OutPoint::new(record.txid, record.vout))
@@ -506,12 +510,12 @@ impl<'a> Projection<'a> {
             Bound::Included((mempool_hash, u32::MAX)),
         )) {
             if let Some(entry) = pool.entry(*entry_id) {
-                ids.insert(entry.txid);
+                selected.insert(entry.txid, (entry.time, Arc::clone(&entry.tx)));
                 for (vout, output) in entry.tx.output.iter().enumerate() {
-                    if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash {
-                        if let Ok(vout) = u32::try_from(vout) {
-                            outputs.insert(OutPoint::new(entry.txid, vout));
-                        }
+                    if MempoolScriptHash::from_script(&output.script_pubkey) == mempool_hash
+                        && let Ok(vout) = u32::try_from(vout)
+                    {
+                        outputs.insert(OutPoint::new(entry.txid, vout));
                     }
                 }
             }
@@ -523,26 +527,20 @@ impl<'a> Projection<'a> {
                 .iter()
                 .any(|input| outputs.contains(&input.previous_output))
             {
-                ids.insert(entry.txid);
+                selected.insert(entry.txid, (entry.time, Arc::clone(&entry.tx)));
             }
         }
-        let mut entries = ids
+        drop(pool);
+        let mut entries = selected
             .into_iter()
-            .filter_map(|txid| {
-                pool.entries.iter().find_map(|(_, entry)| {
-                    (entry.txid == txid).then(|| (entry.time, (*entry.tx).clone()))
-                })
-            })
+            .map(|(txid, (time, transaction))| (time, txid, transaction))
             .collect::<Vec<_>>();
-        entries.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| right.1.compute_txid().cmp(&left.1.compute_txid()))
+        entries.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
         });
         entries
             .into_iter()
-            .map(|(_, transaction)| transaction)
+            .map(|(_, _, transaction)| transaction)
             .collect()
     }
 

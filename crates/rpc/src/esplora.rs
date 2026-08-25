@@ -1720,7 +1720,14 @@ mod tests {
         let activity = projection
             .script_activity(script_hash)
             .expect("script activity resolves");
-        assert_eq!(activity.mempool, vec![spending]);
+        assert_eq!(
+            activity
+                .mempool
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec![&spending]
+        );
         assert!(
             projection
                 .script_utxos(script_hash)
