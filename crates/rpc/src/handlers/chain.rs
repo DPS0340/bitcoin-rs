@@ -212,6 +212,14 @@ pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value,
 
 pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
+    // Tree guard first, then the tip -- and that order is load-bearing rather
+    // than incidental. A connect inserts its node under the tree's write lock
+    // and publishes the applied tip afterwards, so while this read guard is
+    // held no new node can appear, and any tip published in the meantime names
+    // a node that was already in the tree when the guard was taken. Loading the
+    // tip first would allow the reverse: a tip whose node this view has never
+    // seen, and every lookup below it answering `None` for a block the node has
+    // certainly connected.
     let tree = ctx.block_tree.read();
     // The active chain is the one this node has *connected*, not the one its
     // headers describe. Header-first sync runs the header tree thousands of
