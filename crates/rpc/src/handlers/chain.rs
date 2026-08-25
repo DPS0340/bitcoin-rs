@@ -1728,7 +1728,19 @@ mod tests {
             now - 3_600,
             now,
         );
+        let boundary = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            now - 2 * 60 * 60,
+            now,
+        );
         assert!((a - b).abs() < 1e-12, "{a} != {b}");
+        assert!(
+            (a - boundary).abs() < 1e-12,
+            "Core includes the exact two-hour boundary: {a} != {boundary}"
+        );
 
         // Outside the window the timestamp is used again, so this one differs.
         let outside = verification_progress(
@@ -1776,7 +1788,7 @@ mod tests {
             bitcoin_rs_primitives::Network::Regtest,
             100,
             9,
-            9,
+            10,
             tip_time,
             now,
         );
