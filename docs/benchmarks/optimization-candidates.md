@@ -26,8 +26,7 @@ best practice arrive with the UTXO-memory PR. The findings themselves depend on
 neither.
 
 Of the three G14 budgets only **tip RSS ≤ 16 GiB** is anywhere near binding: UTXO
-commit p95 measures 2.4 ms against 50 ms, and the Electrum path measures 33x
-under its 30 ms budget on synthetic fixtures. The ranking reflects that.
+commit p95 measures 2.4 ms against 50 ms. The ranking reflects that.
 
 ## Ranking
 
@@ -38,7 +37,7 @@ under its 30 ms budget on synthetic fixtures. The ranking reflects that.
 | 3 | F — remaining record encoding | 6 B/output, **projected** | ~1.0 GiB at tip | **tip RSS** |
 | 4 | C — mempool priority index | O(n² log n) rebuild, **not timed** | unknown | none |
 | 5 | D — `dbcache_mb` reaches nothing | verified code absence | unlocks tuning | **tip RSS**, indirectly |
-| 6 | E — one file open per position | 12.00 µs x P, **measured** | ~50 µs per 5-position height | Electrum p95 (headroom) |
+| 6 | E — one file open per position | 12.00 µs x P, **measured** | ~50 µs per 5-position height | ScriptIndex resolver headroom |
 
 Only **B** and **E** carry measured per-unit costs. **A** and **C** are shapes,
 not numbers. **F** rests on 3.626 outputs per record, which has not converged.
@@ -205,7 +204,7 @@ costs half a 250 KB one. The optimized resolver arm is now syscall-bound at ~13
 62 µs.
 
 **This is headroom, not a regression.** The position path already beats the scan
-path by 63-77x end to end. It only matters if the real G14 Electrum measurement
+path by 63-77x end to end. It only matters if a production ScriptIndex measurement
 lands closer to the 30 ms budget than the synthetic fixtures suggest — and that
 measurement has not been run.
 
@@ -249,7 +248,7 @@ Checked during the survey and cleared. Recorded so nobody re-checks them.
   old path as the oracle and the benchmark's `before` arm, prove equivalence,
   prove the win in one run.
 - **D** — needs a decision on what `dbcache_mb` should mean per backend first.
-- **E** — gated on the real G14 Electrum measurement. Do not build it against
+- **E** — gate on a production ScriptIndex measurement. Do not build it against
   synthetic fixtures.
 - **F** — the height half is gated on the BIP30 investigation; the script half is
   not gated on anything.
