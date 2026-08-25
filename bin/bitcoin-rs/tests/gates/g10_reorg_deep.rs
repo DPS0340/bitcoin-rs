@@ -1,6 +1,6 @@
 //! G10 — Reorg-deep.
 //! **G10 — Reorg-deep test (INTENDED).** A simulated 100-block reorg replays cleanly: UTXO state,
-//! coinstats, filter index, electrum index, wallet, and mempool all converge to the new tip without
+//! coinstats, filter index, `ScriptIndex`, wallet, and mempool all converge to the new tip without
 //! panic, deadlock, or stale row; verified against bitcoind's reorg behavior in regtest.
 //!
 //! **STATUS — NOT YET IMPLEMENTED.** Node-level chain reorganization does not exist: the apply path
@@ -43,7 +43,7 @@ fn reorg_deep_test() {
     );
 }
 
-/// INTENDED full-stack reorg gate: a 100-block reorg in which UTXO state, coinstats, filter/electrum
+/// INTENDED full-stack reorg gate: a 100-block reorg in which UTXO state, coinstats, filter index, and `ScriptIndex`
 /// indexes, wallet, and mempool all converge to the new tip, cross-checked against bitcoind regtest.
 ///
 /// NOT YET IMPLEMENTED — node-level reorg (block disconnect + UTXO undo) does not exist: `applied_tip`
@@ -53,6 +53,6 @@ fn reorg_deep_test() {
 #[ignore = "node-level reorg unimplemented (forward-only tip, undo not persisted, plan_reorg unwired)"]
 fn reorg_deep_fullstack() {
     // Apply a chain, reorg to a competing higher-work branch, and assert UTXO / coinstats / filter /
-    // electrum / wallet / mempool state converges to the new tip vs bitcoind regtest. Requires
+    // ScriptIndex / wallet / mempool state converges to the new tip vs bitcoind regtest. Requires
     // node-level reorg (disconnect + undo) to be implemented first.
 }

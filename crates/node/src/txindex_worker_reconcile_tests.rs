@@ -14,7 +14,7 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, NodeId, NodeStatus, TipSnapshot};
 use bitcoin_rs_index::PreparedBatchLimits;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_storage::{FjallStore, StorageError};
+use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore as _, StorageError, WriteBatch as _};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 
@@ -216,6 +216,7 @@ fn make_worker(
         block_tree: Arc::clone(tree),
         body_store: Some(body_store),
         batch_limits,
+        enabled: bitcoin_rs_index::IndexCapabilities::ALL,
         wake_rx,
         quiet_period: Duration::ZERO,
         batch_delay: Duration::ZERO,
@@ -262,7 +263,12 @@ fn forward_commit_overlapping_tip_extension_repairs_on_next_pass() {
     let mut pending = None;
     assert!(matches!(
         worker
-            .catch_up_to(&a1_tip, None, &mut pending)
+            .catch_up_to(
+                &a1_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
             .expect("prepare pass"),
         ReconcileAction::Buffered
     ));
@@ -331,7 +337,12 @@ fn forward_commit_overlapping_rival_reorg_repairs_on_next_pass() {
     let mut pending = None;
     assert!(matches!(
         worker
-            .catch_up_to(&a2_tip, None, &mut pending)
+            .catch_up_to(
+                &a2_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
             .expect("prepare pass"),
         ReconcileAction::Buffered
     ));
@@ -396,7 +407,12 @@ fn rollback_of_recanonicalized_watermark_repairs_on_next_pass() {
 
     assert!(matches!(
         worker
-            .catch_up_to(&a2_tip, None, &mut pending)
+            .catch_up_to(
+                &a2_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
             .expect("initial catch-up"),
         ReconcileAction::Buffered
     ));
@@ -408,7 +424,7 @@ fn rollback_of_recanonicalized_watermark_repairs_on_next_pass() {
 
     // The tip is still A2. An already-selected rollback can nevertheless land.
     let a1_watermark = worker
-        .rollback_one(a2_watermark)
+        .rollback_one(bitcoin_rs_index::IndexCapabilities::ALL, a2_watermark)
         .expect("rollback")
         .expect("A1 watermark");
     assert_eq!(
@@ -452,7 +468,12 @@ fn absent_tip_rolls_index_back_to_none() {
 
     assert!(matches!(
         worker
-            .catch_up_to(&a1_tip, None, &mut pending)
+            .catch_up_to(
+                &a1_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
             .expect("initial catch-up"),
         ReconcileAction::Buffered
     ));
@@ -468,6 +489,245 @@ fn absent_tip_rolls_index_back_to_none() {
         ReconcileAction::CaughtUp
     ));
     assert!(writer.watermark().unwrap().is_none());
+}
+
+#[test]
+fn missing_disconnected_body_resets_and_rebuilds_selected_capabilities() {
+    let (_temp, writer) = fjall_writer();
+    let f = fork_fixture();
+    let bodies = Arc::new(MapBodyStore::new(
+        bodies_map(&[
+            (0, f.genesis.1, &f.genesis.0),
+            (1, f.a1.1, &f.a1.0),
+            (2, f.a2.1, &f.a2.0),
+            (1, f.b1.1, &f.b1.0),
+            (2, f.b2.1, &f.b2.0),
+        ]),
+        None,
+    ));
+    let body_store: Arc<dyn PruneBodyStore> = bodies.clone();
+    let tree = Arc::new(RwLock::new(f.tree));
+    let applied_tip = make_applied_tip();
+    let a2_tip = Arc::new(tip_for(&tree.read(), f.a2_id));
+    applied_tip.store(Some(Arc::clone(&a2_tip)));
+    let (_runtime, worker) = make_worker(
+        &writer,
+        &applied_tip,
+        &tree,
+        body_store,
+        DEFAULT_BATCH_LIMITS,
+    );
+    let mut pending = None;
+    assert!(matches!(
+        worker
+            .catch_up_to(
+                &a2_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
+            .expect("initial catch-up"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle A2"),
+        ReconcileAction::CaughtUp
+    ));
+
+    bodies.bodies.lock().remove(&(2, f.a2.1.to_le_bytes()));
+    let b2_tip = Arc::new(tip_for(&tree.read(), f.b2_id));
+    applied_tip.store(Some(Arc::clone(&b2_tip)));
+
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("reset and rebuild pass"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle B2"),
+        ReconcileAction::CaughtUp
+    ));
+    let watermarks = writer.watermarks().expect("watermarks");
+    let expected = Some(IndexWatermark {
+        height: 2,
+        hash: f.b2.1.to_le_bytes(),
+    });
+    assert_eq!(watermarks.tx_lookup, expected);
+    assert_eq!(watermarks.script_history, expected);
+}
+
+#[test]
+fn stale_script_index_reset_preserves_ready_tx_lookup_then_rebuilds() {
+    let (_temp, writer) = fjall_writer();
+    let f = fork_fixture();
+    let bodies = Arc::new(MapBodyStore::new(
+        bodies_map(&[
+            (0, f.genesis.1, &f.genesis.0),
+            (1, f.a1.1, &f.a1.0),
+            (2, f.a2.1, &f.a2.0),
+            (1, f.b1.1, &f.b1.0),
+            (2, f.b2.1, &f.b2.0),
+        ]),
+        None,
+    ));
+    let body_store: Arc<dyn PruneBodyStore> = bodies.clone();
+    let tree = Arc::new(RwLock::new(f.tree));
+    let applied_tip = make_applied_tip();
+    let a2_tip = Arc::new(tip_for(&tree.read(), f.a2_id));
+    applied_tip.store(Some(Arc::clone(&a2_tip)));
+    let (_runtime, mut worker) = make_worker(
+        &writer,
+        &applied_tip,
+        &tree,
+        body_store,
+        DEFAULT_BATCH_LIMITS,
+    );
+    let mut pending = None;
+
+    assert!(matches!(
+        worker
+            .catch_up_to(&a2_tip, None, IndexCapabilities::ALL, &mut pending)
+            .expect("initial catch-up"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle A2"),
+        ReconcileAction::CaughtUp
+    ));
+
+    worker.enabled = IndexCapabilities::TX_LOOKUP;
+    let b2_tip = Arc::new(tip_for(&tree.read(), f.b2_id));
+    applied_tip.store(Some(Arc::clone(&b2_tip)));
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("move tx lookup to B2"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("settle tx lookup at B2"),
+        ReconcileAction::CaughtUp
+    ));
+    let a2 = Some(IndexWatermark {
+        height: 2,
+        hash: f.a2.1.to_le_bytes(),
+    });
+    let b2 = Some(IndexWatermark {
+        height: 2,
+        hash: f.b2.1.to_le_bytes(),
+    });
+    assert_eq!(
+        writer.watermarks().expect("divergent watermarks"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            script_history: a2,
+        }
+    );
+
+    bodies.bodies.lock().remove(&(2, f.a2.1.to_le_bytes()));
+    worker.enabled = IndexCapabilities::ALL;
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("selectively reset ScriptIndex and prepare B2"),
+        ReconcileAction::Buffered
+    ));
+    assert_eq!(
+        writer.watermarks().expect("watermarks during rebuild"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            script_history: None,
+        },
+        "TxLookup must remain ready while the ScriptIndex rebuild is pending"
+    );
+
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("commit ScriptIndex rebuild"),
+        ReconcileAction::CaughtUp
+    ));
+    assert_eq!(
+        writer.watermarks().expect("rebuilt watermarks"),
+        IndexWatermarks {
+            tx_lookup: b2,
+            script_history: b2,
+        }
+    );
+}
+
+#[test]
+fn missing_rollback_identity_resets_and_rebuilds_selected_capabilities() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(FjallStore::open(temp.path()).expect("fjall open"));
+    let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::Mutex::new(
+        bitcoin_rs_index::IndexWriter::open(Arc::clone(&store)).expect("index writer open"),
+    ));
+    let f = fork_fixture();
+    let body_store: Arc<dyn PruneBodyStore> = Arc::new(MapBodyStore::new(
+        bodies_map(&[
+            (0, f.genesis.1, &f.genesis.0),
+            (1, f.a1.1, &f.a1.0),
+            (2, f.a2.1, &f.a2.0),
+            (1, f.b1.1, &f.b1.0),
+            (2, f.b2.1, &f.b2.0),
+        ]),
+        None,
+    ));
+    let tree = Arc::new(RwLock::new(f.tree));
+    let applied_tip = make_applied_tip();
+    let a2_tip = Arc::new(tip_for(&tree.read(), f.a2_id));
+    applied_tip.store(Some(Arc::clone(&a2_tip)));
+    let (_runtime, worker) = make_worker(
+        &writer,
+        &applied_tip,
+        &tree,
+        body_store,
+        DEFAULT_BATCH_LIMITS,
+    );
+    let mut pending = None;
+    assert!(matches!(
+        worker
+            .catch_up_to(
+                &a2_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
+            .expect("initial catch-up"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle A2"),
+        ReconcileAction::CaughtUp
+    ));
+
+    let mut corrupt = store.new_batch();
+    corrupt.delete(ColumnFamily::BlockHeaders, &serialize(&f.a2.0.header));
+    store.write_durable(corrupt).expect("remove identity row");
+    let b2_tip = Arc::new(tip_for(&tree.read(), f.b2_id));
+    applied_tip.store(Some(Arc::clone(&b2_tip)));
+
+    assert!(matches!(
+        worker
+            .reconcile_once(&mut pending)
+            .expect("reset and rebuild pass"),
+        ReconcileAction::Buffered
+    ));
+    assert!(matches!(
+        worker.reconcile_once(&mut pending).expect("settle B2"),
+        ReconcileAction::CaughtUp
+    ));
+    let expected = Some(IndexWatermark {
+        height: 2,
+        hash: f.b2.1.to_le_bytes(),
+    });
+    let watermarks = writer.watermarks().expect("watermarks");
+    assert_eq!(watermarks.tx_lookup, expected);
+    assert_eq!(watermarks.script_history, expected);
 }
 
 #[test]
@@ -489,7 +749,12 @@ fn overflow_block_is_reprepared_and_committed_on_next_pass() {
 
     assert!(matches!(
         worker
-            .catch_up_to(&a1_tip, None, &mut pending)
+            .catch_up_to(
+                &a1_tip,
+                None,
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending
+            )
             .expect("first pass"),
         ReconcileAction::Progressed
     ));
@@ -498,7 +763,12 @@ fn overflow_block_is_reprepared_and_committed_on_next_pass() {
 
     assert!(matches!(
         worker
-            .catch_up_to(&a1_tip, Some(watermark), &mut pending)
+            .catch_up_to(
+                &a1_tip,
+                Some(watermark),
+                bitcoin_rs_index::IndexCapabilities::ALL,
+                &mut pending,
+            )
             .expect("second pass"),
         ReconcileAction::Progressed
     ));

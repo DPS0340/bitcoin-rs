@@ -30,7 +30,7 @@ Language and toolchain settings are locked centrally in `rust-toolchain.toml` an
 ### 3.1 Adding Dependencies
 - All `[dependencies]` and `[build-dependencies]` of member crates (`crates/*`) must be defined centrally in `Cargo.toml` under `[workspace.dependencies]`.
 - Member crates must inherit those using `{ workspace = true }`.
-- `[dev-dependencies]` are exempt. They do not reach the shipped binary, so a version skew between two crates' test harnesses cannot produce a runtime conflict, and centralizing them buys nothing. Eleven member manifests declare `tempfile = "3"` directly under `[dev-dependencies]` and there is no workspace entry for it; that is intended, not drift.
+- `[dev-dependencies]` are exempt. They do not reach the shipped binary, so a version skew between two crates' test harnesses cannot produce a runtime conflict, and centralizing them buys nothing. Twelve member manifests declare `tempfile = "3"` directly under `[dev-dependencies]` and there is no workspace entry for it; that is intended, not drift.
 - Centralize a dev-dependency anyway when two crates must agree on a type that crosses between them in tests.
 - Do not add dependencies for functionality available in the Rust standard library or existing workspace crates.
 - Prohibited dependencies: `tokio`, `async-std`, or any async runtime. The node architecture uses a synchronous crossbeam-channel event loop (`PLAN.md`).
@@ -63,7 +63,6 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-wallet` | `crates/wallet` | Watch-only descriptor tracking, coin selection, PSBT construction, fee bumping |
 | `bitcoin-rs-mining` | `crates/mining` | Block template construction |
 | `bitcoin-rs-rpc` | `crates/rpc` | JSON-RPC HTTP server |
-| `bitcoin-rs-electrum` | `crates/electrum` | Electrum protocol server |
 | `bitcoin-rs-node` | `crates/node` | Full node state machine and event loop |
 | `bitcoin-rs` | `bin/bitcoin-rs` | Command-line node binary |
 

@@ -8,6 +8,7 @@ use bitcoin::hex::{DisplayHex, FromHex as _};
 use bitcoin::{Block, FeeRate, OutPoint, Transaction, TxOut, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_consensus::rust_path::UtxoView;
+use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{
     AcceptChecks, AcceptContext, AcceptError, AcceptResult, Mempool, MempoolLimits,
     StandardnessPolicy, accept_to_mempool, check_acceptance,
@@ -793,6 +794,74 @@ pub trait TxIndexQuery: Send + Sync {
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
 
+/// One current unspent output indexed for a script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptIndexRecord {
+    /// Transaction creating the output.
+    pub txid: Txid,
+    /// Confirmed block height.
+    pub height: u32,
+    /// Output value in satoshis.
+    pub value: u64,
+    /// Output index.
+    pub vout: u32,
+}
+
+/// One confirmed transaction in script history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptHistoryRecord {
+    /// Transaction identifier.
+    pub txid: Txid,
+    /// Confirming block height.
+    pub height: u32,
+}
+
+/// One confirmed transaction spending an indexed outpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpendingRecord {
+    /// Spending transaction identifier.
+    pub txid: Txid,
+    /// Confirming block height.
+    pub height: u32,
+    /// Input index that spends the outpoint.
+    pub vin: u32,
+}
+
+/// A point-in-time script-history answer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScriptIndexSnapshot {
+    /// All confirmed funding and spending transactions for the script.
+    pub history: Vec<ScriptHistoryRecord>,
+    /// Every confirmed output paying the script, spent ones included.
+    ///
+    /// Carried out of the same budgeted storage snapshot that produced
+    /// `history`. Address statistics are sums over these rows; a caller without
+    /// them has to re-read one transaction per history entry, and each of those
+    /// reads is a fresh index query with its own budget, so the total escapes
+    /// the bound this snapshot is taken under.
+    pub funding: Vec<ScriptIndexRecord>,
+}
+
+/// Lockless query adapter for the node-owned generic script index.
+///
+/// A result is returned only when the script-index watermark proves coverage
+/// of the exact applied tip.  `Retry` and `Unavailable` therefore never mean
+/// an empty address.
+pub trait ScriptIndexQuery: Send + Sync {
+    /// Returns current UTXOs for a script.
+    fn unspent_outputs(
+        &self,
+        script_hash: ScriptHash,
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError>;
+    /// Returns confirmed history from one storage snapshot.
+    fn history_snapshot(
+        &self,
+        script_hash: ScriptHash,
+    ) -> Result<ScriptIndexSnapshot, TxQueryError>;
+    /// Returns the confirmed transaction spending `outpoint`, if any.
+    fn spender(&self, outpoint: OutPoint) -> Result<Option<SpendingRecord>, TxQueryError>;
+}
+
 impl TxQueryError {
     /// Maps a transaction-index failure to an explicit JSON-RPC error.
     #[must_use]
@@ -853,6 +922,13 @@ pub struct Context {
     /// Optional node-owned complete transaction-index query adapter.
     /// `None` when transaction indexing is disabled.
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Complete transaction lookup used internally by Esplora projections.
+    ///
+    /// This may be available with `--scriptindex` even when `tx_index` is
+    /// absent, because it does not advertise the Core `--txindex` contract.
+    pub esplora_tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Optional node-owned generic script-index query adapter.
+    pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
@@ -930,6 +1006,8 @@ impl Context {
             coin_stats,
             filter_index: noop_filter_index(),
             tx_index: None,
+            esplora_tx_index: None,
+            script_index: None,
             prune_service: None,
             chain_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
@@ -974,6 +1052,7 @@ impl Context {
         banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
         added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
         tx_index: Option<Arc<dyn TxIndexQuery>>,
+        script_index: Option<Arc<dyn ScriptIndexQuery>>,
     ) -> Self {
         let (mining_sender, mining_notifications) = unbounded();
         Self {
@@ -988,6 +1067,8 @@ impl Context {
             coin_stats,
             filter_index,
             tx_index,
+            esplora_tx_index: None,
+            script_index,
             network,
             chain_network,
             peers,
@@ -1004,6 +1085,14 @@ impl Context {
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             mining_sender,
         }
+    }
+
+    /// Attaches the internal transaction lookup required for Esplora output
+    /// projections without exposing it to Core transaction-index RPCs.
+    #[must_use]
+    pub fn with_esplora_tx_index(mut self, tx_index: Option<Arc<dyn TxIndexQuery>>) -> Self {
+        self.esplora_tx_index = tx_index;
+        self
     }
 
     /// Returns `self` with a durable block body source.
@@ -1735,6 +1824,7 @@ mod tests {
             None,
             Arc::clone(&banned),
             Arc::clone(&added_nodes),
+            None,
             None,
         );
         assert!(

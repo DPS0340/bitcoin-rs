@@ -8,10 +8,10 @@
 use alloc::sync::Arc;
 
 use bitcoin::Block;
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::FromHex as _;
-use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
+use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_index::BlockSource;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::{BlockBodySource, BlockLog, record_at_height, record_at_height_hash};
@@ -25,7 +25,6 @@ pub struct NodeBlockSource {
     blocks: Arc<RwLock<BlockLog>>,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
     block_tree: Option<Arc<RwLock<BlockTree>>>,
-    applied_tip: Option<Arc<arc_swap::ArcSwapOption<TipSnapshot>>>,
 }
 
 impl NodeBlockSource {
@@ -36,7 +35,6 @@ impl NodeBlockSource {
             blocks,
             block_body_source: None,
             block_tree: None,
-            applied_tip: None,
         }
     }
 
@@ -56,16 +54,6 @@ impl NodeBlockSource {
     #[must_use]
     pub fn with_block_tree(mut self, tree: Arc<RwLock<BlockTree>>) -> Self {
         self.block_tree = Some(tree);
-        self
-    }
-
-    /// Returns `self` with the committed applied-tip publisher used by Electrum.
-    #[must_use]
-    pub fn with_applied_tip(
-        mut self,
-        applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
-    ) -> Self {
-        self.applied_tip = Some(applied_tip);
         self
     }
 }
@@ -105,36 +93,6 @@ impl BlockSource for NodeBlockSource {
 }
 
 impl NodeBlockSource {
-    fn captured_applied_tip(
-        &self,
-    ) -> Result<Arc<TipSnapshot>, bitcoin_rs_electrum::methods::ElectrumError> {
-        self.applied_tip
-            .as_ref()
-            .ok_or_else(|| {
-                bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                    "applied chain tip unavailable".into(),
-                )
-            })?
-            .load_full()
-            .ok_or(bitcoin_rs_electrum::methods::ElectrumError::NotFound(
-                "no applied chain tip",
-            ))
-    }
-
-    fn applied_node_at_height(
-        tree: &BlockTree,
-        tip: &TipSnapshot,
-        height: u32,
-    ) -> Result<NodeId, bitcoin_rs_electrum::methods::ElectrumError> {
-        if height > tip.height {
-            return Err(bitcoin_rs_electrum::methods::ElectrumError::NotFound(
-                "applied-chain header",
-            ));
-        }
-        tree.node_at_height_from(tip.tip_id, height).ok_or(
-            bitcoin_rs_electrum::methods::ElectrumError::NotFound("applied-chain header"),
-        )
-    }
     fn cached_body_bytes(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
         let block_hex = {
             let guard = self.blocks.read();
@@ -144,10 +102,8 @@ impl NodeBlockSource {
         Vec::<u8>::from_hex(&block_hex).ok()
     }
 
-    /// Returns the serialized block bytes for an exact `(height, hash)` pair
-    /// from the authoritative body source, falling back to the in-memory record
-    /// cache. The caller is responsible for hashing the bytes and checking
-    /// identity. No shared read guard is held over body-source I/O.
+    /// Returns serialized bytes for an exact `(height, hash)` pair from the
+    /// authoritative body source, falling back to the in-memory payload cache.
     pub(crate) fn block_body_bytes_for(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
         if let Some(body_source) = self.block_body_source.as_ref()
             && let Some(bytes) = body_source.block_body(height, hash)
@@ -164,140 +120,6 @@ impl NodeBlockSource {
         (decoded_hash == active_hash).then_some(block)
     }
 }
-
-impl bitcoin_rs_electrum::methods::BlockTreeAdapter for NodeBlockSource {
-    fn tip(&self) -> Result<(u32, [u8; 80]), bitcoin_rs_electrum::methods::ElectrumError> {
-        let tip = self.captured_applied_tip()?;
-        let tree = self.block_tree.as_ref().ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "authoritative block tree unavailable".into(),
-            )
-        })?;
-        let tree = tree.read();
-        let node_id = Self::applied_node_at_height(&tree, &tip, tip.height)?;
-        let node = tree.node(node_id).map_err(|_| {
-            bitcoin_rs_electrum::methods::ElectrumError::NotFound("applied-chain tip")
-        })?;
-        if node.hash != tip.hash {
-            return Err(bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "applied chain tip changed".into(),
-            ));
-        }
-        Ok((tip.height, serialized_header(&node.header)?))
-    }
-
-    fn header_at(
-        &self,
-        height: u32,
-    ) -> Result<[u8; 80], bitcoin_rs_electrum::methods::ElectrumError> {
-        let tip = self.captured_applied_tip()?;
-        let tree = self.block_tree.as_ref().ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "authoritative block tree unavailable".into(),
-            )
-        })?;
-        let tree = tree.read();
-        let node_id = Self::applied_node_at_height(&tree, &tip, height)?;
-        let node = tree.node(node_id).map_err(|_| {
-            bitcoin_rs_electrum::methods::ElectrumError::NotFound("applied-chain header")
-        })?;
-        serialized_header(&node.header)
-    }
-
-    fn headers_range(
-        &self,
-        start: u32,
-        count: usize,
-    ) -> Result<Vec<[u8; 80]>, bitcoin_rs_electrum::methods::ElectrumError> {
-        let tip = self.captured_applied_tip()?;
-        let tree = self.block_tree.as_ref().ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "authoritative block tree unavailable".into(),
-            )
-        })?;
-        let tree = tree.read();
-        let available = tip
-            .height
-            .checked_sub(start)
-            .and_then(|remaining| remaining.checked_add(1))
-            .and_then(|remaining| usize::try_from(remaining).ok())
-            .unwrap_or(0);
-        let capacity = count.min(available);
-        let mut headers = Vec::with_capacity(capacity);
-        for offset in 0..capacity {
-            let offset = u32::try_from(offset).map_err(|_| {
-                bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                    "header range overflow".into(),
-                )
-            })?;
-            let height = start.checked_add(offset).ok_or_else(|| {
-                bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                    "header range overflow".into(),
-                )
-            })?;
-            let node_id = Self::applied_node_at_height(&tree, &tip, height)?;
-            let node = tree.node(node_id).map_err(|_| {
-                bitcoin_rs_electrum::methods::ElectrumError::NotFound("applied-chain header")
-            })?;
-            headers.push(serialized_header(&node.header)?);
-        }
-        Ok(headers)
-    }
-
-    fn block_at(&self, height: u32) -> Result<Block, bitcoin_rs_electrum::methods::ElectrumError> {
-        let tip = self.captured_applied_tip()?;
-        let tree = self.block_tree.as_ref().ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "authoritative block tree unavailable".into(),
-            )
-        })?;
-        let hash = {
-            let tree = tree.read();
-            let node_id = Self::applied_node_at_height(&tree, &tip, height)?;
-            tree.node(node_id)
-                .map_err(|_| {
-                    bitcoin_rs_electrum::methods::ElectrumError::NotFound("applied-chain block")
-                })?
-                .hash
-        };
-        self.resolve_block_by_hash(height, hash).ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "applied-chain block body unavailable".into(),
-            )
-        })
-    }
-
-    fn genesis_hash(
-        &self,
-    ) -> Result<bitcoin::BlockHash, bitcoin_rs_electrum::methods::ElectrumError> {
-        let tip = self.captured_applied_tip()?;
-        let tree = self.block_tree.as_ref().ok_or_else(|| {
-            bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-                "authoritative block tree unavailable".into(),
-            )
-        })?;
-        let tree = tree.read();
-        let node_id = Self::applied_node_at_height(&tree, &tip, 0)?;
-        tree.node(node_id)
-            .map(|node| node.header.block_hash())
-            .map_err(|_| {
-                bitcoin_rs_electrum::methods::ElectrumError::NotFound(
-                    "applied-chain genesis header",
-                )
-            })
-    }
-}
-
-fn serialized_header(
-    header: &bitcoin::block::Header,
-) -> Result<[u8; 80], bitcoin_rs_electrum::methods::ElectrumError> {
-    serialize(header).try_into().map_err(|_| {
-        bitcoin_rs_electrum::methods::ElectrumError::Unavailable(
-            "invalid serialized block header length".into(),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,65 +368,6 @@ mod tests {
             )
         })?;
         assert_eq!(decoded.block_hash(), genesis.block_hash());
-        Ok(())
-    }
-
-    #[test]
-    fn electrum_block_tree_adapter_stops_at_applied_tip() -> TestResult {
-        use bitcoin_rs_electrum::methods::BlockTreeAdapter;
-
-        let genesis = genesis_block(Network::Regtest);
-        let expected_header: [u8; 80] = serialize(&genesis.header)
-            .try_into()
-            .map_err(|_| std::io::Error::other("genesis header must serialize to 80 bytes"))?;
-        let expected_hash = genesis.block_hash();
-
-        let mut tree = BlockTree::new();
-        let genesis_id = tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
-        let genesis_node = tree.node(genesis_id)?;
-        let applied = TipSnapshot {
-            tip_id: genesis_id,
-            height: genesis_node.height,
-            chainwork: genesis_node.chainwork,
-            hash: genesis_node.hash,
-        };
-        let mut header_only = genesis.header;
-        header_only.prev_blockhash = genesis.block_hash();
-        header_only.time = header_only.time.saturating_add(1);
-        header_only.nonce = header_only.nonce.wrapping_add(1);
-        let header_only_id = tree.insert_header(header_only, NodeStatus::HeaderValid)?;
-        assert_eq!(tree.node(header_only_id)?.height, 1);
-        assert_eq!(tree.tip().map(|tip| tip.height), Some(1));
-        let tree = Arc::new(RwLock::new(tree));
-        let applied_tip = Arc::new(arc_swap::ArcSwapOption::empty());
-        applied_tip.store(Some(Arc::new(applied)));
-
-        let record = BlockRecord::from_block(0, &genesis);
-        let blocks = Arc::new(RwLock::new(BlockLog::from_iter([record])));
-        let source = NodeBlockSource::new(blocks)
-            .with_block_tree(tree)
-            .with_applied_tip(applied_tip);
-
-        let (tip_height, tip_header) = source.tip()?;
-        assert_eq!(tip_height, 0);
-        assert_eq!(tip_header, expected_header);
-
-        let header_at_zero = source.header_at(0)?;
-        assert_eq!(header_at_zero, expected_header);
-        assert!(matches!(
-            source.header_at(1),
-            Err(bitcoin_rs_electrum::methods::ElectrumError::NotFound(_))
-        ));
-
-        let genesis_hash = source.genesis_hash()?;
-        assert_eq!(genesis_hash, expected_hash);
-
-        let headers = source.headers_range(0, 2)?;
-        assert_eq!(headers, vec![expected_header]);
-
-        let block_at_zero = source.block_at(0)?;
-        assert_eq!(block_at_zero.block_hash(), expected_hash);
-
         Ok(())
     }
 }

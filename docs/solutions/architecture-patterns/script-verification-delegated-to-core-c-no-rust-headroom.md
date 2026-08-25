@@ -55,15 +55,11 @@ for (input_index, input) in tx.input.iter().enumerate() {
 
 The hypothesis was that replacing `std::collections::BTreeSet` with `hashbrown::HashSet` would reduce per-transaction verification overhead by substituting O(1) hashing for tree operations. Instead, the change caused a statistically significant performance regression of +2.7% on the `verify_tx/multi_input_true_scripts` benchmark (p<0.05), leading to an immediate revert.
 
-Under current architecture, default builds route all production input-script verification across all script classes to `bitcoinkernel` (`libbitcoinkernel`), while Rust retains surrounding non-script consensus checks. The `--no-default-features` direct `Interpreter` posture is a separate non-production path retained for differential testing, lacking Taproot script-path validation capabilities.
-
-Because the `seen` set holds only a few outpoints per transaction, swapping containers at tiny N adds allocation and hashing overhead without reducing execution time. The +2.7% container regression remains historical evidence from the `bitcoinconsensus` era and cannot support a direct performance comparison against the current `bitcoinkernel` default. The core operational lesson remains valid: profile first before modifying small-N collections or wrapper logic adjacent to consensus verification.
+Because the `seen` set holds only a few outpoints per transaction, swapping containers at tiny N adds allocation and hashing overhead without reducing execution time. The +2.7% number was measured in the `bitcoinconsensus` era; the container conclusion holds regardless, but a direct performance comparison against the current `bitcoinkernel` default needs fresh measurement.
 
 ## Guidance
 
-**Production script verification routes to `bitcoinkernel`; optimize measured Rust-side preparation and non-script stages.** Under default features, production input-script verification delegates all script classes to `bitcoinkernel`, while Rust performs surrounding non-script consensus checks. Direct `Interpreter` calls remain a separate portable posture under `--no-default-features` and cannot validate Taproot script-path transactions on mainnet.
-
-Because core script evaluation runs inside `bitcoinkernel`, Rust-side micro-optimizations inside verifier loops provide limited leverage. Optimization efforts must focus on measured Rust-side bottlenecks (such as UTXO caching, input preparation, storage commits, and block download scheduling).
+**Optimize measured Rust-side preparation and non-script stages.** Because core script evaluation runs inside `bitcoinkernel`, Rust-side micro-optimizations inside verifier loops provide limited leverage. Optimization efforts must focus on measured Rust-side bottlenecks (such as UTXO caching, input preparation, storage commits, and block download scheduling).
 
 Concretely:
 
@@ -73,7 +69,7 @@ Concretely:
 
 ## Why This Matters
 
-**Delegating production script evaluation to `bitcoinkernel` bounds Rust-side execution headroom on the script path while requiring focus on surrounding stages.** While core script execution runs inside `libbitcoinkernel`, surrounding Rust logic (UTXO retrieval, transaction iteration, container allocation, and storage commits) decides remaining Rust-side performance. Unprofiled micro-optimizations risk adding allocation or hashing overhead, whereas measured wrapper or caching improvements remain effective.
+**Delegating production script evaluation to `bitcoinkernel` bounds Rust-side headroom on the script path.** Surrounding Rust logic — UTXO retrieval, transaction iteration, container allocation, storage commits — decides the remaining Rust-side performance.
 
 This aligns with a core system design principle: **optimize the actual bottleneck, not the convenient one.** Real-world IBD wall-clock time is frequently download-bandwidth or storage-bound rather than CPU-script bound. Profiling isolates the true constraint before code changes begin.
 
@@ -116,7 +112,7 @@ if !seen.insert(input.previous_output) {
 | Baseline         | `BTreeSet`            | 3.6312 ms | —                      | —                  |
 | Experiment       | `hashbrown::HashSet`  | 3.7297 ms | **+2.7% (regression)** | p<0.05 significant |
 
-The `seen` set holds only a handful of outpoints per tx; the container swap added `HashSet` allocation plus hashing constant factors at tiny N without delivering a measured win, producing a net +2.7% regression. This result is historical evidence from the `bitcoinconsensus` era; current performance under `bitcoinkernel` requires fresh measurement. Outcome: reverted.
+Outcome: reverted.
 
 ## Related
 

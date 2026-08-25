@@ -28,9 +28,11 @@ through the `ZmqPublisher` trait and its `SocketZmqPublisher` / `TracingZmqPubli
   (`bitcoin-rs-consensus/kernel`).
 - `checksig-census`: `kernel` plus the consensus crate's checksig-census
   instrumentation.
-- `mimalloc`: switch to the mimalloc allocator.
+- `mimalloc`: pulls the optional `mimalloc` dependency; the
+  `mainnet_prefix_replay` example registers it as the global allocator.
 - `utreexo`: pull in the optional `bitcoin-rs-utreexo` crate.
-- `prometheus-http`: expose the metrics registry over a Prometheus HTTP listener.
+- `prometheus-http`: enables the `metrics-exporter-prometheus/http-listener` feature;
+  the in-process metrics recorder does not start an HTTP listener.
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

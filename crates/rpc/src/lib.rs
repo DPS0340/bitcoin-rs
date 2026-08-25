@@ -17,6 +17,8 @@ pub mod auth;
 pub mod context;
 /// JSON-RPC error mapping.
 pub mod error;
+/// Esplora-compatible HTTP endpoints backed by node-owned indexes.
+pub mod esplora;
 /// Method dispatch and Core-compatible handlers.
 pub mod handlers;
 /// Bitcoin Core-compatible REST endpoints.
@@ -28,7 +30,8 @@ pub use auth::Auth;
 pub use context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, BlockRecord, ChainControl, ChainControlError,
     ChainStats, Context, FoldedBlockRecords, NetworkState, PruneResult, PruneService,
-    PruneServiceError, PruneStatus, TxIndexInfo, TxIndexQuery, TxQueryError, ZmqNotification,
+    PruneServiceError, PruneStatus, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
+    ScriptIndexSnapshot, SpendingRecord, TxIndexInfo, TxIndexQuery, TxQueryError, ZmqNotification,
     chain_stats, fold_block_records, record_at_height, record_at_height_hash,
 };
 pub use error::RpcError;

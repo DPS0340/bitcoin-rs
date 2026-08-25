@@ -1,22 +1,17 @@
 # Index read-path benchmarks
 
-Baseline for the Electrum/index read path, captured before any optimization.
+Baseline for the ScriptIndex resolver read path, captured before any optimization.
 Prior performance campaigns covered the sync and apply path only; `crates/index`
-and `crates/electrum` had no benchmarks at all, so no number existed for the
-G14 Electrum `get_history` p95 <= 30 ms budget.
+had no benchmarks for this resolver, so no read-path number existed.
 
-Harness: `crates/index/benches/history_resolve.rs` and
-`crates/electrum/benches/electrum_methods.rs`. Both are Criterion, both hold the
+Harness: `crates/index/benches/history_resolve.rs`. It is Criterion and holds the
 `before_scan` and `after_fast` arms of a refactor set in one group over one
 fixture. At the **baseline** commit both arms called the same code, which is
 what the noise-floor section below measures; both harnesses now run genuinely
 different paths in each arm.
 
-In `history_resolve.rs` the arms call different functions — the retained `*_scan`
-reference against the position-backed resolver. In `electrum_methods.rs` both
-arms enter the same `dispatch`, and the arms are separated by giving each its own
-`IndexHandle` over a block source that either serves ranged reads or declines
-them. Same rows, same block files, same request.
+The arms call different functions — the retained `*_scan` reference against the
+position-backed resolver — over the same rows and block files.
 
 > **Harness correction, 2026-08-13 (second).** Between the resolver rewrite
 > landing and this revision, the two `electrum_methods.rs` arms were *literally
@@ -94,7 +89,11 @@ a txid only for transactions that matched. That is a double-SHA256 over every
 full transaction serialization in the block, per row, thrown away for all but
 one transaction.
 
-## Electrum dispatch
+## Historical Electrum dispatch evidence
+
+> This protocol-level measurement is retained only as provenance for the resolver
+> campaign. The Electrum server was removed; current consumers are `ScriptIndex`
+> and Esplora.
 
 End-to-end through `dispatch`, including JSON parameter parsing and rendering.
 Medians, `before_scan` arm, pre-optimization, on the in-memory harness. The
@@ -484,11 +483,10 @@ with block size. That is a complexity change, and no amount of hardware moves
 `resolve_script_history` at 8 heights off 106 µs whether the blocks are 250 KB or
 1 MB.
 
-## G14 Electrum gate: still unclaimed, and why
+## Historical protocol gate: still unclaimed
 
-Everything above is in-tree signal. The gate of record is
-`scripts/measure-g14-electrum-rss.sh` against a mainnet-tip node, and it has
-**not** been run. Three independent blockers, none of them code:
+Everything above is in-tree resolver evidence. The retired protocol gate was
+never run against a mainnet-tip node.
 
 1. **The script needs Python 3.10+.** It annotates with PEP 604 unions
    (`dict[str, str | bool]`) that are evaluated at runtime. On a host with
@@ -500,22 +498,22 @@ Everything above is in-tree signal. The gate of record is
 2. **The script is Linux-only.** Eight reads of `/proc` — `/proc/{pid}/exe` for
    the process-identity check, and the network tables for the
    accepted-connection proof. There is no macOS path.
-3. **It needs a synced mainnet-tip node** with Electrum enabled and a corpus of
+3. **It needed a synced mainnet-tip node** with the retired server enabled and a corpus of
    real 64-hex scripthashes, one per line, with at least 10,000 non-empty
    histories.
 
-The invocation, for whoever has that host:
+The retired invocation is not a current reproduction command:
 
 ```
-scripts/measure-g14-electrum-rss.sh \
+# retired command; retained arguments are historical only
   --output <measurement.json> --host <host> --port <port> \
   --pid <bitcoin-rs-pid> --tip-height <height> --tip-hash <64-hex> \
   --scripthashes <corpus-path> --sample-size 10000
 ```
 
-Defaults are `--sample-size 10000 --seed g14-electrum-rss-v1
+Defaults were `--sample-size 10000 --seed g14-electrum-rss-v1
 --timeout-seconds 30`; the emitted JSON carries schema
-`g14-electrum-rss-measurement-v1` and feeds the evidence-manifest flow.
+`g14-electrum-rss-measurement-v1`; the retired script is not a current command.
 
 **Do not claim the gate from the numbers on this page.** They come from
 synthetic fixtures on a laptop. What they establish is that the resolver's cost
@@ -526,7 +524,6 @@ direction and the shape, not the gate result.
 
 ```
 cargo bench -p bitcoin-rs-index    --bench history_resolve   --features rocksdb
-cargo bench -p bitcoin-rs-electrum --bench electrum_methods  --features rocksdb
 ```
 
 Both fixtures assert they resolve the expected entry count before benchmarking.

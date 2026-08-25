@@ -513,7 +513,7 @@ out/
 Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`) proves replay state stability across all three storage backends (`fjall`, `rocksdb`, `redb`). The harness operates on disposable reflink copies (`cp --reflink=always -a`). Original stores remain immutable and byte-identical before and after probes.
 
 - **Custody Summary**: `/home/alpha/bench-g14/corpora/c150/durability-sdd/custody-summary.json`
-- **Original Store Digests** (`sha256` over POSIX-sorted files):
+- **Original Store Digests** (deterministic POSIX-path file framing, `sha256(u64le(path_len)||path||u64le(file_size)||file_bytes)`):
   - `fjall`: 50 files, 1,119,730,063 bytes, SHA256 `5ea0d8ef6f473a5809e06e6ebc9dc9cfc3a9ed8abe4d92488ca68ebce88d3409`
   - `rocksdb`: 28 files, 1,000,273,901 bytes, SHA256 `97cec9bc615d040a518f71179ddadd27e7d91effe86cd46f3cdfe502b0f336d0`
   - `redb`: 12 files, 1,317,885,356 bytes, SHA256 `ecd80f3ada801a66e26090bedfb346f5654c2a497dcc1a0da1c22aebd2d1af15`

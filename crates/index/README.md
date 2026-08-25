@@ -1,8 +1,8 @@
 # bitcoin-rs-index
 
-Owns the confirmed-transaction index: electrs-shaped rows over the workspace key-value
-store, the versioned `TxIndex` watermark that pins rows to an exact active-chain prefix,
-and Electrum scripthash status hashing.
+Owns the confirmed-transaction index: compact rows over the workspace key-value
+store and versioned `TxLookup`/`ScriptHistory` watermarks that pin rows to an exact
+active-chain prefix.
 
 `Indexer<S: KvStore>` walks a serialized block once (`ingest_block`) and writes txid,
 script-funding, and previous-outpoint spending rows (counted by `IndexRowCounts`);
@@ -16,7 +16,7 @@ while the `IndexReader` trait captures a point-in-time `TxIndexSnapshot` for bou
 typed scans (`TxIndexScan`), and `IndexFormat`/`INDEX_FORMAT_VERSION` track whether row
 values carry transaction positions. Around the rows sit the stable types (`ScriptHash`,
 `HashPrefixRow`, `HeaderRow`, `TxidRow`, `SpendingPrefixRow`), `MempoolRowWriter` for
-unconfirmed rows, and `compute_status_hash` over ordered `HistoryEntry`s.
+unconfirmed rows and generic script-history resolution.
 
 ## Features
 - `rocksdb`: enables the `RocksDB` backend in `bitcoin-rs-storage`

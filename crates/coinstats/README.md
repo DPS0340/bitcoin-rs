@@ -1,8 +1,8 @@
 # bitcoin-rs-coinstats
 
 Owns running UTXO-set statistics: the `MuHash3072` accumulator, incremental per-block
-`CoinStats`, their persistence, and the rewind that owed derived state requires when a
-block disconnects.
+`CoinStats`, their persistence, and the rewind that accounts for
+[`owed derived state`](../../CONCEPTS.md#owed-derived-state) when a block disconnects.
 
 `MuHash3072` is Bitcoin Core's 3072-bit `MuHash` as a running numerator/denominator
 (`insert`, `remove`, `combine`, `finalize_hash` yielding the Core-compatible `uint256`).

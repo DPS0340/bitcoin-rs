@@ -28,7 +28,6 @@ rocksdb = [
     "bitcoin-rs-chain/rocksdb",
     "bitcoin-rs-coinstats/rocksdb",
     "bitcoin-rs-consensus/rocksdb",
-    "bitcoin-rs-electrum/rocksdb",
     "bitcoin-rs-filters/rocksdb",
     "bitcoin-rs-index/rocksdb",
     "bitcoin-rs-mempool/rocksdb",
@@ -46,7 +45,6 @@ fjall = [
     "bitcoin-rs-chain/fjall",
     "bitcoin-rs-coinstats/fjall",
     "bitcoin-rs-consensus/fjall",
-    "bitcoin-rs-electrum/fjall",
     "bitcoin-rs-filters/fjall",
     "bitcoin-rs-index/fjall",
     "bitcoin-rs-mempool/fjall",
@@ -64,7 +62,6 @@ redb = [
     "bitcoin-rs-chain/redb",
     "bitcoin-rs-coinstats/redb",
     "bitcoin-rs-consensus/redb",
-    "bitcoin-rs-electrum/redb",
     "bitcoin-rs-filters/redb",
     "bitcoin-rs-index/redb",
     "bitcoin-rs-mempool/redb",
@@ -110,7 +107,6 @@ bitcoin-rs-p2p.workspace = true
 bitcoin-rs-wallet.workspace = true
 bitcoin-rs-mining.workspace = true
 bitcoin-rs-rpc.workspace = true
-bitcoin-rs-electrum.workspace = true
 
 bitcoin.workspace = true
 mimalloc = { workspace = true, optional = true }
