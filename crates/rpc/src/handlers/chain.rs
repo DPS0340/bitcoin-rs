@@ -37,16 +37,15 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     // without first making its input durable would turn a wrong-but-close
     // number into a confident 0.0 on every restarted node.
     let verification_progress = if headers > 0 {
-        f64::from(applied) / f64::from(headers)
+        (f64::from(applied) / f64::from(headers)).min(1.0)
     } else {
         0.0
     };
     let initialblockdownload = ctx.is_initial_block_download(unix_now());
     let chain = match ctx.chain_network {
         bitcoin_rs_primitives::Network::Mainnet => "main",
-        bitcoin_rs_primitives::Network::Testnet3 | bitcoin_rs_primitives::Network::Testnet4 => {
-            "test"
-        }
+        bitcoin_rs_primitives::Network::Testnet3 => "test",
+        bitcoin_rs_primitives::Network::Testnet4 => "testnet4",
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
@@ -1585,6 +1584,46 @@ mod tests {
         assert!(
             progress.abs() < f64::EPSILON,
             "expected 0.0, got {progress}"
+        );
+    }
+
+    #[test]
+    fn verificationprogress_is_capped_when_applied_tip_is_temporarily_higher() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[8_u8; 32]);
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 50,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 100,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        assert_eq!(
+            result
+                .get("verificationprogress")
+                .and_then(JsonValueTrait::as_f64),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_names_testnet4_separately_from_testnet3() {
+        let mut context = Context::new();
+        context.chain_network = bitcoin_rs_primitives::Network::Testnet4;
+        let result = getblockchaininfo(&Arc::new(context), &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("chain").and_then(JsonValueTrait::as_str),
+            Some("testnet4")
         );
     }
 
