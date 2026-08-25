@@ -3,15 +3,18 @@
 `PLAN.md` is the spec. This file records places where implementation reality
 forced corrections, with sources.
 
-Every entry below was verified against the crates.io registry via
-`cargo info <crate>` and `cargo info <crate>@<version>` on **2026-05-19** under
-Rust toolchain `1.85.0` (the MSRV declared by `PLAN.md`).
+The Task 0 audit corrections in section 0 were verified against the crates.io
+registry via `cargo info <crate>` and `cargo info <crate>@<version>` on
+**2026-05-19** under Rust toolchain `1.85.0` (the MSRV `PLAN.md` declared at
+audit time). Later sections are not covered by that verification stamp; each
+carries only the evidence it explicitly states. The *Resolved version-floor
+deviations* table below postdates that audit.
 
 ## 0. Workspace bootstrap (Task 0) — dependency audit corrections
 
 The `PLAN.md` "Dependency audit 2026-05-19" section overstated several version
 numbers. The corrections below preserve the audit's intent (latest stable line
-compatible with MSRV 1.85) while reflecting the actual registry state.
+compatible with the Rust 1.85 MSRV) while reflecting the actual registry state.
 
 ### Crate-name fix
 
@@ -24,14 +27,23 @@ compatible with MSRV 1.85) while reflecting the actual registry state.
 | Crate | `PLAN.md` floor | Latest stable | Floor we use |
 |---|---|---|---|
 | `parking_lot` | `>=0.13` | `0.12.5` | `>=0.12.5, <0.13` |
-| `rust-rocksdb` | `>=0.49` | `0.44.2` | `>=0.44, <0.45` |
-| `fjall` | `>=3.1` | `2.11.2` | `>=2.11, <3.0` |
-| `redb` | `>=4.1` | `2.6.3` | `>=2.6, <3.0` |
-| `criterion` | `>=0.8` | `0.7.0` (MSRV-bound) | `>=0.7, <0.8` |
-| `bitcoinkernel` | `>=0.1` | `0.2.0` | `>=0.2, <0.3` |
+| `bitcoinkernel` | `>=0.1` | `0.2.1` | `>=0.2, <0.3` |
 
-`criterion 0.8.2` exists but requires Rust 1.86; under our MSRV 1.85 the
-registry resolves to `0.7.0`.
+### Resolved version-floor deviations
+
+Upstream caught up and the workspace moved with it. Kept as a record so a reader does
+not re-derive the original downgrade.
+
+| Crate | Historical downgrade | Now pinned | What resolved it |
+|---|---|---|---|
+| `rust-rocksdb` | `>=0.44, <0.45` (0.44.2) | `>=0.50, <0.51` (0.50.0) | upstream released the floor `PLAN.md` asked for |
+| `fjall` | `>=2.11, <3.0` (2.11.2) | `>=3.1.4, <4` (3.1.8) | upstream released 3.1 |
+| `redb` | `>=2.6, <3.0` (2.6.3) | `>=4.1, <5` (4.2.0) | upstream released 4.x |
+| `criterion` | `>=0.7, <0.8` (0.7.0, MSRV-bound) | `>=0.8.2, <0.9` (0.8.2) | toolchain moved from 1.85 to 1.95.0 |
+| `sha2` | `>=0.10.9, <0.11` | `>=0.11, <0.12` (0.11.0) | 0.11 exposes no `asm` feature, and the workspace sets `default-features = false` |
+
+`criterion 0.8.2` requires Rust 1.86. The workspace toolchain is 1.95.0
+(`rust-toolchain.toml`), so `>=0.8.2, <0.9` resolves to `0.8.2`.
 
 ### Feature-name fixes
 
@@ -46,16 +58,15 @@ registry resolves to `0.7.0`.
 
 | Crate | Latest on crates.io | We pin | Why |
 |---|---|---|---|
-| `sha2` | `0.11.0` | `>=0.10.9, <0.11` | `0.11` removed the `asm` cargo feature; PLAN.md audit explicitly stays on `0.10`. |
 | `bitcoin` | `0.33.0-beta` | `>=0.32.9, <0.33` | `0.33` is still beta; PLAN.md stays on stable `0.32.x`. |
-| `bitcoin_hashes` | `0.20.0` | `>=0.14.1, <0.15` | Aligned with `bitcoin 0.32` transitive pin. |
+| `bitcoin_hashes` | `0.20.0` | `>=0.14, <0.15` | Aligned with `bitcoin 0.32` transitive pin. |
 | `secp256k1` | `0.32.0-beta.2` | `>=0.31.1, <0.32` | Stable `0.31.x`; `0.32` still beta. |
 | `smallvec` | `2.0.0-alpha.12` | `>=1.15, <2` | Stable `1.x`; `2.0` still alpha. |
 | `zerocopy` | `0.9.0-alpha.0` | `>=0.8, <0.9` | Stable `0.8.x`; `0.9` still alpha. |
 
 ## Validation evidence
 
-`cargo metadata --format-version 1` on the resulting `Cargo.toml` resolves
+Historical (Task 0 bootstrap, Rust 1.85.0): `cargo metadata --format-version 1` on the resulting `Cargo.toml` resolves
 **305 packages** to "latest Rust 1.85.0 compatible versions". `cargo check
 --workspace --all-targets` and `cargo clippy --workspace --all-targets --
 -D warnings` both exit 0. `cargo fmt --all --check` is clean.
@@ -66,7 +77,7 @@ One workspace dependency still needs host packages beyond a clean Rust toolchain
 
 | Crate | Failure mode | Root cause | Resolution |
 |---|---|---|---|
-| `bitcoinkernel` (`libbitcoinkernel-sys` 0.2.0) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. Default build skips the kernel; CI installs `libboost-dev` only in the `kernel-only` job and enables the feature explicitly. |
+| `bitcoinkernel` (`libbitcoinkernel-sys` 0.3.0, via `bitcoinkernel` 0.2.1) | `cmake` aborts: "Could NOT find Boost (missing: Boost_DIR)" | The crate vendors libbitcoinkernel C++ sources and builds them via CMake; **Boost development headers (`libboost-dev`) are required**. | Feature-gate behind `kernel` in `crates/consensus/Cargo.toml`. `kernel` is now a default feature (`crates/consensus/Cargo.toml` `default = ["kernel"]`), CI installs `cmake` and `libboost-dev` up front for the standard jobs, `kernel-parity` replaced the obsolete `kernel-only` and `kernel-node` jobs, and `portable-check` covers `--no-default-features`. |
 
 ### MDBX un-gated after MSRV 1.92
 
@@ -85,8 +96,16 @@ so MDBX no longer needs an elevated-toolchain CI lane.
 
 - **G3 (kernel parity)** is exercised on the default build via `kernel-parity`; default builds validate all script classes through bitcoinkernel.
 - **G7 (4-backend equivalence)** runs in the default full-node CI matrix: rocksdb ↔ fjall ↔ redb ↔ mdbx.
-- All other gates (G1, G2, G4, G5, G6, G8 – G14) are unaffected.
+- All other gates (G1, G2, G4, G5, G6, G8 – G15) are unaffected.
+
 ## 2. Task 3 — script interpreter v1 wraps bitcoin crate
+
+**Superseded — historical record.** The delegation and the Taproot coverage gap
+described in this section were resolved by *Current State Cutover (Tasks 16–18)*
+below, which made `bitcoinkernel` the default production consensus engine. The
+present-tense text is retained as the record of the pre-cutover state and does
+not describe current behavior. The `hand-rolled` cargo feature it anticipates is
+not present in any workspace manifest.
 
 Task 3 Step 2 calls for a hand-rolled per-opcode dispatcher. The v1 script
 crate instead exposes the planned `Interpreter` surface while delegating legacy
@@ -119,7 +138,6 @@ Multi-input taproot and tapscript spends require the `kernel` feature
 (libbitcoinkernel). Future work, behind a `hand-rolled` feature in
 `crates/script`, ships the missing BIP341/BIP342 interpreter coverage.
 
-
 ### Current State Cutover (Tasks 16–18)
 
 The pre-cutover delegation to `bitcoinconsensus` and its associated Taproot coverage gap were resolved by making `bitcoinkernel` (`libbitcoinkernel`) the default production consensus engine across consensus, node, and binary crates. The `bitcoinconsensus` feature chain and backend were removed.
@@ -127,6 +145,7 @@ The pre-cutover delegation to `bitcoinconsensus` and its associated Taproot cove
 - **Forcing Event:** Mainnet IBD twice stopped at block 938344 under the pre-cutover default (first due to missing complete prevouts, then due to unsupported Taproot script-path witness validation in the Rust/bitcoinconsensus path).
 - **Landed Posture:** Default builds link `bitcoinkernel` and require system dependencies (`cmake` and `libboost-dev`). `bitcoinkernel` validates all script classes (legacy, segwit, and Taproot key-path and script-path spends).
 - **Portable Posture:** The Rust interpreter is retained under `--no-default-features` as an explicit portable posture for differential testing without C++ dependencies, but cannot validate mainnet Taproot script-path scripts.
+
 ### v1 legacy sighash + `OP_CODESEPARATOR`
 
 `bitcoin::sighash::SighashCache::legacy_signature_hash` rejects scripts that
@@ -148,6 +167,12 @@ Task 9 acceptance test explicitly requires byte-identical filter and header
 matches against `bitcoin/src/test/data/blockfilters.json`.
 
 ## §4 — T18 node lifecycle scaffold
+
+**Superseded — historical record.** The unwired subsystems and stub tick
+handlers described here were resolved by *§7 — Integration layer* below, which
+wired the subsystem handles into the node lifecycle. The present-tense text is
+retained as the record of the T18 scaffold state and does not describe current
+behavior.
 
 The `bitcoin-rs-node` crate landed with the lifecycle skeleton (config
 layering, tracing, metrics in-process, signal-bridge, graceful drain,
@@ -174,8 +199,8 @@ resolvable.
 
 ## §6 — T20 gates scaffold + integration-layer deferral
 
-G1..G14 acceptance tests are scaffolded under
-`bin/bitcoin-rs/tests/gates/`. Live-infrastructure gates (G1, G2, G3,
+G1..G15 acceptance tests are scaffolded under
+`bin/bitcoin-rs/tests/gates/`. G15 (`bin/bitcoin-rs/tests/gates/g15_workspace_version_sync.rs`) asserts internal workspace dependency versions match `[workspace.package].version`. Live-infrastructure gates (G1, G2, G3,
 G5, G6, G8, G9, G14) are `#[ignore]`d with run instructions in
 doc-comments. Wrapper gates (G4, G7, G10, G11, G12) shell out to
 in-tree crate tests. G13 (lints clean) is `#[ignore]`d because CI
@@ -187,7 +212,7 @@ be validated in-session — it requires multi-day mainnet IBD benchmarks
 against a reference bitcoind. The gate is scaffolded as a structural
 placeholder. Live infrastructure runs are operator responsibilities.
 
-- Files: `bin/bitcoin-rs/{Cargo.toml,tests/gates/g{01..14}_*.rs}`
+- Files: `bin/bitcoin-rs/{Cargo.toml,tests/gates/g{01..15}_*.rs}`
 - Commit: 144e2c1 + 61ae824
 
 ## §7 — Integration layer: NodeState wiring + listeners + synthetic apply_block
@@ -241,6 +266,8 @@ serving remains deferred.
 - `getmempoolinfo` returns real `size`, `bytes`, `total_fee` numbers via `Mempool::stats()`.
 - `getblockchaininfo` surfaces real `chainwork` as a 64-character lowercase big-endian hex string via `rpc::Context::chainwork_hex()`.
 - `Network::is_{bip34,bip65,bip66,csv,segwit,taproot}_active(height) -> bool` const fns carry the per-network activation tables from Core's `chainparams.cpp`.
+- `getblockchaininfo`'s `initialblockdownload` follows Core's definition: `chainwork >= nMinimumChainWork && tip age <= 24h`, latched false once satisfied, matching `UpdateIBDStatus` / `Chain::IsTipRecent`. `Network::minimum_chain_work()` carries that per-network constant from the same `kernel/chainparams.cpp` the assume-valid anchor comes from. **It is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. Core's `-maxtipage` override is not wired; the 24-hour default stands. IBD is evaluated, and therefore latched, when an RPC caller asks for it, rather than continuously during validation as in Core.
+- `getblockchaininfo`'s `verificationprogress` is Core's `GuessVerificationProgress`: transactions verified over transactions estimated to exist, extrapolated from the per-network `ChainTxData` observation `Network::chain_tx_data()` carries from `kernel/chainparams.cpp`, and switching to a height-derived tip age within two hours of the tip exactly as Core does. **`ChainTxData` is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. When `Context::chain_tx_count()` is `None` — a datadir written before the node tracked a cumulative transaction count, which cannot be recovered without re-reading every block body — the field falls back to the old `applied / headers` height ratio rather than reporting Core's `0.0`, because a confident zero on a synced node breaks every caller that gates on this value. That fallback disappears once such a node resyncs.
 - Active-chain DAA retarget validation is wired into header acceptance and `apply_block`: non-retarget heights inherit parent `nBits` unless the network's minimum-difficulty exception applies, retarget heights recompute the expected target over the prior interval with Core's 4x timespan clamp, the network proof-of-work limit cap, and Testnet4's BIP94 period-base rule. Unit coverage pins header pre-insertion rejection, boundary accept/reject cases, clamp behavior, testnet minimum-difficulty exception, and Testnet4 BIP94 behavior.
 - Electrum TLS cert config is honored as plaintext-with-warning until a
   matching `electrum_tls_key` field lands; the warning surfaces on every
@@ -251,7 +278,7 @@ serving remains deferred.
 - **No historical DAA fixture parity.** Header acceptance and active-chain retarget calculation are unit-covered, but they are not yet checked against historical mainnet/testnet retarget windows.
 - **Contextual transaction checks remain node-local.** BIP113 MTP nLocktime, BIP68 sequence locks, and BIP9 CSV/Segwit activation are wired through the node apply path, but the lower-level consensus crate still exposes `verify_transaction(tx, prevouts, height, flags)` rather than a reusable context-rich transaction API.
 - **No persisted block-body serving path for P2P.** P2P `getdata` can serve bodies still present in the in-memory `BlockRecord` cache, but it does not read persisted pruned-body rows after restart or cache eviction; unavailable inventory is reported with `notfound`.
-- **No index / filter / coinstats updates triggered by tip advance.** Electrum index, BIP158 filter generation, and coinstats remain stale until a follow-up wires the listener side.
+- **Electrum index updates are not triggered by tip advance.** Coinstats (`handles.coin_stats.finish_block`) and BIP158 filter generation (`handles.filter_index.put_filter`) are wired into `apply_block` (`crates/node/src/apply.rs`); only the Electrum index still waits on a listener.
 - **G14 empirical validation still deferred.** The `faster than Bitcoin
   Core` claim requires multi-day same-window live mainnet IBD against
   `bitcoin-rs` and `bitcoind`. Operator responsibility.
@@ -305,3 +332,64 @@ position while keeping the rest. See the *All-or-scan position fallback* concept
 in `CONCEPTS.md`. The residual accepted: a stale offset landing exactly on a
 transaction boundary whose transaction also matches, while a different
 transaction in that block matches too.
+
+## §9 — UTXO record payload encoding, and the arena PLAN.md specified
+
+`PLAN.md` design principle 8 specifies a `bumpalo::Bump` arena per shard for
+UTXO record storage. The shipped implementation deviated earlier to one heap
+allocation per record via `ThinRecordBuf`; this section records why the arena
+is now **rejected on measurement** rather than merely deferred, and what
+replaced the record encoding instead.
+
+### The arena is rejected, not pending
+
+The arena's stated purpose was the per-record allocation overhead and the
+fragmentation expected from tens of millions of small allocations. Both were
+measured before any work started (`docs/benchmarks/utxo-memory.md`):
+
+- Allocation header plus slack is **2.2 bytes per output** on a real mainnet
+  chainstate at height 412,732 (55.1 B payload against 57.3 accounted).
+- Fragmentation is **5%** after churning twice the whole set, and the curve is
+  flattening rather than climbing. Uniform small allocations are the case a
+  size-class allocator handles well.
+
+An arena removes an overhead that measurement puts at a few percent, at the cost
+of a self-referential per-shard structure (`self_cell!` over a pinned `Bump`)
+plus the round-robin `defrag_one_shard` PLAN.md Task 5 Step 7 also specifies.
+Do not start it without new evidence; the two numbers above are the evidence
+against it.
+
+### The record payload is v5, not the v4 layout
+
+The same measurement found the UTXO set is **77.4% of process RSS**, which is
+where the encoding work went instead. Per-output metadata was a fixed 19 bytes
+(`vout(4) || value(8) || height(4) || coinbase(1) || script_len(2)`); it is now
+Core's `CTxOutCompressor` amount transform, `height` and `coinbase` packed into
+one varint, and two fixed-width directories in front of the payloads. Measured
+saving **11.75 bytes per output, 21.7% of the payload**, about 1.97 GiB at tip.
+
+Three things about this are deviations worth naming:
+
+- **A flat varint layout was built first and rejected.** It hit the size target
+  and lost 4.4-4.9x on `find_output`, the hot read. See the *Directory-layout
+  record* concept.
+- **`height` is not hoisted into the record header**, which would save three
+  bytes more. It needs "every output of a record shares one height" to hold, and
+  BIP30's duplicate coinbase txids are exactly where it might not.
+- **The snapshot disk format is unchanged.** `PLAN.md`'s successor step called
+  for a v5 file format; disk size is not a G14 budget item (the budgets are tip
+  RSS and Electrum p95), so the invariant that step really protects was covered
+  instead by a golden vector generated from a v4 build —
+  `crates/utxo/tests/snapshot_v4_golden.rs`. `hash_serialized_3` and the MuHash
+  trailer are computed over decoded consensus values, never over the in-memory
+  encoding, and that is asserted in both directions plus as a load/store fixed
+  point.
+
+### Revert criterion
+
+v5 costs about 3 ns per lookup at the measured mainnet average and 3-21% on
+block commit p95, against budgets with roughly twenty times the headroom. It
+buys 12 points of the 16 GiB tip-RSS budget. **If G14 tip RSS measures well
+under budget — say below 10 GiB — this complexity is not earning its keep and
+reverting is the right call.** v4 remains in the tree as the equivalence oracle
+and the benchmark's `before` arm, so a revert is a revert, not a rewrite.
