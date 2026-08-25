@@ -353,14 +353,9 @@ pub(crate) fn getbestblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Val
 pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let hash = parse_hash(required_str(params, 0, "block hash is required")?)?;
     let verbosity = getblock_verbosity(params)?;
-    let Some(record) = ctx.block_by_hash(hash) else {
-        let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
-        let record = BlockRecord::synthetic(synthetic_height, hash);
-        if verbosity == 0 {
-            return Ok(json!(ctx.block_body_hex(&record).unwrap_or_default()));
-        }
-        return Ok(synthetic_block_json(ctx, &record, true));
-    };
+    let record = ctx
+        .block_by_hash(hash)
+        .ok_or(RpcError::NotFound("block not found"))?;
     if verbosity == 0 {
         let Some(block_hex) = ctx.block_body_hex(&record) else {
             return Err(RpcError::NotFound("block data pruned"));
@@ -373,14 +368,9 @@ pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
 pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let hash = parse_hash(required_str(params, 0, "block hash is required")?)?;
     let verbose = optional_bool(params, 1, true)?;
-    let Some(record) = ctx.block_by_hash(hash) else {
-        let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
-        let record = BlockRecord::synthetic(synthetic_height, hash);
-        if !verbose {
-            return Ok(json!(record.header_hex()));
-        }
-        return Ok(synthetic_block_json(ctx, &record, false));
-    };
+    let record = ctx
+        .block_by_hash(hash)
+        .ok_or(RpcError::NotFound("block not found"))?;
     if !verbose {
         return Ok(json!(record.header_hex()));
     }
@@ -955,9 +945,7 @@ fn block_json_verbose(
     include_block_fields: bool,
     verbosity: u64,
 ) -> Result<Value, RpcError> {
-    let Some(header) = decode_header(record) else {
-        return Ok(synthetic_block_json(ctx, record, include_block_fields));
-    };
+    let header = decode_header(record)?;
 
     let version = header.version.to_consensus();
     let version_hex = u32::from_le_bytes(version.to_le_bytes());
@@ -992,9 +980,7 @@ fn block_json_verbose(
         }));
     }
 
-    let Some((block_bytes, block)) = decode_block(ctx, record)? else {
-        return Ok(synthetic_block_json(ctx, record, true));
-    };
+    let (block_bytes, block) = decode_block(ctx, record)?;
     let tx_array: Vec<Value> = if verbosity >= 2 {
         block
             .txdata
@@ -1032,83 +1018,39 @@ fn block_json_verbose(
     }))
 }
 
-fn decode_header(record: &BlockRecord) -> Option<bitcoin::block::Header> {
-    let bytes = record.header_bytes()?;
-    match deserialize(bytes.as_slice()) {
-        Ok(header) => Some(header),
-        Err(error) => {
-            tracing::warn!(
-                block_hash = %record.hash.to_string_be(),
-                %error,
-                "stored block header bytes are invalid"
-            );
-            None
-        }
-    }
+fn decode_header(record: &BlockRecord) -> Result<bitcoin::block::Header, RpcError> {
+    let Some(bytes) = record.header_bytes() else {
+        return Err(RpcError::Internal(
+            "stored block header is corrupt".to_owned(),
+        ));
+    };
+    deserialize(bytes.as_slice()).map_err(|error| {
+        tracing::warn!(
+            block_hash = %record.hash.to_string_be(),
+            %error,
+            "stored block header bytes are invalid"
+        );
+        RpcError::Internal("stored block header is corrupt".to_owned())
+    })
 }
 
 fn decode_block(
     ctx: &Context,
     record: &BlockRecord,
-) -> Result<Option<(Vec<u8>, bitcoin::Block)>, RpcError> {
+) -> Result<(Vec<u8>, bitcoin::Block), RpcError> {
     let Some(bytes) = ctx.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
-    match deserialize(bytes.as_slice()) {
-        Ok(block) => Ok(Some((bytes, block))),
-        Err(error) => {
+    deserialize(bytes.as_slice())
+        .map(|block| (bytes, block))
+        .map_err(|error| {
             tracing::warn!(
                 block_hash = %record.hash.to_string_be(),
                 %error,
                 "stored block bytes are invalid"
             );
-            Ok(None)
-        }
-    }
-}
-
-fn synthetic_block_json(ctx: &Context, record: &BlockRecord, include_block_fields: bool) -> Value {
-    if !include_block_fields {
-        return json!({
-            "hash": record.hash.to_string_be(),
-            "confirmations": confirmations(ctx, record.hash, record.height),
-            "height": record.height,
-            "version": 0,
-            "versionHex": "00000000",
-            "merkleroot": Hash256::default().to_string_be(),
-            "time": 0,
-            "mediantime": 0,
-            "nonce": 0,
-            "bits": "00000000",
-            "difficulty": 0,
-            "chainwork": "00",
-            "nTx": record.tx_count,
-            "previousblockhash": null,
-            "nextblockhash": null
-        });
-    }
-
-    json!({
-        "hash": record.hash.to_string_be(),
-        "confirmations": confirmations(ctx, record.hash, record.height),
-        "height": record.height,
-        "version": 0,
-        "versionHex": "00000000",
-        "merkleroot": Hash256::default().to_string_be(),
-        "time": 0,
-        "mediantime": 0,
-        "nonce": 0,
-        "bits": "00000000",
-        "difficulty": 0,
-        "chainwork": "00",
-        "nTx": record.tx_count,
-        "previousblockhash": null,
-        "nextblockhash": null,
-        "strippedsize": 0,
-        "size": record.body_size,
-        "weight": 0,
-        "tx": []
-    })
+            RpcError::Internal("stored block body is corrupt".to_owned())
+        })
 }
 
 #[cfg(test)]
@@ -1117,6 +1059,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
@@ -1258,6 +1201,40 @@ mod tests {
         );
     }
 
+    /// Unknown hashes must not produce empty hex or zero-filled block JSON.
+    ///
+    /// The removed fallback fabricated successful blocks at the current height,
+    /// so both verbosity forms returned HTTP-level success for absent identity.
+    #[test]
+    fn getblock_reports_not_found_for_an_unknown_hash() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[0xab_u8; 32]).to_string_be();
+
+        for verbosity in [0, 1, 2] {
+            assert!(matches!(
+                getblock(&ctx, &json!([hash.as_str(), verbosity])),
+                Err(RpcError::NotFound("block not found"))
+            ));
+        }
+    }
+
+    /// Unknown hashes must not produce empty hex or zero-filled header JSON.
+    ///
+    /// The removed fallback made both header response forms look like valid
+    /// blocks even though the tree had never seen the requested identity.
+    #[test]
+    fn getblockheader_reports_not_found_for_an_unknown_hash() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[0xcd_u8; 32]).to_string_be();
+
+        for verbose in [false, true] {
+            assert!(matches!(
+                getblockheader(&ctx, &json!([hash.as_str(), verbose])),
+                Err(RpcError::NotFound("block not found"))
+            ));
+        }
+    }
+
     #[test]
     fn getblock_populates_real_header_fields_from_stored_record()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1371,6 +1348,26 @@ mod tests {
             Some(block_hash_hex.as_str())
         );
         Ok(())
+    }
+    /// Corrupt cached body bytes must not become synthetic zero-valued JSON.
+    ///
+    /// The old decode fallback hid storage corruption behind a successful block
+    /// response, preventing callers from distinguishing damage from real data.
+    #[test]
+    fn getblock_reports_corrupt_stored_body() {
+        let ctx = Arc::new(Context::new());
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let mut record = BlockRecord::from_block(0, &genesis);
+        let hash = record.hash.to_string_be();
+        record.block_hex = "00".to_owned();
+        record.body_size = 1;
+        seed_block(&ctx, &genesis, record);
+
+        assert!(matches!(
+            getblock(&ctx, &json!([hash.as_str(), 1])),
+            Err(RpcError::Internal(message))
+                if message == "stored block body is corrupt"
+        ));
     }
 
     #[test]
@@ -1552,6 +1549,49 @@ mod tests {
 
         // Known header, never connected. Core's m_chain does not contain it.
         assert_eq!(confirmations(&ctx, header_tip_hash, 2), -1);
+        Ok(())
+    }
+    /// Header-only tree nodes remain addressable even without a log record.
+    ///
+    /// Rejecting unknown identities must not accidentally require active-chain
+    /// membership or a body: this fork header is known but not applied.
+    #[test]
+    fn getblockheader_answers_a_header_only_tree_node() -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            fork,
+            fork_header,
+            ..
+        } = forked_ctx()?;
+        let hash = fork.to_string_be();
+
+        let raw = getblockheader(&ctx, &json!([hash.as_str(), false]))?;
+        assert_eq!(
+            raw.as_str(),
+            Some(serialize(&fork_header).to_lower_hex_string().as_str())
+        );
+
+        let verbose = getblockheader(&ctx, &json!([hash.as_str(), true]))?;
+        assert_eq!(verbose.get("hash").as_str(), Some(hash.as_str()));
+        assert_eq!(verbose.get("confirmations").as_i64(), Some(-1));
+        assert_eq!(verbose.get("height").as_u64(), Some(1));
+        assert_eq!(
+            verbose.get("version").as_i64(),
+            Some(i64::from(fork_header.version.to_consensus()))
+        );
+        assert_eq!(
+            verbose.get("merkleroot").as_str(),
+            Some(fork_header.merkle_root.to_string().as_str())
+        );
+        assert_eq!(
+            verbose.get("time").as_u64(),
+            Some(u64::from(fork_header.time))
+        );
+        assert_eq!(
+            verbose.get("nonce").as_u64(),
+            Some(u64::from(fork_header.nonce))
+        );
+        assert_eq!(verbose.get("nTx").as_u64(), Some(0));
         Ok(())
     }
 
@@ -2347,6 +2387,8 @@ mod getdifficulty_tests {
 #[cfg(test)]
 mod pruneblockchain_tests {
     use alloc::sync::Arc;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{TxMerkleNode, block::Header, block::Version};
 
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
     use bitcoin_rs_primitives::Hash256;
@@ -2496,24 +2538,51 @@ mod pruneblockchain_tests {
     }
 
     #[test]
-    fn getblock_returns_not_found_after_block_body_is_cleared() {
+    fn getblock_returns_pruned_error_for_a_header_only_block() {
         let ctx = Arc::new(Context::new());
-        let hash = Hash256::default();
-        ctx.add_block(BlockRecord::synthetic(1, hash));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let hash = {
+            let mut tree = ctx.block_tree.write();
+            let id = tree
+                .insert_node(None, genesis.header, NodeStatus::Active)
+                .unwrap_or_else(|err| panic!("genesis header must insert: {err}"));
+            tree.node(id)
+                .unwrap_or_else(|err| panic!("inserted header must resolve: {err}"))
+                .hash
+        };
 
-        let result = getblock(&ctx, &json!([hash.to_string_be(), 0]));
-
-        assert!(matches!(
-            result,
-            Err(RpcError::NotFound("block data pruned"))
-        ));
+        for verbosity in [0, 1] {
+            assert!(matches!(
+                getblock(&ctx, &json!([hash.to_string_be(), verbosity])),
+                Err(RpcError::NotFound("block data pruned"))
+            ));
+        }
     }
 
     #[test]
-    fn getblockstats_returns_not_found_after_block_body_is_cleared() {
+    fn getblockstats_reports_pruned_error_for_a_header_only_block() {
         let ctx = Arc::new(Context::new());
-        let hash = Hash256::default();
-        ctx.add_block(BlockRecord::synthetic(1, hash));
+        let applied_tip = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let genesis_id = tree
+                .insert_node(None, genesis.header, NodeStatus::Active)
+                .unwrap_or_else(|err| panic!("genesis header must insert: {err}"));
+            let child = Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: genesis.header.time.saturating_add(1),
+                bits: genesis.header.bits,
+                nonce: genesis.header.nonce.saturating_add(1),
+            };
+            let _ = tree
+                .insert_node(Some(genesis_id), child, NodeStatus::Active)
+                .unwrap_or_else(|err| panic!("child header must insert: {err}"));
+            tree.tip()
+                .unwrap_or_else(|| panic!("inserted child must publish a tip"))
+        };
+        ctx.set_applied_tip((*applied_tip).clone());
 
         let result = getblockstats(&ctx, &json!([1]));
 

@@ -1875,10 +1875,18 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             },
         );
+        let genesis = bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
         let stale_block = Block {
             header: bitcoin::block::Header {
                 version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
+                prev_blockhash: genesis.block_hash(),
                 merkle_root: TxMerkleNode::all_zeros(),
                 time: 2_000,
                 bits: CompactTarget::from_consensus(0x207f_ffff),
@@ -1891,21 +1899,22 @@ mod tests {
         ctx.add_block(stale_record.clone());
         {
             let mut tree = ctx.block_tree.write();
-            let genesis = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
-                time: 1_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
-                nonce: 0,
-            };
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            tree.insert_node(
+                Some(genesis_id),
+                stale_block.header,
+                NodeStatus::HeaderValid,
+            )?;
+            // BlockTree::insert_node now publishes the best-work header on
+            // insert and only reorgs on strictly greater chainwork. The stale
+            // block had equal work and was inserted first, so it became the
+            // active tip. Give the active chain a lower target so it wins.
             let active = bitcoin::block::Header {
                 version: Version::ONE,
                 prev_blockhash: genesis.block_hash(),
                 merkle_root: TxMerkleNode::all_zeros(),
                 time: 1_500,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: CompactTarget::from_consensus(0x1d00_ffff),
                 nonce: 1,
             };
             tree.insert_node(Some(genesis_id), active, NodeStatus::Active)?;

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
 use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
@@ -644,8 +644,37 @@ fn fee_stats_context(
             },
         }));
     }
+    let block = seed_tree_chain(&ctx, &block);
     ctx.add_block(BlockRecord::from_block(7, &block));
     (Arc::new(ctx), low_tx, high_tx)
+}
+
+fn seed_tree_chain(ctx: &Context, block: &bitcoin::Block) -> bitcoin::Block {
+    let mut tree = ctx.block_tree.write();
+    let mut parent = None;
+    let mut prev_blockhash = bitcoin::BlockHash::all_zeros();
+
+    for height in 0_u32..7 {
+        let header = bitcoin::block::Header {
+            version: bitcoin::block::Version::ONE,
+            prev_blockhash,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_231_006_498 + height,
+            bits: block.header.bits,
+            nonce: height,
+        };
+        prev_blockhash = header.block_hash();
+        parent = Some(
+            tree.insert_node(parent, header, NodeStatus::Active)
+                .expect("insert synthetic ancestor"),
+        );
+    }
+
+    let mut linked_block = block.clone();
+    linked_block.header.prev_blockhash = prev_blockhash;
+    tree.insert_node(parent, linked_block.header, NodeStatus::Active)
+        .expect("insert fixture block");
+    linked_block
 }
 
 fn fee_block(low_tx: Transaction, high_tx: Transaction) -> bitcoin::Block {
@@ -752,6 +781,7 @@ impl Fixture {
             },
             txdata: vec![tx.clone()],
         };
+        let block = seed_tree_chain(&ctx, &block);
         let block_hash_bytes = block.block_hash();
         let block_hash = Hash256::from_le_bytes(block_hash_bytes.as_byte_array());
         ctx.filter_index = Arc::new(Box::new(StaticFilterIndex {
@@ -759,18 +789,15 @@ impl Fixture {
             filter: vec![0x00],
             header: Hash256::from_le_bytes(&[0x08; 32]),
         }));
-        ctx.set_chain_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 7,
-            chainwork: ChainWork::ZERO,
-            hash: block_hash,
-        });
-        ctx.set_applied_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 7,
-            chainwork: ChainWork::ZERO,
-            hash: block_hash,
-        });
+        let tip = ctx
+            .block_tree
+            .read()
+            .tip()
+            .expect("fixture tip missing")
+            .as_ref()
+            .clone();
+        ctx.set_chain_tip(tip.clone());
+        ctx.set_applied_tip(tip);
         ctx.add_block(BlockRecord::from_block(7, &block));
         let mut values = HashMap::new();
         values.insert(outpoint(1), 6_000);

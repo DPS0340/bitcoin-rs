@@ -10,7 +10,7 @@ use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_primitives::Hash256;
 use sonic_rs::{Value, json};
 
-use crate::context::{BlockRecord, Context};
+use crate::context::Context;
 use crate::error::RpcError;
 
 const DEFAULT_HEADER_COUNT: u32 = 5;
@@ -149,32 +149,7 @@ fn header_records(ctx: &Context, hash: Hash256, count: u32) -> Vec<HeaderRecord>
         return truncate_at_linkage_break(records);
     }
 
-    // Cache-only records predate tree publication, so their active-chain
-    // membership cannot be established here; preserve the singleton fallback
-    // for those records rather than turning a usable header into a 404.
-    //
-    // It no longer has a header to hand back. Records stopped carrying one when
-    // the block tree became the single source: `record_for_hash` fills the
-    // header from the tree node, and reaching here means the tree has no node
-    // for this hash. So this now yields an empty result rather than a header.
-    //
-    // Left in place rather than deleted. A record whose hash the tree does not
-    // know cannot arise in a running node — `apply_block` inserts the header
-    // before pushing the record, through the same handles, and the tree never
-    // drops a node — so this is unreachable outside fixtures. Removing an
-    // unreachable fallback is a separate claim from removing a stored field,
-    // and it should be argued on its own.
-    let Some(record) = ctx.block_by_hash(hash) else {
-        return Vec::new();
-    };
-    let Some(header) = decode_header(&record) else {
-        return Vec::new();
-    };
-    vec![HeaderRecord {
-        hash: record.hash,
-        height: record.height,
-        header,
-    }]
+    Vec::new()
 }
 
 fn truncate_at_linkage_break(mut records: Vec<HeaderRecord>) -> Vec<HeaderRecord> {
@@ -216,10 +191,6 @@ fn invalid_count(value: &str) -> Response {
     bad_request_owned(format!(
         "Header count is invalid or out of acceptable range (1-2000): {value}"
     ))
-}
-
-fn decode_header(record: &BlockRecord) -> Option<Header> {
-    bitcoin::consensus::encode::deserialize(record.header_bytes()?.as_slice()).ok()
 }
 
 fn header_json(record: &HeaderRecord) -> Value {
@@ -302,6 +273,7 @@ fn not_found_with(message: &'static str) -> Response {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::context::BlockRecord;
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Version};
     use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
     use sonic_rs::JsonValueTrait;
@@ -826,29 +798,28 @@ mod tests {
         assert_eq!(response.body, expected.to_lower_hex_string().into_bytes());
     }
 
-    /// A hash the tree does not know yields nothing, and that is now the answer.
+    /// A log-only hash remains an empty success in every REST format.
     ///
-    /// The singleton fallback in `header_records` used to decode a header out of
-    /// the cached record. Records no longer carry one — the tree is the single
-    /// source — so reaching the fallback means there is no header to serve. This
-    /// pins that outcome so it is a recorded consequence rather than a silent
-    /// one. The state is not reachable in a running node; see the comment on
-    /// the fallback.
+    /// The deleted fallback consulted `block_by_hash`, which used to recover
+    /// this fixture through its full-log scan. Removing both paths must preserve
+    /// REST's established unknown-hash 200 contract rather than turn it into a
+    /// 404 or leak cached data.
     #[test]
     fn headers_for_a_record_the_tree_does_not_know_serve_nothing() {
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        // Record pushed, tree deliberately left empty.
         ctx.add_block(BlockRecord::from_block(0, &genesis));
 
-        let path = format!("/rest/headers/{}.json", genesis.block_hash());
-        let response = route(&ctx, &path, "count=1", true);
-        assert_eq!(response.status, 200);
-        let values: Vec<Value> = sonic_rs::from_slice(&response.body).expect("headers JSON");
-        assert!(
-            values.is_empty(),
-            "a record with no tree node has no header to serve"
-        );
+        for (format, expected) in [
+            ("json", b"[]".as_slice()),
+            ("hex", b"".as_slice()),
+            ("bin", b"".as_slice()),
+        ] {
+            let path = format!("/rest/headers/{}.{format}", genesis.block_hash());
+            let response = route(&ctx, &path, "count=1", true);
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, expected);
+        }
     }
 
     #[test]

@@ -395,6 +395,7 @@ mod tests {
     use bitcoin::hashes::Hash as _;
     use bitcoin::hex::DisplayHex as _;
     use bitcoin::{OutPoint, Txid};
+    use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_mempool::MempoolEntry;
     use bitcoin_rs_primitives::Hash256;
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
@@ -494,6 +495,10 @@ mod tests {
         let txid = coinbase.compute_txid();
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::Active)
+            .expect("insert genesis header");
         ctx.add_block(BlockRecord::from_block(0, &genesis));
         let handler = Handler::new(Arc::clone(&ctx));
         let result = handler
@@ -564,11 +569,43 @@ mod tests {
         let mut record = BlockRecord::from_block(0, &genesis);
         let block_hash = record.hash;
         record.block_hex.clear();
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::Active)
+            .expect("insert genesis header");
         ctx.add_block(record);
 
         let result = getrawtransaction(
             &ctx,
             &json!([txid.to_string(), false, block_hash.to_string_be()]),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RpcError::NotFound("block data pruned"))
+        ));
+    }
+
+    #[test]
+    fn getrawtransaction_with_blockhash_reports_pruned_body_for_a_header_only_block() {
+        let ctx = Arc::new(Context::new());
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let Some(coinbase) = genesis.txdata.first() else {
+            panic!("genesis has no transactions");
+        };
+        let block_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::HeaderValid)
+            .expect("insert header-only block");
+
+        let result = getrawtransaction(
+            &ctx,
+            &json!([
+                coinbase.compute_txid().to_string(),
+                false,
+                block_hash.to_string_be()
+            ]),
         );
 
         assert!(matches!(
@@ -658,8 +695,12 @@ mod tests {
         };
         let txid = coinbase.compute_txid();
         let unrelated_hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::Active)
+            .expect("insert genesis header");
         ctx.add_block(BlockRecord::synthetic(0, unrelated_hash));
-        let record = BlockRecord::from_block(1, &genesis);
+        let record = BlockRecord::from_block(0, &genesis);
         let block_hash = record.hash;
         ctx.add_block(record);
         let handler = Handler::new(Arc::clone(&ctx));
@@ -684,6 +725,10 @@ mod tests {
         };
         let txid = coinbase.compute_txid();
         let mut record = BlockRecord::from_block(0, &genesis);
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::Active)
+            .expect("insert genesis header");
         let block_hash = record.hash;
         record.block_hex.clear();
         ctx.add_block(record);
@@ -692,6 +737,34 @@ mod tests {
         let result = handler.dispatch(
             "gettxoutproof",
             &json!([[txid.to_string()], block_hash.to_string_be()]),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RpcError::NotFound("block data pruned"))
+        ));
+    }
+
+    #[test]
+    fn gettxoutproof_with_blockhash_reports_pruned_body_for_a_header_only_block() {
+        let ctx = Arc::new(Context::new());
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let Some(coinbase) = genesis.txdata.first() else {
+            panic!("genesis has no transactions");
+        };
+        let block_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        ctx.block_tree
+            .write()
+            .insert_node(None, genesis.header, NodeStatus::HeaderValid)
+            .expect("insert header-only block");
+        let handler = Handler::new(Arc::clone(&ctx));
+
+        let result = handler.dispatch(
+            "gettxoutproof",
+            &json!([
+                [coinbase.compute_txid().to_string()],
+                block_hash.to_string_be()
+            ]),
         );
 
         assert!(matches!(
@@ -1071,6 +1144,10 @@ mod tests {
         };
         let record = BlockRecord::from_block(0, &block);
         let block_hash = record.hash;
+        ctx.block_tree
+            .write()
+            .insert_node(None, block.header, NodeStatus::Active)
+            .expect("insert block header");
         ctx.add_block(record);
 
         let result = super::gettxoutproof(

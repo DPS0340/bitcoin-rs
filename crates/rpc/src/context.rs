@@ -1247,18 +1247,14 @@ impl Context {
 
     /// Resolves a block record for `hash`.
     ///
-    /// The restored header tree is the identity authority: when it knows the
-    /// hash its `(hash, height)` pair wins, and the session vector contributes
-    /// only a matching payload cache or durable body metadata. When the tree
-    /// has no node for `hash` (cache-only fixtures, or a block seen before a
-    /// checkpoint restore) the vector supplies a record by exact hash as a
-    /// legacy fallback. A stale cached height can therefore never override an
-    /// active-tree identity.
+    /// The restored header tree is the only identity authority. A hash it does
+    /// not know resolves to `None`, even when the block log carries a record for
+    /// it. For a tree-resolved `(height, hash)` pair, the log may contribute
+    /// matching payload cache fields or durable body metadata.
     #[must_use]
     pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
-        // 1. Tree authority. When the restored header index knows this hash its
-        //    identity wins; enrich with a height-matched cached payload, else
-        //    with durable body metadata.
+        // Tree authority resolves identity first; the exact `(height, hash)`
+        // record may then enrich its payload fields.
         if let Some(mut record) = self.header_record(hash) {
             // The tree already gave us the height, so this is a binary search
             // over a height-ordered log rather than a walk of every record on
@@ -1286,18 +1282,7 @@ impl Context {
             }
             return Some(record);
         }
-        // 2. Legacy/cache-only fallback. The tree cannot resolve this identity,
-        //    so accept a vector record by exact hash. Metadata-only records and
-        //    pruned-body payloads pass through unchanged via their own fields.
-        //
-        //    This one stays linear on purpose: without the tree there is no
-        //    height to search on, and a hash-keyed index would have to be kept
-        //    for every block to serve a path that only legacy state reaches.
-        self.blocks
-            .read()
-            .iter()
-            .find(|candidate| candidate.hash == hash)
-            .cloned()
+        None
     }
 
     /// Returns the block hash for an applied height.
@@ -1866,6 +1851,20 @@ mod tests {
             record.block_hex, expected_body,
             "the cached payload must survive the header splice"
         );
+    }
+    /// A log-only hash must not make a block identity visible.
+    ///
+    /// The old tree-miss fallback scanned every log record and accepted the
+    /// matching hash, making unknown-hash RPC cost linear in chain length and
+    /// allowing fixture-only state to masquerade as a real node identity.
+    #[test]
+    fn block_by_hash_ignores_log_records_the_tree_does_not_know() {
+        let ctx = Context::new();
+        let hash = Hash256::from_le_bytes(&[3_u8; 32]);
+        ctx.add_block(BlockRecord::synthetic(3, hash));
+
+        assert!(ctx.record_for_hash(hash).is_none());
+        assert!(ctx.block_by_hash(hash).is_none());
     }
 
     /// A record with no header must render as the empty string, the way an empty
