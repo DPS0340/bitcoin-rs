@@ -223,32 +223,42 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 }
 
 #[test]
-fn electrum_bind_requires_txindex() -> Result<()> {
+fn script_index_is_valid_without_core_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
-    config.electrum_bind = Some("127.0.0.1:50001".parse()?);
+    config.script_index = true;
     config.txindex = false;
 
-    match config.validate() {
-        Ok(()) => panic!("electrum_bind without txindex unexpectedly validated"),
-        Err(error) => assert_eq!(error.to_string(), "electrum_bind requires txindex"),
-    }
+    config.validate()?;
     Ok(())
 }
 
 #[test]
-fn empty_electrum_bind_disables_the_optional_service() -> Result<()> {
+fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
+    let config = Config::from_layered_sources(
+        None,
+        None,
+        core::iter::empty::<EnvPair>(),
+        ["bitcoin-rs-node", "--scriptindex"],
+    )?;
+
+    assert!(config.script_index);
+    Ok(())
+}
+
+#[test]
+fn scriptindex_environment_enables_the_index() -> Result<()> {
     let config = Config::from_layered_sources(
         None,
         None,
         [
             ("BITCOIN_RS_TXINDEX", "false"),
-            ("BITCOIN_RS_ELECTRUM_BIND", ""),
+            ("BITCOIN_RS_SCRIPTINDEX", "true"),
         ],
         ["bitcoin-rs-node"],
     )?;
 
     assert!(!config.txindex);
-    assert_eq!(config.electrum_bind, None);
+    assert!(config.script_index);
     Ok(())
 }
 

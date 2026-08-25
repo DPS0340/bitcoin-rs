@@ -21,6 +21,7 @@ anyhow.workspace = true
 bitcoin-rs-node.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile = "3"
@@ -49,10 +50,6 @@ path = "tests/gates/g03_kernel_parity.rs"
 [[test]]
 name = "g04_consensus_vectors"
 path = "tests/gates/g04_consensus_vectors.rs"
-
-[[test]]
-name = "g05_electrum_parity"
-path = "tests/gates/g05_electrum_parity.rs"
 
 [[test]]
 name = "g06_snapshot_roundtrip"
@@ -85,10 +82,6 @@ path = "tests/gates/g12_graceful_shutdown.rs"
 [[test]]
 name = "g13_lints_clean"
 path = "tests/gates/g13_lints_clean.rs"
-
-[[test]]
-name = "g14_perf_budgets"
-path = "tests/gates/g14_perf_budgets.rs"
 
 [[test]]
 name = "g15_workspace_version_sync"

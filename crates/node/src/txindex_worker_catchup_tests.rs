@@ -122,6 +122,7 @@ impl CatchupFixture {
             block_tree: Arc::new(RwLock::new(tree)),
             body_store: Some(bodies.clone()),
             batch_limits: DEFAULT_BATCH_LIMITS,
+            enabled: bitcoin_rs_index::IndexCapabilities::ALL,
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
             batch_delay: Duration::ZERO,
@@ -256,9 +257,12 @@ fn catch_up_retains_prepared_prefix_until_descendant_target()
     fixture.publish_tip(&fixture.a);
     let mut pending = None;
 
-    let action = fixture
-        .worker
-        .catch_up_to(&stale_target, None, &mut pending)?;
+    let action = fixture.worker.catch_up_to(
+        &stale_target,
+        None,
+        bitcoin_rs_index::IndexCapabilities::ALL,
+        &mut pending,
+    )?;
     assert!(matches!(action, ReconcileAction::Progressed));
     assert_eq!(fixture.watermark()?, None);
     assert_eq!(fixture.bodies.sync_count(), 0);
@@ -300,9 +304,12 @@ fn expired_pending_prefix_commits_before_descendant_extension()
     let mut pending = None;
 
     assert!(matches!(
-        fixture
-            .worker
-            .catch_up_to(&stale_target, None, &mut pending)?,
+        fixture.worker.catch_up_to(
+            &stale_target,
+            None,
+            bitcoin_rs_index::IndexCapabilities::ALL,
+            &mut pending,
+        )?,
         ReconcileAction::Progressed
     ));
     assert_eq!(fixture.watermark()?, None);
@@ -340,7 +347,12 @@ fn complete_rival_prefix_commits_and_repairs_on_next_pass() -> Result<(), Box<dy
     fixture.publish_tip(&fixture.b);
     let mut pending = None;
 
-    let action = fixture.worker.catch_up_to(&target, None, &mut pending)?;
+    let action = fixture.worker.catch_up_to(
+        &target,
+        None,
+        bitcoin_rs_index::IndexCapabilities::ALL,
+        &mut pending,
+    )?;
 
     assert!(
         matches!(action, ReconcileAction::Progressed),

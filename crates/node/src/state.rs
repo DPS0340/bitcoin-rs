@@ -3,7 +3,7 @@
 //! V1 keeps this deliberately minimal: it owns the resolved [`Config`], the
 //! data-directory path, the open chainstate storage backend, and the replay log
 //! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
-//! / index / p2p / rpc / electrum) parks here as the integration point matures.
+//! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
@@ -11,7 +11,7 @@ use bitcoin::hex::FromHex as _;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_rpc::{
-    BlockBodyMetadata, BlockBodySource, BlockRecord, NetworkState, PruneResult, PruneService,
+    BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
 };
 use compact_str::CompactString;
@@ -21,7 +21,7 @@ use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -97,6 +97,15 @@ pub enum ApplyError {
     /// Height arithmetic overflowed `u32::MAX`.
     #[error("height overflow at tip {0}")]
     HeightOverflow(u32),
+    /// Summing a block's input or output values left the satoshi range.
+    #[error("block value total overflows the satoshi range")]
+    BlockValueOverflow,
+    /// A block's non-coinbase outputs exceed the inputs they spend.
+    ///
+    /// Per-transaction verification rejects this first, so reaching it means
+    /// the two disagree; refuse rather than treat the block as fee-free.
+    #[error("block creates more value than it spends")]
+    BlockOutputsExceedInputs,
     /// The block header hash does not satisfy its declared proof-of-work target.
     #[error("proof-of-work: header hash {hash} exceeds declared target")]
     ProofOfWork {
@@ -330,7 +339,7 @@ impl NodeStorage {
         &self,
         block_files: &Arc<FlatFileBlockStore>,
         block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
-        blocks: Arc<RwLock<Vec<BlockRecord>>>,
+        blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
@@ -479,6 +488,10 @@ impl BlockBodySource for StoredBlockBodySource {
         self.store.load_block_body(height, hash).ok().flatten()
     }
 
+    fn disk_usage(&self) -> Option<u64> {
+        self.store.disk_usage()
+    }
+
     fn block_body_range(
         &self,
         height: u32,
@@ -489,7 +502,7 @@ impl BlockBodySource for StoredBlockBodySource {
         // `None` is overloaded here: it means both "this store cannot slice"
         // and "the read failed". Callers must treat either as a reason to fall
         // back to the whole body, so the return type stays — but this is the
-        // hot path for every Electrum history call now, and an I/O error that
+        // hot path for every ScriptIndex history call now, and an I/O error that
         // silently degrades into a full block scan is exactly the failure that
         // would otherwise show up only as unexplained latency.
         match self.store.load_block_body_range(height, hash, offset, len) {
@@ -549,7 +562,7 @@ pub struct NodePruneService<S: KvStore> {
     store: Arc<S>,
     block_files: Arc<FlatFileBlockStore>,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
-    blocks: Arc<RwLock<Vec<BlockRecord>>>,
+    blocks: Arc<RwLock<BlockLog>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     pruneheight: Mutex<Option<u32>>,
     /// Height the last clean checkpoint would restore to, 0 when none exists.
@@ -565,7 +578,7 @@ impl<S: KvStore> NodePruneService<S> {
         store: Arc<S>,
         block_files: Arc<FlatFileBlockStore>,
         block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
-        blocks: Arc<RwLock<Vec<BlockRecord>>>,
+        blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
@@ -659,7 +672,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             }
         }
 
-        for record in blocks.iter_mut() {
+        for record in blocks.records_mut() {
             if record.height < updated_pruneheight {
                 record.block_hex = String::new();
             }
@@ -727,8 +740,15 @@ where
 {
     match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
         Ok(writer) => Ok(writer),
-        Err(bitcoin_rs_index::IndexError::LegacyCursorlessIndex) => {
-            bitcoin_rs_index::IndexWriter::reset_legacy(store.as_ref())?;
+        Err(
+            error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
+            | bitcoin_rs_index::IndexError::UnsupportedTxIndexFormatVersion { .. }),
+        ) => {
+            tracing::warn!(
+                %error,
+                "resetting incompatible derived transaction index for rebuild"
+            );
+            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref())?;
             bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
         }
         Err(error) => Err(error),
@@ -754,12 +774,24 @@ where
     })
 }
 
+fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
+    bitcoin_rs_index::IndexCapabilities {
+        // ScriptIndex-backed Esplora responses need exact historical
+        // transactions to render prevouts and calculate fees. This is an
+        // internal dependency; `tx_index_query` below still exposes it to Core
+        // RPCs only for an explicit --txindex configuration.
+        tx_lookup: config.txindex || config.script_index,
+        script_history: config.script_index,
+    }
+}
+
 fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
-    if !config.txindex {
+    let enabled = tx_index_capabilities(config);
+    if enabled.is_empty() {
         return Ok(None);
     }
     if config.prune_target_mb > 0 {
-        bail!("-txindex is not compatible with -prune");
+        bail!("transaction and script indexing are not compatible with -prune");
     }
 
     let txindex_dir = config.data_dir.join("txindex");
@@ -869,8 +901,11 @@ pub struct NodeState {
     mempool: Arc<RwLock<Mempool>>,
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Cumulative transaction count through `applied_tip`, `0` when unknown.
+    /// Shared with `ApplyHandles`, which maintains it, and with the RPC context.
+    chain_tx_count: Arc<AtomicU64>,
     block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
-    blocks: Arc<RwLock<Vec<BlockRecord>>>,
+    blocks: Arc<RwLock<BlockLog>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     network: Arc<RwLock<NetworkState>>,
     peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
@@ -1001,6 +1036,7 @@ impl NodeState {
             initial_coin_stats,
             block_tree_value,
             restored_applied_tip,
+            restored_chain_tx_count,
             resume_source,
         ) = match checkpoint_load {
             crate::checkpoint::CheckpointLoad::Cold { reason } => {
@@ -1012,6 +1048,7 @@ impl NodeState {
                     bitcoin_rs_coinstats::CoinStats::default(),
                     bitcoin_rs_chain::BlockTree::new(),
                     None,
+                    0,
                     ResumeSource::Cold,
                 )
             }
@@ -1022,6 +1059,7 @@ impl NodeState {
                     bitcoin_rs_coinstats::CoinStats::default(),
                     tree,
                     None,
+                    0,
                     ResumeSource::HeadersOnly,
                 )
             }
@@ -1036,6 +1074,7 @@ impl NodeState {
                     restored.coin_stats,
                     restored.tree,
                     Some(restored.applied_tip),
+                    restored.chain_tx_count,
                     ResumeSource::Checkpoint,
                 )
             }
@@ -1058,7 +1097,8 @@ impl NodeState {
         if let Some(restored_applied_tip) = restored_applied_tip {
             applied_tip.store(Some(Arc::new(restored_applied_tip)));
         }
-        let blocks = Arc::new(RwLock::new(Vec::new()));
+        let blocks = Arc::new(RwLock::new(BlockLog::new()));
+        let chain_tx_count = Arc::new(AtomicU64::new(restored_chain_tx_count));
         let transactions = Arc::new(RwLock::new(HashMap::new()));
         let tx_index_open = open_tx_index(&config)?;
         let (tx_index_runtime, tx_index_worker, tx_index_query) = match tx_index_open {
@@ -1085,6 +1125,7 @@ impl NodeState {
                     Arc::clone(&block_tree),
                     Some(Arc::clone(&block_body_store)),
                     open.batch_limits,
+                    tx_index_capabilities(&config),
                     wake_rx,
                 )
                 .context("spawn txindex worker")?;
@@ -1111,6 +1152,7 @@ impl NodeState {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
             applied_tip: Arc::clone(&applied_tip),
+            chain_tx_count: Arc::clone(&chain_tx_count),
             block_tree: Arc::clone(&block_tree),
             utxo: Arc::clone(&utxo),
             coin_stats: Arc::clone(&coin_stats),
@@ -1185,6 +1227,7 @@ impl NodeState {
             mempool,
             chain_tip,
             applied_tip,
+            chain_tx_count: Arc::clone(&chain_tx_count),
             block_tree,
             blocks,
             transactions,
@@ -1262,11 +1305,13 @@ impl NodeState {
             &self.utxo,
             &self.coin_stats,
             applied_tip.as_deref(),
+            self.chain_tx_count
+                .load(core::sync::atomic::Ordering::Relaxed),
             self.config.g2_muhash_samples.is_some(),
         )?;
         // Remove the marker only after this checkpoint publishes the matching
         // UTXO set and applied tip. TxIndex is outside the authoritative
-        // disconnect transaction and recovers from its own atomic watermark.
+        // disconnect transaction and recovers from its own atomic capability watermarks.
         self.apply_handles
             .undo_store
             .disarm_disconnect()
@@ -1301,20 +1346,35 @@ impl NodeState {
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
     pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+        if !self.config.txindex {
+            return None;
+        }
         self.tx_index_query.as_ref().map(|query| {
             let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
             adapter
         })
     }
 
-    /// Returns the node-owned complete transaction-index adapter for Electrum.
+    /// Returns transaction lookup for internal Esplora projections.
+    ///
+    /// `--scriptindex` builds this dependency as well, but that does not
+    /// enable or advertise the Core `--txindex` contract.
     #[must_use]
-    pub(crate) fn tx_index_electrum_adapter(
-        &self,
-    ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
+    pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> =
-                query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
+            adapter
+        })
+    }
+
+    /// Returns the node-owned complete generic script-index query adapter.
+    #[must_use]
+    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
+        if !self.config.script_index {
+            return None;
+        }
+        self.tx_index_query.as_ref().map(|query| {
+            let adapter: Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery> = query.clone();
             adapter
         })
     }
@@ -1372,9 +1432,15 @@ impl NodeState {
         Arc::clone(&self.block_tree)
     }
 
+    /// Shares the cumulative chain transaction-count handle with the RPC layer.
+    #[must_use]
+    pub fn chain_tx_count_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.chain_tx_count)
+    }
+
     /// Returns the shared block-records handle exposed to RPC handlers.
     #[must_use]
-    pub fn blocks(&self) -> Arc<RwLock<Vec<BlockRecord>>> {
+    pub fn blocks(&self) -> Arc<RwLock<BlockLog>> {
         Arc::clone(&self.blocks)
     }
 
@@ -1555,6 +1621,7 @@ impl Drop for NodeState {
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
+    use bitcoin_rs_rpc::BlockRecord;
 
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
@@ -1652,6 +1719,25 @@ mod tests {
     }
 
     #[test]
+    fn script_index_builds_without_advertising_core_txindex() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.txindex = false;
+        config.script_index = true;
+
+        let state = NodeState::open(config)?;
+
+        assert!(state.apply_handles().tx_index_runtime.is_some());
+        assert!(state.tx_index_query().is_none());
+        assert!(state.esplora_tx_index_query().is_some());
+        assert!(state.script_index_query().is_some());
+        assert!(state.data_dir().join("txindex").exists());
+        Ok(())
+    }
+
+    #[test]
     fn drop_joins_txindex_worker_before_reopen() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
@@ -1685,44 +1771,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("-txindex is not compatible with -prune"),
+                .contains("transaction and script indexing are not compatible with -prune"),
             "unexpected error: {error:#}"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn open_rebuilds_legacy_cursorless_txindex() -> anyhow::Result<()> {
-        use bitcoin_rs_storage::{ColumnFamily, KvStore as _};
-
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.storage_backend = "fjall".to_owned();
-        config.txindex = true;
-
-        let txindex_dir = config.data_dir.join("txindex");
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        store.put(ColumnFamily::TxConfirmed, b"legacy-row", &[])?;
-        drop(store);
-
-        let state = NodeState::open(config)?;
-        assert!(state.tx_index_query().is_some());
-        drop(state);
-
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        assert!(
-            store
-                .iter_prefix(ColumnFamily::TxConfirmed, &[])?
-                .next()
-                .is_none(),
-            "legacy rows must be removed before rebuilding"
-        );
-        assert_eq!(
-            store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?,
-            Some(vec![1, 0, 0, 0])
         );
         Ok(())
     }
@@ -2132,6 +2182,53 @@ mod tests {
     /// checkpoint names, and a crash then restores a chainstate that cannot
     /// disconnect its own tip.
     #[test]
+    fn the_chain_transaction_count_survives_a_checkpoint_restart() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let expected = {
+            let state = NodeState::open(config.clone())?;
+            assert_eq!(
+                state.chain_tx_count_handle().load(Ordering::Relaxed),
+                0,
+                "a node that has applied nothing cannot know the count"
+            );
+
+            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let genesis_tx_count = u64::try_from(genesis.txdata.len())?;
+            let _tip = state.apply_block(&genesis)?;
+            let counted = state.chain_tx_count_handle().load(Ordering::Relaxed);
+            assert_eq!(counted, genesis_tx_count, "genesis establishes the count");
+
+            assert!(matches!(
+                state.write_clean_checkpoint()?,
+                crate::checkpoint::CheckpointWrite::Published { .. }
+            ));
+            counted
+        };
+
+        // The block-record log is rebuilt empty on every open, so before this
+        // change the count was unrecoverable after a restart: the applied tip
+        // came back from the checkpoint at its real height with nothing behind
+        // it to sum. The number now rides along with the tip.
+        let resumed = NodeState::open(config)?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+        assert!(
+            resumed.blocks().read().is_empty(),
+            "the record log really does start empty; the count cannot come from it"
+        );
+        assert_eq!(
+            resumed.chain_tx_count_handle().load(Ordering::Relaxed),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
     fn undo_pruning_keeps_records_the_durable_tip_still_needs() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
             let byte = u8::try_from(height)
@@ -2160,7 +2257,7 @@ mod tests {
                 height,
                 block_hex: "00".to_owned(),
                 body_size: 1,
-                header_hex: String::new(),
+                header: None,
                 tx_count: 0,
                 time: 0,
             });
@@ -2220,7 +2317,7 @@ mod tests {
                 height,
                 block_hex: "00".to_owned(),
                 body_size: 1,
-                header_hex: String::new(),
+                header: None,
                 tx_count: 0,
                 time: 0,
             });
@@ -2359,6 +2456,106 @@ mod tests {
             NodeStorage::Mdbx(store) => metadata_exists(&**store)?,
         };
         assert!(!has_metadata);
+        Ok(())
+    }
+
+    /// Pruning a block file must reduce what the node reports as its disk size.
+    ///
+    /// `getblockchaininfo.size_on_disk` used to be the sum of every block
+    /// record's `body_size`. Pruning does not remove records — it clears their
+    /// cached bodies and leaves the rest — so that sum could not move, and a
+    /// pruned node went on reporting bytes it no longer had, under the one field
+    /// an operator reads to check that pruning worked.
+    ///
+    /// This asserts both halves: the store's figure falls by exactly the file
+    /// that was deleted, and the record sum does not move at all. The second is
+    /// what makes the first worth having.
+    #[test]
+    fn pruning_a_block_file_reduces_the_reported_disk_size() -> anyhow::Result<()> {
+        use bitcoin::blockdata::constants::genesis_block;
+
+        fn seed_file_height<S: KvStore>(store: &S, height: u32) -> anyhow::Result<()> {
+            let mut batch = store.new_batch();
+            batch.put(
+                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_storage::block_file_max_height_key(0),
+                &bitcoin_rs_storage::encode_block_file_max_height(height),
+            );
+            store.write(batch)?;
+            Ok(())
+        }
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+
+        // Two files present before the store opens, so the earlier one is not
+        // the append target and is therefore prunable. Same shape as
+        // `prune_reclaims_whole_files_and_keeps_current_file`, but with bytes in
+        // it, because bytes are what is being counted.
+        let blocks_dir = config.data_dir.join("blocks");
+        std::fs::create_dir_all(&blocks_dir)?;
+        let prunable_file = blocks_dir.join("blk00000.dat");
+        let prunable_bytes = vec![7_u8; 4_096];
+        std::fs::write(&prunable_file, &prunable_bytes)?;
+        std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
+
+        let state = NodeState::open(config)?;
+        let block = genesis_block(bitcoin::Network::Regtest);
+        // The hash is not needed: this test counts bytes in files, not bodies.
+        let record = BlockRecord::from_block_metadata(10, &block);
+        let record_sum_before = u64::try_from(record.body_size)?;
+        state.blocks.write().push(record);
+
+        let Some(before) = state.block_body_store.disk_usage() else {
+            anyhow::bail!("a flat-file store must report its usage");
+        };
+        assert!(
+            before >= u64::try_from(prunable_bytes.len())?,
+            "the fixture's bytes must be accounted for"
+        );
+
+        // Tell the pruner that file 0 tops out at height 10, so pruning to 11
+        // makes it prunable.
+        match &state.storage {
+            #[cfg(feature = "rocksdb")]
+            NodeStorage::RocksDb(store) => seed_file_height(&**store, 10)?,
+            #[cfg(feature = "fjall")]
+            NodeStorage::Fjall(store) => seed_file_height(&**store, 10)?,
+            #[cfg(feature = "redb")]
+            NodeStorage::Redb(store) => seed_file_height(&**store, 10)?,
+            #[cfg(feature = "mdbx")]
+            NodeStorage::Mdbx(store) => seed_file_height(&**store, 10)?,
+        }
+
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+        service
+            .prune_to_height(11)
+            .map_err(|error| anyhow::anyhow!("prune failed: {error}"))?;
+
+        assert!(!prunable_file.exists(), "the fixture must actually prune");
+        let Some(after) = state.block_body_store.disk_usage() else {
+            anyhow::bail!("a flat-file store must report its usage");
+        };
+        assert_eq!(
+            after,
+            before.saturating_sub(u64::try_from(prunable_bytes.len())?),
+            "the reported size must fall by exactly the file that was deleted"
+        );
+
+        // The number this replaces, unmoved — which is the defect.
+        let record_sum_after = state.blocks.read().iter().fold(0_u64, |total, entry| {
+            total.saturating_add(u64::try_from(entry.body_size).unwrap_or(0))
+        });
+        assert_eq!(
+            record_sum_after, record_sum_before,
+            "the block-record sum cannot see pruning, which is why it is not \
+             what size_on_disk reports"
+        );
         Ok(())
     }
 

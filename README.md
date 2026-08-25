@@ -38,41 +38,11 @@ backend selection, RPC authentication, and checking sync progress.
 
 ### Enforcer integration
 
-The Compose example under `tools/bip300301-enforcer` is specifically for
-running bitcoin-rs together with the BIP300/301 enforcer; it is not the general
-bitcoin-rs deployment path. It builds the production `fjall` + `bitcoinkernel`
-node profile, starts both services, stores their data under `data/`, exposes
-P2P, and binds RPC to the Docker host's loopback interface only. One
-`BITCOIN_RS_NETWORK` selects the matching network for both services. The
-`drynet4` selection derives its mainnet consensus rules, custom P2P magic,
-fixed peer, and disabled DNS seeding inside bitcoin-rs.
-
-Set explicit RPC credentials in `.env`, then start bitcoin-rs and the enforcer:
-
-```sh
-cd tools/bip300301-enforcer
-cp .env.example .env
-# Edit .env and set BITCOIN_RS_RPC_PASSWORD before starting the node.
-
-docker compose up --build -d
-docker compose logs -f
-```
-
-Check sync progress inside the container. This uses the credentials already
-provided by Compose and does not evaluate `.env` as shell code:
-
-```sh
-docker compose exec node sh -c \
-  'curl --user "$BITCOIN_RS_RPC_USER:$BITCOIN_RS_RPC_PASSWORD" \
-    -H "content-type: application/json" \
-    -d "{\"jsonrpc\":\"1.0\",\"id\":\"sync\",\"method\":\"getblockchaininfo\",\"params\":[]}" \
-    http://127.0.0.1:8332/'
-```
-
-Stop the process without deleting its chain data with
-`docker compose down`.
-Compose allows up to 5 minutes for the full clean checkpoint before forcing
-termination. Chain data remains under `data/` until it is explicitly removed.
+Running bitcoin-rs alongside the BIP300/301 enforcer is a separate deployment path with
+its own Compose example: see [tools/bip300301-enforcer](tools/bip300301-enforcer) for
+the stack and [docs/rest-interface.md](docs/rest-interface.md) for the REST surface the
+enforcer consumes. It builds the production `fjall` plus `bitcoinkernel` profile and
+binds RPC to the Docker host's loopback only.
 
 ## Measured performance
 
@@ -92,42 +62,31 @@ Measured at commit `686379a` with the host near idle: 1.10x faster on
 wall-clock, 1.21x less CPU, and a 1.18x smaller resident set. Both nodes reach
 the same tip hash.
 
-CPU and memory are the stable margins. Wall-clock moves with host load — the
-same pair has measured between 1.04x and 1.24x apart across sessions — so treat
-it as parity-or-better rather than as a fixed number.
-
-This is the replay driver, which reads blocks from local files. Peer sync does
-not reach the same figure yet: it stages at most 128 blocks, so it forms
-smaller script-verification windows and lands between the two. Widening that is
-open work, and it is a change to the download pipeline rather than a constant.
-
-Read the conditions before reusing these numbers. This box runs other tenants,
-and the same binary has measured anywhere from 50s to 73s across sessions
-depending on load. Only runs interleaved with Core inside one session are
-comparable; an absolute number quoted from a different session is not.
+Full measurement conditions, session variance, and the comparative data against Bitcoin
+Core and GoCoin are documented in
+[docs/benchmarks/end-to-end-sync.md](docs/benchmarks/end-to-end-sync.md). Read it before
+reusing any number here: only runs interleaved with Core inside one session are
+comparable.
 
 Against [GoCoin](https://github.com/piotrnar/gocoin) on the same harness:
 2.6x faster on replay and 3.03x on peer-to-peer sync.
-
-These numbers describe one workload on one machine. They are not a claim about
-mainnet tip sync, which is bound by download bandwidth rather than by
-verification.
 
 ## Architecture
 
 - Consensus verification via bitcoinkernel (libbitcoinkernel), covering both
   script-path and key-path spends.
-- A 256-shard arena-backed UTXO set (bumpalo and hashbrown) with a snapshot
-  format and crash-safe defrag.
+- A 256-shard UTXO set: each shard is a `hashbrown::HashTable` of compact records
+  (`ThinRecordBuf`, one pointer-sized heap allocation per record) behind a
+  `parking_lot::RwLock`, with a snapshot format and checkpoint-based crash recovery.
 - Block application in windows: consecutive blocks share one script
   verification dispatch, while each block still commits in order, so every rule
   that depends on committed state sees the real chain.
 - Optional utreexo (Pollard, Stump, MemForest) for stateless validation.
-- A native Electrum-style index, BIP157/158 filters, coinstats over MuHash, and
+- A native ScriptIndex with an Esplora HTTP surface, BIP157/158 filters, coinstats over MuHash, and
   pruning with Core's 288-block reorg-safety floor.
 - `getblocktemplate` for mining.
 - Synchronous HTTP/1.1 JSON-RPC over sonic-rs using Core's method names.
-  Signing methods return -32603, "wallet has no private keys".
+  Signing methods return -32603, "wallet has no private keys; use external signer".
 - mimalloc as the global allocator, over a crossbeam-channel event loop.
 
 ## Default posture
@@ -159,18 +118,14 @@ cargo build --release -p bitcoin-rs
 
 The default features are `rocksdb`, `fjall`, `redb`, `mdbx`, and `kernel`.
 
-A portable build drops the `kernel` feature and its C++ dependencies, but it
-must still name a storage backend: bare `--no-default-features` compiles in
-none, and the node then refuses to start because no backend matches its
-configuration.
-
 ```sh
 cargo build --release -p bitcoin-rs --no-default-features --features fjall
 ```
 
-The portable verifier supports only Taproot key-path spends. It cannot validate
-non-Taproot spends or Taproot script-path spends, so a mainnet sync stops early.
-Use it for development only.
+The portable verifier supports only Taproot key-path spends, so a mainnet sync stops
+early; use it for development only. For portable builds without C++ dependencies and
+their verification trade-offs, see
+[docs/getting-started.md](docs/getting-started.md).
 
 ## Tests
 
@@ -197,7 +152,7 @@ does not emit mempool `A`/`R` events. `docs/README.md` lists the rest.
 - [docs/getting-started.md](docs/getting-started.md) — clone to synced node
 - [docs/](docs/README.md) — the documentation index
 - [CONCEPTS.md](CONCEPTS.md) — project vocabulary
-- [PLAN.md](PLAN.md) — roadmap and the G1-G14 verification gates
+- [PLAN.md](PLAN.md) — roadmap and the G1-G15 verification gates
 
 ## License
 

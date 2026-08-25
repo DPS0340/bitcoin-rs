@@ -100,18 +100,30 @@ pub enum IndexError {
     /// `TxIndex` tables exist but the format-version key is missing.
     #[error("TxIndex tables are present without a versioned watermark")]
     LegacyCursorlessIndex,
+    /// A crash-recovery marker for a capability rebuild was malformed.
+    #[error("invalid TxIndex capability reset marker")]
+    InvalidResetMarker,
 }
 
 // Reserved metadata keys in `ColumnFamily::UtxoMeta`. The 0x00 prefix is reserved for
 // TxIndex metadata; data row keys begin with ASCII letters only and can never collide.
 const FORMAT_VERSION_KEY: &[u8] = &[0x00, b'V'];
-const FORMAT_VERSION_VALUE: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
-const WATERMARK_KEY: &[u8] = &[0x00, b'W'];
+const FORMAT_VERSION_VALUE: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
+const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
+const SCRIPT_HISTORY_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
+const RESET_CAPABILITIES_KEY: &[u8] = &[0x00, b'R'];
 const WATERMARK_LEN: usize = crate::types::HEIGHT_SIZE + 32;
 const RESET_SCAN_LIMIT: PrefixScanLimit = PrefixScanLimit {
     max_rows: 1_000,
     max_bytes: 256 * 1024,
 };
+
+const fn watermark_key(capability: IndexCapability) -> &'static [u8] {
+    match capability {
+        IndexCapability::TxLookup => TX_LOOKUP_WATERMARK_KEY,
+        IndexCapability::ScriptHistory => SCRIPT_HISTORY_WATERMARK_KEY,
+    }
+}
 
 /// Exact durable point represented by all committed `TxIndex` rows.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -120,6 +132,109 @@ pub struct IndexWatermark {
     pub height: u32,
     /// Full block identity at `height`.
     pub hash: [u8; 32],
+}
+
+/// One confirmed transaction discovered by the generic script-history resolver.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ScriptHistoryEntry {
+    /// Transaction identifier.
+    pub txid: bitcoin::Txid,
+    /// Confirming block height.
+    pub height: u32,
+}
+
+impl ScriptHistoryEntry {
+    /// Creates a confirmed script-history entry.
+    pub const fn confirmed(txid: bitcoin::Txid, height: u32) -> Self {
+        Self { txid, height }
+    }
+}
+
+/// One independently tracked family of derived index rows.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IndexCapability {
+    /// Core-compatible transaction lookup rows.
+    TxLookup,
+    /// `ScriptIndex` scripthash funding and spending rows.
+    ScriptHistory,
+}
+
+/// Capabilities included in one prepared index transition.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexCapabilities {
+    /// Build transaction lookup rows.
+    pub tx_lookup: bool,
+    /// Build `ScriptIndex` funding and spending rows.
+    pub script_history: bool,
+}
+
+impl IndexCapabilities {
+    /// No derived rows.
+    pub const NONE: Self = Self {
+        tx_lookup: false,
+        script_history: false,
+    };
+    /// Transaction lookup only.
+    pub const TX_LOOKUP: Self = Self {
+        tx_lookup: true,
+        script_history: false,
+    };
+    /// `ScriptIndex` history only.
+    pub const SCRIPT_HISTORY: Self = Self {
+        tx_lookup: false,
+        script_history: true,
+    };
+    /// Both capabilities.
+    pub const ALL: Self = Self {
+        tx_lookup: true,
+        script_history: true,
+    };
+
+    /// Returns whether `capability` is selected.
+    pub const fn contains(self, capability: IndexCapability) -> bool {
+        match capability {
+            IndexCapability::TxLookup => self.tx_lookup,
+            IndexCapability::ScriptHistory => self.script_history,
+        }
+    }
+
+    /// Returns whether no capability is selected.
+    pub const fn is_empty(self) -> bool {
+        !self.tx_lookup && !self.script_history
+    }
+
+    fn to_mask(self) -> u8 {
+        u8::from(self.tx_lookup) | (u8::from(self.script_history) << 1)
+    }
+
+    fn from_mask(mask: u8) -> Result<Self, IndexError> {
+        if mask == 0 || mask & !0b11 != 0 {
+            return Err(IndexError::InvalidResetMarker);
+        }
+        Ok(Self {
+            tx_lookup: mask & 0b01 != 0,
+            script_history: mask & 0b10 != 0,
+        })
+    }
+}
+
+/// Durable cursors for the independently ready index capabilities.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexWatermarks {
+    /// Transaction lookup cursor.
+    pub tx_lookup: Option<IndexWatermark>,
+    /// `ScriptIndex` history cursor.
+    pub script_history: Option<IndexWatermark>,
+}
+
+impl IndexWatermarks {
+    /// Returns one capability's durable cursor.
+    pub const fn get(self, capability: IndexCapability) -> Option<IndexWatermark> {
+        match capability {
+            IndexCapability::TxLookup => self.tx_lookup,
+            IndexCapability::ScriptHistory => self.script_history,
+        }
+    }
 }
 
 impl IndexWatermark {
@@ -147,9 +262,16 @@ impl IndexWatermark {
     }
 
     /// Reads the durable watermark from a snapshot without requiring a writer handle.
-    pub fn read_from_snapshot(snapshot: &dyn KvSnapshot) -> Result<Option<Self>, IndexError> {
+    pub fn read_from_snapshot(
+        snapshot: &dyn KvSnapshot,
+        capability: IndexCapability,
+    ) -> Result<Option<Self>, IndexError> {
+        let key = match capability {
+            IndexCapability::TxLookup => TX_LOOKUP_WATERMARK_KEY,
+            IndexCapability::ScriptHistory => SCRIPT_HISTORY_WATERMARK_KEY,
+        };
         snapshot
-            .get(ColumnFamily::UtxoMeta, WATERMARK_KEY)?
+            .get(ColumnFamily::UtxoMeta, key)?
             .as_deref()
             .map(Self::from_bytes)
             .transpose()
@@ -177,6 +299,7 @@ pub struct PreparedBlock {
     pub row_count: usize,
     /// Actual encoded key/value bytes retained by the row mutations.
     pub encoded_bytes: usize,
+    capabilities: IndexCapabilities,
     /// Row mutations retained from the serialized body.
     rows: PendingRows,
 }
@@ -197,6 +320,7 @@ pub struct PreparedBatch {
     blocks: Vec<PreparedBlock>,
     row_count: usize,
     encoded_bytes: usize,
+    capabilities: Option<IndexCapabilities>,
 }
 
 impl PreparedBatch {
@@ -207,6 +331,7 @@ impl PreparedBatch {
             blocks: Vec::new(),
             row_count: 0,
             encoded_bytes: 0,
+            capabilities: None,
         }
     }
 
@@ -218,6 +343,13 @@ impl PreparedBatch {
         reason = "returning the prepared block avoids a hot-path allocation"
     )]
     pub fn try_push(&mut self, block: PreparedBlock) -> Result<(), PreparedBlock> {
+        let capabilities = block.capabilities;
+        if self
+            .capabilities
+            .is_some_and(|current| current != capabilities)
+        {
+            return Err(block);
+        }
         let new_rows = self.row_count.checked_add(block.row_count);
         let new_bytes = self.encoded_bytes.checked_add(block.encoded_bytes);
         let fits = new_rows.is_some_and(|rows| rows <= self.limits.max_rows)
@@ -228,6 +360,7 @@ impl PreparedBatch {
         self.row_count = new_rows.unwrap_or(usize::MAX);
         self.encoded_bytes = new_bytes.unwrap_or(usize::MAX);
         self.blocks.push(block);
+        self.capabilities.get_or_insert(capabilities);
         Ok(())
     }
 
@@ -265,6 +398,10 @@ impl PreparedBatch {
     /// Consumes the batch and returns the admitted blocks.
     pub(crate) fn into_blocks(self) -> Vec<PreparedBlock> {
         self.blocks
+    }
+
+    const fn capabilities(&self) -> Option<IndexCapabilities> {
+        self.capabilities
     }
 }
 
@@ -312,74 +449,28 @@ impl<S: KvStore> Indexer<S> {
 
     /// Loads the exact durable `TxIndex` watermark, or `None` for an empty v2 index.
     pub fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
+        self.capability_watermark(IndexCapability::TxLookup)
+    }
+
+    /// Loads one capability's exact durable watermark.
+    pub fn capability_watermark(
+        &self,
+        capability: IndexCapability,
+    ) -> Result<Option<IndexWatermark>, IndexError> {
+        let key = watermark_key(capability);
         self.store
-            .get(ColumnFamily::UtxoMeta, WATERMARK_KEY)?
+            .get(ColumnFamily::UtxoMeta, key)?
             .as_deref()
             .map(IndexWatermark::from_bytes)
             .transpose()
     }
 
-    /// Iterates every persisted block header in the `BlockHeaders` column family.
-    ///
-    /// Returns the raw 80-byte header rows in storage order (lexicographic by key).
-    /// Used by SPV-style range queries that need contiguous headers from genesis.
-    pub fn iter_block_headers(&self) -> Result<Vec<[u8; crate::HEADER_ROW_SIZE]>, IndexError> {
-        let iter = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
-        let mut rows = Vec::new();
-        for entry in iter {
-            let (key, _value) = entry?;
-            if key.len() == crate::HEADER_ROW_SIZE {
-                let mut header = [0_u8; crate::HEADER_ROW_SIZE];
-                header.copy_from_slice(&key);
-                rows.push(header);
-            }
-        }
-        Ok(rows)
-    }
-
-    /// Returns the hash of every indexed block header in storage order.
-    ///
-    /// Cheaper than `iter_block_headers` when only the hash list matters:
-    /// computes `BlockHash` from the 80-byte raw header bytes during iteration
-    /// without retaining the payload.
-    pub fn iter_block_header_hashes(
-        &self,
-    ) -> Result<Vec<bitcoin_rs_primitives::Hash256>, IndexError> {
-        use bitcoin::hashes::Hash as _;
-
-        let iter = self.store.iter_prefix(ColumnFamily::BlockHeaders, &[])?;
-        let mut out = Vec::new();
-        for entry in iter {
-            let (key, _value) = entry?;
-            if key.len() == crate::HEADER_ROW_SIZE {
-                // BlockHeader hash is the double-SHA256 of the 80-byte serialized header.
-                let block_hash = bitcoin::BlockHash::hash(&key);
-                out.push(bitcoin_rs_primitives::Hash256::from_le_bytes(
-                    &block_hash.to_byte_array(),
-                ));
-            }
-        }
-        Ok(out)
-    }
-
-    /// Returns the number of persisted block headers via `iter_block_headers`.
-    ///
-    /// Cost O(N) since the iterator pulls each row; cache if called frequently.
-    pub fn header_count(&self) -> Result<usize, IndexError> {
-        self.iter_block_headers().map(|rows| rows.len())
-    }
-
-    /// Returns the highest indexed header height, or `None` if no headers are
-    /// indexed.
-    ///
-    /// Cost O(N) since `header_count` pulls every row. Cache if called
-    /// frequently. Convenience for IBD progress reporting and status surfaces.
-    pub fn tip_height_indexed(&self) -> Result<Option<u32>, IndexError> {
-        let count = self.header_count()?;
-        if count == 0 {
-            return Ok(None);
-        }
-        Ok(u32::try_from(count.saturating_sub(1)).ok())
+    /// Loads both independently durable capability watermarks.
+    pub fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        Ok(IndexWatermarks {
+            tx_lookup: self.capability_watermark(IndexCapability::TxLookup)?,
+            script_history: self.capability_watermark(IndexCapability::ScriptHistory)?,
+        })
     }
 
     /// Iterates confirmed funding rows for `scripthash`.
@@ -404,7 +495,7 @@ impl<S: KvStore> Indexer<S> {
     ///
     /// Walks `iter_funding_rows(scripthash)` to get every (prefix, height) pair,
     /// fetches each block via `source.block_at_height(height)`, and yields a
-    /// `HistoryEntry::confirmed` for every transaction in that block that has
+    /// `ScriptHistoryEntry::confirmed` for every transaction in that block that has
     /// at least one output matching `scripthash` exactly.
     ///
     /// Entries are returned in iteration order (lexicographic by prefix||height).
@@ -416,7 +507,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
+    ) -> Result<Vec<crate::ScriptHistoryEntry>, IndexError> {
         let rows = self.iter_funding_rows_with_values(scripthash)?;
         let mut entries = Vec::new();
         for (row, value) in &rows {
@@ -440,7 +531,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<crate::HistoryEntry>, IndexError> {
+    ) -> Result<Vec<crate::ScriptHistoryEntry>, IndexError> {
         let rows = self.iter_funding_rows(scripthash)?;
         let mut entries = Vec::new();
         let mut last_height: Option<u32> = None;
@@ -465,7 +556,10 @@ impl<S: KvStore> Indexer<S> {
                     }
                 }
                 if matched {
-                    entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
+                    entries.push(crate::ScriptHistoryEntry::confirmed(
+                        tx.compute_txid(),
+                        height,
+                    ));
                 }
             }
         }
@@ -539,7 +633,7 @@ impl<S: KvStore> Indexer<S> {
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
     ///
     /// Returns `(txid, vout, value_sats, funding_height)` quadruples. Use this
-    /// when callers need the confirmation height (e.g. Electrum `listunspent`
+    /// when callers need the confirmation height (e.g. `ScriptIndex` `listunspent`
     /// emits the height for each unspent output).
     pub fn resolve_unspent_outputs_with_height<B: BlockSource>(
         &self,
@@ -968,7 +1062,7 @@ impl<S: KvStore> Indexer<S> {
         // same height that shares any data — the same output script is enough —
         // derives the same keys. Rolling this block back a second time, after
         // the replacement was indexed, would delete the replacement's rows and
-        // leave Electrum missing active-chain history.
+        // leave ScriptIndex missing active-chain history.
         //
         // The header row is the identity: its key is the 80-byte serialized
         // header, and the block hash is the double-SHA256 of exactly those
@@ -1093,6 +1187,7 @@ fn pending_rows_for_block_with_header(
     block: &[u8],
     height: u32,
     txids: TxidSource<'_>,
+    capabilities: IndexCapabilities,
 ) -> Result<
     (
         PendingRows,
@@ -1113,6 +1208,7 @@ fn pending_rows_for_block_with_header(
             invalid_header_len: None,
             block,
             pending_funding: Vec::new(),
+            capabilities,
         };
         match bsl::Block::visit(block, &mut visitor) {
             Ok(_) => visitor.txid_count,
@@ -1133,7 +1229,8 @@ fn pending_rows_for_block(
     height: u32,
     txids: TxidSource<'_>,
 ) -> Result<(PendingRows, usize), IndexError> {
-    let (rows, txid_count, _) = pending_rows_for_block_with_header(block, height, txids)?;
+    let (rows, txid_count, _) =
+        pending_rows_for_block_with_header(block, height, txids, IndexCapabilities::ALL)?;
     Ok((rows, txid_count))
 }
 
@@ -1340,7 +1437,43 @@ fn put_rows<B: WriteBatch>(batch: &mut B, rows: &PendingRows) {
     }
 }
 
-fn delete_rows<B: WriteBatch>(batch: &mut B, rows: &PendingRows) {
+fn put_selected_watermarks<B: WriteBatch>(
+    batch: &mut B,
+    capabilities: IndexCapabilities,
+    watermark: Option<IndexWatermark>,
+) {
+    for capability in [IndexCapability::TxLookup, IndexCapability::ScriptHistory] {
+        if !capabilities.contains(capability) {
+            continue;
+        }
+        let key = watermark_key(capability);
+        if let Some(watermark) = watermark {
+            batch.put(ColumnFamily::UtxoMeta, key, &watermark.to_bytes());
+        } else {
+            batch.delete(ColumnFamily::UtxoMeta, key);
+        }
+    }
+}
+
+fn selected_watermark(
+    watermarks: IndexWatermarks,
+    capabilities: IndexCapabilities,
+) -> Result<Option<IndexWatermark>, IndexError> {
+    match (capabilities.tx_lookup, capabilities.script_history) {
+        (true, false) => Ok(watermarks.tx_lookup),
+        (false, true) => Ok(watermarks.script_history),
+        (true, true) if watermarks.tx_lookup == watermarks.script_history => {
+            Ok(watermarks.tx_lookup)
+        }
+        (true, true) => Err(IndexError::WatermarkMismatch {
+            expected: watermarks.tx_lookup,
+            actual: watermarks.script_history,
+        }),
+        (false, false) => Err(IndexError::NonContiguousPrepared { watermark: None }),
+    }
+}
+
+fn delete_rows<B: WriteBatch>(batch: &mut B, rows: &PendingRows, delete_shared_identity: bool) {
     for_each_row_group(&rows.txid_rows, |row, _positions| {
         batch.delete(ColumnFamily::TxConfirmed, row.as_bytes());
     });
@@ -1350,8 +1483,10 @@ fn delete_rows<B: WriteBatch>(batch: &mut B, rows: &PendingRows) {
     for row in &rows.spending_rows {
         batch.delete(ColumnFamily::Spending, row.as_bytes());
     }
-    for row in &rows.header_rows {
-        batch.delete(ColumnFamily::BlockHeaders, row);
+    if delete_shared_identity {
+        for row in &rows.header_rows {
+            batch.delete(ColumnFamily::BlockHeaders, row);
+        }
     }
 }
 
@@ -1371,6 +1506,7 @@ struct IndexBlockVisitor<'a> {
     /// the first point where the position exists. Outputs are therefore buffered
     /// here and drained once, in emission order.
     pending_funding: Vec<crate::types::HashPrefix>,
+    capabilities: IndexCapabilities,
 }
 
 impl IndexBlockVisitor<'_> {
@@ -1426,6 +1562,10 @@ impl Visitor for IndexBlockVisitor<'_> {
                 position,
             });
         }
+        if !self.capabilities.tx_lookup {
+            self.txid_count += 1;
+            return ControlFlow::Continue(());
+        }
         match self.txids {
             TxidSource::Compute => {
                 let txid = tx.txid_sha2();
@@ -1460,6 +1600,9 @@ impl Visitor for IndexBlockVisitor<'_> {
     }
 
     fn visit_tx_in(&mut self, _vin: usize, tx_in: &bsl::TxIn<'_>) -> ControlFlow<()> {
+        if !self.capabilities.script_history {
+            return ControlFlow::Continue(());
+        }
         let prevout = tx_in.prevout();
         if !is_null_prevout(prevout) {
             self.rows.spending_rows.push(SpendingPrefixRow::row_parts(
@@ -1472,6 +1615,9 @@ impl Visitor for IndexBlockVisitor<'_> {
     }
 
     fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut<'_>) -> ControlFlow<()> {
+        if !self.capabilities.script_history {
+            return ControlFlow::Continue(());
+        }
         let script = tx_out.script_pubkey();
         if !is_op_return_script(script) {
             self.pending_funding
@@ -1523,7 +1669,7 @@ fn positioned_history<B: BlockSource + ?Sized>(
     height: u32,
     value: &[u8],
     source: &B,
-) -> Option<Vec<crate::HistoryEntry>> {
+) -> Option<Vec<crate::ScriptHistoryEntry>> {
     let positions = crate::types::TxPositionValue::decode(value)?;
     let mut entries = Vec::with_capacity(positions.len());
     for position in positions {
@@ -1531,7 +1677,10 @@ fn positioned_history<B: BlockSource + ?Sized>(
         if !funds_scripthash(&tx, scripthash) {
             return None;
         }
-        entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
+        entries.push(crate::ScriptHistoryEntry::confirmed(
+            tx.compute_txid(),
+            height,
+        ));
     }
     Some(entries)
 }
@@ -1541,14 +1690,17 @@ fn scan_height_history<B: BlockSource + ?Sized>(
     scripthash: crate::ScriptHash,
     height: u32,
     source: &B,
-    entries: &mut Vec<crate::HistoryEntry>,
+    entries: &mut Vec<crate::ScriptHistoryEntry>,
 ) {
     let Some(block) = source.block_at_height(height) else {
         return;
     };
     for tx in &block.txdata {
         if funds_scripthash(tx, scripthash) {
-            entries.push(crate::HistoryEntry::confirmed(tx.compute_txid(), height));
+            entries.push(crate::ScriptHistoryEntry::confirmed(
+                tx.compute_txid(),
+                height,
+            ));
         }
     }
 }
@@ -1672,8 +1824,16 @@ pub struct TxIndexScan {
 
 /// Point-in-time, typed view of durable `TxIndex` rows.
 pub trait TxIndexSnapshot: Send + Sync {
-    /// Loads the exact durable watermark from this snapshot.
+    /// Loads the transaction lookup watermark from this snapshot.
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
+    /// Loads one capability's exact durable watermark from this snapshot.
+    fn capability_watermark(
+        &self,
+        capability: IndexCapability,
+    ) -> Result<Option<IndexWatermark>, IndexError> {
+        let _ = capability;
+        self.watermark()
+    }
     /// Scans confirmed-transaction rows for `txid`.
     fn transaction_rows(
         &self,
@@ -1728,7 +1888,14 @@ impl StoreTxIndexSnapshot<'_> {
 
 impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
-        IndexWatermark::read_from_snapshot(self.snapshot.as_ref())
+        self.capability_watermark(IndexCapability::TxLookup)
+    }
+
+    fn capability_watermark(
+        &self,
+        capability: IndexCapability,
+    ) -> Result<Option<IndexWatermark>, IndexError> {
+        IndexWatermark::read_from_snapshot(self.snapshot.as_ref(), capability)
     }
 
     fn transaction_rows(
@@ -1788,7 +1955,7 @@ pub struct IndexWriter<S: KvStore> {
 }
 
 impl<S: KvStore> IndexWriter<S> {
-    /// Opens a writer over `store`, rejecting legacy cursorless tables.
+    /// Opens a writer over `store`, rejecting unversioned index tables.
     pub fn open(store: std::sync::Arc<S>) -> Result<Self, IndexError> {
         let indexer = Indexer::new(store);
         match indexer
@@ -1810,6 +1977,7 @@ impl<S: KvStore> IndexWriter<S> {
                 }
             }
         }
+        Self::resume_capability_reset(indexer.store.as_ref())?;
         Ok(Self { indexer })
     }
 
@@ -1818,8 +1986,17 @@ impl<S: KvStore> IndexWriter<S> {
         self.indexer.watermark()
     }
 
-    /// Deletes every `TxIndex` row in bounded batches, then initializes empty version metadata.
-    pub fn reset_legacy(store: &S) -> Result<(), IndexError> {
+    /// Loads both independently durable capability watermarks.
+    pub fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        self.indexer.watermarks()
+    }
+
+    /// Deletes every derived index row in bounded batches and initializes the
+    /// current format marker so startup can rebuild it from the active chain.
+    ///
+    /// This is intentionally limited to derived `TxLookup`/`ScriptIndex` data;
+    /// it never touches the UTXO set or block bodies.
+    pub fn reset_index(store: &S) -> Result<(), IndexError> {
         for cf in [
             ColumnFamily::TxConfirmed,
             ColumnFamily::Funding,
@@ -1841,20 +2018,99 @@ impl<S: KvStore> IndexWriter<S> {
                 }
             }
         }
-        // Make every deletion durable before the version key can become durable.
         store.flush()?;
 
-        // Final batch sets the version key and removes any stale watermark.
         let mut batch = store.new_batch();
-        batch.delete(ColumnFamily::UtxoMeta, FORMAT_VERSION_KEY);
-        batch.delete(ColumnFamily::UtxoMeta, WATERMARK_KEY);
+        batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
+        batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
+        batch.delete(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY);
         batch.put(
             ColumnFamily::UtxoMeta,
             FORMAT_VERSION_KEY,
             &FORMAT_VERSION_VALUE,
         );
-        store.write_deferred(batch)?;
+        store.write_durable(batch)?;
+        Ok(())
+    }
+
+    /// Marks selected derived rows unavailable, deletes them in bounded batches,
+    /// and leaves their durable cursors empty so the worker can rebuild from genesis.
+    ///
+    /// The reset marker and cursor deletion land atomically before row deletion.
+    /// `open` resumes an interrupted reset before exposing the writer again.
+    pub fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        self.ensure_prepared_ready()?;
+        if capabilities.is_empty() {
+            return Err(IndexError::InvalidResetMarker);
+        }
+        let mut batch = self.indexer.store.new_batch();
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            RESET_CAPABILITIES_KEY,
+            &[capabilities.to_mask()],
+        );
+        batch.put(
+            ColumnFamily::UtxoMeta,
+            FORMAT_VERSION_KEY,
+            &FORMAT_VERSION_VALUE,
+        );
+        if capabilities.tx_lookup {
+            batch.delete(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY);
+        }
+        if capabilities.script_history {
+            batch.delete(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY);
+        }
+        self.indexer.store.write_durable(batch)?;
+        Self::resume_capability_reset(self.indexer.store.as_ref())
+    }
+
+    fn resume_capability_reset(store: &S) -> Result<(), IndexError> {
+        let Some(marker) = store.get(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY)? else {
+            return Ok(());
+        };
+        let [mask] = marker.as_slice() else {
+            return Err(IndexError::InvalidResetMarker);
+        };
+        let capabilities = IndexCapabilities::from_mask(*mask)?;
+        let mut column_families = Vec::with_capacity(4);
+        if capabilities.tx_lookup {
+            column_families.push(ColumnFamily::TxConfirmed);
+        }
+        if capabilities.script_history {
+            column_families.push(ColumnFamily::Funding);
+            column_families.push(ColumnFamily::Spending);
+        }
+        let unselected_cursor_remains = (!capabilities.tx_lookup
+            && store
+                .get(ColumnFamily::UtxoMeta, TX_LOOKUP_WATERMARK_KEY)?
+                .is_some())
+            || (!capabilities.script_history
+                && store
+                    .get(ColumnFamily::UtxoMeta, SCRIPT_HISTORY_WATERMARK_KEY)?
+                    .is_some());
+        if !unselected_cursor_remains {
+            column_families.push(ColumnFamily::BlockHeaders);
+        }
+        for cf in column_families {
+            loop {
+                let scan = store.scan_prefix_bounded(cf, &[], RESET_SCAN_LIMIT)?;
+                if scan.rows.is_empty() {
+                    break;
+                }
+                let mut batch = store.new_batch();
+                for (key, _) in scan.rows {
+                    batch.delete(cf, &key);
+                }
+                store.write_deferred(batch)?;
+                if scan.complete {
+                    break;
+                }
+            }
+        }
         store.flush()?;
+        let mut batch = store.new_batch();
+        batch.delete(ColumnFamily::UtxoMeta, RESET_CAPABILITIES_KEY);
+        store.write_durable(batch)?;
         Ok(())
     }
 
@@ -1865,8 +2121,24 @@ impl<S: KvStore> IndexWriter<S> {
         hash: [u8; 32],
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError> {
+        self.prepare_block_for(IndexCapabilities::ALL, height, hash, body)
+    }
+
+    /// Derives capability-selected row mutations from one serialized block scan.
+    pub fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        if capabilities.is_empty() {
+            return Err(IndexError::NonContiguousPrepared {
+                watermark: self.watermark()?,
+            });
+        }
         let (mut rows, _txid_count, header) =
-            pending_rows_for_block_with_header(body, height, TxidSource::Compute)?;
+            pending_rows_for_block_with_header(body, height, TxidSource::Compute, capabilities)?;
         let header = header.ok_or(IndexError::InvalidHeaderLength { len: 0 })?;
         let actual_hash = bitcoin::BlockHash::hash(header.as_slice()).to_byte_array();
         if actual_hash != hash {
@@ -1887,6 +2159,7 @@ impl<S: KvStore> IndexWriter<S> {
             parent_hash,
             row_count,
             encoded_bytes,
+            capabilities,
             rows,
         })
     }
@@ -1899,7 +2172,13 @@ impl<S: KvStore> IndexWriter<S> {
                 watermark: self.watermark()?,
             });
         }
-        let current = self.watermark()?;
+        let capabilities = batch
+            .capabilities()
+            .ok_or(IndexError::NonContiguousPrepared {
+                watermark: self.watermark()?,
+            })?;
+        let watermarks = self.watermarks()?;
+        let current = selected_watermark(watermarks, capabilities)?;
         let mut expected_height = match current {
             None => 0,
             Some(w) => w
@@ -1942,11 +2221,7 @@ impl<S: KvStore> IndexWriter<S> {
             FORMAT_VERSION_KEY,
             &FORMAT_VERSION_VALUE,
         );
-        store_batch.put(
-            ColumnFamily::UtxoMeta,
-            WATERMARK_KEY,
-            &final_watermark.to_bytes(),
-        );
+        put_selected_watermarks(&mut store_batch, capabilities, Some(final_watermark));
         self.indexer.store.write_durable(store_batch)?;
         self.indexer.last_counts = merged.counts();
         Ok(final_watermark)
@@ -1958,11 +2233,21 @@ impl<S: KvStore> IndexWriter<S> {
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError> {
+        self.commit_rollback_one_for(IndexCapabilities::ALL, prev, body)
+    }
+
+    /// Atomically rolls back one block for the selected capabilities.
+    pub fn commit_rollback_one_for(
+        &mut self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+    ) -> Result<(), IndexError> {
         self.ensure_prepared_ready()?;
-        let current = self
-            .watermark()?
+        let watermarks = self.watermarks()?;
+        let current = selected_watermark(watermarks, capabilities)?
             .ok_or(IndexError::NonContiguousPrepared { watermark: None })?;
-        let prepared = self.prepare_block(current.height, current.hash, body)?;
+        let prepared = self.prepare_block_for(capabilities, current.height, current.hash, body)?;
         if let Some(prev) = &prev {
             let expected_prev_height =
                 current
@@ -2003,17 +2288,24 @@ impl<S: KvStore> IndexWriter<S> {
             });
         }
         let mut store_batch = self.indexer.store.new_batch();
-        delete_rows(&mut store_batch, &prepared.rows);
+        // A disabled capability may still point above this block on the same
+        // disconnected prefix. Retain every ancestor identity it may need to
+        // reconcile when it is enabled again.
+        let unselected_keeps_identity = (!capabilities.tx_lookup
+            && watermarks
+                .tx_lookup
+                .is_some_and(|watermark| watermark.height >= current.height))
+            || (!capabilities.script_history
+                && watermarks
+                    .script_history
+                    .is_some_and(|watermark| watermark.height >= current.height));
+        delete_rows(&mut store_batch, &prepared.rows, !unselected_keeps_identity);
         store_batch.put(
             ColumnFamily::UtxoMeta,
             FORMAT_VERSION_KEY,
             &FORMAT_VERSION_VALUE,
         );
-        if let Some(prev) = prev {
-            store_batch.put(ColumnFamily::UtxoMeta, WATERMARK_KEY, &prev.to_bytes());
-        } else {
-            store_batch.delete(ColumnFamily::UtxoMeta, WATERMARK_KEY);
-        }
+        put_selected_watermarks(&mut store_batch, capabilities, prev);
         self.indexer.store.write_deferred(store_batch)?;
         self.indexer.store.flush()?;
         self.indexer.last_counts = prepared.rows.counts();
@@ -2124,7 +2416,7 @@ pub trait IndexerLike: Send + Sync {
     /// [`IndexError::UnsupportedRollback`] rather than succeeding: an
     /// implementation that silently reports a successful rollback while
     /// deleting nothing would let the node advance its tip believing the index
-    /// is consistent, and the Electrum server would then serve transactions
+    /// is consistent, and `ScriptIndex` queries would then serve transactions
     /// that are no longer in the chain. Failing loudly is the only safe
     /// default. Concrete indexers that persist rows override this.
     fn rollback_block(
@@ -2346,7 +2638,7 @@ mod tests {
     use bitcoin_rs_storage::{ColumnFamily, KvStore, RocksDbStore};
 
     use super::{BlockSource, Indexer, is_op_return_script};
-    use crate::{HistoryEntry, ScriptHash, ScriptHashRow, SpendingPrefixRow, TxidRow};
+    use crate::{ScriptHash, ScriptHashRow, ScriptHistoryEntry, SpendingPrefixRow, TxidRow};
 
     const HEIGHT: u32 = 42;
     type StoredRows = Vec<(ColumnFamily, Vec<u8>)>;
@@ -2357,72 +2649,6 @@ mod tests {
         assert!(is_op_return_script(&[0x6a]));
         assert!(is_op_return_script(&[0x6a, 0x01, 0x00]));
         assert!(!is_op_return_script(&[0x00, 0x6a]));
-    }
-
-    #[test]
-    fn iter_block_headers_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let (_dir, mut indexer) = indexer()?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-
-        indexer.ingest_block(&serialize(&genesis), 0)?;
-
-        let rows = indexer.iter_block_headers()?;
-        assert_eq!(rows.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn iter_block_header_hashes_empty_index_returns_empty() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let (_dir, indexer) = indexer()?;
-        assert!(indexer.iter_block_header_hashes()?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn iter_block_header_hashes_returns_genesis_after_ingest()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_dir, mut indexer) = indexer()?;
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let bytes = bitcoin::consensus::encode::serialize(&block);
-        indexer.ingest_block(&bytes, 0)?;
-        let hashes = indexer.iter_block_header_hashes()?;
-        assert_eq!(hashes.len(), 1);
-        let expected = bitcoin_rs_primitives::Hash256::from_le_bytes(
-            &block.header.block_hash().to_byte_array(),
-        );
-        assert_eq!(hashes[0], expected);
-        Ok(())
-    }
-
-    #[test]
-    fn header_count_returns_one_after_genesis_ingest() -> Result<(), Box<dyn std::error::Error>> {
-        let (_dir, mut indexer) = indexer()?;
-        assert_eq!(indexer.header_count()?, 0);
-
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        indexer.ingest_block(&serialize(&genesis), 0)?;
-
-        assert_eq!(indexer.header_count()?, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn tip_height_indexed_returns_none_for_empty_index() -> Result<(), Box<dyn std::error::Error>> {
-        let (_dir, indexer) = indexer()?;
-        assert!(indexer.tip_height_indexed()?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn tip_height_indexed_returns_zero_after_genesis_ingest()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_dir, mut indexer) = indexer()?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        indexer.ingest_block(&serialize(&genesis), 0)?;
-
-        assert_eq!(indexer.tip_height_indexed()?, Some(0));
-        Ok(())
     }
 
     #[test]
@@ -2579,7 +2805,7 @@ mod tests {
         };
         let entries = indexer.resolve_script_history(scripthash, &source)?;
 
-        assert_eq!(entries, vec![HistoryEntry::confirmed(txid, 0)]);
+        assert_eq!(entries, vec![ScriptHistoryEntry::confirmed(txid, 0)]);
         Ok(())
     }
     #[test]

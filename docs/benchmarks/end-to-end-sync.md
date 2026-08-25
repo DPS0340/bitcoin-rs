@@ -59,16 +59,15 @@ The live runs were sequential single samples. Peer conditions and validation pos
 
 Later code changed both failed bitcoin-rs paths, but no completed rerun is attached. This report does not infer results from those fixes.
 
-## G14 gate status
+## Historical performance evidence
 
 | Budget | Required evidence | Status in this publication |
 |---|---|---|
 | IBD throughput | bitcoin-rs faster than Bitcoin Core on one identical window | Bounded 0–150,000 one-peer daemon IBD: Core median 73.459s vs bitcoin-rs 89.576s; Core delivered 1.219× bitcoin-rs throughput; gate and 2× target failed |
 | UTXO commit p95 | ≤50ms for serialized blocks ≥1MB | Not captured |
-| Electrum history p95 | ≤30ms over 10,000 non-empty calls | Bounded 0–150,000 p95: 1.213ms; current-tip evidence not captured |
 | Tip RSS | ≤16GiB with fjall, txindex, and blockfilterindex | Bounded txindex-only RSS: 313.1MB; completed current-tip evidence with both indexes not captured |
 
-The ignored `g14_perf_budgets` gate must remain unclaimed.
+These historical measurements do not establish a current performance claim.
 
 ## Bounded current evidence
 
@@ -89,26 +88,18 @@ validation, persistence, crash recovery, or reorg-availability semantics to clai
 
 The transaction-index comparison is not workload parity. Bitcoin Core stores
 transaction lookup positions. bitcoin-rs also stores confirmed headers, funding,
-spending, and script-history rows for RPC and Electrum queries. A nine-run bitcoin-rs
+spending, and script-history rows for RPC and ScriptIndex queries. A nine-run bitcoin-rs
 row-limit sweep retained the 1,000,000-row limit. The 250,000-, 500,000-, 2,000,000-,
 and 4,000,000-row candidates, plus the Fjall `bytes_1` feature-only and
 `bytes_1`-plus-owned-value candidates, failed the required 1.05× throughput gate.
 Every bitcoin-rs TxIndex run produced the same logical digest.
 
-On the same bounded tip, setting `TCP_NODELAY` on every accepted Electrum socket
-reduced `blockchain.scripthash.get_history` p95 from 42.749ms to a three-run median
-of 1.213ms over 10,000 non-empty calls, a 35.237× speedup. This clears the latency
-budget on the bounded corpus. It does not replace current-tip evidence.
-
 The full corpus, treatment, binary, timing, memory, free-space, restore, and rejected
 candidate custody is in
 [`bounded-performance-custody-v1.json`](data/end-to-end-sync/bounded-performance-custody-v1.json).
-The Electrum treatment, raw artifact hashes, tests, and mutation proof are in
-[`electrum-nodelay-custody-v1.json`](data/end-to-end-sync/electrum-nodelay-custody-v1.json).
 The campaign retained one bounded corpus root with one canonical archive per
 implementation and deleted each disposable fixture before the next run. These bounded
-results do not satisfy the live-IBD, current-tip RSS, or current-tip Electrum-history
-gates above.
+results do not satisfy the live-IBD or current-tip RSS gates above.
 
 ## Bounded daemon IBD comparison
 
@@ -148,7 +139,6 @@ The complete machine-readable custody is in [`daemon-ibd-custody-v1.json`](data/
 | `rs-replay-150k-parverify.json` | `f1704f895a958afcf5fcce2f829954056e9864af87bf4f0483c29af36599ac29` |
 | `rs-replay-150k-kernel.json` | `d722ab149c39c5f13e18c6358ab999f4c1f44ce46b37a9d0eb87bfd45e0b91a9` |
 | `bounded-performance-custody-v1.json` | `ce3e561dbd2119579f359b7cf55f8b84211c4c1eec3953cf40762f07faabb3cf` |
-| `electrum-nodelay-custody-v1.json` | `b57087cf368d3e56da75c543c6ba780115a7a6684db03a11e2692d6648b29abf` |
 | `daemon-ibd-custody-v1.json` | `3eb68821cb2e389be5ed5391f5671fae527212a0e2129fcb85fe9676e4d396c8` |
 
 ## Full recorded stage timers

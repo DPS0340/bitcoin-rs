@@ -1,7 +1,6 @@
-# PLAN: Download-path campaign + project closeout (2026-06-11) — ACTIVE DELIVERABLE
+# Download-path campaign and project closeout (2026-06-11)
 
-> On approval this section materializes to `docs/plans/2026-06-11-001-feat-download-path-campaign-plan.md`
-> (ce-plan artifact). Everything above this line is the session's historical ledger.
+> Status: historical campaign plan (2026-06-11).
 
 ## Context
 

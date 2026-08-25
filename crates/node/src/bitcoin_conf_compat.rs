@@ -157,11 +157,8 @@ impl ConfigLayerMerge for ConfigLayer {
         if other.rpc_cookie.is_some() {
             self.rpc_cookie.clone_from(&other.rpc_cookie);
         }
-        if other.electrum_bind.is_some() {
-            self.electrum_bind = other.electrum_bind;
-        }
-        if other.electrum_tls_cert.is_some() {
-            self.electrum_tls_cert.clone_from(&other.electrum_tls_cert);
+        if other.script_index.is_some() {
+            self.script_index = other.script_index;
         }
         if other.p2p_listen.is_some() {
             self.p2p_listen.clone_from(&other.p2p_listen);

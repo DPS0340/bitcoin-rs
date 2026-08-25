@@ -38,7 +38,7 @@ impl Watcher {
         descriptor.derive_address(network, child_index)
     }
 
-    /// Returns the electrum script-hash scan prefix for a descriptor index.
+    /// Returns the generic script-index scan prefix for a descriptor index.
     pub fn script_hash_scan_prefix(
         &self,
         descriptor_index: usize,

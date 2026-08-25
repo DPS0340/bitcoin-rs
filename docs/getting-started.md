@@ -3,12 +3,10 @@
 From a clone to a syncing node. Each step says what you should see, so you can
 tell it worked before moving on.
 
-Before you start: this node reorganises off a losing branch, but several
-things around that still do not work. A disconnected block's transactions are
-dropped rather than returned to the mempool, and the filter index is not
-backfilled across a gap. ZMQ `pubsequence` publishes block connect/disconnect
-events but intentionally omits mempool `A`/`R` events. Do not make it the node
-you depend on. See [README.md](README.md) for the rest of the gaps.
+Before you start: do not run this on mainnet as your only node. Reorganisation
+handling and transaction relay have known limitations documented in
+[README.md](README.md#known-gaps). The filter index is not backfilled across a
+gap.
 
 ## Prerequisites
 
@@ -79,10 +77,26 @@ Defaults worth knowing:
 | `--dbcache-mb` | 450 |
 | `--prune-target-mb` | 0, meaning no pruning |
 | `--txindex` | off |
+| `--scriptindex` | off |
 | `--blockfilterindex` | off |
 
 The node logs its startup and the address the RPC listener bound to. If you see
 that line, it is running.
+
+`--txindex` advertises Bitcoin Core-compatible transaction lookup support.
+`--scriptindex` enables current address/scripthash UTXO queries and confirmed
+funding/spending history.
+`--txindex` remains independent and is required for confirmed transaction
+lookups such as `/tx/<txid>` when the transaction is not in the mempool.
+Esplora is served by the node HTTP listener at the standard root (for example
+`/blocks/tip/height`, `/tx/<txid>`, `/address/<address>/utxo`, and `POST /tx`).
+Address and scripthash routes return `503` until `--scriptindex` catches up, or
+when it is disabled. These index modes are incompatible with pruning
+because backfill and reorg repair require durable block bodies.
+
+The ScriptIndex format does not migrate an existing legacy index. At startup,
+the node deletes incompatible derived index data in bounded batches and rebuilds
+it before exposing `--scriptindex` or `--txindex` queries.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style
@@ -114,8 +128,8 @@ curl -s --user bitcoin-rs:bitcoin-rs \
 
 The full list of implemented methods is the dispatch table in
 `crates/rpc/src/handlers.rs`. Signing methods are present but always return
--32603, "wallet has no private keys", because the wallet holds no keys by
-design.
+-32603, "wallet has no private keys; use external signer", because the wallet
+holds no keys by design.
 
 ## Verifying everything yourself
 

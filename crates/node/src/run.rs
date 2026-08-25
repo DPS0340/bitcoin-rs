@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, TrySendError, bounded};
 
 use crate::config::Config;
@@ -127,58 +127,6 @@ fn build_rpc_auth(node_auth: &crate::Auth) -> Result<bitcoin_rs_rpc::Auth> {
         }
         crate::Auth::Cookie { path } => Ok(bitcoin_rs_rpc::Auth::cookie(path)?),
     }
-}
-
-fn spawn_electrum_listener(
-    config: &bitcoin_rs_node::Config,
-    state: &NodeState,
-    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<Option<std::thread::JoinHandle<Result<(), bitcoin_rs_electrum::ElectrumError>>>>
-{
-    let Some(addr) = config.electrum_bind else {
-        return Ok(None);
-    };
-
-    if let Some(cert) = &config.electrum_tls_cert {
-        tracing::warn!(
-            cert = %cert.display(),
-            "electrum TLS cert configured but TLS wiring deferred; serving plaintext"
-        );
-    }
-
-    let network = match state.config().network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    };
-    let Some(query) = state.tx_index_electrum_adapter() else {
-        bail!("electrum listener requires txindex");
-    };
-    let chain: Arc<dyn bitcoin_rs_electrum::methods::BlockTreeAdapter> = Arc::new(
-        crate::NodeBlockSource::new(state.blocks())
-            .with_block_body_source(state.block_body_source())
-            .with_block_tree(state.block_tree())
-            .with_applied_tip(state.applied_tip()),
-    );
-    let index = bitcoin_rs_electrum::IndexHandle::new()
-        .with_history_reader(query)
-        .with_chain(chain)
-        .with_network(network);
-    let mempool = bitcoin_rs_electrum::MempoolHandle::from_arc(state.mempool());
-    let cfg = bitcoin_rs_electrum::ServerConfig::default();
-    let server = bitcoin_rs_electrum::ElectrumServer::bind(addr, index, mempool, cfg)
-        .map_err(anyhow::Error::from)?;
-    let local_addr = server.local_addr()?;
-    tracing::info!(addr = %local_addr, "electrum listener bound");
-
-    let electrum_shutdown = Arc::clone(shutdown);
-    Ok(Some(
-        std::thread::Builder::new()
-            .name("bitcoin-rs-electrum".into())
-            .spawn(move || server.run_with_shutdown(electrum_shutdown))?,
-    ))
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
@@ -648,8 +596,11 @@ pub fn run(mut config: Config) -> Result<()> {
         Arc::clone(&banned),
         Arc::new(parking_lot::RwLock::new(Vec::new())),
         state.tx_index_query(),
-    );
+        state.script_index_query(),
+    )
+    .with_esplora_tx_index(state.esplora_tx_index_query());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
+    rpc_context = rpc_context.with_chain_tx_count(state.chain_tx_count_handle());
     if let Some(prune_service) = state.prune_service() {
         rpc_context = rpc_context.with_prune_service(prune_service);
     }
@@ -673,7 +624,6 @@ pub fn run(mut config: Config) -> Result<()> {
     let rpc_thread = std::thread::Builder::new()
         .name("bitcoin-rs-rpc".into())
         .spawn(move || rpc_server.serve_with_shutdown(rpc_shutdown))?;
-    let electrum_thread = spawn_electrum_listener(state.config(), &state, &shutdown)?;
     let peers = state.peers();
     let peer_outbound = state.peer_outbound();
     let p2p_threads = spawn_p2p_listeners(
@@ -706,13 +656,6 @@ pub fn run(mut config: Config) -> Result<()> {
         spawn_fixed_peer_bootstrap(&state, &shutdown)?
     };
     loop_handle.spin(&shutdown)?;
-    if let Some(handle) = electrum_thread {
-        match handle.join() {
-            Ok(Ok(())) => tracing::info!("electrum listener exited cleanly"),
-            Ok(Err(error)) => tracing::warn!(%error, "electrum listener exited with error"),
-            Err(_) => tracing::error!("electrum listener panicked"),
-        }
-    }
     match rpc_thread.join() {
         Ok(Ok(())) => tracing::info!("rpc listener exited cleanly"),
         Ok(Err(error)) => tracing::warn!(%error, "rpc listener exited with i/o error"),
@@ -877,7 +820,7 @@ mod tests {
         config.data_dir = temp.path().join("node-success");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.electrum_bind = None;
+        config.script_index = false;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -915,7 +858,7 @@ mod tests {
         config.data_dir = temp.path().join("node");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.electrum_bind = None;
+        config.script_index = false;
         config.p2p_listen.clear();
         config.metrics_bind = None;
         // Force a bootstrap worker to spawn (fixed-peer path) so the drain
