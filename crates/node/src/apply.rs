@@ -12,7 +12,7 @@ use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
-use bitcoin_rs_rpc::{BlockLog, BlockRecord};
+use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
     LiveOutput, LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
@@ -8014,12 +8014,14 @@ mod consensus_rule_tests {
             Arc::clone(&handles.applied_tip),
             None,
         );
-        let query_result =
-            bitcoin_rs_rpc::TxIndexQuery::transaction(&query, &genesis.txdata[0].compute_txid());
+        let query_result = bitcoin_rs_rpc::context::TxIndexQuery::transaction(
+            &query,
+            &genesis.txdata[0].compute_txid(),
+        );
         assert!(
             matches!(
                 query_result,
-                Err(bitcoin_rs_rpc::TxQueryError::Unavailable(_))
+                Err(bitcoin_rs_rpc::context::TxQueryError::Unavailable(_))
             ),
             "failed txindex queries must be explicitly unavailable, got {query_result:?}"
         );

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bitcoin_rs_node::{Config, state::NodeState};
-use bitcoin_rs_rpc::Context;
+use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_utxo::UtxoSet;
 use tempfile::tempdir;
 

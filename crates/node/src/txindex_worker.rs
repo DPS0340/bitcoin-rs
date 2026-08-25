@@ -9,7 +9,7 @@
 //! the next worker pass repairs it. Independent durable capability watermarks
 //! let aligned row families share one parse and commit while divergent families
 //! backfill separately. A snapshot-gated query engine serves
-//! `bitcoin_rs_rpc::TxIndexQuery` and the generic [`ScriptIndexQuery`]
+//! `bitcoin_rs_rpc::context::TxIndexQuery` and the generic [`ScriptIndexQuery`]
 //! without raw index mutex paths.
 
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use bitcoin_rs_index::{
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{
+use bitcoin_rs_rpc::context::{
     BlockBodySource, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
     SpendingRecord, TxIndexInfo, TxIndexQuery, TxQueryError,
 };
@@ -1077,7 +1077,7 @@ impl QueryBudget {
 
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
-/// Implements `bitcoin_rs_rpc::TxIndexQuery` and [`ScriptIndexQuery`] as the
+/// Implements `bitcoin_rs_rpc::context::TxIndexQuery` and [`ScriptIndexQuery`] as the
 /// only public read paths for the transaction index. Every query runs against
 /// one typed point-in-time snapshot, captures
 /// health/shutdown/revision/tip before and after work, and returns typed

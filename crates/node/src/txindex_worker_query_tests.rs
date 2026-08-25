@@ -8,7 +8,7 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_index::{ScriptHashRow, SpendingPrefixRow, TxidRow};
-use bitcoin_rs_rpc::{BlockRecord, ScriptHistoryRecord};
+use bitcoin_rs_rpc::context::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
 
 use super::*;
@@ -261,7 +261,9 @@ impl QueryFixture {
             Vec::new()
         };
         let block_source = NodeBlockSource::new(Arc::new(RwLock::new(
-            records.into_iter().collect::<bitcoin_rs_rpc::BlockLog>(),
+            records
+                .into_iter()
+                .collect::<bitcoin_rs_rpc::context::BlockLog>(),
         )));
         let engine =
             TxIndexQueryEngine::new(runtime, reader, block_source, tree, applied_tip, None);

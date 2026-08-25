@@ -14,7 +14,7 @@ use bitcoin::hex::FromHex as _;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_index::BlockSource;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockBodySource, BlockLog, record_at_height, record_at_height_hash};
+use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, record_at_height, record_at_height_hash};
 use parking_lot::RwLock;
 
 /// Reads decoded Bitcoin blocks from the shared in-memory log.
@@ -128,7 +128,7 @@ mod tests {
     use bitcoin::consensus::encode::serialize;
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_primitives::Hash256;
-    use bitcoin_rs_rpc::BlockRecord;
+    use bitcoin_rs_rpc::context::BlockRecord;
     use std::error::Error;
 
     type TestResult = Result<(), Box<dyn Error>>;

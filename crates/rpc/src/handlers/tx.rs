@@ -645,7 +645,7 @@ mod tests {
     fn gettxoutproof_with_blockhash_skips_unrelated_records() {
         struct PanicBodySource;
 
-        impl crate::BlockBodySource for PanicBodySource {
+        impl crate::context::BlockBodySource for PanicBodySource {
             fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
                 panic!("specified blockhash proof should not load unrelated body {height}:{hash}");
             }
@@ -836,7 +836,7 @@ mod tests {
     fn gettxoutproof_index_path_does_not_read_unrelated_block_bodies() {
         struct PanicBodySource;
 
-        impl crate::BlockBodySource for PanicBodySource {
+        impl crate::context::BlockBodySource for PanicBodySource {
             fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
                 panic!("index path should not load unrelated body {height}:{hash}");
             }
@@ -947,7 +947,7 @@ mod tests {
     /// body-less records fails loudly instead of quietly succeeding.
     struct PanicOnScan;
 
-    impl crate::BlockBodySource for PanicOnScan {
+    impl crate::context::BlockBodySource for PanicOnScan {
         fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
             panic!("the index path should not have scanned: {height}:{hash}");
         }
@@ -1173,11 +1173,11 @@ mod tests {
     #[test]
     fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
         struct LockProbeSource {
-            blocks: Arc<parking_lot::RwLock<crate::BlockLog>>,
+            blocks: Arc<parking_lot::RwLock<crate::context::BlockLog>>,
             bodies: Vec<(u32, Vec<u8>)>,
         }
 
-        impl crate::BlockBodySource for LockProbeSource {
+        impl crate::context::BlockBodySource for LockProbeSource {
             fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
                 assert!(
                     self.blocks.try_write().is_some(),

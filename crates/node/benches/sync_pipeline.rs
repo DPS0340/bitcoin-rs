@@ -31,7 +31,7 @@ use bitcoin_rs_node::{
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockLog, BlockRecord};
+use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::UtxoSet;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbeam_channel::unbounded;

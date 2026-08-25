@@ -71,19 +71,19 @@ struct RpcChainControl {
     handles: crate::apply::ApplyHandles,
 }
 
-impl bitcoin_rs_rpc::ChainControl for RpcChainControl {
+impl bitcoin_rs_rpc::context::ChainControl for RpcChainControl {
     fn invalidate_block(
         &self,
         hash: bitcoin_rs_primitives::Hash256,
-    ) -> core::result::Result<(), bitcoin_rs_rpc::ChainControlError> {
+    ) -> core::result::Result<(), bitcoin_rs_rpc::context::ChainControlError> {
         crate::reorg::invalidate_block(&self.handles, hash).map_err(|error| match error {
             crate::reorg::ReorgError::UnknownBlock(_) => {
-                bitcoin_rs_rpc::ChainControlError::UnknownBlock
+                bitcoin_rs_rpc::context::ChainControlError::UnknownBlock
             }
             crate::reorg::ReorgError::CannotInvalidateGenesis => {
-                bitcoin_rs_rpc::ChainControlError::Genesis
+                bitcoin_rs_rpc::context::ChainControlError::Genesis
             }
-            other => bitcoin_rs_rpc::ChainControlError::Failed(other.to_string()),
+            other => bitcoin_rs_rpc::context::ChainControlError::Failed(other.to_string()),
         })
     }
 }
@@ -577,7 +577,7 @@ pub fn run(mut config: Config) -> Result<()> {
     let peer_registered = sync.peer_registration_handle();
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let rpc_auth = Arc::new(build_rpc_auth(&state.config().rpc_auth)?);
-    let mut rpc_context = bitcoin_rs_rpc::Context::from_handles(
+    let mut rpc_context = bitcoin_rs_rpc::context::Context::from_handles(
         state.chain_tip(),
         state.applied_tip(),
         state.mempool(),

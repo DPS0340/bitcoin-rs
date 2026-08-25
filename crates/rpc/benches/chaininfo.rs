@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockRecord, Context, Handler, chain_stats, fold_block_records};
+use bitcoin_rs_rpc::Handler;
+use bitcoin_rs_rpc::context::{BlockRecord, Context, chain_stats, fold_block_records};
 use criterion::{Criterion, criterion_group, criterion_main};
 use sonic_rs::json;
 

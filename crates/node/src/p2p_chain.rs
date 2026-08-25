@@ -13,7 +13,7 @@ use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_p2p::{ChainQuery, InventoryResponse};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockBodySource, BlockLog};
+use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog};
 use parking_lot::RwLock;
 
 /// Read-only in-memory active-chain view for P2P `getheaders` / `getdata`.
@@ -198,7 +198,7 @@ mod tests {
     use bitcoin::pow::CompactTarget;
     use bitcoin::{Block, TxMerkleNode, Txid};
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_rpc::BlockRecord;
+    use bitcoin_rs_rpc::context::BlockRecord;
 
     #[test]
     fn getheaders_empty_locator_returns_only_active_stop() -> Result<(), Box<dyn std::error::Error>>

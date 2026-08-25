@@ -6,7 +6,8 @@ use std::collections::BTreeSet;
 
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{Context, Handler};
+use bitcoin_rs_rpc::Handler;
+use bitcoin_rs_rpc::context::Context;
 use sonic_rs::{JsonValueTrait as _, json};
 
 #[test]

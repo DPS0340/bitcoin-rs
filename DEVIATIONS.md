@@ -237,7 +237,7 @@ serving remains deferred.
   `Arc<RwLock<Vec<BlockRecord>>>`, `Arc<RwLock<HashMap<Txid, Transaction>>>`,
   `Arc<RwLock<NetworkState>>`, `Arc<ArcSwap<CompactString>>` (mining
   template id).
-- `bitcoin_rs_rpc::Context::from_handles` reuses the same Arcs. The
+- `bitcoin_rs_rpc::context::Context::from_handles` reuses the same Arcs. The
   `rpc_wiring.rs` integration test pins pointer identity across all six.
 - `run.rs` orchestrates: open → tracing → crash recovery → shutdown source
   → spawn RPC listener thread (always) → spawn Electrum listener thread

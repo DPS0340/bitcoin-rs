@@ -8,7 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use bitcoin_rs_rpc::auth::constant_time_eq;
-use bitcoin_rs_rpc::{Auth, Context, Handler, RpcServer};
+use bitcoin_rs_rpc::context::Context;
+use bitcoin_rs_rpc::{Auth, Handler, RpcServer};
 use sonic_rs::json;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 

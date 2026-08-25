@@ -14,7 +14,8 @@ use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockRecord, ChainControl, ChainControlError, Context, Handler, RpcError};
+use bitcoin_rs_rpc::context::{BlockRecord, ChainControl, ChainControlError, Context};
+use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
@@ -396,7 +397,7 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
     let mut ctx = Context::new();
     ctx.tx_index = Some(Arc::new(FakeTxIndex {
         values: HashMap::new(),
-        info: bitcoin_rs_rpc::TxIndexInfo {
+        info: bitcoin_rs_rpc::context::TxIndexInfo {
             synced: false,
             best_block_height: 0,
         },
@@ -601,25 +602,27 @@ impl FilterIndexLike for StaticFilterIndex {
 
 struct FakeTxIndex {
     values: HashMap<OutPoint, u64>,
-    info: bitcoin_rs_rpc::TxIndexInfo,
+    info: bitcoin_rs_rpc::context::TxIndexInfo,
 }
 
-impl bitcoin_rs_rpc::TxIndexQuery for FakeTxIndex {
+impl bitcoin_rs_rpc::context::TxIndexQuery for FakeTxIndex {
     fn transaction(
         &self,
         _txid: &Txid,
-    ) -> Result<Option<Transaction>, bitcoin_rs_rpc::TxQueryError> {
+    ) -> Result<Option<Transaction>, bitcoin_rs_rpc::context::TxQueryError> {
         Ok(None)
     }
 
     fn outpoint_value(
         &self,
         outpoint: &OutPoint,
-    ) -> Result<Option<u64>, bitcoin_rs_rpc::TxQueryError> {
+    ) -> Result<Option<u64>, bitcoin_rs_rpc::context::TxQueryError> {
         Ok(self.values.get(outpoint).copied())
     }
 
-    fn index_info(&self) -> Result<bitcoin_rs_rpc::TxIndexInfo, bitcoin_rs_rpc::TxQueryError> {
+    fn index_info(
+        &self,
+    ) -> Result<bitcoin_rs_rpc::context::TxIndexInfo, bitcoin_rs_rpc::context::TxQueryError> {
         Ok(self.info)
     }
 }
@@ -635,7 +638,7 @@ fn fee_stats_context(
     if let Some(values) = values {
         ctx.tx_index = Some(Arc::new(FakeTxIndex {
             values,
-            info: bitcoin_rs_rpc::TxIndexInfo {
+            info: bitcoin_rs_rpc::context::TxIndexInfo {
                 synced: true,
                 best_block_height: 7,
             },
@@ -773,7 +776,7 @@ impl Fixture {
         values.insert(outpoint(1), 6_000);
         ctx.tx_index = Some(Arc::new(FakeTxIndex {
             values,
-            info: bitcoin_rs_rpc::TxIndexInfo {
+            info: bitcoin_rs_rpc::context::TxIndexInfo {
                 synced: true,
                 best_block_height: 7,
             },

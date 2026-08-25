@@ -1333,7 +1333,7 @@ mod tests {
             calls: AtomicUsize,
         }
 
-        impl crate::BlockBodySource for SingleBlockSource {
+        impl crate::context::BlockBodySource for SingleBlockSource {
             fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 (height == self.height && hash == self.hash).then(|| self.body.clone())
@@ -1994,7 +1994,7 @@ mod tests {
     fn getblockchaininfo_size_on_disk_comes_from_the_block_store() {
         struct SizedStore(u64);
 
-        impl crate::BlockBodySource for SizedStore {
+        impl crate::context::BlockBodySource for SizedStore {
             fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
                 None
             }

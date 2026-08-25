@@ -105,8 +105,8 @@ mod tests {
                 Ok(info) if info.synced => break,
                 Ok(_)
                 | Err(
-                    bitcoin_rs_rpc::TxQueryError::Retry
-                    | bitcoin_rs_rpc::TxQueryError::Unavailable(_),
+                    bitcoin_rs_rpc::context::TxQueryError::Retry
+                    | bitcoin_rs_rpc::context::TxQueryError::Unavailable(_),
                 ) => {}
                 Err(error) => return Err(error.into()),
             }

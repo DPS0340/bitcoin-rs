@@ -31,7 +31,7 @@
 use std::hint::black_box;
 
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockRecord, record_at_height_hash};
+use bitcoin_rs_rpc::context::{BlockRecord, record_at_height_hash};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Log lengths to measure. The last is a mainnet tip at the time of writing;

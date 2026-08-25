@@ -44,8 +44,9 @@ use bitcoin::{
 };
 use bitcoin_rs_index::{BlockSource, Indexer};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{
-    BlockBodySource, BlockRecord, Context, Handler, TxIndexInfo, TxIndexQuery, TxQueryError,
+use bitcoin_rs_rpc::Handler;
+use bitcoin_rs_rpc::context::{
+    BlockBodySource, BlockRecord, Context, TxIndexInfo, TxIndexQuery, TxQueryError,
 };
 use bitcoin_rs_storage::RocksDbStore;
 use bitcoin_rs_storage::block_file::{BlockFilePosition, FlatFileBlockStore};

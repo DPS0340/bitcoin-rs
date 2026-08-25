@@ -10,7 +10,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hex::FromHex as _;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
-use bitcoin_rs_rpc::{
+use bitcoin_rs_rpc::context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
 };
@@ -1105,7 +1105,7 @@ impl NodeState {
             Some(open) => {
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                 let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
-                let body_source: Arc<dyn bitcoin_rs_rpc::BlockBodySource> =
+                let body_source: Arc<dyn bitcoin_rs_rpc::context::BlockBodySource> =
                     Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
                 let block_source = crate::NodeBlockSource::new(Arc::clone(&blocks))
                     .with_block_body_source(Arc::clone(&body_source))
@@ -1345,12 +1345,12 @@ impl NodeState {
 
     /// Returns the node-owned complete transaction-index query adapter.
     #[must_use]
-    pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+    pub fn tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery>> {
         if !self.config.txindex {
             return None;
         }
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
             adapter
         })
     }
@@ -1360,21 +1360,21 @@ impl NodeState {
     /// `--scriptindex` builds this dependency as well, but that does not
     /// enable or advertise the Core `--txindex` contract.
     #[must_use]
-    pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::TxIndexQuery>> {
+    pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery>> {
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::TxIndexQuery> = query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
             adapter
         })
     }
 
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
-    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
+    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery>> {
         if !self.config.script_index {
             return None;
         }
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery> = query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery> = query.clone();
             adapter
         })
     }
@@ -1621,7 +1621,7 @@ impl Drop for NodeState {
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
-    use bitcoin_rs_rpc::BlockRecord;
+    use bitcoin_rs_rpc::context::BlockRecord;
 
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {

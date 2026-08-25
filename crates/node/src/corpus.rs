@@ -19,7 +19,7 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::hashes::sha256d;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_primitives::{Hash256, Network};
-use bitcoin_rs_rpc::BlockBodySource;
+use bitcoin_rs_rpc::context::BlockBodySource;
 use bitcoin_rs_storage::{CORE_FRAME_HEADER_LEN, CoreFrameError, CoreFrameWriter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1343,7 +1343,7 @@ mod tests {
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
     use bitcoin_rs_chain::{BlockTree, NodeStatus};
     use bitcoin_rs_primitives::{Hash256, Network};
-    use bitcoin_rs_rpc::BlockBodySource;
+    use bitcoin_rs_rpc::context::BlockBodySource;
     use bitcoin_rs_storage::CoreFrameReader;
     use sha2::{Digest as _, Sha256};
 
