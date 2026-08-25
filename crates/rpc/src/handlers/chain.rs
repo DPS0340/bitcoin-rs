@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -9,7 +9,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
+use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError, chain_stats};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -28,23 +28,41 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
             )
         })
     });
+    // Still the height ratio, and still wrong for the reason the audit gives:
+    // early blocks are nearly empty, so this reports the chain further along
+    // than it is. Core's `GuessVerificationProgress` needs a cumulative chain
+    // transaction count that survives a restart, and this node has none — the
+    // block-record log is rebuilt empty on every open, so the count reads zero
+    // on any node that did not sync in this process. Correcting the formula
+    // without first making its input durable would turn a wrong-but-close
+    // number into a confident 0.0 on every restarted node.
     let verification_progress = if headers > 0 {
-        f64::from(applied) / f64::from(headers)
+        (f64::from(applied) / f64::from(headers)).min(1.0)
     } else {
         0.0
     };
+    let initialblockdownload = ctx.is_initial_block_download(unix_now());
     let chain = match ctx.chain_network {
         bitcoin_rs_primitives::Network::Mainnet => "main",
-        bitcoin_rs_primitives::Network::Testnet3 | bitcoin_rs_primitives::Network::Testnet4 => {
-            "test"
-        }
+        bitcoin_rs_primitives::Network::Testnet3 => "test",
+        bitcoin_rs_primitives::Network::Testnet4 => "testnet4",
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
-    let block_stats = {
-        let blocks = ctx.blocks.read();
-        fold_block_records(&blocks, applied, None)
-    };
+    // Bytes on disk, from whatever owns them.
+    //
+    // The block store knows what its files occupy and shrinks when pruning
+    // deletes one. The record log can only offer the sum of the block sizes it
+    // has seen: records outlive the bodies they describe, so that sum goes on
+    // counting bytes that are gone — under a field name people read to check
+    // that pruning worked. It stays as the fallback for a context with no
+    // durable storage behind it, which is every test fixture and nothing else.
+    //
+    // Either way the read is O(1) and the log's lock — the one block
+    // application takes to append — is released immediately.
+    let size_on_disk = ctx
+        .block_storage_disk_usage()
+        .unwrap_or_else(|| ctx.blocks.read().size_on_disk());
     let prune_status = ctx.prune_status();
     let bestblockhash = applied_tip
         .as_ref()
@@ -62,15 +80,22 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let _ = response.insert(&"time", time);
     let _ = response.insert(&"mediantime", mediantime);
     let _ = response.insert(&"verificationprogress", json!(verification_progress));
-    let _ = response.insert(&"initialblockdownload", applied < headers);
+    let _ = response.insert(&"initialblockdownload", initialblockdownload);
     let _ = response.insert(&"chainwork", chainwork.as_str());
-    let _ = response.insert(&"size_on_disk", block_stats.size_on_disk);
+    let _ = response.insert(&"size_on_disk", size_on_disk);
     let _ = response.insert(&"pruned", prune_status.pruned);
     if let Some(pruneheight) = prune_status.pruneheight {
         let _ = response.insert(&"pruneheight", pruneheight);
     }
     let _ = response.insert(&"warnings", "");
     Ok(Value::from(response))
+}
+
+/// UNIX seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 fn chainwork_hex(tip: &TipSnapshot) -> String {
@@ -169,7 +194,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         .saturating_sub(window_block_count);
     let block_stats = {
         let blocks_guard = ctx.blocks.read();
-        fold_block_records(&blocks_guard, applied_height, Some(lowest_window_height))
+        chain_stats(&blocks_guard, applied_height, lowest_window_height)
     };
     let total_tx_count = block_stats.total_tx_count;
     let window_tx_count = block_stats.window_tx_count;
@@ -193,48 +218,6 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         "window_interval": window_interval,
         "txrate": txrate
     }))
-}
-
-#[derive(Default)]
-struct FoldedBlockRecords {
-    size_on_disk: u64,
-    total_tx_count: u64,
-    window_tx_count: u64,
-    tip_time: Option<u32>,
-    earliest_window_time: Option<u32>,
-}
-
-fn fold_block_records(
-    blocks: &[BlockRecord],
-    applied_height: u32,
-    lowest_window_height: Option<u64>,
-) -> FoldedBlockRecords {
-    let mut stats = FoldedBlockRecords::default();
-    for record in blocks {
-        stats.size_on_disk = stats
-            .size_on_disk
-            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
-        if record.height > applied_height {
-            continue;
-        }
-        stats.total_tx_count = stats
-            .total_tx_count
-            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-        if record.height == applied_height && stats.tip_time.is_none() {
-            stats.tip_time = Some(record.time);
-        }
-        if lowest_window_height.is_some_and(|lowest| u64::from(record.height) >= lowest) {
-            stats.window_tx_count = stats
-                .window_tx_count
-                .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-            stats.earliest_window_time = Some(
-                stats
-                    .earliest_window_time
-                    .map_or(record.time, |earliest| earliest.min(record.time)),
-            );
-        }
-    }
-    stats
 }
 
 pub(crate) fn getblockcount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -283,12 +266,12 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
         let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
         let record = BlockRecord::synthetic(synthetic_height, hash);
         if !verbose {
-            return Ok(json!(record.header_hex));
+            return Ok(json!(record.header_hex()));
         }
         return Ok(synthetic_block_json(ctx, &record, false));
     };
     if !verbose {
-        return Ok(json!(record.header_hex));
+        return Ok(json!(record.header_hex()));
     }
     block_json_verbose(ctx, &record, false, 1)
 }
@@ -818,13 +801,41 @@ fn parse_hash(value: &str) -> Result<Hash256, RpcError> {
     Hash256::from_str(value).map_err(|_| RpcError::InvalidParams("hash must be 64 hex characters"))
 }
 
-fn confirmations(ctx: &Context, height: u32) -> u32 {
-    let applied = ctx.applied_height();
-    if height > applied {
-        0
-    } else {
-        applied.saturating_sub(height).saturating_add(1)
+/// The block's depth in the **active chain**, or `-1` when it is not in the
+/// active chain at all.
+///
+/// This is Bitcoin Core's `chain.Contains(pindex) ? chain.Height() -
+/// pindex->nHeight + 1 : -1`, and the membership test is the whole point.
+/// Height alone cannot answer it: a block that lost a reorg keeps its height,
+/// so deriving the answer from height reports a *positive* confirmation count
+/// for a block that is no longer in the chain — and anything gating on
+/// `confirmations >= N` reads that as buried.
+///
+/// The chain asked is the **applied** chain, not the header chain. Core's
+/// `m_chain` is the connected, fully-validated chain, and header-first sync
+/// keeps headers ahead of it; a block whose header is known but which has not
+/// been connected is not in it, so it is `-1` rather than `0`.
+fn confirmations(ctx: &Context, hash: Hash256, height: u32) -> i64 {
+    // Membership and depth must come from the same published applied-tip state.
+    let Some(tip) = ctx.applied_tip.load_full() else {
+        return -1;
+    };
+    if height > tip.height {
+        return -1;
     }
+    let active_hash = if height == tip.height {
+        Some(tip.hash)
+    } else {
+        let tree = ctx.block_tree.read();
+        tree.node_at_height_from(tip.tip_id, height)
+            .and_then(|id| tree.node(id).ok().map(|node| node.hash))
+    };
+    if active_hash != Some(hash) {
+        return -1;
+    }
+    i64::from(tip.height)
+        .saturating_sub(i64::from(height))
+        .saturating_add(1)
 }
 
 fn block_json_verbose(
@@ -853,7 +864,7 @@ fn block_json_verbose(
     if !include_block_fields {
         return Ok(json!({
             "hash": record.hash.to_string_be(),
-            "confirmations": confirmations(ctx, record.height),
+            "confirmations": confirmations(ctx, record.hash, record.height),
             "height": record.height,
             "version": i64::from(version),
             "versionHex": format!("{version_hex:08x}"),
@@ -889,7 +900,7 @@ fn block_json_verbose(
 
     Ok(json!({
         "hash": record.hash.to_string_be(),
-        "confirmations": confirmations(ctx, record.height),
+        "confirmations": confirmations(ctx, record.hash, record.height),
         "height": record.height,
         "version": i64::from(version),
         "versionHex": format!("{version_hex:08x}"),
@@ -911,18 +922,8 @@ fn block_json_verbose(
 }
 
 fn decode_header(record: &BlockRecord) -> Option<bitcoin::block::Header> {
-    let bytes = match Vec::<u8>::from_hex(&record.header_hex) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(
-                block_hash = %record.hash.to_string_be(),
-                %error,
-                "stored block header hex is invalid"
-            );
-            return None;
-        }
-    };
-    match deserialize(&bytes) {
+    let bytes = record.header_bytes()?;
+    match deserialize(bytes.as_slice()) {
         Ok(header) => Some(header),
         Err(error) => {
             tracing::warn!(
@@ -942,7 +943,7 @@ fn decode_block(
     let Some(bytes) = ctx.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
-    match deserialize(&bytes) {
+    match deserialize(bytes.as_slice()) {
         Ok(block) => Ok(Some((bytes, block))),
         Err(error) => {
             tracing::warn!(
@@ -959,7 +960,7 @@ fn synthetic_block_json(ctx: &Context, record: &BlockRecord, include_block_field
     if !include_block_fields {
         return json!({
             "hash": record.hash.to_string_be(),
-            "confirmations": confirmations(ctx, record.height),
+            "confirmations": confirmations(ctx, record.hash, record.height),
             "height": record.height,
             "version": 0,
             "versionHex": "00000000",
@@ -978,7 +979,7 @@ fn synthetic_block_json(ctx: &Context, record: &BlockRecord, include_block_field
 
     json!({
         "hash": record.hash.to_string_be(),
-        "confirmations": confirmations(ctx, record.height),
+        "confirmations": confirmations(ctx, record.hash, record.height),
         "height": record.height,
         "version": 0,
         "versionHex": "00000000",
@@ -1009,6 +1010,7 @@ mod tests {
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
+    use crate::context::{BlockLog, fold_block_records};
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
     fn context_with_tip(
@@ -1052,6 +1054,22 @@ mod tests {
         ctx.set_chain_tip(tip.clone());
         ctx.set_applied_tip(tip);
         ctx
+    }
+
+    /// Makes `ctx` know `block` the way a running node does: header in the block
+    /// tree, record in the log.
+    ///
+    /// A record on its own is not a node's state. `apply_block` puts the header
+    /// in the tree first and pushes the record after, through the same handles,
+    /// and the record carries no header of its own — the tree is where one
+    /// lives. A fixture that pushes only a record is asking `getblock` to answer
+    /// from half the state a node would have.
+    fn seed_block(ctx: &Arc<Context>, block: &bitcoin::Block, record: BlockRecord) {
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, NodeStatus::Active);
+        }
+        ctx.add_block(record);
     }
 
     #[test]
@@ -1138,7 +1156,7 @@ mod tests {
         let block_hash_hex = record.hash.to_string_be();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let block_json = getblock(&ctx, &json!([block_hash_hex.as_str(), 1]))?;
         let header_json = getblockheader(&ctx, &json!([block_hash_hex.as_str(), true]))?;
@@ -1223,7 +1241,7 @@ mod tests {
         });
         let calls = Arc::clone(&source);
         let ctx = Arc::new(Context::new().with_block_body_source(source));
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let expected_hex = body.to_lower_hex_string();
         assert_eq!(
@@ -1251,7 +1269,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        seed_block(&ctx, &genesis, BlockRecord::from_block(0, &genesis));
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -1300,30 +1318,226 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn confirmations_uses_applied_height_not_header_tip() {
-        use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
-        use bitcoin_rs_primitives::Hash256;
+    /// A genesis, an applied child at height 1, and a competing branch off the
+    /// same genesis whose *header* chain reaches height 2.
+    ///
+    /// ```text
+    ///   genesis ──> applied            (height 1, the applied tip)
+    ///           └─> fork ──> fork_tip  (heights 1 and 2, headers only)
+    /// ```
+    ///
+    /// `fork` sits at height 1 exactly like `applied` does, which is the state
+    /// a height-only confirmation count cannot tell apart.
+    struct Fork {
+        ctx: Arc<Context>,
+        /// Height 1, on the applied chain.
+        applied: Hash256,
+        /// Height 1 as well, on the branch that lost.
+        fork: Hash256,
+        /// Height 2, header-only — never connected.
+        header_tip: Hash256,
+        /// The headers behind `applied` and `fork`, so a test can build log
+        /// records that actually decode.
+        applied_header: bitcoin::block::Header,
+        fork_header: bitcoin::block::Header,
+    }
+
+    fn forked_ctx() -> Result<Fork, Box<dyn std::error::Error>> {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
 
         let ctx = Context::new();
-        // Header tip at 100, applied tip at 50.
-        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
-        ctx.set_chain_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 100,
-            chainwork: ChainWork::ZERO,
-            hash,
-        });
-        ctx.set_applied_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 50,
-            chainwork: ChainWork::ZERO,
-            hash,
-        });
-        // Block at height 10: confirmations = applied(50) - 10 + 1 = 41.
-        assert_eq!(confirmations(&ctx, 10), 41);
-        // Block at height 60 (above applied tip): confirmations = 0.
-        assert_eq!(confirmations(&ctx, 60), 0);
+        let header = |prev: BlockHash, nonce: u32, time: u32| bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce,
+        };
+
+        let (applied_tip, header_tip, fork_hash, applied_header, fork_header) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = header(BlockHash::all_zeros(), 0, 1_000_000);
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+
+            let applied = header(genesis.block_hash(), 1, 1_000_900);
+            let applied_id = tree.insert_node(Some(genesis_id), applied, NodeStatus::Active)?;
+            let applied_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+            assert_eq!(applied_tip.tip_id, applied_id);
+
+            let fork = header(genesis.block_hash(), 2, 1_000_901);
+            let fork_id = tree.insert_node(Some(genesis_id), fork, NodeStatus::HeaderValid)?;
+            let fork_hash = tree.node(fork_id)?.hash;
+            let fork_tip = header(fork.block_hash(), 3, 1_001_800);
+            let _header_tip_id =
+                tree.insert_node(Some(fork_id), fork_tip, NodeStatus::HeaderValid)?;
+            let header_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing header tip"))?;
+            (applied_tip, header_tip, fork_hash, applied, fork)
+        };
+
+        ctx.set_applied_tip((*applied_tip).clone());
+        ctx.set_chain_tip((*header_tip).clone());
+        Ok(Fork {
+            ctx: Arc::new(ctx),
+            applied: applied_tip.hash,
+            fork: fork_hash,
+            header_tip: header_tip.hash,
+            applied_header,
+            fork_header,
+        })
+    }
+
+    #[test]
+    fn confirmations_uses_applied_height_not_header_tip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            ..
+        } = forked_ctx()?;
+
+        // Header tip is height 2, applied tip height 1. The applied block is one
+        // deep, not two: the header chain does not count.
+        assert_eq!(confirmations(&ctx, applied_hash, 1), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_block_that_lost_the_reorg()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            fork: fork_hash,
+            ..
+        } = forked_ctx()?;
+
+        assert_ne!(applied_hash, fork_hash, "the fixture branches must differ");
+        // Same height as the applied block, different chain. Deriving the answer
+        // from height alone reports 1 here, which says "in the chain, one deep".
+        assert_eq!(
+            confirmations(&ctx, fork_hash, 1),
+            -1,
+            "a block off the applied chain is not in it at any depth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_header_above_the_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            header_tip: header_tip_hash,
+            ..
+        } = forked_ctx()?;
+
+        // Known header, never connected. Core's m_chain does not contain it.
+        assert_eq!(confirmations(&ctx, header_tip_hash, 2), -1);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_hash_the_tree_never_saw()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork { ctx, .. } = forked_ctx()?;
+        let unknown = Hash256::from_le_bytes(&[0xab_u8; 32]);
+
+        assert_eq!(confirmations(&ctx, unknown, 1), -1);
+        Ok(())
+    }
+
+    /// A log record for `header`, either carrying the block or standing in for
+    /// one whose body the node no longer has.
+    fn record_for(header: bitcoin::block::Header, with_body: bool) -> BlockRecord {
+        use bitcoin::hashes::Hash as _;
+
+        let hash = Hash256::from_le_bytes(header.block_hash().as_byte_array());
+        if !with_body {
+            return BlockRecord::synthetic(1, hash);
+        }
+        let block = bitcoin::Block {
+            header,
+            txdata: Vec::new(),
+        };
+        let bytes = bitcoin::consensus::encode::serialize(&block);
+        BlockRecord::from_block_bytes(1, &block, &bytes)
+    }
+
+    /// `getblock` and `getblockheader` both render `confirmations` when a body
+    /// is available. A pruned body still leaves enough tree state for
+    /// `getblockheader`, while Core-compatible `getblock` rejects that request
+    /// as unavailable. The body-less fixture therefore checks the header RPC;
+    /// the complete fixture checks both rendering paths.
+    fn assert_reorged_block_reports_negative_confirmations(
+        with_body: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            fork: fork_hash,
+            applied_header,
+            fork_header,
+            ..
+        } = forked_ctx()?;
+        ctx.add_block(record_for(applied_header, with_body));
+        ctx.add_block(record_for(fork_header, with_body));
+
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let confirmations_of =
+            |method: &str, hash: Hash256| -> Result<i64, Box<dyn std::error::Error>> {
+                let value = handler.dispatch(method, &json!([hash.to_string_be(), true]))?;
+                value
+                    .get("confirmations")
+                    .and_then(JsonValueTrait::as_i64)
+                    .ok_or_else(|| {
+                        Box::<dyn std::error::Error>::from(format!(
+                            "confirmations missing or not an integer: {value:?}"
+                        ))
+                    })
+            };
+
+        let methods = if with_body {
+            &["getblockheader", "getblock"][..]
+        } else {
+            &["getblockheader"][..]
+        };
+        for method in methods {
+            assert_eq!(confirmations_of(method, applied_hash)?, 1, "{method}");
+            assert_eq!(
+                confirmations_of(method, fork_hash)?,
+                -1,
+                "{method} must carry the -1 through, not clamp it"
+            );
+        }
+        if !with_body {
+            for hash in [applied_hash, fork_hash] {
+                assert!(matches!(
+                    handler.dispatch("getblock", &json!([hash.to_string_be(), true])),
+                    Err(RpcError::NotFound("block data pruned"))
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reorged_block_reports_negative_confirmations_with_the_block_stored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_reorged_block_reports_negative_confirmations(true)
+    }
+
+    #[test]
+    fn reorged_block_reports_negative_confirmations_without_the_block_stored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_reorged_block_reports_negative_confirmations(false)
     }
 
     #[test]
@@ -1370,6 +1584,46 @@ mod tests {
         assert!(
             progress.abs() < f64::EPSILON,
             "expected 0.0, got {progress}"
+        );
+    }
+
+    #[test]
+    fn verificationprogress_is_capped_when_applied_tip_is_temporarily_higher() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[8_u8; 32]);
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 50,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 100,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        assert_eq!(
+            result
+                .get("verificationprogress")
+                .and_then(JsonValueTrait::as_f64),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_names_testnet4_separately_from_testnet3() {
+        let mut context = Context::new();
+        context.chain_network = bitcoin_rs_primitives::Network::Testnet4;
+        let result = getblockchaininfo(&Arc::new(context), &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("chain").and_then(JsonValueTrait::as_str),
+            Some("testnet4")
         );
     }
 
@@ -1485,6 +1739,44 @@ mod tests {
         );
     }
 
+    /// `size_on_disk` reports what the block store says, not the record sum.
+    ///
+    /// The record sum keeps counting blocks whose bytes pruning has deleted, so
+    /// it cannot be what a field named "size on disk" reports. This gives the
+    /// context a store that answers with a figure deliberately unrelated to the
+    /// records, so a handler that quietly went on summing them fails here rather
+    /// than looking right by coincidence.
+    #[test]
+    fn getblockchaininfo_size_on_disk_comes_from_the_block_store() {
+        struct SizedStore(u64);
+
+        impl crate::BlockBodySource for SizedStore {
+            fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+                None
+            }
+            fn disk_usage(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record_bytes = u64::try_from(record.body_size).unwrap_or(u64::MAX);
+        let store_bytes = record_bytes.saturating_add(4_096);
+        let ctx =
+            Arc::new(Context::new().with_block_body_source(Arc::new(SizedStore(store_bytes))));
+        ctx.add_block(record);
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("size_on_disk").and_then(JsonValueTrait::as_u64),
+            Some(store_bytes),
+            "size_on_disk must come from the store that owns the bytes"
+        );
+    }
+
     #[test]
     fn getchaintxstats_emits_core_shape_with_zero_blocks() {
         use alloc::sync::Arc;
@@ -1538,6 +1830,106 @@ mod tests {
         assert_eq!(time, u64::from(expected_time));
     }
 
+    /// A log with every shape the windowed search has to survive.
+    ///
+    /// Heights are non-decreasing, which is the invariant the binary searches
+    /// rest on, but they are not a clean `0..n`: height 3 is recorded twice, as
+    /// a reorg leaves it, so the "first record at this height" and
+    /// "records at or below this height" boundaries are not the same thing.
+    /// Timestamps dip at height 5, because block times are not monotonic and an
+    /// earliest-in-window that assumed they were would be wrong there.
+    fn shaped_log() -> BlockLog {
+        const HEIGHTS: [u32; 10] = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8];
+        const TIMES: [u32; 10] = [
+            1_000, 1_010, 1_020, 1_030, 1_031, 1_040, 1_035, 1_060, 1_070, 1_080,
+        ];
+        let mut log = BlockLog::new();
+        for (index, (height, time)) in HEIGHTS.into_iter().zip(TIMES).enumerate() {
+            log.push(BlockRecord {
+                hash: Hash256::from_le_bytes(&[u8::try_from(index).unwrap_or(0); 32]),
+                height,
+                block_hex: String::new(),
+                body_size: 100 + index * 7,
+                header: None,
+                tx_count: 1 + index * 3,
+                time,
+            });
+        }
+        log
+    }
+
+    /// The windowed search must land on exactly what the whole-log fold did.
+    ///
+    /// `getblockchaininfo` and `getchaintxstats` used to walk every record the
+    /// node holds. They now read running sums off the log and binary-search it,
+    /// which is an argument about the log being ordered by height. This checks
+    /// that argument against the implementation that made no argument and simply
+    /// looked at everything — `fold_block_records`, kept for exactly this.
+    ///
+    /// Swept over every applied height and every window length rather than one
+    /// pair, because the boundaries are where a search is wrong: at the
+    /// duplicate height, at the ends, and past both.
+    #[test]
+    fn chain_stats_matches_the_fold_it_replaced() {
+        let log = shaped_log();
+
+        for applied_height in 0_u32..11 {
+            for window in 0_u64..13 {
+                let lowest = u64::from(applied_height)
+                    .saturating_add(1)
+                    .saturating_sub(window.min(u64::from(applied_height).saturating_add(1)));
+
+                let oracle = fold_block_records(&log, applied_height, Some(lowest));
+                let actual = chain_stats(&log, applied_height, lowest);
+
+                assert_eq!(
+                    actual.total_tx_count, oracle.total_tx_count,
+                    "txcount at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.window_tx_count, oracle.window_tx_count,
+                    "window_tx_count at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.tip_time, oracle.tip_time,
+                    "tip_time at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.earliest_window_time, oracle.earliest_window_time,
+                    "earliest_window_time at applied={applied_height} window={window}"
+                );
+            }
+        }
+    }
+
+    /// `size_on_disk` is now a running sum, so it has to equal the fold's.
+    #[test]
+    fn size_on_disk_matches_the_fold_it_replaced() {
+        let mut log = shaped_log();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum disagrees with a fold of the records"
+        );
+
+        // The disconnect path: popping the tip must take its bytes back out.
+        let _popped = log.pop();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum survived a pop but stopped matching"
+        );
+        assert_eq!(
+            log.total_tx_count(),
+            fold_block_records(&log, u32::MAX, None).total_tx_count,
+            "the running tx-count sum survived a pop but stopped matching"
+        );
+
+        log.clear();
+        assert_eq!(log.size_on_disk(), 0, "clear must reset the running sums");
+        assert_eq!(log.total_tx_count(), 0, "clear must reset the running sums");
+    }
+
     #[test]
     fn getchaintxstats_two_block_window_uses_one_folded_window()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1549,7 +1941,7 @@ mod tests {
                 height,
                 block_hex: String::new(),
                 body_size: usize::try_from(100_u32.saturating_add(height))?,
-                header_hex: String::new(),
+                header: None,
                 tx_count: usize::try_from(height.saturating_add(1))?,
                 time: 1_000_u32.saturating_add(height.saturating_mul(10)),
             });
@@ -1559,7 +1951,7 @@ mod tests {
             height: 4,
             block_hex: String::new(),
             body_size: 104,
-            header_hex: String::new(),
+            header: None,
             tx_count: 100,
             time: 1,
         });
@@ -1611,7 +2003,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 200,
         });
@@ -1620,7 +2012,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 300,
         });
@@ -2060,5 +2452,155 @@ fn compute_branchlen(
             return leaf_height;
         };
         cursor = parent_id;
+    }
+}
+
+#[cfg(test)]
+mod initial_block_download_tests {
+    use alloc::sync::Arc;
+
+    use bitcoin::block::Version;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+    use bitcoin_rs_chain::NodeStatus;
+    use bitcoin_rs_primitives::Network;
+
+    use super::*;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// A context whose applied tip is a real tree node stamped `tip_time`, so
+    /// the tip has an age to be judged on. Chain work comes from the tree's own
+    /// accounting, which for a two-block regtest chain is far below any
+    /// production `nMinimumChainWork` — hence the network parameter: regtest
+    /// pins that floor at zero, mainnet does not.
+    fn ctx_with_tip_at(network: Network, tip_time: u32) -> Arc<Context> {
+        let mut ctx = Context::new();
+        ctx.chain_network = network;
+        let tip = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            let Ok(genesis_id) = tree.insert_node(None, genesis, NodeStatus::Active) else {
+                panic!("genesis insert failed");
+            };
+            let child = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: tip_time,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            };
+            let Ok(_child_id) = tree.insert_node(Some(genesis_id), child, NodeStatus::Active)
+            else {
+                panic!("child insert failed");
+            };
+            let Some(tip) = tree.tip() else {
+                panic!("no tip published");
+            };
+            (*tip).clone()
+        };
+        ctx.set_applied_tip(tip);
+        Arc::new(ctx)
+    }
+
+    #[test]
+    fn a_node_that_has_applied_nothing_is_in_initial_block_download() {
+        let ctx = Arc::new(Context::new());
+        assert!(ctx.is_initial_block_download(1_800_000_000));
+    }
+
+    #[test]
+    fn a_recent_tip_without_the_networks_minimum_work_is_still_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        // Timestamped one minute ago, so recency is satisfied and only the work
+        // floor can be what decides. A two-block regtest-difficulty chain has
+        // nowhere near mainnet's `nMinimumChainWork`.
+        let ctx = ctx_with_tip_at(
+            Network::Mainnet,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(
+            ctx.is_initial_block_download(now),
+            "a chain this cheap must not count as synced merely for being recent"
+        );
+    }
+
+    #[test]
+    fn a_stale_tip_with_enough_work_is_still_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        // Regtest's work floor is zero, so only the tip's age is left to decide.
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 60).unwrap_or(u32::MAX),
+        );
+        assert!(ctx.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn a_recent_tip_with_enough_work_has_left_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(!ctx.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn the_tip_age_boundary_is_twenty_four_hours() {
+        let now = 1_800_000_000_u64;
+        let at_the_edge = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY).unwrap_or(u32::MAX),
+        );
+        assert!(
+            !at_the_edge.is_initial_block_download(now),
+            "exactly `max_tip_age` old is still recent enough"
+        );
+
+        let past_the_edge = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 1).unwrap_or(u32::MAX),
+        );
+        assert!(past_the_edge.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn leaving_initial_block_download_latches() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(!ctx.is_initial_block_download(now));
+
+        // Two days later, with no new block. Judged afresh the tip is stale and
+        // the answer would flip back to `true`; latched, it does not. This is
+        // the defect the field had — it went true again every time the node went
+        // quiet, and callers read that as "resyncing, do not trust me".
+        assert!(
+            !ctx.is_initial_block_download(now + 2 * DAY),
+            "the answer must not flip back once the node has left initial sync"
+        );
+    }
+
+    #[test]
+    fn the_latch_does_not_fire_before_the_conditions_are_met() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 60).unwrap_or(u32::MAX),
+        );
+        assert!(ctx.is_initial_block_download(now));
+        // Same tip, asked later at a time when it *is* within the window.
+        assert!(!ctx.is_initial_block_download(now - DAY));
     }
 }

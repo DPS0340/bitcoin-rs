@@ -12,7 +12,7 @@ use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
-use bitcoin_rs_rpc::BlockRecord;
+use bitcoin_rs_rpc::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
     LiveOutput, LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
@@ -496,6 +496,14 @@ pub(crate) trait PruneBodyStore: Send + Sync {
         Ok(Some((body.len(), tx_count)))
     }
 
+    /// Bytes this store's block files occupy on disk, when it keeps files.
+    ///
+    /// `None` from a store with nothing on disk to measure; the caller then
+    /// falls back to the block-record sum.
+    fn disk_usage(&self) -> Option<u64> {
+        None
+    }
+
     /// Makes body bytes durable before their checkpoint can be published.
     fn sync(&self) -> Result<(), StorageError>;
 }
@@ -632,6 +640,10 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
 }
 
 impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
+    fn disk_usage(&self) -> Option<u64> {
+        Some(self.files.disk_usage())
+    }
+
     fn persist_block_body(
         &self,
         height: u32,
@@ -956,7 +968,7 @@ pub struct ApplyHandles {
     /// Shared mempool.
     pub mempool: Arc<RwLock<Mempool>>,
     /// Shared block records exposed to RPC handlers.
-    pub blocks: Arc<RwLock<Vec<BlockRecord>>>,
+    pub blocks: Arc<RwLock<BlockLog>>,
     /// Shared transaction map exposed to RPC handlers.
     pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     /// Shared ZMQ-event publisher (default: `NoOpZmqPublisher`).
@@ -1022,7 +1034,7 @@ impl ApplyHandles {
         tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
         filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
         mempool: Arc<RwLock<Mempool>>,
-        blocks: Arc<RwLock<Vec<BlockRecord>>>,
+        blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     ) -> Self {
@@ -2402,6 +2414,27 @@ fn apply_block_admitted(
             &block_bytes,
             handles.cache_block_bodies_in_memory,
         );
+        // The record carries no header. `BlockRecord`'s is filled from the block
+        // tree when a caller resolves one, which is sound only because the
+        // header is already in the tree by the time the record is in the log —
+        // `applied_header_tip` above, through these same handles, is what puts
+        // it there.
+        //
+        // That ordering is the whole of the argument, and until this assertion
+        // nothing enforced it. Reverse the two and every `getblock` /
+        // `getblockheader` answer for a freshly applied block loses its header,
+        // with nothing failing at the point the mistake is made.
+        //
+        // The tree lock is free here: `applied_header_tip` released its write
+        // guard before returning. The check is one hash-table lookup, and it is
+        // compiled out of release builds — so this is a guard for the test
+        // suite, where it runs on every block any node test applies.
+        debug_assert!(
+            handles.block_tree.read().node_by_hash(block_hash).is_some(),
+            "block {} is entering the record log with no block-tree node; \
+             its header would be unrecoverable",
+            block_hash.to_string_be()
+        );
         handles.blocks.write().push(block_record);
     }
     let block_record_dur = block_record_started.elapsed();
@@ -3640,16 +3673,17 @@ fn applied_block_record(
     } else {
         String::new()
     };
-    let header_hex = block_bytes.get(..SERIALIZED_BLOCK_HEADER_LEN).map_or_else(
-        || bitcoin::consensus::encode::serialize(&block.header).to_lower_hex_string(),
-        DisplayHex::to_lower_hex_string,
-    );
     BlockRecord {
         hash: block_hash,
         height,
         block_hex,
         body_size: block_bytes.len(),
-        header_hex,
+        // Not stored. `applied_header_tip` above has already put this block's
+        // header in the block tree — the record is pushed after that, through
+        // the same handles — and the tree never drops a node. Keeping a second
+        // copy here kept it for every block on the chain, for the life of the
+        // process.
+        header: None,
         tx_count: block.txdata.len(),
         time: block.header.time,
     }
@@ -3749,7 +3783,7 @@ mod consensus_rule_tests {
         assert_eq!(cached.height, expected_cached.height);
         assert_eq!(cached.block_hex, expected_cached.block_hex);
         assert_eq!(cached.body_size, expected_cached.body_size);
-        assert_eq!(cached.header_hex, expected_cached.header_hex);
+        assert_eq!(cached.header, expected_cached.header);
         assert_eq!(cached.tx_count, expected_cached.tx_count);
         assert_eq!(cached.time, expected_cached.time);
 
@@ -3759,7 +3793,7 @@ mod consensus_rule_tests {
         assert_eq!(metadata.height, expected_metadata.height);
         assert_eq!(metadata.block_hex, expected_metadata.block_hex);
         assert_eq!(metadata.body_size, expected_metadata.body_size);
-        assert_eq!(metadata.header_hex, expected_metadata.header_hex);
+        assert_eq!(metadata.header, expected_metadata.header);
         assert_eq!(metadata.tx_count, expected_metadata.tx_count);
         assert_eq!(metadata.time, expected_metadata.time);
     }
@@ -6396,14 +6430,15 @@ mod consensus_rule_tests {
             utxo.commit_block(&remove, &Hash256::from_le_bytes(&[0x83; 32]))?;
 
             let transition = handles.begin_chain_transition()?;
-            let error = apply_block_admitted(
+            let Err(error) = apply_block_admitted(
                 &handles,
                 &block,
                 Some(raw),
                 Some(ProvenApply::Proven(proof)),
                 &transition,
-            )
-            .expect_err("a mismatched proof must re-read the now-missing live prevout");
+            ) else {
+                panic!("a mismatched proof must re-read the now-missing live prevout");
+            };
             assert!(
                 matches!(
                     error,
@@ -6591,26 +6626,24 @@ mod consensus_rule_tests {
             "an empty verification dispatch must not count as script verification",
         );
         let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
-        let skipped = entries
-            .pop()
-            .expect("the trusted assume-valid window returned one entry above");
+        let Some(skipped) = entries.pop() else {
+            panic!("the trusted assume-valid window returned one entry above");
+        };
         handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(Some((
             1,
             Hash256::from_le_bytes(&[0xff; 32]),
         ))));
         assert!(!handles.assume_valid_gate.trusted());
         let transition = handles.begin_chain_transition()?;
-        let error = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition)
-            .expect_err("an untrusted gate at commit must run and reject the bad script");
+        let outcome = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition);
         assert!(
             matches!(
-                error,
-                ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                    input_index: 0,
-                    ..
-                })
+                outcome,
+                Err(ApplyError::Consensus(
+                    bitcoin_rs_consensus::ConsensusError::Script { input_index: 0, .. }
+                ))
             ),
-            "trust-gate flip must re-enter ordinary script validation, got {error:?}"
+            "trust-gate flip must re-enter ordinary script validation, got {outcome:?}"
         );
 
         // Full verification must be completely unaffected.
@@ -8931,7 +8964,7 @@ mod consensus_rule_tests {
             None,
             filter_index,
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
@@ -9945,7 +9978,7 @@ mod consensus_rule_tests {
             None,
             noop_filter_index(),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )

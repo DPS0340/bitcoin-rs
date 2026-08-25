@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use parking_lot::Mutex;
 
 use crate::StorageError;
@@ -91,6 +93,26 @@ pub struct FlatFileBlockStore {
     blocks_dir: PathBuf,
     max_file_bytes: u64,
     writer: Mutex<WriterState>,
+    /// Bytes currently occupied by this store's block files.
+    ///
+    /// Seeded by walking the directory once at open, then maintained by the two
+    /// operations that change it: `append` adds a framed record, and
+    /// `delete_file_if_not_current` subtracts a whole file. Every deletion in
+    /// the workspace goes through that one method, so there is no second path
+    /// to forget.
+    ///
+    /// Maintained rather than measured because the caller is
+    /// `getblockchaininfo`. Walking the directory costs one `stat` per file —
+    /// thousands at a mainnet-sized chain — and that call has just been made
+    /// independent of chain length; putting a directory walk back into it would
+    /// undo that. `disk_usage` checks the running figure against a real walk
+    /// under `debug_assert`.
+    usage: AtomicU64,
+    /// Set only when a failed append could not restore the old file length.
+    ///
+    /// Normal reads remain lock-free. Recovery reads take `writer` once and
+    /// replace `usage` with a directory measurement.
+    usage_dirty: AtomicBool,
 }
 
 struct WriterState {
@@ -98,6 +120,7 @@ struct WriterState {
     file_no: u32,
     append_offset: u64,
     directory_dirty: bool,
+    rollback_offset: Option<u64>,
 }
 /// Reusable reader for framed block bodies.
 pub struct FlatFileBlockReader {
@@ -154,6 +177,7 @@ impl FlatFileBlockStore {
         let len = body_len(body)?;
         let record_len = record_len(len)?;
         let mut writer = self.writer.lock();
+        self.recover_failed_append(&mut writer)?;
 
         if writer.append_offset > 0
             && writer
@@ -191,19 +215,87 @@ impl FlatFileBlockStore {
         header[12..].copy_from_slice(&hash);
 
         writer.file.seek(SeekFrom::Start(position.offset))?;
-        writer.file.write_all(&header)?;
-        writer.file.write_all(body)?;
-        writer.file.flush()?;
-        writer.append_offset = writer
-            .append_offset
+        let next_offset = position
+            .offset
             .checked_add(record_len)
             .ok_or(StorageError::InvalidOperation("block file offset overflow"))?;
+        let append_result = writer
+            .file
+            .write_all(&header)
+            .and_then(|()| writer.file.write_all(body))
+            .and_then(|()| writer.file.flush());
+        if let Err(append_error) = append_result {
+            writer.rollback_offset = Some(position.offset);
+            self.usage_dirty.store(true, Ordering::Release);
+            if let Err(rollback_error) = writer
+                .file
+                .set_len(position.offset)
+                .and_then(|()| writer.file.seek(SeekFrom::Start(position.offset)).map(drop))
+            {
+                return Err(io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "failed to roll back block file after append error ({append_error}): \
+                         {rollback_error}"
+                    ),
+                )
+                .into());
+            }
+            writer.rollback_offset = None;
+            self.usage_dirty.store(false, Ordering::Release);
+            return Err(append_error.into());
+        }
+        writer.append_offset = next_offset;
+        let _ = self.usage.fetch_add(record_len, Ordering::Relaxed);
         Ok(position)
+    }
+
+    /// Bytes this store's block files currently occupy on disk.
+    ///
+    /// This is what `getblockchaininfo` reports as `size_on_disk`: bytes that
+    /// are actually there, so pruning a file makes it fall. It is not the sum of
+    /// the block sizes the node has seen — that figure keeps counting blocks
+    /// whose bytes have been deleted, which is the opposite of what the field
+    /// is read for.
+    ///
+    /// Undo data is not included. It lives in the key-value store rather than in
+    /// files here, so this store cannot see it; Bitcoin Core counts its undo
+    /// files in the same number and this does not.
+    #[must_use]
+    pub fn disk_usage(&self) -> u64 {
+        if self.usage_dirty.load(Ordering::Acquire) {
+            let _writer = self.writer.lock();
+            if self.usage_dirty.load(Ordering::Relaxed) {
+                if let Ok(usage) = measure_blocks_dir(&self.blocks_dir) {
+                    self.usage.store(usage, Ordering::Relaxed);
+                    self.usage_dirty.store(false, Ordering::Release);
+                    return usage;
+                }
+                return self.usage.load(Ordering::Relaxed);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let _writer = self.writer.lock();
+            let usage = self.usage.load(Ordering::Relaxed);
+            debug_assert_eq!(
+                usage,
+                measure_blocks_dir(&self.blocks_dir).unwrap_or(usage),
+                "running block-file usage drifted from the files on disk"
+            );
+            usage
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.usage.load(Ordering::Relaxed)
+        }
     }
 
     /// Flushes the current append file to stable storage.
     pub fn sync(&self) -> Result<(), StorageError> {
         let mut writer = self.writer.lock();
+        self.recover_failed_append(&mut writer)?;
         writer.file.flush()?;
         writer.file.sync_data()?;
         if writer.directory_dirty {
@@ -297,11 +389,36 @@ impl FlatFileBlockStore {
             return Ok(false);
         }
         let path = block_file_path(&self.blocks_dir, file_no);
+        // Sized before the unlink, because afterwards there is nothing to size.
+        // A file that cannot be sized is removed without adjusting the running
+        // figure rather than guessed at; `disk_usage`'s `debug_assert` is what
+        // notices if that ever happens.
+        let reclaimed = fs::metadata(&path).map(|metadata| metadata.len()).ok();
         match fs::remove_file(path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if let Some(bytes) = reclaimed {
+                    let _ = self.usage.fetch_sub(bytes, Ordering::Relaxed);
+                }
+                Ok(true)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn recover_failed_append(&self, writer: &mut WriterState) -> Result<(), StorageError> {
+        let Some(offset) = writer.rollback_offset else {
+            return Ok(());
+        };
+        self.usage_dirty.store(true, Ordering::Release);
+        writer.file.set_len(offset)?;
+        writer.file.seek(SeekFrom::Start(offset))?;
+        let usage = measure_blocks_dir(&self.blocks_dir)?;
+        writer.append_offset = offset;
+        writer.rollback_offset = None;
+        self.usage.store(usage, Ordering::Relaxed);
+        self.usage_dirty.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn open_with_max_file_bytes(
@@ -342,6 +459,11 @@ impl FlatFileBlockStore {
         }
         file.seek(SeekFrom::Start(recovered_offset))?;
 
+        // Seeded from the files themselves, once. A store reopened over an
+        // existing directory has to start from what is there, and an incomplete
+        // tail was just truncated above, so this runs after that.
+        let usage = AtomicU64::new(measure_blocks_dir(&blocks_dir)?);
+
         Ok(Self {
             blocks_dir,
             max_file_bytes,
@@ -350,7 +472,10 @@ impl FlatFileBlockStore {
                 file_no,
                 append_offset: recovered_offset,
                 directory_dirty: false,
+                rollback_offset: None,
             }),
+            usage,
+            usage_dirty: AtomicBool::new(false),
         })
     }
 }
@@ -620,6 +745,27 @@ fn read_exact_or_none(reader: &mut impl io::Read, bytes: &mut [u8]) -> Result<bo
     }
 }
 
+/// Sums the sizes of every block file in `blocks_dir`.
+///
+/// The truth `disk_usage`'s running figure is kept honest against, and how that
+/// figure is seeded at open. Costs one `stat` per file, which is why it is not
+/// what `getblockchaininfo` calls.
+fn measure_blocks_dir(blocks_dir: &Path) -> Result<u64, StorageError> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(blocks_dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if parse_block_file_name(name).is_none() {
+            continue;
+        }
+        total = total.saturating_add(entry.metadata()?.len());
+    }
+    Ok(total)
+}
+
 fn highest_block_file_number(blocks_dir: &Path) -> Result<Option<u32>, StorageError> {
     let mut highest = None;
     for entry in fs::read_dir(blocks_dir)? {
@@ -671,6 +817,164 @@ mod tests {
 
     fn hash(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// `disk_usage` reports bytes that are there, and stops reporting them when
+    /// they are deleted.
+    ///
+    /// This is what `getblockchaininfo` calls `size_on_disk`. The figure it
+    /// replaces was the sum of every block's serialized length, which pruning
+    /// could not move: records are kept when their bodies are dropped, so a
+    /// pruned node went on reporting bytes it no longer had — under a field name
+    /// that is read precisely to check whether pruning is working.
+    ///
+    /// Compared against a fresh walk of the directory at every step, so it pins
+    /// the number against the files rather than against itself.
+    #[test]
+    fn disk_usage_follows_the_files_through_appends_and_deletion() -> Result<(), crate::StorageError>
+    {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+        let blocks_dir = data_dir.path().join(super::BLOCK_FILE_DIRECTORY);
+        assert_eq!(store.disk_usage(), 0, "a fresh store occupies nothing");
+
+        let _first = store.persist(None, 1, hash(1), b"first")?;
+        let after_first = store.disk_usage();
+        assert_eq!(after_first, super::measure_blocks_dir(&blocks_dir)?);
+        assert!(after_first > 0, "an appended body occupies bytes");
+
+        // Past the 120-byte cap, so this rolls into a second file.
+        let third = store.persist(None, 2, hash(2), b"a longer second body")?;
+        let third = store.persist(None, 3, hash(3), b"third").map(|_| third)?;
+        assert_eq!(third.file_no, 0, "the fixture must roll over");
+        let after_rollover = store.disk_usage();
+        assert_eq!(after_rollover, super::measure_blocks_dir(&blocks_dir)?);
+        assert!(after_rollover > after_first, "appends add bytes");
+
+        // File 0 is complete, so it is prunable; file 1 is the current one.
+        assert!(
+            store.delete_file_if_not_current(0)?,
+            "the fixture must have a prunable file"
+        );
+        let after_prune = store.disk_usage();
+        assert_eq!(
+            after_prune,
+            super::measure_blocks_dir(&blocks_dir)?,
+            "usage must follow the files after a deletion"
+        );
+        assert!(
+            after_prune < after_rollover,
+            "pruning a file must reduce the reported size, which is the whole \
+             reason this is not a sum of block lengths"
+        );
+        Ok(())
+    }
+
+    /// A failed rollback must not leave a later append behind a torn frame.
+    #[test]
+    fn retry_recovers_an_append_whose_rollback_failed() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let store = FlatFileBlockStore::open(data_dir.path())?;
+        let read_only = std::fs::File::open(store.file_path(0))?;
+        let writable = {
+            let mut writer = store.writer.lock();
+            std::mem::replace(&mut writer.file, read_only)
+        };
+
+        let error = match store.append(1, hash(1), b"fails") {
+            Ok(position) => panic!(
+                "the read-only file accepted an append at {}:{}",
+                position.file_no, position.offset
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("failed to roll back block file"),
+            "the rollback failure must be reported: {error}"
+        );
+        assert_eq!(
+            store.disk_usage(),
+            0,
+            "a dirty counter must be reconciled against the file"
+        );
+
+        {
+            let mut writer = store.writer.lock();
+            assert_eq!(
+                writer.rollback_offset,
+                Some(0),
+                "the retry must know where the valid prefix ends"
+            );
+            writer.file = writable;
+        }
+
+        let position = store.append(2, hash(2), b"retry")?;
+        assert_eq!(position.offset, 0, "the retry must replace the torn frame");
+        assert_eq!(
+            store.load(position, 2, hash(2))?.as_deref(),
+            Some(b"retry".as_slice())
+        );
+        assert_eq!(
+            store.disk_usage(),
+            super::measure_blocks_dir(&store.blocks_dir)?
+        );
+        Ok(())
+    }
+
+    /// Only block files count, and a stray file must not be mistaken for one.
+    ///
+    /// The seeding walk and the running figure have to agree about what a block
+    /// file is: `append` counts framed records and nothing else, so a walk that
+    /// counted every directory entry would seed a number the maintained one can
+    /// never match — and `disk_usage`'s guard would fire on a node that had
+    /// nothing wrong with it. Backup copies, editor scratch files and the
+    /// operating system's own directory droppings all land here.
+    #[test]
+    fn disk_usage_counts_only_block_files() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let blocks_dir = data_dir.path().join(super::BLOCK_FILE_DIRECTORY);
+        let expected = {
+            let store = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+            let _ = store.persist(None, 1, hash(1), b"first")?;
+            store.disk_usage()
+        };
+
+        std::fs::write(blocks_dir.join("blk00000.dat.bak"), vec![9_u8; 8_192])?;
+        std::fs::write(blocks_dir.join("notes.txt"), vec![9_u8; 8_192])?;
+
+        assert_eq!(
+            super::measure_blocks_dir(&blocks_dir)?,
+            expected,
+            "the walk must ignore files that are not block files"
+        );
+        let reopened = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+        assert_eq!(
+            reopened.disk_usage(),
+            expected,
+            "a stray file must not be seeded into the usage figure"
+        );
+        Ok(())
+    }
+
+    /// A reopened store starts from the files it finds, not from zero.
+    #[test]
+    fn disk_usage_is_seeded_from_an_existing_directory() -> Result<(), crate::StorageError> {
+        let data_dir = tempdir()?;
+        let expected = {
+            let store = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+            let _ = store.persist(None, 1, hash(1), b"first")?;
+            let _ = store.persist(None, 2, hash(2), b"second")?;
+            store.disk_usage()
+        };
+        assert!(expected > 0, "the fixture must write something");
+
+        let reopened = FlatFileBlockStore::open_with_max_file_bytes(data_dir.path(), 120)?;
+        assert_eq!(
+            reopened.disk_usage(),
+            expected,
+            "a reopened store must account for the files already there"
+        );
+        Ok(())
     }
 
     #[test]
