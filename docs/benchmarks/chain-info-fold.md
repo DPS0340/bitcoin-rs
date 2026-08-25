@@ -1,18 +1,23 @@
 # Chain-info RPC benchmarks
 
-Baseline and refactor-set measurement for `getblockchaininfo` and
-`getchaintxstats`, the two RPCs that folded the node's whole block-record log.
+Historical and current benchmarks for `getblockchaininfo` and
+`getchaintxstats`, the two RPCs that folded the node’s whole block-record log.
 
-Harness: `crates/rpc/benches/chaininfo.rs`. Criterion, both arms of the refactor
-set in one group over one fixture in one process, so the ratio cannot be
-confounded by the rebuild and baseline drift recorded in
+The first table below is the historical same-process A/B evidence: it compared
+the retired whole-log baseline against the indexed implementation in one
+Criterion group over one fixture in one process. The current harness in
+`crates/rpc/benches/chaininfo.rs` runs only the indexed implementation plus
+end-to-end `Handler::dispatch` benchmarks.
+
+Because the historical A/B ran both arms in that single process, the ratio
+could not be confounded by the rebuild and baseline drift recorded in
 `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 
 ## What was wrong
 
 `Context::blocks` holds one `BlockRecord` per applied block and grows for the
 life of the process — ~963k entries on a mainnet node at the time of writing.
-`fold_block_records` walked all of it to produce five scalars.
+The retired whole-log path walked all of it to produce five scalars.
 
 `getblockchaininfo` used one of them. It folded 963k records to report
 `size_on_disk`, and threw the rest of the fold away.
@@ -24,7 +29,7 @@ application for the length of the walk, and the walk got longer with every block
 
 ## What was measured
 
-| Records | `before_fold` | `after_indexed` | ratio |
+| Records | whole-log baseline | `after_indexed` | ratio |
 |---:|---:|---:|---:|
 | 10,000 | 19.32 µs | 3.83 µs | **5.0x** |
 | 100,000 | 552.7 µs | 3.94 µs | **140x** |
@@ -102,18 +107,16 @@ from the corrected fixture.
 
 ## Correctness, and how the tests were checked
 
-`fold_block_records` is retained whole: it is the oracle the equivalence tests
-compare against and the benchmark's `before` arm. It makes no assumption about
-the log's ordering, which is the point — the replacement binary-searches, and an
-oracle that shared that assumption could not catch it being wrong.
-
-`chain_stats_matches_the_fold_it_replaced` sweeps **every** applied height from 0
-to past the end of the log against **every** window length from 0 to past the
-whole log, and compares all four figures each time. The fixture records height 3
-twice, as a reorg leaves it, so "the first record at this height" and "records at
-or below this height" are not the same boundary; and its timestamps dip at height
-5, because block times are not monotonic and an earliest-in-window that assumed
-they were would be wrong there.
+At introduction, the whole-log implementation was retained as the equivalence
+oracle: the tests compared the indexed path against it over every applied
+height and every window length, and the benchmark timed it as the `before`
+arm. Once the indexed path had been mutation-audited (below), the oracle had
+no remaining purpose — it has since been deleted, and the figures are pinned
+by direct expected-value tests computed by hand from the fixture. The fixture
+records height 3 twice, as a reorg leaves it, so "the first record at this
+height" and "records at or below this height" are not the same boundary; and
+its timestamps dip at height 5, because block times are not monotonic and an
+earliest-in-window that assumed they were would be wrong there.
 
 The tests were then audited by mutation:
 

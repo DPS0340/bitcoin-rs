@@ -1121,7 +1121,7 @@ mod tests {
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
-    use crate::context::{BlockLog, fold_block_records};
+    use crate::context::BlockLog;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
     fn context_with_tip(
@@ -2102,76 +2102,130 @@ mod tests {
         log
     }
 
-    /// The windowed search must land on exactly what the whole-log fold did.
+    /// `chain_stats` figures, pinned to values computed by hand from
+    /// `shaped_log`. The log records height 3 twice (reorg shape), so the
+    /// applied-tip boundary, the first-at-height tip time, and the window
+    /// boundary are three different indices.
     ///
-    /// `getblockchaininfo` and `getchaintxstats` used to walk every record the
-    /// node holds. They now read running sums off the log and binary-search it,
-    /// which is an argument about the log being ordered by height. This checks
-    /// that argument against the implementation that made no argument and simply
-    /// looked at everything — `fold_block_records`, kept for exactly this.
-    ///
-    /// Swept over every applied height and every window length rather than one
-    /// pair, because the boundaries are where a search is wrong: at the
-    /// duplicate height, at the ends, and past both.
+    /// Catches treating a duplicate applied height as one record or choosing
+    /// its last timestamp rather than its first.
     #[test]
-    fn chain_stats_matches_the_fold_it_replaced() {
+    fn chain_stats_at_the_duplicate_height() {
         let log = shaped_log();
-
-        for applied_height in 0_u32..11 {
-            for window in 0_u64..13 {
-                let lowest = u64::from(applied_height)
-                    .saturating_add(1)
-                    .saturating_sub(window.min(u64::from(applied_height).saturating_add(1)));
-
-                let oracle = fold_block_records(&log, applied_height, Some(lowest));
-                let actual = chain_stats(&log, applied_height, lowest);
-
-                assert_eq!(
-                    actual.total_tx_count, oracle.total_tx_count,
-                    "txcount at applied={applied_height} window={window}"
-                );
-                assert_eq!(
-                    actual.window_tx_count, oracle.window_tx_count,
-                    "window_tx_count at applied={applied_height} window={window}"
-                );
-                assert_eq!(
-                    actual.tip_time, oracle.tip_time,
-                    "tip_time at applied={applied_height} window={window}"
-                );
-                assert_eq!(
-                    actual.earliest_window_time, oracle.earliest_window_time,
-                    "earliest_window_time at applied={applied_height} window={window}"
-                );
-            }
-        }
+        // applied=3, window from height 2: end = 5 (indices 0..=4 are <= 3),
+        // tip is the FIRST record at height 3 (time 1030, not 1031), window
+        // covers indices 2..=4.
+        let stats = chain_stats(&log, 3, 2);
+        assert_eq!(stats.total_tx_count, 1 + 4 + 7 + 10 + 13);
+        assert_eq!(stats.window_tx_count, 7 + 10 + 13);
+        assert_eq!(stats.tip_time, Some(1_030));
+        assert_eq!(stats.earliest_window_time, Some(1_020));
     }
 
-    /// `size_on_disk` is now a running sum, so it has to equal the fold's.
+    /// Catches counting records above the applied tip in the total or window.
     #[test]
-    fn size_on_disk_matches_the_fold_it_replaced() {
-        let mut log = shaped_log();
-        assert_eq!(
-            log.size_on_disk(),
-            fold_block_records(&log, u32::MAX, None).size_on_disk,
-            "the running body-size sum disagrees with a fold of the records"
-        );
+    fn chain_stats_applied_tip_bounds_exclude_records_above_the_tip() {
+        let log = shaped_log();
+        // applied=4, whole-chain window: indices 5..=9 (tx 19+22+25+28) sit
+        // above the tip and must not leak into either count.
+        let stats = chain_stats(&log, 4, 0);
+        assert_eq!(stats.total_tx_count, 1 + 4 + 7 + 10 + 13 + 16);
+        assert_eq!(stats.window_tx_count, 1 + 4 + 7 + 10 + 13 + 16);
+        assert_eq!(stats.tip_time, Some(1_040));
+        assert_eq!(stats.earliest_window_time, Some(1_000));
+    }
 
-        // The disconnect path: popping the tip must take its bytes back out.
+    /// Catches using the first window timestamp instead of its true minimum.
+    #[test]
+    fn chain_stats_earliest_window_time_survives_non_monotonic_timestamps() {
+        let log = shaped_log();
+        // applied=8 (whole log), window from height 4: the window's earliest
+        // time is 1035 at height 5, INSIDE the window — an implementation that
+        // assumed times rise with height would answer 1040 (the window front).
+        let stats = chain_stats(&log, 8, 4);
+        assert_eq!(stats.total_tx_count, 145);
+        assert_eq!(stats.window_tx_count, 16 + 19 + 22 + 25 + 28);
+        assert_eq!(stats.tip_time, Some(1_080));
+        assert_eq!(stats.earliest_window_time, Some(1_035));
+    }
+
+    /// Catches exclusive lower bounds, nonempty zero windows, and failures to
+    /// handle sparse applied heights beyond the log without panicking.
+    #[test]
+    fn chain_stats_at_the_log_edges() {
+        let log = shaped_log();
+        // Window entirely above the applied tip: empty, never a panic.
+        let stats = chain_stats(&log, 8, 9);
+        assert_eq!(stats.total_tx_count, 145);
+        assert_eq!(stats.window_tx_count, 0);
+        assert_eq!(stats.tip_time, Some(1_080));
+        assert_eq!(stats.earliest_window_time, None);
+        // Applied tip past the end of the log: everything counts, no tip time.
+        let stats = chain_stats(&log, 10, 0);
+        assert_eq!(stats.total_tx_count, 145);
+        assert_eq!(stats.window_tx_count, 145);
+        assert_eq!(stats.tip_time, None);
+        assert_eq!(stats.earliest_window_time, Some(1_000));
+        // Applied tip at the log's first record.
+        let stats = chain_stats(&log, 0, 0);
+        assert_eq!(stats.total_tx_count, 1);
+        assert_eq!(stats.window_tx_count, 1);
+        assert_eq!(stats.tip_time, Some(1_000));
+        assert_eq!(stats.earliest_window_time, Some(1_000));
+    }
+
+    /// The running sums are the log's only aggregates; push, pop, clear and the
+    /// `tx_count_before` clamp are pinned to hand-computed fixture values.
+    ///
+    /// Catches stale totals after disconnect or clear and an unclamped prefix
+    /// lookup that panics when the requested count exceeds the log length.
+    #[test]
+    fn block_log_running_sums_track_push_pop_and_clear() {
+        let mut log = shaped_log();
+        assert_eq!(log.size_on_disk(), 1_315);
+        assert_eq!(log.total_tx_count(), 145);
+        assert_eq!(log.tx_count_before(4), 1 + 4 + 7 + 10);
+        assert_eq!(log.tx_count_before(0), 0);
+        // `count` is clamped to the log's length rather than panicking.
+        assert_eq!(log.tx_count_before(usize::MAX), 145);
+
+        // The disconnect path: popping the tip takes its bytes and txs back out.
         let _popped = log.pop();
-        assert_eq!(
-            log.size_on_disk(),
-            fold_block_records(&log, u32::MAX, None).size_on_disk,
-            "the running body-size sum survived a pop but stopped matching"
-        );
-        assert_eq!(
-            log.total_tx_count(),
-            fold_block_records(&log, u32::MAX, None).total_tx_count,
-            "the running tx-count sum survived a pop but stopped matching"
-        );
+        assert_eq!(log.size_on_disk(), 1_315 - 163);
+        assert_eq!(log.total_tx_count(), 145 - 28);
+        assert_eq!(log.tx_count_before(usize::MAX), 145 - 28);
 
         log.clear();
         assert_eq!(log.size_on_disk(), 0, "clear must reset the running sums");
         assert_eq!(log.total_tx_count(), 0, "clear must reset the running sums");
+    }
+
+    /// The running sums must use saturating `u64` addition.
+    ///
+    /// A previous implementation wrapped the body-size and tx-count totals
+    /// on the very next push after saturation (`u64::MAX + 1` became `0`).
+    /// The max-sized first push and the following `+1` push together catch
+    /// that concrete wrapping bug.
+    #[test]
+    fn block_log_running_sums_saturate_instead_of_wrapping() {
+        let max = usize::try_from(u64::MAX).unwrap_or(usize::MAX);
+        let record = |body_size: usize, tx_count: usize| BlockRecord {
+            hash: Hash256::from_le_bytes(&[0_u8; 32]),
+            height: 0,
+            block_hex: String::new(),
+            body_size,
+            header: None,
+            tx_count,
+            time: 0,
+        };
+        let mut log = BlockLog::new();
+        log.push(record(max, max));
+        assert_eq!(log.size_on_disk(), u64::MAX);
+        assert_eq!(log.total_tx_count(), u64::MAX);
+        // A second push must not wrap the sums back to small values.
+        log.push(record(1, 1));
+        assert_eq!(log.size_on_disk(), u64::MAX);
+        assert_eq!(log.total_tx_count(), u64::MAX);
     }
 
     #[test]

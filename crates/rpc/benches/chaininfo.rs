@@ -1,20 +1,12 @@
-//! Whole-log fold cost on the chain-info RPCs.
+//! Chain-info RPC cost with the log's maintained statistics.
 //!
-//! `getblockchaininfo` and `getchaintxstats` used to fold every block record the
-//! node holds. The log grows one entry per block forever, so the cost of a call
-//! that reports a handful of scalars was linear in chain length — and it was
-//! paid under the log's read lock, which is the lock block application takes to
-//! append.
+//! `getblockchaininfo` and `getchaintxstats` read running sums off `BlockLog`
+//! and binary-search it; the whole-log fold they replaced was deleted with
+//! its oracle. `after_indexed` measures that read path directly; the two
+//! dispatch arms measure the end-to-end RPC calls as they stand now. The
+//! historical before/after ratio lives in `docs/benchmarks/chain-info-fold.md`.
 //!
-//! Both arms of the refactor set run here over one fixture in one process, so
-//! the ratio cannot be confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
-//! `before_fold` is `fold_block_records`, the walk that was replaced;
-//! `after_indexed` is the running sums on `BlockLog` plus the windowed search
-//! that replaced it. `dispatch` is the end-to-end RPC call as it stands now.
-//!
-//! Records are metadata-only, which is what a production node stores: the fold
-//! reads `body_size`, `height`, `tx_count` and `time`, and nothing else.
+//! Records are metadata-only, which is what a production node stores.
 // PERF: Criterion emits public harness items whose docs are irrelevant here.
 #![allow(missing_docs)]
 // A fixture that fails to build has no meaningful degraded mode.
@@ -26,7 +18,7 @@ use std::sync::Arc;
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::Handler;
-use bitcoin_rs_rpc::context::{BlockRecord, Context, chain_stats, fold_block_records};
+use bitcoin_rs_rpc::context::{BlockRecord, Context, chain_stats};
 use criterion::{Criterion, criterion_group, criterion_main};
 use sonic_rs::json;
 
@@ -47,9 +39,9 @@ fn context_with_records(count: u32) -> Arc<Context> {
             let mut hash = [0_u8; 32];
             hash[..4].copy_from_slice(&height.to_le_bytes());
             let mut record = BlockRecord::synthetic(height, Hash256::from_le_bytes(&hash));
-            // A real record carries the facts the fold reads. Leaving them zero
+            // A real record carries the facts the stats read. Leaving them zero
             // would still walk the log, but would not fault in the bytes the
-            // fold actually touches.
+            // stats actually touch.
             record.body_size = 1_000_000 + (height as usize % 400_000);
             record.tx_count = 1 + (height as usize % 3_000);
             record.time = 1_231_006_505 + height * 600;
@@ -79,7 +71,7 @@ fn applied_tip_for(ctx: &Arc<Context>, count: u32) -> u32 {
 }
 
 fn bench_chaininfo(c: &mut Criterion) {
-    let mut group = c.benchmark_group("chain_info_fold");
+    let mut group = c.benchmark_group("chain_info");
     group.sample_size(20);
 
     for count in LOG_LENGTHS {
@@ -92,40 +84,6 @@ fn bench_chaininfo(c: &mut Criterion) {
             .saturating_add(1)
             .saturating_sub(DEFAULT_WINDOW.min(u64::from(applied).saturating_add(1)));
 
-        // Prove the arms agree on this fixture before timing either. An arm that
-        // answered a different number would otherwise be timed as a win.
-        {
-            let log = ctx.blocks.read();
-            let oracle = fold_block_records(&log, applied, Some(window));
-            let indexed = chain_stats(&log, applied, window);
-            assert_eq!(
-                log.size_on_disk(),
-                oracle.size_on_disk,
-                "the arms disagree on size_on_disk; the benchmark would be meaningless"
-            );
-            assert_eq!(
-                (
-                    indexed.total_tx_count,
-                    indexed.window_tx_count,
-                    indexed.tip_time,
-                    indexed.earliest_window_time
-                ),
-                (
-                    oracle.total_tx_count,
-                    oracle.window_tx_count,
-                    oracle.tip_time,
-                    oracle.earliest_window_time
-                ),
-                "the arms disagree on the chain stats; the benchmark would be meaningless"
-            );
-        }
-
-        group.bench_function(format!("before_fold/{count}"), |b| {
-            b.iter(|| {
-                let log = ctx.blocks.read();
-                black_box(fold_block_records(&log, applied, Some(window)))
-            });
-        });
         group.bench_function(format!("after_indexed/{count}"), |b| {
             b.iter(|| {
                 let log = ctx.blocks.read();

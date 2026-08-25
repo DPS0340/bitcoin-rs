@@ -245,8 +245,9 @@ impl FromIterator<BlockRecord> for BlockLog {
 /// answer it. The window is the caller's `nblocks` (~4,320 by default), not the
 /// chain.
 ///
-/// [`fold_block_records`] is the implementation this replaced, kept as
-/// the oracle `chain_stats_matches_the_fold_it_replaced` compares against.
+/// The equivalence oracle this was checked against has since been deleted;
+/// direct expected-value tests in `handlers::chain::tests` pin every figure
+/// against hand-computed values instead.
 #[must_use]
 pub fn chain_stats(log: &BlockLog, applied_height: u32, lowest_window_height: u64) -> ChainStats {
     let blocks: &[BlockRecord] = log;
@@ -295,71 +296,6 @@ pub struct ChainStats {
     pub tip_time: Option<u32>,
     /// Lowest timestamp inside the requested window.
     pub earliest_window_time: Option<u32>,
-}
-
-/// What a whole-log fold produced for the chain-info RPCs.
-///
-/// See [`fold_block_records`].
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FoldedBlockRecords {
-    /// Sum of `body_size` over every record.
-    pub size_on_disk: u64,
-    /// Sum of `tx_count` over records at or below the applied tip.
-    pub total_tx_count: u64,
-    /// Sum of `tx_count` over records inside the requested window.
-    pub window_tx_count: u64,
-    /// Timestamp of the first record at the applied height.
-    pub tip_time: Option<u32>,
-    /// Lowest timestamp inside the requested window.
-    pub earliest_window_time: Option<u32>,
-}
-
-/// The whole-log fold `getblockchaininfo` and `getchaintxstats` used to run.
-///
-/// Retained deliberately, not left behind. It is the oracle the equivalence
-/// tests compare [`BlockLog`]'s running sums and the windowed search against,
-/// and the `before` arm of `benches/chaininfo.rs` — both arms have to run in one
-/// process over one fixture for the ratio to mean anything, which they cannot do
-/// if this is deleted.
-///
-/// Nothing in the node calls it. It walks every record the node holds, which is
-/// the entire reason it was replaced.
-///
-/// It makes no assumption about the log's ordering, which is the point: the
-/// replacement binary-searches, and an oracle that shared that assumption could
-/// not catch it being wrong.
-#[must_use]
-pub fn fold_block_records(
-    blocks: &[BlockRecord],
-    applied_height: u32,
-    lowest_window_height: Option<u64>,
-) -> FoldedBlockRecords {
-    let mut stats = FoldedBlockRecords::default();
-    for record in blocks {
-        stats.size_on_disk = stats
-            .size_on_disk
-            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
-        if record.height > applied_height {
-            continue;
-        }
-        stats.total_tx_count = stats
-            .total_tx_count
-            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-        if record.height == applied_height && stats.tip_time.is_none() {
-            stats.tip_time = Some(record.time);
-        }
-        if lowest_window_height.is_some_and(|lowest| u64::from(record.height) >= lowest) {
-            stats.window_tx_count = stats
-                .window_tx_count
-                .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-            stats.earliest_window_time = Some(
-                stats
-                    .earliest_window_time
-                    .map_or(record.time, |earliest| earliest.min(record.time)),
-            );
-        }
-    }
-    stats
 }
 
 /// Finds the record at `height`, or `None` when the log holds no such height.
