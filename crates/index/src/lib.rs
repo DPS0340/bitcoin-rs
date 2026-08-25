@@ -11,9 +11,10 @@ pub mod status;
 pub mod types;
 
 pub use index::{
-    BlockSource, INDEX_FORMAT_VERSION, IndexError, IndexFormat, IndexReader, IndexRowCounts,
-    IndexWatermark, IndexWriter, Indexer, IndexerLike, PreparedBatch, PreparedBatchLimits,
-    PreparedBlock, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    BlockSource, INDEX_FORMAT_VERSION, IndexCapabilities, IndexCapability, IndexError, IndexFormat,
+    IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks, IndexWriter, Indexer,
+    IndexerLike, PreparedBatch, PreparedBatchLimits, PreparedBlock, TxIndexScan, TxIndexScanRow,
+    TxIndexSnapshot,
 };
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use status::{HistoryEntry, HistoryHeight, StatusHash, compute_status_hash};

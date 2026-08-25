@@ -93,11 +93,11 @@ This is the **third instance** of one recurring pattern in this codebase, and th
 
 > The optimization is real, measurable, and correct — and it lives off the production-critical path.
 
-The two siblings:
-- `script-verification-delegated-to-core-c-no-rust-headroom.md` — non-taproot script verification *is*
-  Core's own C engine; no Rust headroom there.
-- `multi-peer-block-download-requires-core-stalling-disconnect.md` — IBD is download-bandwidth-bound;
-  shaving CPU off an apply path already 50–250x faster than download buys nothing.
+The two siblings are
+[`script-verification-delegated-to-core-c-no-rust-headroom.md`](script-verification-delegated-to-core-c-no-rust-headroom.md)
+(no Rust headroom inside Core's own engine) and
+[`multi-peer-block-download-requires-core-stalling-disconnect.md`](multi-peer-block-download-requires-core-stalling-disconnect.md)
+(IBD is download-bound, so apply-side CPU savings buy nothing).
 
 This one adds the intra-subsystem version: **a real hotspot inside the right crate can still be off the
 hot path, because dispatch routing — not the line of code — decides what the production caller executes.**
