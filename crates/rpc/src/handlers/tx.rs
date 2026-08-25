@@ -1173,7 +1173,7 @@ mod tests {
     #[test]
     fn scan_does_not_hold_the_block_log_lock_across_a_body_load() {
         struct LockProbeSource {
-            blocks: Arc<parking_lot::RwLock<Vec<BlockRecord>>>,
+            blocks: Arc<parking_lot::RwLock<crate::BlockLog>>,
             bodies: Vec<(u32, Vec<u8>)>,
         }
 

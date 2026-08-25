@@ -1524,7 +1524,7 @@ mod tests {
                 height,
                 block_hex: String::new(),
                 body_size: 100 + index * 7,
-                header_hex: String::new(),
+                header: None,
                 tx_count: 1 + index * 3,
                 time,
             });
