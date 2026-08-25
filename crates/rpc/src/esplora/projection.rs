@@ -190,6 +190,13 @@ impl<'a> Projection<'a> {
             .and_then(|height| self.confirmation_at_height(height)))
     }
 
+    /// Resolves a broadcast-cached transaction's confirmation, if it can.
+    ///
+    /// The cache is a broadcast staging area, not chain state: it proves the
+    /// node accepted the transaction, never that the chain did or did not
+    /// confirm it. Only the transaction index answers that, so with the index
+    /// disabled this reports "unconfirmed", which is also the only reason
+    /// `/tx/:id` works at all in that configuration.
     fn cached_confirmation(&self, txid: &Txid) -> Result<Option<Confirmation>, Response> {
         let Some(index) = self.ctx.esplora_tx_index.as_ref() else {
             return Ok(None);
