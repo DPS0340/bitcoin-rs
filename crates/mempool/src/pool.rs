@@ -85,8 +85,9 @@ pub struct Mempool {
     /// `clear` — and `debug_assert`s in `total_vsize` and `aggregate_fees` fail
     /// loudly in test and debug builds if that ever stops being true.
     total_vsize: u64,
-    /// Running sum of `fee` over `entries`. See `total_vsize`.
-    total_fee: u64,
+    /// Exact running sum of `fee` over `entries`. A `u32` entry id bounds the
+    /// successful-entry sum below `u128::MAX`.
+    total_fee: u128,
     sequence: core::sync::atomic::AtomicU64,
 }
 /// Aggregate mempool counters surfaced through the JSON-RPC `getmempoolinfo`
@@ -188,7 +189,7 @@ impl Mempool {
         let index = self.entries.insert(entry);
         let id = EntryId::try_from(index).map_err(|_| MempoolError::TooManyEntries)?;
         self.total_vsize = self.total_vsize.saturating_add(added_vsize);
-        self.total_fee = self.total_fee.saturating_add(added_fee);
+        self.total_fee += u128::from(added_fee);
         self.by_txid.insert(txid, id);
         self.index_entry(id);
         // The closure is taken after `index_entry`, because a transaction can
@@ -301,20 +302,19 @@ impl Mempool {
 
     /// Returns the sum of fees of all entries in the pool, in satoshis.
     ///
-    /// Used by `getmempoolinfo.total_fee` (BTC = sats / 1e8). Wraps a single
-    /// linear pass over `self.entries`. Saturating add prevents overflow on a
-    /// pathological pool (would require ~92 quadrillion sat aggregate, well
-    /// above the 21M BTC monetary cap, so saturation here is purely defensive).
+    /// Used by `getmempoolinfo.total_fee` (BTC = sats / 1e8). The exact internal
+    /// sum preserves saturating `u64` semantics after removals and fee decreases.
     #[must_use]
     pub fn aggregate_fees(&self) -> u64 {
+        let total_fee = u64::try_from(self.total_fee).unwrap_or(u64::MAX);
         debug_assert_eq!(
-            self.total_fee,
+            total_fee,
             self.entries
                 .iter()
                 .fold(0_u64, |acc, (_id, entry)| acc.saturating_add(entry.fee)),
             "running fee total drifted from the entries it summarizes"
         );
-        self.total_fee
+        total_fee
     }
 
     /// Returns aggregate counters for the current pool.
@@ -435,7 +435,11 @@ impl Mempool {
             entry.fee_rate = new_fee.saturating_mul(1_000) / denom;
             actual_delta
         };
-        self.total_fee = apply_delta_u64(self.total_fee, actual_delta);
+        if actual_delta >= 0 {
+            self.total_fee += actual_delta.unsigned_abs();
+        } else {
+            self.total_fee -= actual_delta.unsigned_abs();
+        }
 
         // The entry's own fee is the only thing that moved, so the package
         // totals of its relatives follow from the graph — the same refresh an
@@ -571,7 +575,7 @@ impl Mempool {
             }
             let entry = self.entries.remove(index);
             self.total_vsize = self.total_vsize.saturating_sub(u64::from(entry.vsize));
-            self.total_fee = self.total_fee.saturating_sub(entry.fee);
+            self.total_fee -= u128::from(entry.fee);
             removed_any = true;
             self.by_txid.remove(&entry.tx.compute_txid());
             self.pareto.remove(*id);
@@ -914,15 +918,6 @@ fn apply_fee_delta(fee: u64, delta: i64) -> u64 {
     }
 }
 
-fn apply_delta_u64(value: u64, delta: i128) -> u64 {
-    let magnitude = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
-    if delta >= 0 {
-        value.saturating_add(magnitude)
-    } else {
-        value.saturating_sub(magnitude)
-    }
-}
-
 const fn outpoint_range(outpoint: OutPoint) -> RangeInclusive<(OutPoint, EntryId)> {
     (outpoint, EntryId::MIN)..=(outpoint, EntryId::MAX)
 }
@@ -1044,6 +1039,36 @@ mod tests {
         assert_eq!(pool.aggregate_fees(), 1_500);
         Ok(())
     }
+
+    #[test]
+    fn aggregate_fees_stays_saturated_after_decrements() -> Result<(), MempoolError> {
+        let mut pool = Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        });
+        let prioritised = tx(2, Vec::new());
+        let prioritised_txid = prioritised.compute_txid();
+        let removed = tx(3, Vec::new());
+        let removed_txid = removed.compute_txid();
+
+        pool.insert_entry(MempoolEntry::new(
+            Arc::new(tx(1, Vec::new())),
+            100,
+            u64::MAX - 1,
+            1,
+            7,
+        ))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(prioritised), 100, 100, 2, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(removed), 100, 50, 3, 7))?;
+
+        assert_eq!(pool.aggregate_fees(), u64::MAX);
+        assert!(!pool.remove_by_txid(&removed_txid).is_empty());
+        assert_eq!(pool.aggregate_fees(), u64::MAX);
+        assert!(pool.prioritise(prioritised_txid, -100));
+        assert_eq!(pool.aggregate_fees(), u64::MAX - 1);
+        Ok(())
+    }
+
     #[test]
     fn contains_txid_returns_true_after_insert() {
         let mut pool = Mempool::new(MempoolLimits::default());
