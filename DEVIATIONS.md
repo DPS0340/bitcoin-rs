@@ -5,9 +5,10 @@ forced corrections, with sources.
 
 The Task 0 audit corrections in section 0 were verified against the crates.io
 registry via `cargo info <crate>` and `cargo info <crate>@<version>` on
-**2026-05-19** under Rust toolchain `1.85.0` (the MSRV declared by `PLAN.md`).
-Later sections carry their own dates and toolchains; the *Resolved
-version-floor deviations* table below postdates that audit.
+**2026-05-19** under Rust toolchain `1.85.0` (the MSRV `PLAN.md` declared at
+audit time). Later sections are not covered by that verification stamp; each
+carries only the evidence it explicitly states. The *Resolved version-floor
+deviations* table below postdates that audit.
 
 ## 0. Workspace bootstrap (Task 0) — dependency audit corrections
 

@@ -195,13 +195,12 @@ because it agrees with the paired result: `get_balance` and `listunspent` each
 fell about 50% at 1 and 8 heights. The 64-height groups are excluded per the
 noise floor above; on this run their identical arms disagreed by 1.7x.
 
-**Reference retention.** The unspent-output `_scan` functions stay in the crate as
-the equivalence oracle and the `before` arm. They deliberately keep the eager txid:
-an oracle that shares an optimization with the implementation it checks cannot
-catch a fault in that optimization. These two are not production fallback paths;
-the measured cases above show why the optimized resolvers are retained. For rows
-written before row values carried transaction positions, `resolve_script_history`
-uses a private helper, not a public `_scan` entry point; see the
+**Reference retention.** The public unspent-output `_scan` functions stay in the
+crate as the equivalence oracle and the `before` arm. They deliberately keep the
+eager txid: an oracle that shares an optimization with the implementation it
+checks cannot catch a fault in that optimization. These two public entry points
+are not the production fallback paths; the optimized resolvers use private
+whole-block fallbacks for legacy rows and failed position resolution. See the
 position-rewrite section below.
 
 ## Landed: transaction byte positions in row values
@@ -265,10 +264,12 @@ untested branch was the only one that matters in production.
 **Change.** `resolve_script_history`, `resolve_unspent_outputs{,_with_height}`
 and `resolve_transaction` now read each row's `TxPosition` list, fetch only
 those byte ranges through `BlockSource::block_bytes_at_height`, and decode only
-those transactions. The naive whole-block scan survives as `*_scan` — oracle and
-benchmark `before` arm throughout. `resolve_script_history` additionally falls
-back to a private whole-block scan helper for rows written before row values
-carried transaction positions.
+those transactions. The naive whole-block scan survives in the public `*_scan`
+functions as the oracle and benchmark `before` arm. All three resolver families
+also retain private production fallbacks for rows without usable positions:
+`resolve_script_history` calls `scan_height_history`,
+`resolve_unspent_outputs{,_with_height}` calls `scan_height_unspent_outputs`,
+and `resolve_transaction` scans the named block inline.
 
 **The all-or-scan rule is what makes this safe.** A resolver falls back to a full
 block scan the moment any single position fails to resolve; it never skips a

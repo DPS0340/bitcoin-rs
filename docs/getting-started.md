@@ -4,8 +4,9 @@ From a clone to a syncing node. Each step says what you should see, so you can
 tell it worked before moving on.
 
 Before you start: do not run this on mainnet as your only node. Reorganisation
-handling, transaction relay, and indexing have known limitations documented in
-[README.md](README.md#known-gaps).
+handling and transaction relay have known limitations documented in
+[README.md](README.md#known-gaps). The filter index is not backfilled across a
+gap.
 
 ## Prerequisites
 
