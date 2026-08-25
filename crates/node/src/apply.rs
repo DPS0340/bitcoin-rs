@@ -1442,9 +1442,15 @@ fn advance_chain_tx_count(handles: &ApplyHandles, height: u32, tx_count_delta: u
     if known == 0 && height != 0 {
         return;
     }
-    let _ = handles
-        .chain_tx_count
-        .fetch_add(tx_count_delta, Ordering::Relaxed);
+    let advanced = known.checked_add(tx_count_delta).unwrap_or_else(|| {
+        tracing::warn!(
+            known,
+            tx_count_delta,
+            "cumulative chain transaction count overflowed; marking it unknown"
+        );
+        0
+    });
+    handles.chain_tx_count.store(advanced, Ordering::Relaxed);
 }
 
 /// Takes a disconnected block's transactions back out of the cumulative count.
@@ -10403,6 +10409,18 @@ mod chain_tx_count_tests {
         // Only reachable if the count and the chain have diverged. A clamp to
         // some small number would keep reporting a confident wrong total.
         rewind_chain_tx_count(&handles, 9);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_advance_past_u64_marks_the_count_unknown_instead_of_wrapping() {
+        let handles = handles();
+        handles
+            .chain_tx_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        advance_chain_tx_count(&handles, 900_000, 3);
+
         assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
     }
 }
