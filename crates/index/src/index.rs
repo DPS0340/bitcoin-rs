@@ -155,7 +155,7 @@ impl ScriptHistoryEntry {
 pub enum IndexCapability {
     /// Core-compatible transaction lookup rows.
     TxLookup,
-    /// ScriptIndex scripthash funding and spending rows.
+    /// `ScriptIndex` scripthash funding and spending rows.
     ScriptHistory,
 }
 
@@ -164,7 +164,7 @@ pub enum IndexCapability {
 pub struct IndexCapabilities {
     /// Build transaction lookup rows.
     pub tx_lookup: bool,
-    /// Build ScriptIndex funding and spending rows.
+    /// Build `ScriptIndex` funding and spending rows.
     pub script_history: bool,
 }
 
@@ -179,7 +179,7 @@ impl IndexCapabilities {
         tx_lookup: true,
         script_history: false,
     };
-    /// ScriptIndex history only.
+    /// `ScriptIndex` history only.
     pub const SCRIPT_HISTORY: Self = Self {
         tx_lookup: false,
         script_history: true,
@@ -223,7 +223,7 @@ impl IndexCapabilities {
 pub struct IndexWatermarks {
     /// Transaction lookup cursor.
     pub tx_lookup: Option<IndexWatermark>,
-    /// ScriptIndex history cursor.
+    /// `ScriptIndex` history cursor.
     pub script_history: Option<IndexWatermark>,
 }
 
@@ -633,7 +633,7 @@ impl<S: KvStore> Indexer<S> {
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
     ///
     /// Returns `(txid, vout, value_sats, funding_height)` quadruples. Use this
-    /// when callers need the confirmation height (e.g. ScriptIndex `listunspent`
+    /// when callers need the confirmation height (e.g. `ScriptIndex` `listunspent`
     /// emits the height for each unspent output).
     pub fn resolve_unspent_outputs_with_height<B: BlockSource>(
         &self,
@@ -2416,7 +2416,7 @@ pub trait IndexerLike: Send + Sync {
     /// [`IndexError::UnsupportedRollback`] rather than succeeding: an
     /// implementation that silently reports a successful rollback while
     /// deleting nothing would let the node advance its tip believing the index
-    /// is consistent, and ScriptIndex queries would then serve transactions
+    /// is consistent, and `ScriptIndex` queries would then serve transactions
     /// that are no longer in the chain. Failing loudly is the only safe
     /// default. Concrete indexers that persist rows override this.
     fn rollback_block(
