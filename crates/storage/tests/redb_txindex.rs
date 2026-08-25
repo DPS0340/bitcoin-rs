@@ -23,10 +23,7 @@ fn header_80(counter: u32) -> [u8; 80] {
     h
 }
 
-fn row_count(
-    store: &bitcoin_rs_storage::RedbTxIndexStore,
-    cf: ColumnFamily,
-) -> Result<usize, StorageError> {
+fn row_count<S: KvStore>(store: &S, cf: ColumnFamily) -> Result<usize, StorageError> {
     store
         .scan_prefix_bounded(cf, &[], MAX_SCAN)
         .map(|scan| scan.rows.len())
@@ -43,7 +40,7 @@ fn assert_invalid<T>(result: Result<T, StorageError>) {
 #[test]
 fn txindex_all_five_family_roundtrips() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let confirmed = key_12(1);
     store.put(ColumnFamily::TxConfirmed, &confirmed, b"")?;
@@ -104,7 +101,7 @@ fn txindex_all_five_family_roundtrips() -> TestResult<()> {
 #[test]
 fn txindex_position_values_follow_authoritative_rows() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
     let confirmed = key_12(1);
     let funding = key_12(2);
 
@@ -174,7 +171,7 @@ fn txindex_position_values_follow_authoritative_rows() -> TestResult<()> {
 #[test]
 fn txindex_fixed_prefix_boundaries_12() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let zero = [0u8; 12];
     let mut zero_one = zero;
@@ -231,7 +228,7 @@ fn txindex_fixed_prefix_boundaries_12() -> TestResult<()> {
 #[test]
 fn txindex_fixed_prefix_boundaries_80() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let zero = [0u8; 80];
     let mut zero_one = zero;
@@ -284,7 +281,7 @@ fn txindex_fixed_prefix_boundaries_80() -> TestResult<()> {
 #[test]
 fn txindex_bounded_scan_empty_values() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let mut batch = store.new_batch();
     for i in 0..5u32 {
@@ -336,7 +333,7 @@ fn txindex_bounded_scan_empty_values() -> TestResult<()> {
 #[test]
 fn txindex_mixed_batch_ordering_and_interleaved_cf() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let k1 = key_12(1);
     let k2 = key_12(2);
@@ -382,7 +379,7 @@ fn txindex_mixed_batch_ordering_and_interleaved_cf() -> TestResult<()> {
 #[test]
 fn txindex_invalid_operation_aborts_transaction() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     // Invalid key length aborts a batch that already has a valid op.
     let mut batch = store.new_batch();
@@ -424,7 +421,7 @@ fn txindex_invalid_operation_aborts_transaction() -> TestResult<()> {
 #[test]
 fn txindex_unsupported_column_families_rejected() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     for cf in [
         ColumnFamily::TxMempool,
@@ -447,7 +444,7 @@ fn txindex_unsupported_column_families_rejected() -> TestResult<()> {
 #[test]
 fn txindex_snapshot_isolation() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let k1 = key_12(1);
     store.put(ColumnFamily::TxConfirmed, &k1, b"old")?;
@@ -487,7 +484,7 @@ fn txindex_durable_reopen() -> TestResult<()> {
     let meta_value = b"123:abcd";
 
     {
-        let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+        let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::TxConfirmed, &k, b"");
         batch.put(ColumnFamily::BlockHeaders, &h, b"");
@@ -495,7 +492,7 @@ fn txindex_durable_reopen() -> TestResult<()> {
         store.write(batch)?;
     }
 
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
     assert!(store.get(ColumnFamily::TxConfirmed, &k)?.is_some());
     assert!(store.get(ColumnFamily::BlockHeaders, &h)?.is_some());
     assert_eq!(
@@ -509,7 +506,7 @@ fn txindex_durable_reopen() -> TestResult<()> {
 #[test]
 fn txindex_deferred_write_flush_and_reopen() -> TestResult<()> {
     let temp = tempfile::TempDir::new()?;
-    let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
 
     let k = key_12(7);
     let mut batch = store.new_batch();
@@ -520,7 +517,7 @@ fn txindex_deferred_write_flush_and_reopen() -> TestResult<()> {
     store.flush()?;
     drop(store);
 
-    let reopened = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+    let reopened = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
     assert!(reopened.get(ColumnFamily::Funding, &k)?.is_some());
 
     Ok(())
@@ -543,7 +540,7 @@ fn txindex_isolated_from_legacy_redb_store() -> TestResult<()> {
 
     // Open the TxIndex store on the same database and add index rows.
     {
-        let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+        let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
         let k = key_12(9);
         let h = header_80(9);
         let mut batch = store.new_batch();
@@ -568,7 +565,7 @@ fn txindex_isolated_from_legacy_redb_store() -> TestResult<()> {
 
     // The TxIndex store still sees its own data after the legacy store reopens.
     {
-        let store = bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?;
+        let store = bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?;
         assert!(store.get(ColumnFamily::TxConfirmed, &key_12(9))?.is_some());
         assert!(
             store

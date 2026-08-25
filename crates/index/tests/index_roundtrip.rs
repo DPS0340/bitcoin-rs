@@ -993,7 +993,7 @@ fn rollback_rejects_prev_at_genesis() -> Result<(), Box<dyn std::error::Error>> 
 #[test]
 fn redb_snapshot_preserves_position_values() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::TempDir::new()?;
-    let store = Arc::new(bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?);
+    let store = Arc::new(bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?);
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
     let block: bitcoin::Block = bitcoin::consensus::deserialize(&body)?;

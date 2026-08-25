@@ -144,13 +144,13 @@ impl KvStore for RedbStore {
 }
 
 /// redb-backed transaction-index store using fixed-width physical tables.
-pub struct RedbTxIndexStore {
+struct RedbTxIndexStore {
     db: Database,
 }
 
 impl RedbTxIndexStore {
     /// Opens or creates a transaction-index store at `path`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+    fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let db_path = database_path(path.as_ref())?;
         let db = Database::create(db_path).map_err(StorageError::backend)?;
         let write_txn = db.begin_write().map_err(StorageError::backend)?;
@@ -310,6 +310,18 @@ impl KvStore for RedbTxIndexStore {
             read_txn: self.db.begin_read().map_err(StorageError::backend)?,
         }))
     }
+}
+
+/// Opens the fixed-width redb transaction-index store at `path` behind an
+/// opaque [`KvStore`].
+///
+/// The concrete store type is an implementation detail. The store serves
+/// [`ColumnFamily::TxConfirmed`], [`ColumnFamily::Funding`],
+/// [`ColumnFamily::Spending`], [`ColumnFamily::BlockHeaders`], and
+/// [`ColumnFamily::UtxoMeta`]; every other family returns
+/// [`StorageError::InvalidOperation`].
+pub fn open_redb_tx_index_store(path: &Path) -> Result<impl KvStore, StorageError> {
+    RedbTxIndexStore::open(path)
 }
 
 /// redb write-batch adapter.

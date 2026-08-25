@@ -13,17 +13,13 @@ pub mod error;
 pub mod trait_;
 
 #[cfg(feature = "fjall")]
-/// Fjall-backed [`KvStore`](trait_::KvStore) implementation.
-pub mod fjall_impl;
+mod fjall_impl;
 #[cfg(feature = "mdbx")]
-/// MDBX-backed [`KvStore`](trait_::KvStore) implementation.
-pub mod mdbx_impl;
+mod mdbx_impl;
 #[cfg(feature = "redb")]
-/// redb-backed [`KvStore`](trait_::KvStore) implementation.
-pub mod redb_impl;
+mod redb_impl;
 #[cfg(feature = "rocksdb")]
-/// RocksDB-backed [`KvStore`](trait_::KvStore) implementation.
-pub mod rocksdb_impl;
+mod rocksdb_impl;
 
 pub use block_file::{
     BLOCK_FILE_MAGIC, BLOCK_FILE_MAX_BYTES, BlockFilePosition, FlatFileBlockReader,
@@ -43,6 +39,6 @@ pub use fjall_impl::FjallStore;
 #[cfg(feature = "mdbx")]
 pub use mdbx_impl::MdbxStore;
 #[cfg(feature = "redb")]
-pub use redb_impl::{RedbStore, RedbTxIndexStore};
+pub use redb_impl::{RedbStore, open_redb_tx_index_store};
 #[cfg(feature = "rocksdb")]
 pub use rocksdb_impl::RocksDbStore;

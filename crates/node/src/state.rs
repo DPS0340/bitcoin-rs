@@ -821,7 +821,7 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         #[cfg(feature = "redb")]
         "redb" => {
             let store = Arc::new(
-                bitcoin_rs_storage::RedbTxIndexStore::open(&txindex_dir)
+                bitcoin_rs_storage::open_redb_tx_index_store(&txindex_dir)
                     .map_err(anyhow::Error::new)?,
             );
             Ok(Some(open_tx_index_store(
