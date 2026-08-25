@@ -15,7 +15,9 @@ use core::ops::Bound;
 use core::str::FromStr as _;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::hashes::{Hash as _, sha256d};
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{Block, OutPoint, Transaction, TxOut, Txid};
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::ScriptHash as MempoolScriptHash;
@@ -48,20 +50,32 @@ pub fn route(handler: &Handler, path: &str) -> Response {
         ["tx", id, "hex"] => tx_hex(&ctx, id),
         ["tx", id, "raw"] => tx_raw(&ctx, id),
         ["tx", id, "status"] => tx_status(&ctx, id),
+        ["tx", id, "merkleblock-proof"] => tx_merkleblock_proof(&ctx, id),
+        ["tx", id, "merkle-proof"] => tx_merkle_proof(&ctx, id),
+        ["tx", id, "outspend", vout] => tx_outspend(&ctx, id, vout),
+        ["tx", id, "outspends"] => tx_outspends(&ctx, id),
         ["tx", id] => tx(&ctx, id),
         ["block", hash, "header"] => block_header(&ctx, hash),
+        ["block", hash, "status"] => block_status(&ctx, hash),
+        ["block", hash, "raw"] => block_raw(&ctx, hash),
         ["block", hash, "txs"] => block_txs(&ctx, hash, 0),
         ["block", hash, "txs", start] => match start.parse::<usize>() {
             Ok(n) if n % CHAIN_PAGE == 0 => block_txs(&ctx, hash, n),
             _ => bad("transaction start index must be a multiple of 25"),
         },
         ["block", hash, "txids"] => block_txids(&ctx, hash),
+        ["block", hash, "txid", index] => block_txid(&ctx, hash, index),
         ["block", hash] => block(&ctx, hash),
         ["block-height", height] => height
             .parse::<u32>()
             .ok()
             .and_then(|h| ctx.block_hash_at_height(h))
             .map_or_else(not_found, |h| text(h.to_string_be())),
+        ["blocks"] => blocks(&ctx, None),
+        ["blocks", height] => height.parse::<u32>().map_or_else(
+            |_| bad("start height must be an unsigned integer"),
+            |h| blocks(&ctx, Some(h)),
+        ),
         ["mempool"] => mempool(&ctx),
         ["mempool", "txids"] => json_response(
             ctx.mempool
@@ -73,6 +87,7 @@ pub fn route(handler: &Handler, path: &str) -> Response {
         ),
         ["mempool", "recent"] => mempool_recent(&ctx),
         ["fee-estimates"] => fee_estimates(handler),
+        ["block-template"] => block_template(handler),
         ["scripthash", hash] => summary(&ctx, hash, None),
         ["address", address] => {
             address_hash(&ctx, address).map_or_else(|r| r, |h| summary_for(&ctx, h, Some(address)))
@@ -105,6 +120,7 @@ pub fn route(handler: &Handler, path: &str) -> Response {
         ["address", address, "txs", "chain", last] => {
             address_hash(&ctx, address).map_or_else(|r| r, |h| history(&ctx, h, Some(last), false))
         }
+        ["address-prefix", _] => unavailable("address prefix search requires an address index"),
         _ => not_found(),
     }
 }
@@ -112,21 +128,45 @@ pub fn route(handler: &Handler, path: &str) -> Response {
 /// Routes Esplora raw-transaction broadcast.
 #[must_use]
 pub fn route_post(handler: &Handler, path: &str, body: &[u8]) -> Option<Response> {
-    if path != "/tx" {
-        return None;
+    match path {
+        "/tx" => {
+            let Ok(hex) = core::str::from_utf8(body) else {
+                return Some(bad("transaction body must be UTF-8 hex"));
+            };
+            Some(
+                match handler.dispatch("sendrawtransaction", &sonic_json!([hex.trim()])) {
+                    Ok(value) => match value.as_str() {
+                        Some(id) => text(id.to_owned()),
+                        None => json_response(value),
+                    },
+                    Err(error) => dispatch_error(error),
+                },
+            )
+        }
+        "/txs/package" => Some(broadcast_package(handler, body)),
+        _ => None,
     }
-    let Ok(hex) = core::str::from_utf8(body) else {
-        return Some(bad("transaction body must be UTF-8 hex"));
+}
+
+fn broadcast_package(handler: &Handler, body: &[u8]) -> Response {
+    let Ok(raw_transactions) = serde_json::from_slice::<Vec<String>>(body) else {
+        return bad("package body must be a JSON array of transaction hex strings");
     };
-    Some(
-        match handler.dispatch("sendrawtransaction", &sonic_json!([hex.trim()])) {
-            Ok(value) => match value.as_str() {
-                Some(id) => text(id.to_owned()),
-                None => json_response(value),
-            },
-            Err(error) => dispatch_error(error),
-        },
-    )
+    if raw_transactions.is_empty() {
+        return bad("transaction package must not be empty");
+    }
+    let mut results = serde_json::Map::new();
+    for raw in raw_transactions {
+        let result = match handler.dispatch("sendrawtransaction", &sonic_json!([raw])) {
+            Ok(value) => value,
+            Err(error) => return dispatch_error(error),
+        };
+        let Some(txid) = result.as_str() else {
+            return internal("transaction broadcast did not return a txid");
+        };
+        results.insert(txid.to_owned(), json!({"txid":txid}));
+    }
+    json_response(json!({"package_msg":"success","tx-results":results}))
 }
 
 fn tx(ctx: &Context, id: &str) -> Response {
@@ -151,6 +191,179 @@ fn tx_raw(ctx: &Context, id: &str) -> Response {
 }
 fn tx_status(ctx: &Context, id: &str) -> Response {
     lookup(ctx, id).map_or_else(|r| r, |(_, status)| json_response(status_value(status)))
+}
+
+fn tx_merkleblock_proof(ctx: &Context, id: &str) -> Response {
+    confirmed_block(ctx, id).map_or_else(
+        |r| r,
+        |(_, block, txid)| {
+            let proof =
+                MerkleBlock::from_block_with_predicate(&block, |candidate| *candidate == txid);
+            text(serialize(&proof).to_lower_hex_string())
+        },
+    )
+}
+
+fn tx_merkle_proof(ctx: &Context, id: &str) -> Response {
+    confirmed_block(ctx, id).map_or_else(
+        |r| r,
+        |(record, block, txid)| {
+            let txids = block
+                .txdata
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>();
+            let Some(position) = txids.iter().position(|candidate| *candidate == txid) else {
+                return internal("confirmed transaction is absent from its block");
+            };
+            let proof = merkle_proof(txids, position);
+            json_response(json!({"block_height":record.height,"merkle":proof,"pos":position}))
+        },
+    )
+}
+
+fn confirmed_block(
+    ctx: &Context,
+    id: &str,
+) -> Result<(crate::context::BlockRecord, Block, Txid), Response> {
+    let txid = Txid::from_str(id).map_err(|_| bad("txid must be 64 hex characters"))?;
+    let (_, Some(status)) = lookup(ctx, id)? else {
+        return Err(not_found());
+    };
+    let record = ctx
+        .block_by_height(status.height)
+        .ok_or_else(|| unavailable("confirming block unavailable"))?;
+    let bytes = ctx
+        .block_body_bytes(&record)
+        .ok_or_else(|| unavailable("confirming block body unavailable"))?;
+    let block = deserialize(&bytes).map_err(|_| internal("stored block body is corrupt"))?;
+    Ok((record, block, txid))
+}
+
+fn merkle_proof(mut level: Vec<Txid>, mut position: usize) -> Vec<String> {
+    let mut proof = Vec::new();
+    while level.len() > 1 {
+        let sibling = if position.is_multiple_of(2) {
+            level.get(position + 1).unwrap_or(&level[position])
+        } else {
+            &level[position - 1]
+        };
+        proof.push(sibling.to_string());
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut bytes = [0_u8; 64];
+            bytes[..32].copy_from_slice(&pair[0].to_byte_array());
+            bytes[32..].copy_from_slice(&right.to_byte_array());
+            next.push(Txid::from_raw_hash(sha256d::Hash::hash(&bytes)));
+        }
+        level = next;
+        position /= 2;
+    }
+    proof
+}
+
+fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
+    let Ok(vout) = vout.parse::<u32>() else {
+        return bad("vout must be an unsigned integer");
+    };
+    lookup(ctx, id).map_or_else(
+        |r| r,
+        |(transaction, _)| {
+            let Some(output) = transaction
+                .output
+                .get(usize::try_from(vout).unwrap_or(usize::MAX))
+            else {
+                return not_found();
+            };
+            outspend(
+                ctx,
+                OutPoint::new(transaction.compute_txid(), vout),
+                &output.script_pubkey,
+            )
+            .map_or_else(|r| r, json_response)
+        },
+    )
+}
+
+fn tx_outspends(ctx: &Context, id: &str) -> Response {
+    lookup(ctx, id).map_or_else(
+        |r| r,
+        |(transaction, _)| {
+            transaction
+                .output
+                .iter()
+                .enumerate()
+                .map(|(vout, output)| {
+                    let vout =
+                        u32::try_from(vout).map_err(|_| internal("output index is too large"))?;
+                    outspend(
+                        ctx,
+                        OutPoint::new(transaction.compute_txid(), vout),
+                        &output.script_pubkey,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_or_else(|r| r, json_response)
+        },
+    )
+}
+
+fn outspend(
+    ctx: &Context,
+    outpoint: OutPoint,
+    script: &bitcoin::ScriptBuf,
+) -> Result<Value, Response> {
+    let pool = ctx.mempool.read();
+    if let Some((_, entry_id)) = pool
+        .spending
+        .range((
+            Bound::Included((outpoint, 0)),
+            Bound::Included((outpoint, u32::MAX)),
+        ))
+        .next()
+    {
+        if let Some(entry) = pool.entry(*entry_id) {
+            let vin = entry
+                .tx
+                .input
+                .iter()
+                .position(|input| input.previous_output == outpoint)
+                .ok_or_else(|| internal("mempool spending index is inconsistent"))?;
+            return Ok(
+                json!({"spent":true,"txid":entry.txid.to_string(),"vin":vin,"status":{"confirmed":false}}),
+            );
+        }
+    }
+    drop(pool);
+
+    let index = ctx
+        .script_index
+        .as_ref()
+        .ok_or_else(|| unavailable("script index is disabled"))?;
+    for history in index
+        .history_snapshot(ScriptHash::new(script))
+        .map_err(query_error)?
+        .history
+    {
+        let transaction = ctx
+            .esplora_tx_index
+            .as_ref()
+            .ok_or_else(|| unavailable("transaction lookup index is disabled"))?
+            .transaction(&history.txid)
+            .map_err(query_error)?
+            .ok_or_else(|| unavailable("indexed transaction unavailable"))?;
+        if let Some(vin) = transaction
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+        {
+            return Ok(
+                json!({"spent":true,"txid":history.txid.to_string(),"vin":vin,"status":status_value(status(ctx,history.height))}),
+            );
+        }
+    }
+    Ok(json!({"spent":false}))
 }
 
 fn lookup(ctx: &Context, id: &str) -> Result<(Transaction, Option<Status>), Response> {
@@ -180,19 +393,22 @@ fn block(ctx: &Context, text_hash: &str) -> Response {
     let Some(record) = ctx.block_by_hash(hash) else {
         return not_found();
     };
+    block_value(ctx, &record).map_or_else(|r| r, json_response)
+}
+fn block_value(ctx: &Context, record: &crate::context::BlockRecord) -> Result<Value, Response> {
     let Some(header) = record
         .header_bytes()
         .and_then(|b| deserialize::<bitcoin::block::Header>(b).ok())
     else {
-        return unavailable("block header unavailable");
+        return Err(unavailable("block header unavailable"));
     };
     let Some(bytes) = ctx.block_body_bytes(&record) else {
-        return unavailable("block body unavailable");
+        return Err(unavailable("block body unavailable"));
     };
     let Ok(decoded) = deserialize::<Block>(&bytes) else {
-        return internal("stored block body is corrupt");
+        return Err(internal("stored block body is corrupt"));
     };
-    json_response(
+    Ok(
         json!({"id":record.hash.to_string_be(),"height":record.height,"version":header.version.to_consensus(),"timestamp":header.time,"mediantime":ctx.median_time_past_for_hash(record.hash).unwrap_or(0),"bits":header.bits.to_consensus(),"nonce":header.nonce,"difficulty":ctx.difficulty_for_bits(header.bits),"merkle_root":header.merkle_root.to_string(),"tx_count":decoded.txdata.len(),"size":bytes.len(),"weight":decoded.weight().to_wu(),"previousblockhash":header.prev_blockhash.to_string()}),
     )
 }
@@ -203,6 +419,39 @@ fn block_header(ctx: &Context, h: &str) -> Response {
     ctx.block_by_hash(hash)
         .and_then(|r| r.header_bytes().map(|b| text(b.to_lower_hex_string())))
         .unwrap_or_else(not_found)
+}
+fn block_status(ctx: &Context, text_hash: &str) -> Response {
+    let Ok(hash) = Hash256::from_str(text_hash) else {
+        return bad("block hash must be 64 hex characters");
+    };
+    let Some(record) = ctx.block_by_hash(hash) else {
+        return not_found();
+    };
+    let in_best_chain = ctx.active_hash_at_height(record.height) == Some(hash);
+    let mut value = json!({"in_best_chain":in_best_chain});
+    if in_best_chain {
+        if let Some(next) = ctx.block_hash_at_height(record.height.saturating_add(1)) {
+            value["next_best"] = json!(next.to_string_be());
+        }
+    }
+    json_response(value)
+}
+fn block_raw(ctx: &Context, text_hash: &str) -> Response {
+    let Ok(hash) = Hash256::from_str(text_hash) else {
+        return bad("block hash must be 64 hex characters");
+    };
+    let Some(record) = ctx.block_by_hash(hash) else {
+        return not_found();
+    };
+    let Some(bytes) = ctx.block_body_bytes(&record) else {
+        return unavailable("block body unavailable");
+    };
+    Response {
+        status: 200,
+        reason: "OK",
+        content_type: "application/octet-stream",
+        body: bytes,
+    }
 }
 fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
     let Some((record, block)) = decode_block(ctx, h) else {
@@ -229,6 +478,33 @@ fn block_txids(ctx: &Context, h: &str) -> Response {
             .map(|tx| tx.compute_txid().to_string())
             .collect::<Vec<_>>(),
     )
+}
+fn block_txid(ctx: &Context, h: &str, index: &str) -> Response {
+    let Ok(index) = index.parse::<usize>() else {
+        return bad("transaction index must be an unsigned integer");
+    };
+    let Some((_, block)) = decode_block(ctx, h) else {
+        return not_found();
+    };
+    block
+        .txdata
+        .get(index)
+        .map_or_else(not_found, |tx| text(tx.compute_txid().to_string()))
+}
+fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
+    let start = start_height.unwrap_or_else(|| ctx.applied_height());
+    let mut values = Vec::with_capacity(10);
+    for height in (0..=start).rev().take(10) {
+        let Some(record) = ctx.block_by_height(height) else {
+            continue;
+        };
+        let value = match block_value(ctx, &record) {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+        values.push(value);
+    }
+    json_response(values)
 }
 fn decode_block(ctx: &Context, h: &str) -> Option<(crate::context::BlockRecord, Block)> {
     let hash = Hash256::from_str(h).ok()?;
@@ -265,6 +541,11 @@ fn fee_estimates(handler: &Handler) -> Response {
         values.insert(target.to_string(), json!(fee));
     }
     json_response(values)
+}
+fn block_template(handler: &Handler) -> Response {
+    handler
+        .dispatch("getblocktemplate", &sonic_json!([]))
+        .map_or_else(dispatch_error, json_response)
 }
 
 fn summary(ctx: &Context, text: &str, address: Option<&str>) -> Response {
