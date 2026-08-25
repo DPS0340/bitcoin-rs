@@ -1715,7 +1715,7 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 
     fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             Ok(self
                 .locate_transaction_for(snapshot, tip, budget, txid)?
                 .map(|(height, _)| height))
