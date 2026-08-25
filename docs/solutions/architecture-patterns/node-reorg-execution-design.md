@@ -58,7 +58,7 @@ Done:
 * Fork-aware download requests start at the common ancestor's child. A target
   change discards pending ownership from the losing branch.
 * A node-owned supervised TxIndex worker reconciles independent versioned
-  `TxLookup` and `ElectrumHistory` `(height, hash)` watermarks to exact
+  `TxLookup` and `ScriptHistory` `(height, hash)` watermarks to exact
   applied-tip ancestry. Equal cursors share one body scan and one atomic commit;
   divergent cursors move only the lagging capability. It can retain one bounded
   forward batch across strict descendant tip revisions. A rival, lower, or
@@ -71,7 +71,7 @@ replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
 disconnect notifications through `pubsequence`, but mempool `A`/`R` events remain
 intentionally open.
 Transaction reconsideration requires one production admission pipeline shared
-by Electrum, P2P relay, and reorg handling. Raw mempool insertion cannot supply
+by Esplora broadcast, P2P relay, and reorg handling. Raw mempool insertion cannot supply
 the required fee, policy, conflict, and ancestry metadata.
 
 ## Why it matters
@@ -104,7 +104,7 @@ Consequences:
    checkpoint refuses `InFlight`, and startup refuses either phase. The marker
    prevents service on inconsistent authoritative state. It does not repair it.
 3. **TxIndex recovery starts from atomic capability watermarks.** `TxLookup`
-   owns `TxConfirmed`; `ElectrumHistory` owns `Funding` and `Spending`; the
+   owns `TxConfirmed`; `ScriptHistory` owns `Funding` and `Spending`; the
    identity-bearing `BlockHeaders` rows are shared rollback metadata. The worker
    can retain one bounded forward batch while the applied tip moves through
    strict descendants. Equal cursors prepare both families in one block scan
@@ -171,7 +171,7 @@ Done:
 | Undo generation in apply | built in the same pass as `BorrowedBlockChanges`, sharing one set of filters so the two halves cannot drift |
 | Persistence | queued before the block body and UTXO commit; flushed with a clean checkpoint, not per block |
 | `disconnect_block` | restores the UTXO set, coinstats, and applied tip; then publishes a TxIndex wake |
-| TxIndex reconciliation | one node-owned worker rolls enabled capability watermarks back to the common ancestor, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Equal cursors share one body parse and atomic commit; divergent cursors move independently. `--electrum` implicitly enables internal `TxLookup` plus `ElectrumHistory`, while only explicit `--txindex` advertises Core txindex semantics. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Exact capability snapshot-plus-tip gating keeps queries unavailable until every consumed watermark matches. |
+| TxIndex reconciliation | one node-owned worker rolls enabled capability watermarks back to the common ancestor, then assembles count-and-byte-bounded forward batches across strict descendant tip revisions. Equal cursors share one body parse and atomic commit; divergent cursors move independently. `--scriptindex=current` enables the generic script UTXO view and `--scriptindex=history` exposes its history, while only explicit `--txindex` advertises Core txindex semantics. Each queued wake triggers reconciliation without moving the pending batch's fixed deadline. Exact capability snapshot-plus-tip gating keeps queries unavailable until every consumed watermark matches. |
 | `coin_stats` rewind | block-level fields only; the per-coin ones ride the `UtxoSet` change listener, which the undo already drives in reverse |
 | Filter header cache | repointed at the parent; the index itself needs no rollback because its rows are hash-addressed like block bodies |
 | `blocks` RPC cache | popped when the tail is ours; absence is legitimate after a restart or a prune |
@@ -187,7 +187,7 @@ Open:
 
 | Piece | Notes |
 |---|---|
-| Mempool reconsideration | Block transactions need the same production admission pipeline as Electrum and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
+| Mempool reconsideration | Block transactions need the same production admission pipeline as Esplora broadcast and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
 | Mempool sequence events | Mempool `A`/`R` notifications remain intentionally absent until event sequencing and removal reasons are redesigned |
 | Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
 | Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |

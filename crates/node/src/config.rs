@@ -19,6 +19,28 @@ const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
 
+/// Depth of the node-owned generic script index.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptIndexMode {
+    /// Maintain only the current UTXO view for each script.
+    Current,
+    /// Maintain funding and spending history; this is a superset of `current`.
+    History,
+}
+
+impl core::str::FromStr for ScriptIndexMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> core::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "current" => Ok(Self::Current),
+            "history" => Ok(Self::History),
+            _ => Err("scriptindex must be `current` or `history`".to_owned()),
+        }
+    }
+}
+
 /// A complete built-in node network selection.
 ///
 /// Unlike [`Network`], which selects consensus rules, this also selects P2P
@@ -137,10 +159,10 @@ pub struct Config {
     pub rest: bool,
     /// JSON-RPC authentication configuration.
     pub rpc_auth: Auth,
-    /// Optional Electrum TCP bind address.
-    pub electrum_bind: Option<SocketAddr>,
-    /// Optional Electrum TLS certificate path.
-    pub electrum_tls_cert: Option<PathBuf>,
+    /// Optional generic script index used by address and scripthash Esplora routes.
+    pub script_index: Option<ScriptIndexMode>,
+    /// Optional public Esplora HTTP listener. It has no JSON-RPC surface.
+    pub esplora_bind: Option<SocketAddr>,
     /// P2P listener bind addresses.
     pub p2p_listen: Vec<SocketAddr>,
     /// Whether DNS seeds are used for peer bootstrap.
@@ -221,8 +243,8 @@ impl fmt::Debug for Config {
             .field("rpc_bind", &self.rpc_bind)
             .field("rest", &self.rest)
             .field("rpc_auth", &self.rpc_auth)
-            .field("electrum_bind", &self.electrum_bind)
-            .field("electrum_tls_cert", &self.electrum_tls_cert)
+            .field("script_index", &self.script_index)
+            .field("esplora_bind", &self.esplora_bind)
             .field("p2p_listen", &self.p2p_listen)
             .field("dns_seeds_enabled", &self.dns_seeds_enabled)
             .field("connect", &self.connect)
@@ -285,8 +307,8 @@ impl Config {
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], network.default_rpc_port())),
             rest: false,
             rpc_auth: Auth::default(),
-            electrum_bind: None,
-            electrum_tls_cert: None,
+            script_index: None,
+            esplora_bind: None,
             p2p_listen: vec![SocketAddr::from(([0, 0, 0, 0], network.default_p2p_port()))],
             dns_seeds_enabled: true,
             connect: Vec::new(),
@@ -387,9 +409,6 @@ impl Config {
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
-        }
-        if self.electrum_tls_cert.is_some() && self.electrum_bind.is_none() {
-            bail!("electrum_tls_cert requires electrum_bind");
         }
         match (&self.g2_muhash_samples, self.g2_muhash_tip_height) {
             (Some(_), Some(0)) => bail!("g2_muhash_tip_height must be greater than zero"),
@@ -538,14 +557,17 @@ impl Config {
                 layer.rpc_password.clone().unwrap_or(old_password),
             );
         }
-        if let Some(electrum_bind) = layer.electrum_bind {
-            self.electrum_bind = Some(electrum_bind);
+        if let Some(script_index) = layer.script_index {
+            self.script_index = Some(script_index);
         }
-        if layer.clear_electrum_bind {
-            self.electrum_bind = None;
+        if layer.clear_script_index {
+            self.script_index = None;
         }
-        if let Some(electrum_tls_cert) = &layer.electrum_tls_cert {
-            self.electrum_tls_cert = Some(electrum_tls_cert.clone());
+        if let Some(esplora_bind) = layer.esplora_bind {
+            self.esplora_bind = Some(esplora_bind);
+        }
+        if layer.clear_esplora_bind {
+            self.esplora_bind = None;
         }
         if let Some(p2p_listen) = &layer.p2p_listen {
             self.p2p_listen.clone_from(p2p_listen);
@@ -689,12 +711,14 @@ pub(crate) struct ConfigLayer {
     pub(crate) rpc_password: Option<String>,
     #[arg(long = "rpc-cookie")]
     pub(crate) rpc_cookie: Option<PathBuf>,
-    #[arg(long = "electrum")]
-    pub(crate) electrum_bind: Option<SocketAddr>,
+    #[arg(long = "scriptindex")]
+    pub(crate) script_index: Option<ScriptIndexMode>,
     #[arg(skip)]
-    pub(crate) clear_electrum_bind: bool,
-    #[arg(long = "electrum-tls-cert")]
-    pub(crate) electrum_tls_cert: Option<PathBuf>,
+    pub(crate) clear_script_index: bool,
+    #[arg(long = "esplora-bind")]
+    pub(crate) esplora_bind: Option<SocketAddr>,
+    #[arg(skip)]
+    pub(crate) clear_esplora_bind: bool,
     #[arg(long = "p2p-listen", value_delimiter = ',')]
     pub(crate) p2p_listen: Option<Vec<SocketAddr>>,
     #[arg(long = "dns-seeds-enabled")]
@@ -784,13 +808,16 @@ impl ConfigLayer {
                 "BITCOIN_RS_RPC_USER" => layer.rpc_user = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_PASSWORD" => layer.rpc_password = Some(value.to_owned()),
                 "BITCOIN_RS_RPC_COOKIE" => layer.rpc_cookie = Some(PathBuf::from(value)),
-                "BITCOIN_RS_ELECTRUM_BIND" if value.trim().is_empty() => {
-                    layer.clear_electrum_bind = true;
+                "BITCOIN_RS_SCRIPTINDEX" if value.trim().is_empty() => {
+                    layer.clear_script_index = true;
                 }
-                "BITCOIN_RS_ELECTRUM_BIND" => layer.electrum_bind = Some(value.parse()?),
-                "BITCOIN_RS_ELECTRUM_TLS_CERT" => {
-                    layer.electrum_tls_cert = Some(PathBuf::from(value));
+                "BITCOIN_RS_SCRIPTINDEX" => {
+                    layer.script_index = Some(value.parse().map_err(anyhow::Error::msg)?);
                 }
+                "BITCOIN_RS_ESPLORA_BIND" if value.trim().is_empty() => {
+                    layer.clear_esplora_bind = true;
+                }
+                "BITCOIN_RS_ESPLORA_BIND" => layer.esplora_bind = Some(value.parse()?),
                 "BITCOIN_RS_P2P_LISTEN" => layer.p2p_listen = Some(parse_socket_list(value)?),
                 "BITCOIN_RS_DNS_SEEDS_ENABLED" => {
                     layer.dns_seeds_enabled = Some(parse_bool(value)?);

@@ -3,7 +3,7 @@
 //! V1 keeps this deliberately minimal: it owns the resolved [`Config`], the
 //! data-directory path, the open chainstate storage backend, and the replay log
 //! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
-//! / index / p2p / rpc / electrum) parks here as the integration point matures.
+//! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
@@ -502,7 +502,7 @@ impl BlockBodySource for StoredBlockBodySource {
         // `None` is overloaded here: it means both "this store cannot slice"
         // and "the read failed". Callers must treat either as a reason to fall
         // back to the whole body, so the return type stays — but this is the
-        // hot path for every Electrum history call now, and an I/O error that
+        // hot path for every ScriptIndex history call now, and an I/O error that
         // silently degrades into a full block scan is exactly the failure that
         // would otherwise show up only as unexplained latency.
         match self.store.load_block_body_range(height, hash, offset, len) {
@@ -738,14 +738,7 @@ fn open_writer<S>(
 where
     S: bitcoin_rs_storage::KvStore,
 {
-    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
-        Ok(writer) => Ok(writer),
-        Err(bitcoin_rs_index::IndexError::LegacyCursorlessIndex) => {
-            bitcoin_rs_index::IndexWriter::reset_legacy(store.as_ref())?;
-            bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
-        }
-        Err(error) => Err(error),
-    }
+    bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
 }
 
 fn open_tx_index_store<S>(
@@ -769,8 +762,8 @@ where
 
 fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
-        tx_lookup: config.txindex || config.electrum_bind.is_some(),
-        electrum_history: config.electrum_bind.is_some(),
+        tx_lookup: config.txindex,
+        script_history: config.script_index.is_some(),
     }
 }
 
@@ -1344,15 +1337,12 @@ impl NodeState {
         })
     }
 
-    /// Returns the node-owned complete transaction-index adapter for Electrum.
+    /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
-    pub(crate) fn tx_index_electrum_adapter(
-        &self,
-    ) -> Option<Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader>> {
-        self.config.electrum_bind?;
+    pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
+        self.config.script_index?;
         self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_electrum::methods::ConfirmedHistoryReader> =
-                query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery> = query.clone();
             adapter
         })
     }
@@ -1697,20 +1687,19 @@ mod tests {
     }
 
     #[test]
-    fn electrum_only_builds_internal_lookup_without_advertising_core_txindex() -> anyhow::Result<()>
-    {
+    fn script_index_builds_without_advertising_core_txindex() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
-        config.electrum_bind = Some("127.0.0.1:50001".parse()?);
+        config.script_index = Some(crate::ScriptIndexMode::History);
 
         let state = NodeState::open(config)?;
 
         assert!(state.apply_handles().tx_index_runtime.is_some());
         assert!(state.tx_index_query().is_none());
-        assert!(state.tx_index_electrum_adapter().is_some());
+        assert!(state.script_index_query().is_some());
         assert!(state.data_dir().join("txindex").exists());
         Ok(())
     }
@@ -1751,42 +1740,6 @@ mod tests {
                 .to_string()
                 .contains("transaction lookup indexing is not compatible with -prune"),
             "unexpected error: {error:#}"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn open_rebuilds_legacy_cursorless_txindex() -> anyhow::Result<()> {
-        use bitcoin_rs_storage::{ColumnFamily, KvStore as _};
-
-        let dir = tempfile::tempdir()?;
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = dir.path().join("node");
-        config.p2p_listen.clear();
-        config.storage_backend = "fjall".to_owned();
-        config.txindex = true;
-
-        let txindex_dir = config.data_dir.join("txindex");
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        store.put(ColumnFamily::TxConfirmed, b"legacy-row", &[])?;
-        drop(store);
-
-        let state = NodeState::open(config)?;
-        assert!(state.tx_index_query().is_some());
-        drop(state);
-
-        let store = bitcoin_rs_storage::FjallStore::open(&txindex_dir)?;
-        assert!(
-            store
-                .iter_prefix(ColumnFamily::TxConfirmed, &[])?
-                .next()
-                .is_none(),
-            "legacy rows must be removed before rebuilding"
-        );
-        assert_eq!(
-            store.get(ColumnFamily::UtxoMeta, &[0x00, b'V'])?,
-            Some(vec![2, 0, 0, 0])
         );
         Ok(())
     }

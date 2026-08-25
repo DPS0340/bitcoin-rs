@@ -67,6 +67,8 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         Arc::clone(&banned),
         Arc::clone(&added_nodes),
         Some(tx_index),
+        None,
+        false,
     )
     .with_zmq_notifications(state.active_zmq_notifications());
 

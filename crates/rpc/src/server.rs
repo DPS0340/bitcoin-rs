@@ -118,7 +118,7 @@ impl RpcServer {
         let idle_timeout = self.idle_timeout;
         thread::spawn(move || {
             if let Err(error) =
-                serve_connection(stream, &auth, &handler, rest_enabled, idle_timeout)
+                serve_connection(stream, &auth, &handler, rest_enabled, idle_timeout, false)
             {
                 debug!(%error, "rpc connection closed with error");
             }
@@ -135,6 +135,7 @@ fn serve_connection(
     handler: &Handler,
     rest_enabled: bool,
     idle_timeout: Duration,
+    public_esplora_only: bool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
@@ -154,12 +155,35 @@ fn serve_connection(
         let keep_alive = request.keep_alive;
 
         if request.method == "GET" {
-            let response = if request.path.starts_with("/rest/") {
-                let (path, query) = split_path_query(&request.path);
+            let (path, query) = split_path_query(&request.path);
+            let response = if path.starts_with("/rest/") {
                 crate::rest::route(handler.context(), path, query, rest_enabled)
+            } else if public_esplora_only {
+                crate::esplora::route(handler, path)
             } else {
                 crate::rest::not_found_response()
             };
+            write_response(reader.get_mut(), &response, keep_alive)?;
+            if !keep_alive {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if public_esplora_only {
+            if let Some(response) =
+                crate::esplora::route_post(handler, &request.path, &request.body)
+            {
+                write_response(reader.get_mut(), &response, keep_alive)?;
+                if !keep_alive {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
+
+        if public_esplora_only {
+            let response = crate::rest::not_found_response();
             write_response(reader.get_mut(), &response, keep_alive)?;
             if !keep_alive {
                 return Ok(());
@@ -193,6 +217,88 @@ fn serve_connection(
         if !keep_alive {
             return Ok(());
         }
+    }
+}
+
+/// Unauthenticated, Esplora-only HTTP listener.
+///
+/// This deliberately has no JSON-RPC fallback, so an operator can expose it
+/// separately while keeping `rpc_bind` private and authenticated.
+pub struct EsploraServer {
+    listener: TcpListener,
+    handler: Arc<Handler>,
+    max_connections: usize,
+    idle_timeout: Duration,
+}
+
+impl EsploraServer {
+    /// Binds a public Esplora listener.
+    pub fn bind<A: ToSocketAddrs>(
+        address: A,
+        handler: Arc<Handler>,
+        max_connections: usize,
+        idle_timeout: Duration,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind(address)?,
+            handler,
+            max_connections,
+            idle_timeout,
+        })
+    }
+
+    /// Returns the actual listener address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Serves Esplora until `shutdown` is set.
+    pub fn serve_with_shutdown(
+        self,
+        shutdown: alloc::sync::Arc<core::sync::atomic::AtomicBool>,
+    ) -> io::Result<()> {
+        use core::sync::atomic::Ordering;
+
+        self.listener.set_nonblocking(true)?;
+        let active = Arc::new(Mutex::new(0_usize));
+        while !shutdown.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    let accepted = {
+                        let mut count = active.lock();
+                        if *count >= self.max_connections {
+                            false
+                        } else {
+                            *count += 1;
+                            true
+                        }
+                    };
+                    if !accepted {
+                        write_status(&mut stream, 503, "Service Unavailable", b"busy", false)?;
+                        continue;
+                    }
+                    let active = Arc::clone(&active);
+                    let handler = Arc::clone(&self.handler);
+                    let timeout = self.idle_timeout;
+                    thread::spawn(move || {
+                        let auth = Auth::basic("esplora", "disabled");
+                        if let Err(error) =
+                            serve_connection(stream, &auth, &handler, false, timeout, true)
+                        {
+                            debug!(%error, "esplora connection closed with error");
+                        }
+                        let mut count = active.lock();
+                        *count = count.saturating_sub(1);
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(POLL_INTERVAL)
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 

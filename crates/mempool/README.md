@@ -12,7 +12,7 @@ violations as `PolicyError` or `MempoolError`; `enforce_size_limit` delegates to
 `evict_lowest_fee_packages` over the `ParetoFront` ancestor-aware priority ordering;
 `prioritise` adjusts an entry's effective fee, and `remove_entry_and_descendants` /
 `evict_below_fee_rate` handle removal. `MempoolStats` supplies the aggregate counters
-behind `getmempoolinfo` and the Electrum fee histogram. The `rbf` module plans
+behind `getmempoolinfo` and Esplora fee estimates. The `rbf` module plans
 replacements as a `ReplacementCandidate` and `ReplacementPlan`, `standardness` holds
 the relay policy, and `orphan` parks transactions whose parents are still missing.
 `FeeEstimator` is fed by `tx_entered`, `tx_left`, and `block_connected`, and its

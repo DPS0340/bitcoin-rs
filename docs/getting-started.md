@@ -77,18 +77,27 @@ Defaults worth knowing:
 | `--dbcache-mb` | 450 |
 | `--prune-target-mb` | 0, meaning no pruning |
 | `--txindex` | off |
-| `--electrum` | off |
+| `--scriptindex` | off (`current` or `history`) |
+| `--esplora-bind` | off |
 | `--blockfilterindex` | off |
 
 The node logs its startup and the address the RPC listener bound to. If you see
 that line, it is running.
 
 `--txindex` advertises Bitcoin Core-compatible transaction lookup support.
-`--electrum <address>` starts the Electrum service and automatically builds
-the internal transaction lookup plus scripthash history indexes; it does not
-require `--txindex` or advertise Core txindex support unless that flag is also
-set. Either index mode is incompatible with pruning because backfill and reorg
-repair require durable block bodies.
+`--scriptindex=current` enables current address/scripthash UTXO queries, while
+`--scriptindex=history` additionally exposes confirmed funding/spending history.
+`--txindex` remains independent and is required for confirmed transaction
+lookups such as `/tx/<txid>` when the transaction is not in the mempool.
+`--esplora-bind <address>` starts an unauthenticated Esplora-only HTTP listener;
+it never exposes JSON-RPC. Its routes use the standard listener root (for
+example `/blocks/tip/height`, `/tx/<txid>`, `/address/<address>/utxo`, and
+`POST /tx`). These index modes are incompatible with pruning
+because backfill and reorg repair require durable block bodies.
+
+The ScriptIndex format is not migrated from the removed Electrum index. Remove
+the old derived index data and let the node rebuild it before enabling either
+ScriptIndex mode.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style

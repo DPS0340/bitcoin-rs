@@ -23,13 +23,13 @@ struct ScanResponse {
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
-    electrum_watermark: ElectrumWatermark,
+    script_history_watermark: ScriptHistoryWatermark,
     scans: Vec<ScanResponse>,
     aba: Option<Arc<AbaMutation>>,
 }
 
 #[derive(Clone, Copy)]
-enum ElectrumWatermark {
+enum ScriptHistoryWatermark {
     MatchTx,
     Override(Option<IndexWatermark>),
 }
@@ -92,9 +92,9 @@ impl TxIndexSnapshot for QuerySnapshot {
     ) -> Result<Option<IndexWatermark>, IndexError> {
         Ok(match capability {
             IndexCapability::TxLookup => Some(self.watermark),
-            IndexCapability::ElectrumHistory => match self.electrum_watermark {
-                ElectrumWatermark::MatchTx => Some(self.watermark),
-                ElectrumWatermark::Override(watermark) => watermark,
+            IndexCapability::ScriptHistory => match self.script_history_watermark {
+                ScriptHistoryWatermark::MatchTx => Some(self.watermark),
+                ScriptHistoryWatermark::Override(watermark) => watermark,
             },
         })
     }
@@ -206,12 +206,12 @@ impl BlockBodySource for CountingBodySource {
 
 impl QueryFixture {
     fn new(config: FixtureConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_electrum_watermark(config, ElectrumWatermark::MatchTx)
+        Self::new_with_script_history_watermark(config, ScriptHistoryWatermark::MatchTx)
     }
 
-    fn new_with_electrum_watermark(
+    fn new_with_script_history_watermark(
         config: FixtureConfig,
-        electrum_watermark: ElectrumWatermark,
+        script_history_watermark: ScriptHistoryWatermark,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip_id = tree.insert_header(config.block.header, NodeStatus::HeaderValid)?;
@@ -250,7 +250,7 @@ impl QueryFixture {
         let reader = Arc::new(QueryReader {
             snapshot: QuerySnapshot {
                 watermark,
-                electrum_watermark,
+                script_history_watermark,
                 scans: config.scans,
                 aba,
             },
@@ -270,11 +270,11 @@ impl QueryFixture {
 }
 
 #[test]
-fn tx_queries_can_be_ready_while_electrum_history_is_backfilling()
+fn tx_queries_can_be_ready_while_script_history_is_backfilling()
 -> Result<(), Box<dyn std::error::Error>> {
     let block = genesis_block(Network::Regtest);
     let txid = block.txdata[0].compute_txid();
-    let fixture = QueryFixture::new_with_electrum_watermark(
+    let fixture = QueryFixture::new_with_script_history_watermark(
         FixtureConfig {
             block,
             retain_body: true,
@@ -282,15 +282,15 @@ fn tx_queries_can_be_ready_while_electrum_history_is_backfilling()
             aba_trigger: None,
             watermark: None,
         },
-        ElectrumWatermark::Override(None),
+        ScriptHistoryWatermark::Override(None),
     )?;
 
     assert!(TxIndexQuery::transaction(&fixture.engine, &txid)?.is_none());
     assert!(matches!(
         fixture
             .engine
-            .confirmed_history_snapshot(ScriptHash::from_script_bytes(&[])),
-        Err(ElectrumError::Unavailable(_))
+            .history_snapshot(ScriptHash::from_script_bytes(&[])),
+        Err(TxQueryError::Unavailable(_))
     ));
     Ok(())
 }
@@ -568,7 +568,7 @@ fn funding_history_uses_positioned_range_without_full_body_load()
         bytes: bitcoin::consensus::serialize(&block),
     }));
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
     assert_eq!(snapshot.unspent, snapshot.history);
@@ -616,7 +616,7 @@ fn wrong_positioned_funding_falls_back_to_complete_block() -> Result<(), Box<dyn
         bytes: bitcoin::consensus::serialize(&block),
     }));
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
     assert_eq!(snapshot.unspent, snapshot.history);
@@ -794,7 +794,7 @@ fn unspent_outputs_reject_aggregate_scan_budget_exhaustion()
 
     assert!(matches!(
         fixture.engine.unspent_outputs(scripthash),
-        Err(ElectrumError::Unavailable(_))
+        Err(TxQueryError::Unavailable(_))
     ));
     Ok(())
 }
@@ -821,11 +821,11 @@ fn confirmed_history_snapshot_matches_history_and_unspent_for_funding()
         watermark: None,
     })?;
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.unspent.len(), 1);
 
-    let expected = bitcoin_rs_electrum::methods::HistoryRecord {
+    let expected = ScriptIndexRecord {
         txid,
         height: 0,
         value,
@@ -893,18 +893,18 @@ fn confirmed_history_snapshot_omits_spent_output_from_unspent()
         watermark: None,
     })?;
 
-    let snapshot = fixture.engine.confirmed_history_snapshot(scripthash)?;
+    let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert!(snapshot.unspent.is_empty());
     assert_eq!(snapshot.history.len(), 2);
 
-    let funding_record = bitcoin_rs_electrum::methods::HistoryRecord {
+    let funding_record = ScriptIndexRecord {
         txid,
         height: 0,
         value,
         vout: 0,
         spent: false,
     };
-    let spending_record = bitcoin_rs_electrum::methods::HistoryRecord {
+    let spending_record = ScriptIndexRecord {
         txid: spend_txid,
         height: 0,
         value: 0,
@@ -961,8 +961,8 @@ fn confirmed_history_snapshot_retries_after_aba_on_spending_scan()
     })?;
 
     assert!(matches!(
-        fixture.engine.confirmed_history_snapshot(scripthash),
-        Err(ElectrumError::Unavailable(_))
+        fixture.engine.history_snapshot(scripthash),
+        Err(TxQueryError::Unavailable(_))
     ));
     Ok(())
 }

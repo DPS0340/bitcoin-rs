@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::entry::fee_rate;
 use crate::{EntryId, MempoolEntry, MempoolLimits, ParetoFront, PolicyError};
 
-/// Electrum-compatible script hash key for funding index range scans.
+/// Script-index key for funding index range scans.
 #[derive(
     Clone,
     Copy,
@@ -91,7 +91,7 @@ pub struct Mempool {
     sequence: core::sync::atomic::AtomicU64,
 }
 /// Aggregate mempool counters surfaced through the JSON-RPC `getmempoolinfo`
-/// and Electrum `mempool.get_fee_histogram` surfaces.
+/// and Esplora fee-estimate surfaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MempoolStats {
     /// Number of transactions in the mempool.
@@ -224,7 +224,7 @@ impl Mempool {
     /// transaction is not in the pool.
     ///
     /// Composite of `self.by_txid.get(txid)` and `self.entry(*id)`. Saves the
-    /// 2-step lookup pattern at electrum/rpc handler callsites.
+    /// 2-step lookup pattern at HTTP/RPC handler callsites.
     #[must_use]
     pub fn entry_by_txid(&self, txid: &bitcoin::Txid) -> Option<&MempoolEntry> {
         let id = *self.by_txid.get(txid)?;

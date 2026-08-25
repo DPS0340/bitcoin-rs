@@ -1,7 +1,7 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
 //! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
-//! Electrum enables an index capability. The runtime holds a process-local revision counter and a bounded
+//! ScriptIndex enables an index capability. The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The single writer may atomically
 //! publish a complete formerly authoritative prefix while the applied chain
@@ -9,7 +9,7 @@
 //! the next worker pass repairs it. Independent durable capability watermarks
 //! let aligned row families share one parse and commit while divergent families
 //! backfill separately. A snapshot-gated query engine serves
-//! `bitcoin_rs_rpc::TxIndexQuery` and the Electrum `ConfirmedHistoryReader`
+//! `bitcoin_rs_rpc::TxIndexQuery` and the generic `ScriptIndexQuery`
 //! without raw index mutex paths.
 
 use std::sync::Arc;
@@ -17,15 +17,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::DisplayHex as _;
 use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
-use bitcoin_rs_electrum::methods::{
-    ConfirmedHistoryReader, ConfirmedHistorySnapshot, ElectrumError, HistoryRecord,
-    TxIndexInfo as ElectrumTxIndexInfo,
-};
 use bitcoin_rs_index::{
     HashPrefixRow, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
     IndexWatermarks, IndexWriter, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHash,
@@ -33,8 +28,11 @@ use bitcoin_rs_index::{
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::{BlockBodySource, TxIndexInfo, TxIndexQuery, TxQueryError};
-use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
+use bitcoin_rs_rpc::{
+    BlockBodySource, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, TxIndexInfo,
+    TxIndexQuery, TxQueryError,
+};
+use bitcoin_rs_storage::PrefixScanLimit;
 use compact_str::CompactString;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
@@ -233,7 +231,7 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let watermark = self.watermark()?;
         Ok(IndexWatermarks {
             tx_lookup: watermark,
-            electrum_history: watermark,
+            script_history: watermark,
         })
     }
     fn prepare_block(
@@ -372,10 +370,10 @@ fn selected_watermark(
     watermarks: IndexWatermarks,
     capabilities: IndexCapabilities,
 ) -> SelectedWatermark {
-    match (capabilities.tx_lookup, capabilities.electrum_history) {
+    match (capabilities.tx_lookup, capabilities.script_history) {
         (true, false) => SelectedWatermark::Valid(watermarks.tx_lookup),
-        (false, true) => SelectedWatermark::Valid(watermarks.electrum_history),
-        (true, true) if watermarks.tx_lookup == watermarks.electrum_history => {
+        (false, true) => SelectedWatermark::Valid(watermarks.script_history),
+        (true, true) if watermarks.tx_lookup == watermarks.script_history => {
             SelectedWatermark::Valid(watermarks.tx_lookup)
         }
         (true, true) | (false, false) => SelectedWatermark::Invalid,
@@ -540,7 +538,7 @@ impl Worker {
                     tracing::warn!(
                         error = %error,
                         tx_lookup = capabilities.tx_lookup,
-                        electrum_history = capabilities.electrum_history,
+                        script_history = capabilities.script_history,
                         "index cursor cannot be rolled back; rebuilding selected capabilities"
                     );
                     self.writer
@@ -553,8 +551,8 @@ impl Worker {
             if capabilities.tx_lookup {
                 watermarks.tx_lookup = previous;
             }
-            if capabilities.electrum_history {
-                watermarks.electrum_history = previous;
+            if capabilities.script_history {
+                watermarks.script_history = previous;
             }
         }
 
@@ -639,15 +637,15 @@ impl Worker {
             .tx_lookup
             .then_some(watermarks.tx_lookup)
             .flatten();
-        let electrum = self
+        let script_index = self
             .enabled
-            .electrum_history
-            .then_some(watermarks.electrum_history)
+            .script_history
+            .then_some(watermarks.script_history)
             .flatten();
         let needs_rollback = |watermark: IndexWatermark| {
             target.is_none_or(|target| !self.watermark_is_on_target_chain(watermark, target))
         };
-        let selected = [tx, electrum]
+        let selected = [tx, script_index]
             .into_iter()
             .flatten()
             .filter(|watermark| needs_rollback(*watermark))
@@ -655,7 +653,7 @@ impl Worker {
         Some((
             IndexCapabilities {
                 tx_lookup: tx == Some(selected) && needs_rollback(selected),
-                electrum_history: electrum == Some(selected) && needs_rollback(selected),
+                script_history: script_index == Some(selected) && needs_rollback(selected),
             },
             selected,
         ))
@@ -667,17 +665,17 @@ impl Worker {
         target: &TipSnapshot,
     ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
         let tx = self.enabled.tx_lookup.then_some(watermarks.tx_lookup);
-        let electrum = self
+        let script_index = self
             .enabled
-            .electrum_history
-            .then_some(watermarks.electrum_history);
+            .script_history
+            .then_some(watermarks.script_history);
         let needs_forward = |watermark: Option<IndexWatermark>| {
             watermark.is_none_or(|watermark| watermark.height < target.height)
         };
         let start_height = |watermark: Option<IndexWatermark>| {
             watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
         };
-        let selected_start = [tx, electrum]
+        let selected_start = [tx, script_index]
             .into_iter()
             .flatten()
             .filter(|watermark| needs_forward(*watermark))
@@ -687,7 +685,7 @@ impl Worker {
             None
         } else {
             let height = selected_start - 1;
-            [tx, electrum]
+            [tx, script_index]
                 .into_iter()
                 .flatten()
                 .flatten()
@@ -698,7 +696,7 @@ impl Worker {
                 tx_lookup: tx.is_some_and(|watermark| {
                     needs_forward(watermark) && start_height(watermark) == selected_start
                 }),
-                electrum_history: electrum.is_some_and(|watermark| {
+                script_history: script_index.is_some_and(|watermark| {
                     needs_forward(watermark) && start_height(watermark) == selected_start
                 }),
             },
@@ -1079,9 +1077,9 @@ impl QueryBudget {
 
 /// Node-owned, snapshot-gated transaction-index query engine.
 ///
-/// Implements `bitcoin_rs_rpc::TxIndexQuery` and `bitcoin_rs_electrum`'s
-/// `ConfirmedHistoryReader` as the only public read paths for the transaction
-/// index. Every query runs against one typed point-in-time snapshot, captures
+/// Implements `bitcoin_rs_rpc::TxIndexQuery` and `ScriptIndexQuery` as the
+/// only public read paths for the transaction index. Every query runs against
+/// one typed point-in-time snapshot, captures
 /// health/shutdown/revision/tip before and after work, and returns typed
 /// `Retry`/`Unavailable` when the answer cannot be proven.
 #[derive(Clone)]
@@ -1160,7 +1158,7 @@ impl TxIndexQueryEngine {
 
         // Ensure the index watermark is exactly at the applied tip we are
         // answering for, otherwise the snapshot is stale.
-        for capability in [IndexCapability::TxLookup, IndexCapability::ElectrumHistory] {
+        for capability in [IndexCapability::TxLookup, IndexCapability::ScriptHistory] {
             if !required.contains(capability) {
                 continue;
             }
@@ -1490,21 +1488,21 @@ impl TxIndexQueryEngine {
         Ok(outputs)
     }
 
-    fn confirmed_history_snapshot_for(
+    fn history_snapshot_for(
         &self,
         snapshot: &dyn TxIndexSnapshot,
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         scripthash: ScriptHash,
-    ) -> Result<ConfirmedHistorySnapshot, TxQueryError> {
+    ) -> Result<ScriptIndexSnapshot, TxQueryError> {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
 
         let mut history = Vec::new();
         let mut unspent = Vec::new();
         for &(txid, vout, value, height) in &funding_outputs {
-            history.push(HistoryRecord {
+            history.push(ScriptIndexRecord {
                 txid,
-                height: i64::from(height),
+                height,
                 value,
                 vout,
                 spent: false,
@@ -1537,9 +1535,9 @@ impl TxIndexQueryEngine {
                         .any(|input| input.previous_output == outpoint)
                     {
                         spent = true;
-                        history.push(HistoryRecord {
+                        history.push(ScriptIndexRecord {
                             txid: tx.compute_txid(),
-                            height: i64::from(spend_height),
+                            height: spend_height,
                             value: 0,
                             vout: 0,
                             spent: true,
@@ -1550,9 +1548,9 @@ impl TxIndexQueryEngine {
             }
 
             if !spent {
-                unspent.push(HistoryRecord {
+                unspent.push(ScriptIndexRecord {
                     txid,
-                    height: i64::from(height),
+                    height,
                     value,
                     vout,
                     spent: false,
@@ -1576,7 +1574,7 @@ impl TxIndexQueryEngine {
         });
         unspent.dedup_by(|a, b| a.txid == b.txid && a.height == b.height && a.vout == b.vout);
 
-        Ok(ConfirmedHistorySnapshot { history, unspent })
+        Ok(ScriptIndexSnapshot { history, unspent })
     }
 
     fn unspent_outputs_for(
@@ -1585,7 +1583,7 @@ impl TxIndexQueryEngine {
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         scripthash: ScriptHash,
-    ) -> Result<Vec<HistoryRecord>, TxQueryError> {
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
         let mut records = Vec::new();
         for (txid, vout, value, height) in funding_outputs {
@@ -1615,9 +1613,9 @@ impl TxIndexQueryEngine {
                 }
             }
             if !spent {
-                records.push(HistoryRecord {
+                records.push(ScriptIndexRecord {
                     txid,
-                    height: i64::from(height),
+                    height,
                     value,
                     vout,
                     spent: false,
@@ -1659,9 +1657,9 @@ impl TxIndexQueryEngine {
             .transpose()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
             .flatten();
-        let electrum = required
-            .electrum_history
-            .then(|| snapshot.capability_watermark(IndexCapability::ElectrumHistory))
+        let script_index = required
+            .script_history
+            .then(|| snapshot.capability_watermark(IndexCapability::ScriptHistory))
             .transpose()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
             .flatten();
@@ -1671,14 +1669,14 @@ impl TxIndexQueryEngine {
                     && watermark.hash == *tip_before.hash.as_byte_array()
             })
         };
-        let synced =
-            (!required.tx_lookup || at_tip(tx)) && (!required.electrum_history || at_tip(electrum));
-        let best_block_height = match (required.tx_lookup, required.electrum_history) {
+        let synced = (!required.tx_lookup || at_tip(tx))
+            && (!required.script_history || at_tip(script_index));
+        let best_block_height = match (required.tx_lookup, required.script_history) {
             (true, true) => tx
                 .map_or(0, |watermark| watermark.height)
-                .min(electrum.map_or(0, |watermark| watermark.height)),
+                .min(script_index.map_or(0, |watermark| watermark.height)),
             (true, false) => tx.map_or(0, |watermark| watermark.height),
-            (false, true) => electrum.map_or(0, |watermark| watermark.height),
+            (false, true) => script_index.map_or(0, |watermark| watermark.height),
             (false, false) => 0,
         };
 
@@ -1727,56 +1725,29 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 }
 
-impl ConfirmedHistoryReader for TxIndexQueryEngine {
-    fn confirmed_history_snapshot(
+impl ScriptIndexQuery for TxIndexQueryEngine {
+    fn history_snapshot(
         &self,
         scripthash: ScriptHash,
-    ) -> Result<ConfirmedHistorySnapshot, ElectrumError> {
-        self.with_snapshot(IndexCapabilities::ALL, |snapshot, tip, budget| {
-            self.confirmed_history_snapshot_for(snapshot, tip, budget, scripthash)
-        })
-        .map_err(tx_query_error_to_electrum)
+    ) -> Result<ScriptIndexSnapshot, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.history_snapshot_for(snapshot, tip, budget, scripthash),
+        )
     }
 
-    fn unspent_outputs(&self, scripthash: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
-        self.with_snapshot(IndexCapabilities::ALL, |snapshot, tip, budget| {
-            self.unspent_outputs_for(snapshot, tip, budget, scripthash)
-        })
-        .map_err(tx_query_error_to_electrum)
+    fn unspent_outputs(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+        self.with_snapshot(
+            IndexCapabilities::SCRIPT_HISTORY,
+            |snapshot, tip, budget| self.unspent_outputs_for(snapshot, tip, budget, scripthash),
+        )
     }
 
-    fn transaction_hex(&self, txid: &Txid) -> Result<String, ElectrumError> {
-        let tx = self
-            .transaction(txid)
-            .map_err(tx_query_error_to_electrum)?
-            .ok_or(ElectrumError::NotFound("transaction not found"))?;
-        Ok(serialize(&tx).to_lower_hex_string())
-    }
-
-    fn outpoint_value(&self, op: &OutPoint) -> Result<Option<u64>, ElectrumError> {
-        TxIndexQuery::outpoint_value(self, op).map_err(tx_query_error_to_electrum)
-    }
-
-    fn index_info(&self) -> Result<ElectrumTxIndexInfo, ElectrumError> {
-        let info = self
-            .index_info_internal(IndexCapabilities::ALL)
-            .map_err(tx_query_error_to_electrum)?;
-        Ok(ElectrumTxIndexInfo {
-            synced: info.synced,
-            best_block_height: info.best_block_height,
-        })
-    }
-}
-
-fn tx_query_error_to_electrum(error: TxQueryError) -> ElectrumError {
-    match error {
-        TxQueryError::Retry => {
-            ElectrumError::Unavailable("transaction index changed during query; retry".into())
-        }
-        TxQueryError::Unavailable(reason) => ElectrumError::Unavailable(reason),
-        TxQueryError::Storage(reason) => {
-            ElectrumError::Storage(StorageError::Backend(reason.to_string()))
-        }
+    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
+        self.index_info_internal(IndexCapabilities::SCRIPT_HISTORY)
     }
 }
 

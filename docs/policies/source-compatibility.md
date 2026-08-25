@@ -63,7 +63,6 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-wallet` | `crates/wallet` | Watch-only descriptor tracking, coin selection, PSBT construction, fee bumping |
 | `bitcoin-rs-mining` | `crates/mining` | Block template construction |
 | `bitcoin-rs-rpc` | `crates/rpc` | JSON-RPC HTTP server |
-| `bitcoin-rs-electrum` | `crates/electrum` | Electrum protocol server |
 | `bitcoin-rs-node` | `crates/node` | Full node state machine and event loop |
 | `bitcoin-rs` | `bin/bitcoin-rs` | Command-line node binary |
 
