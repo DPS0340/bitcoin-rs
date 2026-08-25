@@ -12,7 +12,7 @@ use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_primitives::{Hash256, Network, OutPoint};
-use bitcoin_rs_rpc::BlockRecord;
+use bitcoin_rs_rpc::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
     LiveOutput, LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
@@ -20,7 +20,7 @@ use bitcoin_rs_utxo::{
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::state::ApplyError;
 use bitcoin_rs_storage::{
@@ -496,6 +496,14 @@ pub(crate) trait PruneBodyStore: Send + Sync {
         Ok(Some((body.len(), tx_count)))
     }
 
+    /// Bytes this store's block files occupy on disk, when it keeps files.
+    ///
+    /// `None` from a store with nothing on disk to measure; the caller then
+    /// falls back to the block-record sum.
+    fn disk_usage(&self) -> Option<u64> {
+        None
+    }
+
     /// Makes body bytes durable before their checkpoint can be published.
     fn sync(&self) -> Result<(), StorageError>;
 }
@@ -632,6 +640,10 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
 }
 
 impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
+    fn disk_usage(&self) -> Option<u64> {
+        Some(self.files.disk_usage())
+    }
+
     fn persist_block_body(
         &self,
         height: u32,
@@ -931,6 +943,18 @@ pub struct ApplyHandles {
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Shared best-applied-block tip handle.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Cumulative transaction count of the applied chain, or `0` when unknown.
+    ///
+    /// Bitcoin Core's `CBlockIndex::m_chain_tx_count`, including its convention
+    /// that zero means *unset* rather than *empty* (`HaveNumChainTxs()`). Only a
+    /// chain applied from genesis by a node that maintains this counter can know
+    /// it; a datadir written before it existed restores as unknown and stays
+    /// unknown, because nothing short of re-reading every block body could
+    /// recover the history.
+    ///
+    /// Kept beside `applied_tip` and moved with it, so the pair is always
+    /// consistent: a count that lagged its tip would be worse than no count.
+    pub chain_tx_count: Arc<AtomicU64>,
     /// Shared in-memory block tree.
     pub block_tree: Arc<RwLock<BlockTree>>,
     /// Shared UTXO set.
@@ -944,7 +968,7 @@ pub struct ApplyHandles {
     /// Shared mempool.
     pub mempool: Arc<RwLock<Mempool>>,
     /// Shared block records exposed to RPC handlers.
-    pub blocks: Arc<RwLock<Vec<BlockRecord>>>,
+    pub blocks: Arc<RwLock<BlockLog>>,
     /// Shared transaction map exposed to RPC handlers.
     pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     /// Shared ZMQ-event publisher (default: `NoOpZmqPublisher`).
@@ -1010,7 +1034,7 @@ impl ApplyHandles {
         tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
         filter_index: Arc<Box<dyn bitcoin_rs_filters::FilterIndexLike>>,
         mempool: Arc<RwLock<Mempool>>,
-        blocks: Arc<RwLock<Vec<BlockRecord>>>,
+        blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     ) -> Self {
@@ -1018,6 +1042,7 @@ impl ApplyHandles {
             network,
             chain_tip,
             applied_tip,
+            chain_tx_count: Arc::new(AtomicU64::new(0)),
             block_tree,
             utxo,
             coin_stats,
@@ -1361,6 +1386,7 @@ pub(crate) fn disconnect_block_admitted(
     handles
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
+    rewind_chain_tx_count(handles, tx_count_delta);
     handles.wake_tx_index();
 
     if handles.zmq_publisher.wants_notifications() {
@@ -1403,6 +1429,49 @@ pub(crate) fn disconnect_block_admitted(
 /// apply never added.
 fn tx_count_delta_for(block: &bitcoin::Block) -> u64 {
     u64::try_from(block.txdata.len()).unwrap_or(u64::MAX)
+}
+
+/// Carries the cumulative transaction count forward across a connected block.
+///
+/// Zero means *unknown*, so a count that is already unknown stays unknown
+/// rather than restarting from this block and pretending to be a chain total.
+/// Genesis is the one block that can establish the count from nothing: there is
+/// no chain below it.
+fn advance_chain_tx_count(handles: &ApplyHandles, height: u32, tx_count_delta: u64) {
+    let known = handles.chain_tx_count.load(Ordering::Relaxed);
+    if known == 0 && height != 0 {
+        return;
+    }
+    let advanced = known.checked_add(tx_count_delta).unwrap_or_else(|| {
+        tracing::warn!(
+            known,
+            tx_count_delta,
+            "cumulative chain transaction count overflowed; marking it unknown"
+        );
+        0
+    });
+    handles.chain_tx_count.store(advanced, Ordering::Relaxed);
+}
+
+/// Takes a disconnected block's transactions back out of the cumulative count.
+///
+/// An unknown count stays unknown. A subtraction that would go below zero means
+/// the count and the chain have diverged, and a silently clamped total is worse
+/// than an admitted absence, so that case resets to unknown.
+fn rewind_chain_tx_count(handles: &ApplyHandles, tx_count_delta: u64) {
+    let known = handles.chain_tx_count.load(Ordering::Relaxed);
+    if known == 0 {
+        return;
+    }
+    let rewound = known.checked_sub(tx_count_delta).unwrap_or_else(|| {
+        tracing::warn!(
+            known,
+            tx_count_delta,
+            "cumulative chain transaction count fell below zero; marking it unknown"
+        );
+        0
+    });
+    handles.chain_tx_count.store(rewound, Ordering::Relaxed);
 }
 
 /// Synthetically applies `block` as the next tip after consensus checks.
@@ -2053,6 +2122,12 @@ struct ValidatedBlock {
 ///
 /// Deliberately one straight run of checks: the order is consensus-significant
 /// and splitting it into named halves would hide that.
+///
+/// Takes the [`ChainTransition`] proof rather than reading a flag: every read
+/// below -- the predecessor, the activation heights, the difficulty target, the
+/// committed prevouts -- must come from one chainstate, and the borrow is what
+/// makes the compiler say so. A caller that has not taken the lock cannot
+/// produce the argument, and one that drops it early stops compiling.
 #[allow(clippy::too_many_lines)]
 fn validate_block_for_apply(
     handles: &ApplyHandles,
@@ -2060,6 +2135,7 @@ fn validate_block_for_apply(
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply>,
     pow_check: PowCheck,
+    _transition: &ChainTransition<'_>,
 ) -> core::result::Result<ValidatedBlock, ApplyError> {
     use bitcoin::hashes::Hash as _;
 
@@ -2274,10 +2350,16 @@ fn validate_block_for_apply(
 /// Genesis is skipped for the same reason its transactions are not connected.
 /// Shared with `test_block_validity` so a proposal is weighed on the same
 /// arithmetic a connected block is.
+///
+/// Takes the [`ChainTransition`] proof for the same reason the checks above it
+/// do: the fees it weighs were computed against prevouts read under that lock,
+/// and a verdict reached after it was released would be arithmetic over a
+/// chainstate that had already moved.
 fn check_coinbase_amount(
     handles: &ApplyHandles,
     height: u32,
     value_totals: BlockValueTotals,
+    _transition: &ChainTransition<'_>,
 ) -> core::result::Result<(), ApplyError> {
     if height == 0 {
         return Ok(());
@@ -2305,21 +2387,44 @@ fn check_coinbase_amount(
 /// Proof of work is deliberately not checked. A proposal is a block whose nonce
 /// has not been searched for; the declared difficulty is still validated.
 ///
+/// The chain-transition lock is held for the whole answer, exactly as a connect
+/// holds it. Without it a connect or a disconnect landing mid-validation moves
+/// the applied tip and the committed UTXO set between the predecessor and
+/// activation reads, the prevout and script checks, and the coinbase-fee
+/// arithmetic -- so the verdict describes no chainstate that ever existed. It
+/// can say a proposal built on the old parent is valid against the new parent's
+/// UTXO set, which is the one answer a miner cannot afford to be given. The
+/// handler's `applied_hash` comparison narrows the window and cannot close it;
+/// only holding the lock the connect path holds does that.
+///
 /// # Errors
 ///
-/// Returns the [`ApplyError`] the block would have been rejected with.
+/// Returns the [`ApplyError`] the block would have been rejected with, or
+/// [`ApplyError::Shutdown`] if admission closed before the guard was taken.
 pub fn test_block_validity(
     handles: &ApplyHandles,
     block: &bitcoin::Block,
     serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<(), ApplyError> {
+    // Same order a connect takes them in: admission permit, then the transition
+    // lock. Taking them in any other order here would invert the node's lock
+    // order against every applier.
+    let transition = handles.begin_chain_transition()?;
+
     let ValidatedBlock {
         height,
         block_hash,
         tx_plan,
         resolved,
         ..
-    } = validate_block_for_apply(handles, block, serialized, None, PowCheck::Skipped)?;
+    } = validate_block_for_apply(
+        handles,
+        block,
+        serialized,
+        None,
+        PowCheck::Skipped,
+        &transition,
+    )?;
 
     // The coinbase-amount gate sits past the point where an apply starts
     // computing what it will write, so reaching it means computing the same
@@ -2345,7 +2450,7 @@ pub fn test_block_validity(
         bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
             .then(|| handles.utxo.as_ref()),
     )?;
-    check_coinbase_amount(handles, height, value_totals)
+    check_coinbase_amount(handles, height, value_totals, &transition)
 }
 
 /// The apply itself, with the admission permit and the transition lock held.
@@ -2365,7 +2470,7 @@ fn apply_block_admitted(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply>,
-    _transition: &ChainTransition<'_>,
+    transition: &ChainTransition<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let total_started = quanta::Instant::now();
     let ValidatedBlock {
@@ -2381,6 +2486,7 @@ fn apply_block_admitted(
         provided_serialized.clone(),
         proven,
         PowCheck::Required,
+        transition,
     )?;
 
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
@@ -2435,7 +2541,7 @@ fn apply_block_admitted(
     // free, and still before `persist_undo` -- the first write of any kind --
     // so a rejected block leaves nothing behind. Genesis is skipped for the
     // same reason its transactions are not connected.
-    check_coinbase_amount(handles, height, value_totals)?;
+    check_coinbase_amount(handles, height, value_totals, transition)?;
 
     // Persist undo before the block body, the index, and the UTXO commit. All
     // three are derived state for a block that is about to apply; if the undo
@@ -2539,6 +2645,27 @@ fn apply_block_admitted(
             &block_bytes,
             handles.cache_block_bodies_in_memory,
         );
+        // The record carries no header. `BlockRecord`'s is filled from the block
+        // tree when a caller resolves one, which is sound only because the
+        // header is already in the tree by the time the record is in the log —
+        // `applied_header_tip` above, through these same handles, is what puts
+        // it there.
+        //
+        // That ordering is the whole of the argument, and until this assertion
+        // nothing enforced it. Reverse the two and every `getblock` /
+        // `getblockheader` answer for a freshly applied block loses its header,
+        // with nothing failing at the point the mistake is made.
+        //
+        // The tree lock is free here: `applied_header_tip` released its write
+        // guard before returning. The check is one hash-table lookup, and it is
+        // compiled out of release builds — so this is a guard for the test
+        // suite, where it runs on every block any node test applies.
+        debug_assert!(
+            handles.block_tree.read().node_by_hash(block_hash).is_some(),
+            "block {} is entering the record log with no block-tree node; \
+             its header would be unrecoverable",
+            block_hash.to_string_be()
+        );
         handles.blocks.write().push(block_record);
     }
     let block_record_dur = block_record_started.elapsed();
@@ -2641,6 +2768,7 @@ fn apply_block_admitted(
         }
     }
     handles.applied_tip.store(Some(Arc::new(tip.clone())));
+    advance_chain_tx_count(handles, height, tx_count_delta_for(block));
     handles.wake_tx_index();
     if handles.zmq_publisher.wants_notifications() {
         handles
@@ -3839,16 +3967,17 @@ fn applied_block_record(
     } else {
         String::new()
     };
-    let header_hex = block_bytes.get(..SERIALIZED_BLOCK_HEADER_LEN).map_or_else(
-        || bitcoin::consensus::encode::serialize(&block.header).to_lower_hex_string(),
-        DisplayHex::to_lower_hex_string,
-    );
     BlockRecord {
         hash: block_hash,
         height,
         block_hex,
         body_size: block_bytes.len(),
-        header_hex,
+        // Not stored. `applied_header_tip` above has already put this block's
+        // header in the block tree — the record is pushed after that, through
+        // the same handles — and the tree never drops a node. Keeping a second
+        // copy here kept it for every block on the chain, for the life of the
+        // process.
+        header: None,
         tx_count: block.txdata.len(),
         time: block.header.time,
     }
@@ -3948,7 +4077,7 @@ mod consensus_rule_tests {
         assert_eq!(cached.height, expected_cached.height);
         assert_eq!(cached.block_hex, expected_cached.block_hex);
         assert_eq!(cached.body_size, expected_cached.body_size);
-        assert_eq!(cached.header_hex, expected_cached.header_hex);
+        assert_eq!(cached.header, expected_cached.header);
         assert_eq!(cached.tx_count, expected_cached.tx_count);
         assert_eq!(cached.time, expected_cached.time);
 
@@ -3958,7 +4087,7 @@ mod consensus_rule_tests {
         assert_eq!(metadata.height, expected_metadata.height);
         assert_eq!(metadata.block_hex, expected_metadata.block_hex);
         assert_eq!(metadata.body_size, expected_metadata.body_size);
-        assert_eq!(metadata.header_hex, expected_metadata.header_hex);
+        assert_eq!(metadata.header, expected_metadata.header);
         assert_eq!(metadata.tx_count, expected_metadata.tx_count);
         assert_eq!(metadata.time, expected_metadata.time);
     }
@@ -6667,6 +6796,78 @@ mod consensus_rule_tests {
         );
     }
 
+    /// A proposal waits for an in-flight chain transition instead of reading
+    /// across it.
+    ///
+    /// The connect path takes `chain_transition` for the whole of a connect or
+    /// a disconnect. Answering a proposal without it lets a transition land
+    /// between the predecessor read, the prevout and script checks, and the
+    /// coinbase-fee arithmetic -- and the verdict then describes no chainstate
+    /// that ever existed. The dangerous case is the flattering one: an
+    /// old-parent proposal called valid against the new parent's UTXO set.
+    ///
+    /// The test is deterministic in the direction that matters. A transition is
+    /// held open, a proposal is asked for, and the answer must not arrive; only
+    /// once the transition is released may it. Without the guard the proposal
+    /// answers immediately and the first assertion fails every run -- there is
+    /// no window to lose, because the lock is held for the whole of it.
+    ///
+    /// The guard being retained to the end of the answer is not tested here; it
+    /// is a borrow. `validate_block_for_apply` and `check_coinbase_amount` both
+    /// take `&ChainTransition`, so releasing it early does not compile.
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn a_proposal_waits_for_an_in_flight_chain_transition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let subsidy =
+            bitcoin_rs_consensus::block_subsidy(1, Network::Regtest.subsidy_halving_interval());
+        let (handles, block) =
+            height_one_fixture(vec![fee_paying_spend()], subsidy + 999, Pow::Mined);
+
+        let proposer_handles = handles.clone();
+        let (asked_tx, asked_rx) = std::sync::mpsc::sync_channel(1);
+        let (answered_tx, answered_rx) = std::sync::mpsc::sync_channel(1);
+
+        // Stands in for a connect or a disconnect in flight: the same lock, the
+        // same order, taken through the same constructor.
+        let transition = handles.begin_chain_transition()?;
+
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let proposer = scope.spawn(move || {
+                let _ = asked_tx.send(());
+                let verdict = test_block_validity(&proposer_handles, &block, None);
+                let _ = answered_tx.send(verdict.is_ok());
+                verdict
+            });
+
+            asked_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+            assert!(
+                matches!(
+                    answered_rx.recv_timeout(std::time::Duration::from_millis(200)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a proposal was answered while a chain transition was in flight"
+            );
+
+            drop(transition);
+            assert!(
+                answered_rx.recv_timeout(std::time::Duration::from_secs(5))?,
+                "the proposal must be answered once the transition completes"
+            );
+            proposer
+                .join()
+                .map_err(|_| std::io::Error::other("proposal worker panicked"))??;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.height),
+            Some(0),
+            "answering a proposal must leave the tip where it was"
+        );
+        Ok(())
+    }
+
     /// Timestamp rules must hold on the apply path, not only in header sync.
     ///
     /// `applied_header_tip` inserts a header the tree has never seen, so before
@@ -6899,14 +7100,15 @@ mod consensus_rule_tests {
             utxo.commit_block(&remove, &Hash256::from_le_bytes(&[0x83; 32]))?;
 
             let transition = handles.begin_chain_transition()?;
-            let error = apply_block_admitted(
+            let Err(error) = apply_block_admitted(
                 &handles,
                 &block,
                 Some(raw),
                 Some(ProvenApply::Proven(proof)),
                 &transition,
-            )
-            .expect_err("a mismatched proof must re-read the now-missing live prevout");
+            ) else {
+                panic!("a mismatched proof must re-read the now-missing live prevout");
+            };
             assert!(
                 matches!(
                     error,
@@ -7094,26 +7296,24 @@ mod consensus_rule_tests {
             "an empty verification dispatch must not count as script verification",
         );
         let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
-        let skipped = entries
-            .pop()
-            .expect("the trusted assume-valid window returned one entry above");
+        let Some(skipped) = entries.pop() else {
+            panic!("the trusted assume-valid window returned one entry above");
+        };
         handles.assume_valid_gate = Arc::new(AssumeValidGate::with_anchor(Some((
             1,
             Hash256::from_le_bytes(&[0xff; 32]),
         ))));
         assert!(!handles.assume_valid_gate.trusted());
         let transition = handles.begin_chain_transition()?;
-        let error = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition)
-            .expect_err("an untrusted gate at commit must run and reject the bad script");
+        let outcome = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition);
         assert!(
             matches!(
-                error,
-                ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                    input_index: 0,
-                    ..
-                })
+                outcome,
+                Err(ApplyError::Consensus(
+                    bitcoin_rs_consensus::ConsensusError::Script { input_index: 0, .. }
+                ))
             ),
-            "trust-gate flip must re-enter ordinary script validation, got {error:?}"
+            "trust-gate flip must re-enter ordinary script validation, got {outcome:?}"
         );
 
         // Full verification must be completely unaffected.
@@ -9109,8 +9309,47 @@ mod consensus_rule_tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn empty_apply_handles() -> ApplyHandles {
+    pub(super) fn empty_apply_handles() -> ApplyHandles {
         empty_apply_handles_for_network(Network::Mainnet)
+    }
+
+    /// The rewind is wired to the disconnect, not merely implemented.
+    ///
+    /// `rewind_chain_tx_count` has its own unit tests, and they all passed while
+    /// the call site was missing: a mutation that deleted the call from
+    /// `disconnect_block_admitted` survived the whole audit. Testing a function
+    /// is not testing that anything calls it.
+    #[test]
+    fn a_disconnect_takes_the_blocks_transactions_back_out_of_the_chain_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        // Genesis counted, as it would be on a node that synced from it.
+        handles.chain_tx_count.store(1, Ordering::Relaxed);
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        let applied = apply_block(&handles, &block)?;
+        assert_eq!(applied.height, 1, "the block must connect first");
+        assert_eq!(
+            handles.chain_tx_count.load(Ordering::Relaxed),
+            2,
+            "connecting a one-transaction block moves the count by one"
+        );
+
+        let _restored = disconnect_block(&handles, &block)?;
+        assert_eq!(
+            handles.chain_tx_count.load(Ordering::Relaxed),
+            1,
+            "the disconnected block's transactions must leave the count with it"
+        );
+        Ok(())
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -9395,7 +9634,7 @@ mod consensus_rule_tests {
             None,
             filter_index,
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
@@ -10409,7 +10648,7 @@ mod consensus_rule_tests {
             None,
             noop_filter_index(),
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
         )
@@ -10778,4 +11017,74 @@ fn check_pow_limit_and_continuity_for_seeded_tip(
 ) -> core::result::Result<(), ApplyError> {
     let prior = handles.chain_tip.load_full();
     check_pow_limit_and_continuity(handles, prior.as_deref(), block, height)
+}
+
+#[cfg(test)]
+mod chain_tx_count_tests {
+    use super::*;
+
+    fn handles() -> ApplyHandles {
+        super::consensus_rule_tests::empty_apply_handles()
+    }
+
+    #[test]
+    fn genesis_establishes_the_count_from_nothing() {
+        let handles = handles();
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+        advance_chain_tx_count(&handles, 0, 1);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn an_unknown_count_stays_unknown_above_genesis() {
+        let handles = handles();
+        // A datadir written before the counter existed restores as unknown.
+        // Accumulating from here would produce a small number that looks like a
+        // chain total and is not one — worse than admitting we do not know.
+        advance_chain_tx_count(&handles, 900_000, 2_500);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_known_count_advances_and_rewinds_by_the_same_delta() {
+        let handles = handles();
+        advance_chain_tx_count(&handles, 0, 1);
+        advance_chain_tx_count(&handles, 1, 7);
+        advance_chain_tx_count(&handles, 2, 3);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 11);
+
+        rewind_chain_tx_count(&handles, 3);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 8);
+        rewind_chain_tx_count(&handles, 7);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rewinding_an_unknown_count_leaves_it_unknown() {
+        let handles = handles();
+        rewind_chain_tx_count(&handles, 5);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_rewind_past_zero_admits_it_does_not_know_rather_than_clamping() {
+        let handles = handles();
+        advance_chain_tx_count(&handles, 0, 4);
+        // Only reachable if the count and the chain have diverged. A clamp to
+        // some small number would keep reporting a confident wrong total.
+        rewind_chain_tx_count(&handles, 9);
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_advance_past_u64_marks_the_count_unknown_instead_of_wrapping() {
+        let handles = handles();
+        handles
+            .chain_tx_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        advance_chain_tx_count(&handles, 900_000, 3);
+
+        assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
 }

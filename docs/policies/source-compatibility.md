@@ -60,7 +60,7 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-pruning` | `crates/pruning` | Block file and state pruning logic |
 | `bitcoin-rs-mempool` | `crates/mempool` | Memory pool transaction storage |
 | `bitcoin-rs-p2p` | `crates/p2p` | Peer-to-peer network protocol |
-| `bitcoin-rs-wallet` | `crates/wallet` | Key management and fee estimation |
+| `bitcoin-rs-wallet` | `crates/wallet` | Watch-only descriptor tracking, coin selection, PSBT construction, fee bumping |
 | `bitcoin-rs-mining` | `crates/mining` | Block template construction |
 | `bitcoin-rs-rpc` | `crates/rpc` | JSON-RPC HTTP server |
 | `bitcoin-rs-electrum` | `crates/electrum` | Electrum protocol server |

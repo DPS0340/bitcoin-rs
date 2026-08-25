@@ -11,7 +11,8 @@ use bitcoin::{
 };
 use bitcoin_rs_mempool::{EntryId, Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_mining::{
-    BlockTemplate, BlockTemplateParams, DEFAULT_BLOCK_RESERVED_WEIGHT, MiningPolicy,
+    BlockTemplate, BlockTemplateParams, DEFAULT_BLOCK_RESERVED_WEIGHT,
+    DEFAULT_COINBASE_RESERVED_SIGOPS, MiningPolicy,
 };
 use bitcoin_rs_primitives::Hash256;
 
@@ -411,6 +412,10 @@ fn the_template_reports_each_transaction_sigop_cost() -> Result<(), Box<dyn Erro
 }
 
 fn params(max_weight: u32) -> BlockTemplateParams {
+    params_with_sigops(max_weight, SIGOP_BUDGET)
+}
+
+fn params_with_sigops(max_weight: u32, max_sigops: u32) -> BlockTemplateParams {
     BlockTemplateParams {
         previous_block_hash: Hash256::from_le_bytes(&[1_u8; 32]),
         height: 800_001,
@@ -421,7 +426,7 @@ fn params(max_weight: u32) -> BlockTemplateParams {
         current_time: 1_700_000_123,
         long_poll_id: "synthetic".to_owned(),
         max_weight,
-        max_sigops: SIGOP_BUDGET,
+        max_sigops,
         max_size: 4_000_000,
     }
 }
@@ -454,6 +459,222 @@ fn the_coinbase_reserve_is_held_back_from_selection() -> Result<(), Box<dyn Erro
     // One more weight unit of room and it fits, so the emptiness above is the
     // reserve and not something else refusing the transaction.
     let template = BlockTemplate::from_mempool(&pool, &MiningPolicy, params(max_weight + 1))?;
+    assert_eq!(template.transactions.len(), 1);
+    Ok(())
+}
+
+/// A sibling is re-ranked once their shared parent is already paid for.
+///
+/// One cheap parent, two children. The richer child pulls the parent in. From
+/// that moment the second child no longer pays for the parent, so what it is
+/// worth per byte jumps -- above a rival that used to outrank it.
+///
+/// Ranked once and never again, the second child keeps the score it had when
+/// it still owed for the parent, the rival takes the last slot, and the block
+/// carries less fee than it could. Bitcoin Core keeps the same accounting in
+/// `mapModifiedTx` and updates it in `UpdatePackagesForAdded`.
+#[test]
+fn a_sibling_is_re_ranked_once_their_shared_parent_is_taken() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+
+    // Nearly free on its own: only a child's fee gets it into a block.
+    let parent = tx_spending(confirmed_outpoint(1), 1);
+    let parent_txid = parent.compute_txid();
+    let parent_id = insert(&mut pool, parent, 200, 0)?;
+
+    // Rich enough that its whole package outranks everything.
+    let rich = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(parent_txid, 0), 2),
+        100_000,
+        1,
+    )?;
+    // Its package rate is 30_100 per unit while the parent is unpaid, and
+    // 60_000 once the parent is in -- straddling the rival below.
+    let sibling = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(parent_txid, 1), 3),
+        60_000,
+        2,
+    )?;
+    let rival = insert(&mut pool, tx_spending(confirmed_outpoint(4), 5), 40_000, 3)?;
+
+    let unit = weight_of(&pool, parent_id);
+    assert_eq!(
+        unit,
+        weight_of(&pool, sibling),
+        "the fixture assumes equal sizes"
+    );
+
+    // Room for exactly three: the parent, one child, and one more thing.
+    let budget = u32::try_from(unit * 3)?;
+    let selected = MiningPolicy.select_transactions(&pool, budget, SIGOP_BUDGET);
+
+    assert!(
+        position(&selected, parent_id).is_some() && position(&selected, rich).is_some(),
+        "the rich child pulls the parent in: {selected:?}"
+    );
+    assert!(
+        position(&selected, sibling).is_some(),
+        "the last slot goes to the re-ranked sibling: {selected:?}"
+    );
+    assert!(
+        position(&selected, rival).is_none(),
+        "and not to the rival it now outranks: {selected:?}"
+    );
+
+    // The rival is not being refused for size: with a fourth slot it is taken.
+    let roomy = u32::try_from(unit * 4)?;
+    let selected = MiningPolicy.select_transactions(&pool, roomy, SIGOP_BUDGET);
+    assert!(position(&selected, rival).is_some(), "{selected:?}");
+    Ok(())
+}
+
+/// Re-ranking reaches past the immediate children.
+///
+/// A grandchild owes for its parent *and* its grandparent. Taking the
+/// grandparent lightens it too, and if the walk stops at direct children the
+/// grandchild keeps a score that includes an ancestor already in the block.
+#[test]
+fn re_ranking_reaches_a_grandchild() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+
+    let grandparent = tx_spending(confirmed_outpoint(1), 1);
+    let grandparent_txid = grandparent.compute_txid();
+    let grandparent_id = insert(&mut pool, grandparent, 200, 0)?;
+
+    // Rich enough to pull the grandparent in on its own.
+    let rich = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(grandparent_txid, 0), 2),
+        100_000,
+        1,
+    )?;
+
+    // The other branch: a cheap child carrying a rich child of its own.
+    let middle = tx_spending(OutPoint::new(grandparent_txid, 1), 3);
+    let middle_txid = middle.compute_txid();
+    let middle_id = insert(&mut pool, middle, 200, 2)?;
+    let grandchild = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(middle_txid, 0), 4),
+        100_000,
+        3,
+    )?;
+
+    // Above the grandchild's three-deep package, below its two-deep one.
+    let rival = insert(&mut pool, tx_spending(confirmed_outpoint(5), 6), 40_000, 4)?;
+
+    let unit = weight_of(&pool, grandparent_id);
+    let budget = u32::try_from(unit * 4)?;
+    let selected = MiningPolicy.select_transactions(&pool, budget, SIGOP_BUDGET);
+
+    assert!(
+        position(&selected, grandparent_id).is_some() && position(&selected, rich).is_some(),
+        "the rich child pulls the grandparent in: {selected:?}"
+    );
+    assert!(
+        position(&selected, middle_id).is_some() && position(&selected, grandchild).is_some(),
+        "the grandchild's package must be re-scored without the grandparent: {selected:?}"
+    );
+    assert!(
+        position(&selected, rival).is_none(),
+        "the rival is worth less than the re-scored grandchild: {selected:?}"
+    );
+    Ok(())
+}
+
+/// Package fee rates are compared exactly, not by integer division.
+///
+/// Two packages a couple of satoshis apart over the same size divide to the
+/// same whole number of satoshis per vbyte. Dividing first turns that into a
+/// tie, and the tie-break then settles by age what the fee should have settled
+/// -- taking the *worse* package because it happens to be older.
+#[test]
+fn packages_a_fraction_apart_are_ordered_by_fee_not_age() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+
+    // Two packages of two transactions each. The children pay the same, so the
+    // own-fee-rate tie-break cannot separate them either; only the parents
+    // differ, and only by two satoshis.
+    let poorer_parent = tx_spending(confirmed_outpoint(1), 1);
+    let poorer_txid = poorer_parent.compute_txid();
+    let poorer_parent_id = insert(&mut pool, poorer_parent, 1, 0)?;
+    let poorer = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(poorer_txid, 0), 2),
+        999,
+        0,
+    )?;
+
+    let richer_parent = tx_spending(confirmed_outpoint(3), 3);
+    let richer_txid = richer_parent.compute_txid();
+    let richer_parent_id = insert(&mut pool, richer_parent, 3, 9)?;
+    let richer = insert(
+        &mut pool,
+        tx_spending(OutPoint::new(richer_txid, 0), 4),
+        999,
+        9,
+    )?;
+
+    // Room for one package only, so the order decides which one is in.
+    let budget = u32::try_from(weight_of(&pool, poorer_parent_id) * 2)?;
+    let selected = MiningPolicy.select_transactions(&pool, budget, SIGOP_BUDGET);
+
+    assert!(
+        position(&selected, richer_parent_id).is_some() && position(&selected, richer).is_some(),
+        "the package paying two satoshis more must win: {selected:?}"
+    );
+    assert!(
+        position(&selected, poorer).is_none(),
+        "the older, poorer package must not: {selected:?}"
+    );
+    Ok(())
+}
+
+/// The coinbase's sigop allowance is held back, like its weight.
+///
+/// A miner's payout script may carry `CHECKSIG`. Selection that spent the whole
+/// consensus budget would leave nothing for it and push the finished block over
+/// the limit, so the reserve comes off the selection budget while the template
+/// still advertises the full figure.
+#[test]
+fn the_coinbase_sigop_reserve_is_held_back_from_selection() -> Result<(), Box<dyn Error>> {
+    let mut pool = pool();
+    let sigops = 1_000_u32;
+    let id = insert_with_sigops(
+        &mut pool,
+        tx_spending(confirmed_outpoint(1), 1),
+        10_000,
+        0,
+        sigops,
+    )?;
+    let _ = id;
+
+    // Exactly enough for the transaction if the reserve is ignored, and one
+    // sigop short once it is honoured.
+    let max_sigops = DEFAULT_COINBASE_RESERVED_SIGOPS + sigops - 1;
+    let template = BlockTemplate::from_mempool(
+        &pool,
+        &MiningPolicy,
+        params_with_sigops(4_000_000, max_sigops),
+    )?;
+    assert!(
+        template.transactions.is_empty(),
+        "the reserve must be subtracted before selection"
+    );
+    assert_eq!(
+        template.sigoplimit, max_sigops,
+        "the advertised limit stays the full figure"
+    );
+
+    // One more sigop of room and it fits, so the emptiness above is the reserve
+    // and not something else refusing the transaction.
+    let template = BlockTemplate::from_mempool(
+        &pool,
+        &MiningPolicy,
+        params_with_sigops(4_000_000, max_sigops + 1),
+    )?;
     assert_eq!(template.transactions.len(), 1);
     Ok(())
 }
