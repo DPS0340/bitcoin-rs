@@ -23,8 +23,15 @@ struct ScanResponse {
 #[derive(Clone)]
 struct QuerySnapshot {
     watermark: IndexWatermark,
+    electrum_watermark: ElectrumWatermark,
     scans: Vec<ScanResponse>,
     aba: Option<Arc<AbaMutation>>,
+}
+
+#[derive(Clone, Copy)]
+enum ElectrumWatermark {
+    MatchTx,
+    Override(Option<IndexWatermark>),
 }
 
 impl QuerySnapshot {
@@ -77,6 +84,19 @@ impl QuerySnapshot {
 impl TxIndexSnapshot for QuerySnapshot {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
         Ok(Some(self.watermark))
+    }
+
+    fn capability_watermark(
+        &self,
+        capability: IndexCapability,
+    ) -> Result<Option<IndexWatermark>, IndexError> {
+        Ok(match capability {
+            IndexCapability::TxLookup => Some(self.watermark),
+            IndexCapability::ElectrumHistory => match self.electrum_watermark {
+                ElectrumWatermark::MatchTx => Some(self.watermark),
+                ElectrumWatermark::Override(watermark) => watermark,
+            },
+        })
     }
 
     fn transaction_rows(
@@ -186,6 +206,13 @@ impl BlockBodySource for CountingBodySource {
 
 impl QueryFixture {
     fn new(config: FixtureConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_electrum_watermark(config, ElectrumWatermark::MatchTx)
+    }
+
+    fn new_with_electrum_watermark(
+        config: FixtureConfig,
+        electrum_watermark: ElectrumWatermark,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
         let tip_id = tree.insert_header(config.block.header, NodeStatus::HeaderValid)?;
         let node = tree.node(tip_id)?;
@@ -223,6 +250,7 @@ impl QueryFixture {
         let reader = Arc::new(QueryReader {
             snapshot: QuerySnapshot {
                 watermark,
+                electrum_watermark,
                 scans: config.scans,
                 aba,
             },
@@ -239,6 +267,32 @@ impl QueryFixture {
             TxIndexQueryEngine::new(runtime, reader, block_source, tree, applied_tip, None);
         Ok(Self { engine })
     }
+}
+
+#[test]
+fn tx_queries_can_be_ready_while_electrum_history_is_backfilling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let block = genesis_block(Network::Regtest);
+    let txid = block.txdata[0].compute_txid();
+    let fixture = QueryFixture::new_with_electrum_watermark(
+        FixtureConfig {
+            block,
+            retain_body: true,
+            scans: Vec::new(),
+            aba_trigger: None,
+            watermark: None,
+        },
+        ElectrumWatermark::Override(None),
+    )?;
+
+    assert!(TxIndexQuery::transaction(&fixture.engine, &txid)?.is_none());
+    assert!(matches!(
+        fixture
+            .engine
+            .confirmed_history_snapshot(ScriptHash::from_script_bytes(&[])),
+        Err(ElectrumError::Unavailable(_))
+    ));
+    Ok(())
 }
 
 fn scan_response(

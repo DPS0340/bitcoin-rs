@@ -79,10 +79,18 @@ Defaults worth knowing:
 | `--dbcache-mb` | 450 |
 | `--prune-target-mb` | 0, meaning no pruning |
 | `--txindex` | off |
+| `--electrum` | off |
 | `--blockfilterindex` | off |
 
 The node logs its startup and the address the RPC listener bound to. If you see
 that line, it is running.
+
+`--txindex` advertises Bitcoin Core-compatible transaction lookup support.
+`--electrum <address>` starts the Electrum service and automatically builds
+the internal transaction lookup plus scripthash history indexes; it does not
+require `--txindex` or advertise Core txindex support unless that flag is also
+set. Either index mode is incompatible with pruning because backfill and reorg
+repair require durable block bodies.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style

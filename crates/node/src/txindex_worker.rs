@@ -1,12 +1,14 @@
 //! Asynchronous, durable, node-owned transaction index runtime.
 //!
-//! The node creates and owns exactly one `TxIndexRuntime` when `txindex` is
-//! enabled. The runtime holds a process-local revision counter and a bounded
+//! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
+//! Electrum enables an index capability. The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
 //! after every committed `applied_tip.store`. The single writer may atomically
 //! publish a complete formerly authoritative prefix while the applied chain
 //! advances or reorganizes; exact query gating refuses that temporary lag and
-//! the next worker pass repairs it. A snapshot-gated query engine serves
+//! the next worker pass repairs it. Independent durable capability watermarks
+//! let aligned row families share one parse and commit while divergent families
+//! backfill separately. A snapshot-gated query engine serves
 //! `bitcoin_rs_rpc::TxIndexQuery` and the Electrum `ConfirmedHistoryReader`
 //! without raw index mutex paths.
 
@@ -25,8 +27,9 @@ use bitcoin_rs_electrum::methods::{
     TxIndexInfo as ElectrumTxIndexInfo,
 };
 use bitcoin_rs_index::{
-    HashPrefixRow, IndexError, IndexReader, IndexWatermark, IndexWriter, PreparedBatch,
-    PreparedBatchLimits, PreparedBlock, ScriptHash, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    HashPrefixRow, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
+    IndexWatermarks, IndexWriter, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHash,
+    TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
@@ -161,6 +164,7 @@ impl TxIndexWorker {
         block_tree: Arc<RwLock<BlockTree>>,
         body_store: Option<Arc<dyn PruneBodyStore>>,
         batch_limits: PreparedBatchLimits,
+        enabled: IndexCapabilities,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
         let worker = Worker {
@@ -170,6 +174,7 @@ impl TxIndexWorker {
             block_tree,
             body_store,
             batch_limits,
+            enabled,
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
             batch_delay: FORWARD_BATCH_DELAY,
@@ -224,18 +229,48 @@ impl Drop for TxIndexWorker {
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
+    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        let watermark = self.watermark()?;
+        Ok(IndexWatermarks {
+            tx_lookup: watermark,
+            electrum_history: watermark,
+        })
+    }
     fn prepare_block(
         &self,
         height: u32,
         hash: [u8; 32],
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError>;
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        let _ = capabilities;
+        self.prepare_block(height, hash, body)
+    }
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError>;
     fn commit_rollback_one(
         &self,
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError>;
+    fn commit_rollback_one_for(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+    ) -> Result<(), IndexError> {
+        let _ = capabilities;
+        self.commit_rollback_one(prev, body)
+    }
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        let _ = capabilities;
+        Err(IndexError::UnsupportedRollback)
+    }
 }
 
 impl<S> TxIndexWriter for Mutex<IndexWriter<S>>
@@ -246,6 +281,10 @@ where
         self.lock().watermark()
     }
 
+    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
+        self.lock().watermarks()
+    }
+
     fn prepare_block(
         &self,
         height: u32,
@@ -253,6 +292,17 @@ where
         body: &[u8],
     ) -> Result<PreparedBlock, IndexError> {
         self.lock().prepare_block(height, hash, body)
+    }
+
+    fn prepare_block_for(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, IndexError> {
+        self.lock()
+            .prepare_block_for(capabilities, height, hash, body)
     }
 
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
@@ -266,6 +316,20 @@ where
     ) -> Result<(), IndexError> {
         self.lock().commit_rollback_one(prev, body)
     }
+
+    fn commit_rollback_one_for(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+    ) -> Result<(), IndexError> {
+        self.lock()
+            .commit_rollback_one_for(capabilities, prev, body)
+    }
+
+    fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
+        self.lock().reset_capabilities(capabilities)
+    }
 }
 
 struct Worker {
@@ -275,6 +339,7 @@ struct Worker {
     block_tree: Arc<RwLock<BlockTree>>,
     body_store: Option<Arc<dyn PruneBodyStore>>,
     batch_limits: PreparedBatchLimits,
+    enabled: IndexCapabilities,
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
@@ -282,6 +347,7 @@ struct Worker {
 
 /// Uncommitted contiguous rows based on one unchanged durable watermark.
 struct PendingForward {
+    capabilities: IndexCapabilities,
     durable: Option<IndexWatermark>,
     batch: PreparedBatch,
     deadline: Instant,
@@ -293,6 +359,26 @@ impl PendingForward {
             unreachable!("pending forward batch is nonempty");
         };
         watermark
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SelectedWatermark {
+    Valid(Option<IndexWatermark>),
+    Invalid,
+}
+
+fn selected_watermark(
+    watermarks: IndexWatermarks,
+    capabilities: IndexCapabilities,
+) -> SelectedWatermark {
+    match (capabilities.tx_lookup, capabilities.electrum_history) {
+        (true, false) => SelectedWatermark::Valid(watermarks.tx_lookup),
+        (false, true) => SelectedWatermark::Valid(watermarks.electrum_history),
+        (true, true) if watermarks.tx_lookup == watermarks.electrum_history => {
+            SelectedWatermark::Valid(watermarks.tx_lookup)
+        }
+        (true, true) | (false, false) => SelectedWatermark::Invalid,
     }
 }
 
@@ -438,90 +524,186 @@ impl Worker {
         &self,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
-        let (target, watermark) = self.capture_target_watermark()?;
+        let (target, watermarks) = self.capture_target_watermarks()?;
 
-        if let Some(state) = pending.as_ref() {
-            if state.durable != watermark {
-                return Err(TxIndexWorkerError::PendingDurableChanged);
-            }
-            let endpoint = state.endpoint();
-            let Some(target) = target.as_deref() else {
-                return if self.commit_pending(pending)? {
-                    Ok(ReconcileAction::Progressed)
-                } else {
-                    Ok(ReconcileAction::Stalled)
-                };
+        if pending.is_some() {
+            return self.reconcile_pending(pending, watermarks, target.as_deref());
+        }
+
+        let mut watermarks = watermarks;
+        while let Some((capabilities, watermark)) =
+            self.rollback_selection(watermarks, target.as_deref())
+        {
+            let previous = match self.rollback_one(capabilities, watermark) {
+                Ok(previous) => previous,
+                Err(error) if error.requires_capability_rebuild() => {
+                    tracing::warn!(
+                        error = %error,
+                        tx_lookup = capabilities.tx_lookup,
+                        electrum_history = capabilities.electrum_history,
+                        "index cursor cannot be rolled back; rebuilding selected capabilities"
+                    );
+                    self.writer
+                        .reset_capabilities(capabilities)
+                        .map_err(TxIndexWorkerError::Index)?;
+                    None
+                }
+                Err(error) => return Err(error),
             };
-
-            if endpoint.height == target.height && endpoint.hash == target.hash.to_le_bytes() {
-                if Instant::now() < state.deadline {
-                    return Ok(ReconcileAction::Buffered);
-                }
-                return if self.commit_pending(pending)? {
-                    Ok(ReconcileAction::CaughtUp)
-                } else {
-                    Ok(ReconcileAction::Stalled)
-                };
+            if capabilities.tx_lookup {
+                watermarks.tx_lookup = previous;
             }
-            if endpoint.height < target.height
-                && self.watermark_is_on_target_chain(endpoint, target)
-            {
-                if Instant::now() >= state.deadline {
-                    return if self.commit_pending(pending)? {
-                        Ok(ReconcileAction::Progressed)
-                    } else {
-                        Ok(ReconcileAction::Stalled)
-                    };
-                }
-                return self.catch_up_to(target, watermark, pending);
+            if capabilities.electrum_history {
+                watermarks.electrum_history = previous;
             }
+        }
 
+        let Some(target) = target else {
+            return Ok(ReconcileAction::CaughtUp);
+        };
+        let Some((capabilities, watermark)) = self.forward_selection(watermarks, &target) else {
+            return Ok(ReconcileAction::CaughtUp);
+        };
+        self.catch_up_to(&target, watermark, capabilities, pending)
+    }
+
+    fn reconcile_pending(
+        &self,
+        pending: &mut Option<PendingForward>,
+        watermarks: IndexWatermarks,
+        target: Option<&TipSnapshot>,
+    ) -> Result<ReconcileAction, TxIndexWorkerError> {
+        let Some(state) = pending.as_ref() else {
+            return Err(TxIndexWorkerError::PendingDurableChanged);
+        };
+        if selected_watermark(watermarks, state.capabilities)
+            != SelectedWatermark::Valid(state.durable)
+        {
+            return Err(TxIndexWorkerError::PendingDurableChanged);
+        }
+        let endpoint = state.endpoint();
+        let Some(target) = target else {
             return if self.commit_pending(pending)? {
                 Ok(ReconcileAction::Progressed)
             } else {
                 Ok(ReconcileAction::Stalled)
             };
-        }
-
-        let Some(watermark) = watermark else {
-            let Some(target) = target else {
-                return Ok(ReconcileAction::CaughtUp);
-            };
-            return self.catch_up_to(&target, None, pending);
         };
 
-        let Some(target) = target else {
-            return match self.rollback_to_none(watermark) {
-                Ok(()) => Ok(ReconcileAction::CaughtUp),
-                Err(TxIndexWorkerError::MissingBody { .. }) => Ok(ReconcileAction::Stalled),
-                Err(error) => Err(error),
+        if endpoint.height == target.height && endpoint.hash == target.hash.to_le_bytes() {
+            if Instant::now() < state.deadline {
+                return Ok(ReconcileAction::Buffered);
+            }
+            return if self.commit_pending(pending)? {
+                Ok(ReconcileAction::CaughtUp)
+            } else {
+                Ok(ReconcileAction::Stalled)
             };
-        };
-
-        if !self.watermark_is_on_target_chain(watermark, &target) {
-            let new_watermark = match self.rollback_to_target(watermark, &target) {
-                Ok(watermark) => watermark,
-                Err(TxIndexWorkerError::MissingBody { .. }) => {
-                    return Ok(ReconcileAction::Stalled);
-                }
-                Err(error) => return Err(error),
-            };
-            return self.catch_up_to(&target, new_watermark, pending);
+        }
+        if endpoint.height < target.height && self.watermark_is_on_target_chain(endpoint, target) {
+            if Instant::now() >= state.deadline {
+                return if self.commit_pending(pending)? {
+                    Ok(ReconcileAction::Progressed)
+                } else {
+                    Ok(ReconcileAction::Stalled)
+                };
+            }
+            return self.catch_up_to(target, state.durable, state.capabilities, pending);
         }
 
-        if watermark.height == target.height {
-            return Ok(ReconcileAction::CaughtUp);
+        if self.commit_pending(pending)? {
+            Ok(ReconcileAction::Progressed)
+        } else {
+            Ok(ReconcileAction::Stalled)
         }
-
-        self.catch_up_to(&target, Some(watermark), pending)
     }
 
-    fn capture_target_watermark(
+    fn capture_target_watermarks(
         &self,
-    ) -> Result<(Option<Arc<TipSnapshot>>, Option<IndexWatermark>), TxIndexWorkerError> {
+    ) -> Result<(Option<Arc<TipSnapshot>>, IndexWatermarks), TxIndexWorkerError> {
         let target = self.applied_tip.load_full();
-        let watermark = self.writer.watermark().map_err(TxIndexWorkerError::Index)?;
-        Ok((target, watermark))
+        let watermarks = self
+            .writer
+            .watermarks()
+            .map_err(TxIndexWorkerError::Index)?;
+        Ok((target, watermarks))
+    }
+
+    fn rollback_selection(
+        &self,
+        watermarks: IndexWatermarks,
+        target: Option<&TipSnapshot>,
+    ) -> Option<(IndexCapabilities, IndexWatermark)> {
+        let tx = self
+            .enabled
+            .tx_lookup
+            .then_some(watermarks.tx_lookup)
+            .flatten();
+        let electrum = self
+            .enabled
+            .electrum_history
+            .then_some(watermarks.electrum_history)
+            .flatten();
+        let needs_rollback = |watermark: IndexWatermark| {
+            target.is_none_or(|target| !self.watermark_is_on_target_chain(watermark, target))
+        };
+        let selected = [tx, electrum]
+            .into_iter()
+            .flatten()
+            .filter(|watermark| needs_rollback(*watermark))
+            .max_by_key(|watermark| watermark.height)?;
+        Some((
+            IndexCapabilities {
+                tx_lookup: tx == Some(selected) && needs_rollback(selected),
+                electrum_history: electrum == Some(selected) && needs_rollback(selected),
+            },
+            selected,
+        ))
+    }
+
+    fn forward_selection(
+        &self,
+        watermarks: IndexWatermarks,
+        target: &TipSnapshot,
+    ) -> Option<(IndexCapabilities, Option<IndexWatermark>)> {
+        let tx = self.enabled.tx_lookup.then_some(watermarks.tx_lookup);
+        let electrum = self
+            .enabled
+            .electrum_history
+            .then_some(watermarks.electrum_history);
+        let needs_forward = |watermark: Option<IndexWatermark>| {
+            watermark.is_none_or(|watermark| watermark.height < target.height)
+        };
+        let start_height = |watermark: Option<IndexWatermark>| {
+            watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
+        };
+        let selected_start = [tx, electrum]
+            .into_iter()
+            .flatten()
+            .filter(|watermark| needs_forward(*watermark))
+            .map(start_height)
+            .min()?;
+        let selected_watermark = if selected_start == 0 {
+            None
+        } else {
+            let height = selected_start - 1;
+            [tx, electrum]
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|watermark| watermark.height == height)
+        };
+        Some((
+            IndexCapabilities {
+                tx_lookup: tx.is_some_and(|watermark| {
+                    needs_forward(watermark) && start_height(watermark) == selected_start
+                }),
+                electrum_history: electrum.is_some_and(|watermark| {
+                    needs_forward(watermark) && start_height(watermark) == selected_start
+                }),
+            },
+            selected_watermark,
+        ))
     }
 
     fn watermark_is_on_target_chain(
@@ -582,6 +764,7 @@ impl Worker {
         &self,
         target: &TipSnapshot,
         watermark: Option<IndexWatermark>,
+        capabilities: IndexCapabilities,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
         if self.runtime.should_stop() {
@@ -589,11 +772,12 @@ impl Worker {
         }
 
         let mut state = pending.take().unwrap_or_else(|| PendingForward {
+            capabilities,
             durable: watermark,
             batch: PreparedBatch::new(self.batch_limits),
             deadline: Instant::now() + self.batch_delay,
         });
-        if state.durable != watermark {
+        if state.durable != watermark || state.capabilities != capabilities {
             return Err(TxIndexWorkerError::PendingDurableChanged);
         }
         let start_height = state.batch.watermark().map_or_else(
@@ -652,7 +836,7 @@ impl Worker {
 
                 let prepared = self
                     .writer
-                    .prepare_block(identity.height, identity.hash, &body)
+                    .prepare_block_for(capabilities, identity.height, identity.hash, &body)
                     .map_err(TxIndexWorkerError::Index)?;
                 drop(body);
                 if self.runtime.should_stop() {
@@ -718,42 +902,10 @@ impl Worker {
             Ok(ReconcileAction::Stalled)
         }
     }
-    /// Rolls the index back until the watermark is an ancestor of `target` or
-    /// `None`.
-    fn rollback_to_target(
-        &self,
-        mut watermark: IndexWatermark,
-        target: &TipSnapshot,
-    ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
-        while !self.watermark_is_on_target_chain(watermark, target) {
-            if self.runtime.should_stop() {
-                return Err(TxIndexWorkerError::Stopped);
-            }
-            let new_watermark = self.rollback_one(watermark)?;
-            watermark = match new_watermark {
-                Some(watermark) => watermark,
-                None => return Ok(None),
-            };
-        }
-        Ok(Some(watermark))
-    }
-
-    /// Rolls the index back to `None`.
-    fn rollback_to_none(&self, mut watermark: IndexWatermark) -> Result<(), TxIndexWorkerError> {
-        loop {
-            if self.runtime.should_stop() {
-                return Err(TxIndexWorkerError::Stopped);
-            }
-            match self.rollback_one(watermark)? {
-                Some(next) => watermark = next,
-                None => return Ok(()),
-            }
-        }
-    }
-
-    /// Rolls back one complete block from the single-writer index.
+    /// Rolls back one complete block for every selected capability.
     fn rollback_one(
         &self,
+        capabilities: IndexCapabilities,
         watermark: IndexWatermark,
     ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
         let watermark_hash = Hash256::from_le_bytes(&watermark.hash);
@@ -764,7 +916,7 @@ impl Worker {
         } else {
             let prepared = self
                 .writer
-                .prepare_block(watermark.height, watermark.hash, &body)
+                .prepare_block_for(capabilities, watermark.height, watermark.hash, &body)
                 .map_err(TxIndexWorkerError::Index)?;
             Some(IndexWatermark {
                 height: watermark.height.saturating_sub(1),
@@ -776,7 +928,7 @@ impl Worker {
             return Err(TxIndexWorkerError::Stopped);
         }
         self.writer
-            .commit_rollback_one(prev, &body)
+            .commit_rollback_one_for(capabilities, prev, &body)
             .map_err(TxIndexWorkerError::Index)?;
         Ok(prev)
     }
@@ -846,6 +998,15 @@ enum TxIndexWorkerError {
     NoBodyStore,
     #[error("txindex worker: target chain node missing at height {height}")]
     MissingTargetChain { height: u32 },
+}
+
+impl TxIndexWorkerError {
+    fn requires_capability_rebuild(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingBody { .. } | Self::Index(IndexError::MissingWatermarkIdentity { .. })
+        )
+    }
 }
 
 /// Aggregate work budget shared by every operation in one public query.
@@ -974,7 +1135,7 @@ impl TxIndexQueryEngine {
         Ok(())
     }
 
-    fn with_snapshot<F, T>(&self, f: F) -> Result<T, TxQueryError>
+    fn with_snapshot<F, T>(&self, required: IndexCapabilities, f: F) -> Result<T, TxQueryError>
     where
         F: for<'s> FnOnce(
             &'s dyn TxIndexSnapshot,
@@ -999,16 +1160,21 @@ impl TxIndexQueryEngine {
 
         // Ensure the index watermark is exactly at the applied tip we are
         // answering for, otherwise the snapshot is stale.
-        let watermark = snapshot
-            .watermark()
-            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-        let Some(watermark) = watermark else {
-            return Err(TxQueryError::Retry);
-        };
-        if watermark.height != tip_before.height
-            || watermark.hash != *tip_before.hash.as_byte_array()
-        {
-            return Err(TxQueryError::Retry);
+        for capability in [IndexCapability::TxLookup, IndexCapability::ElectrumHistory] {
+            if !required.contains(capability) {
+                continue;
+            }
+            let watermark = snapshot
+                .capability_watermark(capability)
+                .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
+            let Some(watermark) = watermark else {
+                return Err(TxQueryError::Retry);
+            };
+            if watermark.height != tip_before.height
+                || watermark.hash != *tip_before.hash.as_byte_array()
+            {
+                return Err(TxQueryError::Retry);
+            }
         }
 
         let mut budget = QueryBudget::new();
@@ -1469,7 +1635,10 @@ impl TxIndexQueryEngine {
         Ok(records)
     }
 
-    fn index_info_internal(&self) -> Result<TxIndexInfo, TxQueryError> {
+    fn index_info_internal(
+        &self,
+        required: IndexCapabilities,
+    ) -> Result<TxIndexInfo, TxQueryError> {
         self.query_health()?;
 
         let tip_before = self
@@ -1484,17 +1653,34 @@ impl TxIndexQueryEngine {
         let snapshot = reader
             .snapshot()
             .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-        let watermark = snapshot
-            .watermark()
-            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?;
-
-        // Synced means the durable index watermark is exactly at the published
-        // applied chainstate tip.
-        let synced = watermark.as_ref().is_some_and(|watermark| {
-            watermark.height == tip_before.height
-                && watermark.hash == *tip_before.hash.as_byte_array()
-        });
-        let best_block_height = watermark.map_or(0, |w| w.height);
+        let tx = required
+            .tx_lookup
+            .then(|| snapshot.capability_watermark(IndexCapability::TxLookup))
+            .transpose()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
+            .flatten();
+        let electrum = required
+            .electrum_history
+            .then(|| snapshot.capability_watermark(IndexCapability::ElectrumHistory))
+            .transpose()
+            .map_err(|e| TxQueryError::Storage(e.to_string().into()))?
+            .flatten();
+        let at_tip = |watermark: Option<IndexWatermark>| {
+            watermark.is_some_and(|watermark| {
+                watermark.height == tip_before.height
+                    && watermark.hash == *tip_before.hash.as_byte_array()
+            })
+        };
+        let synced =
+            (!required.tx_lookup || at_tip(tx)) && (!required.electrum_history || at_tip(electrum));
+        let best_block_height = match (required.tx_lookup, required.electrum_history) {
+            (true, true) => tx
+                .map_or(0, |watermark| watermark.height)
+                .min(electrum.map_or(0, |watermark| watermark.height)),
+            (true, false) => tx.map_or(0, |watermark| watermark.height),
+            (false, true) => electrum.map_or(0, |watermark| watermark.height),
+            (false, false) => 0,
+        };
 
         self.query_health()?;
         let tip_after = self.applied_tip.load();
@@ -1517,19 +1703,19 @@ impl TxIndexQueryEngine {
 
 impl TxIndexQuery for TxIndexQueryEngine {
     fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             self.transaction_for(snapshot, tip, budget, txid)
         })
     }
 
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             self.outpoint_value_for(snapshot, tip, budget, outpoint)
         })
     }
 
     fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             Ok(self
                 .locate_transaction_for(snapshot, tip, budget, txid)?
                 .map(|(height, _)| height))
@@ -1537,7 +1723,7 @@ impl TxIndexQuery for TxIndexQueryEngine {
     }
 
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
-        self.index_info_internal()
+        self.index_info_internal(IndexCapabilities::TX_LOOKUP)
     }
 }
 
@@ -1546,14 +1732,14 @@ impl ConfirmedHistoryReader for TxIndexQueryEngine {
         &self,
         scripthash: ScriptHash,
     ) -> Result<ConfirmedHistorySnapshot, ElectrumError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::ALL, |snapshot, tip, budget| {
             self.confirmed_history_snapshot_for(snapshot, tip, budget, scripthash)
         })
         .map_err(tx_query_error_to_electrum)
     }
 
     fn unspent_outputs(&self, scripthash: ScriptHash) -> Result<Vec<HistoryRecord>, ElectrumError> {
-        self.with_snapshot(|snapshot, tip, budget| {
+        self.with_snapshot(IndexCapabilities::ALL, |snapshot, tip, budget| {
             self.unspent_outputs_for(snapshot, tip, budget, scripthash)
         })
         .map_err(tx_query_error_to_electrum)
@@ -1572,7 +1758,9 @@ impl ConfirmedHistoryReader for TxIndexQueryEngine {
     }
 
     fn index_info(&self) -> Result<ElectrumTxIndexInfo, ElectrumError> {
-        let info = TxIndexQuery::index_info(self).map_err(tx_query_error_to_electrum)?;
+        let info = self
+            .index_info_internal(IndexCapabilities::ALL)
+            .map_err(tx_query_error_to_electrum)?;
         Ok(ElectrumTxIndexInfo {
             synced: info.synced,
             best_block_height: info.best_block_height,
@@ -1724,6 +1912,7 @@ mod body_reader_tests {
             block_tree: tree,
             body_store: Some(body_store.clone()),
             batch_limits: DEFAULT_BATCH_LIMITS,
+            enabled: IndexCapabilities::ALL,
             wake_rx,
             quiet_period: Duration::ZERO,
             batch_delay: Duration::ZERO,
@@ -1731,7 +1920,7 @@ mod body_reader_tests {
         let mut pending = None;
 
         assert!(matches!(
-            worker.catch_up_to(&tip, None, &mut pending)?,
+            worker.catch_up_to(&tip, None, IndexCapabilities::ALL, &mut pending)?,
             ReconcileAction::Buffered
         ));
         assert_eq!(body_store.readers.load(Ordering::Acquire), 1);
