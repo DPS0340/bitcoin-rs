@@ -763,7 +763,7 @@ where
 fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
         tx_lookup: config.txindex,
-        script_history: config.script_index.is_some(),
+        script_history: config.script_index,
     }
 }
 
@@ -773,7 +773,7 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         return Ok(None);
     }
     if config.prune_target_mb > 0 {
-        bail!("transaction lookup indexing is not compatible with -prune");
+        bail!("transaction and script indexing are not compatible with -prune");
     }
 
     let txindex_dir = config.data_dir.join("txindex");
@@ -1340,7 +1340,9 @@ impl NodeState {
     /// Returns the node-owned complete generic script-index query adapter.
     #[must_use]
     pub fn script_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery>> {
-        self.config.script_index?;
+        if !self.config.script_index {
+            return None;
+        }
         self.tx_index_query.as_ref().map(|query| {
             let adapter: Arc<dyn bitcoin_rs_rpc::ScriptIndexQuery> = query.clone();
             adapter
@@ -1693,7 +1695,7 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.txindex = false;
-        config.script_index = Some(crate::ScriptIndexMode::History);
+        config.script_index = true;
 
         let state = NodeState::open(config)?;
 
@@ -1738,7 +1740,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("transaction lookup indexing is not compatible with -prune"),
+                .contains("transaction and script indexing are not compatible with -prune"),
             "unexpected error: {error:#}"
         );
         Ok(())

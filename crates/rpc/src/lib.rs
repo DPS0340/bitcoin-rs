@@ -36,4 +36,4 @@ pub use context::{
 };
 pub use error::RpcError;
 pub use handlers::Handler;
-pub use server::{EsploraServer, RpcServer};
+pub use server::RpcServer;

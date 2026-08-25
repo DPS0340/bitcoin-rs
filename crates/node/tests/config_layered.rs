@@ -223,9 +223,9 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 }
 
 #[test]
-fn script_index_mode_is_valid_without_core_txindex() -> Result<()> {
+fn script_index_is_valid_without_core_txindex() -> Result<()> {
     let mut config = Config::default_for_network(Network::Regtest);
-    config.script_index = Some(bitcoin_rs_node::ScriptIndexMode::Current);
+    config.script_index = true;
     config.txindex = false;
 
     config.validate()?;
@@ -233,51 +233,32 @@ fn script_index_mode_is_valid_without_core_txindex() -> Result<()> {
 }
 
 #[test]
-fn scriptindex_cli_flag_selects_history_mode() -> Result<()> {
+fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
     let config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex", "history"],
+        ["bitcoin-rs-node", "--scriptindex"],
     )?;
 
-    assert_eq!(
-        config.script_index,
-        Some(bitcoin_rs_node::ScriptIndexMode::History)
-    );
+    assert!(config.script_index);
     Ok(())
 }
 
 #[test]
-fn scriptindex_environment_selects_current_mode() -> Result<()> {
+fn scriptindex_environment_enables_the_index() -> Result<()> {
     let config = Config::from_layered_sources(
         None,
         None,
         [
             ("BITCOIN_RS_TXINDEX", "false"),
-            ("BITCOIN_RS_SCRIPTINDEX", "current"),
+            ("BITCOIN_RS_SCRIPTINDEX", "true"),
         ],
         ["bitcoin-rs-node"],
     )?;
 
     assert!(!config.txindex);
-    assert_eq!(
-        config.script_index,
-        Some(bitcoin_rs_node::ScriptIndexMode::Current)
-    );
-    Ok(())
-}
-
-#[test]
-fn esplora_bind_flag_selects_a_dedicated_public_listener() -> Result<()> {
-    let address: SocketAddr = "127.0.0.1:3002".parse()?;
-    let config = Config::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--esplora-bind", "127.0.0.1:3002"],
-    )?;
-    assert_eq!(config.esplora_bind, Some(address));
+    assert!(config.script_index);
     Ok(())
 }
 

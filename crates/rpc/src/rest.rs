@@ -289,12 +289,6 @@ fn not_found() -> Response {
     not_found_with("not found")
 }
 
-/// Constructs the Core-style response for an unsupported HTTP path.
-#[must_use]
-pub(crate) fn not_found_response() -> Response {
-    not_found()
-}
-
 fn not_found_with(message: &'static str) -> Response {
     Response {
         status: 404,

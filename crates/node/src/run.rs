@@ -597,7 +597,6 @@ pub fn run(mut config: Config) -> Result<()> {
         Arc::new(parking_lot::RwLock::new(Vec::new())),
         state.tx_index_query(),
         state.script_index_query(),
-        state.config().script_index == Some(bitcoin_rs_node::ScriptIndexMode::History),
     );
     rpc_context = rpc_context.with_block_body_source(block_body_source);
     rpc_context = rpc_context.with_chain_tx_count(state.chain_tx_count_handle());
@@ -612,7 +611,7 @@ pub fn run(mut config: Config) -> Result<()> {
     let rpc_server = bitcoin_rs_rpc::RpcServer::bind(
         state.config().rpc_bind,
         rpc_auth,
-        Arc::clone(&rpc_handler),
+        rpc_handler,
         RPC_MAX_CONNECTIONS,
         RPC_IDLE_TIMEOUT,
         state.config().rest,
@@ -624,24 +623,6 @@ pub fn run(mut config: Config) -> Result<()> {
     let rpc_thread = std::thread::Builder::new()
         .name("bitcoin-rs-rpc".into())
         .spawn(move || rpc_server.serve_with_shutdown(rpc_shutdown))?;
-    let esplora_thread = if let Some(addr) = state.config().esplora_bind {
-        let server = bitcoin_rs_rpc::EsploraServer::bind(
-            addr,
-            Arc::clone(&rpc_handler),
-            RPC_MAX_CONNECTIONS,
-            RPC_IDLE_TIMEOUT,
-        )?;
-        let local_addr = server.local_addr()?;
-        tracing::info!(addr = %local_addr, "esplora listener bound");
-        let esplora_shutdown = Arc::clone(&shutdown);
-        Some(
-            std::thread::Builder::new()
-                .name("bitcoin-rs-esplora".into())
-                .spawn(move || server.serve_with_shutdown(esplora_shutdown))?,
-        )
-    } else {
-        None
-    };
     let peers = state.peers();
     let peer_outbound = state.peer_outbound();
     let p2p_threads = spawn_p2p_listeners(
@@ -674,13 +655,6 @@ pub fn run(mut config: Config) -> Result<()> {
         spawn_fixed_peer_bootstrap(&state, &shutdown)?
     };
     loop_handle.spin(&shutdown)?;
-    if let Some(handle) = esplora_thread {
-        match handle.join() {
-            Ok(Ok(())) => tracing::info!("esplora listener exited cleanly"),
-            Ok(Err(error)) => tracing::warn!(%error, "esplora listener exited with i/o error"),
-            Err(_) => tracing::error!("esplora listener panicked"),
-        }
-    }
     match rpc_thread.join() {
         Ok(Ok(())) => tracing::info!("rpc listener exited cleanly"),
         Ok(Err(error)) => tracing::warn!(%error, "rpc listener exited with i/o error"),
@@ -845,7 +819,7 @@ mod tests {
         config.data_dir = temp.path().join("node-success");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = None;
+        config.script_index = false;
         config.p2p_listen.clear();
         config.metrics_bind = None;
 
@@ -883,7 +857,7 @@ mod tests {
         config.data_dir = temp.path().join("node");
         config.rpc_bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.rpc_auth = crate::Auth::basic("user", "password");
-        config.script_index = None;
+        config.script_index = false;
         config.p2p_listen.clear();
         config.metrics_bind = None;
         // Force a bootstrap worker to spawn (fixed-peer path) so the drain

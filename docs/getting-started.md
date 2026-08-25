@@ -77,27 +77,26 @@ Defaults worth knowing:
 | `--dbcache-mb` | 450 |
 | `--prune-target-mb` | 0, meaning no pruning |
 | `--txindex` | off |
-| `--scriptindex` | off (`current` or `history`) |
-| `--esplora-bind` | off |
+| `--scriptindex` | off |
 | `--blockfilterindex` | off |
 
 The node logs its startup and the address the RPC listener bound to. If you see
 that line, it is running.
 
 `--txindex` advertises Bitcoin Core-compatible transaction lookup support.
-`--scriptindex=current` enables current address/scripthash UTXO queries, while
-`--scriptindex=history` additionally exposes confirmed funding/spending history.
+`--scriptindex` enables current address/scripthash UTXO queries and confirmed
+funding/spending history.
 `--txindex` remains independent and is required for confirmed transaction
 lookups such as `/tx/<txid>` when the transaction is not in the mempool.
-`--esplora-bind <address>` starts an unauthenticated Esplora-only HTTP listener;
-it never exposes JSON-RPC. Its routes use the standard listener root (for
-example `/blocks/tip/height`, `/tx/<txid>`, `/address/<address>/utxo`, and
-`POST /tx`). These index modes are incompatible with pruning
+Esplora is served by the node HTTP listener at the standard root (for example
+`/blocks/tip/height`, `/tx/<txid>`, `/address/<address>/utxo`, and `POST /tx`).
+Address and scripthash routes return `503` until `--scriptindex` catches up, or
+when it is disabled. These index modes are incompatible with pruning
 because backfill and reorg repair require durable block bodies.
 
 The ScriptIndex format is not migrated from the removed Electrum index. Remove
-the old derived index data and let the node rebuild it before enabling either
-ScriptIndex mode.
+the old derived index data and let the node rebuild it before enabling
+`--scriptindex`.
 
 Change the RPC credentials before exposing the port anywhere. The defaults are
 a development convenience, not a secret. `--rpc-cookie` takes a Core-style

@@ -62,7 +62,7 @@ pub mod zmq_publisher;
 pub use bip9_context::BlockTreeContext;
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
-pub use config::{Auth, Config, ScriptIndexMode};
+pub use config::{Auth, Config};
 pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;
 pub use state::{ApplyError, DisconnectError};

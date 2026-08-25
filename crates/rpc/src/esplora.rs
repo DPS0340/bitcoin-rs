@@ -10,7 +10,7 @@ use crate::context::{Context, ScriptIndexRecord, TxQueryError};
 use crate::handlers::Handler;
 use crate::rest::Response;
 
-/// Routes a read-only Esplora request from the dedicated public listener.
+/// Routes a read-only Esplora request from the node HTTP listener.
 #[must_use]
 pub fn route(handler: &Handler, path: &str) -> Response {
     let ctx = handler.context();
@@ -68,9 +68,6 @@ fn script_utxos(ctx: &Context, hash: &str) -> Response {
 }
 
 fn script_history(ctx: &Context, hash: &str) -> Response {
-    if !ctx.script_index_history {
-        return unavailable("ScriptIndex=current does not retain history");
-    }
     let hash = match parse_scripthash(hash) {
         Ok(hash) => hash,
         Err(response) => return response,
@@ -112,9 +109,6 @@ fn script_utxos_for(ctx: &Context, hash: ScriptHash) -> Response {
 }
 
 fn script_history_for(ctx: &Context, hash: ScriptHash) -> Response {
-    if !ctx.script_index_history {
-        return unavailable("ScriptIndex=current does not retain history");
-    }
     let Some(index) = ctx.script_index.as_ref() else {
         return unavailable("script index is disabled");
     };
@@ -272,5 +266,10 @@ mod tests {
             "/scripthash/0000000000000000000000000000000000000000000000000000000000000000/utxo",
         );
         assert_eq!(utxo.status, 503);
+        let history = route(
+            &handler,
+            "/scripthash/0000000000000000000000000000000000000000000000000000000000000000/txs",
+        );
+        assert_eq!(history.status, 503);
     }
 }

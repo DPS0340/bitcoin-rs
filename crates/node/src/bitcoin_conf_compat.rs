@@ -159,19 +159,6 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.script_index.is_some() {
             self.script_index = other.script_index;
-            self.clear_script_index = false;
-        }
-        if other.clear_script_index {
-            self.clear_script_index = true;
-            self.script_index = None;
-        }
-        if other.esplora_bind.is_some() {
-            self.esplora_bind = other.esplora_bind;
-            self.clear_esplora_bind = false;
-        }
-        if other.clear_esplora_bind {
-            self.clear_esplora_bind = true;
-            self.esplora_bind = None;
         }
         if other.p2p_listen.is_some() {
             self.p2p_listen.clone_from(&other.p2p_listen);

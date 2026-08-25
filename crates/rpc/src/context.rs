@@ -866,8 +866,6 @@ pub struct Context {
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Optional node-owned generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
-    /// Whether the configured script index includes full transaction history.
-    pub script_index_history: bool,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
@@ -946,7 +944,6 @@ impl Context {
             filter_index: noop_filter_index(),
             tx_index: None,
             script_index: None,
-            script_index_history: false,
             prune_service: None,
             chain_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
@@ -992,7 +989,6 @@ impl Context {
         added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
         tx_index: Option<Arc<dyn TxIndexQuery>>,
         script_index: Option<Arc<dyn ScriptIndexQuery>>,
-        script_index_history: bool,
     ) -> Self {
         let (mining_sender, mining_notifications) = unbounded();
         Self {
@@ -1008,7 +1004,6 @@ impl Context {
             filter_index,
             tx_index,
             script_index,
-            script_index_history,
             network,
             chain_network,
             peers,
@@ -1690,7 +1685,6 @@ mod tests {
             Arc::clone(&added_nodes),
             None,
             None,
-            false,
         );
         assert!(
             Arc::ptr_eq(&ctx.chain_tip, &chain_tip),
