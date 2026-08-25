@@ -51,7 +51,7 @@ impl ScriptHash {
     }
 }
 
-/// Mempool insertion and mutation errors.
+/// Mempool insertion, mutation, and query-consistency errors.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum MempoolError {
     /// The transaction id already exists in the pool.
@@ -63,6 +63,10 @@ pub enum MempoolError {
     /// The transaction violates mempool policy limits.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// The spending index names an entry that is missing from the pool, or an
+    /// entry whose transaction does not spend the indexed outpoint.
+    #[error("mempool spending index is inconsistent")]
+    InconsistentSpendingIndex,
 }
 
 /// In-memory transaction pool with txid, funding, spending, and fee-priority indexes.
@@ -70,12 +74,14 @@ pub enum MempoolError {
 pub struct Mempool {
     /// Entry arena. Public ids are slab indices represented as `u32`.
     pub entries: Slab<MempoolEntry>,
-    /// Transaction id to entry id lookup.
-    pub by_txid: HashMap<Txid, EntryId>,
+    /// Transaction id to entry id lookup. Owned by this module; reach it
+    /// through `contains_txid`, `entry_id_by_txid`, and `entry_by_txid`.
+    by_txid: HashMap<Txid, EntryId>,
     /// Funding index keyed by script hash then entry id.
     pub funding: std::collections::BTreeSet<(ScriptHash, EntryId)>,
-    /// Spending index keyed by spent outpoint then entry id.
-    pub spending: std::collections::BTreeSet<(OutPoint, EntryId)>,
+    /// Spending index keyed by spent outpoint then entry id. Owned by this
+    /// module; reach it through `is_outpoint_spent` and `outpoint_spender`.
+    spending: std::collections::BTreeSet<(OutPoint, EntryId)>,
     /// Fee-priority index for mining and eviction consumers.
     pub pareto: ParetoFront,
     /// Active mempool policy limits.
@@ -98,6 +104,16 @@ pub struct Mempool {
     total_fee: u128,
     sequence: core::sync::atomic::AtomicU64,
 }
+
+/// The in-pool spender of one outpoint, resolved through the spending index.
+#[derive(Clone, Copy, Debug)]
+pub struct OutpointSpender<'a> {
+    /// The entry whose transaction spends the outpoint.
+    pub entry: &'a MempoolEntry,
+    /// Index of the input within `entry.tx` that spends the outpoint.
+    pub vin: u32,
+}
+
 /// Aggregate mempool counters surfaced through the JSON-RPC `getmempoolinfo`
 /// and Esplora fee-estimate surfaces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -249,6 +265,17 @@ impl Mempool {
         self.entry_by_txid(txid).map(|entry| Arc::clone(&entry.tx))
     }
 
+    /// Returns the public entry id for `txid`, or `None` when the transaction
+    /// is not in the pool.
+    ///
+    /// The id is a slab index, so it is valid only while the pool is not
+    /// mutated: a removal can recycle the slot behind it. Re-resolve through
+    /// this lookup after dropping and re-acquiring a pool lock.
+    #[must_use]
+    pub fn entry_id_by_txid(&self, txid: &bitcoin::Txid) -> Option<EntryId> {
+        self.by_txid.get(txid).copied()
+    }
+
     /// Returns whether the pool currently holds zero entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -390,30 +417,52 @@ impl Mempool {
             .collect()
     }
 
-    /// Returns the txid of the in-mempool transaction that spends `outpoint`,
-    /// or `None` if no entry spends it. Linear scan over entries; acceptable
-    /// for early IBD where the pool is small, future strands may add a per-
-    /// outpoint index.
-    #[must_use]
-    pub fn find_by_outpoint(&self, outpoint: &bitcoin::OutPoint) -> Option<bitcoin::Txid> {
-        for (_id, entry) in &self.entries {
-            for input in &entry.tx.input {
-                if input.previous_output == *outpoint {
-                    return Some(entry.txid);
-                }
-            }
-        }
-        None
-    }
-
     /// Returns whether any in-pool transaction spends `outpoint`.
     ///
-    /// Composes `find_by_outpoint(...).is_some()`. Cheaper than
-    /// `find_by_outpoint` when only the presence answer matters — the wider
-    /// accessor returns the spending txid which callers may not need.
+    /// A range probe over the spending index: the presence of any
+    /// `(outpoint, entry)` row is the answer, and the entries themselves are
+    /// never touched.
     #[must_use]
     pub fn is_outpoint_spent(&self, outpoint: &bitcoin::OutPoint) -> bool {
-        self.find_by_outpoint(outpoint).is_some()
+        self.spending
+            .range(outpoint_range(*outpoint))
+            .next()
+            .is_some()
+    }
+
+    /// Returns the in-pool spender of `outpoint`: the spending entry and the
+    /// exact input (`vin`) of its transaction that spends it, or `None` when
+    /// nothing in the pool spends it.
+    ///
+    /// Resolved through the spending index, so callers never see index
+    /// tuples. If an inconsistent pool indexed more than one spender for one
+    /// outpoint, the first in `EntryId` order wins — the entry a first-match
+    /// scan over `entries` would have settled on. A spending index row that
+    /// names a missing entry, or an entry whose transaction does not spend
+    /// `outpoint`, is [`MempoolError::InconsistentSpendingIndex`].
+    ///
+    /// The returned entry borrows the pool and is valid only while the pool
+    /// is not mutated.
+    pub fn outpoint_spender(
+        &self,
+        outpoint: OutPoint,
+    ) -> Result<Option<OutpointSpender<'_>>, MempoolError> {
+        let Some(&(_, id)) = self.spending.range(outpoint_range(outpoint)).next() else {
+            return Ok(None);
+        };
+        let entry = self
+            .entry(id)
+            .ok_or(MempoolError::InconsistentSpendingIndex)?;
+        let vin = entry
+            .tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .ok_or(MempoolError::InconsistentSpendingIndex)?;
+        Ok(Some(OutpointSpender {
+            entry,
+            vin: u32::try_from(vin).unwrap_or(u32::MAX),
+        }))
     }
 
     /// Adjusts the effective fee of `txid` in the pool by `fee_delta` satoshis.
@@ -1404,18 +1453,97 @@ mod tests {
     }
 
     #[test]
-    fn find_by_outpoint_locates_spending_tx() {
-        let mut pool = Mempool::new(MempoolLimits::default());
-        let prev_txid = bitcoin::Txid::from_byte_array([0xaa; 32]);
+    fn outpoint_spender_returns_the_spending_entry_and_vin() {
+        let mut pool = Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        });
         let outpoint = bitcoin::OutPoint {
-            txid: prev_txid,
+            txid: bitcoin::Txid::from_byte_array([0xaa; 32]),
             vout: 7,
+        };
+        // A decoy input first, so the spending input sits at vin 1 rather
+        // than the position every trivial fixture happens to use.
+        let decoy = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xbb; 32]),
+            vout: 3,
         };
         let spending = bitcoin::Transaction {
             version: bitcoin::transaction::Version(2),
             lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![
+                bitcoin::TxIn {
+                    previous_output: decoy,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                },
+                bitcoin::TxIn {
+                    previous_output: outpoint,
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                },
+            ],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(99_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let spending_txid = spending.compute_txid();
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7));
+        let spender = pool
+            .outpoint_spender(outpoint)
+            .expect("the index and the entries agree")
+            .expect("the pool holds a spender");
+        assert_eq!(spender.entry.txid, spending_txid);
+        assert_eq!(spender.vin, 1);
+    }
+
+    #[test]
+    fn outpoint_spender_returns_none_for_unspent_outpoint() {
+        let pool = Mempool::new(MempoolLimits::default());
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xff; 32]),
+            vout: 0,
+        };
+        assert!(matches!(pool.outpoint_spender(outpoint), Ok(None)));
+    }
+
+    #[test]
+    fn outpoint_spender_errors_when_the_index_names_a_missing_entry() {
+        let mut pool = Mempool::new(MempoolLimits::default());
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xee; 32]),
+            vout: 0,
+        };
+        // No entry was ever inserted, so this row dangles.
+        pool.spending.insert((outpoint, 9_999));
+        assert!(matches!(
+            pool.outpoint_spender(outpoint),
+            Err(MempoolError::InconsistentSpendingIndex)
+        ));
+    }
+
+    #[test]
+    fn outpoint_spender_errors_when_the_entry_does_not_spend_the_outpoint() {
+        let mut pool = Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        });
+        let unrelated = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xdd; 32]),
+            vout: 0,
+        };
+        let indexed = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xcc; 32]),
+            vout: 5,
+        };
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
-                previous_output: outpoint,
+                previous_output: unrelated,
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: bitcoin::Witness::new(),
@@ -1425,19 +1553,59 @@ mod tests {
                 script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let spending_txid = spending.compute_txid();
-        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(spending), 100, 10_000, 1, 7));
-        assert_eq!(pool.find_by_outpoint(&outpoint), Some(spending_txid));
+        let id = pool
+            .insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            .expect("insertion succeeds");
+        // A row the entry's inputs never earn.
+        pool.spending.insert((indexed, id));
+        assert!(matches!(
+            pool.outpoint_spender(indexed),
+            Err(MempoolError::InconsistentSpendingIndex)
+        ));
     }
 
     #[test]
-    fn find_by_outpoint_returns_none_for_unspent_outpoint() {
-        let pool = Mempool::new(MempoolLimits::default());
+    fn outpoint_spender_keeps_the_first_entry_when_two_spenders_are_indexed() {
+        let mut pool = Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        });
         let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array([0xff; 32]),
+            txid: bitcoin::Txid::from_byte_array([0x11; 32]),
             vout: 0,
         };
-        assert_eq!(pool.find_by_outpoint(&outpoint), None);
+        let spender_tx = |fee: u64| bitcoin::Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(fee),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let first = spender_tx(99_000);
+        let first_txid = first.compute_txid();
+        let _ = pool.insert_entry(MempoolEntry::new(Arc::new(first), 100, 10_000, 1, 7));
+        // A second spender of the same outpoint is a pool invariant violation
+        // that insertion does not police; the query must still answer with
+        // the first indexed entry, like the scan it replaces did.
+        let _ = pool.insert_entry(MempoolEntry::new(
+            Arc::new(spender_tx(98_000)),
+            100,
+            10_000,
+            1,
+            7,
+        ));
+        let spender = pool
+            .outpoint_spender(outpoint)
+            .expect("both rows are internally consistent")
+            .expect("the pool holds spenders");
+        assert_eq!(spender.entry.txid, first_txid);
     }
 
     #[test]
@@ -1529,7 +1697,7 @@ mod tests {
         let lone = tx(1, Vec::new());
         let lone_txid = lone.compute_txid();
         pool.insert_entry(MempoolEntry::new(Arc::new(lone), 500, 1_000, 1, 7))?;
-        let Some(&id) = pool.by_txid.get(&lone_txid) else {
+        let Some(id) = pool.entry_id_by_txid(&lone_txid) else {
             panic!("insert failed");
         };
         assert_eq!(pool.descendant_count_inclusive(id), 1);
@@ -1547,7 +1715,7 @@ mod tests {
 
         assert!(pool.prioritise(txid, 500));
 
-        let Some(&id) = pool.by_txid.get(&txid) else {
+        let Some(id) = pool.entry_id_by_txid(&txid) else {
             panic!("tx missing after prioritise");
         };
         let Some(entry) = pool.entry(id) else {
@@ -1568,7 +1736,7 @@ mod tests {
 
         assert!(pool.prioritise(txid, -2_000));
 
-        let Some(&id) = pool.by_txid.get(&txid) else {
+        let Some(id) = pool.entry_id_by_txid(&txid) else {
             panic!("tx missing after prioritise");
         };
         let Some(entry) = pool.entry(id) else {
@@ -1692,8 +1860,8 @@ mod tests {
         let evicted = pool.evict_below_fee_rate(5_000);
 
         assert_eq!(evicted, vec![low_txid]);
-        assert!(!pool.by_txid.contains_key(&low_txid));
-        assert!(pool.by_txid.contains_key(&high_txid));
+        assert!(!pool.contains_txid(&low_txid));
+        assert!(pool.contains_txid(&high_txid));
         Ok(())
     }
 
@@ -1731,8 +1899,8 @@ mod tests {
         let evicted = pool.enforce_size_limit(600);
 
         assert_eq!(evicted.len(), 1);
-        assert!(!pool.by_txid.contains_key(&low_txid));
-        assert!(pool.by_txid.contains_key(&high_txid));
+        assert!(!pool.contains_txid(&low_txid));
+        assert!(pool.contains_txid(&high_txid));
         assert!(pool.total_vsize() <= 600);
         Ok(())
     }
@@ -2249,7 +2417,7 @@ mod spend_index_tests {
     #[test]
     fn a_transaction_reached_through_two_outputs_is_reported_once() {
         let (pool, root_txid) = graph_pool();
-        let Some(&root_id) = pool.by_txid.get(&root_txid) else {
+        let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
             panic!("root missing from the fixture pool");
         };
         let spenders = pool.spender_txids(root_id);
@@ -2267,13 +2435,13 @@ mod spend_index_tests {
     #[test]
     fn spender_txids_is_empty_once_the_spenders_are_gone() {
         let (mut pool, root_txid) = graph_pool();
-        let Some(&root_id) = pool.by_txid.get(&root_txid) else {
+        let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
             panic!("root missing from the fixture pool");
         };
         let removed = pool.remove_entry_and_descendants(root_id);
         assert!(!removed.is_empty());
         // The root left with its descendants, so nothing is left to spend it.
-        assert!(pool.by_txid.get(&root_txid).is_none());
+        assert!(pool.entry_id_by_txid(&root_txid).is_none());
         assert!(pool.is_empty(), "the fixture is a single connected package");
     }
 }

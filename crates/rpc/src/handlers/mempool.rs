@@ -59,12 +59,8 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
 pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
     let pool = ctx.mempool.read();
-    let id = pool
-        .by_txid
-        .get(&txid)
-        .ok_or(RpcError::NotFound("transaction not in mempool"))?;
     let entry = pool
-        .entry(*id)
+        .entry_by_txid(&txid)
         .ok_or(RpcError::NotFound("transaction not in mempool"))?;
     entry_to_value(entry, &pool)
 }
@@ -118,7 +114,7 @@ pub(crate) fn getmempoolancestors(ctx: &Arc<Context>, params: &Value) -> Result<
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
     let verbose = optional_bool(params, 1, false)?;
     let pool = ctx.mempool.read();
-    let Some(&id) = pool.by_txid.get(&txid) else {
+    let Some(id) = pool.entry_id_by_txid(&txid) else {
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.ancestor_ids_for_entry(id);
@@ -129,7 +125,7 @@ pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Resul
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
     let verbose = optional_bool(params, 1, false)?;
     let pool = ctx.mempool.read();
-    let Some(&id) = pool.by_txid.get(&txid) else {
+    let Some(id) = pool.entry_id_by_txid(&txid) else {
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.descendant_ids_for_entry(id);
@@ -178,14 +174,14 @@ fn entry_to_serde(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> s
     let mut depends = Vec::new();
     for input in &entry.tx.input {
         let prev_txid = input.previous_output.txid;
-        if pool.by_txid.contains_key(&prev_txid) {
+        if pool.contains_txid(&prev_txid) {
             depends.push(prev_txid.to_string());
         }
     }
     depends.sort();
     depends.dedup();
 
-    let entry_id = pool.by_txid.get(&txid).copied();
+    let entry_id = pool.entry_id_by_txid(&txid);
 
     // The spend index answers this directly. Scanning every entry's inputs here
     // made a `getrawmempool true` cost O(pool²) input comparisons while holding

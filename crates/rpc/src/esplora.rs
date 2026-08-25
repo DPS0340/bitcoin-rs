@@ -16,7 +16,6 @@ mod projection;
 
 use alloc::sync::Arc;
 
-use core::ops::Bound;
 use core::str::FromStr as _;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -345,28 +344,16 @@ fn outspends_for_transaction(
 fn outspend(projection: &Projection<'_>, outpoint: OutPoint) -> Result<Outspend, Response> {
     let ctx = projection.ctx;
     let pool = ctx.mempool.read();
-    if let Some((_, entry_id)) = pool
-        .spending
-        .range((
-            Bound::Included((outpoint, 0)),
-            Bound::Included((outpoint, u32::MAX)),
-        ))
-        .next()
+    if let Some(spender) = pool
+        .outpoint_spender(outpoint)
+        .map_err(|_| internal("mempool spending index is inconsistent"))?
     {
-        if let Some(entry) = pool.entry(*entry_id) {
-            let vin = entry
-                .tx
-                .input
-                .iter()
-                .position(|input| input.previous_output == outpoint)
-                .ok_or_else(|| internal("mempool spending index is inconsistent"))?;
-            return Ok(Outspend {
-                spent: true,
-                txid: Some(entry.txid.to_string()),
-                vin: Some(u32::try_from(vin).unwrap_or(u32::MAX)),
-                status: Some(Projection::status_value(None)),
-            });
-        }
+        return Ok(Outspend {
+            spent: true,
+            txid: Some(spender.entry.txid.to_string()),
+            vin: Some(spender.vin),
+            status: Some(Projection::status_value(None)),
+        });
     }
     drop(pool);
 
