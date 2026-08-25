@@ -1110,9 +1110,10 @@ impl Context {
         &self,
         tx: Transaction,
         now: u64,
+        max_fee: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        let accept_ctx = self.accept_context(now);
+        let accept_ctx = self.accept_context(now, max_fee);
         let result = {
             let mut pool = self.mempool.write();
             accept_to_mempool(&mut pool, tx, &chain, &accept_ctx)?
@@ -1134,12 +1135,14 @@ impl Context {
         now: u64,
     ) -> Result<AcceptChecks, AcceptError> {
         let chain = ChainUtxoView::new(Arc::clone(&self.utxo));
-        let accept_ctx = self.accept_context(now);
+        // No ceiling: this reports what acceptance would decide, and a fee the
+        // submitter would have capped is still a fee the network would accept.
+        let accept_ctx = self.accept_context(now, None);
         let pool = self.mempool.read();
         check_acceptance(&pool, tx, &chain, &accept_ctx)
     }
 
-    fn accept_context(&self, now: u64) -> AcceptContext {
+    fn accept_context(&self, now: u64, max_fee: Option<u64>) -> AcceptContext {
         AcceptContext {
             // The next block's height: a transaction entering the mempool is a
             // candidate for the block being built, not for the tip.
@@ -1152,6 +1155,7 @@ impl Context {
             },
             // Core's `-acceptnonstdtxn`, which it permits only on regtest.
             require_standard: self.chain_network != Network::Regtest,
+            max_fee,
         }
     }
 

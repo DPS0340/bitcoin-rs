@@ -55,6 +55,13 @@ pub enum MempoolError {
     /// The transaction violates mempool policy limits.
     #[error(transparent)]
     Policy(#[from] PolicyError),
+    /// The pool was over its size limit and this transaction was what it shed.
+    ///
+    /// Bitcoin Core's `mempool full`: it adds the transaction, trims the pool,
+    /// and then checks whether what it added is still there. A transaction that
+    /// was trimmed away was never accepted, however briefly it was indexed.
+    #[error("mempool full: the transaction was evicted by the size limit")]
+    Full,
 }
 
 /// In-memory transaction pool with txid, funding, spending, and fee-priority indexes.
@@ -201,6 +208,15 @@ impl Mempool {
         self.bump_sequence();
         if self.limits.max_total_bytes > 0 && self.total_vsize() > self.limits.max_total_bytes {
             let _evicted = self.enforce_size_limit(self.limits.max_total_bytes);
+            // The trim evicts the worst-paying entries, and the arrival can be
+            // one of them. Reporting the id anyway hands the caller a receipt
+            // for a transaction that is not in the pool -- and `sendrawtransaction`
+            // turns that into a success the sender will act on. Core makes the
+            // same check for the same reason (`validation.cpp`: `LimitMempoolSize`
+            // then `if (!m_pool.exists(...))` -> "mempool full").
+            if !self.by_txid.contains_key(&txid) {
+                return Err(MempoolError::Full);
+            }
         }
         Ok(id)
     }
@@ -1760,6 +1776,58 @@ mod tests {
             pool.total_vsize() <= 1_000,
             "size limit must hold after inserts: {}",
             pool.total_vsize()
+        );
+    }
+
+    /// A transaction the size limit sheds was never accepted.
+    ///
+    /// `insert_entry` indexes the arrival and only then trims the pool, so the
+    /// arrival can be what the trim takes. Returning its id anyway hands the
+    /// caller a receipt for a transaction that is not in the pool, and
+    /// `sendrawtransaction` turns that receipt into a success the sender acts
+    /// on. The paired accept is the point: the same pool, one better-paying
+    /// transaction, must still be admitted.
+    #[test]
+    fn a_transaction_the_size_limit_sheds_is_not_accepted() {
+        fn tx_paying(nonce: u8) -> Arc<bitcoin::Transaction> {
+            Arc::new(bitcoin::Transaction {
+                version: bitcoin::transaction::Version(2),
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(1_000 + u64::from(nonce)),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51, nonce]),
+                }],
+            })
+        }
+
+        let limits = MempoolLimits {
+            max_total_bytes: 1_000,
+            min_relay_fee_sat_per_kvb: 0,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        // Fills the pool at a rate the arrivals below are measured against.
+        let seated = pool.insert_entry(MempoolEntry::new(tx_paying(1), 900, 90_000, 1, 7));
+        assert!(seated.is_ok(), "the first transaction fits: {seated:?}");
+
+        // Pays far less per byte than what is seated, so the trim takes it.
+        let shed = pool.insert_entry(MempoolEntry::new(tx_paying(2), 900, 10, 2, 7));
+        assert!(
+            matches!(shed, Err(MempoolError::Full)),
+            "a transaction evicted by the trim must not report success: {shed:?}"
+        );
+        assert_eq!(pool.len(), 1, "the seated transaction stays");
+
+        // The paired accept: pays more, so the trim takes the other one.
+        let admitted = pool.insert_entry(MempoolEntry::new(tx_paying(3), 900, 900_000, 3, 7));
+        let Ok(id) = admitted else {
+            panic!("a better-paying transaction must be admitted: {admitted:?}");
+        };
+        assert!(
+            pool.entry(id).is_some(),
+            "an accepted id must resolve to an entry"
         );
     }
 

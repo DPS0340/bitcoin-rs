@@ -339,19 +339,79 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
     Ok(json!(result))
 }
 
+/// Fee rate above which `sendrawtransaction` refuses by default, in sat/kvB.
+///
+/// Bitcoin Core's `DEFAULT_MAX_RAW_TX_FEE_RATE`, `COIN / 10` — 0.1 BTC per kvB.
+/// The guard exists because a change-output mistake shows up as an enormous
+/// fee, and a fee is not recoverable once the transaction confirms.
+const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
+
+/// One whole coin per kvB, which Core refuses to accept even as a ceiling.
+const MAX_ACCEPTED_FEE_RATE_SAT_PER_KVB: u64 = 100_000_000;
+
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let tx = decode_tx(raw)?;
     let txid = tx.compute_txid();
-    match ctx.accept_transaction(tx, now_seconds()) {
+    let max_fee = max_fee_for(params, &tx)?;
+    match ctx.accept_transaction(tx, now_seconds(), max_fee) {
         Ok(result) => Ok(json!(result.checks.txid.to_string())),
         // Core does not treat a resubmission as a failure: `BroadcastTransaction`
         // finds the transaction already in the mempool, rebroadcasts it, and
         // returns the txid. Callers retry on a dropped connection and expect
         // that to be idempotent.
         Err(bitcoin_rs_mempool::AcceptError::AlreadyInPool) => Ok(json!(txid.to_string())),
+        // A capped fee is not a rejection by the network's rules -- the
+        // transaction is acceptable and the sender asked not to send it. Core
+        // separates the two: -25 for a guard the caller configured, -26 for
+        // what policy or consensus refused.
+        Err(bitcoin_rs_mempool::AcceptError::FeeExceedsMaximum { .. }) => {
+            Err(RpcError::TxVerifyError(
+                "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".to_owned(),
+            ))
+        }
         Err(error) => Err(RpcError::TxRejected(error.to_string())),
     }
+}
+
+/// The absolute fee ceiling for this submission, from `maxfeerate`.
+///
+/// Bitcoin Core takes a rate in BTC/kvB, turns it into an absolute fee for this
+/// transaction's vsize, and refuses the submission when the fee it computed is
+/// larger. `0` disables the guard; the argument's absence means the default,
+/// which is *not* the same thing.
+fn max_fee_for(params: &Value, tx: &bitcoin::Transaction) -> Result<Option<u64>, RpcError> {
+    let requested = params_array(params)
+        .ok()
+        .and_then(|array| array.get(1).cloned())
+        .filter(|value| !value.is_null());
+
+    let rate_sat_per_kvb = match requested {
+        None => DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB,
+        Some(value) => {
+            let btc = value.as_f64().ok_or(RpcError::InvalidType(
+                "maxfeerate must be an amount in BTC/kvB",
+            ))?;
+            let amount = bitcoin::Amount::from_btc(btc)
+                .map_err(|_| RpcError::InvalidType("maxfeerate must be an amount in BTC/kvB"))?;
+            let rate = amount.to_sat();
+            if rate >= MAX_ACCEPTED_FEE_RATE_SAT_PER_KVB {
+                return Err(RpcError::InvalidParameter(
+                    "Fee rates larger than or equal to 1BTC/kvB are not accepted".to_owned(),
+                ));
+            }
+            rate
+        }
+    };
+
+    if rate_sat_per_kvb == 0 {
+        return Ok(None);
+    }
+    // Core's `CFeeRate::GetFee`: rounded up, and never zero for a non-empty
+    // transaction at a non-zero rate.
+    let vsize = u64::try_from(tx.vsize()).unwrap_or(u64::MAX);
+    let fee = rate_sat_per_kvb.saturating_mul(vsize).saturating_add(999) / 1_000;
+    Ok(Some(fee.max(1)))
 }
 
 pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -1432,6 +1492,90 @@ mod acceptance_tests {
         assert_eq!(value.as_str(), Some(tx.compute_txid().to_string().as_str()));
         assert_eq!(ctx.mempool.read().len(), 1, "the pool must hold it");
         assert!(ctx.mempool.read().contains_txid(&tx.compute_txid()));
+    }
+
+    /// The default fee guard stops a transaction that burns its change.
+    ///
+    /// The classic shape: an input worth 1 BTC, an output worth a hundredth of
+    /// it, and the rest handed to the miner. Core refuses that by default and
+    /// the sender has to say they meant it. This node used to send it, and a
+    /// fee is not recoverable once the transaction confirms.
+    #[test]
+    fn sendrawtransaction_refuses_an_absurd_fee_by_default() {
+        let ctx = Arc::new(Context::new());
+        seed_utxo(&ctx, 8, 100_000_000);
+        // 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on a ~110 vbyte transaction,
+        // which is thousands of times the 0.1 BTC/kvB default ceiling.
+        let tx = spending_tx(8, 1_000_000);
+
+        let error = sendrawtransaction(&ctx, &json!([hex_of(&tx)]))
+            .err()
+            .unwrap_or_else(|| panic!("an absurd fee must not be sent by default"));
+
+        assert_eq!(
+            error.code(),
+            RpcError::CORE_VERIFY_ERROR,
+            "a caller-configured guard is not a network rejection: {error:?}"
+        );
+        assert_eq!(ctx.mempool.read().len(), 0, "and nothing was admitted");
+    }
+
+    /// The guard is the caller's to lift, and the ceiling is a *rate*.
+    ///
+    /// Zero disables it outright. Any other value is BTC per kvB, turned into
+    /// an absolute fee for this transaction's vsize -- so 0.99 BTC/kvB on a
+    /// ~110-vbyte transaction is a ceiling near 0.109 BTC, and a 0.99 BTC fee
+    /// is still far above it. Reading the argument as an absolute cap would
+    /// send that transaction.
+    #[test]
+    fn the_fee_ceiling_is_a_rate_and_zero_disables_it() {
+        let disabled = {
+            let ctx = Arc::new(Context::new());
+            seed_utxo(&ctx, 9, 100_000_000);
+            let tx = spending_tx(9, 1_000_000);
+            let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx), 0]));
+            assert_eq!(ctx.mempool.read().len(), 1, "zero sends it: {sent:?}");
+            sent
+        };
+        assert!(disabled.is_ok(), "{disabled:?}");
+
+        let ctx = Arc::new(Context::new());
+        seed_utxo(&ctx, 12, 100_000_000);
+        let tx = spending_tx(12, 1_000_000);
+        let error = sendrawtransaction(&ctx, &json!([hex_of(&tx), 0.99]))
+            .err()
+            .unwrap_or_else(|| panic!("0.99 BTC/kvB is a ceiling, not a fee allowance"));
+        assert_eq!(error.code(), RpcError::CORE_VERIFY_ERROR, "{error:?}");
+        assert_eq!(ctx.mempool.read().len(), 0);
+    }
+
+    /// A ceiling the transaction stays under changes nothing.
+    #[test]
+    fn sendrawtransaction_admits_a_fee_below_the_ceiling() {
+        let ctx = Arc::new(Context::new());
+        seed_utxo(&ctx, 10, 100_000);
+        // A ~10_000 sat fee on ~110 vbytes, well under the default ceiling.
+        let tx = spending_tx(10, 90_000);
+
+        let sent = sendrawtransaction(&ctx, &json!([hex_of(&tx)]));
+
+        assert!(sent.is_ok(), "an ordinary fee is not capped: {sent:?}");
+        assert_eq!(ctx.mempool.read().len(), 1);
+    }
+
+    /// Core refuses a ceiling of one whole coin per kvB as a parameter.
+    #[test]
+    fn sendrawtransaction_refuses_a_fee_rate_of_a_whole_coin() {
+        let ctx = Arc::new(Context::new());
+        seed_utxo(&ctx, 11, 100_000);
+        let tx = spending_tx(11, 90_000);
+
+        let error = sendrawtransaction(&ctx, &json!([hex_of(&tx), 1.0]))
+            .err()
+            .unwrap_or_else(|| panic!("1 BTC/kvB must be refused"));
+
+        assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER, "{error:?}");
+        assert_eq!(ctx.mempool.read().len(), 0);
     }
 
     /// A rejection must say why, under Core's `RPC_VERIFY_REJECTED` code.
