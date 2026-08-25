@@ -15,6 +15,9 @@
 //! The manifest is deliberately allowed to say *less* than the surface does.
 //! What it may not do is say more.
 
+/// Comparing results against Core's own declared result schemas.
+pub mod schema;
+
 /// The manifest source, embedded so it cannot drift from the binary.
 pub const MANIFEST_TOML: &str = include_str!("../../../docs/api/core-compat.toml");
 
