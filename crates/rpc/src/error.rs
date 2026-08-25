@@ -42,6 +42,12 @@ pub enum RpcError {
     /// The node is still catching up with the chain.
     #[error("{0}")]
     ClientInInitialDownload(&'static str),
+    /// A transaction was refused before the network's rules were consulted.
+    ///
+    /// Bitcoin Core's `RPC_VERIFY_ERROR` (-25), which it uses for submissions
+    /// stopped by a caller-configured guard rather than by consensus or policy.
+    #[error("{0}")]
+    TxVerifyError(String),
     /// Internal server failure.
     #[error("internal error: {0}")]
     Internal(String),
@@ -70,6 +76,8 @@ impl RpcError {
     pub const CORE_CLIENT_NOT_CONNECTED: i64 = -9;
     /// Bitcoin Core still-syncing code, `RPC_CLIENT_IN_INITIAL_DOWNLOAD`.
     pub const CORE_CLIENT_IN_INITIAL_DOWNLOAD: i64 = -10;
+    /// Bitcoin Core general submission-error code, `RPC_VERIFY_ERROR`.
+    pub const CORE_VERIFY_ERROR: i64 = -25;
 
     /// Builds the no-private-keys policy error used by signing RPCs.
     #[must_use]
@@ -89,6 +97,7 @@ impl RpcError {
             Self::NotFound(_) => Self::CORE_NOT_FOUND,
             Self::TxRejected(_) => Self::CORE_VERIFY_REJECTED,
             Self::InvalidParameter(_) => Self::CORE_INVALID_PARAMETER,
+            Self::TxVerifyError(_) => Self::CORE_VERIFY_ERROR,
             Self::ClientNotConnected(_) => Self::CORE_CLIENT_NOT_CONNECTED,
             Self::ClientInInitialDownload(_) => Self::CORE_CLIENT_IN_INITIAL_DOWNLOAD,
             Self::MethodDisabled(_) | Self::Internal(_) => Self::INTERNAL_ERROR,

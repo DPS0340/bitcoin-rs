@@ -446,6 +446,19 @@ struct CheckpointTipV1 {
     height: u32,
     hash: String,
     chainwork: String,
+    /// Cumulative transaction count of the chain through this tip.
+    ///
+    /// `#[serde(default)]` so a manifest written before this field existed
+    /// still parses, restoring as `0` — Bitcoin Core's own "unset" encoding for
+    /// `m_chain_tx_count`. Those chains cannot recover the number without
+    /// re-reading every block body, and this project does not do in-place
+    /// migrations (see `docs/policies/db-migration.md`), so they stay unknown
+    /// until the node is resynced.
+    ///
+    /// Only meaningful for the applied tip; the best-header tip records `0`,
+    /// since headers carry no transactions.
+    #[serde(default)]
+    chain_tx_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -526,6 +539,9 @@ pub(crate) struct RestoredChainstate {
     pub(crate) utxo: UtxoSet,
     pub(crate) coin_stats: CoinStats,
     pub(crate) applied_tip: TipSnapshot,
+    /// Cumulative transaction count through `applied_tip`, or `0` when the
+    /// manifest predates the field.
+    pub(crate) chain_tx_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,6 +783,7 @@ pub(crate) fn write_checkpoint_from_dir(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
+    chain_tx_count: u64,
     rolling_stats: bool,
 ) -> Result<CheckpointWrite, CheckpointError> {
     write_checkpoint_inner(
@@ -776,6 +793,7 @@ pub(crate) fn write_checkpoint_from_dir(
         utxo,
         coin_stats,
         applied_tip,
+        chain_tx_count,
         rolling_stats,
         test_failpoint(),
     )
@@ -798,6 +816,7 @@ fn write_checkpoint(
         utxo,
         coin_stats,
         applied_tip,
+        0,
         rolling_stats,
     )
 }
@@ -818,6 +837,72 @@ fn checkpoint_best_tip_id(
     Ok(applied_id)
 }
 
+/// Logs and gauges what the UTXO set holds in memory, against process RSS.
+///
+/// Runs on the checkpoint path because a checkpoint already walks every record
+/// to serialize the snapshot, so a second pointer-only walk is cheap beside it,
+/// and because a checkpoint is the only moment the set is guaranteed stable.
+///
+/// The residual between `accounted` and RSS is the point: the set can only
+/// account for its own allocations, while the G14 budget is written against the
+/// process. See `docs/benchmarks/utxo-memory.md`.
+fn report_utxo_memory(utxo: &UtxoSet, height: u32) {
+    // Clippy suggests a method reference here; it does not compile, because
+    // `with_stable_view` needs a closure general over the view's lifetime.
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    let report = utxo.with_stable_view(|view| view.memory_report());
+    let accounted = report.accounted_bytes();
+    let rss = crate::metrics::process_rss_bytes();
+
+    metrics::gauge!("node.utxo.records").set(metric_count(report.records));
+    metrics::gauge!("node.utxo.outputs").set(metric_count(report.outputs));
+    metrics::gauge!("node.utxo.record_payload_bytes")
+        .set(metric_count(report.record_payload_bytes));
+    metrics::gauge!("node.utxo.record_allocation_bytes")
+        .set(metric_count(report.record_allocation_bytes));
+    metrics::gauge!("node.utxo.table_bytes").set(metric_count(report.table_bytes));
+    metrics::gauge!("node.utxo.accounted_bytes").set(metric_count(accounted));
+    if let Some(rss) = rss {
+        metrics::gauge!("node.process.rss_bytes").set(metric_count_u64(rss));
+    }
+
+    tracing::info!(
+        height,
+        records = report.records,
+        outputs = report.outputs,
+        record_payload_bytes = report.record_payload_bytes,
+        record_allocation_bytes = report.record_allocation_bytes,
+        table_bytes = report.table_bytes,
+        accounted_bytes = accounted,
+        // Plain numbers, not `?rss`: Debug on an `Option` emits "Some(123)",
+        // which every downstream parser then has to strip.
+        rss_bytes = rss.unwrap_or_default(),
+        rss_known = rss.is_some(),
+        unaccounted_bytes = rss
+            .map(|rss| rss.saturating_sub(accounted.try_into().unwrap_or(u64::MAX)))
+            .unwrap_or_default(),
+        "utxo memory attribution"
+    );
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "gauge values are f64 by the metrics crate's contract"
+)]
+fn metric_count(value: usize) -> f64 {
+    value as f64
+}
+
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "gauge values are f64 by the metrics crate's contract"
+)]
+fn metric_count_u64(value: u64) -> f64 {
+    value as f64
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_checkpoint_inner(
     data_dir: &Dir,
@@ -826,6 +911,7 @@ fn write_checkpoint_inner(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
+    chain_tx_count: u64,
     rolling_stats: bool,
     #[cfg_attr(not(test), allow(unused_variables))] failpoint: Option<CheckpointFailpoint>,
 ) -> Result<CheckpointWrite, CheckpointError> {
@@ -875,6 +961,8 @@ fn write_checkpoint_inner(
     )?;
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish()?;
     sync_file(&utxo_file, failpoint, CheckpointFailpoint::UtxoSync)?;
+
+    report_utxo_memory(utxo, applied_tip.height);
 
     let listener_stats = coin_stats.snapshot();
     if listener_stats.height != applied_tip.height {
@@ -951,8 +1039,8 @@ fn write_checkpoint_inner(
         network: network_name(config.network).to_owned(),
         network_magic: hex_encode(&config.network.magic()),
         genesis_hash: config.genesis.to_string_be(),
-        applied_tip: manifest_tip(headers_write.metadata.applied),
-        best_header_tip: manifest_tip(headers_write.metadata.best),
+        applied_tip: manifest_tip(headers_write.metadata.applied, chain_tx_count),
+        best_header_tip: manifest_tip(headers_write.metadata.best, 0),
         headers: HeadersArtifactV1 {
             file: HEADERS_FILE.to_owned(),
             codec: HEADER_CODEC.to_owned(),
@@ -1077,6 +1165,7 @@ pub(crate) fn write_checkpoint_with_failpoint(
         utxo,
         coin_stats,
         applied_tip,
+        0,
         rolling_stats,
         Some(failpoint),
     )
@@ -1305,6 +1394,7 @@ fn load_payloads(
     manifest: &CheckpointManifestV1,
     headers: RestoredHeaders,
 ) -> Result<RestoredChainstate, Box<(BlockTree, CheckpointError)>> {
+    let chain_tx_count = manifest.applied_tip.chain_tx_count;
     match load_payloads_inner(generation_dir, manifest, &headers) {
         Ok((utxo, coin_stats)) => {
             let applied_node = match headers.tree.node(headers.applied_tip_id) {
@@ -1327,6 +1417,7 @@ fn load_payloads(
                 utxo,
                 coin_stats,
                 applied_tip,
+                chain_tx_count,
             })
         }
         Err(error) => Err(Box::new((headers.tree, error))),
@@ -1695,12 +1786,13 @@ fn require_filename(actual: &str, expected: &str) -> Result<(), CheckpointError>
     Ok(())
 }
 
-fn manifest_tip(tip: HeaderCheckpointTip) -> CheckpointTipV1 {
+fn manifest_tip(tip: HeaderCheckpointTip, chain_tx_count: u64) -> CheckpointTipV1 {
     let chainwork: [u8; 32] = tip.chainwork.to_be_bytes();
     CheckpointTipV1 {
         height: tip.height,
         hash: tip.hash.to_string_be(),
         chainwork: hex_encode(&chainwork),
+        chain_tx_count,
     }
 }
 
@@ -1761,6 +1853,28 @@ fn decode_nibble(byte: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The migration guarantee. `docs/policies/db-migration.md` rules out
+    /// in-place migrations, so a field added to the manifest has to be readable
+    /// as absent — otherwise every existing datadir fails to load and resyncs
+    /// from genesis for the sake of one number.
+    #[test]
+    fn a_manifest_tip_written_before_the_count_existed_reads_as_unknown() {
+        let without = r#"{"height":7,"hash":"00","chainwork":"01"}"#;
+        let Ok(parsed) = serde_json::from_str::<super::CheckpointTipV1>(without) else {
+            panic!("a pre-existing manifest tip must still parse");
+        };
+        assert_eq!(
+            parsed.chain_tx_count, 0,
+            "absent must decode as Core's unset encoding, not as a wrong total"
+        );
+
+        let with = r#"{"height":7,"hash":"00","chainwork":"01","chain_tx_count":42}"#;
+        let Ok(parsed) = serde_json::from_str::<super::CheckpointTipV1>(with) else {
+            panic!("a manifest tip carrying the count must parse");
+        };
+        assert_eq!(parsed.chain_tx_count, 42);
+    }
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
