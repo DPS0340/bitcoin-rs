@@ -2111,7 +2111,7 @@ fn apply_block_admitted(
         return Err(ApplyError::ProofOfWork { hash: block_hash });
     }
 
-    let (prev_tip_state, softfork_state) = if let Some(tip) = prior.as_deref() {
+    let (prev_median_time_past, softfork_state) = if let Some(tip) = prior.as_deref() {
         let tree = handles.block_tree.read();
         let mtp = tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0);
         let softfork_state = crate::bip9_context::contextual_softfork_state(
@@ -2120,27 +2120,16 @@ fn apply_block_admitted(
             Some(tip.tip_id),
             height,
         );
-        (
-            bitcoin_rs_consensus::rust_path::TipState {
-                height: Some(tip.height),
-                block_hash: None,
-                median_time_past: mtp,
-            },
-            softfork_state,
-        )
+        (mtp, softfork_state)
     } else {
         let tree = handles.block_tree.read();
         (
-            bitcoin_rs_consensus::rust_path::TipState {
-                height: None,
-                block_hash: None,
-                median_time_past: 0,
-            },
+            0,
             crate::bip9_context::contextual_softfork_state(&tree, handles.network, None, height),
         )
     };
     let locktime_cutoff = if softfork_state.csv_active {
-        prev_tip_state.median_time_past
+        prev_median_time_past
     } else {
         block.header.time
     };
@@ -2183,16 +2172,14 @@ fn apply_block_admitted(
     check_unseen_header_timestamp(handles, block, block_hash)?;
 
     let block_rules_started = quanta::Instant::now();
-    let block_rules_result =
-        bitcoin_rs_consensus::verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
-            block,
-            &prev_tip_state,
-            bitcoin_rs_consensus::BlockRuleContext {
-                segwit_active: softfork_state.segwit_active,
-            },
-            tx_plan.txids(),
-            tx_plan.witness_presence.is_present(),
-        );
+    let block_rules_result = bitcoin_rs_consensus::verify_block_rules_precomputed(
+        block,
+        bitcoin_rs_consensus::BlockRuleContext {
+            segwit_active: softfork_state.segwit_active,
+        },
+        tx_plan.txids(),
+        tx_plan.witness_presence.is_present(),
+    );
     let block_rules_dur = block_rules_started.elapsed();
     metrics::histogram!("node.apply_block.block_rules_seconds")
         .record(block_rules_dur.as_secs_f64());
@@ -2267,7 +2254,7 @@ fn apply_block_admitted(
         &tx_plan,
         Arc::clone(&resolved),
         height,
-        prev_tip_state.median_time_past,
+        prev_median_time_past,
         softfork_state,
         previous_tip_id,
     );
@@ -3495,7 +3482,7 @@ fn check_bip30_and_bip34(
             .txdata
             .first()
             .ok_or(bitcoin_rs_consensus::ConsensusError::EmptyBlock)?;
-        // `verify_block_rules_borrowed` already pinned the first tx to
+        // `verify_block_rules_precomputed` already pinned the first tx to
         // be the coinbase; relying on that here. `coinbase.input[0]`
         // is the synthetic prevout pointing at the impossible
         // outpoint; its `script_sig` carries the BIP34 height encoding.

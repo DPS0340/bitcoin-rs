@@ -5,7 +5,6 @@ use bitcoin::hashes::Hash as _;
 use bitcoin_rs_primitives::Block;
 
 use crate::ConsensusError;
-use crate::rust_path::TipState;
 use crate::sha256d64::{Avx2Sha256d64, detect_avx2};
 
 /// Context needed for block rules whose activation is height-dependent.
@@ -26,67 +25,30 @@ impl BlockRuleContext {
 }
 
 /// Verifies non-contextual block rules that do not require a UTXO set.
-pub fn verify_block_rules(block: &Block, prev_tip: &TipState) -> Result<(), ConsensusError> {
-    verify_block_rules_contextual(block, prev_tip, BlockRuleContext::non_contextual())
-}
-
-/// Verifies block rules with caller-supplied deployment activation context.
-pub fn verify_block_rules_contextual(
-    block: &Block,
-    prev_tip: &TipState,
-    context: BlockRuleContext,
-) -> Result<(), ConsensusError> {
-    verify_block_rules_borrowed_contextual(&block.0, prev_tip, context)
-}
-
-/// Verifies non-contextual block rules for callers that already hold a
-/// `&bitcoin::Block`, avoiding a clone into [`bitcoin_rs_primitives::Block`].
-pub fn verify_block_rules_borrowed(
-    block: &bitcoin::Block,
-    prev_tip: &TipState,
-) -> Result<(), ConsensusError> {
-    verify_block_rules_borrowed_contextual(block, prev_tip, BlockRuleContext::non_contextual())
-}
-
-/// Verifies block rules for borrowed blocks with caller-supplied deployment context.
-pub fn verify_block_rules_borrowed_contextual(
-    block: &bitcoin::Block,
-    prev_tip: &TipState,
-    context: BlockRuleContext,
-) -> Result<(), ConsensusError> {
-    let txids = block
+pub fn verify_block_rules(block: &Block) -> Result<(), ConsensusError> {
+    let txids: Vec<Txid> = block
+        .0
         .txdata
         .iter()
         .map(bitcoin::Transaction::compute_txid)
-        .collect::<Vec<_>>();
-    verify_block_rules_borrowed_contextual_with_txids(block, prev_tip, context, &txids)
-}
-
-#[doc(hidden)]
-/// Verifies borrowed block rules using caller-supplied transaction IDs.
-pub fn verify_block_rules_borrowed_contextual_with_txids(
-    block: &bitcoin::Block,
-    prev_tip: &TipState,
-    context: BlockRuleContext,
-    txids: &[bitcoin::Txid],
-) -> Result<(), ConsensusError> {
-    let has_witness = block_has_witness(block);
-    verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
-        block,
-        prev_tip,
-        context,
-        txids,
+        .collect();
+    let has_witness = block_has_witness(&block.0);
+    verify_block_rules_precomputed(
+        &block.0,
+        BlockRuleContext::non_contextual(),
+        &txids,
         has_witness,
     )
 }
 
-#[doc(hidden)]
-/// Verifies borrowed block rules using caller-supplied transaction IDs and witness presence.
-pub fn verify_block_rules_borrowed_contextual_with_txids_and_witness_hint(
+/// Verifies block rules for callers that already hold the transaction IDs
+/// and witness presence, such as the node hot path.
+///
+/// Performs no allocation or hashing beyond the existing rule implementation.
+pub fn verify_block_rules_precomputed(
     block: &bitcoin::Block,
-    _prev_tip: &TipState,
     context: BlockRuleContext,
-    txids: &[bitcoin::Txid],
+    txids: &[Txid],
     has_witness: bool,
 ) -> Result<(), ConsensusError> {
     debug_assert_eq!(has_witness, block_has_witness(block));
@@ -277,12 +239,11 @@ mod tests {
     use bitcoin_rs_primitives::Block;
 
     use super::{
-        BlockRuleContext, block_merkle_root_matches_txids, merkle_root_and_mutation,
-        merkle_root_and_mutation_scalar, verify_block_rules, verify_block_rules_contextual,
-        verify_merkle_root_with_txids,
+        BlockRuleContext, block_has_witness, block_merkle_root_matches_txids,
+        merkle_root_and_mutation, merkle_root_and_mutation_scalar, verify_block_rules,
+        verify_block_rules_precomputed, verify_merkle_root_with_txids,
     };
     use crate::ConsensusError;
-    use crate::rust_path::TipState;
     use crate::sha256d64::detect_avx2;
 
     #[test]
@@ -303,7 +264,7 @@ mod tests {
             panic!("single coinbase block should have merkle root");
         };
         fixed.0.header.merkle_root = root;
-        assert_eq!(verify_block_rules(&fixed, &tip()), Ok(()));
+        assert_eq!(verify_block_rules(&fixed), Ok(()));
     }
 
     #[test]
@@ -337,7 +298,7 @@ mod tests {
             txdata: vec![tx],
         });
         assert_eq!(
-            verify_block_rules(&block, &tip()),
+            verify_block_rules(&block),
             Err(ConsensusError::MissingCoinbase)
         );
     }
@@ -347,9 +308,8 @@ mod tests {
         let block = block_with_transactions(vec![coinbase_tx(), witness_spend_tx()]);
 
         assert_eq!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: false,
                 },
@@ -363,9 +323,8 @@ mod tests {
         let block = block_with_transactions(vec![coinbase_tx(), witness_spend_tx()]);
 
         assert_eq!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: true,
                 },
@@ -381,9 +340,8 @@ mod tests {
         let block = block_with_transactions(vec![coinbase]);
 
         assert!(matches!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: false,
                 },
@@ -391,9 +349,8 @@ mod tests {
             Err(ConsensusError::BlockWeight { .. })
         ));
         assert!(matches!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: true,
                 },
@@ -408,9 +365,8 @@ mod tests {
         let block = block_with_transactions(vec![coinbase_tx(), spend_tx(0x02), tx.clone(), tx]);
 
         assert_eq!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: false,
                 },
@@ -426,9 +382,8 @@ mod tests {
         let block = block_with_transactions(vec![coinbase_tx(), tx.clone(), distinct, tx]);
 
         assert_eq!(
-            verify_block_rules_contextual(
+            check_block_rules(
                 &block,
-                &tip(),
                 BlockRuleContext {
                     segwit_active: false,
                 },
@@ -514,14 +469,12 @@ mod tests {
         block.0.header.merkle_root = root;
         block
     }
-
-    const fn tip() -> TipState {
-        TipState {
-            height: None,
-            block_hash: None,
-            median_time_past: 0,
-        }
+    fn check_block_rules(block: &Block, context: BlockRuleContext) -> Result<(), ConsensusError> {
+        let txids: Vec<Txid> = block.0.txdata.iter().map(|tx| tx.compute_txid()).collect();
+        let has_witness = block_has_witness(&block.0);
+        verify_block_rules_precomputed(&block.0, context, &txids, has_witness)
     }
+
     fn txid(seed: u8) -> Txid {
         Txid::from_byte_array([seed; 32])
     }
@@ -740,7 +693,7 @@ mod tests {
             .compute_merkle_root()
             .unwrap_or_else(TxMerkleNode::all_zeros);
         assert_eq!(
-            verify_block_rules(&block, &tip()),
+            verify_block_rules(&block),
             Err(ConsensusError::MissingCoinbase)
         );
     }
