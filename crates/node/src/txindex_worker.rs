@@ -29,8 +29,8 @@ use bitcoin_rs_index::{
 };
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::{
-    BlockBodySource, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot, TxIndexInfo,
-    TxIndexQuery, TxQueryError,
+    BlockBodySource, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
+    TxIndexInfo, TxIndexQuery, TxQueryError,
 };
 use bitcoin_rs_storage::PrefixScanLimit;
 use compact_str::CompactString;
@@ -1498,24 +1498,15 @@ impl TxIndexQueryEngine {
         let funding_outputs = self.funding_outputs_for(snapshot, tip, budget, scripthash)?;
 
         let mut history = Vec::new();
-        let mut unspent = Vec::new();
-        for &(txid, vout, value, height) in &funding_outputs {
-            history.push(ScriptIndexRecord {
-                txid,
-                height,
-                value,
-                vout,
-                spent: false,
-            });
+        for &(txid, _, _, height) in &funding_outputs {
+            history.push(ScriptHistoryRecord { txid, height });
         }
 
-        // Resolve every funding record, retaining it as unspent only when no
-        // indexed candidate contains a transaction that actually spends it.
-        for (txid, vout, value, height) in funding_outputs {
+        // Resolve every funding record to discover the transactions that
+        // spend it.
+        for (txid, vout, _, _) in funding_outputs {
             let outpoint = OutPoint { txid, vout };
             let spend_rows = Self::scan_spending_rows(snapshot, budget, &outpoint)?;
-            let mut spent = false;
-
             let mut last_spend_height: Option<u32> = None;
             let mut cached_spend_block: Option<Block> = None;
             for row in spend_rows {
@@ -1534,47 +1525,20 @@ impl TxIndexQueryEngine {
                         .iter()
                         .any(|input| input.previous_output == outpoint)
                     {
-                        spent = true;
-                        history.push(ScriptIndexRecord {
+                        history.push(ScriptHistoryRecord {
                             txid: tx.compute_txid(),
                             height: spend_height,
-                            value: 0,
-                            vout: 0,
-                            spent: true,
                         });
                         break;
                     }
                 }
             }
-
-            if !spent {
-                unspent.push(ScriptIndexRecord {
-                    txid,
-                    height,
-                    value,
-                    vout,
-                    spent: false,
-                });
-            }
         }
 
-        history.sort_by(|a, b| {
-            a.height
-                .cmp(&b.height)
-                .then_with(|| a.txid.cmp(&b.txid))
-                .then_with(|| a.vout.cmp(&b.vout))
-                .then_with(|| a.value.cmp(&b.value))
-        });
-        history.dedup_by(|a, b| a.txid == b.txid && a.height == b.height && a.vout == b.vout);
-        unspent.sort_by(|a, b| {
-            a.height
-                .cmp(&b.height)
-                .then_with(|| a.txid.cmp(&b.txid))
-                .then_with(|| a.vout.cmp(&b.vout))
-        });
-        unspent.dedup_by(|a, b| a.txid == b.txid && a.height == b.height && a.vout == b.vout);
+        history.sort_by(|a, b| a.height.cmp(&b.height).then_with(|| a.txid.cmp(&b.txid)));
+        history.dedup_by(|a, b| a.txid == b.txid && a.height == b.height);
 
-        Ok(ScriptIndexSnapshot { history, unspent })
+        Ok(ScriptIndexSnapshot { history })
     }
 
     fn unspent_outputs_for(
@@ -1618,7 +1582,6 @@ impl TxIndexQueryEngine {
                     height,
                     value,
                     vout,
-                    spent: false,
                 });
             }
         }
@@ -1744,10 +1707,6 @@ impl ScriptIndexQuery for TxIndexQueryEngine {
             IndexCapabilities::SCRIPT_HISTORY,
             |snapshot, tip, budget| self.unspent_outputs_for(snapshot, tip, budget, scripthash),
         )
-    }
-
-    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
-        self.index_info_internal(IndexCapabilities::SCRIPT_HISTORY)
     }
 }
 

@@ -1,6 +1,12 @@
 # bitcoin-rs Implementation Plan
 
 > **Execution:** Steps use checkbox (`- [ ]`) syntax. Every task in this plan must ship before bitcoin-rs is declared done.
+> **Historical plan.** This document preserves the original implementation roadmap,
+> including its now-removed Electrum design. The current architecture and supported
+> configuration are defined by `CONCEPTS.md` and `docs/getting-started.md`; do not
+> treat unfinished tasks or dependency entries below as current work.
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` to implement task-by-task. Steps use checkbox (`- [ ]`) syntax. **Do not split phases or roadmaps** — every task in this plan must ship before bitcoin-rs is declared done.
 
 **Goal:** Ship `bitcoin-rs` — a single-binary fast Bitcoin full node in Rust 2024. Natively-integrated UTXO (gocoin shape), Electrum-style index (electrs shape), utreexo accumulator (utreexod shape), in-process wallet (PSBT builder; **no private keys, no signing**), in-process mining (getblocktemplate), pruning, BIP157/158 compact filters, coinstats index, four pluggable storage backends (RocksDB / MDBX / fjall / redb), SIMD JSON on the RPC hot path. All production polish (graceful shutdown, ban-score, crash recovery, metrics, structured logging, config) is part of core scope.
 

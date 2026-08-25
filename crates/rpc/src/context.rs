@@ -756,32 +756,33 @@ pub trait TxIndexQuery: Send + Sync {
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
 
-/// One confirmed transaction/output event indexed for a script.
-///
-/// The record is deliberately protocol-neutral.  Esplora, wallets, and future
-/// HTTP clients can choose their own response shape without teaching the node
-/// about a session protocol.
+/// One current unspent output indexed for a script.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScriptIndexRecord {
-    /// Transaction containing the event.
+    /// Transaction creating the output.
     pub txid: Txid,
     /// Confirmed block height.
     pub height: u32,
-    /// Output value in satoshis for funding events.
+    /// Output value in satoshis.
     pub value: u64,
-    /// Output index for funding events.
+    /// Output index.
     pub vout: u32,
-    /// Whether this record represents a spending transaction.
-    pub spent: bool,
 }
 
-/// A point-in-time script-index answer.
+/// One confirmed transaction in script history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScriptHistoryRecord {
+    /// Transaction identifier.
+    pub txid: Txid,
+    /// Confirming block height.
+    pub height: u32,
+}
+
+/// A point-in-time script-history answer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScriptIndexSnapshot {
     /// All confirmed funding and spending transactions for the script.
-    pub history: Vec<ScriptIndexRecord>,
-    /// The current unspent funding outputs from the same snapshot.
-    pub unspent: Vec<ScriptIndexRecord>,
+    pub history: Vec<ScriptHistoryRecord>,
 }
 
 /// Lockless query adapter for the node-owned generic script index.
@@ -795,13 +796,11 @@ pub trait ScriptIndexQuery: Send + Sync {
         &self,
         script_hash: ScriptHash,
     ) -> Result<Vec<ScriptIndexRecord>, TxQueryError>;
-    /// Returns confirmed history and UTXOs from one storage snapshot.
+    /// Returns confirmed history from one storage snapshot.
     fn history_snapshot(
         &self,
         script_hash: ScriptHash,
     ) -> Result<ScriptIndexSnapshot, TxQueryError>;
-    /// Returns generic script-index progress.
-    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
 
 impl TxQueryError {

@@ -30,9 +30,9 @@ pub use auth::Auth;
 pub use context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, BlockRecord, ChainControl, ChainControlError,
     ChainStats, Context, FoldedBlockRecords, NetworkState, PruneResult, PruneService,
-    PruneServiceError, PruneStatus, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
-    TxIndexInfo, TxIndexQuery, TxQueryError, ZmqNotification, chain_stats, fold_block_records,
-    record_at_height, record_at_height_hash,
+    PruneServiceError, PruneStatus, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord,
+    ScriptIndexSnapshot, TxIndexInfo, TxIndexQuery, TxQueryError, ZmqNotification, chain_stats,
+    fold_block_records, record_at_height, record_at_height_hash,
 };
 pub use error::RpcError;
 pub use handlers::Handler;

@@ -94,7 +94,7 @@ Address and scripthash routes return `503` until `--scriptindex` catches up, or
 when it is disabled. These index modes are incompatible with pruning
 because backfill and reorg repair require durable block bodies.
 
-The ScriptIndex format is not migrated from the removed Electrum index. Remove
+The ScriptIndex format does not migrate an existing legacy index. Remove
 the old derived index data and let the node rebuild it before enabling
 `--scriptindex`.
 

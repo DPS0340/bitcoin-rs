@@ -27,8 +27,7 @@ conservative side of the real one.
 
 Block bodies are served from a real `FlatFileBlockStore`, the same open /
 `fstat` / seek / read sequence production takes. Serving them from an in-memory
-map would leave the syscalls out entirely, which is the mistake
-`docs/benchmarks/index-read-path.md` records having made and corrected.
+map would leave the syscalls out entirely, invalidating a read-path comparison.
 
 ## What was measured
 

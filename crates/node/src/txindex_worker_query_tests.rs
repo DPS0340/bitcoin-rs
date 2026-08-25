@@ -8,7 +8,7 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_index::{ScriptHashRow, SpendingPrefixRow, TxidRow};
-use bitcoin_rs_rpc::BlockRecord;
+use bitcoin_rs_rpc::{BlockRecord, ScriptHistoryRecord};
 use bitcoin_rs_storage::{ColumnFamily, PrefixScan, PrefixScanLimit};
 
 use super::*;
@@ -571,7 +571,6 @@ fn funding_history_uses_positioned_range_without_full_body_load()
     let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(snapshot.unspent, snapshot.history);
     assert_eq!(range_calls.load(Ordering::Acquire), 1);
     assert_eq!(full_calls.load(Ordering::Acquire), 0);
     Ok(())
@@ -619,7 +618,6 @@ fn wrong_positioned_funding_falls_back_to_complete_block() -> Result<(), Box<dyn
     let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
     assert_eq!(snapshot.history[0].txid, txid);
-    assert_eq!(snapshot.unspent, snapshot.history);
     assert_eq!(range_calls.load(Ordering::Acquire), 1);
     assert_eq!(full_calls.load(Ordering::Acquire), 1);
     Ok(())
@@ -800,12 +798,11 @@ fn unspent_outputs_reject_aggregate_scan_budget_exhaustion()
 }
 
 #[test]
-fn confirmed_history_snapshot_matches_history_and_unspent_for_funding()
+fn confirmed_history_snapshot_includes_funding_transaction()
 -> Result<(), Box<dyn std::error::Error>> {
     let block = genesis_block(Network::Regtest);
     let txid = block.txdata[0].compute_txid();
     let script = block.txdata[0].output[0].script_pubkey.clone();
-    let value = block.txdata[0].output[0].value.to_sat();
     let scripthash = ScriptHash::new(&script);
     let funding_row = ScriptHashRow::row(scripthash, 0).to_db_row().to_vec();
     let fixture = QueryFixture::new(FixtureConfig {
@@ -823,22 +820,13 @@ fn confirmed_history_snapshot_matches_history_and_unspent_for_funding()
 
     let snapshot = fixture.engine.history_snapshot(scripthash)?;
     assert_eq!(snapshot.history.len(), 1);
-    assert_eq!(snapshot.unspent.len(), 1);
-
-    let expected = ScriptIndexRecord {
-        txid,
-        height: 0,
-        value,
-        vout: 0,
-        spent: false,
-    };
+    let expected = ScriptHistoryRecord { txid, height: 0 };
     assert_eq!(snapshot.history[0], expected);
-    assert_eq!(snapshot.unspent[0], expected);
     Ok(())
 }
 
 #[test]
-fn confirmed_history_snapshot_omits_spent_output_from_unspent()
+fn confirmed_history_snapshot_includes_the_spending_transaction()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut block = genesis_block(Network::Regtest);
     let coinbase = &mut block.txdata[0];
@@ -894,22 +882,12 @@ fn confirmed_history_snapshot_omits_spent_output_from_unspent()
     })?;
 
     let snapshot = fixture.engine.history_snapshot(scripthash)?;
-    assert!(snapshot.unspent.is_empty());
     assert_eq!(snapshot.history.len(), 2);
 
-    let funding_record = ScriptIndexRecord {
-        txid,
-        height: 0,
-        value,
-        vout: 0,
-        spent: false,
-    };
-    let spending_record = ScriptIndexRecord {
+    let funding_record = ScriptHistoryRecord { txid, height: 0 };
+    let spending_record = ScriptHistoryRecord {
         txid: spend_txid,
         height: 0,
-        value: 0,
-        vout: 0,
-        spent: true,
     };
     assert!(snapshot.history.contains(&funding_record));
     assert!(snapshot.history.contains(&spending_record));

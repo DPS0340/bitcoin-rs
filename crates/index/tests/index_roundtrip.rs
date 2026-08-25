@@ -427,7 +427,7 @@ fn format_version_rejection() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn legacy_rows_rejected_and_reset_initializes_version() -> Result<(), Box<dyn std::error::Error>> {
+fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let mut indexer = Indexer::new(Arc::clone(&store));
     let body = read_fixture(0)?;
@@ -437,19 +437,6 @@ fn legacy_rows_rejected_and_reset_initializes_version() -> Result<(), Box<dyn st
         IndexWriter::open(Arc::clone(&store)),
         Err(IndexError::LegacyCursorlessIndex)
     ));
-
-    IndexWriter::reset_index(store.as_ref())?;
-    let writer = IndexWriter::open(Arc::clone(&store))?;
-    assert!(writer.watermark()?.is_none());
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::BlockHeaders),
-        0
-    );
-    assert!(
-        store
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
-    );
     Ok(())
 }
 
@@ -858,28 +845,6 @@ fn batch_caps_admit_oversized_first_block() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn reset_index_deletes_many_rows_in_batches() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    for i in 0..2000_u32 {
-        let mut header = [0_u8; 80];
-        header[..4].copy_from_slice(&i.to_le_bytes());
-        store.put(bitcoin_rs_storage::ColumnFamily::BlockHeaders, &header, &[])?;
-    }
-
-    IndexWriter::reset_index(store.as_ref())?;
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::BlockHeaders),
-        0
-    );
-    assert!(
-        store
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
-    );
-    Ok(())
-}
-
-#[test]
 fn format_version_requires_exact_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     // Extra trailing byte must be rejected even though the prefix is version 3.
@@ -1029,70 +994,5 @@ fn redb_snapshot_preserves_position_values() -> Result<(), Box<dyn std::error::E
         TxPositionValue::decode(&transaction_rows.rows[0].value).map(<[TxPosition]>::len),
         Some(1)
     );
-    Ok(())
-}
-
-#[cfg(feature = "redb")]
-#[test]
-fn redb_cursorless_header_reset_in_bounded_batches() -> Result<(), Box<dyn std::error::Error>> {
-    const MAX_SCAN: bitcoin_rs_storage::PrefixScanLimit = bitcoin_rs_storage::PrefixScanLimit {
-        max_rows: 10_000,
-        max_bytes: 10_000_000,
-    };
-    let temp = tempfile::TempDir::new()?;
-    let store = Arc::new(bitcoin_rs_storage::RedbTxIndexStore::open(temp.path())?);
-
-    // Seed >1000 cursorless fixed rows in one write.
-    let mut batch = store.new_batch();
-    for height in 0..1001_u32 {
-        let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&height.to_le_bytes());
-        batch.put(bitcoin_rs_storage::ColumnFamily::BlockHeaders, &header, b"");
-    }
-    for counter in 1..=3_u32 {
-        let mut key = [0u8; 12];
-        key[0..4].copy_from_slice(&counter.to_le_bytes());
-        batch.put(bitcoin_rs_storage::ColumnFamily::TxConfirmed, &key, b"");
-        batch.put(bitcoin_rs_storage::ColumnFamily::Funding, &key, b"");
-        batch.put(bitcoin_rs_storage::ColumnFamily::Spending, &key, b"");
-    }
-    store.write(batch)?;
-
-    // IndexWriter rejects the legacy cursorless format.
-    assert!(matches!(
-        IndexWriter::open(Arc::clone(&store)),
-        Err(IndexError::LegacyCursorlessIndex)
-    ));
-
-    // reset_index removes every index row in bounded batches, then writes version metadata.
-    IndexWriter::reset_index(store.as_ref())?;
-
-    // After reset, opening succeeds with no watermark.
-    let writer = IndexWriter::open(Arc::clone(&store))?;
-    assert!(writer.watermark()?.is_none());
-
-    // All index rows are gone.
-    for cf in [
-        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
-        bitcoin_rs_storage::ColumnFamily::Funding,
-        bitcoin_rs_storage::ColumnFamily::Spending,
-        bitcoin_rs_storage::ColumnFamily::BlockHeaders,
-    ] {
-        let scan = store.as_ref().scan_prefix_bounded(cf, &[], MAX_SCAN)?;
-        assert!(
-            scan.rows.is_empty(),
-            "{cf:?} still has {} rows after reset",
-            scan.rows.len()
-        );
-    }
-
-    // The format-version key exists in UtxoMeta.
-    assert!(
-        store
-            .as_ref()
-            .get(bitcoin_rs_storage::ColumnFamily::UtxoMeta, &[0x00, b'V'])?
-            .is_some()
-    );
-
     Ok(())
 }
