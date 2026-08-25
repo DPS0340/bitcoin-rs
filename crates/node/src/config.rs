@@ -676,7 +676,12 @@ pub(crate) struct ConfigLayer {
     pub(crate) rpc_password: Option<String>,
     #[arg(long = "rpc-cookie")]
     pub(crate) rpc_cookie: Option<PathBuf>,
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(
+        long = "scriptindex",
+        visible_alias = "script-index",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub(crate) script_index: Option<bool>,
     #[arg(long = "p2p-listen", value_delimiter = ',')]
     pub(crate) p2p_listen: Option<Vec<SocketAddr>>,

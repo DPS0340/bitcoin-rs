@@ -290,7 +290,7 @@ fn tx_queries_can_be_ready_while_script_history_is_backfilling()
         fixture
             .engine
             .history_snapshot(ScriptHash::from_script_bytes(&[])),
-        Err(TxQueryError::Unavailable(_))
+        Err(TxQueryError::Retry)
     ));
     Ok(())
 }
@@ -940,7 +940,7 @@ fn confirmed_history_snapshot_retries_after_aba_on_spending_scan()
 
     assert!(matches!(
         fixture.engine.history_snapshot(scripthash),
-        Err(TxQueryError::Unavailable(_))
+        Err(TxQueryError::Retry)
     ));
     Ok(())
 }
