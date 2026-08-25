@@ -379,11 +379,23 @@ fn lookup(ctx: &Context, id: &str) -> Result<(Transaction, Option<Status>), Resp
         .transaction(&id)
         .map_err(query_error)?
         .ok_or_else(not_found)?;
-    let status = index
-        .transaction_height(&id)
-        .map_err(query_error)?
-        .and_then(|h| status(ctx, h));
+    let status = current_confirmation_status(ctx, &id)?;
     Ok((tx, status))
+}
+
+/// Resolves a transaction's confirmation only against the current applied chain.
+fn current_confirmation_status(ctx: &Context, id: &Txid) -> Result<Option<Status>, Response> {
+    if ctx.mempool.read().transaction_by_txid(id).is_some() {
+        return Ok(None);
+    }
+    let index = ctx
+        .esplora_tx_index
+        .as_ref()
+        .ok_or_else(|| unavailable("transaction lookup index is disabled"))?;
+    Ok(index
+        .transaction_height(id)
+        .map_err(query_error)?
+        .and_then(|height| status(ctx, height)))
 }
 
 fn block(ctx: &Context, text_hash: &str) -> Response {
@@ -457,13 +469,26 @@ fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
     let Some((record, block)) = decode_block(ctx, h) else {
         return not_found();
     };
-    let state = status(ctx, record.height);
+    // A record fetched by hash can be from a losing branch. Do not reuse the
+    // active block at the same height for its transactions' confirmation data.
+    let block_status =
+        (ctx.active_hash_at_height(record.height) == Some(record.hash)).then_some(Status {
+            height: record.height,
+            hash: record.hash,
+            time: record.time,
+        });
     block
         .txdata
         .iter()
         .skip(start)
         .take(CHAIN_PAGE)
-        .map(|tx| tx_value(ctx, tx, state))
+        .map(|tx| {
+            let state = match block_status {
+                Some(state) => Some(state),
+                None => current_confirmation_status(ctx, &tx.compute_txid())?,
+            };
+            tx_value(ctx, tx, state)
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_or_else(|r| r, json_response)
 }
@@ -959,7 +984,11 @@ fn internal(m: &str) -> Response {
 mod tests {
     use alloc::sync::Arc;
 
-    use bitcoin::{Amount, ScriptBuf, TxIn, Witness, absolute, hashes::Hash as _, transaction};
+    use bitcoin::{
+        Amount, Block, BlockHash, CompactTarget, ScriptBuf, TxIn, TxMerkleNode, Witness, absolute,
+        block::Version, hashes::Hash as _, transaction,
+    };
+    use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_mempool::MempoolEntry;
 
     use super::*;
@@ -981,22 +1010,40 @@ mod tests {
         }
     }
 
-    struct StaticTxIndex(Transaction);
+    struct StaticTxIndex {
+        transaction: Transaction,
+        height: Option<u32>,
+    }
+
+    impl StaticTxIndex {
+        fn new(transaction: Transaction) -> Self {
+            Self {
+                transaction,
+                height: None,
+            }
+        }
+    }
 
     impl crate::context::TxIndexQuery for StaticTxIndex {
         fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
-            Ok((self.0.compute_txid() == *txid).then(|| self.0.clone()))
+            Ok((self.transaction.compute_txid() == *txid).then(|| self.transaction.clone()))
         }
 
         fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
-            Ok((self.0.compute_txid() == outpoint.txid)
+            Ok((self.transaction.compute_txid() == outpoint.txid)
                 .then(|| {
-                    self.0
+                    self.transaction
                         .output
                         .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
                 })
                 .flatten()
                 .map(|output| output.value.to_sat()))
+        }
+
+        fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+            Ok((self.transaction.compute_txid() == *txid)
+                .then_some(self.height)
+                .flatten())
         }
 
         fn index_info(&self) -> Result<crate::context::TxIndexInfo, TxQueryError> {
@@ -1078,10 +1125,69 @@ mod tests {
             },
         );
         let mut ctx = Context::new();
-        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex(parent)));
+        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(parent)));
 
         let rendered = tx_value(&ctx, &child, None).expect("prevout indexed");
         assert_eq!(rendered["fee"], json!(25));
         assert_eq!(rendered["vin"][0]["prevout"]["value"], json!(125));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stale_block_transactions_do_not_inherit_active_chain_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transaction = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(125),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        );
+        let stale_block = Block {
+            header: bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 2_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 2,
+            },
+            txdata: vec![transaction.clone()],
+        };
+        let stale_record = crate::context::BlockRecord::from_block(1, &stale_block);
+        let mut ctx = Context::new();
+        ctx.add_block(stale_record.clone());
+        {
+            let mut tree = ctx.block_tree.write();
+            let genesis = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            };
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            let active = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_500,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            };
+            tree.insert_node(Some(genesis_id), active, NodeStatus::Active)?;
+            let tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing active tip"))?;
+            ctx.set_applied_tip((*tip).clone());
+        }
+        ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
+
+        let response = block_txs(&ctx, &stale_record.hash.to_string_be(), 0);
+        assert_eq!(response.status, 200);
+        let rendered: Value = serde_json::from_slice(&response.body)?;
+        assert_eq!(rendered[0]["status"], json!({"confirmed":false}));
+        Ok(())
     }
 }

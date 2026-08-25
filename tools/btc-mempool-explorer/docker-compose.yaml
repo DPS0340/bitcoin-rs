@@ -17,7 +17,7 @@ services:
       BITCOIN_RS_SCRIPTINDEX: "true"
       BITCOIN_RS_LOG_LEVEL: "${BITCOIN_RS_LOG_LEVEL:-info}"
     volumes:
-      - bitcoin-rs-data:/data
+      - ../../data/bitcoin-rs:/data
     ports:
       - "127.0.0.1:${BITCOIN_RS_RPC_PORT:-8332}:8332"
       - "${BITCOIN_RS_P2P_PORT:-8333}:8333"
@@ -61,7 +61,7 @@ services:
       MAXMIND_ENABLED: "false"
       FIAT_PRICE_ENABLED: "false"
     volumes:
-      - mempool-cache:/backend/cache
+      - ../../data/mempool-cache:/backend/cache
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://localhost:8999/api/v1/backend-info >/dev/null"]
       interval: 30s
@@ -100,14 +100,9 @@ services:
       MYSQL_ROOT_PASSWORD: "${MEMPOOL_DATABASE_ROOT_PASSWORD:-change-me}"
       MARIADB_AUTO_UPGRADE: "1"
     volumes:
-      - mempool-db-data:/var/lib/mysql
+      - ../../data/mempool-db:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "mempool", "-p$${MYSQL_PASSWORD}"]
       interval: 5s
       timeout: 5s
       retries: 10
-
-volumes:
-  bitcoin-rs-data:
-  mempool-cache:
-  mempool-db-data:

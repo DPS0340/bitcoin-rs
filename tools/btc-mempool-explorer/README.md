@@ -41,5 +41,7 @@ The following variables are optional:
 | `BITCOIN_RS_P2P_PORT` | `8333` | Host P2P port. |
 | `MEMPOOL_EXPLORER_PORT` | `8080` | Loopback explorer HTTP port. |
 
-Stop the stack with `docker compose down`. Add `--volumes` only when both the
-node indexes and Mempool database can be discarded.
+All persistent data is stored beneath the repository-root `data/` directory:
+`data/bitcoin-rs`, `data/mempool-cache`, and `data/mempool-db`. Stop the stack
+with `docker compose down`; remove those directories only when the node indexes
+and Mempool database can be discarded.
