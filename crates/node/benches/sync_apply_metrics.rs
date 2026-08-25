@@ -74,7 +74,6 @@ const APPLY_STAGE_METRICS: &[(&str, &str)] = &[
         "utxo_listener_event_batches",
         "node.utxo.listener.event_batches_seconds",
     ),
-    ("utxo_listener_replay", "node.utxo.listener.replay_seconds"),
     (
         "block_tree_insert",
         "node.apply_block.block_tree_insert_seconds",

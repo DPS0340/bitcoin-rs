@@ -8,7 +8,7 @@ component: utxo
 severity: medium
 applies_when:
   - "Proposing to eliminate the per-spent-coin ScriptBuf allocation in the UTXO commit listener path"
-  - "Optimizing the UtxoChangeListener removal dispatch (on_remove / on_remove_coins)"
+  - "Optimizing the UtxoChangeListener removal dispatch (on_remove_coins)"
   - "Treating a criterion utxo_commit *_noop_listener win as evidence of a production CoinStats speedup"
   - "Deciding whether a measured hotspot is on the path the production listener actually takes"
 related_components:
@@ -61,24 +61,21 @@ listener (`CoinStatsListener`) takes — not which path the benchmark's `NoopLis
 and the difference is the whole story.
 
 The commit router in `crates/utxo/src/set.rs` (`commit_adds_and_removes`, `commit_multi_shard_with_listener`)
-branches on the number of distinct active shards and on `listener.coalesces_committed_events()`:
+branches only on the number of distinct active shards:
 
 - `active_shard_count == 1` -> `commit_single_shard` -> `commit_single_shard_batch_with_listener`
-  -> `commit_single_shard_with_listener` (`shard.rs:511`), which calls
-  `apply_outpoint_remove_run_with_listener` **directly** and never consults `coalesces_committed_events()`.
-  **This is the optimized direct-dispatch path.**
-- `active_shard_count >= 2` -> `commit_multi_shard_with_listener` (`set.rs:928`). When the listener
-  coalesces (`coalesces_committed_events() == true`), it routes to `commit_serial_coalesced_event_batches`
-  (for `< PARALLEL_LISTENER_SHARD_THRESHOLD == 8`, `set.rs:23`/`936`) or to the parallel
-  `commit_batch_collect_events` -> `on_committed_event_batches` (for `>= 8`). **This is the event-collect
-  path, which the optimization does NOT touch.**
+  -> `commit_single_shard_with_listener`, which calls `on_remove_coins` directly. **This is the optimized
+  direct-dispatch path.**
+- `active_shard_count >= 2` -> `commit_multi_shard_with_listener`. It always routes through collected event
+  batches: serial collection below `PARALLEL_LISTENER_SHARD_THRESHOLD == 8`, and parallel collection at or
+  above the threshold. Both routes end at `on_committed_event_batches`. **This is the event-collect path,
+  which the optimization does NOT touch.**
 
-`CoinStatsListener::coalesces_committed_events()` returns `true` (`crates/coinstats/src/stats.rs:551`).
-Therefore the production listener reaches the optimized direct path **only when `active_shard_count == 1`**
-— i.e. when every coin touched by the commit hashes into a single one of the 256 shards. That is a
-degenerate, tiny-block case. A realistic IBD block touches many distinct txids, scatters across `>= 8`
-shards by birthday math, and routes through the parallel event-collect path every time. There the owned
-`UtxoRemoved` is still built, and the borrowed-removal change has **zero effect**.
+The batch-only listener Interface no longer has a coalescing capability selector or replay fallback. Every
+listener takes the same shard-count route. The production listener reaches the optimized direct path **only
+when `active_shard_count == 1`**: every coin touched by the commit hashes into one of 256 shards. A realistic
+IBD block touches many distinct txids and routes through event collection. There the owned `UtxoRemoved` is
+still built, and the borrowed-removal change has **zero effect**.
 
 **The event path cannot be borrow-optimized without `unsafe`, and must not be.** `table.script_bytes` is a
 `bumpalo::collections::Vec` that **relocates on growth**. Buffered events are read by
@@ -104,12 +101,11 @@ hot path, because dispatch routing — not the line of code — decides what the
 
 Two specific traps it documents:
 
-1. **The benchmark listener is not the production listener.** `utxo_commit`'s `*_noop_listener` benches
-   install a *non-coalescing* `NoopListener`, so `two_shard` / `four_shard` (`< 8` shards) take the direct
-   path and *do* show the win. The production `CoinStatsListener` coalesces those same commits onto the
-   event path. A green criterion delta on those sub-benches is **not** evidence of a production speedup.
-   The only sub-bench representing the production direct path is `concentrated` (single-shard) — itself a
-   degenerate case, so measuring it would only quantify the degenerate win and re-tempt a commit.
+1. **The benchmark listener is not the production listener.** The batch-only Interface now routes the
+   benchmark `NoopListener` and production `CoinStatsListener` identically by shard count, but the noop
+   listener still omits all production MuHash and accounting work. A green criterion delta on a noop
+   sub-bench is not evidence of a production speedup. The direct path exists only for `concentrated`
+   single-shard work, itself a degenerate case.
 
 2. **The concurrency steelman points the wrong way.** "Fewer allocations help under concurrent allocator
    contention" is backwards here: the contended path is `active_shard_count >= 8` -> rayon `par_iter` ->
@@ -124,12 +120,11 @@ does not even qualify as `compress`. **Correct outcome: exit-12, commit nothing,
 
 ## When to Apply
 
-- Before optimizing any `UtxoChangeListener` removal dispatch: trace `commit_adds_and_removes` ->
-  `commit_multi_shard_with_listener` and check `coalesces_committed_events()` for the *production* listener.
-  If it coalesces, the direct `on_remove*` path is reached only at `active_shard_count == 1`.
-- When a criterion `utxo_commit` win appears only on `*_noop_listener` sub-benches with `< 8` active
-  shards: that is the non-coalescing `NoopListener` taking a path the coalescing `CoinStatsListener` does
-  not — discount it.
+- Before optimizing any `UtxoChangeListener` removal dispatch, trace `commit_adds_and_removes` through
+  `commit_multi_shard_with_listener`. The direct `on_remove_coins` path is reached only when
+  `active_shard_count == 1`; every multi-shard commit uses owned event batches.
+- When a criterion `utxo_commit` win appears only on `*_noop_listener` sub-benches, prove it survives the
+  production `CoinStatsListener` accounting work before crediting it.
 - Whenever a removal/event optimization is tempted to borrow from `table.script_bytes` across an
   `entry.remove()` *and* an insert: stop. The bumpalo slab relocates on growth; buffered events read it
   after later inserts. Borrowing there is a consensus-grade use-after-free.

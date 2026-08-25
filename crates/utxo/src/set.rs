@@ -124,56 +124,41 @@ pub enum UtxoError {
 }
 
 /// Receives UTXO mutations committed to durable shard state.
+///
+/// The notification interface is batch-only and order-independent. A commit
+/// that touches exactly one shard delivers its same-transaction runs directly
+/// through [`Self::on_insert_coins`] and [`Self::on_remove_coins`]; a commit
+/// that touches two or more shards collects every shard's events and delivers
+/// them once, after all shard mutations have landed, through
+/// [`Self::on_committed_event_batches`].
+///
+/// Multi-shard batch order and chunking are not semantic. Batches arrive in
+/// shard order and each groups one shard's same-transaction runs, but they may
+/// be chunked, merged, or split without changing the mutations they
+/// represent. A listener must derive the same final state from direct
+/// single-shard batches and collected multi-shard batches. The one ordering
+/// guarantee that always holds within a commit: the removal of an outpoint is
+/// delivered before the insertion that replaces it — overwrite removals
+/// arrive as one-element `RemoveBatch` events ahead of their replacement
+/// `InsertBatch`.
 pub trait UtxoChangeListener {
-    /// Called after an output has been inserted into its shard.
-    fn on_insert(&self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool);
+    /// Called after a run of same-transaction outputs has been inserted into
+    /// its shard.
+    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]);
 
-    /// Called after a same-transaction run of outputs has been inserted.
-    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
-        for insertion in insertions {
-            self.on_insert(
-                insertion.op,
-                insertion.txout,
-                insertion.height,
-                insertion.coinbase,
-            );
-        }
-    }
+    /// Called after a run of same-transaction outputs has been removed from
+    /// its shard. Overwrite removals arrive as one-element batches ordered
+    /// ahead of their replacement insertions.
+    fn on_remove_coins(&self, removals: &[UtxoRemoved]);
 
-    /// Called after an output has been removed from its shard.
-    fn on_remove(&self, op: &OutPoint, txout: &TxOut, height: u32);
-
-    /// Called after an output has been removed, with the coinbase flag retained.
-    fn on_remove_coin(&self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        let _ = coinbase;
-        self.on_remove(op, txout, height);
-    }
-
-    /// Called after a same-transaction run of outputs has been removed.
-    fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
-        for removal in removals {
-            self.on_remove_coin(
-                &removal.op,
-                &removal.txout,
-                removal.height,
-                removal.coinbase,
-            );
-        }
-    }
-
-    #[doc(hidden)]
-    /// Applies committed shard event batches when this listener's final state is event-order
-    /// independent.
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) -> bool {
-        let _ = batches;
-        false
-    }
-
-    #[doc(hidden)]
-    /// Returns true when this listener accepts coalesced committed event batches.
-    fn coalesces_committed_events(&self) -> bool {
-        false
-    }
+    /// Called once with every collected shard event batch for a multi-shard
+    /// commit, synchronously, after the shard mutations have landed and
+    /// before any shard error is returned.
+    ///
+    /// Every event for a mutation that landed is delivered here even when a
+    /// later shard failed: a partial commit stays fatal and never rolls back,
+    /// so the listener must observe exactly what the shards now hold.
+    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]);
 
     /// Returns the current `MuHash3072` snapshot trailer, when this listener tracks one.
     fn muhash3072(&self) -> Option<[u8; 384]> {
@@ -236,51 +221,51 @@ impl UtxoRemoved {
 enum UtxoChangeEvent<'a> {
     InsertBatch(SmallVec<[UtxoInserted<'a>; 8]>),
     RemoveBatch(SmallVec<[UtxoRemoved; 2]>),
-    RemoveCoin(UtxoRemoved),
 }
 
-#[derive(Default)]
-#[doc(hidden)]
+/// Events collected from the shards one multi-shard commit touched.
+///
+/// Handed to [`UtxoChangeListener::on_committed_event_batches`] after every
+/// shard mutation has landed. Batch order and chunking are not semantic:
+/// batches arrive in shard order and each groups one shard's
+/// same-transaction runs, but a listener must derive the same final state
+/// however the events are chunked or merged. Within one commit the removal
+/// of an outpoint always precedes the insertion that replaces it; overwrite
+/// removals appear as one-element `RemoveBatch` events ahead of their
+/// replacement `InsertBatch`.
 pub struct UtxoChangeEvents<'a> {
     events: Vec<UtxoChangeEvent<'a>>,
     operation_count: usize,
-    coalesced_insert_capacity: usize,
-    coalesced_remove_capacity: usize,
+    insert_capacity: usize,
+    remove_capacity: usize,
 }
 
-#[doc(hidden)]
 /// Read-only view over one committed UTXO event.
+///
+/// One inserted batch or one removed batch. Removed batches include the
+/// one-element batches emitted at overwrite boundaries, ordered ahead of
+/// their replacement insertions.
 #[derive(Clone, Copy)]
 pub enum UtxoCommittedEvent<'batch, 'coin> {
     /// Batch of inserted UTXOs.
     InsertBatch(&'batch [UtxoInserted<'coin>]),
-    /// Batch of removed UTXOs.
+    /// Batch of removed UTXOs, including one-element overwrite removals.
     RemoveBatch(&'batch [UtxoRemoved]),
-    /// Single removed UTXO emitted at an overwrite boundary.
-    RemoveCoin(&'batch UtxoRemoved),
 }
 
 impl<'a> UtxoChangeEvents<'a> {
-    pub(crate) fn with_coalesced_capacity(insertions: usize, removals: usize) -> Self {
+    pub(crate) fn with_capacity_hint(insertions: usize, removals: usize) -> Self {
         Self {
             events: Vec::with_capacity(usize::from(insertions > 0) + usize::from(removals > 0)),
             operation_count: 0,
-            coalesced_insert_capacity: insertions,
-            coalesced_remove_capacity: removals,
+            insert_capacity: insertions,
+            remove_capacity: removals,
         }
     }
 
+    /// Appends a run of insertions, merging into the previous insert batch
+    /// when the stream still ends on one.
     pub(crate) fn push_insert_batch(&mut self, insertions: SmallVec<[UtxoInserted<'a>; 8]>) {
-        if !insertions.is_empty() {
-            self.operation_count = self.operation_count.saturating_add(insertions.len());
-            self.events.push(UtxoChangeEvent::InsertBatch(insertions));
-        }
-    }
-
-    pub(crate) fn push_insert_batch_coalesced(
-        &mut self,
-        insertions: SmallVec<[UtxoInserted<'a>; 8]>,
-    ) {
         if insertions.is_empty() {
             return;
         }
@@ -289,29 +274,27 @@ impl<'a> UtxoChangeEvents<'a> {
             existing.extend(insertions);
         } else {
             let mut insertions = insertions;
-            reserve_smallvec(&mut insertions, self.coalesced_insert_capacity);
+            reserve_smallvec(&mut insertions, self.insert_capacity);
             self.events.push(UtxoChangeEvent::InsertBatch(insertions));
         }
     }
 
-    pub(crate) fn push_insert_coin_coalesced(&mut self, insertion: UtxoInserted<'a>) {
+    /// Appends one insertion, merging into the previous insert batch.
+    pub(crate) fn push_insert_coin(&mut self, insertion: UtxoInserted<'a>) {
         self.operation_count = self.operation_count.saturating_add(1);
         if let Some(UtxoChangeEvent::InsertBatch(existing)) = self.events.last_mut() {
             existing.push(insertion);
         } else {
             let mut insertions = SmallVec::<[UtxoInserted<'a>; 8]>::new();
-            reserve_smallvec(&mut insertions, self.coalesced_insert_capacity);
+            reserve_smallvec(&mut insertions, self.insert_capacity);
             insertions.push(insertion);
             self.events.push(UtxoChangeEvent::InsertBatch(insertions));
         }
     }
 
+    /// Appends a run of removals, merging into the previous remove batch when
+    /// the stream still ends on one.
     pub(crate) fn push_remove_batch(&mut self, removals: SmallVec<[UtxoRemoved; 2]>) {
-        self.operation_count = self.operation_count.saturating_add(removals.len());
-        self.events.push(UtxoChangeEvent::RemoveBatch(removals));
-    }
-
-    pub(crate) fn push_remove_batch_coalesced(&mut self, removals: SmallVec<[UtxoRemoved; 2]>) {
         if removals.is_empty() {
             return;
         }
@@ -320,17 +303,23 @@ impl<'a> UtxoChangeEvents<'a> {
             existing.extend(removals);
         } else {
             let mut removals = removals;
-            reserve_smallvec(&mut removals, self.coalesced_remove_capacity);
+            reserve_smallvec(&mut removals, self.remove_capacity);
             self.events.push(UtxoChangeEvent::RemoveBatch(removals));
         }
     }
 
+    /// Appends one removal as its own remove batch.
+    ///
+    /// Used for overwrite removals, which must not merge with a previous remove
+    /// batch so the replacement insert is ordered after this exact removal.
     pub(crate) fn push_remove_coin(&mut self, removal: UtxoRemoved) {
         self.operation_count = self.operation_count.saturating_add(1);
-        self.events.push(UtxoChangeEvent::RemoveCoin(removal));
+        let mut removals = SmallVec::<[UtxoRemoved; 2]>::new();
+        removals.push(removal);
+        self.events.push(UtxoChangeEvent::RemoveBatch(removals));
     }
 
-    /// Visits committed events in the same order the fallback listener replay uses.
+    /// Visits committed events in collection order.
     pub fn for_each(&self, mut visit: impl FnMut(UtxoCommittedEvent<'_, 'a>)) {
         for event in &self.events {
             match event {
@@ -339,9 +328,6 @@ impl<'a> UtxoChangeEvents<'a> {
                 }
                 UtxoChangeEvent::RemoveBatch(removals) => {
                     visit(UtxoCommittedEvent::RemoveBatch(removals));
-                }
-                UtxoChangeEvent::RemoveCoin(removal) => {
-                    visit(UtxoCommittedEvent::RemoveCoin(removal));
                 }
             }
         }
@@ -354,6 +340,8 @@ impl<'a> UtxoChangeEvents<'a> {
     }
 
     /// Visits committed events split into bounded chunks.
+    ///
+    /// Chunking is not semantic: any chunk size yields the same mutations.
     pub fn for_each_chunk<'batch>(
         &'batch self,
         chunk_size: usize,
@@ -372,24 +360,6 @@ impl<'a> UtxoChangeEvents<'a> {
                         visit(UtxoCommittedEvent::RemoveBatch(chunk));
                     }
                 }
-                UtxoChangeEvent::RemoveCoin(removal) => {
-                    visit(UtxoCommittedEvent::RemoveCoin(removal));
-                }
-            }
-        }
-    }
-
-    fn replay(&self, listener: &(dyn UtxoChangeListener + Send + Sync)) {
-        for event in &self.events {
-            match event {
-                UtxoChangeEvent::InsertBatch(insertions) => listener.on_insert_coins(insertions),
-                UtxoChangeEvent::RemoveBatch(removals) => listener.on_remove_coins(removals),
-                UtxoChangeEvent::RemoveCoin(removal) => listener.on_remove_coin(
-                    &removal.op,
-                    &removal.txout,
-                    removal.height,
-                    removal.coinbase,
-                ),
             }
         }
     }
@@ -965,7 +935,7 @@ impl UtxoSet {
             for &shard_idx in &active_shards[..active_shard_count] {
                 let shard_adds = buckets.adds(shard_idx);
                 let shard_removes = buckets.removes(shard_idx);
-                self.shards[shard_idx].commit_batch(shard_adds, shard_removes, None)?;
+                self.shards[shard_idx].commit_batch(shard_adds, shard_removes)?;
             }
             return Ok(());
         }
@@ -983,8 +953,7 @@ impl UtxoSet {
                         let shard_adds = buckets.adds(shard_idx);
                         let shard_removes = buckets.removes(shard_idx);
                         let shard = &shards[shard_idx];
-                        if let Err(error) = shard.commit_batch(shard_adds, shard_removes, listener)
-                        {
+                        if let Err(error) = shard.commit_batch(shard_adds, shard_removes) {
                             errors.lock().push(error);
                         }
                     }
@@ -1007,22 +976,13 @@ impl UtxoSet {
         buckets: &ShardCommitBuckets<'_>,
         listener: &(dyn UtxoChangeListener + Send + Sync),
     ) -> Result<(), UtxoError> {
-        let coalesce_events = listener.coalesces_committed_events();
         if active_shard_count < PARALLEL_LISTENER_SHARD_THRESHOLD {
-            if coalesce_events {
-                return self.commit_serial_coalesced_event_batches(
-                    active_shards,
-                    active_shard_count,
-                    buckets,
-                    listener,
-                );
-            }
-            for &shard_idx in &active_shards[..active_shard_count] {
-                let shard_adds = buckets.adds(shard_idx);
-                let shard_removes = buckets.removes(shard_idx);
-                self.shards[shard_idx].commit_batch(shard_adds, shard_removes, Some(listener))?;
-            }
-            return Ok(());
+            return self.commit_serial_event_batches(
+                active_shards,
+                active_shard_count,
+                buckets,
+                listener,
+            );
         }
 
         let errors = Mutex::new(Vec::new());
@@ -1033,25 +993,18 @@ impl UtxoSet {
                 let shard_removes = buckets.removes(shard_idx);
                 let shard = &self.shards[shard_idx];
                 let (shard_events, result) =
-                    shard.commit_batch_collect_events(shard_adds, shard_removes, coalesce_events);
+                    shard.commit_batch_collect_events(shard_adds, shard_removes);
                 if let Err(error) = result {
                     errors.lock().push(error);
                 }
                 shard_events
             })
             .collect();
+
         let listener_started = Instant::now();
-        let handled_batches = listener.on_committed_event_batches(&shard_events);
+        listener.on_committed_event_batches(&shard_events);
         metrics::histogram!("node.utxo.listener.event_batches_seconds")
             .record(listener_started.elapsed().as_secs_f64());
-        if !handled_batches {
-            let replay_started = Instant::now();
-            for shard_events in &shard_events {
-                shard_events.replay(listener);
-            }
-            metrics::histogram!("node.utxo.listener.replay_seconds")
-                .record(replay_started.elapsed().as_secs_f64());
-        }
 
         let mut errors = errors.into_inner();
         if let Some(error) = errors.pop() {
@@ -1061,7 +1014,7 @@ impl UtxoSet {
         Ok(())
     }
 
-    fn commit_serial_coalesced_event_batches(
+    fn commit_serial_event_batches(
         &self,
         active_shards: &[usize; UtxoKey::SHARD_COUNT],
         active_shard_count: usize,
@@ -1075,24 +1028,17 @@ impl UtxoSet {
             let shard_adds = buckets.adds(shard_idx);
             let shard_removes = buckets.removes(shard_idx);
             let (events, result) =
-                self.shards[shard_idx].commit_batch_collect_events(shard_adds, shard_removes, true);
+                self.shards[shard_idx].commit_batch_collect_events(shard_adds, shard_removes);
             if let Err(shard_error) = result {
                 error = Some(shard_error);
             }
             shard_events.push(events);
         }
+
         let listener_started = Instant::now();
-        let handled_batches = listener.on_committed_event_batches(&shard_events);
+        listener.on_committed_event_batches(&shard_events);
         metrics::histogram!("node.utxo.listener.event_batches_seconds")
             .record(listener_started.elapsed().as_secs_f64());
-        if !handled_batches {
-            let replay_started = Instant::now();
-            for shard_events in &shard_events {
-                shard_events.replay(listener);
-            }
-            metrics::histogram!("node.utxo.listener.replay_seconds")
-                .record(replay_started.elapsed().as_secs_f64());
-        }
 
         if let Some(error) = error {
             return Err(error);

@@ -25,8 +25,9 @@ pub mod undo_codec;
 pub use key::{UtxoBuildHasher, UtxoKey};
 pub use record::{OneUtxoOut, RecordCodec, UtxoRecord};
 pub use set::{
-    BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeListener, UtxoError, UtxoInserted,
-    UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet, UtxoSetView,
+    BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
+    UtxoCommittedEvent, UtxoError, UtxoInserted, UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet,
+    UtxoSetView,
 };
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{

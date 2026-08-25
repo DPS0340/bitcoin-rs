@@ -4,9 +4,9 @@ use std::sync::Arc;
 use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, varint};
 use bitcoin_rs_utxo::{
-    BlockChanges, UtxoAdd, UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey, UtxoSet,
-    hash_serialized_3,
-    set::{BorrowedBlockChanges, BorrowedUtxoAdd, UtxoChangeEvents, UtxoCommittedEvent},
+    BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoError,
+    UtxoInserted, UtxoKey, UtxoRemoved, UtxoSet, hash_serialized_3,
+    set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ListenerEvent {
     InsertBatch(Vec<u32>),
-    Insert(u32),
     Remove(u32),
 }
 
@@ -24,50 +23,76 @@ struct RecordingListener {
 }
 
 #[derive(Clone, Debug)]
-struct CoalescingRecordingListener {
+struct BatchRecordingListener {
     events: Arc<Mutex<Vec<ListenerEvent>>>,
     batch_calls: Arc<Mutex<usize>>,
     operation_counts: Arc<Mutex<Vec<usize>>>,
 }
 
-impl UtxoChangeListener for RecordingListener {
-    fn on_insert(&self, op: &OutPoint, _txout: &TxOut, _height: u32, _coinbase: bool) {
-        self.events.lock().push(ListenerEvent::Insert(op.vout));
-    }
+fn record_insertions(events: &Arc<Mutex<Vec<ListenerEvent>>>, insertions: &[UtxoInserted<'_>]) {
+    events.lock().push(ListenerEvent::InsertBatch(
+        insertions
+            .iter()
+            .map(|insertion| insertion.op.vout)
+            .collect(),
+    ));
+}
 
-    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
-        self.events.lock().push(ListenerEvent::InsertBatch(
-            insertions
-                .iter()
-                .map(|insertion| insertion.op.vout)
-                .collect(),
-        ));
-    }
+fn record_removals(events: &Arc<Mutex<Vec<ListenerEvent>>>, removals: &[UtxoRemoved]) {
+    events.lock().extend(
+        removals
+            .iter()
+            .map(|removal| ListenerEvent::Remove(removal.op.vout)),
+    );
+}
 
-    fn on_remove(&self, op: &OutPoint, _txout: &TxOut, _height: u32) {
-        self.events.lock().push(ListenerEvent::Remove(op.vout));
+fn record_event_batches(events: &Arc<Mutex<Vec<ListenerEvent>>>, batches: &[UtxoChangeEvents<'_>]) {
+    let mut events = events.lock();
+    for batch in batches {
+        batch.for_each(|event| match event {
+            UtxoCommittedEvent::InsertBatch(insertions) => {
+                events.push(ListenerEvent::InsertBatch(
+                    insertions
+                        .iter()
+                        .map(|insertion| insertion.op.vout)
+                        .collect(),
+                ));
+            }
+            UtxoCommittedEvent::RemoveBatch(removals) => {
+                events.extend(
+                    removals
+                        .iter()
+                        .map(|removal| ListenerEvent::Remove(removal.op.vout)),
+                );
+            }
+        });
     }
 }
 
-impl UtxoChangeListener for CoalescingRecordingListener {
-    fn on_insert(&self, op: &OutPoint, _txout: &TxOut, _height: u32, _coinbase: bool) {
-        self.events.lock().push(ListenerEvent::Insert(op.vout));
-    }
-
+impl UtxoChangeListener for RecordingListener {
     fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
-        self.events.lock().push(ListenerEvent::InsertBatch(
-            insertions
-                .iter()
-                .map(|insertion| insertion.op.vout)
-                .collect(),
-        ));
+        record_insertions(&self.events, insertions);
     }
 
-    fn on_remove(&self, op: &OutPoint, _txout: &TxOut, _height: u32) {
-        self.events.lock().push(ListenerEvent::Remove(op.vout));
+    fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
+        record_removals(&self.events, removals);
     }
 
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) -> bool {
+    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
+        record_event_batches(&self.events, batches);
+    }
+}
+
+impl UtxoChangeListener for BatchRecordingListener {
+    fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
+        record_insertions(&self.events, insertions);
+    }
+
+    fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
+        record_removals(&self.events, removals);
+    }
+
+    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
         let mut batch_calls = self.batch_calls.lock();
         *batch_calls = batch_calls.saturating_add(1);
         drop(batch_calls);
@@ -75,33 +100,7 @@ impl UtxoChangeListener for CoalescingRecordingListener {
         self.operation_counts
             .lock()
             .extend(batches.iter().map(UtxoChangeEvents::operation_count));
-
-        let mut events = self.events.lock();
-        for batch in batches {
-            batch.for_each(|event| match event {
-                UtxoCommittedEvent::InsertBatch(insertions) => {
-                    events.push(ListenerEvent::InsertBatch(
-                        insertions
-                            .iter()
-                            .map(|insertion| insertion.op.vout)
-                            .collect(),
-                    ));
-                }
-                UtxoCommittedEvent::RemoveBatch(removals) => {
-                    for removal in removals {
-                        events.push(ListenerEvent::Remove(removal.op.vout));
-                    }
-                }
-                UtxoCommittedEvent::RemoveCoin(removal) => {
-                    events.push(ListenerEvent::Remove(removal.op.vout));
-                }
-            });
-        }
-        true
-    }
-
-    fn coalesces_committed_events(&self) -> bool {
-        true
+        record_event_batches(&self.events, batches);
     }
 }
 
@@ -471,8 +470,8 @@ fn listener_full_record_spend_preserves_remove_input_order()
 }
 
 #[test]
-fn listener_replays_parallel_multi_shard_events_in_shard_order()
--> Result<(), Box<dyn std::error::Error>> {
+fn listener_batches_parallel_multi_shard_event_multiset() -> Result<(), Box<dyn std::error::Error>>
+{
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut set = UtxoSet::new();
     set.set_listener(Box::new(RecordingListener {
@@ -511,12 +510,24 @@ fn listener_replays_parallel_multi_shard_events_in_shard_order()
     }
     set.commit_block(&mixed, &txid(635))?;
 
-    let mut expected = Vec::new();
-    for shard in 0_u32..20 {
-        expected.push(ListenerEvent::Remove(shard));
-        expected.push(ListenerEvent::InsertBatch(vec![shard + 100]));
-    }
-    assert_eq!(events.lock().clone(), expected);
+    let mut recorded = events
+        .lock()
+        .iter()
+        .flat_map(|event| match event {
+            ListenerEvent::InsertBatch(vouts) => vouts
+                .iter()
+                .copied()
+                .map(|vout| (true, vout))
+                .collect::<Vec<_>>(),
+            ListenerEvent::Remove(vout) => vec![(false, *vout)],
+        })
+        .collect::<Vec<_>>();
+    recorded.sort_unstable();
+    let mut expected = (0_u32..20)
+        .flat_map(|vout| [(false, vout), (true, vout + 100)])
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(recorded, expected);
     for (index, (remove, insert)) in removes.iter().zip(&inserts).enumerate() {
         assert_eq!(set.get(remove), None);
         assert_eq!(set.get(insert), Some(txout(u64::try_from(index)? + 700)));
@@ -525,8 +536,7 @@ fn listener_replays_parallel_multi_shard_events_in_shard_order()
 }
 
 #[test]
-fn coalescing_listener_batches_small_multi_shard_commits() -> Result<(), Box<dyn std::error::Error>>
-{
+fn listener_batches_small_multi_shard_commits() -> Result<(), Box<dyn std::error::Error>> {
     let events = Arc::new(Mutex::new(Vec::new()));
     let batch_calls = Arc::new(Mutex::new(0_usize));
     let operation_counts = Arc::new(Mutex::new(Vec::new()));
@@ -541,7 +551,7 @@ fn coalescing_listener_batches_small_multi_shard_commits() -> Result<(), Box<dyn
     initial.add(UtxoAdd::new(second_remove, txout(651), false, 306));
     set.commit_block(&initial, &txid(654))?;
 
-    set.set_listener(Box::new(CoalescingRecordingListener {
+    set.set_listener(Box::new(BatchRecordingListener {
         events: Arc::clone(&events),
         batch_calls: Arc::clone(&batch_calls),
         operation_counts: Arc::clone(&operation_counts),
@@ -1174,57 +1184,5 @@ fn hash_serialized_3_matches_independent_core_serialization_for_edge_cases()
     ];
     let expected = expected_hash_serialized_3(&entries)?;
     assert_eq!(hash_serialized_3(&set)?, expected);
-    Ok(())
-}
-
-#[test]
-fn listener_multi_shard_remove_before_insert_ordering_trace()
--> Result<(), Box<dyn std::error::Error>> {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let mut set = UtxoSet::new();
-    set.set_listener(Box::new(RecordingListener {
-        events: Arc::clone(&events),
-    }));
-
-    let op_shard0_old = OutPoint::new(txid_in_shard(0, 500), 0);
-    let op_shard1_old = OutPoint::new(txid_in_shard(1, 500), 0);
-    let op_shard0_new = OutPoint::new(txid_in_shard(0, 501), 1);
-    let op_shard1_new = OutPoint::new(txid_in_shard(1, 501), 1);
-
-    let mut initial = BlockChanges::default();
-    initial.add(UtxoAdd::new(op_shard0_old, txout(500), false, 1));
-    initial.add(UtxoAdd::new(op_shard1_old, txout(501), false, 1));
-    set.commit_block(&initial, &txid(502))?;
-    events.lock().clear();
-
-    let mut mixed = BlockChanges::default();
-    mixed.remove(op_shard0_old);
-    mixed.remove(op_shard1_old);
-    mixed.add(UtxoAdd::new(op_shard0_new, txout(502), false, 2));
-    mixed.add(UtxoAdd::new(op_shard1_new, txout(503), false, 2));
-    set.commit_block(&mixed, &txid(504))?;
-
-    let recorded = events.lock().clone();
-    let remove_0_idx = recorded.iter().position(|e| e == &ListenerEvent::Remove(0));
-    let insert_batch_indices: Vec<_> = recorded
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| match e {
-            ListenerEvent::InsertBatch(_) | ListenerEvent::Insert(_) => Some(i),
-            ListenerEvent::Remove(_) => None,
-        })
-        .collect();
-
-    assert!(remove_0_idx.is_some(), "expected remove event for vout 0");
-    assert!(!insert_batch_indices.is_empty(), "expected insert event(s)");
-    if let Some(first_insert) = insert_batch_indices.first() {
-        if let Some(r0) = remove_0_idx {
-            assert!(r0 < *first_insert, "remove must precede inserts");
-        }
-    }
-    assert_eq!(set.get(&op_shard0_old), None);
-    assert_eq!(set.get(&op_shard1_old), None);
-    assert_eq!(set.get(&op_shard0_new), Some(txout(502)));
-    assert_eq!(set.get(&op_shard1_new), Some(txout(503)));
     Ok(())
 }

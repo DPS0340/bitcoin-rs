@@ -5,8 +5,8 @@ use bitcoin::{
 };
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{
-    BlockChanges, UtxoAdd, UtxoChangeListener, UtxoError, UtxoKey, UtxoSet, hash_serialized_3,
-    read_snapshot, write_snapshot,
+    BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey,
+    UtxoRemoved, UtxoSet, hash_serialized_3, read_snapshot, write_snapshot,
 };
 use std::io::{Cursor, Read, Seek};
 use tempfile::tempfile;
@@ -842,8 +842,9 @@ struct StaticTrailer {
 }
 
 impl UtxoChangeListener for StaticTrailer {
-    fn on_insert(&self, _: &OutPoint, _: &TxOut, _: u32, _: bool) {}
-    fn on_remove(&self, _: &OutPoint, _: &TxOut, _: u32) {}
+    fn on_insert_coins(&self, _: &[UtxoInserted<'_>]) {}
+    fn on_remove_coins(&self, _: &[UtxoRemoved]) {}
+    fn on_committed_event_batches(&self, _: &[UtxoChangeEvents<'_>]) {}
     fn muhash3072(&self) -> Option<[u8; 384]> {
         Some(self.trailer)
     }

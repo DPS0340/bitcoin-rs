@@ -17,7 +17,9 @@ use std::{
 
 use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
-use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoChangeListener, UtxoSet};
+use bitcoin_rs_utxo::{
+    BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoInserted, UtxoRemoved, UtxoSet,
+};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const ENTRY_COUNT: u64 = 10_000;
@@ -55,9 +57,11 @@ struct SyntheticWorkload {
 struct NoopListener;
 
 impl UtxoChangeListener for NoopListener {
-    fn on_insert(&self, _op: &OutPoint, _txout: &TxOut, _height: u32, _coinbase: bool) {}
+    fn on_insert_coins(&self, _insertions: &[UtxoInserted<'_>]) {}
 
-    fn on_remove(&self, _op: &OutPoint, _txout: &TxOut, _height: u32) {}
+    fn on_remove_coins(&self, _removals: &[UtxoRemoved]) {}
+
+    fn on_committed_event_batches(&self, _batches: &[UtxoChangeEvents<'_>]) {}
 }
 
 const fn next_u64(state: &mut u64) -> u64 {

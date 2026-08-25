@@ -3,8 +3,8 @@ use core::convert::Infallible;
 
 use bitcoin_rs_primitives::{OutPoint, TxOut};
 use bitcoin_rs_utxo::{
-    SnapshotCoin, SnapshotCoinObserver, UtxoChangeListener, UtxoInserted, UtxoRemoved,
-    set::{UtxoChangeEvents, UtxoCommittedEvent},
+    SnapshotCoin, SnapshotCoinObserver, UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent,
+    UtxoInserted, UtxoRemoved,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -488,15 +488,6 @@ impl CoinStatsDelta {
             UtxoCommittedEvent::RemoveBatch(removals) => {
                 delta.remove_batch(&mut scratch, removals);
             }
-            UtxoCommittedEvent::RemoveCoin(removal) => {
-                delta.remove_utxo(
-                    &mut scratch,
-                    &removal.op,
-                    &removal.txout,
-                    removal.height,
-                    removal.coinbase,
-                );
-            }
         });
         delta
     }
@@ -510,15 +501,6 @@ impl CoinStatsDelta {
             }
             UtxoCommittedEvent::RemoveBatch(removals) => {
                 delta.remove_batch(&mut scratch, removals);
-            }
-            UtxoCommittedEvent::RemoveCoin(removal) => {
-                delta.remove_utxo(
-                    &mut scratch,
-                    &removal.op,
-                    &removal.txout,
-                    removal.height,
-                    removal.coinbase,
-                );
             }
         }
         delta
@@ -721,12 +703,6 @@ impl CoinStatsListener {
 }
 
 impl UtxoChangeListener for CoinStatsListener {
-    fn on_insert(&self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        let mut state = self.state.lock();
-        state.insert_utxo(op, txout, height, coinbase);
-        state.trim_scratch_capacity();
-    }
-
     fn on_insert_coins(&self, insertions: &[UtxoInserted<'_>]) {
         if insertions.len() < PARALLEL_COIN_BATCH_OP_THRESHOLD {
             let mut state = self.state.lock();
@@ -748,18 +724,6 @@ impl UtxoChangeListener for CoinStatsListener {
             .reduce(CoinStatsDelta::new, CoinStatsDelta::combine);
         let mut state = self.state.lock();
         delta.apply_to(&mut state.stats);
-    }
-
-    fn on_remove(&self, op: &OutPoint, txout: &TxOut, height: u32) {
-        let mut state = self.state.lock();
-        state.remove_utxo(op, txout, height, false);
-        state.trim_scratch_capacity();
-    }
-
-    fn on_remove_coin(&self, op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) {
-        let mut state = self.state.lock();
-        state.remove_utxo(op, txout, height, coinbase);
-        state.trim_scratch_capacity();
     }
 
     fn on_remove_coins(&self, removals: &[UtxoRemoved]) {
@@ -785,9 +749,9 @@ impl UtxoChangeListener for CoinStatsListener {
         delta.apply_to(&mut state.stats);
     }
 
-    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) -> bool {
+    fn on_committed_event_batches(&self, batches: &[UtxoChangeEvents<'_>]) {
         if batches.is_empty() {
-            return true;
+            return;
         }
 
         let operation_count = batches
@@ -820,11 +784,6 @@ impl UtxoChangeListener for CoinStatsListener {
         };
         let mut state = self.state.lock();
         delta.apply_to(&mut state.stats);
-        true
-    }
-
-    fn coalesces_committed_events(&self) -> bool {
-        true
     }
 
     fn muhash3072(&self) -> Option<[u8; 384]> {
