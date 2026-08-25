@@ -868,20 +868,28 @@ impl Mempool {
         children
     }
 
-    /// Returns the txids of in-pool transactions that spend an output of `id`,
+    /// Returns the txids of in-pool transactions whose inputs reference `id`,
     /// in `EntryId` order and deduplicated.
     ///
-    /// This is Bitcoin Core's `spentby` field. The answer comes from the
-    /// `spending` index — `O(outputs · log n + children)` — where asking the
-    /// same question by scanning is `O(inputs in the whole pool)` per entry.
-    ///
-    /// Only outputs this transaction actually has are consulted, so a child
-    /// spending an out-of-range `vout` is not reported. That case cannot occur
-    /// for a transaction the pool would accept, and it is the relation Core
-    /// tracks: `mapNextTx` is keyed by the exact `COutPoint`.
+    /// This is Bitcoin Core's `spentby` field. The answer comes from one
+    /// contiguous range of the `spending` index — `O(log n + matching inputs)`
+    /// — where asking the same question by scanning is
+    /// `O(inputs in the whole pool)` per entry.
     #[must_use]
     pub fn spender_txids(&self, id: EntryId) -> Vec<Txid> {
-        self.child_ids(id)
+        let Some(entry) = self.entry(id) else {
+            return Vec::new();
+        };
+        let start = (OutPoint::new(entry.txid, u32::MIN), EntryId::MIN);
+        let end = (OutPoint::new(entry.txid, u32::MAX), EntryId::MAX);
+        let mut spenders: Vec<EntryId> = self
+            .spending
+            .range(start..=end)
+            .map(|(_, child)| *child)
+            .collect();
+        spenders.sort_unstable();
+        spenders.dedup();
+        spenders
             .into_iter()
             .filter_map(|child| self.entry(child).map(|entry| entry.txid))
             .collect()
@@ -2207,6 +2215,27 @@ mod spend_index_tests {
             spenders_seen, 3,
             "the fixture must exercise spenders: root has 2, child_a has 1"
         );
+    }
+
+    #[test]
+    fn spender_txids_includes_an_out_of_range_prevout_inserted_before_its_parent() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([8_u8; 32]), 0);
+        let parent = tx_with(&[confirmed], 1, 10);
+        let parent_txid = parent.compute_txid();
+        let child = tx_with(&[OutPoint::new(parent_txid, u32::MAX)], 1, 11);
+        let child_txid = child.compute_txid();
+        let mut pool = Mempool::new(MempoolLimits::default());
+
+        let child_entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7);
+        let Ok(_child_id) = pool.insert_entry(child_entry) else {
+            panic!("child insertion failed");
+        };
+        let parent_entry = MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7);
+        let Ok(parent_id) = pool.insert_entry(parent_entry) else {
+            panic!("parent insertion failed");
+        };
+
+        assert_eq!(pool.spender_txids(parent_id), vec![child_txid]);
     }
 
     #[test]
