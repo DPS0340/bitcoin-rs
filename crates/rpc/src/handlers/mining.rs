@@ -3,7 +3,6 @@ use core::time::Duration;
 
 use bitcoin::hex::DisplayHex as _;
 use bitcoin_rs_mining::{BlockTemplate, BlockTemplateParams};
-use bitcoin_rs_primitives::Hash256;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
 use crate::context::{CachedBlockTemplate, Context};
@@ -26,6 +25,9 @@ const VERSIONBITS_TOP_BITS: i32 = 0x2000_0000;
 /// this bounds only how stale `curtime` may get. Bitcoin Core re-checks on the
 /// same order of interval.
 const TEMPLATE_CACHE_SECONDS: u64 = 5;
+/// Blocks in a median-time-past window (BIP113).
+const MEDIAN_TIME_SPAN: usize = 11;
+
 /// Tip age past which the node is treated as still catching up.
 ///
 /// Bitcoin Core's `DEFAULT_MAX_TIP_AGE`, the same 24 hours its
@@ -150,38 +152,89 @@ fn wait_for_long_poll(ctx: &Arc<Context>, request: Option<&Value>) {
     }
 }
 
-/// Returns a template for the current tip, assembling one only when needed.
-fn template_for_tip(ctx: &Arc<Context>, now: u64) -> Result<BlockTemplate, RpcError> {
-    let tip = ctx.applied_hash();
-    let sequence = ctx.mempool.read().sequence_number();
+/// How many times to rebuild a template the chain moved out from under.
+///
+/// A tip advance during assembly is rare and self-clearing; two retries is
+/// already generous. Returning the stale answer instead would hand a miner a
+/// candidate built against a block that is no longer the tip.
+const TEMPLATE_TIP_RETRIES: usize = 2;
 
-    if let Some(cached) = ctx.mining_template_cache.read().as_ref() {
-        if cached.tip == tip
-            && cached.mempool_sequence == sequence
-            && now.saturating_sub(cached.built_at) < TEMPLATE_CACHE_SECONDS
-        {
-            return Ok(cached.template.clone());
+/// Returns a template for the current tip, assembling one only when needed.
+///
+/// The tip is captured once, as a snapshot, and every chain-dependent field is
+/// derived from it. Reloading the applied tip per field lets a concurrent
+/// connect land between two of them, and the result is a candidate whose
+/// parent, height, difficulty and time do not describe the same block —
+/// unmineable, and the miner has no way to tell.
+fn template_for_tip(ctx: &Arc<Context>, now: u64) -> Result<BlockTemplate, RpcError> {
+    for _attempt in 0..=TEMPLATE_TIP_RETRIES {
+        let Some(tip) = ctx.applied_tip.load_full() else {
+            return Err(RpcError::ClientInInitialDownload(
+                "bitcoin-rs has no applied tip to build on",
+            ));
+        };
+        let sequence = ctx.mempool.read().sequence_number();
+
+        if let Some(cached) = ctx.mining_template_cache.read().as_ref() {
+            if cached.tip == tip.hash
+                && cached.mempool_sequence == sequence
+                && now.saturating_sub(cached.built_at) < TEMPLATE_CACHE_SECONDS
+            {
+                return Ok(cached.template.clone());
+            }
         }
+
+        let template = assemble(ctx, &tip, now)?;
+
+        // The chain may have moved while this was being built. Publishing it
+        // anyway would cache a candidate for a parent that is no longer the
+        // tip, and the cache key would then claim it belongs to the new one.
+        if ctx.applied_tip.load_full().map(|current| current.hash) != Some(tip.hash) {
+            continue;
+        }
+        *ctx.mining_template_cache.write() = Some(CachedBlockTemplate {
+            tip: tip.hash,
+            mempool_sequence: sequence,
+            built_at: now,
+            template: template.clone(),
+        });
+        return Ok(template);
     }
 
-    let template = assemble(ctx, tip, now)?;
-    *ctx.mining_template_cache.write() = Some(CachedBlockTemplate {
-        tip,
-        mempool_sequence: sequence,
-        built_at: now,
-        template: template.clone(),
-    });
-    Ok(template)
+    Err(RpcError::Internal(
+        "the chain advanced while every attempt to assemble a template was in flight".to_owned(),
+    ))
 }
 
-fn assemble(ctx: &Arc<Context>, tip: Hash256, now: u64) -> Result<BlockTemplate, RpcError> {
-    let height = ctx.applied_height().saturating_add(1);
-    let min_time = median_time_past(ctx).map_or(0, |mtp| mtp.saturating_add(1));
+/// Builds a template for exactly the tip it is handed.
+///
+/// Every chain-dependent field comes from `tip` and one block-tree view, so
+/// they describe one block and not several.
+fn assemble(
+    ctx: &Arc<Context>,
+    tip: &bitcoin_rs_chain::TipSnapshot,
+    now: u64,
+) -> Result<BlockTemplate, RpcError> {
+    let height = tip.height.saturating_add(1);
+    let (min_time, bits) = {
+        let tree = ctx.block_tree.read();
+        let min_time = tree
+            .median_time_past_at(tip.tip_id, MEDIAN_TIME_SPAN)
+            .map_or(0, |mtp| mtp.saturating_add(1));
+        let candidate_time = u32::try_from(now).unwrap_or(u32::MAX).max(min_time);
+        let bits = bitcoin_rs_chain::expected_next_bits(
+            ctx.chain_network,
+            &tree,
+            tip.tip_id,
+            candidate_time,
+        )
+        .map_err(|error| RpcError::Internal(format!("next difficulty is unknown: {error}")))?;
+        (min_time, bits)
+    };
     let current_time = u32::try_from(now).unwrap_or(u32::MAX).max(min_time);
-    let bits = next_bits(ctx, current_time)?;
 
     let params = BlockTemplateParams {
-        previous_block_hash: tip,
+        previous_block_hash: tip.hash,
         height,
         version: VERSIONBITS_TOP_BITS,
         bits: format!("{:08x}", bits.to_consensus()),
@@ -197,29 +250,6 @@ fn assemble(ctx: &Arc<Context>, tip: Hash256, now: u64) -> Result<BlockTemplate,
     let pool = ctx.mempool.read();
     BlockTemplate::from_mempool(&pool, &bitcoin_rs_mining::MiningPolicy, params)
         .map_err(|error| RpcError::Internal(format!("block template assembly failed: {error}")))
-}
-
-/// The compact target the next block must carry.
-///
-/// Asks the chain crate the same question a validator asks, so a template can
-/// never advertise difficulty the node would then reject.
-fn next_bits(ctx: &Context, candidate_time: u32) -> Result<bitcoin::CompactTarget, RpcError> {
-    let Some(tip) = ctx.applied_tip.load_full() else {
-        return Err(RpcError::ClientInInitialDownload(
-            "bitcoin-rs has no applied tip to build on",
-        ));
-    };
-    let tree = ctx.block_tree.read();
-    bitcoin_rs_chain::expected_next_bits(ctx.chain_network, &tree, tip.tip_id, candidate_time)
-        .map_err(|error| RpcError::Internal(format!("next difficulty is unknown: {error}")))
-}
-
-fn median_time_past(ctx: &Context) -> Option<u32> {
-    const MEDIAN_TIME_SPAN: usize = 11;
-    let tip = ctx.applied_tip.load_full()?;
-    ctx.block_tree
-        .read()
-        .median_time_past_at(tip.tip_id, MEDIAN_TIME_SPAN)
 }
 
 /// The full target as conventional big-endian hex.
@@ -282,9 +312,19 @@ fn render(ctx: &Context, template: &BlockTemplate) -> Value {
 /// active, and `!signet` on signet. The `!` prefix is BIP9's marker for a rule
 /// that changes block structure, which a miner may not ignore.
 fn active_rules(ctx: &Context, height: u32) -> Vec<&'static str> {
-    let mut rules = vec!["csv"];
+    // Each deployment is asked about itself. CSV was reported unconditionally,
+    // which is wrong for the blocks before it activated, and Taproot was
+    // reported whenever Segwit was -- a mainnet interval of about four years
+    // in which a miner would have been told Taproot rules applied when they
+    // did not.
+    let mut rules = Vec::new();
+    if ctx.chain_network.is_csv_active(height) {
+        rules.push("csv");
+    }
     if ctx.chain_network.is_segwit_active(height) {
         rules.push("!segwit");
+    }
+    if ctx.chain_network.is_taproot_active(height) {
         rules.push("taproot");
     }
     if ctx.chain_network == bitcoin_rs_primitives::Network::Signet {
@@ -453,7 +493,6 @@ mod submitblock_tests {
     use super::*;
     use alloc::sync::Arc;
     use bitcoin::consensus::encode::serialize;
-    use bitcoin::hex::DisplayHex as _;
 
     #[test]
     fn submitblock_accepts_regtest_genesis() {
@@ -602,7 +641,7 @@ mod getblocktemplate_tests {
     use bitcoin_rs_primitives::{Hash256, Network};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
 
-    use super::getblocktemplate;
+    use super::{active_rules, getblocktemplate};
     use crate::context::Context;
     use crate::error::RpcError;
 
@@ -790,14 +829,142 @@ mod getblocktemplate_tests {
             .iter()
             .filter_map(sonic_rs::JsonValueTrait::as_str)
             .collect::<Vec<_>>();
-        assert!(names.contains(&"csv"), "got {names:?}");
         assert!(
             names.contains(&"!segwit"),
             "segwit is active on regtest and changes block structure, so it \
              must carry the marker: {names:?}"
         );
+        assert!(
+            !names.contains(&"csv"),
+            "regtest activates CSV at height 432 and this fixture is at 11, so \
+             claiming it here would be an invention: {names:?}"
+        );
         // Nothing is signalling, so claiming a version bit would be an invention.
         assert_eq!(value.get("vbrequired").as_u64(), Some(0));
+    }
+
+    /// A template describes one tip, even while the chain is moving.
+    ///
+    /// Assembly used to capture the tip hash and then reload the applied tip
+    /// again for the height, the median time and the next difficulty. A connect
+    /// landing between two of those reads produces a candidate whose parent and
+    /// height belong to different blocks — unmineable, and nothing in the
+    /// response says so.
+    ///
+    /// The assertion is exact and the race is not: a returned template must
+    /// always name the block one below its own height as its parent. With the
+    /// tip captured once that can never fail; with it reloaded per field, a few
+    /// hundred crossings find it.
+    #[test]
+    fn a_template_describes_one_tip_while_the_chain_advances() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ctx = context_with_chain(Network::Regtest, now_seconds());
+        // Every block of the fixture chain, as a tip the mover can publish.
+        let tips = {
+            let tree = ctx.block_tree.read();
+            (0..=10_u32)
+                .filter_map(|height| {
+                    let node = tree.active_node_at_height(height)?;
+                    let tip_id = tree.lookup(node.hash)?;
+                    Some(bitcoin_rs_chain::TipSnapshot {
+                        tip_id,
+                        height,
+                        chainwork: node.chainwork,
+                        hash: node.hash,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tips.len(), 11, "the fixture builds eleven blocks");
+        let rounds = 400;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mover = {
+            let ctx = Arc::clone(&ctx);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut index = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(tip) = tips.get(index % tips.len()) else {
+                        break;
+                    };
+                    ctx.set_applied_tip(tip.clone());
+                    index = index.wrapping_add(1);
+                }
+            })
+        };
+
+        for _round in 0..rounds {
+            // The cache is keyed on the tip, so a moving tip keeps missing it.
+            let Ok(template) = getblocktemplate(&ctx, &json!([{"rules": ["segwit"]}])) else {
+                // Exhausting the retries while the tip churns is a refusal, not
+                // an inconsistent answer, and is what this must never trade for.
+                continue;
+            };
+            let Some(height) = template
+                .get("height")
+                .and_then(sonic_rs::JsonValueTrait::as_u64)
+            else {
+                panic!("height missing: {template:?}");
+            };
+            let Some(parent) = template
+                .get("previousblockhash")
+                .and_then(sonic_rs::JsonValueTrait::as_str)
+            else {
+                panic!("previousblockhash missing: {template:?}");
+            };
+            let expected = {
+                let tree = ctx.block_tree.read();
+                let parent_height = u32::try_from(height.saturating_sub(1)).unwrap_or(0);
+                tree.active_node_at_height(parent_height)
+                    .map(|node| node.hash.to_string_be())
+            };
+            assert_eq!(
+                Some(parent.to_owned()),
+                expected,
+                "the parent must be the block one below the template's height"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _joined = mover.join();
+    }
+
+    /// Each deployment answers for itself, at its own height.
+    ///
+    /// CSV used to be reported unconditionally and Taproot whenever Segwit was
+    /// active. On mainnet that second one covers about four years — every
+    /// block between Segwit and Taproot would have been described to a miner
+    /// as one Taproot rules applied to.
+    ///
+    /// One height below each activation and one at it, so a rule that reported
+    /// itself as always-on and a rule that reported itself as never-on would
+    /// both fail.
+    #[test]
+    fn each_rule_is_named_from_its_own_activation_height() {
+        for (network, rule, activation) in [
+            (Network::Mainnet, "csv", 419_328_u32),
+            (Network::Mainnet, "!segwit", 481_824),
+            (Network::Mainnet, "taproot", 709_632),
+            (Network::Regtest, "csv", 432),
+        ] {
+            let mut context = Context::new();
+            context.chain_network = network;
+            let ctx = Arc::new(context);
+
+            let before = active_rules(&ctx, activation.saturating_sub(1));
+            let at = active_rules(&ctx, activation);
+
+            assert!(
+                !before.contains(&rule),
+                "{rule} is not active on {network:?} below {activation}: {before:?}"
+            );
+            assert!(
+                at.contains(&rule),
+                "{rule} is active on {network:?} from {activation}: {at:?}"
+            );
+        }
     }
 
     /// The second call must not reassemble the template.
