@@ -134,9 +134,8 @@ bump in section 6.2.
 
 ### 6.1.1 Undo Record Encoding
 Undo records in `UndoData` carry their own format version as the first byte
-(`crates/utxo/src/undo_codec.rs`), and each record is bound to the height AND
-block hash of the block it undoes, so a record from an abandoned branch cannot
-be replayed against a different block at the same height.
+(`crates/utxo/src/undo_codec.rs`), and each record is keyed by height and block
+hash — see [*Undo record*](../../CONCEPTS.md#undo-record) for why that binding matters.
 
 The codec has no reader for a version other than the current one, by design:
 a record it cannot decode is a record the node refuses to disconnect against,
@@ -146,9 +145,8 @@ change. It is not covered by the UTXO snapshot version rules, which govern a
 different format.
 
 Undo records are also the one persistent structure a resync cannot rebuild
-lazily: they exist to disconnect blocks already applied. Discarding them costs
-the ability to reorganise below the discard point until those blocks are
-re-applied.
+lazily: they exist to disconnect blocks already applied. [Section 2.1](#21-key-value-store-column-families)
+states the cost of discarding them.
 
 ### 6.2 Recommended Rule for Schema Modifications
 When a pull request alters key-value column family key/value formats, column family enum definitions, or storage engine layouts:

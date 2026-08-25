@@ -96,7 +96,8 @@ if !network.is_bip16_p2sh_exception(block_hash) {
 The block hash is already computed at the top of `apply_block`
 (`Hash256::from_le_bytes(block.block_hash().as_byte_array())`); thread it into
 `compute_verify_flags`. `compute_verify_flags` is the single chokepoint feeding `verify_block_transactions`,
-so the fix covers the kernel, bitcoinconsensus, and Rust-interpreter backends uniformly.
+so the fix covered every backend at the time uniformly: the kernel, the
+since-removed `bitcoinconsensus` path, and the Rust interpreter.
 
 Commits: `49bf5cd` (mainnet fix + unit tests), `de97248` (end-to-end regression test), `badf017`
 (testnet3 exception).
@@ -154,9 +155,10 @@ When touching softfork activation or script flags, audit against Core's pinned
 1. **No script flag is unconditional.** Every flag is either height-gated against a per-network
    activation, or governed by a `script_flag_exceptions` entry. A hardcoded `VerifyFlags::X` seed is a
    smell — P2SH was the one that slipped through.
-2. **Enumerate every `script_flag_exceptions` entry on every network.** As of Core v29: mainnet
-   {170060 → NONE, 692261 → P2SH|WITNESS}, testnet3 {394 → NONE}; testnet4/signet/regtest have none.
-   Key them by **block hash**, mainnet-and-testnet3-only.
+2. **Enumerate every `script_flag_exceptions` entry on every network** before assuming the set you
+   already handle is complete; the current per-network roster is
+   [*Script-flag exceptions (BIP16Exception)*](../../../CONCEPTS.md#script-flag-exceptions-bip16exception).
+   Key exceptions by **block hash**, never height.
 3. **Compare effective flag sets, not raw overrides** (see the 692261 analysis above).
 4. **Benchmarks that stop at the assume-valid height do not exercise full script verification past
    it.** A green assume-valid IBD number is not evidence the node can validate the chain above that
@@ -168,6 +170,6 @@ When touching softfork activation or script flags, audit against Core's pinned
 
 ## Related
 
-- [[script-verification-delegated-to-core-c-no-rust-headroom]] — why script verification runs Core's
+- [script-verification-delegated-to-core-c-no-rust-headroom.md](script-verification-delegated-to-core-c-no-rust-headroom.md) — why script verification runs Core's
   C engine in the first place (the reason a flag mismatch surfaces as a *kernel* rejection).
-- CONCEPTS.md → Consensus validation (bitcoinkernel, bitcoinconsensus, script-flag exceptions).
+- [*Script-flag exceptions (BIP16Exception)*](../../../CONCEPTS.md#script-flag-exceptions-bip16exception) — the current per-network roster.

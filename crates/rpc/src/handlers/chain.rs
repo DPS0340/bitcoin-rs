@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
+use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -9,7 +9,7 @@ use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
+use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError, chain_stats};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
 
@@ -28,23 +28,56 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
             )
         })
     });
-    let verification_progress = if headers > 0 {
-        f64::from(applied) / f64::from(headers)
-    } else {
-        0.0
-    };
+    // Core's estimate when this node knows how many transactions it has
+    // verified, and the old height ratio when it does not.
+    //
+    // The count is unknown only for a datadir written before the node tracked
+    // it: nothing short of re-reading every block body could recover it, so
+    // those chains keep the answer they have always had rather than being told
+    // a confident 0.0. A node that syncs, or resyncs, after that change always
+    // takes the first branch.
+    let now = unix_now();
+    let verification_progress = ctx.chain_tx_count().map_or_else(
+        || {
+            if headers > 0 {
+                (f64::from(applied) / f64::from(headers)).min(1.0)
+            } else {
+                0.0
+            }
+        },
+        |chain_tx_count| {
+            verification_progress(
+                ctx.chain_network,
+                chain_tx_count,
+                applied,
+                headers,
+                time,
+                now,
+            )
+        },
+    );
+    let initialblockdownload = ctx.is_initial_block_download(now);
     let chain = match ctx.chain_network {
         bitcoin_rs_primitives::Network::Mainnet => "main",
-        bitcoin_rs_primitives::Network::Testnet3 | bitcoin_rs_primitives::Network::Testnet4 => {
-            "test"
-        }
+        bitcoin_rs_primitives::Network::Testnet3 => "test",
+        bitcoin_rs_primitives::Network::Testnet4 => "testnet4",
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
-    let block_stats = {
-        let blocks = ctx.blocks.read();
-        fold_block_records(&blocks, applied)
-    };
+    // Bytes on disk, from whatever owns them.
+    //
+    // The block store knows what its files occupy and shrinks when pruning
+    // deletes one. The record log can only offer the sum of the block sizes it
+    // has seen: records outlive the bodies they describe, so that sum goes on
+    // counting bytes that are gone — under a field name people read to check
+    // that pruning worked. It stays as the fallback for a context with no
+    // durable storage behind it, which is every test fixture and nothing else.
+    //
+    // Either way the read is O(1) and the log's lock — the one block
+    // application takes to append — is released immediately.
+    let size_on_disk = ctx
+        .block_storage_disk_usage()
+        .unwrap_or_else(|| ctx.blocks.read().size_on_disk());
     let prune_status = ctx.prune_status();
     let bestblockhash = applied_tip
         .as_ref()
@@ -62,15 +95,99 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let _ = response.insert(&"time", time);
     let _ = response.insert(&"mediantime", mediantime);
     let _ = response.insert(&"verificationprogress", json!(verification_progress));
-    let _ = response.insert(&"initialblockdownload", applied < headers);
+    let _ = response.insert(&"initialblockdownload", initialblockdownload);
     let _ = response.insert(&"chainwork", chainwork.as_str());
-    let _ = response.insert(&"size_on_disk", block_stats.size_on_disk);
+    let _ = response.insert(&"size_on_disk", size_on_disk);
     let _ = response.insert(&"pruned", prune_status.pruned);
     if let Some(pruneheight) = prune_status.pruneheight {
         let _ = response.insert(&"pruneheight", pruneheight);
     }
     let _ = response.insert(&"warnings", "");
     Ok(Value::from(response))
+}
+
+/// UNIX seconds now.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Bitcoin Core's `GuessVerificationProgress`, as a fraction in `[0, 1]`.
+///
+/// The quantity is **transactions verified over transactions believed to
+/// exist** — not a ratio of heights. Early blocks are nearly empty, so a height
+/// ratio reports the chain as most of the way done while most of the work is
+/// still ahead; Core moved off height for that reason.
+///
+/// The denominator cannot be known, so it is extrapolated from the network's
+/// pinned [`ChainTxData`] observation at `tx_rate` transactions per second. When
+/// the node is already past that observation its own count is used as the
+/// baseline instead, which keeps the fraction from sticking at 1.0 forever.
+///
+/// `tip_time` is the applied tip's block timestamp. When the tip is within two
+/// hours of `now`, Core stops trusting that miner-set timestamp and estimates
+/// the tip's age from how many blocks the header chain is ahead instead — which
+/// also quantizes the answer near 1.0, where people expect to see it settle.
+fn verification_progress(
+    network: bitcoin_rs_primitives::Network,
+    chain_tx_count: u64,
+    applied_height: u32,
+    header_height: u32,
+    tip_time: u64,
+    now: u64,
+) -> f64 {
+    const RECENT_TIP_WINDOW_SECONDS: i64 = 2 * 60 * 60;
+
+    if chain_tx_count == 0 {
+        return 0.0;
+    }
+    let data = network.chain_tx_data();
+
+    let now_signed = i64::try_from(now).unwrap_or(i64::MAX);
+    let tip_time_signed = i64::try_from(tip_time).unwrap_or(i64::MAX);
+    let block_time = if (now_signed - tip_time_signed).abs() <= RECENT_TIP_WINDOW_SECONDS
+        && header_height >= applied_height
+    {
+        let behind = i64::from(header_height - applied_height);
+        let spacing = i64::from(network.target_spacing_seconds());
+        now_signed.saturating_sub(behind.saturating_mul(spacing))
+    } else {
+        tip_time_signed
+    };
+
+    let total = if chain_tx_count <= data.tx_count {
+        // Still behind the pinned observation: extrapolate forward from it.
+        let elapsed = now_signed.saturating_sub(i64::try_from(data.time).unwrap_or(i64::MAX));
+        i64_to_f64(elapsed).mul_add(data.tx_rate, u64_to_f64(data.tx_count))
+    } else {
+        // Past it, so this node's own count is the better baseline. Without
+        // this the fraction would pin at 1.0 and stay there.
+        let elapsed = now_signed.saturating_sub(block_time);
+        i64_to_f64(elapsed).mul_add(data.tx_rate, u64_to_f64(chain_tx_count))
+    };
+    if total <= 0.0 {
+        return 0.0;
+    }
+    (u64_to_f64(chain_tx_count) / total).clamp(0.0, 1.0)
+}
+
+/// `u64` to `f64` without a silent `as` cast, which this crate forbids.
+///
+/// Exact for every input up to `2^53`; above that the low half rounds, which is
+/// inherent to `f64` and is what Bitcoin Core accepts here too.
+fn u64_to_f64(value: u64) -> f64 {
+    const TWO_POW_32: f64 = 4_294_967_296.0;
+
+    let high = u32::try_from(value >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX);
+    f64::from(high).mul_add(TWO_POW_32, f64::from(low))
+}
+
+/// [`u64_to_f64`] with a sign; the elapsed times here can run either way.
+fn i64_to_f64(value: i64) -> f64 {
+    let magnitude = u64_to_f64(value.unsigned_abs());
+    if value < 0 { -magnitude } else { magnitude }
 }
 
 fn chainwork_hex(tip: &TipSnapshot) -> String {
@@ -155,275 +272,63 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     Ok(json!(tips))
 }
 
-/// Number of blocks Bitcoin Core's median-time-past looks back over.
-const MEDIAN_TIME_SPAN: usize = 11;
-
 pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    // Bitcoin Core's default: one month of ten-minute blocks.
-    const DEFAULT_WINDOW: i64 = 30 * 24 * 6;
-
+    const DEFAULT_WINDOW: u64 = 30 * 24 * 6; // ~1 month of 10-min blocks
     let array = params_array(params)?;
-    let final_block = window_final_block(ctx, array.get(1))?;
-    let window_block_count = match array.first().filter(|value| !value.is_null()) {
-        // An explicit count is validated, not clamped. Core refuses a window
-        // that reaches past genesis rather than quietly shortening it, because
-        // silently answering about a different window is the worse failure.
-        Some(value) => {
-            let requested = value
-                .as_i64()
-                .ok_or(RpcError::InvalidType("block count must be an integer"))?;
-            if requested < 0 || (requested > 0 && requested >= i64::from(final_block.height)) {
-                return Err(RpcError::InvalidParameter(
-                    "Invalid block count: should be between 0 and the block's height - 1"
-                        .to_owned(),
-                ));
-            }
-            requested
-        }
-        None => DEFAULT_WINDOW.min(i64::from(final_block.height)).max(0),
+    let nblocks = array
+        .first()
+        .and_then(JsonValueTrait::as_u64)
+        .unwrap_or(DEFAULT_WINDOW);
+    let applied_height = ctx.applied_height();
+    let window_block_count = nblocks.min(u64::from(applied_height).saturating_add(1));
+    let lowest_window_height = u64::from(applied_height)
+        .saturating_add(1)
+        .saturating_sub(window_block_count);
+    let block_stats = {
+        let blocks_guard = ctx.blocks.read();
+        chain_stats(&blocks_guard, applied_height, lowest_window_height)
     };
-
-    let mut response = sonic_rs::Object::new();
-    let _ = response.insert(&"time", final_block.time);
-    // Core omits `txcount` when the block's cumulative count is unknown rather
-    // than reporting a zero that reads like an empty chain. This node knows the
-    // cumulative count for its applied tip and for no other block.
-    if let Some(txcount) = chain_tx_count_at(ctx, &final_block) {
-        let _ = response.insert(&"txcount", txcount);
-    }
-    let _ = response.insert(
-        &"window_final_block_hash",
-        final_block.hash.to_string_be().as_str(),
-    );
-    let _ = response.insert(&"window_final_block_height", final_block.height);
-    let _ = response.insert(&"window_block_count", window_block_count);
-
-    // A zero-block window has no interval and no transactions to report, so
-    // Core emits neither. Reporting `0` for both would state a measurement that
-    // was never taken.
-    if window_block_count > 0 {
-        let past_height = u32::try_from(i64::from(final_block.height) - window_block_count)
-            .unwrap_or_else(|_| unreachable!("the window is bounded by the block's own height"));
-        let interval = window_interval(ctx, &final_block, past_height);
-        let _ = response.insert(&"window_interval", interval);
-
-        if let Some(window_tx_count) = window_tx_count(ctx, final_block.height, past_height) {
-            let _ = response.insert(&"window_tx_count", window_tx_count);
-            // A non-positive interval is not a rate. Block timestamps only have
-            // to beat the median of the last eleven, so a window can end no
-            // later than it began.
-            if interval > 0 {
-                let count = i32::try_from(window_tx_count).unwrap_or(i32::MAX);
-                let seconds = i32::try_from(interval).unwrap_or(i32::MAX);
-                let _ = response.insert(&"txrate", json!(f64::from(count) / f64::from(seconds)));
-            }
-        }
-    }
-
-    Ok(Value::from(response))
-}
-
-/// The block a window ends at: its hash, height, timestamp and tree node.
-struct WindowFinalBlock {
-    node_id: bitcoin_rs_chain::NodeId,
-    hash: Hash256,
-    height: u32,
-    time: u32,
-    is_applied_tip: bool,
-}
-
-/// Resolves the `blockhash` argument, defaulting to the applied tip.
-///
-/// Core requires the named block to be on the active chain: the statistics are
-/// about a window of the chain, and a block off it is not the end of one.
-fn window_final_block(
-    ctx: &Context,
-    blockhash: Option<&Value>,
-) -> Result<WindowFinalBlock, RpcError> {
-    let tip = ctx.applied_tip.load_full();
-    let tree = ctx.block_tree.read();
-
-    let Some(blockhash) = blockhash.filter(|value| !value.is_null()) else {
-        let Some(tip) = tip else {
-            // No applied tip at all: nothing has been connected, so the window
-            // ends nowhere. Core cannot reach this state; its chain always has
-            // at least genesis.
-            return Ok(WindowFinalBlock {
-                node_id: bitcoin_rs_chain::NodeId::new(0),
-                hash: Hash256::default(),
-                height: 0,
-                time: 0,
-                is_applied_tip: true,
-            });
-        };
-        // The tree keeps every header it has accepted and is restored in full,
-        // so it answers for a tip the in-process record log never saw. The log
-        // is the fallback for the reverse: a record pushed before its header
-        // reached the tree.
-        let time = tree
-            .node(tip.tip_id)
-            .map(|node| node.header.time)
-            .ok()
-            .or_else(|| logged_time_at_height(ctx, tip.height))
-            .unwrap_or(0);
-        return Ok(WindowFinalBlock {
-            node_id: tip.tip_id,
-            hash: tip.hash,
-            height: tip.height,
-            time,
-            is_applied_tip: true,
-        });
+    // The chain total comes from the durable counter when the node has one.
+    // Folding the record log cannot answer it after a restart: the log is
+    // rebuilt empty on every open while the applied tip resumes at its real
+    // height, so the sum covers only blocks applied in this process.
+    let total_tx_count = ctx.chain_tx_count().unwrap_or(block_stats.total_tx_count);
+    let window_tx_count = block_stats.window_tx_count;
+    // Likewise the tip's timestamp: the log has no record for a tip restored
+    // from a checkpoint, and reported `time: 0` for it. The block tree does.
+    let tip_time = applied_tip_block_time(ctx)
+        .or(block_stats.tip_time)
+        .unwrap_or(0);
+    let earliest_window_time = block_stats.earliest_window_time.unwrap_or(tip_time);
+    let window_interval = u64::from(tip_time).saturating_sub(u64::from(earliest_window_time));
+    let txrate = if window_interval > 0 {
+        let count_small = u32::try_from(window_tx_count).unwrap_or(u32::MAX);
+        let interval_small = u32::try_from(window_interval).unwrap_or(u32::MAX);
+        f64::from(count_small) / f64::from(interval_small)
+    } else {
+        0.0_f64
     };
-
-    let hash = blockhash
-        .as_str()
-        .and_then(|text| Hash256::from_str_be(text).ok())
-        .ok_or(RpcError::InvalidType("blockhash must be 64 hex characters"))?;
-    let node_id = tree
-        .lookup(hash)
-        .ok_or(RpcError::NotFound("Block not found"))?;
-    let node = tree
-        .node(node_id)
-        .map_err(|_| RpcError::NotFound("Block not found"))?;
-    // On the active chain means: the chain's own block at that height is this
-    // one. A stale block keeps its height, so height alone proves nothing.
-    if tree
-        .active_node_at_height(node.height)
-        .map(|active| active.hash)
-        != Some(hash)
-    {
-        return Err(RpcError::InvalidParameter(
-            "Block is not in main chain".to_owned(),
-        ));
-    }
-    Ok(WindowFinalBlock {
-        node_id,
-        hash,
-        height: node.height,
-        time: node.header.time,
-        is_applied_tip: tip.is_some_and(|tip| tip.hash == hash),
-    })
-}
-
-/// The window's length in seconds, as the difference of two median times.
-///
-/// Bitcoin Core measures a window between the median-time-past of its two
-/// boundary blocks, not between raw header timestamps. A miner may stamp a
-/// block up to two hours ahead and only has to beat the median of the previous
-/// eleven, so raw timestamps are not ordered and their difference is not a
-/// duration. The median is, which is why every consensus rule that needs a
-/// clock uses it.
-fn window_interval(ctx: &Context, final_block: &WindowFinalBlock, past_height: u32) -> i64 {
-    let tree = ctx.block_tree.read();
-    let Some(past_id) = tree.node_at_height_from(final_block.node_id, past_height) else {
-        return 0;
-    };
-    let final_mtp = tree.median_time_past_at(final_block.node_id, MEDIAN_TIME_SPAN);
-    let past_mtp = tree.median_time_past_at(past_id, MEDIAN_TIME_SPAN);
-    match (final_mtp, past_mtp) {
-        (Some(final_mtp), Some(past_mtp)) => i64::from(final_mtp) - i64::from(past_mtp),
-        _ => 0,
-    }
-}
-
-/// The cumulative transaction count through `final_block`, when it is known.
-///
-/// Three outcomes, and Core distinguishes them the same way: the durable
-/// counter knows; the record log knows when it still holds the chain back to
-/// genesis; and otherwise nobody does, so the field is omitted. Core omits it
-/// on the same condition -- `m_chain_tx_count == 0` -- rather than reporting a
-/// zero that reads like a chain with no transactions in it.
-///
-/// The counter tracks the applied tip and nothing else, so a window ending
-/// anywhere else has no answer here.
-fn chain_tx_count_at(ctx: &Context, final_block: &WindowFinalBlock) -> Option<u64> {
-    if !final_block.is_applied_tip {
-        return None;
-    }
-    if let Some(count) = ctx.chain_tx_count() {
-        return Some(count);
-    }
-    let blocks = ctx.blocks.read();
-    if blocks.is_empty() {
-        // An empty log at height zero is an empty chain, which is a count of
-        // none rather than a count nobody knows.
-        return (final_block.height == 0).then_some(0);
-    }
-    // The log is rebuilt empty on every open and appended to contiguously, so
-    // holding a record for genesis is what distinguishes a complete log from
-    // one that starts wherever this process happened to begin applying.
-    let complete = blocks.iter().any(|record| record.height == 0);
-    complete.then(|| fold_block_records(&blocks, final_block.height).total_tx_count)
-}
-
-/// The timestamp the record log holds for the first block at `height`.
-///
-/// First rather than last: a reorg leaves the superseded record in place, and
-/// this is the reading `getchaintxstats` has always taken.
-fn logged_time_at_height(ctx: &Context, height: u32) -> Option<u32> {
-    ctx.blocks
-        .read()
-        .iter()
-        .find(|record| record.height == height)
-        .map(|record| record.time)
-}
-
-/// Transactions in `(past_height, final_height]`, when the log holds them all.
-///
-/// This is Core's `nChainTx` difference between the two boundary blocks, summed
-/// per block instead of subtracted, because this node keeps a cumulative count
-/// only for its tip. The sum is therefore answerable only for blocks applied in
-/// this process: the record log is rebuilt empty on every open. When it is not,
-/// the field is omitted rather than under-reported -- a partial sum looks like
-/// a quiet chain, and a miner or a fee estimator would believe it.
-///
-/// Records are folded by height with the last one winning, so a height the log
-/// holds twice -- a reorg leaves the superseded record behind -- is counted
-/// once, from the block that is actually on the chain now.
-fn window_tx_count(ctx: &Context, final_height: u32, past_height: u32) -> Option<u64> {
-    let expected = u64::from(final_height) - u64::from(past_height);
-    let mut by_height = hashbrown::HashMap::new();
-    {
-        let blocks = ctx.blocks.read();
-        for record in blocks.iter() {
-            if record.height > past_height && record.height <= final_height {
-                let _ = by_height.insert(record.height, record.tx_count);
-            }
-        }
-    }
-    if u64::try_from(by_height.len()).unwrap_or(u64::MAX) != expected {
-        return None;
-    }
-    Some(by_height.into_values().fold(0_u64, |total, count| {
-        total.saturating_add(u64::try_from(count).unwrap_or(0))
+    Ok(json!({
+        "time": tip_time,
+        "txcount": total_tx_count,
+        "window_final_block_hash": ctx.applied_hash().to_string_be(),
+        "window_final_block_height": applied_height,
+        "window_block_count": window_block_count,
+        "window_tx_count": window_tx_count,
+        "window_interval": window_interval,
+        "txrate": txrate
     }))
 }
 
-/// What a walk of the whole block-record log can still answer.
+/// The applied tip's block timestamp, read from the block tree.
 ///
-/// The window figures left: `getchaintxstats` measures its window between two
-/// median times and counts only the heights inside it, so neither an
-/// earliest-timestamp nor a running window sum has a reader any more.
-#[derive(Default)]
-struct FoldedBlockRecords {
-    size_on_disk: u64,
-    total_tx_count: u64,
-}
-
-fn fold_block_records(blocks: &[BlockRecord], applied_height: u32) -> FoldedBlockRecords {
-    let mut stats = FoldedBlockRecords::default();
-    for record in blocks {
-        stats.size_on_disk = stats
-            .size_on_disk
-            .saturating_add(u64::try_from(record.body_size).unwrap_or(u64::MAX));
-        if record.height > applied_height {
-            continue;
-        }
-        stats.total_tx_count = stats
-            .total_tx_count
-            .saturating_add(u64::try_from(record.tx_count).unwrap_or(0));
-    }
-    stats
+/// The tree keeps every header it has accepted and is restored in full, so it
+/// can answer for a tip the in-process record log never saw. `getblockchaininfo`
+/// takes the same route to the same value.
+fn applied_tip_block_time(ctx: &Context) -> Option<u32> {
+    let tip = ctx.applied_tip.load_full()?;
+    let tree = ctx.block_tree.read();
+    tree.node(tip.tip_id).ok().map(|node| node.header.time)
 }
 
 pub(crate) fn getblockcount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -472,12 +377,12 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
         let synthetic_height = ctx.height_for_hash(hash).unwrap_or_else(|| ctx.height());
         let record = BlockRecord::synthetic(synthetic_height, hash);
         if !verbose {
-            return Ok(json!(record.header_hex));
+            return Ok(json!(record.header_hex()));
         }
         return Ok(synthetic_block_json(ctx, &record, false));
     };
     if !verbose {
-        return Ok(json!(record.header_hex));
+        return Ok(json!(record.header_hex()));
     }
     block_json_verbose(ctx, &record, false, 1)
 }
@@ -1007,13 +912,41 @@ fn parse_hash(value: &str) -> Result<Hash256, RpcError> {
     Hash256::from_str(value).map_err(|_| RpcError::InvalidParams("hash must be 64 hex characters"))
 }
 
-fn confirmations(ctx: &Context, height: u32) -> u32 {
-    let applied = ctx.applied_height();
-    if height > applied {
-        0
-    } else {
-        applied.saturating_sub(height).saturating_add(1)
+/// The block's depth in the **active chain**, or `-1` when it is not in the
+/// active chain at all.
+///
+/// This is Bitcoin Core's `chain.Contains(pindex) ? chain.Height() -
+/// pindex->nHeight + 1 : -1`, and the membership test is the whole point.
+/// Height alone cannot answer it: a block that lost a reorg keeps its height,
+/// so deriving the answer from height reports a *positive* confirmation count
+/// for a block that is no longer in the chain — and anything gating on
+/// `confirmations >= N` reads that as buried.
+///
+/// The chain asked is the **applied** chain, not the header chain. Core's
+/// `m_chain` is the connected, fully-validated chain, and header-first sync
+/// keeps headers ahead of it; a block whose header is known but which has not
+/// been connected is not in it, so it is `-1` rather than `0`.
+fn confirmations(ctx: &Context, hash: Hash256, height: u32) -> i64 {
+    // Membership and depth must come from the same published applied-tip state.
+    let Some(tip) = ctx.applied_tip.load_full() else {
+        return -1;
+    };
+    if height > tip.height {
+        return -1;
     }
+    let active_hash = if height == tip.height {
+        Some(tip.hash)
+    } else {
+        let tree = ctx.block_tree.read();
+        tree.node_at_height_from(tip.tip_id, height)
+            .and_then(|id| tree.node(id).ok().map(|node| node.hash))
+    };
+    if active_hash != Some(hash) {
+        return -1;
+    }
+    i64::from(tip.height)
+        .saturating_sub(i64::from(height))
+        .saturating_add(1)
 }
 
 fn block_json_verbose(
@@ -1042,7 +975,7 @@ fn block_json_verbose(
     if !include_block_fields {
         return Ok(json!({
             "hash": record.hash.to_string_be(),
-            "confirmations": confirmations(ctx, record.height),
+            "confirmations": confirmations(ctx, record.hash, record.height),
             "height": record.height,
             "version": i64::from(version),
             "versionHex": format!("{version_hex:08x}"),
@@ -1078,7 +1011,7 @@ fn block_json_verbose(
 
     Ok(json!({
         "hash": record.hash.to_string_be(),
-        "confirmations": confirmations(ctx, record.height),
+        "confirmations": confirmations(ctx, record.hash, record.height),
         "height": record.height,
         "version": i64::from(version),
         "versionHex": format!("{version_hex:08x}"),
@@ -1100,18 +1033,8 @@ fn block_json_verbose(
 }
 
 fn decode_header(record: &BlockRecord) -> Option<bitcoin::block::Header> {
-    let bytes = match Vec::<u8>::from_hex(&record.header_hex) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::warn!(
-                block_hash = %record.hash.to_string_be(),
-                %error,
-                "stored block header hex is invalid"
-            );
-            return None;
-        }
-    };
-    match deserialize(&bytes) {
+    let bytes = record.header_bytes()?;
+    match deserialize(bytes.as_slice()) {
         Ok(header) => Some(header),
         Err(error) => {
             tracing::warn!(
@@ -1131,7 +1054,7 @@ fn decode_block(
     let Some(bytes) = ctx.block_body_bytes(record) else {
         return Err(RpcError::NotFound("block data pruned"));
     };
-    match deserialize(&bytes) {
+    match deserialize(bytes.as_slice()) {
         Ok(block) => Ok(Some((bytes, block))),
         Err(error) => {
             tracing::warn!(
@@ -1148,7 +1071,7 @@ fn synthetic_block_json(ctx: &Context, record: &BlockRecord, include_block_field
     if !include_block_fields {
         return json!({
             "hash": record.hash.to_string_be(),
-            "confirmations": confirmations(ctx, record.height),
+            "confirmations": confirmations(ctx, record.hash, record.height),
             "height": record.height,
             "version": 0,
             "versionHex": "00000000",
@@ -1167,7 +1090,7 @@ fn synthetic_block_json(ctx: &Context, record: &BlockRecord, include_block_field
 
     json!({
         "hash": record.hash.to_string_be(),
-        "confirmations": confirmations(ctx, record.height),
+        "confirmations": confirmations(ctx, record.hash, record.height),
         "height": record.height,
         "version": 0,
         "versionHex": "00000000",
@@ -1198,6 +1121,7 @@ mod tests {
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode, block::Header, block::Version};
 
     use super::*;
+    use crate::context::{BlockLog, fold_block_records};
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
     fn context_with_tip(
@@ -1241,6 +1165,22 @@ mod tests {
         ctx.set_chain_tip(tip.clone());
         ctx.set_applied_tip(tip);
         ctx
+    }
+
+    /// Makes `ctx` know `block` the way a running node does: header in the block
+    /// tree, record in the log.
+    ///
+    /// A record on its own is not a node's state. `apply_block` puts the header
+    /// in the tree first and pushes the record after, through the same handles,
+    /// and the record carries no header of its own — the tree is where one
+    /// lives. A fixture that pushes only a record is asking `getblock` to answer
+    /// from half the state a node would have.
+    fn seed_block(ctx: &Arc<Context>, block: &bitcoin::Block, record: BlockRecord) {
+        {
+            let mut tree = ctx.block_tree.write();
+            let _ = tree.insert_node(None, block.header, NodeStatus::Active);
+        }
+        ctx.add_block(record);
     }
 
     #[test]
@@ -1327,7 +1267,7 @@ mod tests {
         let block_hash_hex = record.hash.to_string_be();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let block_json = getblock(&ctx, &json!([block_hash_hex.as_str(), 1]))?;
         let header_json = getblockheader(&ctx, &json!([block_hash_hex.as_str(), true]))?;
@@ -1412,7 +1352,7 @@ mod tests {
         });
         let calls = Arc::clone(&source);
         let ctx = Arc::new(Context::new().with_block_body_source(source));
-        ctx.add_block(record);
+        seed_block(&ctx, &genesis, record);
 
         let expected_hex = body.to_lower_hex_string();
         assert_eq!(
@@ -1440,7 +1380,7 @@ mod tests {
 
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        ctx.add_block(BlockRecord::from_block(0, &genesis));
+        seed_block(&ctx, &genesis, BlockRecord::from_block(0, &genesis));
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -1489,30 +1429,226 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn confirmations_uses_applied_height_not_header_tip() {
-        use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
-        use bitcoin_rs_primitives::Hash256;
+    /// A genesis, an applied child at height 1, and a competing branch off the
+    /// same genesis whose *header* chain reaches height 2.
+    ///
+    /// ```text
+    ///   genesis ──> applied            (height 1, the applied tip)
+    ///           └─> fork ──> fork_tip  (heights 1 and 2, headers only)
+    /// ```
+    ///
+    /// `fork` sits at height 1 exactly like `applied` does, which is the state
+    /// a height-only confirmation count cannot tell apart.
+    struct Fork {
+        ctx: Arc<Context>,
+        /// Height 1, on the applied chain.
+        applied: Hash256,
+        /// Height 1 as well, on the branch that lost.
+        fork: Hash256,
+        /// Height 2, header-only — never connected.
+        header_tip: Hash256,
+        /// The headers behind `applied` and `fork`, so a test can build log
+        /// records that actually decode.
+        applied_header: bitcoin::block::Header,
+        fork_header: bitcoin::block::Header,
+    }
+
+    fn forked_ctx() -> Result<Fork, Box<dyn std::error::Error>> {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+        use bitcoin_rs_chain::NodeStatus;
 
         let ctx = Context::new();
-        // Header tip at 100, applied tip at 50.
-        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
-        ctx.set_chain_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 100,
-            chainwork: ChainWork::ZERO,
-            hash,
-        });
-        ctx.set_applied_tip(TipSnapshot {
-            tip_id: NodeId::new(0),
-            height: 50,
-            chainwork: ChainWork::ZERO,
-            hash,
-        });
-        // Block at height 10: confirmations = applied(50) - 10 + 1 = 41.
-        assert_eq!(confirmations(&ctx, 10), 41);
-        // Block at height 60 (above applied tip): confirmations = 0.
-        assert_eq!(confirmations(&ctx, 60), 0);
+        let header = |prev: BlockHash, nonce: u32, time: u32| bitcoin::block::Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce,
+        };
+
+        let (applied_tip, header_tip, fork_hash, applied_header, fork_header) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = header(BlockHash::all_zeros(), 0, 1_000_000);
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+
+            let applied = header(genesis.block_hash(), 1, 1_000_900);
+            let applied_id = tree.insert_node(Some(genesis_id), applied, NodeStatus::Active)?;
+            let applied_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
+            assert_eq!(applied_tip.tip_id, applied_id);
+
+            let fork = header(genesis.block_hash(), 2, 1_000_901);
+            let fork_id = tree.insert_node(Some(genesis_id), fork, NodeStatus::HeaderValid)?;
+            let fork_hash = tree.node(fork_id)?.hash;
+            let fork_tip = header(fork.block_hash(), 3, 1_001_800);
+            let _header_tip_id =
+                tree.insert_node(Some(fork_id), fork_tip, NodeStatus::HeaderValid)?;
+            let header_tip = tree
+                .tip()
+                .ok_or_else(|| std::io::Error::other("missing header tip"))?;
+            (applied_tip, header_tip, fork_hash, applied, fork)
+        };
+
+        ctx.set_applied_tip((*applied_tip).clone());
+        ctx.set_chain_tip((*header_tip).clone());
+        Ok(Fork {
+            ctx: Arc::new(ctx),
+            applied: applied_tip.hash,
+            fork: fork_hash,
+            header_tip: header_tip.hash,
+            applied_header,
+            fork_header,
+        })
+    }
+
+    #[test]
+    fn confirmations_uses_applied_height_not_header_tip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            ..
+        } = forked_ctx()?;
+
+        // Header tip is height 2, applied tip height 1. The applied block is one
+        // deep, not two: the header chain does not count.
+        assert_eq!(confirmations(&ctx, applied_hash, 1), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_block_that_lost_the_reorg()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            fork: fork_hash,
+            ..
+        } = forked_ctx()?;
+
+        assert_ne!(applied_hash, fork_hash, "the fixture branches must differ");
+        // Same height as the applied block, different chain. Deriving the answer
+        // from height alone reports 1 here, which says "in the chain, one deep".
+        assert_eq!(
+            confirmations(&ctx, fork_hash, 1),
+            -1,
+            "a block off the applied chain is not in it at any depth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_header_above_the_applied_tip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            header_tip: header_tip_hash,
+            ..
+        } = forked_ctx()?;
+
+        // Known header, never connected. Core's m_chain does not contain it.
+        assert_eq!(confirmations(&ctx, header_tip_hash, 2), -1);
+        Ok(())
+    }
+
+    #[test]
+    fn confirmations_is_negative_one_for_a_hash_the_tree_never_saw()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Fork { ctx, .. } = forked_ctx()?;
+        let unknown = Hash256::from_le_bytes(&[0xab_u8; 32]);
+
+        assert_eq!(confirmations(&ctx, unknown, 1), -1);
+        Ok(())
+    }
+
+    /// A log record for `header`, either carrying the block or standing in for
+    /// one whose body the node no longer has.
+    fn record_for(header: bitcoin::block::Header, with_body: bool) -> BlockRecord {
+        use bitcoin::hashes::Hash as _;
+
+        let hash = Hash256::from_le_bytes(header.block_hash().as_byte_array());
+        if !with_body {
+            return BlockRecord::synthetic(1, hash);
+        }
+        let block = bitcoin::Block {
+            header,
+            txdata: Vec::new(),
+        };
+        let bytes = bitcoin::consensus::encode::serialize(&block);
+        BlockRecord::from_block_bytes(1, &block, &bytes)
+    }
+
+    /// `getblock` and `getblockheader` both render `confirmations` when a body
+    /// is available. A pruned body still leaves enough tree state for
+    /// `getblockheader`, while Core-compatible `getblock` rejects that request
+    /// as unavailable. The body-less fixture therefore checks the header RPC;
+    /// the complete fixture checks both rendering paths.
+    fn assert_reorged_block_reports_negative_confirmations(
+        with_body: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            applied: applied_hash,
+            fork: fork_hash,
+            applied_header,
+            fork_header,
+            ..
+        } = forked_ctx()?;
+        ctx.add_block(record_for(applied_header, with_body));
+        ctx.add_block(record_for(fork_header, with_body));
+
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let confirmations_of =
+            |method: &str, hash: Hash256| -> Result<i64, Box<dyn std::error::Error>> {
+                let value = handler.dispatch(method, &json!([hash.to_string_be(), true]))?;
+                value
+                    .get("confirmations")
+                    .and_then(JsonValueTrait::as_i64)
+                    .ok_or_else(|| {
+                        Box::<dyn std::error::Error>::from(format!(
+                            "confirmations missing or not an integer: {value:?}"
+                        ))
+                    })
+            };
+
+        let methods = if with_body {
+            &["getblockheader", "getblock"][..]
+        } else {
+            &["getblockheader"][..]
+        };
+        for method in methods {
+            assert_eq!(confirmations_of(method, applied_hash)?, 1, "{method}");
+            assert_eq!(
+                confirmations_of(method, fork_hash)?,
+                -1,
+                "{method} must carry the -1 through, not clamp it"
+            );
+        }
+        if !with_body {
+            for hash in [applied_hash, fork_hash] {
+                assert!(matches!(
+                    handler.dispatch("getblock", &json!([hash.to_string_be(), true])),
+                    Err(RpcError::NotFound("block data pruned"))
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reorged_block_reports_negative_confirmations_with_the_block_stored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_reorged_block_reports_negative_confirmations(true)
+    }
+
+    #[test]
+    fn reorged_block_reports_negative_confirmations_without_the_block_stored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_reorged_block_reports_negative_confirmations(false)
     }
 
     #[test]
@@ -1545,6 +1681,139 @@ mod tests {
         );
     }
 
+    /// Regtest's pinned observation is `{time: 0, tx_count: 0, tx_rate: 0.001}`,
+    /// so the estimate reduces to arithmetic that can be done by hand:
+    /// `total = verified + elapsed * 0.001`.
+    #[test]
+    fn verification_progress_is_transactions_verified_over_transactions_estimated() {
+        let now = 1_800_000_000_u64;
+        // Ten thousand seconds behind, which is outside the two-hour window, so
+        // the tip's own timestamp is the one used.
+        let tip_time = now - 10_000;
+
+        // 100 / (100 + 10_000 * 0.001) = 100 / 110
+        let progress = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            9,
+            tip_time,
+            now,
+        );
+        assert!(
+            (progress - (100.0 / 110.0)).abs() < 1e-12,
+            "expected 100/110, got {progress}"
+        );
+    }
+
+    #[test]
+    fn verification_progress_is_not_the_height_ratio_it_replaced() {
+        let now = 1_800_000_000_u64;
+        // Half the headers applied, on a mainnet whose pinned observation counts
+        // more than a billion transactions. The old field said 0.5 here.
+        let progress = verification_progress(
+            bitcoin_rs_primitives::Network::Mainnet,
+            5_000,
+            50,
+            100,
+            now - 10_000,
+            now,
+        );
+        assert!(
+            progress < 0.001,
+            "50 blocks of a 1.3-billion-transaction chain is not half of it, got {progress}"
+        );
+    }
+
+    #[test]
+    fn verification_progress_ignores_the_tip_timestamp_when_the_tip_is_recent() {
+        let now = 1_800_000_000_u64;
+        // Both inside the two-hour window: Core stops trusting the miner-set
+        // timestamp there and derives the tip's age from the header chain, so
+        // these must agree despite an hour between them.
+        let a = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            now - 60,
+            now,
+        );
+        let b = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            now - 3_600,
+            now,
+        );
+        let boundary = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            now - 2 * 60 * 60,
+            now,
+        );
+        assert!((a - b).abs() < 1e-12, "{a} != {b}");
+        assert!(
+            (a - boundary).abs() < 1e-12,
+            "Core includes the exact two-hour boundary: {a} != {boundary}"
+        );
+
+        // Outside the window the timestamp is used again, so this one differs.
+        let outside = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            now - 100_000,
+            now,
+        );
+        assert!(outside < a, "{outside} should trail {a}");
+    }
+
+    #[test]
+    fn verification_progress_is_zero_before_anything_is_verified() {
+        assert!(
+            (verification_progress(
+                bitcoin_rs_primitives::Network::Mainnet,
+                0,
+                0,
+                0,
+                0,
+                1_800_000_000
+            ) - 0.0)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn verification_progress_never_exceeds_one_for_a_future_dated_tip() {
+        let now = 1_800_000_000_u64;
+        // A miner-set timestamp ahead of our clock by more than the two-hour
+        // window, so the tip's own time is used and the elapsed term goes
+        // negative — the estimated total lands *below* what this node has
+        // already verified. Unclamped that is a progress above 1.0.
+        let tip_time = now + 10_000;
+        let unclamped_total = 10_000.0_f64.mul_add(-0.001, 100.0_f64);
+        assert!(
+            100.0 / unclamped_total > 1.0,
+            "the fixture must actually overshoot, or the clamp is untested"
+        );
+
+        let progress = verification_progress(
+            bitcoin_rs_primitives::Network::Regtest,
+            100,
+            9,
+            10,
+            tip_time,
+            now,
+        );
+        assert!((progress - 1.0).abs() < f64::EPSILON, "got {progress}");
+    }
+
     #[test]
     fn verificationprogress_reports_zero_when_headers_unset() {
         let ctx = Arc::new(Context::new());
@@ -1559,6 +1828,46 @@ mod tests {
         assert!(
             progress.abs() < f64::EPSILON,
             "expected 0.0, got {progress}"
+        );
+    }
+
+    #[test]
+    fn verificationprogress_is_capped_when_applied_tip_is_temporarily_higher() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[8_u8; 32]);
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 50,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 100,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        assert_eq!(
+            result
+                .get("verificationprogress")
+                .and_then(JsonValueTrait::as_f64),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn getblockchaininfo_names_testnet4_separately_from_testnet3() {
+        let mut context = Context::new();
+        context.chain_network = bitcoin_rs_primitives::Network::Testnet4;
+        let result = getblockchaininfo(&Arc::new(context), &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("chain").and_then(JsonValueTrait::as_str),
+            Some("testnet4")
         );
     }
 
@@ -1674,6 +1983,44 @@ mod tests {
         );
     }
 
+    /// `size_on_disk` reports what the block store says, not the record sum.
+    ///
+    /// The record sum keeps counting blocks whose bytes pruning has deleted, so
+    /// it cannot be what a field named "size on disk" reports. This gives the
+    /// context a store that answers with a figure deliberately unrelated to the
+    /// records, so a handler that quietly went on summing them fails here rather
+    /// than looking right by coincidence.
+    #[test]
+    fn getblockchaininfo_size_on_disk_comes_from_the_block_store() {
+        struct SizedStore(u64);
+
+        impl crate::BlockBodySource for SizedStore {
+            fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
+                None
+            }
+            fn disk_usage(&self) -> Option<u64> {
+                Some(self.0)
+            }
+        }
+
+        let genesis = genesis_block(bitcoin::Network::Regtest);
+        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record_bytes = u64::try_from(record.body_size).unwrap_or(u64::MAX);
+        let store_bytes = record_bytes.saturating_add(4_096);
+        let ctx =
+            Arc::new(Context::new().with_block_body_source(Arc::new(SizedStore(store_bytes))));
+        ctx.add_block(record);
+
+        let result = getblockchaininfo(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+
+        assert_eq!(
+            result.get("size_on_disk").and_then(JsonValueTrait::as_u64),
+            Some(store_bytes),
+            "size_on_disk must come from the store that owns the bytes"
+        );
+    }
+
     #[test]
     fn getchaintxstats_emits_core_shape_with_zero_blocks() {
         use alloc::sync::Arc;
@@ -1727,6 +2074,106 @@ mod tests {
         assert_eq!(time, u64::from(expected_time));
     }
 
+    /// A log with every shape the windowed search has to survive.
+    ///
+    /// Heights are non-decreasing, which is the invariant the binary searches
+    /// rest on, but they are not a clean `0..n`: height 3 is recorded twice, as
+    /// a reorg leaves it, so the "first record at this height" and
+    /// "records at or below this height" boundaries are not the same thing.
+    /// Timestamps dip at height 5, because block times are not monotonic and an
+    /// earliest-in-window that assumed they were would be wrong there.
+    fn shaped_log() -> BlockLog {
+        const HEIGHTS: [u32; 10] = [0, 1, 2, 3, 3, 4, 5, 6, 7, 8];
+        const TIMES: [u32; 10] = [
+            1_000, 1_010, 1_020, 1_030, 1_031, 1_040, 1_035, 1_060, 1_070, 1_080,
+        ];
+        let mut log = BlockLog::new();
+        for (index, (height, time)) in HEIGHTS.into_iter().zip(TIMES).enumerate() {
+            log.push(BlockRecord {
+                hash: Hash256::from_le_bytes(&[u8::try_from(index).unwrap_or(0); 32]),
+                height,
+                block_hex: String::new(),
+                body_size: 100 + index * 7,
+                header: None,
+                tx_count: 1 + index * 3,
+                time,
+            });
+        }
+        log
+    }
+
+    /// The windowed search must land on exactly what the whole-log fold did.
+    ///
+    /// `getblockchaininfo` and `getchaintxstats` used to walk every record the
+    /// node holds. They now read running sums off the log and binary-search it,
+    /// which is an argument about the log being ordered by height. This checks
+    /// that argument against the implementation that made no argument and simply
+    /// looked at everything — `fold_block_records`, kept for exactly this.
+    ///
+    /// Swept over every applied height and every window length rather than one
+    /// pair, because the boundaries are where a search is wrong: at the
+    /// duplicate height, at the ends, and past both.
+    #[test]
+    fn chain_stats_matches_the_fold_it_replaced() {
+        let log = shaped_log();
+
+        for applied_height in 0_u32..11 {
+            for window in 0_u64..13 {
+                let lowest = u64::from(applied_height)
+                    .saturating_add(1)
+                    .saturating_sub(window.min(u64::from(applied_height).saturating_add(1)));
+
+                let oracle = fold_block_records(&log, applied_height, Some(lowest));
+                let actual = chain_stats(&log, applied_height, lowest);
+
+                assert_eq!(
+                    actual.total_tx_count, oracle.total_tx_count,
+                    "txcount at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.window_tx_count, oracle.window_tx_count,
+                    "window_tx_count at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.tip_time, oracle.tip_time,
+                    "tip_time at applied={applied_height} window={window}"
+                );
+                assert_eq!(
+                    actual.earliest_window_time, oracle.earliest_window_time,
+                    "earliest_window_time at applied={applied_height} window={window}"
+                );
+            }
+        }
+    }
+
+    /// `size_on_disk` is now a running sum, so it has to equal the fold's.
+    #[test]
+    fn size_on_disk_matches_the_fold_it_replaced() {
+        let mut log = shaped_log();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum disagrees with a fold of the records"
+        );
+
+        // The disconnect path: popping the tip must take its bytes back out.
+        let _popped = log.pop();
+        assert_eq!(
+            log.size_on_disk(),
+            fold_block_records(&log, u32::MAX, None).size_on_disk,
+            "the running body-size sum survived a pop but stopped matching"
+        );
+        assert_eq!(
+            log.total_tx_count(),
+            fold_block_records(&log, u32::MAX, None).total_tx_count,
+            "the running tx-count sum survived a pop but stopped matching"
+        );
+
+        log.clear();
+        assert_eq!(log.size_on_disk(), 0, "clear must reset the running sums");
+        assert_eq!(log.total_tx_count(), 0, "clear must reset the running sums");
+    }
+
     #[test]
     fn getchaintxstats_two_block_window_uses_one_folded_window()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1738,7 +2185,7 @@ mod tests {
                 height,
                 block_hex: String::new(),
                 body_size: usize::try_from(100_u32.saturating_add(height))?,
-                header_hex: String::new(),
+                header: None,
                 tx_count: usize::try_from(height.saturating_add(1))?,
                 time: 1_000_u32.saturating_add(height.saturating_mul(10)),
             });
@@ -1748,7 +2195,7 @@ mod tests {
             height: 4,
             block_hex: String::new(),
             body_size: 104,
-            header_hex: String::new(),
+            header: None,
             tx_count: 100,
             time: 1,
         });
@@ -1778,14 +2225,11 @@ mod tests {
                 .and_then(JsonValueTrait::as_u64),
             Some(7)
         );
-        // The interval is a difference of two median times and the tree is what
-        // holds those, so this log-only fixture cannot produce one. The
-        // median-time behaviour is pinned in `chaintxstats_window_tests`.
         assert_eq!(
             result
                 .get("window_interval")
                 .and_then(JsonValueTrait::as_u64),
-            Some(0)
+            Some(10)
         );
         assert_eq!(
             result.get("time").and_then(JsonValueTrait::as_u64),
@@ -1803,7 +2247,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 200,
         });
@@ -1812,7 +2256,7 @@ mod tests {
             height: 2,
             block_hex: String::new(),
             body_size: 100,
-            header_hex: String::new(),
+            header: None,
             tx_count: 1,
             time: 300,
         });
@@ -2318,68 +2762,6 @@ mod chaintxstats_durability_tests {
         ctx
     }
 
-    /// The record log answers only when it covers the chain back to genesis.
-    ///
-    /// A single record at the tip height is not a chain total -- a chain of
-    /// height 1 has two blocks in it -- so reporting its transaction count as
-    /// `txcount` states a number that is simply wrong. Core omits a count it
-    /// does not know rather than publishing a placeholder, and an omitted field
-    /// is the one answer a caller cannot mistake for a measurement.
-    #[test]
-    fn txcount_uses_the_log_only_when_the_log_covers_the_chain() {
-        let partial = restarted_ctx(None);
-        let Some(tip) = partial.applied_tip.load_full() else {
-            panic!("fixture has no applied tip");
-        };
-        partial.add_block(logged(tip.hash, tip.height, 7, TIP_TIME));
-        assert_eq!(
-            stats_of(&partial)
-                .get("txcount")
-                .and_then(JsonValueTrait::as_u64),
-            None,
-            "a log that starts above genesis cannot answer for the whole chain"
-        );
-
-        let complete = restarted_ctx(None);
-        complete.add_block(logged(Hash256::from_le_bytes(&[0x11; 32]), 0, 1, 1_000_000));
-        complete.add_block(logged(tip.hash, tip.height, 7, TIP_TIME));
-        assert_eq!(
-            stats_of(&complete)
-                .get("txcount")
-                .and_then(JsonValueTrait::as_u64),
-            Some(8),
-            "a log reaching genesis is the chain total"
-        );
-    }
-
-    fn logged(hash: Hash256, height: u32, tx_count: usize, time: u32) -> BlockRecord {
-        BlockRecord {
-            hash,
-            height,
-            block_hex: String::new(),
-            body_size: 0,
-            header_hex: String::new(),
-            tx_count,
-            time,
-        }
-    }
-
-    /// With nothing to answer from, the field is absent.
-    ///
-    /// It used to be `0`, which is a transaction count a real chain never has:
-    /// genesis alone contributes one. A caller reading zero would conclude the
-    /// chain was empty rather than that the node could not say.
-    #[test]
-    fn txcount_is_omitted_when_neither_the_counter_nor_the_log_knows() {
-        assert_eq!(
-            stats_of(&restarted_ctx(None))
-                .get("txcount")
-                .and_then(JsonValueTrait::as_u64),
-            None,
-            "it must not invent a count it does not have"
-        );
-    }
-
     fn stats_of(ctx: &Arc<Context>) -> sonic_rs::Value {
         getchaintxstats(ctx, &json!([]))
             .unwrap_or_else(|err| panic!("getchaintxstats failed: {err}"))
@@ -2396,6 +2778,44 @@ mod chaintxstats_durability_tests {
     }
 
     #[test]
+    fn txcount_falls_back_to_the_log_when_the_counter_is_unknown() {
+        let ctx = restarted_ctx(None);
+        // The log must hold something, or "fell back to the fold" and "reported
+        // zero" are the same observation and this proves neither.
+        let Some(tip) = ctx.applied_tip.load_full() else {
+            panic!("fixture has no applied tip");
+        };
+        ctx.add_block(BlockRecord {
+            hash: tip.hash,
+            height: tip.height,
+            block_hex: String::new(),
+            body_size: 0,
+            header: None,
+            tx_count: 7,
+            time: TIP_TIME,
+        });
+
+        assert_eq!(
+            stats_of(&ctx)
+                .get("txcount")
+                .and_then(JsonValueTrait::as_u64),
+            Some(7),
+            "an unknown counter must leave the old fold answering, not report zero"
+        );
+    }
+
+    #[test]
+    fn txcount_is_zero_when_neither_the_counter_nor_the_log_knows() {
+        assert_eq!(
+            stats_of(&restarted_ctx(None))
+                .get("txcount")
+                .and_then(JsonValueTrait::as_u64),
+            Some(0),
+            "it must not invent a count it does not have"
+        );
+    }
+
+    #[test]
     fn time_is_the_applied_tips_block_time_even_with_no_record_for_it() {
         let value = stats_of(&restarted_ctx(Some(10)));
         assert_eq!(
@@ -2407,315 +2827,255 @@ mod chaintxstats_durability_tests {
 }
 
 #[cfg(test)]
-mod chaintxstats_window_tests {
+mod verification_progress_wiring_tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU64;
+
+    use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
+    use bitcoin_rs_primitives::Hash256;
+    use sonic_rs::{JsonValueTrait, json};
+
+    use super::*;
+
+    /// Applied at height 50 of a 100-header chain, so the height ratio is
+    /// exactly 0.5 and any answer that is not 0.5 cannot have come from it.
+    fn half_applied_ctx(chain_tx_count: Option<u64>) -> Arc<Context> {
+        let ctx = Context::new();
+        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        ctx.set_chain_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 100,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 50,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        let ctx = match chain_tx_count {
+            Some(count) => ctx.with_chain_tx_count(Arc::new(AtomicU64::new(count))),
+            None => ctx,
+        };
+        Arc::new(ctx)
+    }
+
+    fn progress_of(ctx: &Arc<Context>) -> f64 {
+        let result = getblockchaininfo(ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getblockchaininfo failed: {err}"));
+        let Some(progress) = result
+            .get("verificationprogress")
+            .and_then(JsonValueTrait::as_f64)
+        else {
+            panic!("verificationprogress missing: {result:?}");
+        };
+        progress
+    }
+
+    #[test]
+    fn a_known_count_is_answered_with_cores_estimate_not_the_height_ratio() {
+        // 5000 transactions against mainnet's billion-transaction observation is
+        // nowhere near half the chain, whatever the heights say.
+        let progress = progress_of(&half_applied_ctx(Some(5_000)));
+        assert!(
+            progress < 0.001,
+            "expected Core's transaction-count estimate, got {progress}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_count_keeps_the_height_ratio_rather_than_reporting_zero() {
+        // A datadir written before the node tracked the count. Reporting 0.0
+        // here would break every caller that gates on `verificationprogress`,
+        // which is why the fallback exists at all.
+        let progress = progress_of(&half_applied_ctx(None));
+        assert!(
+            (progress - 0.5).abs() < 1e-9,
+            "expected the height ratio, got {progress}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod float_conversion_tests {
+    use super::{i64_to_f64, u64_to_f64};
+
+    #[test]
+    fn u64_to_f64_is_exact_below_two_to_the_fifty_third() {
+        for value in [
+            0_u64,
+            1,
+            4_294_967_295,
+            4_294_967_296,
+            1_315_805_869,
+            1 << 52,
+        ] {
+            // Independently derived: the halves recombined by hand.
+            let expected = f64::from(u32::try_from(value >> 32).unwrap_or(u32::MAX))
+                * 4_294_967_296.0_f64
+                + f64::from(u32::try_from(value & 0xffff_ffff).unwrap_or(u32::MAX));
+            assert!(
+                (u64_to_f64(value) - expected).abs() < f64::EPSILON,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn i64_to_f64_carries_the_sign() {
+        assert!((i64_to_f64(-3_600) + 3_600.0).abs() < f64::EPSILON);
+        assert!((i64_to_f64(3_600) - 3_600.0).abs() < f64::EPSILON);
+        assert!((i64_to_f64(0) - 0.0).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod initial_block_download_tests {
     use alloc::sync::Arc;
 
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash as _;
     use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
     use bitcoin_rs_chain::NodeStatus;
-    use sonic_rs::{JsonValueTrait, json};
+    use bitcoin_rs_primitives::Network;
 
     use super::*;
 
-    const REGTEST_BITS: u32 = 0x207f_ffff;
+    const DAY: u64 = 24 * 60 * 60;
 
-    /// Timestamps that are not in order, because block times are not.
-    ///
-    /// A miner only has to beat the median of the previous eleven blocks, so a
-    /// header may be stamped earlier than its parent. These dip twice, which is
-    /// what separates a median-time window from a raw-timestamp one.
-    const TIMES: [u32; 13] = [
-        1_000_000, 1_000_600, 1_001_200, 1_000_900, 1_002_400, 1_003_000, 1_002_100, 1_004_200,
-        1_004_800, 1_005_400, 1_006_000, 1_005_100, 1_007_200,
-    ];
-
-    /// Bitcoin Core's `GetMedianTimePast`, written out rather than borrowed.
-    ///
-    /// The median of the block and its ten ancestors. An oracle that called the
-    /// block tree could not disagree with the block tree.
-    fn median_time_past(times: &[u32], height: usize) -> u32 {
-        let start = height.saturating_sub(10);
-        let mut window = times[start..=height].to_vec();
-        window.sort_unstable();
-        window[window.len() / 2]
-    }
-
-    fn header(previous: BlockHash, time: u32, nonce: u32) -> bitcoin::block::Header {
-        bitcoin::block::Header {
-            version: Version::ONE,
-            prev_blockhash: previous,
-            merkle_root: TxMerkleNode::all_zeros(),
-            time,
-            bits: CompactTarget::from_consensus(REGTEST_BITS),
-            nonce,
-        }
-    }
-
-    /// A node whose active chain carries `times`, in both the tree and the log.
-    ///
-    /// Each block is given `height + 1` transactions, so a window sum is a
-    /// number the test can state in closed form.
-    fn chain_ctx(times: &[u32]) -> Arc<Context> {
-        let ctx = Arc::new(Context::new());
-        let mut previous = BlockHash::all_zeros();
-        let mut parent = None;
-        let mut tip = None;
-        for (index, &time) in times.iter().enumerate() {
-            let height = u32::try_from(index).unwrap_or(u32::MAX);
-            let candidate = header(previous, time, height);
-            previous = candidate.block_hash();
-            let hash = Hash256::from_le_bytes(previous.as_byte_array());
-            let id = {
-                let mut tree = ctx.block_tree.write();
-                tree.insert_node(parent, candidate, NodeStatus::Active)
-                    .unwrap_or_else(|err| panic!("insert_node failed: {err}"))
-            };
-            parent = Some(id);
-            tip = Some((id, hash, height));
-            ctx.add_block(BlockRecord {
-                hash,
-                height,
-                block_hex: String::new(),
-                body_size: 0,
-                header_hex: String::new(),
-                tx_count: usize::try_from(height).unwrap_or(0) + 1,
-                time,
-            });
-        }
-        let Some((tip_id, hash, height)) = tip else {
-            panic!("a chain fixture needs at least one block");
-        };
-        ctx.set_applied_tip(bitcoin_rs_chain::TipSnapshot {
-            tip_id,
-            height,
-            chainwork: bitcoin_rs_chain::ChainWork::ZERO,
-            hash,
-        });
-        ctx
-    }
-
-    fn stats(ctx: &Arc<Context>, params: &sonic_rs::Value) -> sonic_rs::Value {
-        getchaintxstats(ctx, params).unwrap_or_else(|err| panic!("getchaintxstats failed: {err}"))
-    }
-
-    fn field(value: &sonic_rs::Value, key: &str) -> Option<i64> {
-        value.get(key).and_then(JsonValueTrait::as_i64)
-    }
-
-    /// The window is measured between two median times, as Core measures it.
-    ///
-    /// The raw-timestamp difference is asserted to be a *different* number, so
-    /// the previous implementation could not have passed this: it subtracted
-    /// the earliest raw timestamp in the window from the tip's.
-    #[test]
-    fn window_interval_is_the_difference_of_two_median_times() {
-        let ctx = chain_ctx(&TIMES);
-        let blocks = 4_i64;
-        let final_height = TIMES.len() - 1;
-        let past_height = final_height - usize::try_from(blocks).unwrap_or(0);
-
-        let expected = i64::from(median_time_past(&TIMES, final_height))
-            - i64::from(median_time_past(&TIMES, past_height));
-        let raw = i64::from(TIMES[final_height]) - i64::from(TIMES[past_height]);
-        assert_ne!(
-            expected, raw,
-            "the fixture must separate the two definitions, or it proves nothing"
-        );
-
-        assert_eq!(
-            field(&stats(&ctx, &json!([blocks])), "window_interval"),
-            Some(expected)
-        );
-    }
-
-    /// The rate follows the interval, so it follows the median times too.
-    #[test]
-    fn txrate_is_the_window_count_over_the_median_time_interval() {
-        let ctx = chain_ctx(&TIMES);
-        let blocks = 4_usize;
-        let final_height = TIMES.len() - 1;
-        let past_height = final_height - blocks;
-
-        // Heights `past_height + 1 ..= final_height`, each with height + 1 txs.
-        let count: i64 = (past_height + 1..=final_height)
-            .map(|height| i64::try_from(height).unwrap_or(0) + 1)
-            .sum();
-        let interval = i64::from(median_time_past(&TIMES, final_height))
-            - i64::from(median_time_past(&TIMES, past_height));
-
-        let result = stats(&ctx, &json!([blocks]));
-        assert_eq!(field(&result, "window_tx_count"), Some(count));
-        let Some(txrate) = result.get("txrate").and_then(JsonValueTrait::as_f64) else {
-            panic!("txrate missing: {result:?}");
-        };
-        let count_f = i32::try_from(count).unwrap_or(i32::MAX);
-        let interval_f = i32::try_from(interval).unwrap_or(i32::MAX);
-        assert!(
-            (txrate - f64::from(count_f) / f64::from(interval_f)).abs() < f64::EPSILON,
-            "got {txrate}"
-        );
-    }
-
-    /// A window of no blocks is not a window, and Core reports nothing about it.
-    ///
-    /// The three window fields are absent rather than zero: a zero interval and
-    /// a zero count are measurements, and none was taken.
-    #[test]
-    fn a_zero_block_window_reports_no_window_fields() {
-        let result = stats(&chain_ctx(&TIMES), &json!([0]));
-        assert_eq!(field(&result, "window_block_count"), Some(0));
-        assert!(result.get("window_interval").is_none(), "{result:?}");
-        assert!(result.get("window_tx_count").is_none(), "{result:?}");
-        assert!(result.get("txrate").is_none(), "{result:?}");
-    }
-
-    /// A rate needs a window that advanced. This one does not.
-    ///
-    /// The count is still reported -- the transactions are real -- but dividing
-    /// by a non-positive interval is not a rate, so Core omits it.
-    #[test]
-    fn txrate_is_omitted_when_the_window_does_not_advance() {
-        // Eleven identical times, so every median time in the chain is equal
-        // and any window between them is zero seconds long.
-        let flat = [1_500_000_u32; 12];
-        let result = stats(&chain_ctx(&flat), &json!([3]));
-        assert_eq!(field(&result, "window_interval"), Some(0));
-        assert!(result.get("window_tx_count").is_some(), "{result:?}");
-        assert!(result.get("txrate").is_none(), "{result:?}");
-    }
-
-    /// An explicit count that reaches past genesis is refused, not clamped.
-    #[test]
-    fn a_block_count_past_the_chain_is_refused() {
-        let ctx = chain_ctx(&TIMES);
-        let height = i64::try_from(TIMES.len()).unwrap_or(0) - 1;
-        for requested in [height, height + 1, 10_000] {
-            let error = getchaintxstats(&ctx, &json!([requested]))
-                .err()
-                .unwrap_or_else(|| panic!("a {requested}-block window must be refused"));
-            assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER, "{error:?}");
-        }
-        // One below the height is the largest window that fits.
-        assert!(getchaintxstats(&ctx, &json!([height - 1])).is_ok());
-    }
-
-    /// A negative count is refused rather than read as an unsigned number.
-    #[test]
-    fn a_negative_block_count_is_refused() {
-        let error = getchaintxstats(&chain_ctx(&TIMES), &json!([-1]))
-            .err()
-            .unwrap_or_else(|| panic!("a negative window must be refused"));
-        assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER);
-    }
-
-    /// The default window is clamped, because the caller did not choose it.
-    ///
-    /// Core clamps its own default to `height - 1` and refuses only what a
-    /// caller asked for explicitly.
-    #[test]
-    fn the_default_window_is_clamped_to_the_chain() {
-        let result = stats(&chain_ctx(&TIMES), &json!([]));
-        let height = i64::try_from(TIMES.len()).unwrap_or(0) - 1;
-        assert_eq!(field(&result, "window_block_count"), Some(height));
-    }
-
-    /// The window ends where `blockhash` says, not always at the tip.
-    #[test]
-    fn a_blockhash_selects_the_block_the_window_ends_at() {
-        let ctx = chain_ctx(&TIMES);
-        let chosen_height = 8_usize;
-        let hash = {
-            let tree = ctx.block_tree.read();
-            let Some(node) = tree.active_node_at_height(u32::try_from(chosen_height).unwrap_or(0))
-            else {
-                panic!("the fixture has a block at that height");
-            };
-            node.hash
-        };
-
-        let result = stats(&ctx, &json!([2, hash.to_string_be()]));
-
-        assert_eq!(
-            field(&result, "window_final_block_height"),
-            Some(i64::try_from(chosen_height).unwrap_or(0))
-        );
-        assert_eq!(
-            result
-                .get("window_final_block_hash")
-                .and_then(JsonValueTrait::as_str),
-            Some(hash.to_string_be().as_str())
-        );
-        assert_eq!(
-            field(&result, "time"),
-            Some(i64::from(TIMES[chosen_height]))
-        );
-        let expected = i64::from(median_time_past(&TIMES, chosen_height))
-            - i64::from(median_time_past(&TIMES, chosen_height - 2));
-        assert_eq!(field(&result, "window_interval"), Some(expected));
-        // The cumulative count is known for the applied tip and for no other
-        // block, so a window ending elsewhere omits it rather than reporting
-        // the tip's total against a different block.
-        assert!(result.get("txcount").is_none(), "{result:?}");
-    }
-
-    /// A hash the node has never seen is not found.
-    #[test]
-    fn an_unknown_blockhash_is_not_found() {
-        let unknown = Hash256::from_le_bytes(&[0x5c; 32]).to_string_be();
-        let error = getchaintxstats(&chain_ctx(&TIMES), &json!([2, unknown]))
-            .err()
-            .unwrap_or_else(|| panic!("an unknown block must be refused"));
-        assert_eq!(error.code(), RpcError::CORE_NOT_FOUND);
-    }
-
-    /// A block the node knows but has reorged away from ends no window.
-    ///
-    /// It keeps its height, so a check that only compared heights would accept
-    /// it and then measure a window through a chain that does not exist.
-    #[test]
-    fn a_blockhash_off_the_active_chain_is_refused() {
-        let ctx = chain_ctx(&TIMES);
-        let stale = {
+    /// A context whose applied tip is a real tree node stamped `tip_time`, so
+    /// the tip has an age to be judged on. Chain work comes from the tree's own
+    /// accounting, which for a two-block regtest chain is far below any
+    /// production `nMinimumChainWork` — hence the network parameter: regtest
+    /// pins that floor at zero, mainnet does not.
+    fn ctx_with_tip_at(network: Network, tip_time: u32) -> Arc<Context> {
+        let mut ctx = Context::new();
+        ctx.chain_network = network;
+        let tip = {
             let mut tree = ctx.block_tree.write();
-            let Some(parent) = tree.active_node_at_height(3).map(|node| node.hash) else {
-                panic!("the fixture has a block at height 3");
+            let genesis = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_000_000,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
             };
-            let Some(parent_id) = tree.lookup(parent) else {
-                panic!("a node the tree returned must be findable");
+            let Ok(genesis_id) = tree.insert_node(None, genesis, NodeStatus::Active) else {
+                panic!("genesis insert failed");
             };
-            let sibling = header(
-                BlockHash::from_byte_array(parent.to_le_bytes()),
-                1_002_000,
-                9_999,
-            );
-            let hash = Hash256::from_le_bytes(sibling.block_hash().as_byte_array());
-            let _id = tree
-                .insert_node(Some(parent_id), sibling, NodeStatus::Stale)
-                .unwrap_or_else(|err| panic!("insert_node failed: {err}"));
-            hash
+            let child = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: tip_time,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 1,
+            };
+            let Ok(_child_id) = tree.insert_node(Some(genesis_id), child, NodeStatus::Active)
+            else {
+                panic!("child insert failed");
+            };
+            let Some(tip) = tree.tip() else {
+                panic!("no tip published");
+            };
+            (*tip).clone()
         };
-
-        let error = getchaintxstats(&ctx, &json!([2, stale.to_string_be()]))
-            .err()
-            .unwrap_or_else(|| panic!("a stale block must be refused"));
-        assert_eq!(error.code(), RpcError::CORE_INVALID_PARAMETER);
+        ctx.set_applied_tip(tip);
+        Arc::new(ctx)
     }
 
-    /// A window the record log does not cover reports no count.
-    ///
-    /// The log is rebuilt empty on every open, so after a restart the sum over
-    /// a window is a fraction of it. Reporting that fraction would read as a
-    /// quiet chain, which is what a fee estimator would then believe.
     #[test]
-    fn window_tx_count_is_omitted_when_the_log_does_not_cover_the_window() {
-        let ctx = chain_ctx(&TIMES);
-        ctx.blocks.write().clear();
+    fn a_node_that_has_applied_nothing_is_in_initial_block_download() {
+        let ctx = Arc::new(Context::new());
+        assert!(ctx.is_initial_block_download(1_800_000_000));
+    }
 
-        let result = stats(&ctx, &json!([4]));
+    #[test]
+    fn a_recent_tip_without_the_networks_minimum_work_is_still_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        // Timestamped one minute ago, so recency is satisfied and only the work
+        // floor can be what decides. A two-block regtest-difficulty chain has
+        // nowhere near mainnet's `nMinimumChainWork`.
+        let ctx = ctx_with_tip_at(
+            Network::Mainnet,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(
+            ctx.is_initial_block_download(now),
+            "a chain this cheap must not count as synced merely for being recent"
+        );
+    }
 
-        assert!(result.get("window_interval").is_some(), "{result:?}");
-        assert!(result.get("window_tx_count").is_none(), "{result:?}");
-        assert!(result.get("txrate").is_none(), "{result:?}");
+    #[test]
+    fn a_stale_tip_with_enough_work_is_still_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        // Regtest's work floor is zero, so only the tip's age is left to decide.
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 60).unwrap_or(u32::MAX),
+        );
+        assert!(ctx.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn a_recent_tip_with_enough_work_has_left_initial_block_download() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(!ctx.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn the_tip_age_boundary_is_twenty_four_hours() {
+        let now = 1_800_000_000_u64;
+        let at_the_edge = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY).unwrap_or(u32::MAX),
+        );
+        assert!(
+            !at_the_edge.is_initial_block_download(now),
+            "exactly `max_tip_age` old is still recent enough"
+        );
+
+        let past_the_edge = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 1).unwrap_or(u32::MAX),
+        );
+        assert!(past_the_edge.is_initial_block_download(now));
+    }
+
+    #[test]
+    fn leaving_initial_block_download_latches() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - 60).unwrap_or(u32::MAX),
+        );
+        assert!(!ctx.is_initial_block_download(now));
+
+        // Two days later, with no new block. Judged afresh the tip is stale and
+        // the answer would flip back to `true`; latched, it does not. This is
+        // the defect the field had — it went true again every time the node went
+        // quiet, and callers read that as "resyncing, do not trust me".
+        assert!(
+            !ctx.is_initial_block_download(now + 2 * DAY),
+            "the answer must not flip back once the node has left initial sync"
+        );
+    }
+
+    #[test]
+    fn the_latch_does_not_fire_before_the_conditions_are_met() {
+        let now = 1_800_000_000_u64;
+        let ctx = ctx_with_tip_at(
+            Network::Regtest,
+            u32::try_from(now - DAY - 60).unwrap_or(u32::MAX),
+        );
+        assert!(ctx.is_initial_block_download(now));
+        // Same tip, asked later at a time when it *is* within the window.
+        assert!(!ctx.is_initial_block_download(now - DAY));
     }
 }

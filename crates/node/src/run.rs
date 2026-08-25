@@ -154,7 +154,7 @@ fn spawn_electrum_listener(
         bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
     };
     let Some(query) = state.tx_index_electrum_adapter() else {
-        bail!("electrum listener requires txindex");
+        bail!("electrum listener requires its internal index capabilities");
     };
     let chain: Arc<dyn bitcoin_rs_electrum::methods::BlockTreeAdapter> = Arc::new(
         crate::NodeBlockSource::new(state.blocks())

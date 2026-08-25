@@ -69,13 +69,12 @@ artifacts: `~/bench-g14/results/`; harness `crates/node/examples/mainnet_prefix_
 ## Alternatives Considered (researched, closed)
 
 **Rust-native consensus-grade script interpreter: none exists as of mid-2026.** A five-family
-ultraresearch sweep (June 2026) returned four dead-ends and one strong candidate that is itself
+research sweep (June 2026) returned four dead-ends and one strong candidate that is itself
 the kernel route:
 
 - **Floresta's validation component** — contains no Rust interpreter; it uses rust-bitcoinkernel
   (after migrating off rust-bitcoinconsensus), and its default build skips script validation
-  entirely. The most serious independent Rust node is revealed-preference evidence *for* the
-  kernel route.
+  entirely. Floresta's architecture provides independent evidence for the kernel route.
 - **rust-bitcoin ecosystem** — the `bitcoin` crate has no execution engine and affirmatively
   disclaims consensus use; `miniscript::interpreter` covers only descriptor-representable spends.
 - **BitVM/rust-bitcoin-scriptexec** — explicit all-caps anti-consensus disclaimer,

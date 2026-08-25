@@ -1,8 +1,8 @@
 # Fuzz Targets
 
 Five `cargo-fuzz` harnesses covering the untrusted-input surfaces of
-bitcoin-rs: P2P wire messages, block/transaction deserialization, script
-evaluation, and UTXO snapshot loading.
+bitcoin-rs: P2P wire messages, block/transaction deserialization, P2TR
+key-path verification, and UTXO snapshot loading.
 
 ## Prerequisites
 
@@ -26,8 +26,8 @@ Replace `p2p_message` with any of:
 | `p2p_message`   | P2P wire message decoder (`read_message`)            |
 | `block_decode`  | Block consensus deserialization                      |
 | `tx_decode`     | Transaction consensus deserialization                |
-| `script_eval`   | Portable script interpreter (`Interpreter::execute`) |
-| `utxo_snapshot` | UTXO snapshot deserializer (`read_snapshot`)         |
+| `script_eval`   | Taproot key-path verifier (`Interpreter::execute` with `VerifyFlags::TAPROOT`) |
+| `utxo_snapshot` | UTXO snapshot deserializer (`read_snapshot_strict_v4`)     |
 
 To limit the number of iterations:
 

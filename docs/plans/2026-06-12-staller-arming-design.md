@@ -1,6 +1,6 @@
 # Staller arming redesign: why BLOCK_STALLING_TIMEOUT has never fired, and what to change
 
-Status: DESIGN (no code). Author: design worker, 2026-06-12.
+Status: design record (2026-06-12).
 Scope: `crates/node/src/sync.rs` (R8 staller seam), `crates/node/src/sync/window.rs`
 (stall state machine). Re-attempt precondition for the reverted w256 window (U2).
 
