@@ -854,18 +854,20 @@ fn query_error(e: TxQueryError) -> Response {
 fn dispatch_error(e: crate::RpcError) -> Response {
     match e {
         crate::RpcError::NotFound(_) => not_found(),
-        crate::RpcError::InvalidParams(_) | crate::RpcError::InvalidType(_) => bad(&e.to_string()),
-        // A transaction the rules refuse is the client's problem, not the
-        // server's. `unavailable` is 503, which tells a broadcaster to retry --
+        // 400: the request is the problem, and re-sending it unchanged will not
+        // help. That covers a malformed request and a refused transaction
+        // alike -- `unavailable` is 503, which tells a broadcaster to retry,
         // and the one thing a rejected transaction will not do is succeed on a
         // retry. Esplora answers `POST /tx` with 400 and the reject reason, and
         // a wallet reads that as "fix the transaction" rather than "come back
         // later".
         //
-        // Both codes reach here: `TxRejected` is what policy or consensus
-        // refused, `TxVerifyError` a guard the caller configured themselves.
-        // Neither improves with time.
-        crate::RpcError::TxRejected(_) | crate::RpcError::TxVerifyError(_) => bad(&e.to_string()),
+        // `TxRejected` is what policy or consensus refused; `TxVerifyError` a
+        // guard the caller configured themselves. Neither improves with time.
+        crate::RpcError::InvalidParams(_)
+        | crate::RpcError::InvalidType(_)
+        | crate::RpcError::TxRejected(_)
+        | crate::RpcError::TxVerifyError(_) => bad(&e.to_string()),
         _ => unavailable(&e.to_string()),
     }
 }
