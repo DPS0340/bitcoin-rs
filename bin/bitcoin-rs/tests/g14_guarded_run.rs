@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::{Mutex, MutexGuard};
 use serde_json::Value;
 
 const BREACH_EXIT: i32 = 75;
@@ -16,7 +17,7 @@ const BREACH_EXIT: i32 = 75;
 #[test]
 fn setsid_descendant_rss_breach_kills_tree_and_deletes_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -84,7 +85,7 @@ wait "$child"
 #[test]
 fn sighup_stops_unit_kills_descendant_and_writes_failure_verdict()
 -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -96,7 +97,10 @@ fn sighup_stops_unit_kills_descendant_and_writes_failure_verdict()
 import pathlib
 import sys
 import time
-pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding="ascii")
+pid_path = pathlib.Path(sys.argv[1])
+pending_pid_path = pid_path.with_suffix(".tmp")
+pending_pid_path.write_text(str(os.getpid()), encoding="ascii")
+pending_pid_path.replace(pid_path)
 pathlib.Path(sys.argv[2]).mkdir()
 time.sleep(30)
 "#,
@@ -165,7 +169,7 @@ wait "$child"
 
 #[test]
 fn fixture_size_breach_deletes_fixture() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -208,7 +212,7 @@ time.sleep(30)
 
 #[test]
 fn insufficient_space_preflight_never_starts_command() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -230,7 +234,7 @@ fn insufficient_space_preflight_never_starts_command() -> Result<(), Box<dyn std
 
 #[test]
 fn existing_output_preflight_never_starts_command() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -255,7 +259,7 @@ fn existing_output_preflight_never_starts_command() -> Result<(), Box<dyn std::e
 
 #[test]
 fn aliased_custody_paths_never_start_command() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -280,7 +284,7 @@ fn aliased_custody_paths_never_start_command() -> Result<(), Box<dyn std::error:
 
 #[test]
 fn success_leaves_fixture_and_writes_verdict() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -341,7 +345,7 @@ print("guarded stderr", file=sys.stderr)
 #[test]
 fn command_digest_redacts_secrets_but_binds_other_arguments()
 -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -386,7 +390,7 @@ pathlib.Path(sys.argv[1]).write_bytes(b"digest")
 
 #[test]
 fn repeated_unit_teardown_never_becomes_guard_error() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     for iteration in 0..64 {
@@ -404,7 +408,7 @@ fn repeated_unit_teardown_never_becomes_guard_error() -> Result<(), Box<dyn std:
 
 #[test]
 fn disappearing_cgroup_member_is_not_a_guard_error() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     fs::write(
@@ -444,7 +448,7 @@ Path.open = open_with_enodev
 
 #[test]
 fn child_failure_removes_fixture_and_propagates_status() -> Result<(), Box<dyn std::error::Error>> {
-    require_systemd_user_units()?;
+    let _systemd_user_units = lock_systemd_user_units()?;
 
     let temp = tempfile::tempdir()?;
     let fixture = temp.path().join("fixture");
@@ -598,7 +602,7 @@ fn guarded_command_digest(
     Ok(digest)
 }
 
-fn require_systemd_user_units() -> Result<(), Box<dyn std::error::Error>> {
+fn lock_systemd_user_units() -> Result<MutexGuard<'static, ()>, Box<dyn std::error::Error>> {
     static PROBE: LazyLock<Result<(), String>> = LazyLock::new(|| {
         let unit = unique_unit("probe");
         match Command::new("systemd-run")
@@ -621,10 +625,11 @@ fn require_systemd_user_units() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => Err(format!("systemd user unit probe failed: {error}")),
         }
     });
-    match &*PROBE {
-        Ok(()) => Ok(()),
-        Err(message) => Err(message.clone().into()),
+    static SYSTEMD_USER_UNITS: Mutex<()> = Mutex::new(());
+    if let Err(message) = &*PROBE {
+        return Err(message.clone().into());
     }
+    Ok(SYSTEMD_USER_UNITS.lock())
 }
 
 fn unique_unit(case: &str) -> String {
