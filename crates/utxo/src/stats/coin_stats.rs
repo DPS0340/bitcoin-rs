@@ -930,6 +930,9 @@ const fn compact_size_len(len: usize) -> usize {
 }
 
 #[cfg(test)]
+// A test pool that will not build has failed the test; panicking names the
+// reason. Matches the convention already used in `compress.rs`.
+#[expect(clippy::expect_used, reason = "test assertions")]
 mod tests {
     use crate::{SnapshotCoin, SnapshotCoinObserver};
     use bitcoin::{Amount, ScriptBuf};
