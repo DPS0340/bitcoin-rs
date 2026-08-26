@@ -26,7 +26,6 @@ workspace = true
 default = ["fjall", "kernel"]
 rocksdb = [
     "bitcoin-rs-chain/rocksdb",
-    "bitcoin-rs-coinstats/rocksdb",
     "bitcoin-rs-consensus/rocksdb",
     "bitcoin-rs-index/rocksdb",
     "bitcoin-rs-mempool/rocksdb",
@@ -40,7 +39,6 @@ rocksdb = [
 ]
 fjall = [
     "bitcoin-rs-chain/fjall",
-    "bitcoin-rs-coinstats/fjall",
     "bitcoin-rs-consensus/fjall",
     "bitcoin-rs-index/fjall",
     "bitcoin-rs-mempool/fjall",
@@ -54,7 +52,6 @@ fjall = [
 ]
 redb = [
     "bitcoin-rs-chain/redb",
-    "bitcoin-rs-coinstats/redb",
     "bitcoin-rs-consensus/redb",
     "bitcoin-rs-index/redb",
     "bitcoin-rs-mempool/redb",
@@ -87,7 +84,6 @@ bitcoin-rs-storage.workspace = true
 bitcoin-rs-utxo.workspace = true
 bitcoin-rs-chain.workspace = true
 bitcoin-rs-index.workspace = true
-bitcoin-rs-coinstats.workspace = true
 bitcoin-rs-pruning.workspace = true
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true

@@ -12,7 +12,6 @@ use bitcoin::{
     Txid, Witness, absolute, transaction,
 };
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
-use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
     BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
@@ -20,6 +19,7 @@ use bitcoin_rs_node::{
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
 use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use crossbeam_channel::{bounded, unbounded};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};

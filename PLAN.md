@@ -66,8 +66,6 @@ bitcoin-rs/
 │   ├── chain/                    # Slab<BlockTreeNode>+u32 NodeId; ArcSwapOption tip; ruint chainwork; reorg
 │   ├── index/                    # port electrs verbatim (embedded; 5 CFs; HashPrefixRow; bitcoin_slices visitor)
 │   │   └── benches/              # history_resolve.rs
-│   ├── coinstats/                # running muhash3072; O(1) gettxoutsetinfo
-│   │   └── benches/              # coinstats_hotpath.rs
 │   ├── pruning/                  # block-file + undo-file pruner; utreexo-only mode coordinator
 │   ├── mempool/                  # Pareto-front by-fee; RBF (BIP125); package eviction; ancestor/descendant limits
 │   ├── p2p/                      # peer FSM; addrv2; wtxid relay (BIP339); ban-score; compact-block-relay (BIP152) opt
@@ -528,11 +526,14 @@ git commit -am "feat(index): port electrs to KvStore-backed embedded indexer" -m
 
 ---
 
-### Task 10: `crates/coinstats` — running muhash3072 for O(1) gettxoutsetinfo
+### Task 10: running muhash3072 for O(1) gettxoutsetinfo
 
 **Files:**
-- Create: `crates/coinstats/src/{lib,muhash3072}.rs`
-- Test: `crates/coinstats/tests/parity_against_core.rs`
+- Create: `crates/coinstats/src/{lib,muhash3072}.rs`. Merged into
+  `crates/utxo/src/stats/` by issue #164: statistics are derived computation over
+  the UTXO state that crate already owns, and the separate package added a
+  dependency edge without a boundary.
+- Test: `crates/utxo/tests/{muhash_unit,coin_stats_roundtrip,snapshot_with_muhash}.rs`
 
 - [ ] **Step 1: `MuHash3072`** — 3072-bit multiplicative hash, group elements over residues mod `2^3072 - r`. Port from `bitcoin/src/crypto/muhash.cpp` exactly (constant-time mul + inv).
 

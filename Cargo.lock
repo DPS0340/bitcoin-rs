@@ -237,30 +237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcoin-rs-coinstats"
-version = "0.4.0"
-dependencies = [
- "bitcoin",
- "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
- "bitcoin-rs-utxo",
- "bytemuck",
- "criterion",
- "mimalloc",
- "parking_lot",
- "proptest",
- "rayon",
- "ruint",
- "serde_json",
- "sha2 0.11.0",
- "smallvec",
- "tempfile",
- "thiserror",
- "tracing",
- "zerocopy",
-]
-
-[[package]]
 name = "bitcoin-rs-consensus"
 version = "0.4.0"
 dependencies = [
@@ -348,7 +324,6 @@ dependencies = [
  "arc-swap",
  "bitcoin",
  "bitcoin-rs-chain",
- "bitcoin-rs-coinstats",
  "bitcoin-rs-consensus",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
@@ -452,7 +427,6 @@ dependencies = [
  "arc-swap",
  "bitcoin",
  "bitcoin-rs-chain",
- "bitcoin-rs-coinstats",
  "bitcoin-rs-consensus",
  "bitcoin-rs-index",
  "bitcoin-rs-mempool",
@@ -536,6 +510,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "rayon",
+ "ruint",
  "sha2 0.11.0",
  "smallvec",
  "tempfile",

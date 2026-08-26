@@ -19,7 +19,6 @@ use bitcoin::{
     TxMerkleNode, TxOut, Txid, Witness, transaction,
 };
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
-use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_index::BlockSource as _;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
@@ -32,6 +31,7 @@ use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, BlockRecord};
 use bitcoin_rs_utxo::UtxoSet;
+use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbeam_channel::unbounded;
 use hashbrown::HashMap;

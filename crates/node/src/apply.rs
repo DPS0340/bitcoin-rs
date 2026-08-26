@@ -1002,7 +1002,7 @@ pub struct ApplyHandles {
     /// Shared UTXO set.
     pub utxo: Arc<UtxoSet>,
     /// Shared coinstats listener.
-    pub coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Shared transaction index runtime, when enabled.
     pub tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
     /// Shared mempool.
@@ -1069,7 +1069,7 @@ impl ApplyHandles {
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
         block_tree: Arc<RwLock<BlockTree>>,
         utxo: Arc<UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
         tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
         mempool: Arc<RwLock<Mempool>>,
         blocks: Arc<RwLock<BlockLog>>,
@@ -1204,7 +1204,7 @@ fn plan_disconnect(
     let stats = handles.coin_stats.snapshot();
     if stats.height != height {
         return Err(ApplyError::CoinStatsRewind(
-            bitcoin_rs_coinstats::CoinStatsRewindError::HeightMismatch {
+            bitcoin_rs_utxo::stats::CoinStatsRewindError::HeightMismatch {
                 expected: height,
                 found: stats.height,
             },
@@ -1212,7 +1212,7 @@ fn plan_disconnect(
     }
     if stats.tx_count < tx_count_delta {
         return Err(ApplyError::CoinStatsRewind(
-            bitcoin_rs_coinstats::CoinStatsRewindError::TxCountUnderflow {
+            bitcoin_rs_utxo::stats::CoinStatsRewindError::TxCountUnderflow {
                 tx_count: stats.tx_count,
                 tx_delta: tx_count_delta,
             },
@@ -7185,8 +7185,8 @@ mod consensus_rule_tests {
     {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let mut utxo = UtxoSet::new();
-        let listener = bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
+        let listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         utxo.set_listener(Box::new(listener.clone()));
         let utxo = Arc::new(utxo);
@@ -9572,8 +9572,8 @@ mod consensus_rule_tests {
             Arc::new(ArcSwapOption::empty()),
             Arc::new(RwLock::new(BlockTree::new())),
             utxo,
-            Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
-                bitcoin_rs_coinstats::CoinStats::default(),
+            Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                bitcoin_rs_utxo::stats::CoinStats::default(),
             )),
             None,
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),

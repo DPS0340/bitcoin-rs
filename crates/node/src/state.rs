@@ -173,7 +173,7 @@ pub enum ApplyError {
     /// directly, and a refusal here means they do not describe the block being
     /// disconnected.
     #[error("coinstats rewind: {0}")]
-    CoinStatsRewind(#[source] bitcoin_rs_coinstats::CoinStatsRewindError),
+    CoinStatsRewind(#[source] bitcoin_rs_utxo::stats::CoinStatsRewindError),
 }
 
 /// The outcome of a refused or failed block disconnect.
@@ -832,7 +832,7 @@ pub struct NodeState {
     storage: NodeStorage,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     utxo: Arc<UtxoSet>,
-    coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+    coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
     tx_index_worker: Option<crate::txindex_worker::TxIndexWorker>,
     tx_index_query: Option<Arc<crate::txindex_worker::TxIndexQueryEngine>>,
@@ -985,7 +985,7 @@ impl NodeState {
                 }
                 (
                     bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_coinstats::CoinStats::default(),
+                    bitcoin_rs_utxo::stats::CoinStats::default(),
                     bitcoin_rs_chain::BlockTree::new(),
                     None,
                     0,
@@ -996,7 +996,7 @@ impl NodeState {
                 tracing::warn!(%reason, "chainstate payload rejected; retaining validated headers only");
                 (
                     bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_coinstats::CoinStats::default(),
+                    bitcoin_rs_utxo::stats::CoinStats::default(),
                     tree,
                     None,
                     0,
@@ -1019,7 +1019,8 @@ impl NodeState {
                 )
             }
         };
-        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(initial_coin_stats);
+        let coin_stats_listener =
+            bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
         // The rolling coin-stats listener does per-coin MuHash + event work on
         // the block-apply hot path. Bitcoin Core does not maintain rolling UTXO
         // stats during IBD by default; gettxoutsetinfo scans on demand instead
@@ -1276,7 +1277,7 @@ impl NodeState {
 
     /// Returns the shared coinstats listener handle.
     #[must_use]
-    pub fn coin_stats(&self) -> Arc<bitcoin_rs_coinstats::CoinStatsListener> {
+    pub fn coin_stats(&self) -> Arc<bitcoin_rs_utxo::stats::CoinStatsListener> {
         Arc::clone(&self.coin_stats)
     }
 
@@ -2804,7 +2805,7 @@ mod tests {
         );
         let listener_after_apply = resumed.coin_stats().snapshot();
         let mut rescanned = resumed.utxo().with_stable_view(|view| {
-            bitcoin_rs_coinstats::scan_coin_stats(view, next_tip.height, true)
+            bitcoin_rs_utxo::stats::scan_coin_stats(view, next_tip.height, true)
         })?;
         rescanned.tx_count = listener_after_apply.tx_count;
         assert_ne!(
@@ -2896,7 +2897,7 @@ mod tests {
         resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
         let rolling = resumed.coin_stats().snapshot();
         let mut scanned = resumed.utxo().with_stable_view(|view| {
-            bitcoin_rs_coinstats::scan_coin_stats(view, rolling.height, true)
+            bitcoin_rs_utxo::stats::scan_coin_stats(view, rolling.height, true)
         })?;
         scanned.tx_count = rolling.tx_count;
         assert_eq!(rolling, scanned);

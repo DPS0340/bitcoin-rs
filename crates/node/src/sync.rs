@@ -7392,8 +7392,8 @@ mod tests {
             applied_tip,
             block_tree,
             Arc::new(UtxoSet::new()),
-            Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
-                bitcoin_rs_coinstats::CoinStats::default(),
+            Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+                bitcoin_rs_utxo::stats::CoinStats::default(),
             )),
             None,
             Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),

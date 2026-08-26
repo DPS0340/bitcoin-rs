@@ -777,8 +777,9 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     };
     let want_muhash = hash_type == "muhash";
     let (stats, txouts, transactions, set_hash) = ctx.utxo.with_stable_view(|view| {
-        let stats = bitcoin_rs_coinstats::scan_coin_stats(view, ctx.applied_height(), want_muhash)
-            .map_err(|err| RpcError::Internal(err.to_string()))?;
+        let stats =
+            bitcoin_rs_utxo::stats::scan_coin_stats(view, ctx.applied_height(), want_muhash)
+                .map_err(|err| RpcError::Internal(err.to_string()))?;
         let set_hash = match hash_type {
             "hash_serialized_3" => Some((
                 "hash_serialized_3",

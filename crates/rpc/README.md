@@ -45,7 +45,7 @@ The synchronous, Bitcoin Core-compatible JSON-RPC and REST surface of the node: 
 
 ## Features
 
-- `rocksdb`, `fjall`, `redb`: forward the storage-backend selection into the `coinstats`, `storage`, and `p2p` crates.
+- `rocksdb`, `fjall`, `redb`: forward the storage-backend selection into the `utxo`, `storage`, and `p2p` crates.
 - `mdbx`: forwards the MDBX storage-backend selection into the `storage` crate.
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the

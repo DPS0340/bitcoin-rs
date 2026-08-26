@@ -289,7 +289,7 @@ fn capture_invariants(state: &NodeState) -> Result<CapturedInvariants> {
 
     let utxo = state.utxo();
     let stats = utxo
-        .with_stable_view(|view| bitcoin_rs_coinstats::scan_coin_stats(view, tip_height, true))
+        .with_stable_view(|view| bitcoin_rs_utxo::stats::scan_coin_stats(view, tip_height, true))
         .context("scan full UTXO coin statistics with MuHash")?;
     ensure!(
         stats.height == tip_height,
