@@ -1,4 +1,5 @@
 //! Block-apply pipeline over shared node handles.
+use std::ops::ControlFlow;
 
 mod scratch;
 
@@ -6,6 +7,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bitcoin::consensus::{Decodable as _, encode::VarInt};
+use bitcoin::hashes::Hash as _;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
@@ -16,6 +18,7 @@ use bitcoin_rs_utxo::{
     LiveOutput, LiveOutputMeta, UtxoSet,
     set::{BorrowedBlockChanges, BorrowedUtxoAdd},
 };
+use bitcoin_slices::{Visit as _, Visitor, bsl};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
@@ -46,6 +49,75 @@ fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
     let mut cursor = bytes.get(SERIALIZED_BLOCK_HEADER_LEN..)?;
     let count = VarInt::consensus_decode(&mut cursor).ok()?.0;
     usize::try_from(count).ok()
+}
+
+/// Collects transaction IDs directly from the canonical serialized block.
+///
+/// `bitcoin_slices` borrows every transaction from the same `Bytes` retained by
+/// the apply path. The visitor therefore performs the only production txid
+/// pass and never creates decoded transaction values or a second byte buffer.
+struct RustBlockTxidVisitor {
+    txids: Vec<Txid>,
+    invalid_header_len: Option<usize>,
+}
+
+impl RustBlockTxidVisitor {
+    fn new() -> Self {
+        Self {
+            txids: Vec::new(),
+            invalid_header_len: None,
+        }
+    }
+}
+
+impl Visitor for RustBlockTxidVisitor {
+    fn visit_block_header(&mut self, header: &bsl::BlockHeader<'_>) -> ControlFlow<()> {
+        if header.as_ref().len() != SERIALIZED_BLOCK_HEADER_LEN {
+            self.invalid_header_len = Some(header.as_ref().len());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn visit_transaction(&mut self, tx: &bsl::Transaction<'_>) -> ControlFlow<()> {
+        let digest = tx.txid_sha2();
+        let Ok(bytes): Result<[u8; 32], _> = digest.as_slice().try_into() else {
+            return ControlFlow::Break(());
+        };
+        self.txids.push(Txid::from_byte_array(bytes));
+        ControlFlow::Continue(())
+    }
+}
+
+fn rust_txids_from_serialized(
+    raw_block: &[u8],
+) -> Result<Vec<Txid>, bitcoin_rs_consensus::ConsensusError> {
+    let mut visitor = RustBlockTxidVisitor::new();
+    match bsl::Block::visit(raw_block, &mut visitor) {
+        Ok(_) => Ok(visitor.txids),
+        Err(bitcoin_slices::Error::VisitBreak) => {
+            let detail = visitor.invalid_header_len.map_or_else(
+                || "visitor stopped".to_owned(),
+                |len| format!("invalid block header length {len}"),
+            );
+            Err(bitcoin_rs_consensus::ConsensusError::Encoding(detail))
+        }
+        Err(error) => Err(bitcoin_rs_consensus::ConsensusError::Encoding(format!(
+            "{error:?}"
+        ))),
+    }
+}
+
+fn validate_visited_txid_count(
+    visited: usize,
+    decoded: usize,
+) -> Result<(), bitcoin_rs_consensus::ConsensusError> {
+    if visited == decoded {
+        return Ok(());
+    }
+    Err(bitcoin_rs_consensus::ConsensusError::Encoding(format!(
+        "visitor parsed {visited} transactions, decoder produced {decoded}"
+    )))
 }
 
 /// Storage for per-block UTXO undo records.
@@ -1775,9 +1847,15 @@ fn prove_window(
     let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
-        let Ok((kernel_block, tx_plan)) = parsed else {
+        let Ok(parsed) = parsed else {
             return Vec::new();
         };
+        let ParsedApply {
+            canonical_bytes,
+            tx_plan,
+            #[cfg(feature = "kernel")]
+            kernel_scripts,
+        } = parsed;
         let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
         if overlay
             .advance(
@@ -1791,7 +1869,9 @@ fn prove_window(
             return Vec::new();
         }
         prepared.push(PreparedApply {
-            kernel_block,
+            canonical_bytes,
+            #[cfg(feature = "kernel")]
+            kernel_scripts,
             tx_plan,
             resolved,
         });
@@ -1848,6 +1928,8 @@ fn prove_window(
         // split within one.
         let mut units = Vec::with_capacity(prepared.len());
         let mut flags: Vec<bitcoin_rs_script::VerifyFlags> = Vec::with_capacity(prepared.len());
+        #[cfg(not(feature = "kernel"))]
+        let portable_kernel_marker = bitcoin_rs_consensus::kernel::KernelBlock;
         for (index, ((block, unit), context)) in
             blocks.iter().zip(&prepared).zip(&contexts).enumerate()
         {
@@ -1876,7 +1958,10 @@ fn prove_window(
                 resolved,
                 context.height,
                 context.locktime_cutoff,
-                &unit.kernel_block,
+                #[cfg(feature = "kernel")]
+                &unit.kernel_scripts,
+                #[cfg(not(feature = "kernel"))]
+                &portable_kernel_marker,
             ) {
                 Ok(checks) => {
                     units.push(checks);
@@ -1950,27 +2035,31 @@ enum ProvenApply {
     AssumeValidSkipped(PreparedApply),
 }
 
+/// Parse-only data derived from one block's canonical bytes.
+///
+/// The transaction plan uses transaction IDs visited from `canonical_bytes`.
+/// Kernel data, when compiled, is retained only as script input and never
+/// contributes to Rust state decisions.
+struct ParsedApply {
+    canonical_bytes: bytes::Bytes,
+    tx_plan: BlockTxPlan,
+    #[cfg(feature = "kernel")]
+    kernel_scripts: bitcoin_rs_consensus::kernel::KernelBlock,
+}
+
 /// Everything a block's application needs that depends only on the block and
 /// the outputs it spends, not on the chain state the commit will mutate.
 ///
 /// Split out because a window of consecutive blocks can produce all of these
 /// at once, against one ordered overlay, and share a single script dispatch.
-/// The measured duplication that made an earlier batching attempt a wash was
-/// exactly the kernel parse and the prevout resolution below being done twice.
 struct PreparedApply {
-    kernel_block: bitcoin_rs_consensus::kernel::KernelBlock,
+    canonical_bytes: bytes::Bytes,
+    #[cfg(feature = "kernel")]
+    kernel_scripts: bitcoin_rs_consensus::kernel::KernelBlock,
     tx_plan: BlockTxPlan,
     resolved: Arc<ResolvedUtxoView>,
 }
 
-/// Parses a block and resolves the outputs it spends.
-///
-/// `source` is where prevouts come from. Today that is always the committed
-/// UTXO set; a window passes an overlay so a block can see outputs an earlier
-/// block in the same window created.
-///
-/// Runs no consensus rule and mutates nothing, which is what lets a window
-/// prepare several blocks before committing any of them.
 /// A sink that compares what is written to it against `expected`.
 ///
 /// Used to check preserved bytes against a block without serialising the block
@@ -2022,58 +2111,65 @@ pub(crate) fn bytes_are_block(raw: &[u8], block: &bitcoin::Block) -> bool {
 fn parse_block_for_apply(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
-) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, BlockTxPlan), ApplyError> {
-    // Preserved bytes must BE this block, not merely agree with it on
-    // transaction count. In kernel builds the txids and the transactions that
-    // script verification runs come from these bytes, while the witness
-    // commitment check and the UTXO mutation use the decoded block. Changing a
-    // witness does not change a txid, so a count check lets a caller pair a
-    // block carrying an invalid witness with bytes carrying a valid one: the
-    // scripts verify against the bytes and the invalid block gets applied.
-    if let Some(raw) = provided_serialized.as_deref()
-        && !bytes_are_block(raw, block)
-    {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(
-                "preserved bytes are not the serialization of the block they accompany".to_owned(),
-            ),
-        ));
-    }
-    let raw_block: bytes::Bytes =
-        provided_serialized.unwrap_or_else(|| bitcoin::consensus::encode::serialize(block).into());
-    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+) -> core::result::Result<ParsedApply, ApplyError> {
+    // A caller-supplied payload is accepted only when it is the canonical
+    // serialization of the decoded block. The accepted `Bytes` is then the
+    // single retained source for txid visiting, script parsing, persistence,
+    // indexing, window proofs, and ZMQ publication.
+    let canonical_bytes = if let Some(raw) = provided_serialized {
+        if !bytes_are_block(&raw, block) {
+            return Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Encoding(
+                    "preserved bytes are not the serialization of the block they accompany"
+                        .to_owned(),
+                ),
+            ));
+        }
+        raw
+    } else {
+        bytes::Bytes::from(bitcoin::consensus::encode::serialize(block))
+    };
+    let txids = rust_txids_from_serialized(&canonical_bytes).map_err(ApplyError::Consensus)?;
+    validate_visited_txid_count(txids.len(), block.txdata.len()).map_err(ApplyError::Consensus)?;
+    #[cfg(feature = "kernel")]
+    let kernel_scripts = bitcoin_rs_consensus::kernel::KernelBlock::parse(&canonical_bytes)
         .map_err(ApplyError::Consensus)?;
-    if kernel_block.transaction_count() != block.txdata.len() {
+    #[cfg(feature = "kernel")]
+    if kernel_scripts.transaction_count() != txids.len() {
         return Err(ApplyError::Consensus(
             bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                "kernel parsed {} transactions, decoder produced {}",
-                kernel_block.transaction_count(),
-                block.txdata.len()
+                "kernel parsed {} transactions, Rust visitor produced {}",
+                kernel_scripts.transaction_count(),
+                txids.len()
             )),
         ));
     }
-    let tx_plan = plan_block_transactions_with_txids(
-        block,
-        kernel_block.txids().map_err(ApplyError::Consensus)?,
-    );
-    Ok((kernel_block, tx_plan))
+    let tx_plan = plan_block_transactions_with_txids(block, txids);
+    Ok(ParsedApply {
+        canonical_bytes,
+        tx_plan,
+        #[cfg(feature = "kernel")]
+        kernel_scripts,
+    })
 }
 
 /// Parses a block and resolves the outputs it spends.
 ///
-/// `source` is where prevouts come from. Every caller outside a window passes
-/// the committed UTXO set; a window passes an overlay so a block can see
-/// outputs an earlier block in the same window created.
+/// `source` is where prevouts come from. Today that is always the committed
+/// UTXO set; a window passes an overlay so a block can see outputs an earlier
+/// block in the same window created.
 fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
     block: &bitcoin::Block,
     provided_serialized: Option<bytes::Bytes>,
     source: &S,
 ) -> core::result::Result<PreparedApply, ApplyError> {
-    let (kernel_block, tx_plan) = parse_block_for_apply(block, provided_serialized)?;
-    let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &tx_plan));
+    let parsed = parse_block_for_apply(block, provided_serialized)?;
+    let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &parsed.tx_plan));
     Ok(PreparedApply {
-        kernel_block,
-        tx_plan,
+        canonical_bytes: parsed.canonical_bytes,
+        #[cfg(feature = "kernel")]
+        kernel_scripts: parsed.kernel_scripts,
+        tx_plan: parsed.tx_plan,
         resolved,
     })
 }
@@ -2160,15 +2256,11 @@ fn apply_block_admitted(
         flags: verify_flags,
         locktime_cutoff,
     };
-    // Parse the block once with the kernel and take its txids. Core's
-    // `CTransaction` hashes itself while deserializing with the SHA-256
-    // implementation selected at runtime, so this one parse replaces the
-    // scalar `compute_txid` pass *and* the per-transaction serialize/reparse
-    // that script preparation used to perform.
-    // A window prepares several blocks against one overlay and hands the result
-    // back, so the kernel parse and the prevout resolution happen once. A proof
-    // whose context no longer matches is discarded together with its prepared
-    // view; the ordinary path rebuilds both from the live UTXO set.
+    // The Rust visitor owns ordered txids and the canonical bytes. Kernel
+    // parsing, when enabled, is retained only as the script execution input.
+    // A window prepares several blocks against one overlay and hands the
+    // result back, so both the canonical bytes and resolved prevouts are
+    // reused rather than rebuilt.
     let (prepared, transactions_proven) = match proven {
         Some(ProvenApply::Proven(proof)) if proof.context == validation_context => {
             (proof.prepared, true)
@@ -2180,7 +2272,9 @@ fn apply_block_admitted(
         ),
     };
     let PreparedApply {
-        kernel_block,
+        canonical_bytes,
+        #[cfg(feature = "kernel")]
+        kernel_scripts,
         tx_plan,
         resolved,
     } = prepared;
@@ -2227,16 +2321,32 @@ fn apply_block_admitted(
     let script_verify_result = if transactions_proven {
         Ok(())
     } else {
-        verify_block_transactions(
-            handles,
-            block,
-            &tx_plan,
-            Arc::clone(&resolved),
-            height,
-            locktime_cutoff,
-            verify_flags,
-            &kernel_block,
-        )
+        #[cfg(feature = "kernel")]
+        {
+            verify_block_transactions(
+                handles,
+                block,
+                &tx_plan,
+                Arc::clone(&resolved),
+                height,
+                locktime_cutoff,
+                verify_flags,
+                &kernel_scripts,
+            )
+        }
+        #[cfg(not(feature = "kernel"))]
+        {
+            verify_block_transactions(
+                handles,
+                block,
+                &tx_plan,
+                Arc::clone(&resolved),
+                height,
+                locktime_cutoff,
+                verify_flags,
+                &bitcoin_rs_consensus::kernel::KernelBlock,
+            )
+        }
     };
     let script_verify_dur = script_verify_started.elapsed();
     metrics::histogram!("node.apply_block.script_verify_seconds")
@@ -2346,41 +2456,10 @@ fn apply_block_admitted(
         .record(undo_persist_started.elapsed().as_secs_f64());
     undo_persist_result?;
 
-    // Serialize the block lazily: only when a consumer actually needs the
-    // full bytes. During IBD with pruning+txindex disabled this avoids a
-    // full-block serialize on every apply.
-    let block_bytes: bytes::Bytes = {
-        let needs_body = handles.block_body_store.is_some()
-            || handles.tx_index_runtime.is_some()
-            || wants_rawblock
-            || needs_g14_sample;
-        if needs_body {
-            // The preserved P2P wire payload is byte-identical to the canonical
-            // block serialization: the decoder rejects every non-canonical
-            // encoding, so a decoded block always re-serializes to its wire
-            // bytes. The length guard keeps that invariant release-observable and
-            // self-heals to a fresh serialize if it ever fails to hold, so a
-            // future decoder change can never admit non-canonical bytes into the
-            // block body store.
-            match provided_serialized {
-                Some(provided) if provided.len() == block.total_size() => {
-                    #[cfg(debug_assertions)]
-                    {
-                        debug_assert_eq!(
-                            provided.as_ref(),
-                            bitcoin::consensus::encode::serialize(block).as_slice(),
-                        );
-                    }
-                    provided
-                }
-                _ => bytes::Bytes::from(bitcoin::consensus::encode::serialize(block)),
-            }
-        } else {
-            // Nothing downstream reads `block_bytes` unless one of the consumers
-            // above needs the full body, so skip the serialize entirely.
-            bytes::Bytes::new()
-        }
-    };
+    // `canonical_bytes` was validated and retained before any consensus rule
+    // ran. Reuse the same allocation for every downstream consumer rather than
+    // serializing a second block after validation.
+    let block_bytes = canonical_bytes;
 
     let block_body_persist_started = quanta::Instant::now();
     let block_body_persist_result = match &handles.block_body_store {
@@ -3704,6 +3783,62 @@ mod consensus_rule_tests {
     }
 
     #[test]
+    fn rust_block_data_tests_visit_txids_and_retain_canonical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let block =
+            block_with_transactions(vec![coinbase_transaction(0x41), coinbase_transaction(0x42)]);
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let parsed = parse_block_for_apply(&block, Some(raw.clone()))?;
+        let expected = block
+            .txdata
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+
+        assert_eq!(parsed.tx_plan.txids(), expected);
+        assert_eq!(parsed.canonical_bytes.as_ref(), raw.as_ref());
+        assert_eq!(
+            parsed.canonical_bytes.as_ptr(),
+            raw.as_ptr(),
+            "caller bytes must be retained rather than serialized again"
+        );
+
+        let locally_serialized = parse_block_for_apply(&block, None)?;
+        assert_eq!(locally_serialized.canonical_bytes.as_ref(), raw.as_ref());
+        Ok(())
+    }
+
+    #[test]
+    fn rust_block_data_tests_reject_malformed_and_count_mismatched_bytes() {
+        let block = block_with_transactions(vec![coinbase_transaction(0x43)]);
+        let raw = bitcoin::consensus::encode::serialize(&block);
+        let mut malformed = raw.clone();
+        malformed.truncate(SERIALIZED_BLOCK_HEADER_LEN);
+        assert!(matches!(
+            rust_txids_from_serialized(&malformed),
+            Err(bitcoin_rs_consensus::ConsensusError::Encoding(_))
+        ));
+
+        let count_error = validate_visited_txid_count(1, 2).unwrap_err();
+        assert_eq!(
+            count_error,
+            bitcoin_rs_consensus::ConsensusError::Encoding(
+                "visitor parsed 1 transactions, decoder produced 2".to_owned()
+            )
+        );
+
+        let two_transaction_block =
+            block_with_transactions(vec![coinbase_transaction(0x43), coinbase_transaction(0x44)]);
+        let result = parse_block_for_apply(&two_transaction_block, Some(bytes::Bytes::from(raw)));
+        assert!(matches!(
+            result,
+            Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Encoding(_)
+            ))
+        ));
+    }
+
+    #[test]
     fn decode_block_tx_count_reads_the_varint_after_the_header() {
         let block = block_with_transaction(coinbase_transaction(0x42));
         let block_bytes = bitcoin::consensus::encode::serialize(&block);
@@ -3715,6 +3850,108 @@ mod consensus_rule_tests {
             super::decode_block_tx_count(&block_bytes[..SERIALIZED_BLOCK_HEADER_LEN]),
             None
         );
+    }
+
+    #[test]
+    fn rust_block_data_tests_window_proof_retains_canonical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_for_network(Network::Regtest, Arc::clone(&utxo));
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(0x44)],
+        )?;
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        applied_header_tip(&handles, block_hash, &block, 1)?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let mut proofs = prove_window(&handles, &[&block], std::slice::from_ref(&raw));
+        let Some(ProvenApply::Proven(proof)) = proofs.pop() else {
+            return Err("honest block did not produce a window proof".into());
+        };
+        assert_eq!(proof.prepared.canonical_bytes.as_ref(), raw.as_ref());
+        assert_eq!(proof.prepared.canonical_bytes.as_ptr(), raw.as_ptr());
+        Ok(())
+    }
+
+    #[test]
+    fn rust_block_data_tests_persistence_reuses_canonical_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(0x45)],
+        )?;
+        let raw = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let applied = apply_block_with_serialized(&handles, &block, raw.clone())?;
+        let stored = bodies
+            .bodies
+            .read()
+            .get(&(applied.height, applied.hash))
+            .cloned();
+        assert_eq!(stored.as_deref(), Some(raw.as_ref()));
+        assert_eq!(
+            bodies
+                .persisted_ptrs
+                .read()
+                .get(&(applied.height, applied.hash))
+                .copied(),
+            Some(raw.as_ptr() as usize),
+            "body persistence must receive the retained canonical allocation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rust_block_data_tests_reorg_reuses_persisted_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ReorgBodyLoadingFixture {
+            handles,
+            bodies,
+            target,
+            ..
+        } = reorg_body_loading_fixture()?;
+        let (target_hash, parent_key, target_key) = {
+            let tree = handles.block_tree.read();
+            let target_node = tree.node(target)?;
+            let parent_id = target_node.parent.ok_or("target has no parent")?;
+            let parent = tree.node(parent_id)?;
+            (
+                target_node.hash,
+                (parent.height, parent.hash),
+                (target_node.height, target_node.hash),
+            )
+        };
+        crate::reorg::switch_to_branch(&handles, target, |_| None, |_| {})?;
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(target_hash)
+        );
+        let loaded = bodies.loaded.read().clone();
+        let parent_position = loaded
+            .iter()
+            .position(|key| *key == parent_key)
+            .ok_or("reorg did not load the first winning body")?;
+        let target_position = loaded
+            .iter()
+            .position(|key| *key == target_key)
+            .ok_or("reorg did not load the second winning body")?;
+        assert!(
+            parent_position < target_position,
+            "reconnect bodies must load in chain order"
+        );
+        Ok(())
     }
 
     #[test]
@@ -8575,6 +8812,8 @@ mod consensus_rule_tests {
     struct MapBodyStore {
         bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
         failed_reads: parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+        loaded: parking_lot::RwLock<Vec<(u32, bitcoin_rs_primitives::Hash256)>>,
+        persisted_ptrs: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), usize>>,
     }
 
     struct ReorgBodyLoadingFixture {
@@ -8592,6 +8831,7 @@ mod consensus_rule_tests {
             height: u32,
             hash: bitcoin_rs_primitives::Hash256,
         ) -> Result<Option<Vec<u8>>, StorageError> {
+            self.loaded.write().push((height, hash));
             if self.failed_reads.read().contains(&(height, hash)) {
                 return Err(StorageError::Backend(
                     "injected block-body read failure".to_owned(),
@@ -8606,6 +8846,9 @@ mod consensus_rule_tests {
             hash: bitcoin_rs_primitives::Hash256,
             body: &[u8],
         ) -> Result<(), StorageError> {
+            self.persisted_ptrs
+                .write()
+                .insert((height, hash), body.as_ptr() as usize);
             self.bodies.write().insert((height, hash), body.to_vec());
             Ok(())
         }
@@ -9756,7 +9999,6 @@ mod contextual_softfork_tests {
 #[cfg(test)]
 mod zmq_emit_tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
     use parking_lot::Mutex as TestMutex;
 
     #[derive(Debug, Default)]
