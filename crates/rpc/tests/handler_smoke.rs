@@ -30,6 +30,13 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
     let valid_psbt = build_valid_base64_psbt(&fixture.tx)?;
     let txid = fixture.txid.to_string();
     let block_hash = fixture.block_hash.to_string_be();
+    let descriptor = "addr(1111111111111111111114oLvT2)";
+    let descriptor_info = handler.dispatch("getdescriptorinfo", &json!([descriptor]))?;
+    let checksummed_descriptor = descriptor_info
+        .get("descriptor")
+        .as_str()
+        .ok_or("getdescriptorinfo omitted descriptor")?
+        .to_owned();
 
     let calls = [
         ("getblockchaininfo", json!([])),
@@ -63,23 +70,14 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
         ("getblocktemplate", json!([{}])),
         ("submitblock", json!([""])),
         ("prioritisetransaction", json!([txid.as_str(), 0, 0])),
-        (
-            "getdescriptorinfo",
-            json!(["addr(1111111111111111111114oLvT2)"]),
-        ),
-        (
-            "deriveaddresses",
-            json!(["addr(1111111111111111111114oLvT2)"]),
-        ),
+        ("getdescriptorinfo", json!([descriptor])),
+        ("deriveaddresses", json!([checksummed_descriptor.as_str()])),
         (
             "scantxoutset",
             json!(["start", ["addr(1111111111111111111114oLvT2)"]]),
         ),
-        ("walletcreatefundedpsbt", json!([[], []])),
-        ("walletprocesspsbt", json!([valid_psbt.as_str()])),
         ("finalizepsbt", json!([valid_psbt.as_str()])),
         ("combinepsbt", json!([[valid_psbt.as_str()]])),
-        ("bumpfee", json!([txid.as_str()])),
     ];
 
     for (method, params) in calls {
@@ -503,18 +501,35 @@ fn network_peer_methods_read_shared_peer_registry() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn signing_methods_are_disabled() -> Result<(), Box<dyn std::error::Error>> {
+fn removed_wallet_methods_return_method_not_found() {
     let handler = Handler::new(Arc::new(Context::new()));
-    let error = handler
-        .dispatch("signrawtransactionwithwallet", &json!([]))
-        .err()
-        .ok_or("signing method unexpectedly succeeded")?;
-    assert_eq!(error.code(), RpcError::INTERNAL_ERROR);
-    assert_eq!(
-        error.to_string(),
-        "wallet has no private keys; use external signer"
-    );
-    Ok(())
+    for method in [
+        "walletcreatefundedpsbt",
+        "walletprocesspsbt",
+        "bumpfee",
+        "signrawtransactionwithkey",
+        "signrawtransactionwithwallet",
+        "dumpprivkey",
+        "dumpwallet",
+        "importprivkey",
+        "importwallet",
+        "importmulti",
+        "importdescriptors",
+        "sethdseed",
+        "walletpassphrase",
+        "walletpassphrasechange",
+        "encryptwallet",
+    ] {
+        let error = handler
+            .dispatch(method, &json!([]))
+            .err()
+            .unwrap_or_else(|| panic!("{method} unexpectedly succeeded"));
+        assert_eq!(error.code(), RpcError::METHOD_NOT_FOUND);
+        assert!(
+            matches!(&error, RpcError::MethodNotFound(name) if name == method),
+            "{method} must map to MethodNotFound, got {error:?}"
+        );
+    }
 }
 
 struct FakeTxIndex {

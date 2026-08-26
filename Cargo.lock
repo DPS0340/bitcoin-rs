@@ -151,12 +151,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bdk_coin_select"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43064fa3dd1d3a8b24079cfcb5ede6b785857edc782277f17a1736511ccc1916"
-
-[[package]]
 name = "bech32"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -366,7 +360,6 @@ dependencies = [
  "bitcoin-rs-script",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
- "bitcoin-rs-wallet",
  "bytes",
  "cap-fs-ext",
  "cap-std",
@@ -469,11 +462,11 @@ dependencies = [
  "bitcoin-rs-pruning",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
- "bitcoin-rs-wallet",
  "compact_str",
  "criterion",
  "crossbeam-channel",
  "hashbrown 0.17.1",
+ "miniscript",
  "parking_lot",
  "proptest",
  "serde",
@@ -550,32 +543,6 @@ dependencies = [
  "tinyvec",
  "tracing",
  "zerocopy",
-]
-
-[[package]]
-name = "bitcoin-rs-wallet"
-version = "0.4.0"
-dependencies = [
- "arc-swap",
- "bdk_coin_select",
- "bitcoin",
- "bitcoin-rs-consensus",
- "bitcoin-rs-index",
- "bitcoin-rs-primitives",
- "bitcoin-rs-script",
- "bitcoin-rs-storage",
- "hashbrown 0.17.1",
- "miniscript",
- "parking_lot",
- "proptest",
- "secp256k1 0.31.1",
- "serde",
- "serde_json",
- "smallvec",
- "tempfile",
- "thiserror",
- "tinyvec",
- "tracing",
 ]
 
 [[package]]
@@ -1865,14 +1832,13 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniscript"
-version = "13.0.1"
+version = "13.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cfb042402e95bb8a7a2f476bb8896ee1552c2f14224b3d680ac809fb20ff29d"
+checksum = "cd35e2c377504e50159561884b03610711db6c2fec6c89f2b98d94016684726b"
 dependencies = [
  "bech32",
  "bitcoin",
  "hex-conservative 1.2.0",
- "serde",
 ]
 
 [[package]]
