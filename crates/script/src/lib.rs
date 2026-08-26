@@ -12,12 +12,18 @@
 
 /// Rayon-backed Schnorr verification helpers.
 pub mod batch;
+pub(crate) mod classify;
 /// Script verification wrapper.
 pub mod interpreter;
+pub(crate) mod nested;
 /// Opcode re-exports and local opcode newtype.
 pub mod opcodes;
+pub(crate) mod p2pkh;
+pub(crate) mod p2wpkh;
+pub(crate) mod p2wsh;
 /// Signature hash cache wrapper.
 pub mod sighash_cache;
+pub(crate) mod signature;
 /// Signature operation counters.
 pub mod sigops;
 /// Bounded stack infrastructure for the future hand-rolled interpreter.

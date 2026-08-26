@@ -22,9 +22,9 @@ included — is self-authenticating against the recorded provenance.
 
 | file | class | txid | height | flags | interpreter parity | source |
 |---|---|---|---|---|---|---|
-| `legacy_p2pk.json` | P2PK | `f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16` | 170 | `P2SH` | no | local mainnet datadir via `bitcoind -rest`, `/rest/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee.json` |
-| `legacy_p2pkh.json` | P2PKH | `74c1a6dd6e88f73035143f8fc7420b5c395d28300a70bb35b943f7f2eddc656d` | 2812 | `P2SH` | no | local mainnet datadir via `bitcoind -rest`, `/rest/block/0000000049a63b4dda3a43450c19d085d6c28bfb4cbb2e0576815d7f31919c5d.json` |
-| `p2sh_spend.json` | P2SH (2-of-2 `OP_CHECKMULTISIG` redeem) | `3a12b4f2361806a2f8508ebcf1968cd07052351c24bfe069f143ef244c24a7e8` | 400000 | `P2SH,DERSIG,CHECKLOCKTIMEVERIFY` | no | <https://mempool.space/api/tx/3a12b4f2361806a2f8508ebcf1968cd07052351c24bfe069f143ef244c24a7e8> |
+| `legacy_p2pk.json` | P2PK | `f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16` | 170 | `P2SH` | **yes** | local mainnet datadir via `bitcoind -rest`, `/rest/block/00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee.json` |
+| `legacy_p2pkh.json` | P2PKH | `74c1a6dd6e88f73035143f8fc7420b5c395d28300a70bb35b943f7f2eddc656d` | 2812 | `P2SH` | **yes** | local mainnet datadir via `bitcoind -rest`, `/rest/block/0000000049a63b4dda3a43450c19d085d6c28bfb4cbb2e0576815d7f31919c5d.json` |
+| `p2sh_spend.json` | P2SH (2-of-2 `OP_CHECKMULTISIG` redeem) | `3a12b4f2361806a2f8508ebcf1968cd07052351c24bfe069f143ef244c24a7e8` | 400000 | `P2SH,DERSIG,CHECKLOCKTIMEVERIFY` | **yes** | <https://mempool.space/api/tx/3a12b4f2361806a2f8508ebcf1968cd07052351c24bfe069f143ef244c24a7e8> |
 | `segwit_v0_spend.json` | segwit v0 (P2WPKH) | `f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd` | 481824 | `P2SH,DERSIG,NULLDUMMY,CHECKLOCKTIMEVERIFY,CHECKSEQUENCEVERIFY,WITNESS` | no | <https://mempool.space/api/tx/f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd> |
 | `taproot_keypath_spend.json` | taproot key path | `33e794d097969002ee05d336686fc03c9e15a597c1b9827669460fac98799036` | 709635 | `P2SH,DERSIG,NULLDUMMY,CHECKLOCKTIMEVERIFY,CHECKSEQUENCEVERIFY,WITNESS,TAPROOT` | **yes** | <https://mempool.space/api/tx/33e794d097969002ee05d336686fc03c9e15a597c1b9827669460fac98799036> |
 | `taproot_scriptpath_spend.json` | taproot script path | `905ecdf95a84804b192f4dc221cfed4d77959b81ed66013a7e41a6e61e7ed530` | 709635 | `P2SH,DERSIG,NULLDUMMY,CHECKLOCKTIMEVERIFY,CHECKSEQUENCEVERIFY,WITNESS,TAPROOT` | no | <https://mempool.space/api/tx/905ecdf95a84804b192f4dc221cfed4d77959b81ed66013a7e41a6e61e7ed530> |
@@ -43,17 +43,17 @@ included — is self-authenticating against the recorded provenance.
   at 183k/200k/220k/250k/290k/320k) found no all-P2SH-input spend — organic
   P2SH usage stayed rare for years after activation. The redeem script is a
   2-of-2 multisig, so this fixture also exercises `OP_CHECKMULTISIG`
-  (the "multisig era" legacy semantics) through the kernel.
+  (the "multisig era" legacy semantics) through native Rust and kernel.
 - **`segwit_v0_spend`** is from block 481,824, the segwit activation block.
+- **`legacy_p2pk`**, **`legacy_p2pkh`**, and **`p2sh_spend`** now assert
+  native Rust/kernel verdict parity. The P2PK/P2PKH rows cover historical
+  pre-BIP66 encoding and the P2SH row covers BIP16, FindAndDelete, and
+  2-of-2 CHECKMULTISIG.
 - **`taproot_keypath_spend`** is the widely documented **first taproot spend
   on mainnet** (block 709,635, single input, one 64-byte Schnorr signature,
-  no annex). It is the one fixture inside the in-repo Rust interpreter's
-  native scope (single-input key-path), so it carries
-  `interpreter_parity: true`.
-- **`taproot_scriptpath_spend`** is a single-input script-path spend from the
-  same block. It doubles as the fixture-grounded half of the
-  `differential_is_non_vacuous` pin: the kernel accepts it while the key-path-
-  only Rust interpreter rejects it.
+  no annex). It remains inside the in-repo Rust interpreter's native scope.
+- **`taproot_scriptpath_spend`** remains outside this stage and supplies the
+  fixture-grounded non-vacuous differential rejection.
 
 Esplora data was fetched from `mempool.space` (the recorded source URLs);
 `blockstream.info` serves the identical transactions under the same API paths

@@ -63,6 +63,85 @@ pub use verify_tx::{
 
 use thiserror::Error;
 
+/// Immutable block-wide prevout matrix shared by transaction checks and script
+/// execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedBlockInputs {
+    matrix: Vec<Vec<Option<bitcoin::TxOut>>>,
+}
+
+impl ResolvedBlockInputs {
+    /// Takes ownership of rows in block transaction and input order.
+    #[must_use]
+    pub fn new(matrix: Vec<Vec<Option<bitcoin::TxOut>>>) -> Self {
+        Self { matrix }
+    }
+
+    /// Number of transaction rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.matrix.len()
+    }
+
+    /// Returns whether the matrix has no transaction rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.matrix.is_empty()
+    }
+
+    /// Returns one transaction's immutable input row.
+    #[must_use]
+    pub fn transaction(&self, tx_index: usize) -> Option<&[Option<bitcoin::TxOut>]> {
+        self.matrix.get(tx_index).map(Vec::as_slice)
+    }
+
+    /// Returns one resolved input, preserving a missing-prevout marker.
+    #[must_use]
+    pub fn get(&self, tx_index: usize, input_index: usize) -> Option<&bitcoin::TxOut> {
+        self.matrix.get(tx_index)?.get(input_index)?.as_ref()
+    }
+}
+
+/// Coordinates and reason for one transaction input's script failure.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("transaction {tx_index} input {input_index}: {reason}")]
+pub struct ScriptFailure {
+    /// Transaction index within the block.
+    pub tx_index: usize,
+    /// Input index within the transaction.
+    pub input_index: usize,
+    /// Stable underlying script error text.
+    pub reason: String,
+}
+
+/// Ordered result of a block's non-script and script phases.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum BlockCheckFailure {
+    /// A transaction or block rule failed outside script execution.
+    #[error("non-script consensus failure: {0}")]
+    NonScript(ConsensusError),
+    /// One input's script failed with block coordinates.
+    #[error("{0}")]
+    Script(ScriptFailure),
+}
+
+impl From<ConsensusError> for BlockCheckFailure {
+    fn from(error: ConsensusError) -> Self {
+        Self::NonScript(error)
+    }
+}
+impl From<BlockCheckFailure> for ConsensusError {
+    fn from(failure: BlockCheckFailure) -> Self {
+        match failure {
+            BlockCheckFailure::NonScript(error) => error,
+            BlockCheckFailure::Script(script) => Self::Script {
+                input_index: script.input_index,
+                reason: script.reason,
+            },
+        }
+    }
+}
+
 /// Consensus validation error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
