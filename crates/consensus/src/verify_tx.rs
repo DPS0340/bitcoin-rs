@@ -1703,6 +1703,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
     fn multi_input_transaction_jobs_scan_inputs_in_order() {
         let first_outpoint = OutPoint {
             txid: Txid::from_byte_array([1; 32]),
