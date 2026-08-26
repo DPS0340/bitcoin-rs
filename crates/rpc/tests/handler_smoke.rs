@@ -6,6 +6,7 @@ use hashbrown::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bitcoin::consensus::encode::serialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
@@ -14,7 +15,9 @@ use bitcoin_rs_filters::{FilterIndexError, FilterIndexLike};
 use bitcoin_rs_mempool::MempoolEntry;
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{BlockRecord, ChainControl, ChainControlError, Context};
+use bitcoin_rs_rpc::context::{
+    BlockBodySource, BlockRecord, ChainControl, ChainControlError, Context,
+};
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use parking_lot::RwLock;
@@ -645,7 +648,13 @@ fn fee_stats_context(
         }));
     }
     let block = seed_tree_chain(&ctx, &block);
-    ctx.add_block(BlockRecord::from_block(7, &block));
+    let record = BlockRecord::from_block(7, &block);
+    ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+        height: record.height,
+        hash: record.hash,
+        body: serialize(&block),
+    }));
+    ctx.add_block(record);
     (Arc::new(ctx), low_tx, high_tx)
 }
 
@@ -753,6 +762,18 @@ fn assert_percentiles(
     Ok(())
 }
 
+struct SingleBlockSource {
+    height: u32,
+    hash: Hash256,
+    body: Vec<u8>,
+}
+
+impl BlockBodySource for SingleBlockSource {
+    fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        (height == self.height && hash == self.hash).then(|| self.body.clone())
+    }
+}
+
 struct Fixture {
     ctx: Arc<Context>,
     tx: Transaction,
@@ -798,6 +819,11 @@ impl Fixture {
             .clone();
         ctx.set_chain_tip(tip.clone());
         ctx.set_applied_tip(tip);
+        ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 7,
+            hash: block_hash,
+            body: serialize(&block),
+        }));
         ctx.add_block(BlockRecord::from_block(7, &block));
         let mut values = HashMap::new();
         values.insert(outpoint(1), 6_000);

@@ -830,7 +830,6 @@ mod tests {
             )
             .expect("hash"),
             height: 1,
-            block_hex: String::new(),
             body_size: 0,
             header: None,
             tx_count: 0,

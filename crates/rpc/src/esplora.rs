@@ -912,6 +912,18 @@ mod tests {
 
     use super::*;
 
+    struct SingleBlockSource {
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        body: Vec<u8>,
+    }
+
+    impl crate::context::BlockBodySource for SingleBlockSource {
+        fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
+            (height == self.height && hash == self.hash).then(|| self.body.clone())
+        }
+    }
+
     fn transaction(input: Option<OutPoint>, output: TxOut) -> Transaction {
         Transaction {
             version: transaction::Version(2),
@@ -1170,6 +1182,11 @@ mod tests {
         let txid = transaction.compute_txid();
         let mut context = Context::new();
         context.chain_network = bitcoin_rs_primitives::Network::Regtest;
+        context.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 0,
+            hash: record.hash,
+            body: serialize(&block),
+        }));
         context.add_block(record);
         let tip = {
             let mut tree = context.block_tree.write();
@@ -1896,6 +1913,11 @@ mod tests {
         };
         let stale_record = crate::context::BlockRecord::from_block(1, &stale_block);
         let mut ctx = Context::new();
+        ctx.block_body_source = Some(Arc::new(SingleBlockSource {
+            height: 1,
+            hash: stale_record.hash,
+            body: serialize(&stale_block),
+        }));
         ctx.add_block(stale_record.clone());
         {
             let mut tree = ctx.block_tree.write();

@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bitcoin::consensus::{Decodable as _, encode::VarInt};
-use bitcoin::hex::DisplayHex;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
@@ -974,7 +973,6 @@ pub struct ApplyHandles {
     /// Shared ZMQ-event publisher (default: `NoOpZmqPublisher`).
     pub zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     pub(crate) filter_header_cache: Arc<Mutex<Option<(Hash256, Hash256)>>>,
-    pub(crate) cache_block_bodies_in_memory: bool,
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
     /// Undo storage. Mandatory: see [`UndoStore`].
     pub(crate) undo_store: Arc<dyn UndoStore>,
@@ -1053,7 +1051,6 @@ impl ApplyHandles {
             transactions,
             zmq_publisher,
             filter_header_cache: Arc::new(Mutex::new(None)),
-            cache_block_bodies_in_memory: true,
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
             g2_muhash_sampler: None,
@@ -2346,7 +2343,6 @@ fn apply_block_admitted(
     let block_bytes: bytes::Bytes = {
         let needs_body = handles.block_body_store.is_some()
             || handles.tx_index_runtime.is_some()
-            || handles.cache_block_bodies_in_memory
             || wants_rawblock
             || needs_g14_sample;
         if needs_body {
@@ -2371,8 +2367,9 @@ fn apply_block_admitted(
                 _ => bytes::Bytes::from(bitcoin::consensus::encode::serialize(block)),
             }
         } else {
-            // Header-only: 80 bytes is enough for the block record.
-            bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block.header))
+            // Nothing downstream reads `block_bytes` unless one of the consumers
+            // above needs the full body, so skip the serialize entirely.
+            bytes::Bytes::new()
         }
     };
 
@@ -2421,13 +2418,7 @@ fn apply_block_admitted(
 
     let block_record_started = quanta::Instant::now();
     {
-        let block_record = applied_block_record(
-            height,
-            block_hash,
-            block,
-            &block_bytes,
-            handles.cache_block_bodies_in_memory,
-        );
+        let block_record = BlockRecord::from_block(height, block);
         // The record carries no header. `BlockRecord`'s is filled from the block
         // tree when a caller resolves one, which is sound only because the
         // header is already in the tree by the time the record is in the log —
@@ -3738,34 +3729,6 @@ fn internal_outpoint(outpoint: &bitcoin::OutPoint) -> OutPoint {
     )
 }
 
-fn applied_block_record(
-    height: u32,
-    block_hash: Hash256,
-    block: &bitcoin::Block,
-    block_bytes: &[u8],
-    include_body: bool,
-) -> BlockRecord {
-    let block_hex = if include_body {
-        block_bytes.to_lower_hex_string()
-    } else {
-        String::new()
-    };
-    BlockRecord {
-        hash: block_hash,
-        height,
-        block_hex,
-        body_size: block_bytes.len(),
-        // Not stored. `applied_header_tip` above has already put this block's
-        // header in the block tree — the record is pushed after that, through
-        // the same handles — and the tree never drops a node. Keeping a second
-        // copy here kept it for every block on the chain, for the life of the
-        // process.
-        header: None,
-        tx_count: block.txdata.len(),
-        time: block.header.time,
-    }
-}
-
 #[must_use]
 fn compute_verify_flags(
     network: Network,
@@ -3841,10 +3804,9 @@ mod consensus_rule_tests {
     }
 
     #[test]
-    fn applied_block_record_matches_rpc_constructors() {
+    fn decode_block_tx_count_reads_the_varint_after_the_header() {
         let block = block_with_transaction(coinbase_transaction(0x42));
         let block_bytes = bitcoin::consensus::encode::serialize(&block);
-        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
         assert_eq!(
             super::decode_block_tx_count(&block_bytes),
             Some(block.txdata.len())
@@ -3853,26 +3815,20 @@ mod consensus_rule_tests {
             super::decode_block_tx_count(&block_bytes[..SERIALIZED_BLOCK_HEADER_LEN]),
             None
         );
+    }
 
-        let cached = applied_block_record(7, block_hash, &block, &block_bytes, true);
-        let expected_cached = BlockRecord::from_block_bytes(7, &block, &block_bytes);
-        assert_eq!(cached.hash, expected_cached.hash);
-        assert_eq!(cached.height, expected_cached.height);
-        assert_eq!(cached.block_hex, expected_cached.block_hex);
-        assert_eq!(cached.body_size, expected_cached.body_size);
-        assert_eq!(cached.header, expected_cached.header);
-        assert_eq!(cached.tx_count, expected_cached.tx_count);
-        assert_eq!(cached.time, expected_cached.time);
+    #[test]
+    fn applied_record_carries_block_metadata_without_the_body() {
+        let block = block_with_transaction(coinbase_transaction(0x42));
+        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let record = BlockRecord::from_block(7, &block);
 
-        let metadata = applied_block_record(7, block_hash, &block, &block_bytes, false);
-        let expected_metadata = BlockRecord::from_block_metadata_bytes(7, &block, &block_bytes);
-        assert_eq!(metadata.hash, expected_metadata.hash);
-        assert_eq!(metadata.height, expected_metadata.height);
-        assert_eq!(metadata.block_hex, expected_metadata.block_hex);
-        assert_eq!(metadata.body_size, expected_metadata.body_size);
-        assert_eq!(metadata.header, expected_metadata.header);
-        assert_eq!(metadata.tx_count, expected_metadata.tx_count);
-        assert_eq!(metadata.time, expected_metadata.time);
+        assert_eq!(record.hash, block_hash);
+        assert_eq!(record.height, 7);
+        assert_eq!(record.body_size, block.total_size());
+        assert!(record.header.is_none());
+        assert_eq!(record.tx_count, block.txdata.len());
+        assert_eq!(record.time, block.header.time);
     }
 
     #[test]
@@ -8095,10 +8051,8 @@ mod consensus_rule_tests {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let publisher = Arc::new(RecordingRawBlockPublisher::default());
         let publisher_for_handles: Arc<dyn crate::ZmqPublisher> = publisher.clone();
-        let mut handles =
-            apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()))
-                .with_zmq_publisher(publisher_for_handles);
-        handles.cache_block_bodies_in_memory = false;
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()))
+            .with_zmq_publisher(publisher_for_handles);
         assert!(handles.block_body_store.is_none());
         assert!(handles.tx_index_runtime.is_none());
         let genesis_tip = applied_header_tip(
@@ -8157,10 +8111,8 @@ mod consensus_rule_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let publisher: Arc<dyn crate::ZmqPublisher> = Arc::new(PanickingNoRawblockPublisher);
-        let mut handles =
-            apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()))
-                .with_zmq_publisher(publisher);
-        handles.cache_block_bodies_in_memory = false;
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()))
+            .with_zmq_publisher(publisher);
         assert!(handles.block_body_store.is_none());
         assert!(handles.tx_index_runtime.is_none());
         let genesis_tip = applied_header_tip(

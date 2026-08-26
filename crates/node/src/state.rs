@@ -7,7 +7,6 @@
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hex::FromHex as _;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_rpc::context::{
@@ -600,46 +599,42 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
         &self,
         requested_height: u32,
     ) -> core::result::Result<PruneResult, PruneServiceError> {
-        let mut blocks = self.blocks.write();
-        let mut pruneheight = self.pruneheight.lock();
         let policy = PrunePolicy {
             target_size_mb: 0,
             keep_below_tip: CORE_REORG_SAFETY_MARGIN,
         };
+        let mut pruneheight = self.pruneheight.lock();
         let updated_pruneheight =
             pruneheight.map_or(requested_height, |height| height.max(requested_height));
         let pruner_tip = updated_pruneheight
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
 
+        let prune_candidates: Vec<(u32, bitcoin_rs_primitives::Hash256, usize)> = {
+            let blocks = self.blocks.read();
+            blocks
+                .iter()
+                .filter(|record| record.height < updated_pruneheight && record.tx_count > 0)
+                .map(|record| (record.height, record.hash, record.tx_count))
+                .collect()
+        };
+
         let mut pruned_txids = Vec::new();
-        for record in blocks
-            .iter()
-            .filter(|record| record.height < updated_pruneheight)
-        {
-            if record.tx_count == 0 {
+        for (height, hash, tx_count) in prune_candidates {
+            if tx_count == 0 {
                 continue;
             }
-            let bytes = if record.block_hex.is_empty() {
-                self.block_body_store
-                    .load_block_body(record.height, record.hash)
-                    .map_err(|error| PruneServiceError::failed(error.to_string()))?
-                    .unwrap_or_default()
-            } else {
-                Vec::<u8>::from_hex(&record.block_hex).map_err(|error| {
-                    PruneServiceError::failed(format!(
-                        "cached block body at height {} is not valid hex: {error}",
-                        record.height
-                    ))
-                })?
-            };
+            let bytes = self
+                .block_body_store
+                .load_block_body(height, hash)
+                .map_err(|error| PruneServiceError::failed(error.to_string()))?
+                .unwrap_or_default();
             if bytes.is_empty() {
                 continue;
             }
             let block = deserialize::<bitcoin::Block>(&bytes).map_err(|error| {
                 PruneServiceError::failed(format!(
-                    "cached block body at height {} failed decode: {error}",
-                    record.height
+                    "stored block body at height {height} failed decode: {error}"
                 ))
             })?;
             pruned_txids.extend(block.txdata.iter().map(Transaction::compute_txid));
@@ -672,11 +667,6 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             }
         }
 
-        for record in blocks.records_mut() {
-            if record.height < updated_pruneheight {
-                record.block_hex = String::new();
-            }
-        }
         *pruneheight = Some(updated_pruneheight);
 
         Ok(PruneResult {
@@ -1163,7 +1153,6 @@ impl NodeState {
             transactions: Arc::clone(&transactions),
             zmq_publisher: Arc::clone(&zmq_publisher),
             filter_header_cache: Arc::new(Mutex::new(None)),
-            cache_block_bodies_in_memory: false,
             block_body_store: Some(Arc::clone(&block_body_store)),
             undo_store,
             g2_muhash_sampler,
@@ -2068,12 +2057,8 @@ mod tests {
         state.apply_block(&block)?;
 
         assert_eq!(
-            state
-                .blocks
-                .read()
-                .first()
-                .map(|record| record.block_hex.as_str()),
-            Some("")
+            state.blocks.read().first().map(|record| record.body_size),
+            Some(serialize(&block).len())
         );
         assert_eq!(
             state.block_body_store.load_block_body(0, hash)?.as_deref(),
@@ -2255,7 +2240,6 @@ mod tests {
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
-                block_hex: "00".to_owned(),
                 body_size: 1,
                 header: None,
                 tx_count: 0,
@@ -2289,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_service_deletes_seeded_storage_rows_and_clears_cached_bodies() -> anyhow::Result<()> {
+    fn prune_service_deletes_seeded_storage_rows_and_advances_pruneheight() -> anyhow::Result<()> {
         fn hash(height: u32) -> anyhow::Result<bitcoin_rs_primitives::Hash256> {
             let byte = u8::try_from(height)
                 .map_err(|_| anyhow::anyhow!("test height {height} exceeds u8"))?;
@@ -2315,7 +2299,6 @@ mod tests {
             state.blocks.write().push(BlockRecord {
                 hash,
                 height,
-                block_hex: "00".to_owned(),
                 body_size: 1,
                 header: None,
                 tx_count: 0,
@@ -2348,29 +2331,6 @@ mod tests {
         assert!(state.storage.stored_prune_undo(11, hash(11)?)?.is_some());
         assert!(state.storage.stored_prune_body(12, hash(12)?)?.is_some());
         assert!(state.storage.stored_prune_undo(12, hash(12)?)?.is_some());
-
-        let blocks = state.blocks.read();
-        assert_eq!(
-            blocks
-                .iter()
-                .find(|record| record.height == 10)
-                .map(|record| record.block_hex.as_str()),
-            Some("")
-        );
-        assert_eq!(
-            blocks
-                .iter()
-                .find(|record| record.height == 10)
-                .map(|record| record.block_hex.capacity()),
-            Some(0)
-        );
-        assert_eq!(
-            blocks
-                .iter()
-                .find(|record| record.height == 11)
-                .map(|record| record.block_hex.as_str()),
-            Some("00")
-        );
 
         Ok(())
     }
@@ -2505,7 +2465,7 @@ mod tests {
         let state = NodeState::open(config)?;
         let block = genesis_block(bitcoin::Network::Regtest);
         // The hash is not needed: this test counts bytes in files, not bodies.
-        let record = BlockRecord::from_block_metadata(10, &block);
+        let record = BlockRecord::from_block(10, &block);
         let record_sum_before = u64::try_from(record.body_size)?;
         state.blocks.write().push(record);
 
@@ -2586,7 +2546,7 @@ mod tests {
         state
             .blocks
             .write()
-            .push(BlockRecord::from_block_metadata(10, &pruned_block));
+            .push(BlockRecord::from_block(10, &pruned_block));
 
         let pruned_tx = pruned_block.txdata[0].clone();
         let pruned_txid = pruned_tx.compute_txid();
@@ -2642,6 +2602,134 @@ mod tests {
         };
         assert_eq!(service.status().pruneheight, Some(11));
 
+        Ok(())
+    }
+
+    /// Overlapping prune calls must commit in acquisition order.
+    ///
+    /// A lower request blocks inside body-store load while holding
+    /// `pruneheight`; a higher contender must neither enter that load nor
+    /// finish until the lower call releases, and both persisted and in-memory
+    /// pruneheight end at the higher value.
+    #[cfg(feature = "fjall")]
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn prune_to_height_serializes_overlapping_calls() -> anyhow::Result<()> {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        struct BlockingPruneBodyStore {
+            entered: Barrier,
+            release: Barrier,
+            block_once: AtomicBool,
+            loads: AtomicUsize,
+        }
+
+        impl crate::apply::PruneBodyStore for BlockingPruneBodyStore {
+            fn load_block_body(
+                &self,
+                _height: u32,
+                _hash: bitcoin_rs_primitives::Hash256,
+            ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+                self.loads.fetch_add(1, Ordering::AcqRel);
+                if self.block_once.swap(false, Ordering::AcqRel) {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                Ok(None)
+            }
+
+            fn persist_block_body(
+                &self,
+                _height: u32,
+                _hash: bitcoin_rs_primitives::Hash256,
+                _body: &[u8],
+            ) -> Result<(), bitcoin_rs_storage::StorageError> {
+                Ok(())
+            }
+
+            fn sync(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        std::fs::create_dir_all(data_dir.join("chainstate"))?;
+        let store = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            data_dir.join("chainstate"),
+        )?);
+        let block_files = Arc::new(FlatFileBlockStore::open(&data_dir)?);
+        let body_store = Arc::new(BlockingPruneBodyStore {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+            block_once: AtomicBool::new(true),
+            loads: AtomicUsize::new(0),
+        });
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = body_store.clone();
+        let blocks = Arc::new(RwLock::new(BlockLog::new()));
+        let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
+        blocks.write().push(BlockRecord {
+            hash,
+            height: 10,
+            body_size: 1,
+            header: None,
+            tx_count: 1,
+            time: 0,
+        });
+        let service = Arc::new(NodePruneService::new(
+            Arc::clone(&store),
+            block_files,
+            body_handle,
+            Arc::clone(&blocks),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
+        )?);
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let lower_service = Arc::clone(&service);
+            let lower = scope.spawn(move || lower_service.prune_to_height(11));
+            body_store.entered.wait();
+
+            let higher_service = Arc::clone(&service);
+            let higher = scope.spawn(move || {
+                let _ = started_tx.send(());
+                let result = higher_service.prune_to_height(12);
+                let _ = done_tx.send(());
+                result
+            });
+            let higher_started = started_rx.recv_timeout(Duration::from_secs(5));
+            let higher_done = done_rx.recv_timeout(Duration::from_millis(100));
+            let loads_while_lower_blocked = body_store.loads.load(Ordering::Acquire);
+            body_store.release.wait();
+            let lower_join = lower.join();
+            let higher_join = higher.join();
+            higher_started
+                .map_err(|error| anyhow::anyhow!("higher prune did not start: {error}"))?;
+            let lower_result = lower_join
+                .map_err(|_| anyhow::anyhow!("lower prune panicked"))?
+                .map_err(|err| anyhow::anyhow!("lower prune failed: {err}"))?;
+            let higher_result = higher_join
+                .map_err(|_| anyhow::anyhow!("higher prune panicked"))?
+                .map_err(|err| anyhow::anyhow!("higher prune failed: {err}"))?;
+            assert!(
+                matches!(higher_done, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "higher prune committed while lower still held the pruneheight lock; done_rx={higher_done:?}"
+            );
+            assert_eq!(
+                loads_while_lower_blocked, 1,
+                "higher prune must not enter body-store load while lower holds pruneheight; loads={loads_while_lower_blocked}"
+            );
+            assert_eq!(lower_result.pruneheight, 11);
+            assert_eq!(higher_result.pruneheight, 12);
+            Ok(())
+        })?;
+
+        assert_eq!(service.status().pruneheight, Some(12));
+        assert_eq!(load_pruneheight(&*store)?, Some(12));
         Ok(())
     }
 

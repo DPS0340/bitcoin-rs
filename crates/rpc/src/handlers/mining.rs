@@ -204,8 +204,8 @@ mod submitblock_tests {
     fn submitblock_accepts_regtest_genesis() {
         let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let block_hex = serialize(&genesis).to_lower_hex_string();
-        let result = submitblock(&ctx, &json!([block_hex]))
+        let block_payload_hex = serialize(&genesis).to_lower_hex_string();
+        let result = submitblock(&ctx, &json!([block_payload_hex]))
             .unwrap_or_else(|err| panic!("submitblock failed: {err}"));
         assert!(
             result.is_null(),

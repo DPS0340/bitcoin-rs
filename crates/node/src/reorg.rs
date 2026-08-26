@@ -10,7 +10,6 @@ use alloc::vec::Vec;
 
 use bitcoin::consensus::Decodable as _;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::FromHex as _;
 use bitcoin_rs_chain::{NodeId, ReorgPlan, plan_reorg};
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_storage::StorageError;
@@ -437,22 +436,7 @@ where
     {
         return decode_branch_body(hash, height, bytes::Bytes::from(body));
     }
-    if let Some(serialized) = cached_applied_body(handles, hash) {
-        return decode_branch_body(hash, height, serialized);
-    }
     Err(ReorgError::MissingBody { hash, height })
-}
-
-fn cached_applied_body(handles: &ApplyHandles, hash: Hash256) -> Option<bytes::Bytes> {
-    let block_hex = handles
-        .blocks
-        .read()
-        .iter()
-        .rev()
-        .find(|record| record.hash == hash && !record.block_hex.is_empty())?
-        .block_hex
-        .clone();
-    Vec::<u8>::from_hex(&block_hex).ok().map(bytes::Bytes::from)
 }
 
 fn decode_branch_body(

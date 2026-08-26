@@ -569,7 +569,7 @@ pub fn run(mut config: Config) -> Result<()> {
     let banned = state.banned_subnets();
     let block_body_source = state.block_body_source();
     let p2p_chain_query: P2pChainQuery = Arc::new(
-        crate::NodeP2pChainQuery::new(state.block_tree(), state.blocks())
+        crate::NodeP2pChainQuery::new(state.block_tree())
             .with_block_body_source(Arc::clone(&block_body_source)),
     );
     let (sync_wake_tx, sync_wake_rx) = bounded(1);

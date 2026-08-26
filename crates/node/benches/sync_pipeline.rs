@@ -31,7 +31,7 @@ use bitcoin_rs_node::{
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
+use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, BlockRecord};
 use bitcoin_rs_utxo::UtxoSet;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use crossbeam_channel::unbounded;
@@ -101,10 +101,6 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| panic!("pruned proxy apply did not publish a record"));
-                assert!(
-                    record.block_hex.is_empty(),
-                    "pruned proxy should publish metadata-only block records"
-                );
                 black_box((tip.height, record.body_size));
             },
             BatchSize::SmallInput,
@@ -399,7 +395,23 @@ fn block_source_fixture(max_height: u32) -> bitcoin_rs_node::NodeBlockSource {
     let records = (0..=max_height)
         .map(|height| BlockRecord::from_block(height, &block))
         .collect();
-    bitcoin_rs_node::NodeBlockSource::new(Arc::new(RwLock::new(records)))
+    bitcoin_rs_node::NodeBlockSource::new(Arc::new(RwLock::new(records))).with_block_body_source(
+        Arc::new(InstalledBlockBody {
+            hash: Hash256::from_le_bytes(block.block_hash().as_byte_array()),
+            bytes: bitcoin::consensus::encode::serialize(&block),
+        }),
+    )
+}
+
+struct InstalledBlockBody {
+    hash: Hash256,
+    bytes: Vec<u8>,
+}
+
+impl BlockBodySource for InstalledBlockBody {
+    fn block_body(&self, _height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        (hash == self.hash).then(|| self.bytes.clone())
+    }
 }
 
 fn open_regtest_state() -> (TempDir, NodeState) {

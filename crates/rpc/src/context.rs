@@ -4,7 +4,7 @@ use core::fmt;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::{DisplayHex, FromHex as _};
+use bitcoin::hex::DisplayHex;
 use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
@@ -23,15 +23,16 @@ const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 /// `-maxtipage`; this node has no such option yet, so the default stands.
 const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
 
-/// Block data made available to RPC handlers without forcing storage I/O.
+/// Block metadata made available to RPC handlers without forcing storage I/O.
+///
+/// The serialized block body lives in durable storage behind
+/// [`BlockBodySource`]; records carry only identity and size facts.
 #[derive(Clone, Debug)]
 pub struct BlockRecord {
     /// Block hash in conventional big-endian hex order.
     pub hash: Hash256,
     /// Height in the active chain.
     pub height: u32,
-    /// Serialized block bytes as lowercase hex.
-    pub block_hex: String,
     /// Serialized block byte length.
     pub body_size: usize,
     /// Serialized block header bytes, when the record carries a header.
@@ -140,16 +141,6 @@ impl BlockLog {
     pub fn reserve(&mut self, additional: usize) {
         self.records.reserve(additional);
         self.cumulative_tx_count.reserve(additional);
-    }
-
-    /// Mutable access to the records, for fields the running sums do not cover.
-    ///
-    /// Pruning uses this to release cached block bodies. `body_size` and
-    /// `tx_count` describe the block and do not change when its body is dropped,
-    /// so the sums stay correct — and `debug_assert`s in [`Self::size_on_disk`]
-    /// and [`Self::tx_count_before`] fail loudly if a caller ever changes them.
-    pub fn records_mut(&mut self) -> impl Iterator<Item = &mut BlockRecord> {
-        self.records.iter_mut()
     }
 
     /// Sum of every record's serialized block length, in bytes.
@@ -416,52 +407,19 @@ pub trait BlockBodySource: Send + Sync {
 
 impl BlockRecord {
     /// Builds a record from a decoded Bitcoin block.
+    ///
+    /// The record is metadata only: `body_size` is measured by
+    /// [`Block::total_size`], never by serializing the block a second time.
     #[must_use]
     pub fn from_block(height: u32, block: &Block) -> Self {
-        let block_bytes = serialize(block);
-        Self::from_block_bytes(height, block, &block_bytes)
-    }
-
-    /// Builds a record from a decoded Bitcoin block and its serialized bytes.
-    ///
-    /// Callers on hot paths can pass bytes already produced for persistence or
-    /// indexes instead of serializing the full block a second time.
-    #[must_use]
-    pub fn from_block_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
         let block_hash = block.block_hash();
         let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        let block_hex = block_bytes.to_lower_hex_string();
         Self {
             hash,
             height,
-            block_hex,
-            body_size: block_bytes.len(),
+            body_size: block.total_size(),
             // Not stored: the block tree holds this block's header, and
             // `Context::header_record` supplies it on the way out.
-            header: None,
-            tx_count: block.txdata.len(),
-            time: block.header.time,
-        }
-    }
-
-    /// Builds a metadata-only record for nodes that serve block bodies from storage.
-    #[must_use]
-    pub fn from_block_metadata(height: u32, block: &Block) -> Self {
-        let block_bytes = serialize(block);
-        Self::from_block_metadata_bytes(height, block, &block_bytes)
-    }
-
-    /// Builds a metadata-only record from bytes already serialized by the caller.
-    #[must_use]
-    pub fn from_block_metadata_bytes(height: u32, block: &Block, block_bytes: &[u8]) -> Self {
-        let block_hash = block.block_hash();
-        let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
-        Self {
-            hash,
-            height,
-            block_hex: String::new(),
-            body_size: block_bytes.len(),
-            // See `from_block_bytes`.
             header: None,
             tx_count: block.txdata.len(),
             time: block.header.time,
@@ -474,7 +432,6 @@ impl BlockRecord {
         Self {
             hash,
             height,
-            block_hex: String::new(),
             body_size: 0,
             header: None,
             tx_count: 0,
@@ -1234,7 +1191,6 @@ impl Context {
         Some(BlockRecord {
             hash,
             height: node.height,
-            block_hex: String::new(),
             body_size: 0,
             // The one place a header is produced. Every constructor leaves the
             // field empty, so the tree node reached here is the single source of
@@ -1250,7 +1206,7 @@ impl Context {
     /// The restored header tree is the only identity authority. A hash it does
     /// not know resolves to `None`, even when the block log carries a record for
     /// it. For a tree-resolved `(height, hash)` pair, the log may contribute
-    /// matching payload cache fields or durable body metadata.
+    /// matching durable body metadata.
     #[must_use]
     pub fn record_for_hash(&self, hash: Hash256) -> Option<BlockRecord> {
         // Tree authority resolves identity first; the exact `(height, hash)`
@@ -1260,7 +1216,7 @@ impl Context {
             // over a height-ordered log rather than a walk of every record on
             // the chain. `getblock` and `getblockheader` both land here.
             if let Some(cached) = record_at_height_hash(&self.blocks.read(), record.height, hash) {
-                // The cached record supplies the payload facts — body hex, size,
+                // The cached record supplies the payload facts — size and
                 // transaction count — and the tree supplies the header, because
                 // the log does not store one. Returning the cached record as it
                 // stands would answer with no header at all.
@@ -1325,12 +1281,9 @@ impl Context {
         record_at_height(&self.blocks.read(), height).cloned()
     }
 
-    /// Returns serialized block bytes from the record or durable storage.
+    /// Returns serialized block bytes from durable body storage.
     #[must_use]
     pub fn block_body_bytes(&self, record: &BlockRecord) -> Option<Vec<u8>> {
-        if !record.block_hex.is_empty() {
-            return Vec::<u8>::from_hex(&record.block_hex).ok();
-        }
         self.block_body_source
             .as_ref()?
             .block_body(record.height, record.hash)
@@ -1344,12 +1297,9 @@ impl Context {
         self.block_body_source.as_ref()?.disk_usage()
     }
 
-    /// Returns lowercase serialized block hex from the record or durable storage.
+    /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
     pub fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
-        if !record.block_hex.is_empty() {
-            return Some(record.block_hex.clone());
-        }
         Some(self.block_body_bytes(record)?.to_lower_hex_string())
     }
 
@@ -1701,20 +1651,19 @@ mod tests {
     }
 
     #[test]
-    fn block_record_from_block_bytes_matches_from_block() {
+    fn block_record_from_block_is_metadata_only() {
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let block_bytes = serialize(&block);
+        let record = BlockRecord::from_block(0, &block);
 
-        let from_block = BlockRecord::from_block(0, &block);
-        let from_bytes = BlockRecord::from_block_bytes(0, &block, &block_bytes);
-
-        assert_eq!(from_bytes.hash, from_block.hash);
-        assert_eq!(from_bytes.height, from_block.height);
-        assert_eq!(from_bytes.block_hex, from_block.block_hex);
-        assert_eq!(from_bytes.body_size, from_block.body_size);
-        assert_eq!(from_bytes.header, from_block.header);
-        assert_eq!(from_bytes.tx_count, from_block.tx_count);
-        assert_eq!(from_bytes.time, from_block.time);
+        assert_eq!(
+            record.hash,
+            Hash256::from_le_bytes(block.block_hash().as_byte_array())
+        );
+        assert_eq!(record.height, 0);
+        assert_eq!(record.body_size, block.total_size());
+        assert_eq!(record.header, None);
+        assert_eq!(record.tx_count, block.txdata.len());
+        assert_eq!(record.time, block.header.time);
     }
 
     #[test]
@@ -1733,7 +1682,7 @@ mod tests {
 
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let body = serialize(&block);
-        let record = BlockRecord::from_block_metadata(0, &block);
+        let record = BlockRecord::from_block(0, &block);
         let source = Arc::new(SingleBlockSource {
             height: 0,
             hash: record.hash,
@@ -1742,8 +1691,7 @@ mod tests {
         let ctx = Context::new().with_block_body_source(source);
         ctx.add_block(record.clone());
 
-        assert!(record.block_hex.is_empty());
-        assert_eq!(record.body_size, body.len());
+        assert_eq!(record.body_size, block.total_size());
         assert_eq!(
             ctx.block_body_bytes(&record).as_deref(),
             Some(body.as_slice())
@@ -1762,26 +1710,25 @@ mod tests {
     ///
     /// The field was 104 bytes inline plus a 160-byte heap `String` of hex —
     /// 264 bytes and an allocation per block. Storing the raw header inline took
-    /// that to 168 with no allocation. Not storing it at all takes it to **88**:
-    /// a further **80 bytes per block**, about **73.5 MiB** at a mainnet-sized
-    /// chain, on top of the 88 MiB the inline change saved.
+    /// that to 168 with no allocation. Not storing it at all takes it to **64**:
+    /// a further **24 bytes per block**, about **23.1 MiB** at a mainnet-sized
+    /// chain, on top of the 73.5 MiB the boxed header saved.
     ///
     /// The boxing is what buys those 80 bytes and is easy to undo by accident.
     /// An `Option<[u8; 80]>` costs its full width in every record even when it
     /// is `None`, so emptying the log's records would have saved nothing at all.
     /// This test is here so that reverting the box fails loudly.
     #[test]
-    fn a_record_costs_88_bytes_and_carries_no_header() {
+    fn a_record_costs_64_bytes_and_carries_no_header() {
         let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
 
         assert_eq!(
             core::mem::size_of::<BlockRecord>(),
-            88,
+            64,
             "BlockRecord footprint changed; re-measure the per-block saving"
         );
         for record in [
             BlockRecord::from_block(0, &block),
-            BlockRecord::from_block_metadata(0, &block),
             BlockRecord::synthetic(0, Hash256::default()),
         ] {
             assert!(
@@ -1820,8 +1767,8 @@ mod tests {
 
     /// The tree's header must reach a caller even when the log has the block.
     ///
-    /// `record_for_hash` returns the cached record for its payload facts — body
-    /// hex, size, transaction count — and that record has no header. Returning
+    /// `record_for_hash` returns the cached record for its payload facts — size,
+    /// transaction count — and that record has no header. Returning
     /// it unchanged would answer with none, which is what an earlier revision of
     /// this change did until this test caught it.
     #[test]
@@ -1835,7 +1782,8 @@ mod tests {
         }
         let cached = BlockRecord::from_block(0, &block);
         let hash = cached.hash;
-        let expected_body = cached.block_hex.clone();
+        let expected_body_size = cached.body_size;
+        let expected_tx_count = cached.tx_count;
         assert!(cached.header_bytes().is_none(), "the log stores no header");
         ctx.add_block(cached);
 
@@ -1848,8 +1796,12 @@ mod tests {
             "the resolved record must carry the tree's header"
         );
         assert_eq!(
-            record.block_hex, expected_body,
-            "the cached payload must survive the header splice"
+            record.body_size, expected_body_size,
+            "the cached body size must survive the header splice"
+        );
+        assert_eq!(
+            record.tx_count, expected_tx_count,
+            "the cached transaction count must survive the header splice"
         );
     }
     /// A log-only hash must not make a block identity visible.

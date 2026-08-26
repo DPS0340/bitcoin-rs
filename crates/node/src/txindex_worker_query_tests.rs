@@ -184,6 +184,18 @@ struct CountingBodySource {
     bytes: Vec<u8>,
 }
 
+struct SingleBlockBody {
+    height: u32,
+    hash: Hash256,
+    body: Vec<u8>,
+}
+
+impl BlockBodySource for SingleBlockBody {
+    fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        (height == self.height && hash == self.hash).then(|| self.body.clone())
+    }
+}
+
 impl BlockBodySource for CountingBodySource {
     fn block_body(&self, _height: u32, _hash: Hash256) -> Option<Vec<u8>> {
         self.full_calls.fetch_add(1, Ordering::AcqRel);
@@ -260,13 +272,27 @@ impl QueryFixture {
         } else {
             Vec::new()
         };
+        let body_source = config.retain_body.then(|| {
+            let source: Arc<dyn BlockBodySource> = Arc::new(SingleBlockBody {
+                height: tip.height,
+                hash: Hash256::from_le_bytes(config.block.block_hash().as_byte_array()),
+                body: bitcoin::consensus::encode::serialize(&config.block),
+            });
+            source
+        });
         let block_source = NodeBlockSource::new(Arc::new(RwLock::new(
             records
                 .into_iter()
                 .collect::<bitcoin_rs_rpc::context::BlockLog>(),
         )));
-        let engine =
-            TxIndexQueryEngine::new(runtime, reader, block_source, tree, applied_tip, None);
+        let engine = TxIndexQueryEngine::new(
+            runtime,
+            reader,
+            block_source,
+            tree,
+            applied_tip,
+            body_source,
+        );
         Ok(Self { engine })
     }
 }

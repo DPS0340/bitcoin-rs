@@ -1,36 +1,33 @@
 //! Node-side adapter for server-side P2P active-chain requests.
 //!
 //! Headers come from `BlockTree`; block bodies come from the shared
-//! `BlockRecord` cache or the durable body source when records are metadata-only.
+//! [`BlockBodySource`] when records are metadata-only.
 
 use alloc::sync::Arc;
 
 use bitcoin::block::{BlockHash, Header};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::hex::FromHex as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_chain::BlockTree;
 use bitcoin_rs_p2p::{ChainQuery, InventoryResponse};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog};
+use bitcoin_rs_rpc::context::BlockBodySource;
 use parking_lot::RwLock;
 
 /// Read-only in-memory active-chain view for P2P `getheaders` / `getdata`.
 #[derive(Clone)]
 pub struct NodeP2pChainQuery {
     block_tree: Arc<RwLock<BlockTree>>,
-    blocks: Arc<RwLock<BlockLog>>,
     block_body_source: Option<Arc<dyn BlockBodySource>>,
 }
 
 impl NodeP2pChainQuery {
     /// Builds a P2P chain query view over the node's shared active-chain state.
     #[must_use]
-    pub const fn new(block_tree: Arc<RwLock<BlockTree>>, blocks: Arc<RwLock<BlockLog>>) -> Self {
+    pub const fn new(block_tree: Arc<RwLock<BlockTree>>) -> Self {
         Self {
             block_tree,
-            blocks,
             block_body_source: None,
         }
     }
@@ -123,23 +120,10 @@ impl NodeP2pChainQuery {
             active_height(&tree, tree.tip()?.tip_id, hash)?
         };
         let hash256 = hash256(hash);
-        let cached = self
-            .blocks
-            .read()
-            .iter()
-            .find(|record| {
-                record.height == current_height
-                    && record.hash == hash256
-                    && !record.block_hex.is_empty()
-            })
-            .map(|record| record.block_hex.clone());
-        let bytes = match cached {
-            Some(hex) => Vec::<u8>::from_hex(&hex).ok()?,
-            None => self
-                .block_body_source
-                .as_ref()?
-                .block_body(current_height, hash256)?,
-        };
+        let bytes = self
+            .block_body_source
+            .as_ref()?
+            .block_body(current_height, hash256)?;
         let block = deserialize::<bitcoin::Block>(&bytes).ok()?;
         if block.block_hash() != hash {
             return None;
@@ -198,14 +182,26 @@ mod tests {
     use bitcoin::pow::CompactTarget;
     use bitcoin::{Block, TxMerkleNode, Txid};
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_rpc::context::BlockRecord;
+    use bitcoin_rs_rpc::context::BlockBodySource;
+
+    struct SingleBlockSource {
+        height: u32,
+        hash: Hash256,
+        body: Vec<u8>,
+    }
+
+    impl BlockBodySource for SingleBlockSource {
+        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            (height == self.height && hash == self.hash).then(|| self.body.clone())
+        }
+    }
 
     #[test]
     fn getheaders_empty_locator_returns_only_active_stop() -> Result<(), Box<dyn std::error::Error>>
     {
         let headers = seed_headers(3);
         let stop = headers[2].block_hash();
-        let query = query_with(headers, Vec::new())?;
+        let query = query_with(headers)?;
 
         let response = query.headers_after(&[], stop, 2);
 
@@ -217,7 +213,7 @@ mod tests {
     fn getheaders_empty_locator_unknown_or_zero_stop_returns_empty()
     -> Result<(), Box<dyn std::error::Error>> {
         let headers = seed_headers(3);
-        let query = query_with(headers, Vec::new())?;
+        let query = query_with(headers)?;
 
         assert!(
             query
@@ -236,7 +232,7 @@ mod tests {
     fn getheaders_unknown_locator_starts_after_genesis() -> Result<(), Box<dyn std::error::Error>> {
         let headers = seed_headers(3);
         let expected = vec![headers[1].block_hash(), headers[2].block_hash()];
-        let query = query_with(headers, Vec::new())?;
+        let query = query_with(headers)?;
 
         let response = query.headers_after(
             &[BlockHash::from_byte_array([42; 32])],
@@ -254,7 +250,7 @@ mod tests {
         let locator = headers[1].block_hash();
         let stop = headers[3].block_hash();
         let expected = vec![headers[2].block_hash(), stop];
-        let query = query_with(headers, Vec::new())?;
+        let query = query_with(headers)?;
 
         let response = query.headers_after(&[locator], stop, 10);
 
@@ -273,10 +269,7 @@ mod tests {
         let active1_id = tree.insert_node(Some(genesis_id), active1, NodeStatus::Active)?;
         tree.insert_node(Some(active1_id), active2, NodeStatus::Active)?;
         tree.insert_node(Some(genesis_id), fork1, NodeStatus::Stale)?;
-        let query = NodeP2pChainQuery::new(
-            Arc::new(RwLock::new(tree)),
-            Arc::new(RwLock::new(BlockLog::new())),
-        );
+        let query = NodeP2pChainQuery::new(Arc::new(RwLock::new(tree)));
 
         let response = query.headers_after(&[fork1.block_hash()], BlockHash::all_zeros(), 10);
 
@@ -289,17 +282,21 @@ mod tests {
     }
 
     #[test]
-    fn getdata_decodes_active_cached_body_and_reports_missing_inventory()
+    fn getdata_decodes_active_body_from_source_and_reports_missing_inventory()
     -> Result<(), Box<dyn std::error::Error>> {
         let headers = seed_headers(2);
         let block = Block {
             header: headers[1],
             txdata: Vec::new(),
         };
-        let record = BlockRecord::from_block(1, &block);
+        let body_source = Arc::new(SingleBlockSource {
+            height: 1,
+            hash: hash256(block.block_hash()),
+            body: serialize(&block),
+        });
         let txid = Txid::all_zeros();
         let missing = Inventory::WitnessBlock(BlockHash::from_byte_array([8; 32]));
-        let query = query_with(headers, vec![record])?;
+        let query = query_with(headers)?.with_block_body_source(body_source);
 
         let response = query.blocks_for_inventory(&[
             Inventory::Block(block.block_hash()),
@@ -320,8 +317,7 @@ mod tests {
     fn getdata_rejects_pruned_or_missing_body() -> Result<(), Box<dyn std::error::Error>> {
         let headers = seed_headers(2);
         let hash = headers[1].block_hash();
-        let record = BlockRecord::synthetic(1, hash256(hash));
-        let query = query_with(headers, vec![record])?;
+        let query = query_with(headers)?;
 
         let response = query.blocks_for_inventory(&[Inventory::Block(hash)]);
 
@@ -332,30 +328,17 @@ mod tests {
 
     #[test]
     fn getdata_reads_metadata_only_body_from_source() -> Result<(), Box<dyn std::error::Error>> {
-        struct SingleBlockSource {
-            height: u32,
-            hash: Hash256,
-            body: Vec<u8>,
-        }
-
-        impl BlockBodySource for SingleBlockSource {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
-                (height == self.height && hash == self.hash).then(|| self.body.clone())
-            }
-        }
-
         let headers = seed_headers(2);
         let block = Block {
             header: headers[1],
             txdata: Vec::new(),
         };
-        let record = BlockRecord::from_block_metadata(1, &block);
         let body_source = Arc::new(SingleBlockSource {
             height: 1,
-            hash: record.hash,
+            hash: hash256(block.block_hash()),
             body: serialize(&block),
         });
-        let query = query_with(headers, vec![record])?.with_block_body_source(body_source);
+        let query = query_with(headers)?.with_block_body_source(body_source);
 
         let response = query.blocks_for_inventory(&[Inventory::Block(block.block_hash())]);
 
@@ -365,19 +348,13 @@ mod tests {
         Ok(())
     }
 
-    fn query_with(
-        headers: Vec<Header>,
-        records: Vec<BlockRecord>,
-    ) -> Result<NodeP2pChainQuery, bitcoin_rs_chain::ChainError> {
+    fn query_with(headers: Vec<Header>) -> Result<NodeP2pChainQuery, bitcoin_rs_chain::ChainError> {
         let mut tree = BlockTree::new();
         let mut parent = None;
         for header in headers {
             parent = Some(tree.insert_node(parent, header, NodeStatus::Active)?);
         }
-        Ok(NodeP2pChainQuery::new(
-            Arc::new(RwLock::new(tree)),
-            Arc::new(RwLock::new(records.into_iter().collect::<BlockLog>())),
-        ))
+        Ok(NodeP2pChainQuery::new(Arc::new(RwLock::new(tree))))
     }
 
     fn seed_headers(count: u32) -> Vec<Header> {

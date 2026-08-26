@@ -357,10 +357,10 @@ pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         .block_by_hash(hash)
         .ok_or(RpcError::NotFound("block not found"))?;
     if verbosity == 0 {
-        let Some(block_hex) = ctx.block_body_hex(&record) else {
+        let Some(block_payload_hex) = ctx.block_body_hex(&record) else {
             return Err(RpcError::NotFound("block data pruned"));
         };
-        return Ok(json!(block_hex));
+        return Ok(json!(block_payload_hex));
     }
     block_json_verbose(ctx, &record, true, verbosity)
 }
@@ -1067,6 +1067,34 @@ mod tests {
     use crate::context::BlockLog;
     use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
 
+    struct SingleBlockSource {
+        height: u32,
+        hash: bitcoin_rs_primitives::Hash256,
+        body: Vec<u8>,
+        calls: core::sync::atomic::AtomicUsize,
+    }
+
+    struct MultiBlockSource {
+        bodies: Vec<(u32, bitcoin_rs_primitives::Hash256, Vec<u8>)>,
+    }
+
+    impl crate::context::BlockBodySource for MultiBlockSource {
+        fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
+            self.bodies
+                .iter()
+                .find(|(h, k, _)| *h == height && *k == hash)
+                .map(|(_, _, body)| body.clone())
+        }
+    }
+
+    impl crate::context::BlockBodySource for SingleBlockSource {
+        fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
+            self.calls
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            (height == self.height && hash == self.hash).then(|| self.body.clone())
+        }
+    }
+
     fn context_with_tip(
         network: bitcoin_rs_primitives::Network,
         bits: u32,
@@ -1238,9 +1266,16 @@ mod tests {
     #[test]
     fn getblock_populates_real_header_fields_from_stored_record()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = Arc::new(Context::new());
         let genesis = genesis_block(bitcoin::Network::Regtest);
         let record = BlockRecord::from_block(0, &genesis);
+        let ctx = Arc::new(
+            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
+                height: 0,
+                hash: record.hash,
+                body: serialize(&genesis),
+                calls: core::sync::atomic::AtomicUsize::new(0),
+            })),
+        );
         let block_hash_hex = record.hash.to_string_be();
         let block_size = u64::try_from(record.body_size)?;
         let tx_count = u64::try_from(record.tx_count)?;
@@ -1319,7 +1354,7 @@ mod tests {
 
         let genesis = genesis_block(bitcoin::Network::Regtest);
         let body = bitcoin::consensus::encode::serialize(&genesis);
-        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record = BlockRecord::from_block(0, &genesis);
         let block_hash_hex = record.hash.to_string_be();
         let source = Arc::new(SingleBlockSource {
             height: 0,
@@ -1355,12 +1390,17 @@ mod tests {
     /// response, preventing callers from distinguishing damage from real data.
     #[test]
     fn getblock_reports_corrupt_stored_body() {
-        let ctx = Arc::new(Context::new());
         let genesis = genesis_block(bitcoin::Network::Regtest);
-        let mut record = BlockRecord::from_block(0, &genesis);
+        let record = BlockRecord::from_block(0, &genesis);
         let hash = record.hash.to_string_be();
-        record.block_hex = "00".to_owned();
-        record.body_size = 1;
+        let ctx = Arc::new(
+            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
+                height: 0,
+                hash: record.hash,
+                body: vec![0x00],
+                calls: core::sync::atomic::AtomicUsize::new(0),
+            })),
+        );
         seed_block(&ctx, &genesis, record);
 
         assert!(matches!(
@@ -1375,9 +1415,17 @@ mod tests {
         use bitcoin::Network;
         use bitcoin::hashes::Hash as _;
 
-        let ctx = Arc::new(Context::new());
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        seed_block(&ctx, &genesis, BlockRecord::from_block(0, &genesis));
+        let record = BlockRecord::from_block(0, &genesis);
+        let ctx = Arc::new(
+            Context::new().with_block_body_source(Arc::new(SingleBlockSource {
+                height: 0,
+                hash: record.hash,
+                body: serialize(&genesis),
+                calls: core::sync::atomic::AtomicUsize::new(0),
+            })),
+        );
+        seed_block(&ctx, &genesis, record);
         let block_hash =
             bitcoin_rs_primitives::Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
         let result = getblock(&ctx, &json!([block_hash.to_string_be(), 2]))
@@ -1618,8 +1666,7 @@ mod tests {
             header,
             txdata: Vec::new(),
         };
-        let bytes = bitcoin::consensus::encode::serialize(&block);
-        BlockRecord::from_block_bytes(1, &block, &bytes)
+        BlockRecord::from_block(1, &block)
     }
 
     /// `getblock` and `getblockheader` both render `confirmations` when a body
@@ -1631,15 +1678,43 @@ mod tests {
         with_body: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Fork {
-            ctx,
+            mut ctx,
             applied: applied_hash,
             fork: fork_hash,
             applied_header,
             fork_header,
             ..
         } = forked_ctx()?;
-        ctx.add_block(record_for(applied_header, with_body));
-        ctx.add_block(record_for(fork_header, with_body));
+        let applied_record = record_for(applied_header, with_body);
+        let fork_record = record_for(fork_header, with_body);
+        if with_body {
+            let applied_block = bitcoin::Block {
+                header: applied_header,
+                txdata: Vec::new(),
+            };
+            let fork_block = bitcoin::Block {
+                header: fork_header,
+                txdata: Vec::new(),
+            };
+            Arc::get_mut(&mut ctx)
+                .expect("unique fork fixture context")
+                .block_body_source = Some(Arc::new(MultiBlockSource {
+                bodies: vec![
+                    (
+                        applied_record.height,
+                        applied_record.hash,
+                        bitcoin::consensus::encode::serialize(&applied_block),
+                    ),
+                    (
+                        fork_record.height,
+                        fork_record.hash,
+                        bitcoin::consensus::encode::serialize(&fork_block),
+                    ),
+                ],
+            }));
+        }
+        ctx.add_block(applied_record);
+        ctx.add_block(fork_record);
 
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let confirmations_of =
@@ -2010,7 +2085,7 @@ mod tests {
     fn getblockchaininfo_size_on_disk_uses_metadata_body_size() {
         let genesis = genesis_block(bitcoin::Network::Regtest);
         let body = bitcoin::consensus::encode::serialize(&genesis);
-        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record = BlockRecord::from_block(0, &genesis);
         let ctx = Arc::new(Context::new());
         ctx.add_block(record);
 
@@ -2044,7 +2119,7 @@ mod tests {
         }
 
         let genesis = genesis_block(bitcoin::Network::Regtest);
-        let record = BlockRecord::from_block_metadata(0, &genesis);
+        let record = BlockRecord::from_block(0, &genesis);
         let record_bytes = u64::try_from(record.body_size).unwrap_or(u64::MAX);
         let store_bytes = record_bytes.saturating_add(4_096);
         let ctx =
@@ -2132,7 +2207,6 @@ mod tests {
             log.push(BlockRecord {
                 hash: Hash256::from_le_bytes(&[u8::try_from(index).unwrap_or(0); 32]),
                 height,
-                block_hex: String::new(),
                 body_size: 100 + index * 7,
                 header: None,
                 tx_count: 1 + index * 3,
@@ -2252,7 +2326,6 @@ mod tests {
         let record = |body_size: usize, tx_count: usize| BlockRecord {
             hash: Hash256::from_le_bytes(&[0_u8; 32]),
             height: 0,
-            block_hex: String::new(),
             body_size,
             header: None,
             tx_count,
@@ -2277,7 +2350,6 @@ mod tests {
             ctx.add_block(BlockRecord {
                 hash: Hash256::from_le_bytes(&[u8::try_from(height)?; 32]),
                 height,
-                block_hex: String::new(),
                 body_size: usize::try_from(100_u32.saturating_add(height))?,
                 header: None,
                 tx_count: usize::try_from(height.saturating_add(1))?,
@@ -2287,7 +2359,6 @@ mod tests {
         ctx.add_block(BlockRecord {
             hash: Hash256::from_le_bytes(&[4_u8; 32]),
             height: 4,
-            block_hex: String::new(),
             body_size: 104,
             header: None,
             tx_count: 100,
@@ -2339,7 +2410,6 @@ mod tests {
         ctx.add_block(BlockRecord {
             hash: tip_hash,
             height: 2,
-            block_hex: String::new(),
             body_size: 100,
             header: None,
             tx_count: 1,
@@ -2348,7 +2418,6 @@ mod tests {
         ctx.add_block(BlockRecord {
             hash: Hash256::from_le_bytes(&[7_u8; 32]),
             height: 2,
-            block_hex: String::new(),
             body_size: 100,
             header: None,
             tx_count: 1,
@@ -2911,7 +2980,6 @@ mod chaintxstats_durability_tests {
         ctx.add_block(BlockRecord {
             hash: tip.hash,
             height: tip.height,
-            block_hex: String::new(),
             body_size: 0,
             header: None,
             tx_count: 7,

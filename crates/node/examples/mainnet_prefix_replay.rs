@@ -819,10 +819,10 @@ impl BlockSource<'_> {
             Self::Cli(args) => {
                 let hash = bitcoin_cli(args, ["getblockhash".to_owned(), height.to_string()])
                     .with_context(|| format!("get block hash at height {height}"))?;
-                let block_hex =
+                let block_payload_hex =
                     bitcoin_cli(args, ["getblock".to_owned(), hash.clone(), "0".to_owned()])
                         .with_context(|| format!("get block {hash} at height {height}"))?;
-                let bytes = Vec::<u8>::from_hex(block_hex.trim())
+                let bytes = Vec::<u8>::from_hex(block_payload_hex.trim())
                     .with_context(|| format!("decode block hex at height {height}"))?;
                 Ok((hash, bytes))
             }

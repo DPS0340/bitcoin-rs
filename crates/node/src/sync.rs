@@ -1996,8 +1996,8 @@ mod tests {
         Ok(())
     }
 
-    // One no-store lifecycle must prove both accounting retirement and the
-    // cached reverse source; splitting it would stop exercising their handoff.
+    // One no-store lifecycle must prove both accounting retirement and bounded
+    // staging body resolution; splitting it would stop exercising their handoff.
     #[allow(clippy::too_many_lines)]
     #[test]
     fn branch_switch_uses_staged_bodies_without_durable_store()
@@ -2103,27 +2103,49 @@ mod tests {
             assert_eq!(sync.download_window.lock().received_len(), 0);
         }
 
+        install_budget(
+            &sync,
+            super::SyncBudget {
+                max_received_blocks: 5,
+                ..super::default_sync_budget()
+            },
+        );
+        for block in &fork {
+            stage_body(&sync, block);
+        }
+        for block in &main {
+            stage_body(&sync, block);
+        }
+        assert_eq!(
+            sync.block_stager.lock().received_len(),
+            5,
+            "bounded staging must contain every reverse-switch plan body"
+        );
+        // The reverse switch must resolve all five disconnect and connect bodies from
+        // the bounded stager, without durable storage or fixture-vector lookup.
+        let explicit_body = |hash: Hash256| sync.block_stager.lock().staged_body(hash);
         let main_target = sync
             .handles
             .block_tree
             .read()
             .lookup(Hash256::from_le_bytes(main[1].block_hash().as_byte_array()))
             .ok_or_else(|| std::io::Error::other("missing original branch tip"))?;
-        crate::reorg::switch_to_branch(
-            &sync.handles,
-            main_target,
-            |hash| sync.block_stager.lock().staged_body(hash),
-            |hash| sync.retire_applied_reorg_body(hash),
-        )?;
+        crate::reorg::switch_to_branch(&sync.handles, main_target, explicit_body, |hash| {
+            sync.retire_applied_reorg_body(hash);
+        })?;
         let restored = applied_tip
             .load_full()
             .ok_or_else(|| std::io::Error::other("reverse switch did not publish a tip"))?;
         assert_eq!(
             restored.hash,
             Hash256::from_le_bytes(main[1].block_hash().as_byte_array()),
-            "the applied-body cache must supply disconnected fork bodies after staging retires"
+            "bounded staging must supply the reverse branch switch without durable storage"
         );
-        assert_eq!(sync.block_stager.lock().received_len(), 0);
+        assert_eq!(
+            sync.block_stager.lock().received_len(),
+            3,
+            "only connected bodies retire from bounded staging after the reverse switch"
+        );
         Ok(())
     }
 
@@ -2137,6 +2159,9 @@ mod tests {
             stage_body(&sync, block);
         }
         assert_eq!(sync.apply_buffered_blocks(None), (2, 0));
+        for block in &main {
+            stage_body(&sync, block);
+        }
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let genesis_id = sync
@@ -2171,6 +2196,7 @@ mod tests {
         let mut racing_coinbase = coinbase_transaction(3);
         racing_coinbase.output[0].script_pubkey = Builder::new().push_int(3).into_script();
         let racing = mined_block_with_prev_hash(main[1].block_hash(), 3, vec![racing_coinbase]);
+        stage_body(&sync, &racing);
         sync.handles.block_tree.write().insert_node(
             Some(main_tip_id),
             racing.header,
