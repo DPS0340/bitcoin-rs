@@ -37,6 +37,10 @@ tempfile = "3"
 
 [features]
 default = []
+# The real script backend, for the one test that verifies a finished
+# transaction against consensus. Off by default, as `bitcoin-rs-consensus`'s
+# own workspace declaration is, so a portable build stays portable.
+kernel = ["bitcoin-rs-consensus/kernel"]
 rocksdb = ["bitcoin-rs-storage/rocksdb"]
 fjall = ["bitcoin-rs-storage/fjall"]
 redb = ["bitcoin-rs-storage/redb"]

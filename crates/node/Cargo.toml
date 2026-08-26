@@ -80,7 +80,7 @@ mdbx = [
     "bitcoin-rs-index/mdbx",
     "bitcoin-rs-storage/mdbx",
 ]
-kernel = ["bitcoin-rs-consensus/kernel"]
+kernel = ["bitcoin-rs-consensus/kernel", "bitcoin-rs-wallet/kernel"]
 checksig-census = [
     "kernel",
     "bitcoin-rs-consensus/checksig-census",

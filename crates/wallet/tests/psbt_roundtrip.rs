@@ -1,4 +1,35 @@
 //! PSBT build, external signing, finalization, and consensus roundtrips.
+//!
+//! **Gated on the `kernel` feature, because it needs the real script backend.**
+//! The last step hands the finished transaction to
+//! `bitcoin_rs_consensus::verify_transaction`, which without the kernel routes
+//! to `verify_non_taproot_portable` -- a stub that accepts only bare `OP_TRUE`
+//! and refuses everything else.
+//!
+//! Before the gate this crate declared no such dependency and the test passed
+//! anyway, because `cargo test --workspace` unifies features across members and
+//! `bin/bitcoin-rs` turns the kernel on. So it was green through a dependency it
+//! did not name, of a crate it did not mention -- and `cargo test -p
+//! bitcoin-rs-wallet` failed with "portable script backend cannot verify this
+//! non-taproot spend", a message about script backends, in a PSBT test, with
+//! nothing connecting the two.
+//!
+//! Two things follow, and both matter:
+//!
+//! - `crates/node`'s `kernel` feature now forwards to this crate's, so anything
+//!   turning the kernel on turns it on here too. `cargo test --workspace` still
+//!   runs this.
+//! - A gated-out file is an empty binary, and an empty binary reports success --
+//!   which is the failure mode the gate exists to remove. `psbt_roundtrip_gate`
+//!   compiles in its place and says what is not being checked.
+//!
+//! Run it alone with:
+//!
+//! ```text
+//! cargo test -p bitcoin-rs-wallet --features kernel --test psbt_roundtrip
+//! ```
+#![cfg(feature = "kernel")]
+
 use std::collections::BTreeMap;
 
 use bitcoin::hashes::Hash as _;
