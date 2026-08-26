@@ -340,6 +340,7 @@ impl NodeStorage {
         block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        authority: crate::apply::PruneAuthority,
         durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
         match self {
@@ -350,6 +351,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                authority,
                 Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "fjall")]
@@ -359,6 +361,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                authority,
                 Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "redb")]
@@ -368,6 +371,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                authority,
                 Arc::clone(durable_tip_height),
             )?)),
             #[cfg(feature = "mdbx")]
@@ -377,6 +381,7 @@ impl NodeStorage {
                 Arc::clone(block_body_store),
                 blocks,
                 transactions,
+                authority,
                 Arc::clone(durable_tip_height),
             )?)),
         }
@@ -563,6 +568,7 @@ pub struct NodePruneService<S: KvStore> {
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     blocks: Arc<RwLock<BlockLog>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    authority: crate::apply::PruneAuthority,
     pruneheight: Mutex<Option<u32>>,
     /// Height the last clean checkpoint would restore to, 0 when none exists.
     ///
@@ -579,6 +585,7 @@ impl<S: KvStore> NodePruneService<S> {
         block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        authority: crate::apply::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
         let pruneheight = load_pruneheight(&*store)?;
@@ -588,6 +595,7 @@ impl<S: KvStore> NodePruneService<S> {
             block_body_store,
             blocks,
             transactions,
+            authority,
             pruneheight: Mutex::new(pruneheight),
             durable_tip_height,
         })
@@ -603,9 +611,22 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             target_size_mb: 0,
             keep_below_tip: CORE_REORG_SAFETY_MARGIN,
         };
+        let authority = self
+            .authority
+            .begin()
+            .map_err(|error| PruneServiceError::failed(error.to_string()))?;
+        let applied_tip_height = authority
+            .applied_tip_height()
+            .ok_or_else(|| PruneServiceError::failed("applied tip is unavailable"))?;
         let mut pruneheight = self.pruneheight.lock();
         let updated_pruneheight =
             pruneheight.map_or(requested_height, |height| height.max(requested_height));
+        let safe_prune_height = applied_tip_height.saturating_sub(policy.retention_depth());
+        if updated_pruneheight > safe_prune_height {
+            return Err(PruneServiceError::failed(
+                "prune height is within reorg safety margin",
+            ));
+        }
         let pruner_tip = updated_pruneheight
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
@@ -1185,6 +1206,7 @@ impl NodeState {
                 &block_body_store,
                 Arc::clone(&blocks),
                 Arc::clone(&transactions),
+                apply_handles.prune_authority(),
                 &durable_tip_height,
             )?)
         } else {
@@ -1611,6 +1633,17 @@ mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_rpc::context::BlockRecord;
+
+    fn publish_applied_tip_height(state: &NodeState, height: u32) {
+        let mut hash = [0_u8; 32];
+        hash[..size_of::<u32>()].copy_from_slice(&height.to_le_bytes());
+        state.applied_tip.store(Some(Arc::new(TipSnapshot {
+            tip_id: bitcoin_rs_chain::node::NodeId::new(height),
+            height,
+            chainwork: bitcoin_rs_chain::node::ChainWork::ZERO,
+            hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
+        })));
+    }
 
     #[test]
     fn open_constructs_empty_handles() -> anyhow::Result<()> {
@@ -2227,6 +2260,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         for height in 10_u32..=12 {
             let hash = hash(height)?;
@@ -2286,6 +2320,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         for height in 10_u32..=12 {
             let hash = hash(height)?;
@@ -2383,6 +2418,7 @@ mod tests {
         std::fs::write(&prunable_file, [])?;
         std::fs::write(&current_file, [])?;
         let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
 
         match &state.storage {
@@ -2463,6 +2499,7 @@ mod tests {
         std::fs::write(blocks_dir.join("blk00001.dat"), [])?;
 
         let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
         let block = genesis_block(bitcoin::Network::Regtest);
         // The hash is not needed: this test counts bytes in files, not bodies.
         let record = BlockRecord::from_block(10, &block);
@@ -2531,6 +2568,7 @@ mod tests {
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
         let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
         let pruned_block = genesis_block(bitcoin::Network::Regtest);
         let pruned_hash = bitcoin_rs_primitives::Hash256::from_le_bytes(
@@ -2587,6 +2625,7 @@ mod tests {
 
         {
             let state = NodeState::open(config.clone())?;
+            publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
             let Some(service) = state.prune_service() else {
                 anyhow::bail!("prune service should exist when prune_target_mb > 0");
             };
@@ -2602,6 +2641,99 @@ mod tests {
         };
         assert_eq!(service.status().pruneheight, Some(11));
 
+        Ok(())
+    }
+
+    #[test]
+    fn prune_waits_for_chain_transition_and_revalidates_applied_tip() -> anyhow::Result<()> {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config.clone())?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+
+        let handles = state.apply_handles();
+        let transition = handles.chain_transition.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_while_locked, result) = std::thread::scope(|scope| -> anyhow::Result<_> {
+            let service = Arc::clone(&service);
+            let worker = scope.spawn(move || {
+                let _ = started_tx.send(());
+                let result = service.prune_to_height(11);
+                let _ = done_tx.send(());
+                result
+            });
+            started_rx.recv_timeout(Duration::from_secs(5))?;
+            let done_while_locked = done_rx.recv_timeout(Duration::from_millis(100));
+            publish_applied_tip_height(&state, 10 + CORE_REORG_SAFETY_MARGIN);
+            drop(transition);
+            let result = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("prune worker panicked"))?;
+            Ok((done_while_locked, result))
+        })?;
+        let status_after = service.status();
+        drop(service);
+        drop(handles);
+        drop(state);
+        let reopened = NodeState::open(config)?;
+        let Some(reopened_service) = reopened.prune_service() else {
+            anyhow::bail!("prune service should exist after reopen");
+        };
+
+        assert!(
+            matches!(
+                done_while_locked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "pruning entered while another chain transition held authority"
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(PruneServiceError::Failed(message))
+                    if message == "prune height is within reorg safety margin"
+            ),
+            "pruning did not reject the tip observed under authority: {result:?}"
+        );
+        assert_eq!(status_after.pruneheight, None);
+        assert_eq!(reopened_service.status().pruneheight, None);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_refuses_after_apply_admission_closes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        config.prune_target_mb = 1;
+        let state = NodeState::open(config)?;
+        publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
+        let Some(service) = state.prune_service() else {
+            anyhow::bail!("prune service should exist when prune_target_mb > 0");
+        };
+
+        state.apply_handles.admission.close_permanently();
+        let result = service.prune_to_height(11);
+
+        assert!(
+            matches!(
+                &result,
+                Err(PruneServiceError::Failed(message))
+                    if message == "block apply rejected because clean shutdown has begun"
+            ),
+            "pruning ignored closed chain-mutation admission: {result:?}"
+        );
+        assert_eq!(service.status().pruneheight, None);
         Ok(())
     }
 
@@ -2655,6 +2787,11 @@ mod tests {
         }
 
         let dir = tempfile::tempdir()?;
+        let mut authority_config = crate::Config::default_for_network(crate::Network::Regtest);
+        authority_config.data_dir = dir.path().join("authority");
+        authority_config.p2p_listen.clear();
+        let authority_state = NodeState::open(authority_config)?;
+        publish_applied_tip_height(&authority_state, 12 + CORE_REORG_SAFETY_MARGIN);
         let data_dir = dir.path().join("node");
         std::fs::create_dir_all(data_dir.join("chainstate"))?;
         let store = Arc::new(bitcoin_rs_storage::FjallStore::open(
@@ -2684,6 +2821,7 @@ mod tests {
             body_handle,
             Arc::clone(&blocks),
             Arc::new(RwLock::new(HashMap::new())),
+            authority_state.apply_handles().prune_authority(),
             Arc::new(AtomicU32::new(11 + CORE_REORG_SAFETY_MARGIN)),
         )?);
 

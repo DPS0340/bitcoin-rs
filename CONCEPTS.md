@@ -233,6 +233,11 @@ held from that preflight through header invalidation and branch switching, so
 another apply or reorg cannot enter between them; successful disconnects emit
 the same `pubsequence` `D` events as an organic reorg.
 
+Manual pruning uses `PruneAuthority`, which is derived from the apply handles.
+It acquires the same apply-admission and chain-transition locks before it reads
+the applied tip. It validates the monotonic prune height against that tip and
+holds the authority until storage, file, and cache deletion completes.
+
 ### Dispatch-bound parallelism
 
 A stage that is parallel in shape but serial in effect because each dispatch is

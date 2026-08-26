@@ -842,11 +842,54 @@ impl ApplyAdmission {
 
 /// Proof that admission and the chain-transition lock are both held.
 ///
-/// Private fields make [`ApplyHandles::begin_chain_transition`] the only
-/// constructor. Field order releases the transition lock before the permit.
+/// [`begin_chain_transition`] is the only constructor. Field order releases
+/// the transition lock before the permit.
 pub(crate) struct ChainTransition<'a> {
     _transition: MutexGuard<'a, ()>,
     _admission: RwLockReadGuard<'a, ()>,
+}
+
+fn begin_chain_transition<'a>(
+    admission: &'a ApplyAdmission,
+    chain_transition: &'a Mutex<()>,
+) -> core::result::Result<ChainTransition<'a>, ApplyError> {
+    let admission_guard = admission.enter()?;
+    let transition = chain_transition.lock();
+    admission.ensure_open()?;
+    Ok(ChainTransition {
+        _transition: transition,
+        _admission: admission_guard,
+    })
+}
+
+/// Chain-mutation authority required by destructive block-body pruning.
+#[derive(Clone)]
+pub(crate) struct PruneAuthority {
+    admission: Arc<ApplyAdmission>,
+    chain_transition: Arc<Mutex<()>>,
+    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+}
+
+impl PruneAuthority {
+    pub(crate) fn begin(&self) -> core::result::Result<PruneGuard<'_>, ApplyError> {
+        Ok(PruneGuard {
+            _transition: begin_chain_transition(&self.admission, &self.chain_transition)?,
+            applied_tip: &self.applied_tip,
+        })
+    }
+}
+
+/// Proof that pruning owns chain mutation and may read the authoritative tip.
+pub(crate) struct PruneGuard<'a> {
+    _transition: ChainTransition<'a>,
+    applied_tip: &'a ArcSwapOption<TipSnapshot>,
+}
+
+impl PruneGuard<'_> {
+    #[must_use]
+    pub(crate) fn applied_tip_height(&self) -> Option<u32> {
+        self.applied_tip.load().as_ref().map(|tip| tip.height)
+    }
 }
 
 /// Hash-pinned assume-valid trust gate (Bitcoin Core `-assumevalid` semantics).
@@ -986,11 +1029,10 @@ pub struct ApplyHandles {
     /// Distinct from `admission`, which is a shutdown barrier: `enter` takes a
     /// READ guard, so any number of applies hold it at once and it excludes
     /// nothing but a checkpoint close. A transition reads the applied tip,
-    /// decides what follows it, mutates the UTXO set, and publishes a new tip;
-    /// two of those interleaved can both pass the predecessor check against the
-    /// same tip and then race to publish, so one silently discards the other's
-    /// block. This lock spans the whole read-decide-mutate-publish sequence for
-    /// connects, windows, and disconnects alike.
+    /// decides what follows it, mutates chain-owned state, and publishes the
+    /// result. Two such operations interleaved can both validate against the
+    /// same tip and then invalidate each other's retention or publication
+    /// decisions. This lock spans connects, windows, disconnects, and pruning.
     pub(crate) chain_transition: Arc<parking_lot::Mutex<()>>,
     /// Block height at or below which kernel / portable script execution is skipped during block apply.
     /// Non-script transaction checks still run. Zero disables the shortcut (full script checks on every block).
@@ -1000,16 +1042,18 @@ pub struct ApplyHandles {
 }
 
 impl ApplyHandles {
+    pub(crate) fn prune_authority(&self) -> PruneAuthority {
+        PruneAuthority {
+            admission: Arc::clone(&self.admission),
+            chain_transition: Arc::clone(&self.chain_transition),
+            applied_tip: Arc::clone(&self.applied_tip),
+        }
+    }
+
     pub(crate) fn begin_chain_transition(
         &self,
     ) -> core::result::Result<ChainTransition<'_>, ApplyError> {
-        let admission = self.admission.enter()?;
-        let transition = self.chain_transition.lock();
-        self.admission.ensure_open()?;
-        Ok(ChainTransition {
-            _transition: transition,
-            _admission: admission,
-        })
+        begin_chain_transition(&self.admission, &self.chain_transition)
     }
 
     /// Notifies the transaction index runtime that the applied tip changed.
