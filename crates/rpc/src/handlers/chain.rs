@@ -6,7 +6,7 @@ use core::{fmt, fmt::Write as _};
 
 use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
+use bitcoin_rs_storage::pruning::policy::CORE_REORG_SAFETY_MARGIN;
 use hashbrown::HashMap;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 

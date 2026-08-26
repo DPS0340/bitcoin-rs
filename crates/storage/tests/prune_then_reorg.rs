@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use std::collections::BTreeMap;
 
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_pruning::{
+use bitcoin_rs_storage::pruning::{
     BLOCK_DATA_CF, BlockPruner, PrunePolicy, block_body_key, reclaim_staged_flat_block_files,
     stage_block_and_undo_prune,
 };
