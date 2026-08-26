@@ -51,10 +51,9 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 | `bitcoin-rs-consensus` | `crates/consensus` | Block and transaction verification |
 | `bitcoin-rs-script` | `crates/script` | Script execution and evaluation |
 | `bitcoin-rs-storage` | `crates/storage` | Key-value store abstraction and implementations |
-| `bitcoin-rs-utxo` | `crates/utxo` | In-memory UTXO set management and snapshots |
+| `bitcoin-rs-utxo` | `crates/utxo` | In-memory UTXO set management, snapshots, and UTXO statistics / MuHash |
 | `bitcoin-rs-chain` | `crates/chain` | Block tree and chain index tracking |
 | `bitcoin-rs-index` | `crates/index` | Transaction and address indexing |
-| `bitcoin-rs-coinstats` | `crates/coinstats` | UTXO statistics and MuHash computation |
 | `bitcoin-rs-pruning` | `crates/pruning` | Block file and state pruning logic |
 | `bitcoin-rs-mempool` | `crates/mempool` | Memory pool transaction storage |
 | `bitcoin-rs-p2p` | `crates/p2p` | Peer-to-peer network protocol |

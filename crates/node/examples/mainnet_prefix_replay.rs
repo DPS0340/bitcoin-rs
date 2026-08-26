@@ -580,7 +580,7 @@ fn write_validation_artifact(
 ) -> Result<()> {
     let stats = handles
         .utxo
-        .with_stable_view(|view| bitcoin_rs_coinstats::scan_coin_stats(view, stop_height, true))
+        .with_stable_view(|view| bitcoin_rs_utxo::stats::scan_coin_stats(view, stop_height, true))
         .context("scan UTXO set for CoinStats validation")?;
     let utxo_hash = bitcoin_rs_utxo::aggregate_hash(&handles.utxo)
         .context("compute deterministic UTXO aggregate hash")?;

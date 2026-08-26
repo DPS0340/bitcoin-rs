@@ -69,7 +69,10 @@ existing column family is in the open set).
 - `manifest-v1.json` (`CheckpointManifestV1`) records component versions and codec identifier strings:
   - `headers`: version `1`, codec `"bitcoin-rs-canonical-headers"`.
   - `utxo`: version `4`, codec `"bitcoin-rs-utxo-spendable-v1"`.
-  - `coinstats`: version `1`, codec `"bitcoin-rs-coinstats"`.
+  - `coinstats`: version `1`, codec `"bitcoin-rs-coinstats"`. The crate of that name
+    was merged into `bitcoin-rs-utxo` (issue #164); the identifier is an on-disk
+    value and deliberately keeps the old spelling, because changing it would fail
+    the codec check on every existing checkpoint.
 
 ## 3. Schema Breaking Changes
 

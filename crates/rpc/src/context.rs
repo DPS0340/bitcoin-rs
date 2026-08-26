@@ -736,7 +736,7 @@ pub struct Context {
     /// UTXO set snapshot handle used by chain metadata RPCs.
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO-set statistics.
-    pub coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     /// Optional storage pruning mutator.
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
@@ -810,8 +810,8 @@ impl Context {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         let (mining_sender, mining_notifications) = unbounded();
-        let coin_stats_listener = bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
+        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
         );
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
         utxo.set_listener(Box::new(coin_stats_listener.clone()));
@@ -862,7 +862,7 @@ impl Context {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_coinstats::CoinStatsListener>,
+        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
         network: Arc<RwLock<NetworkState>>,
         mining_template_id: Arc<ArcSwap<CompactString>>,
         peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
@@ -1543,8 +1543,8 @@ mod tests {
         let chain_tip = Arc::new(ArcSwapOption::empty());
         let applied_tip = Arc::new(ArcSwapOption::empty());
         let utxo = Arc::new(bitcoin_rs_utxo::UtxoSet::new());
-        let coin_stats = Arc::new(bitcoin_rs_coinstats::CoinStatsListener::new(
-            bitcoin_rs_coinstats::CoinStats::default(),
+        let coin_stats = Arc::new(bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
         ));
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));

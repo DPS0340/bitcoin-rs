@@ -18,7 +18,6 @@ use bitcoin::{
     TxMerkleNode, TxOut, Txid, Witness, transaction,
 };
 use bitcoin_rs_chain::{BlockTree, NodeStatus};
-use bitcoin_rs_coinstats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_node::{
     Config, Network,
     metrics::{MetricValue, MetricsHandle, install_metrics},
@@ -26,6 +25,7 @@ use bitcoin_rs_node::{
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::{Hash256, OutPoint as PrimitiveOutPoint};
+use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 use crossbeam_channel::unbounded;
 use hashbrown::HashMap;
