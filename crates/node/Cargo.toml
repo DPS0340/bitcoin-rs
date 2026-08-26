@@ -95,7 +95,6 @@ bitcoin-rs-mining.workspace = true
 bitcoin-rs-rpc.workspace = true
 
 bitcoin.workspace = true
-bitcoin_slices.workspace = true
 mimalloc = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true

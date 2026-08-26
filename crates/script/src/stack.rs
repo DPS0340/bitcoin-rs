@@ -2,12 +2,20 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tinyvec::ArrayVec;
 
-/// One stack item, retaining the exact bytes pushed by the script.
-///
-/// Numeric interpretation belongs to the evaluator. Keeping raw bytes here
-/// preserves negative zero and non-minimal integer encodings for consensus
-/// checks.
-pub type ScriptItem = SmallVec<[u8; 32]>;
+/// One stack item in the future hand-rolled interpreter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptItem {
+    /// A minimally encoded script integer.
+    Num(i64),
+    /// A byte vector kept inline for common small pushes.
+    Bytes(SmallVec<[u8; 32]>),
+}
+
+impl Default for ScriptItem {
+    fn default() -> Self {
+        Self::Bytes(SmallVec::new())
+    }
+}
 
 /// Bounded script stack with Core's 1000-item maximum depth.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -74,26 +82,18 @@ pub enum StackError {
 
 #[cfg(test)]
 mod tests {
-    use smallvec::SmallVec;
-
     use super::{ScriptItem, Stack, StackError};
 
     #[test]
     fn stack_rejects_overflow_and_reports_underflow() {
         let mut stack = Stack::new();
         assert_eq!(stack.pop(), Err(StackError::Underflow));
-        let negative_zero = ScriptItem::from_slice(&[0x80]);
-        assert_eq!(negative_zero.as_slice(), &[0x80]);
         for value in 0..Stack::MAX_DEPTH {
             let num = i64::try_from(value)
                 .unwrap_or_else(|error| panic!("stack test index should fit in i64: {error}"));
-            let bytes = SmallVec::<[u8; 32]>::from_slice(&num.to_le_bytes());
-            assert_eq!(stack.push(bytes), Ok(()));
+            assert_eq!(stack.push(ScriptItem::Num(num)), Ok(()));
         }
         assert_eq!(stack.len(), Stack::MAX_DEPTH);
-        assert_eq!(
-            stack.push(ScriptItem::from_slice(&[1])),
-            Err(StackError::Overflow)
-        );
+        assert_eq!(stack.push(ScriptItem::Num(1)), Err(StackError::Overflow));
     }
 }

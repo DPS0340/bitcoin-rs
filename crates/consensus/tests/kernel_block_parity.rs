@@ -27,12 +27,16 @@
 //! where they are known to differ, which is impossible if both sides reach the
 //! kernel.
 //!
-//! ## Native interpreter scope
+//! ## Honest interpreter scoping — no fake parity
 //!
-//! The portable `Interpreter` executes legacy bare/P2PK/P2PKH and BIP16 P2SH
-//! spends plus the existing taproot key-path seam. Segwit v0 and taproot
-//! script-path spends remain outside this stage. The fixture flag records
-//! exactly which rows assert interpreter-vs-kernel parity.
+//! The portable `Interpreter` (`crates/script/src/interpreter.rs`, the script
+//! crate's default posture) natively executes exactly one class: **taproot
+//! key-path spends** (local BIP341 Schnorr verification). Legacy, P2SH,
+//! segwit v0, and taproot script-path spends have no Rust execution path —
+//! production routes those through bitcoinkernel. Fixtures therefore
+//! carry an explicit `interpreter_parity` flag: only the taproot key-path
+//! fixture asserts two-engine verdict parity; every other class is verified
+//! against the kernel alone, with the scoping stated rather than faked.
 //!
 //! ## Fixtures
 //!
@@ -658,80 +662,28 @@ fn script_verdict_parity() -> TestResult {
     );
     Ok(())
 }
-// ---------------------------------------------------------------------------
-// Test 1b: legacy/P2SH native differential.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn legacy_and_p2sh_differential() -> TestResult {
-    let fixtures = load_fixtures()?;
-    let mut selected = 0usize;
-    let mut cases = 0usize;
-    for fixture in fixtures
-        .iter()
-        .filter(|fixture| matches!(fixture.class.as_str(), "p2pk" | "p2pkh" | "p2sh"))
-    {
-        selected += 1;
-        for mutation in Mutation::ALL {
-            let Some(tx) = mutation.apply(&fixture.tx) else {
-                continue;
-            };
-            let kernel = kernel_result(&tx, &fixture.prevouts, fixture.flags);
-            let interpreter = interpreter_result(&tx, &fixture.prevouts, fixture.flags);
-            assert_eq!(
-                Verdict::of(&interpreter),
-                Verdict::of(&kernel),
-                "legacy/P2SH engine divergence: fixture={} class={} mutation={mutation:?} \
-                 kernel={kernel:?} interpreter={interpreter:?}",
-                fixture.name,
-                fixture.class,
-            );
-            cases += 1;
-        }
-    }
-    assert_eq!(selected, 3, "legacy/P2SH fixture set changed");
-    assert!(cases > 0, "legacy/P2SH differential executed no cases");
-    Ok(())
-}
-
-#[test]
-fn embedded_signature_find_and_delete_differential() -> TestResult {
-    let tx_hex = "010000000169c12106097dc2e0526493ef67f21269fe888ef05c7a3a5dacab38e1ac8387f1581b0000b64830450220487fb382c4974de3f7d834c1b617fe15860828c7f96454490edd6d891556dcc9022100baf95feb48f845d5bfc9882eb6aeefa1bc3790e39f59eaa46ff7f15ae626c53e0121037a3fb04bcdb09eba90f69961ba1692a3528e45e67c85b200df820212d7594d334aad4830450220487fb382c4974de3f7d834c1b617fe15860828c7f96454490edd6d891556dcc9022100baf95feb48f845d5bfc9882eb6aeefa1bc3790e39f59eaa46ff7f15ae626c53e01ffffffff0101000000000000000000000000";
-    let tx: Transaction = encode::deserialize(&decode_hex(tx_hex)?)?;
-    let prevouts = vec![TxOut {
-        value: Amount::from_sat(7_000),
-        script_pubkey: ScriptBuf::from_bytes(decode_hex(
-            "a9140c746489e2d83cdbb5b90b432773342ba809c13487",
-        )?),
-    }];
-    let flags = VerifyFlags::P2SH;
-    let kernel = kernel_result(&tx, &prevouts, flags);
-    let interpreter = interpreter_result(&tx, &prevouts, flags);
-    assert_eq!(Verdict::of(&kernel), Verdict::Accept, "kernel: {kernel:?}");
-    assert_eq!(
-        Verdict::of(&interpreter),
-        Verdict::Accept,
-        "native interpreter: {interpreter:?}"
-    );
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Test 2: the differential cannot be kernel-vs-kernel (ADV-1 pin).
 // ---------------------------------------------------------------------------
 
-/// Proves [`script_verdict_parity`]'s Rust side is a direct native path rather
-/// than the kernel in disguise. The crafted legacy spend agrees with the
-/// kernel, while the committed taproot script-path spend remains outside this
-/// stage and deliberately diverges.
-///
-/// If anyone re-routes [`interpreter_result`] through the production
+/// Proves [`script_verdict_parity`]'s Rust side is not the kernel in disguise
+/// by asserting the engines *disagree* on two inputs where they are known to
+/// differ. If anyone re-routes [`interpreter_result`] through the production
 /// `verify_transaction` (which dispatches to the kernel under this feature),
-/// the script-path disagreement disappears and this test goes red.
+/// both checks collapse into agreement and this test goes red.
+///
+/// Known divergences used:
+/// 1. An `OP_TRUE` output spent with a non-empty scriptSig: the kernel
+///    executes it and accepts; the interpreter's non-taproot path in this
+///    binary (no `bitcoinconsensus`) only accepts the empty-scriptSig
+///    `OP_TRUE` form and rejects everything else.
+/// 2. The committed taproot **script-path** fixture: the kernel accepts the
+///    pristine spend; the interpreter supports only key-path witnesses and
+///    rejects script-path spends by construction.
 #[test]
 fn differential_is_non_vacuous() -> TestResult {
-    // (1) Crafted legacy spend: both engines must accept the same valid
-    // native path, including a non-empty push-only scriptSig.
+    // (1) Crafted divergence, independent of the committed corpus.
     let tx = op_true_spend_with_push_script_sig();
     let prevouts = vec![TxOut {
         value: Amount::from_sat(50_000),
@@ -739,11 +691,16 @@ fn differential_is_non_vacuous() -> TestResult {
     }];
     let kernel = kernel_result(&tx, &prevouts, VerifyFlags::NONE);
     let interpreter = interpreter_result(&tx, &prevouts, VerifyFlags::NONE);
-    assert_eq!(Verdict::of(&kernel), Verdict::Accept, "kernel: {kernel:?}");
+    assert_eq!(
+        Verdict::of(&kernel),
+        Verdict::Accept,
+        "kernel must accept OP_TRUE spent with a push-only scriptSig: {kernel:?}"
+    );
     assert_eq!(
         Verdict::of(&interpreter),
-        Verdict::Accept,
-        "native interpreter: {interpreter:?}"
+        Verdict::Reject,
+        "interpreter must reject the non-empty-scriptSig OP_TRUE spend; if it \
+         accepted, the Rust side of the differential is reaching the kernel"
     );
 
     // (2) Fixture-grounded divergence on a real mainnet spend.
