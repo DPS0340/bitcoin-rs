@@ -251,9 +251,14 @@ criterion       = { version = ">=0.8.2, <0.9", default-features = false, feature
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs           = "warn"
+unused_lifetimes       = "warn"
 unreachable_pub        = "warn"
 
 [workspace.lints.clippy]
+correctness                = { level = "deny", priority = -1 }
+suspicious                 = { level = "warn", priority = -1 }
+complexity                 = { level = "warn", priority = -1 }
+perf                       = { level = "warn", priority = -1 }
 pedantic                   = { level = "warn", priority = -1 }
 nursery                    = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "deny"

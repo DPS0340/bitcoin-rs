@@ -14,3 +14,7 @@
   space reaches the reserve. Record compact results and delete the disposable fixture
   before starting the next run, because accumulated benchmark copies have exhausted
   the workstation's home dataset.
+- For each implementation task, record verifiable goals in
+  `.agent-tasks/<task-id>/GOALS.md` and place task-local proof in its sibling
+  `tests/` directory; delete the task directory after the change merges so
+  temporary acceptance evidence does not become permanent project policy.
