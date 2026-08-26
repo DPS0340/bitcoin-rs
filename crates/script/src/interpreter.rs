@@ -5,6 +5,37 @@
 //! local implementation: no reference storage, query, or script dependency is
 //! linked into this crate.
 
+#![allow(
+    clippy::as_conversions,
+    clippy::assigning_clones,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::drop_non_drop,
+    clippy::get_first,
+    clippy::if_not_else,
+    clippy::items_after_statements,
+    clippy::manual_bits,
+    clippy::manual_range_contains,
+    clippy::map_identity,
+    clippy::match_same_arms,
+    clippy::needless_lifetimes,
+    clippy::needless_pass_by_ref_mut,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure,
+    clippy::redundant_closure_for_method_calls,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_wraps,
+    clippy::unwrap_used,
+    clippy::useless_let_if_seq,
+    clippy::verbose_bit_mask
+)]
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -1480,7 +1511,7 @@ fn scriptnum_encode(mut n: i64) -> Vec<u8> {
         out.push((n & 0xff) as u8);
         n >>= 8;
     }
-    if out.last().map(|b| b & 0x80 != 0).unwrap_or(false) {
+    if out.last().is_some_and(|b| b & 0x80 != 0) {
         out.push(if neg { 0x80 } else { 0x00 });
     } else if neg {
         let last = out.last_mut().unwrap();

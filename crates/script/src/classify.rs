@@ -84,7 +84,7 @@ pub(crate) fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
 fn is_p2pk(script: &Script) -> bool {
     let bytes = script.as_bytes();
     matches!(bytes.last(), Some(0xac))
-        && matches!(bytes.first(), Some(33) | Some(65))
+        && matches!(bytes.first(), Some(33 | 65))
         && bytes.len() == usize::from(bytes[0]) + 2
 }
 #[cfg(test)]

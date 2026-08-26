@@ -2267,7 +2267,7 @@ fn apply_block_admitted(
         }
         Some(ProvenApply::AssumeValidSkipped(prepared)) => (prepared, false),
         Some(ProvenApply::Proven(_)) | None => (
-            prepare_apply(block, provided_serialized.clone(), handles.utxo.as_ref())?,
+            prepare_apply(block, provided_serialized, handles.utxo.as_ref())?,
             false,
         ),
     };
@@ -3824,7 +3824,9 @@ mod consensus_rule_tests {
             Err(bitcoin_rs_consensus::ConsensusError::Encoding(_))
         ));
 
-        let count_error = validate_visited_txid_count(1, 2).unwrap_err();
+        let Err(count_error) = validate_visited_txid_count(1, 2) else {
+            panic!("count mismatch must fail");
+        };
         assert_eq!(
             count_error,
             bitcoin_rs_consensus::ConsensusError::Encoding(
@@ -3912,7 +3914,7 @@ mod consensus_rule_tests {
                 .read()
                 .get(&(applied.height, applied.hash))
                 .copied(),
-            Some(raw.as_ptr() as usize),
+            Some(raw.as_ptr().addr()),
             "body persistence must receive the retained canonical allocation"
         );
         Ok(())
@@ -8862,7 +8864,7 @@ mod consensus_rule_tests {
         ) -> Result<(), StorageError> {
             self.persisted_ptrs
                 .write()
-                .insert((height, hash), body.as_ptr() as usize);
+                .insert((height, hash), body.as_ptr().addr());
             self.bodies.write().insert((height, hash), body.to_vec());
             Ok(())
         }

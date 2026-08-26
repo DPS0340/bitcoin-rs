@@ -360,7 +360,7 @@ dependencies = [
  "bitcoin-rs-script",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
-
+ "bitcoin_slices",
  "bytes",
  "cap-fs-ext",
  "cap-std",

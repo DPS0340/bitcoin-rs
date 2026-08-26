@@ -1,4 +1,4 @@
-//! SegWit v0 key-hash template helpers.
+//! `SegWit` v0 key-hash template helpers.
 //!
 //! The module shape follows `reardencode/rbitcoin` commit
 //! `b6ad818e4aa36e5b4a9f8a0d83feb8f3b036937` (MIT OR Apache-2.0). BIP143

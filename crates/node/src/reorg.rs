@@ -494,14 +494,14 @@ fn is_permanent_invalid(error: &ApplyError) -> bool {
     match error {
         ApplyError::ProofOfWork { .. }
         | ApplyError::TargetAboveLimit
-        | ApplyError::NbitsNonRetargetMismatch { .. } => true,
+        | ApplyError::NbitsNonRetargetMismatch { .. }
+        | ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(_)) => true,
         ApplyError::Consensus(error) => !matches!(
             error,
             bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
                 | bitcoin_rs_consensus::ConsensusError::Kernel(_)
                 | bitcoin_rs_consensus::ConsensusError::Encoding(_)
         ),
-        ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(_)) => true,
         ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::NonScript(error)) => {
             !matches!(
                 error,

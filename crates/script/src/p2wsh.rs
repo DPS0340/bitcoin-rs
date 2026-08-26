@@ -1,4 +1,4 @@
-//! SegWit v0 script-hash template helpers.
+//! `SegWit` v0 script-hash template helpers.
 //!
 //! The boundary is adapted from `reardencode/rbitcoin` commit
 //! `b6ad818e4aa36e5b4a9f8a0ad83feb8f3b036937` (MIT OR Apache-2.0). The local

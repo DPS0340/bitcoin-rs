@@ -661,6 +661,7 @@ fn prepare_block_input_checks<'b>(
 }
 
 /// Runs one transaction's inputs serially against its retained state.
+#[allow(clippy::needless_lifetimes)]
 fn check_input<'tx>(
     #[cfg(feature = "kernel")] _txs: &'tx [bitcoin::Transaction],
     #[cfg(not(feature = "kernel"))] txs: &'tx [bitcoin::Transaction],
