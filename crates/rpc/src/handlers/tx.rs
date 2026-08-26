@@ -7,12 +7,16 @@ use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
+use corepc_types::v31::{
+    CombinePsbt, FinalizePsbt, GetRawTransaction, GetTxOut, MempoolAcceptance,
+    MempoolAcceptanceFees, ScriptPubKey, SendRawTransaction, TestMempoolAccept, VerifyTxOutProof,
+};
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{optional_bool, params_array, required_str, required_u64};
+use crate::handlers::{corepc_to_sonic, optional_bool, params_array, required_str, required_u64};
 
 pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
@@ -34,7 +38,9 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         for tx in &block.txdata {
             if tx.compute_txid() == txid {
                 if !verbose {
-                    return Ok(json!(serialize(tx).to_lower_hex_string()));
+                    return corepc_to_sonic(&GetRawTransaction(
+                        serialize(tx).to_lower_hex_string(),
+                    ));
                 }
                 return super::tx_render::tx_to_value(tx);
             }
@@ -45,7 +51,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         let transactions = ctx.transactions.read();
         if let Some(tx) = transactions.get(&txid) {
             if !verbose {
-                return Ok(json!(serialize(tx).to_lower_hex_string()));
+                return corepc_to_sonic(&GetRawTransaction(serialize(tx).to_lower_hex_string()));
             }
             return super::tx_render::tx_to_value(tx);
         }
@@ -55,7 +61,7 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         if let Some(entry) = pool.entry_by_txid(&txid) {
             let tx = entry.tx.as_ref();
             if !verbose {
-                return Ok(json!(serialize(tx).to_lower_hex_string()));
+                return corepc_to_sonic(&GetRawTransaction(serialize(tx).to_lower_hex_string()));
             }
             return super::tx_render::tx_to_value(tx);
         }
@@ -64,7 +70,9 @@ pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Va
         match tx_index.transaction(&txid) {
             Ok(Some(tx)) => {
                 if !verbose {
-                    return Ok(json!(serialize(&tx).to_lower_hex_string()));
+                    return corepc_to_sonic(&GetRawTransaction(
+                        serialize(&tx).to_lower_hex_string(),
+                    ));
                 }
                 return super::tx_render::tx_to_value(&tx);
             }
@@ -128,22 +136,22 @@ pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         || format!("raw({script_hex})"),
         |addr| format!("addr({addr})"),
     );
-    let mut script_pubkey = json!({
-        "asm": live.txout.script_pubkey.to_asm_string(),
-        "desc": desc,
-        "hex": script_hex,
-        "type": classify_script(&live.txout.script_pubkey)
-    });
-    if let Some(addr) = address {
-        let _ = script_pubkey.insert("address", json!(addr));
-    }
-    Ok(json!({
-        "bestblock": ctx.best_hash().to_string_be(),
-        "confirmations": confirmations,
-        "value": super::tx_render::btc_value(live.txout.value.to_sat()),
-        "scriptPubKey": script_pubkey,
-        "coinbase": live.coinbase
-    }))
+    let script_pubkey = ScriptPubKey {
+        asm: live.txout.script_pubkey.to_asm_string(),
+        descriptor: Some(desc),
+        hex: script_hex,
+        required_signatures: None,
+        type_: classify_script(&live.txout.script_pubkey).to_owned(),
+        address,
+        addresses: None,
+    };
+    corepc_to_sonic(&GetTxOut {
+        best_block: ctx.best_hash().to_string_be(),
+        confirmations,
+        value: super::tx_render::btc_value(live.txout.value.to_sat()),
+        script_pubkey,
+        coinbase: live.coinbase,
+    })
 }
 
 pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -321,7 +329,7 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
     let bytes = Vec::<u8>::from_hex(proof_hex)
         .map_err(|_| RpcError::InvalidParams("proof must be valid hex"))?;
     let Ok(merkle_block) = deserialize::<MerkleBlock>(&bytes) else {
-        return Ok(json!([]));
+        return corepc_to_sonic(&VerifyTxOutProof(Vec::new()));
     };
 
     let mut matched_txids = Vec::new();
@@ -330,21 +338,21 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
         .extract_matches(&mut matched_txids, &mut indexes)
         .is_err()
     {
-        return Ok(json!([]));
+        return corepc_to_sonic(&VerifyTxOutProof(Vec::new()));
     }
 
     let result = matched_txids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    Ok(json!(result))
+    corepc_to_sonic(&VerifyTxOutProof(result))
 }
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let tx = decode_tx(raw)?;
     let txid = ctx.add_transaction(tx);
-    Ok(json!(txid.to_string()))
+    corepc_to_sonic(&SendRawTransaction(txid.to_string()))
 }
 
 pub(crate) fn testmempoolaccept(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -352,7 +360,7 @@ pub(crate) fn testmempoolaccept(_ctx: &Arc<Context>, params: &Value) -> Result<V
         .first()
         .and_then(|value| value.as_array())
         .ok_or(RpcError::InvalidParams("raw transaction array is required"))?;
-    let mut rows = Vec::with_capacity(raw_txs.len());
+    let mut results = Vec::with_capacity(raw_txs.len());
     for raw in raw_txs {
         let Some(raw) = raw.as_str() else {
             return Err(RpcError::InvalidType("raw transaction must be a string"));
@@ -362,15 +370,30 @@ pub(crate) fn testmempoolaccept(_ctx: &Arc<Context>, params: &Value) -> Result<V
             |_| Hash256::default().to_string_be(),
             |tx| tx.compute_txid().to_string(),
         );
-        rows.push(json!({
-            "txid": txid,
-            "wtxid": txid,
-            "allowed": decoded.is_ok(),
-            "vsize": decoded.as_ref().map_or(0, Transaction::vsize),
-            "fees": {"base": 0.0}
-        }));
+        let wtxid = decoded.as_ref().map_or_else(
+            |_| Hash256::default().to_string_be(),
+            |tx| tx.compute_wtxid().to_string(),
+        );
+        let vsize = decoded
+            .as_ref()
+            .ok()
+            .map(|tx| i64::try_from(tx.vsize()).unwrap_or(i64::MAX));
+        let fees = decoded.as_ref().ok().map(|_| MempoolAcceptanceFees {
+            base: 0.0,
+            effective_fee_rate: Some(0.0),
+            effective_includes: vec![wtxid.clone()],
+        });
+        results.push(MempoolAcceptance {
+            txid,
+            wtxid,
+            allowed: decoded.is_ok(),
+            vsize,
+            fees,
+            reject_reason: None,
+            reject_details: None,
+        });
     }
-    Ok(json!(rows))
+    corepc_to_sonic(&TestMempoolAccept(results))
 }
 
 pub(crate) fn decoderawtransaction(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -407,16 +430,18 @@ pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value,
     let complete = finalized_tx.is_some();
     if extract && let Some(tx) = finalized_tx {
         let hex = bitcoin::consensus::encode::serialize(&tx).to_lower_hex_string();
-        Ok(json!({
-            "hex": hex,
-            "complete": true,
-        }))
+        corepc_to_sonic(&FinalizePsbt {
+            psbt: None,
+            hex: Some(hex),
+            complete: true,
+        })
     } else {
         let serialized = encode_base64(&psbt.serialize());
-        Ok(json!({
-            "psbt": serialized,
-            "complete": complete,
-        }))
+        corepc_to_sonic(&FinalizePsbt {
+            psbt: Some(serialized),
+            hex: None,
+            complete,
+        })
     }
 }
 
@@ -449,7 +474,7 @@ pub(crate) fn combinepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             .map_err(|err| RpcError::Internal(format!("combine failed: {err}")))?;
     }
 
-    Ok(json!(encode_base64(&psbt.serialize())))
+    corepc_to_sonic(&CombinePsbt(encode_base64(&psbt.serialize())))
 }
 
 const BASE64_ALPHABET: &[u8; 64] =

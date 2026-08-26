@@ -3,60 +3,76 @@
 use bitcoin::Transaction;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hex::DisplayHex as _;
-use serde_json::json as serde_json_value;
+use corepc_types::ScriptSig;
+use corepc_types::v31::{
+    GetRawTransactionVerbose, RawTransactionInput, RawTransactionOutput, ScriptPubKey,
+};
 use sonic_rs::Value;
 
 use crate::error::RpcError;
-use crate::handlers::serde_to_sonic;
+use crate::handlers::corepc_to_sonic;
 
 pub(crate) fn tx_to_value(tx: &Transaction) -> Result<Value, RpcError> {
-    let txid = tx.compute_txid().to_string();
-    let size = usize_to_u64(serialize(tx).len())?;
-    let vsize = usize_to_u64(tx.vsize())?;
-    let weight = tx.weight().to_wu();
-    let vin = tx
+    let raw = serialize(tx);
+    let inputs = tx
         .input
         .iter()
-        .map(|input| {
-            serde_json_value!({
-                "txid": input.previous_output.txid.to_string(),
-                "vout": input.previous_output.vout,
-                "scriptSig": {"asm": "", "hex": input.script_sig.as_bytes().to_lower_hex_string()},
-                "sequence": input.sequence.to_consensus_u32(),
-                "txinwitness": []
-            })
+        .map(|input| RawTransactionInput {
+            coinbase: None,
+            txid: Some(input.previous_output.txid.to_string()),
+            vout: Some(input.previous_output.vout),
+            script_sig: Some(ScriptSig {
+                asm: String::new(),
+                hex: input.script_sig.as_bytes().to_lower_hex_string(),
+            }),
+            txin_witness: Some(
+                input
+                    .witness
+                    .iter()
+                    .map(bitcoin::hex::DisplayHex::to_lower_hex_string)
+                    .collect(),
+            ),
+            sequence: input.sequence.to_consensus_u32(),
         })
         .collect::<Vec<_>>();
-    let vout = tx
+    let outputs = tx
         .output
         .iter()
         .enumerate()
         .map(|(index, output)| {
-            serde_json_value!({
-                "value": btc_value(output.value.to_sat()),
-                "n": index,
-                "scriptPubKey": {
-                    "asm": "",
-                    "desc": "raw()",
-                    "hex": output.script_pubkey.as_bytes().to_lower_hex_string(),
-                    "type": "nonstandard"
-                }
+            Ok(RawTransactionOutput {
+                value: btc_value(output.value.to_sat()),
+                index: usize_to_u64(index)?,
+                script_pubkey: ScriptPubKey {
+                    asm: String::new(),
+                    descriptor: Some("raw()".to_owned()),
+                    hex: output.script_pubkey.as_bytes().to_lower_hex_string(),
+                    required_signatures: None,
+                    type_: "nonstandard".to_owned(),
+                    address: None,
+                    addresses: None,
+                },
             })
         })
-        .collect::<Vec<_>>();
-    let value = serde_json_value!({
-        "txid": txid,
-        "hash": tx.compute_wtxid().to_string(),
-        "version": tx.version.0,
-        "size": size,
-        "vsize": vsize,
-        "weight": weight,
-        "locktime": tx.lock_time.to_consensus_u32(),
-        "vin": vin,
-        "vout": vout,
-        "hex": serialize(tx).to_lower_hex_string()
-    });
-    serde_to_sonic(&value)
+        .collect::<Result<Vec<_>, RpcError>>()?;
+    let verbose = GetRawTransactionVerbose {
+        in_active_chain: None,
+        hex: raw.to_lower_hex_string(),
+        txid: tx.compute_txid().to_string(),
+        hash: tx.compute_wtxid().to_string(),
+        size: usize_to_u64(raw.len())?,
+        vsize: usize_to_u64(tx.vsize())?,
+        weight: tx.weight().to_wu(),
+        version: tx.version.0,
+        lock_time: tx.lock_time.to_consensus_u32(),
+        inputs,
+        outputs,
+        block_hash: None,
+        confirmations: None,
+        transaction_time: None,
+        block_time: None,
+    };
+    corepc_to_sonic(&verbose)
 }
 
 pub(crate) fn usize_to_u64(value: usize) -> Result<u64, RpcError> {

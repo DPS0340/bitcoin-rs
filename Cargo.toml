@@ -92,6 +92,11 @@ bitcoin_slices = { version = ">=0.11, <0.12", default-features = false, features
     "bitcoin", "sha2",
 ] }
 
+# corepc-types 0.15 (bitcoin 0.32 line): typed Bitcoin Core JSON-RPC response
+# models; `corepc_types::v31` is the Core v31 wire contract used by the RPC
+# handlers. `serde-deny-unknown-fields` is deliberately not enabled.
+corepc-types = { version = ">=0.15, <0.16", default-features = false, features = ["std"] }
+
 # Note: `payjoin` is intentionally NOT declared at the workspace level. Task 14
 # adds it with feature names verified against the version current at that time;
 # the 0.23 line uses `["v2"]` and the 1.0-rc line uses different feature names,

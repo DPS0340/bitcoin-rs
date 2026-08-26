@@ -1,14 +1,19 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use corepc_types::v31::{
+    DeriveAddresses, EstimateRawFee, EstimateSmartFee, GetDescriptorInfo, GetMemoryInfoStats,
+    GetRpcInfo, GetZmqNotifications, Locked, RawFeeDetail, ValidateAddress,
+};
 use sonic_rs::{JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{params_array, required_str, required_u64, serde_to_sonic};
+use crate::handlers::{corepc_to_sonic, params_array, required_str, required_u64};
 
 static SERVER_START: OnceLock<Instant> = OnceLock::new();
 
@@ -63,10 +68,11 @@ pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcEr
 pub(crate) fn getrpcinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
     // TODO(logpath): wire from Config.log_file once configured.
-    Ok(json!({
-        "active_commands": Vec::<String>::new(),
-        "logpath": ""
-    }))
+    let info = GetRpcInfo {
+        active_commands: Vec::new(),
+        log_path: String::new(),
+    };
+    corepc_to_sonic(&info)
 }
 
 pub(crate) fn getmemoryinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -85,16 +91,18 @@ pub(crate) fn getmemoryinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value
     // Bitcoin Core reports locked-pool allocator stats. This implementation
     // exposes resident set size from Linux /proc as the available v1 proxy.
     let rss_bytes = read_linux_rss_bytes().unwrap_or(0);
-    Ok(json!({
-        "locked": {
-            "used": rss_bytes,
-            "free": 0_u64,
-            "total": rss_bytes,
-            "locked": 0_u64,
-            "chunks_used": 0_u64,
-            "chunks_free": 0_u64
-        }
-    }))
+    let stats = GetMemoryInfoStats(BTreeMap::from([(
+        "locked".to_owned(),
+        Locked {
+            used: rss_bytes,
+            free: 0,
+            total: rss_bytes,
+            locked: 0,
+            chunks_used: 0,
+            chunks_free: 0,
+        },
+    )]));
+    corepc_to_sonic(&stats)
 }
 
 fn read_linux_rss_bytes() -> Option<u64> {
@@ -111,39 +119,48 @@ fn read_linux_rss_bytes() -> Option<u64> {
 
 pub(crate) fn getzmqnotifications(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
-    let notifications: Vec<_> = ctx
+    let notifications: Vec<GetZmqNotifications> = ctx
         .zmq_notifications()
         .iter()
-        .map(|notification| {
-            json!({
-                "type": notification.notification_type.as_str(),
-                "address": notification.address.as_str(),
-                "hwm": notification.hwm
-            })
+        .map(|notification| GetZmqNotifications {
+            type_: notification.notification_type.as_str().to_owned(),
+            address: notification.address.clone(),
+            hwm: u64::from(notification.hwm),
         })
         .collect();
-    Ok(json!(notifications))
+    corepc_to_sonic(&notifications)
 }
 
 pub(crate) fn estimatesmartfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
     let rate_sat_per_kvb = estimate_feerate_sat_per_kvb(ctx, conf_target);
     let feerate = sat_per_kvb_to_btc_per_kvb(rate_sat_per_kvb);
-    Ok(json!({
-        "feerate": feerate,
-        "blocks": conf_target
-    }))
+    let estimate = EstimateSmartFee {
+        fee_rate: Some(feerate),
+        errors: None,
+        blocks: u32::try_from(conf_target).unwrap_or(u32::MAX),
+    };
+    corepc_to_sonic(&estimate)
 }
 
 pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
     let rate_sat_per_kvb = estimate_feerate_sat_per_kvb(ctx, conf_target);
     let feerate = sat_per_kvb_to_btc_per_kvb(rate_sat_per_kvb);
-    Ok(json!({
-        "short": {"feerate": feerate, "decay": 0.962, "scale": 1},
-        "medium": {"feerate": feerate, "decay": 0.962, "scale": 1},
-        "long": {"feerate": feerate, "decay": 0.962, "scale": 1}
-    }))
+    let detail = RawFeeDetail {
+        fee_rate: Some(feerate),
+        decay: 0.962,
+        scale: 1,
+        pass: None,
+        fail: None,
+        errors: None,
+    };
+    let estimate = EstimateRawFee {
+        short: Some(detail.clone()),
+        medium: Some(detail.clone()),
+        long: detail,
+    };
+    corepc_to_sonic(&estimate)
 }
 
 pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -160,6 +177,8 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
     };
     let Ok(unchecked) = bitcoin::Address::from_str(address_str) else {
+        // Core returns only `isvalid:false` for an invalid address; the v31
+        // `ValidateAddress` struct cannot express that reduced shape.
         return Ok(json!({ "isvalid": false }));
     };
     let Ok(address) = unchecked.require_network(network) else {
@@ -169,40 +188,23 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let script = address.script_pubkey();
     let script_hex = script.as_bytes().to_lower_hex_string();
     let address_canon = address.to_string();
-    let mut response = serde_json::Map::new();
-    response.insert("isvalid".to_owned(), serde_json::Value::Bool(true));
-    response.insert(
-        "address".to_owned(),
-        serde_json::Value::String(address_canon),
-    );
-    response.insert(
-        "scriptPubKey".to_owned(),
-        serde_json::Value::String(script_hex),
-    );
-    response.insert(
-        "isscript".to_owned(),
-        serde_json::Value::Bool(script.is_p2sh() || script.is_p2wsh()),
-    );
-    response.insert(
-        "iswitness".to_owned(),
-        serde_json::Value::Bool(script.is_witness_program()),
-    );
-    if let Some(version) = script.witness_version() {
-        response.insert(
-            "witness_version".to_owned(),
-            serde_json::Value::Number(i64::from(version.to_num()).into()),
-        );
-        // Witness program is the bytes after the 1-byte version prefix and 1-byte push opcode.
-        let bytes = script.as_bytes();
-        if bytes.len() >= 2 {
-            response.insert(
-                "witness_program".to_owned(),
-                serde_json::Value::String(bytes[2..].to_lower_hex_string()),
-            );
-        }
-    }
-
-    serde_to_sonic(&serde_json::Value::Object(response))
+    let witness_version = script.witness_version();
+    // Witness program is the bytes after the 1-byte version prefix and 1-byte push opcode.
+    let witness_program = if witness_version.is_some() && script.as_bytes().len() >= 2 {
+        Some(script.as_bytes()[2..].to_lower_hex_string())
+    } else {
+        None
+    };
+    let validated = ValidateAddress {
+        is_valid: true,
+        address: address_canon,
+        script_pubkey: script_hex,
+        is_script: script.is_p2sh() || script.is_p2wsh(),
+        is_witness: script.is_witness_program(),
+        witness_version: witness_version.map(|version| i64::from(version.to_num())),
+        witness_program,
+    };
+    corepc_to_sonic(&validated)
 }
 
 pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -216,13 +218,15 @@ pub(crate) fn getdescriptorinfo(_ctx: &Arc<Context>, params: &Value) -> Result<V
     let checksum = descriptor_checksum(payload).ok_or(RpcError::InvalidParams(
         "descriptor contains invalid characters",
     ))?;
-    Ok(json!({
-        "descriptor": format!("{payload}#{checksum}"),
-        "checksum": checksum,
-        "isrange": payload.contains('*'),
-        "issolvable": false,
-        "hasprivatekeys": false
-    }))
+    let info = GetDescriptorInfo {
+        descriptor: format!("{payload}#{checksum}"),
+        multipath_expansion: None,
+        checksum,
+        is_range: payload.contains('*'),
+        is_solvable: false,
+        has_private_keys: false,
+    };
+    corepc_to_sonic(&info)
 }
 
 pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -233,18 +237,18 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         if inner.contains('*') {
             // TODO(miniscript): support ranged addr() once miniscript+derivation
             // is wired. For now return empty since we cannot enumerate.
-            return Ok(json!([]));
+            return corepc_to_sonic(&DeriveAddresses(Vec::new()));
         }
         let address = bitcoin::Address::from_str(inner)
             .map_err(|_| RpcError::InvalidParams("addr() contains an invalid address"))?;
         let address = address
             .require_network(bitcoin_network(ctx.chain_network))
             .map_err(|_| RpcError::InvalidParams("addr() address is for the wrong network"))?;
-        return Ok(json!([address.to_string()]));
+        return corepc_to_sonic(&DeriveAddresses(Vec::from([address.to_string()])));
     }
     // TODO(miniscript): other wrappers (pkh, sh, wpkh, tr, wsh, multi, ...) need
     // miniscript-based key derivation. Return empty until then.
-    Ok(json!([]))
+    corepc_to_sonic(&DeriveAddresses(Vec::new()))
 }
 
 fn required_checked_descriptor_payload(descriptor: &str) -> Result<&str, RpcError> {

@@ -1,13 +1,21 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::time::Duration;
 
+use bitcoin::hex::DisplayHex;
+use corepc_types::v31::{GetBlockTemplate, GetMiningInfo, NextBlockInfo};
 use sonic_rs::{JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{ensure_no_params, params_array, required_str};
+use crate::handlers::{corepc_to_sonic, ensure_no_params, params_array, required_str};
 
 const NETWORK_HASHPS_WINDOW: u32 = 120;
+
+/// Placeholder compact target used while no tip/template drives the RPC.
+const STUB_BITS_HEX: &str = "00000000";
+/// Placeholder expanded target matching `STUB_BITS_HEX`.
+const STUB_TARGET_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub(crate) fn getblocktemplate(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     if !params.is_null() {
@@ -25,28 +33,34 @@ pub(crate) fn getblocktemplate(ctx: &Arc<Context>, params: &Value) -> Result<Val
     }
     let tip_hash = ctx.best_hash().to_string_be();
     let template_id = ctx.mining_template_id.load().to_string();
-    Ok(json!({
-        "version": 0,
-        "rules": ["segwit"],
-        "vbavailable": {},
-        "vbrequired": 0,
-        "previousblockhash": tip_hash,
-        "transactions": [],
-        "coinbaseaux": {},
-        "coinbasevalue": 0,
-        "longpollid": template_id,
-        "target": "0000000000000000000000000000000000000000000000000000000000000000",
-        "mintime": 0,
-        "mutable": ["time", "transactions", "prevblock"],
-        "noncerange": "00000000ffffffff",
-        "sigoplimit": 0,
-        "sizelimit": 4_000_000,
-        "weightlimit": 4_000_000,
-        "curtime": 0,
-        "bits": "00000000",
-        "height": ctx.height().saturating_add(1),
-        "default_witness_commitment": ""
-    }))
+    corepc_to_sonic(&GetBlockTemplate {
+        version: 0,
+        rules: vec!["segwit".to_owned()],
+        version_bits_available: BTreeMap::new(),
+        capabilities: Vec::new(),
+        version_bits_required: 0,
+        previous_block_hash: tip_hash,
+        transactions: Vec::new(),
+        coinbase_aux: BTreeMap::new(),
+        coinbase_value: 0,
+        long_poll_id: Some(template_id),
+        target: STUB_TARGET_HEX.to_owned(),
+        min_time: 0,
+        mutable: vec![
+            "time".to_owned(),
+            "transactions".to_owned(),
+            "prevblock".to_owned(),
+        ],
+        nonce_range: "00000000ffffffff".to_owned(),
+        sigop_limit: 0,
+        size_limit: 4_000_000,
+        weight_limit: 4_000_000,
+        current_time: 0,
+        bits: STUB_BITS_HEX.to_owned(),
+        height: i64::from(ctx.height().saturating_add(1)),
+        signet_challenge: None,
+        default_witness_commitment: Some(String::new()),
+    })
 }
 
 pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -70,16 +84,40 @@ pub(crate) fn getmininginfo(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
 
-    Ok(json!({
-        "blocks": blocks,
-        "currentblockweight": current_block_weight,
-        "currentblocktx": current_block_tx,
-        "difficulty": difficulty,
-        "networkhashps": estimate_network_hashps(ctx),
-        "pooledtx": pooledtx,
-        "chain": chain,
-        "warnings": ""
-    }))
+    // Core v31 reports the tip's compact `bits` alongside the expanded target.
+    // This node has no template assembler, so the `next` projection mirrors the
+    // current tip instead of forecasting a retarget.
+    let (bits, target) = tip_bits.map_or_else(
+        || (STUB_BITS_HEX.to_owned(), STUB_TARGET_HEX.to_owned()),
+        |compact| {
+            let expanded = bitcoin::Target::from_compact(compact);
+            (
+                format!("{:08x}", compact.to_consensus()),
+                expanded.to_be_bytes().to_lower_hex_string(),
+            )
+        },
+    );
+
+    corepc_to_sonic(&GetMiningInfo {
+        blocks: u64::from(blocks),
+        current_block_weight: Some(current_block_weight),
+        current_block_tx: Some(i64::try_from(current_block_tx).unwrap_or(i64::MAX)),
+        bits: bits.clone(),
+        difficulty,
+        target: target.clone(),
+        network_hash_ps: estimate_network_hashps(ctx),
+        pooled_tx: i64::try_from(pooledtx).unwrap_or(i64::MAX),
+        block_min_tx_fee: 0.0,
+        chain: chain.to_owned(),
+        signet_challenge: None,
+        next: NextBlockInfo {
+            height: u64::from(blocks.saturating_add(1)),
+            bits,
+            difficulty,
+            target,
+        },
+        warnings: Vec::new(),
+    })
 }
 
 fn estimate_current_block(ctx: &Context) -> (u64, u64) {

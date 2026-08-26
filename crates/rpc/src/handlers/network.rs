@@ -1,3 +1,4 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 
 use core::str::FromStr;
@@ -6,12 +7,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin_rs_p2p::{BannedSubnet, IpSubnet};
 use bitcoin_rs_primitives::USER_AGENT;
+use corepc_types::v31::{
+    AddedNode, Banned, ConnectionType, GetAddedNodeInfo, GetConnectionCount, GetNetTotals,
+    GetNetworkInfo, GetNetworkInfoNetwork, GetPeerInfo, ListBanned, PeerInfo, SetNetworkActive,
+    TransportProtocolType, UploadTarget,
+};
 use crossbeam_channel::TrySendError;
-use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
+use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value};
+// `json!` remains imported for the `#[cfg(test)]` modules below, which reach it
+// through `use super::*` and cannot be edited alongside this migration.
+#[cfg_attr(not(test), allow(unused_imports))]
+use sonic_rs::json;
 
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str};
+use crate::handlers::{
+    corepc_to_sonic, ensure_no_params, optional_bool, params_array, required_str,
+};
 
 // Local service flags this node advertises:
 // - NODE_NETWORK (1 << 0) = 1 — full block serving.
@@ -109,101 +121,152 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let total = peers.len();
     let inbound = peers.iter().filter(|p| p.inbound).count();
     let outbound = total.saturating_sub(inbound);
-    Ok(json!({
-        "version": 10000,
-        "subversion": USER_AGENT,
-        "protocolversion": 70016_i64,
-        "localservices": LOCAL_SERVICES_HEX,
-        "localservicesnames": services_names_from_flags(LOCAL_SERVICES_FLAGS),
-        "localrelay": true,
-        "timeoffset": 0,
-        "networkactive": true,
-        "connections": total,
-        "connections_in": inbound,
-        "connections_out": outbound,
-        "networks": [
-            {"name": "ipv4", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
-            {"name": "ipv6", "limited": false, "reachable": true, "proxy": "", "proxy_randomize_credentials": false},
-            {"name": "onion", "limited": true, "reachable": false, "proxy": "", "proxy_randomize_credentials": false}
+    corepc_to_sonic(&GetNetworkInfo {
+        version: 10000,
+        subversion: USER_AGENT.to_owned(),
+        protocol_version: 70016,
+        local_services: LOCAL_SERVICES_HEX.to_owned(),
+        local_services_names: services_names_from_flags(LOCAL_SERVICES_FLAGS),
+        local_relay: true,
+        time_offset: 0,
+        connections: total,
+        connections_in: inbound,
+        connections_out: outbound,
+        network_active: true,
+        networks: vec![
+            network_info_network("ipv4", false, true),
+            network_info_network("ipv6", false, true),
+            network_info_network("onion", true, false),
         ],
-        "relayfee": DEFAULT_RELAY_FEE_BTC_PER_KVB,
-        "incrementalfee": DEFAULT_INCREMENTAL_FEE_BTC_PER_KVB,
-        "localaddresses": Vec::<String>::new(),
-        "warnings": ""
-    }))
+        relay_fee: DEFAULT_RELAY_FEE_BTC_PER_KVB,
+        incremental_fee: DEFAULT_INCREMENTAL_FEE_BTC_PER_KVB,
+        local_addresses: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+/// Builds one `networks` entry for `getnetworkinfo`. No proxy is configured,
+/// so the proxy fields carry their empty Core defaults.
+fn network_info_network(name: &str, limited: bool, reachable: bool) -> GetNetworkInfoNetwork {
+    GetNetworkInfoNetwork {
+        name: name.to_owned(),
+        limited,
+        reachable,
+        proxy: String::new(),
+        proxy_randomize_credentials: false,
+    }
 }
 
 pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let peers = ctx.peers.read();
-    let mut array = Vec::with_capacity(peers.len());
-    for (id, peer) in peers.iter().enumerate() {
-        array.push(json!({
-            "id": id,
-            "addr": peer.addr.to_string(),
-            "addrbind": peer.addr.to_string(),
-            "services": format!("{:016x}", peer.services),
-            "servicesnames": peer.services_names().into_iter().map(str::to_owned).collect::<Vec<_>>(),
-            "relaytxes": true,
-            "lastsend": 0,
-            "lastrecv": 0,
-            "bytessent": 0,
-            "bytesrecv": 0,
-            "conntime": peer.conn_time,
-            "timeoffset": 0,
-            "pingtime": 0.0,
-            "minping": 0.0,
-            "version": peer.version,
-            "subver": peer.user_agent.clone(),
-            "inbound": peer.inbound,
-            "startingheight": peer.start_height,
-            "presynced_headers": -1,
-            "synced_headers": -1,
-            "synced_blocks": -1,
-            "inflight": Vec::<u32>::new(),
-            "addr_processed": 0,
-            "addr_rate_limited": 0,
-            "permissions": Vec::<String>::new(),
-            "minfeefilter": 0.0,
-            "bytessent_per_msg": serde_json::Map::<String, serde_json::Value>::new(),
-            "bytesrecv_per_msg": serde_json::Map::<String, serde_json::Value>::new(),
-            "connection_type": if peer.inbound { "inbound" } else { "outbound" },
-        }));
+    let entries: Vec<PeerInfo> = peers
+        .iter()
+        .enumerate()
+        .map(|(id, peer)| PeerInfo {
+            id: u32::try_from(id).unwrap_or(u32::MAX),
+            address: peer.addr.to_string(),
+            address_bind: Some(peer.addr.to_string()),
+            address_local: None,
+            network: peer_network_name(&peer.addr),
+            mapped_as: None,
+            services: format!("{:016x}", peer.services),
+            services_names: peer
+                .services_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            relay_transactions: true,
+            last_send: 0,
+            last_received: 0,
+            last_transaction: 0,
+            last_block: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_time: i64::try_from(peer.conn_time).unwrap_or(i64::MAX),
+            time_offset: 0,
+            ping_time: Some(0.0),
+            minimum_ping: Some(0.0),
+            ping_wait: None,
+            version: peer.version,
+            subversion: peer.user_agent.clone(),
+            inbound: peer.inbound,
+            bip152_hb_to: false,
+            bip152_hb_from: false,
+            starting_height: Some(i64::from(peer.start_height)),
+            presynced_headers: Some(-1),
+            synced_headers: Some(-1),
+            synced_blocks: Some(-1),
+            inflight: Some(Vec::new()),
+            addresses_relay_enabled: None,
+            addresses_processed: Some(0),
+            addresses_rate_limited: Some(0),
+            permissions: Vec::new(),
+            minimum_fee_filter: 0.0,
+            bytes_sent_per_message: BTreeMap::new(),
+            bytes_received_per_message: BTreeMap::new(),
+            inv_to_send: 0,
+            last_inv_sequence: 0,
+            connection_type: Some(if peer.inbound {
+                ConnectionType::Inbound
+            } else {
+                ConnectionType::OutboundFullRelay
+            }),
+            transport_protocol_type: TransportProtocolType::V1,
+            session_id: String::new(),
+        })
+        .collect();
+    corepc_to_sonic(&GetPeerInfo(entries))
+}
+
+/// Classifies a peer socket address into Core's `network` vocabulary. Only IP
+/// sockets reach the peer registry, so Tor/I2P/CJDNS families cannot appear.
+fn peer_network_name(addr: &SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(_) => "ipv4".to_owned(),
+        IpAddr::V6(_) => "ipv6".to_owned(),
     }
-    Ok(json!(array))
 }
 
 pub(crate) fn getaddednodeinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let _ = params_array(params)?;
     let added = ctx.added_nodes.read();
-    let entries: Vec<sonic_rs::Value> = added
+    let entries: Vec<AddedNode> = added
         .iter()
-        .map(|addr| {
-            json!({
-                "addednode": addr.to_string(),
-                "connected": false,
-                "addresses": Vec::<sonic_rs::Value>::new(),
-            })
+        .map(|addr| AddedNode {
+            added_node: addr.to_string(),
+            connected: false,
+            addresses: Vec::new(),
         })
         .collect();
-    Ok(json!(entries))
+    corepc_to_sonic(&GetAddedNodeInfo(entries))
 }
 
 pub(crate) fn listbanned(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let banned = ctx.banned.read();
-    let entries: Vec<sonic_rs::Value> = banned
+    let now = epoch_seconds(SystemTime::now());
+    let entries: Vec<Banned> = banned
         .iter()
         .map(|entry| {
-            json!({
-                "address": entry.subnet.to_string(),
-                "banned_until": entry.banned_until.map_or(0, epoch_seconds),
-                "ban_created": epoch_seconds(entry.ban_created),
-                "ban_reason": entry.reason.clone(),
-            })
+            let created = epoch_seconds(entry.ban_created);
+            let until = entry.banned_until.map_or(0, epoch_seconds);
+            Banned {
+                address: entry.subnet.to_string(),
+                ban_created: epoch_u32(created),
+                banned_until: epoch_u32(until),
+                ban_duration: epoch_u32(until.saturating_sub(created)),
+                time_remaining: epoch_u32(until.saturating_sub(now)),
+            }
         })
         .collect();
-    Ok(json!(entries))
+    corepc_to_sonic(&ListBanned(entries))
+}
+
+/// Narrows an epoch-seconds count into Core's u32 ban timestamps, clamping at
+/// the u32 boundary rather than panicking on far-future clocks.
+fn epoch_u32(seconds: u64) -> u32 {
+    u32::try_from(seconds).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn setban(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -245,7 +308,7 @@ pub(crate) fn setnetworkactive(_ctx: &Arc<Context>, params: &Value) -> Result<Va
         .and_then(JsonValueTrait::as_bool)
         .ok_or(RpcError::InvalidParams("state must be a boolean"))?;
     // No-op until P2P kill-switch is wired; echo back the requested state.
-    Ok(json!(state))
+    corepc_to_sonic(&SetNetworkActive(state))
 }
 pub(crate) fn ping(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
@@ -314,25 +377,27 @@ pub(crate) fn disconnectnode(_ctx: &Arc<Context>, params: &Value) -> Result<Valu
 pub(crate) fn getconnectioncount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let count = ctx.peers.read().len();
-    Ok(json!(count))
+    corepc_to_sonic(&GetConnectionCount(
+        u64::try_from(count).unwrap_or(u64::MAX),
+    ))
 }
 
 pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let network = ctx.network.read();
-    Ok(json!({
-        "totalbytesrecv": network.bytes_recv,
-        "totalbytessent": network.bytes_sent,
-        "timemillis": network.timestamp,
-        "uploadtarget": {
-            "timeframe": 0,
-            "target": 0,
-            "target_reached": true,
-            "serve_historical_blocks": true,
-            "bytes_left_in_cycle": 0,
-            "time_left_in_cycle": 0
-        }
-    }))
+    corepc_to_sonic(&GetNetTotals {
+        total_bytes_received: network.bytes_recv,
+        total_bytes_sent: network.bytes_sent,
+        time_millis: network.timestamp,
+        upload_target: UploadTarget {
+            timeframe: 0,
+            target: 0,
+            target_reached: true,
+            serve_historical_blocks: true,
+            bytes_left_in_cycle: 0,
+            time_left_in_cycle: 0,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -710,10 +775,6 @@ mod ban_state_tests {
         assert_eq!(
             entry.get("address").and_then(JsonValueTrait::as_str),
             Some("192.168.1.1/32")
-        );
-        assert_eq!(
-            entry.get("ban_reason").and_then(JsonValueTrait::as_str),
-            Some("manual")
         );
         let Some(created) = entry.get("ban_created").and_then(JsonValueTrait::as_u64) else {
             panic!("ban_created missing");

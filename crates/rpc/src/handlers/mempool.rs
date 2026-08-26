@@ -1,25 +1,35 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::str::FromStr as _;
 
 use bitcoin::Txid;
 use bitcoin_rs_mempool::MempoolEntry;
-use serde_json::json as serde_json_value;
+use corepc_types::v31::{
+    GetMempoolAncestorsVerbose, GetMempoolDescendantsVerbose, GetMempoolEntry, GetMempoolInfo,
+    GetRawMempool, GetRawMempoolSequence, GetRawMempoolVerbose, MempoolEntry as CoreMempoolEntry,
+    MempoolEntryFees,
+};
 use sonic_rs::{Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{optional_bool, required_str, serde_to_sonic};
+use crate::handlers::{corepc_to_sonic, optional_bool, required_str};
 
 // Bitcoin Core default for incremental relay-fee policy until per-node
 // configuration is wired. Units: sat/kvB (the canonical workspace internal).
 // 1000 sat/kvB = 1 sat/vB = 0.00001 BTC/kvB.
 const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
 
+// Bitcoin Core's default `-maxdatacarriersize`, and the cap this node's
+// standardness policy fixes its nulldata tests to. Reported until policy
+// wiring exposes a configured value on the mempool.
+const DEFAULT_MAX_DATA_CARRIER_SIZE: u64 = 83;
+
 pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
     let pool = ctx.mempool.read();
     let stats = pool.stats();
-    let mempool_sequence = pool.sequence_number();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
     let min_relay_fee = sat_per_kvb_to_btc(live_min_relay_sat_per_kvb);
@@ -37,23 +47,39 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     } else {
         live_min_relay_sat_per_kvb
     };
-    let mempool_min_fee_btc = sat_per_kvb_to_btc(mempool_min_fee_sat_per_kvb);
-    Ok(json!({
-        "loaded": true,
-        "size": stats.txs,
-        "bytes": stats.bytes,
-        "usage": stats.bytes,
-        "total_fee": sats_to_btc(stats.total_fee),
-        "maxmempool": maxmempool,
-        "mempoolminfee": mempool_min_fee_btc,
-        "minrelaytxfee": min_relay_fee,
-        "incrementalrelayfee": incremental_relay_fee,
-        // Deviation: Bitcoin Core exposes this via getrawmempool's
-        // mempool_sequence argument; this v1 surface emits it here instead.
-        "mempool_sequence": mempool_sequence,
-        "unbroadcastcount": 0,
-        "fullrbf": true
-    }))
+    // The v31 `GetMempoolInfo` contract carries no `mempool_sequence` field;
+    // Core exposes the sequence only through getrawmempool's
+    // `mempool_sequence` argument, served here by `GetRawMempoolSequence`.
+    let info = GetMempoolInfo {
+        loaded: true,
+        size: u64_to_i64(stats.txs),
+        bytes: u64_to_i64(stats.bytes),
+        usage: u64_to_i64(stats.bytes),
+        total_fee: sats_to_btc(stats.total_fee),
+        max_mempool: u64_to_i64(maxmempool),
+        mempool_min_fee: sat_per_kvb_to_btc(mempool_min_fee_sat_per_kvb),
+        min_relay_tx_fee: min_relay_fee,
+        incremental_relay_fee,
+        // No initial-broadcast tracking exists yet, so nothing sits in the
+        // unbroadcast set.
+        unbroadcast_count: 0,
+        // Full-RBF is this node's only replacement policy: acceptance never
+        // gates on BIP125 signaling.
+        full_rbf: true,
+        // The standardness layer classifies bare multisig outputs as
+        // standard, matching Core's `-permitbaremultisig` default.
+        permit_bare_multisig: true,
+        max_data_carrier_size: DEFAULT_MAX_DATA_CARRIER_SIZE,
+        // No cluster-mempool accounting exists here. The package limits this
+        // node actually enforces at admission are the ancestor caps, so those
+        // are what the v31 cluster-limit fields report.
+        limit_cluster_count: i64::from(pool.limits.max_ancestors),
+        limit_cluster_size: u64_to_i64(pool.limits.max_ancestor_size),
+        // Fee-rate priority ordering is a heuristic, not a proven-optimal
+        // linearization, so the pool never claims Core's `optimal` bit.
+        optimal: false,
+    };
+    corepc_to_sonic(&info)
 }
 
 pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -62,26 +88,23 @@ pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let entry = pool
         .entry_by_txid(&txid)
         .ok_or(RpcError::NotFound("transaction not in mempool"))?;
-    entry_to_value(entry, &pool)
+    corepc_to_sonic(&GetMempoolEntry(entry_to_core(entry, &pool)))
 }
 
 pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let verbose = optional_bool(params, 0, false)?;
     let include_sequence = optional_bool(params, 1, false)?;
     let pool = ctx.mempool.read();
-    let sequence = pool.sequence_number();
     if verbose {
-        let mut object = serde_json::Map::new();
+        // The v31 verbose contract is a txid -> entry map; Core carries the
+        // sequence only on the non-verbose `mempool_sequence` response, and
+        // `GetRawMempoolVerbose` has no slot for it, so a sequence requested
+        // alongside verbose output has no typed home and is not emitted.
+        let mut entries = BTreeMap::new();
         for (_id, entry) in &pool.entries {
-            object.insert(entry.txid.to_string(), entry_to_serde(entry, &pool));
+            entries.insert(entry.txid.to_string(), entry_to_core(entry, &pool));
         }
-        if include_sequence {
-            object.insert(
-                "mempool_sequence".to_owned(),
-                serde_json::Value::Number(serde_json::Number::from(sequence)),
-            );
-        }
-        return serde_to_sonic(&serde_json::Value::Object(object));
+        return corepc_to_sonic(&GetRawMempoolVerbose(entries));
     }
 
     let txids: Vec<String> = pool
@@ -90,12 +113,12 @@ pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         .map(|txid| txid.to_string())
         .collect();
     if include_sequence {
-        return Ok(json!({
-            "txids": txids,
-            "mempool_sequence": sequence,
-        }));
+        return corepc_to_sonic(&GetRawMempoolSequence {
+            txids,
+            mempool_sequence: pool.sequence_number(),
+        });
     }
-    Ok(json!(txids))
+    corepc_to_sonic(&GetRawMempool(txids))
 }
 
 pub(crate) fn clearmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -118,7 +141,7 @@ pub(crate) fn getmempoolancestors(ctx: &Arc<Context>, params: &Value) -> Result<
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.ancestor_ids_for_entry(id);
-    render_relatives(&pool, &related_ids, verbose)
+    render_relatives(&pool, &related_ids, verbose, GetMempoolAncestorsVerbose)
 }
 
 pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -129,24 +152,29 @@ pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Resul
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.descendant_ids_for_entry(id);
-    render_relatives(&pool, &related_ids, verbose)
+    render_relatives(&pool, &related_ids, verbose, GetMempoolDescendantsVerbose)
 }
 
-fn render_relatives(
+fn render_relatives<W>(
     pool: &bitcoin_rs_mempool::Mempool,
     ids: &[bitcoin_rs_mempool::EntryId],
     verbose: bool,
-) -> Result<Value, RpcError> {
+    wrap: fn(BTreeMap<String, CoreMempoolEntry>) -> W,
+) -> Result<Value, RpcError>
+where
+    W: serde::Serialize,
+{
     if verbose {
-        let mut object = serde_json::Map::new();
+        let mut entries = BTreeMap::new();
         for id in ids {
             if let Some(entry) = pool.entry(*id) {
-                let txid = entry.txid.to_string();
-                object.insert(txid, entry_to_serde(entry, pool));
+                entries.insert(entry.txid.to_string(), entry_to_core(entry, pool));
             }
         }
-        serde_to_sonic(&serde_json::Value::Object(object))
+        corepc_to_sonic(&wrap(entries))
     } else {
+        // v31 exposes no non-verbose relatives wrapper, so the primitive
+        // txid-array answer stays as it was.
         let mut txids = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(entry) = pool.entry(*id) {
@@ -161,14 +189,7 @@ fn parse_txid(value: &str) -> Result<Txid, RpcError> {
     Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
 }
 
-fn entry_to_value(
-    entry: &MempoolEntry,
-    pool: &bitcoin_rs_mempool::Mempool,
-) -> Result<Value, RpcError> {
-    serde_to_sonic(&entry_to_serde(entry, pool))
-}
-
-fn entry_to_serde(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> serde_json::Value {
+fn entry_to_core(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> CoreMempoolEntry {
     let txid = entry.txid;
     let bip125_replaceable = entry.is_replaceable();
     let mut depends = Vec::new();
@@ -186,43 +207,64 @@ fn entry_to_serde(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> s
     // The spend index answers this directly. Scanning every entry's inputs here
     // made a `getrawmempool true` cost O(pool²) input comparisons while holding
     // the mempool read lock, which is what blocks transaction acceptance.
-    let mut spentby: Vec<String> = entry_id
+    let mut spent_by: Vec<String> = entry_id
         .map(|id| pool.spender_txids(id))
         .unwrap_or_default()
         .iter()
         .map(ToString::to_string)
         .collect();
-    spentby.sort();
-    spentby.dedup();
+    spent_by.sort();
+    spent_by.dedup();
 
-    let (descendantcount, ancestorcount) = entry_id.map_or((1, 1), |id| {
+    let (descendant_count, ancestor_count) = entry_id.map_or((1, 1), |id| {
         (
             pool.descendant_count_inclusive(id),
             pool.ancestor_count_inclusive(id),
         )
     });
 
-    serde_json_value!({
-        "vsize": entry.vsize,
-        "weight": u64::from(entry.vsize).saturating_mul(4),
-        "time": entry.time,
-        "height": entry.height,
-        "descendantcount": descendantcount,
-        "descendantsize": entry.descendant_size,
-        "ancestorcount": ancestorcount,
-        "ancestorsize": entry.ancestor_size,
-        "wtxid": entry.tx.compute_wtxid().to_string(),
-        "fees": {
-            "base": sats_to_btc(entry.fee),
-            "modified": sats_to_btc(entry.fee),
-            "ancestor": sats_to_btc(entry.ancestor_fee),
-            "descendant": sats_to_btc(entry.descendant_fee)
+    // This pool keeps per-transaction fee and package accounting, not cluster
+    // linearizations: every transaction is its own singleton chunk, so the v31
+    // chunk fee and chunk weight mirror the transaction itself. No per-entry
+    // priority deltas are tracked, so the modified fee equals the base fee.
+    let base_fee_btc = sats_to_btc(entry.fee);
+    let weight = u64::from(entry.vsize).saturating_mul(4);
+    CoreMempoolEntry {
+        vsize: i64::from(entry.vsize),
+        weight: u64_to_i64(weight),
+        time: u64_to_i64(entry.time),
+        height: i64::from(entry.height),
+        descendant_count: i64::from(descendant_count),
+        descendant_size: u64_to_i64(entry.descendant_size),
+        ancestor_count: i64::from(ancestor_count),
+        ancestor_size: u64_to_i64(entry.ancestor_size),
+        chunk_weight: u64_to_i64(weight),
+        wtxid: entry.tx.compute_wtxid().to_string(),
+        fees: MempoolEntryFees {
+            base: base_fee_btc,
+            modified: base_fee_btc,
+            ancestor: sats_to_btc(entry.ancestor_fee),
+            descendant: sats_to_btc(entry.descendant_fee),
+            chunk: base_fee_btc,
         },
-        "depends": depends,
-        "spentby": spentby,
-        "bip125-replaceable": bip125_replaceable,
-        "unbroadcast": false
-    })
+        depends,
+        spent_by,
+        bip125_replaceable,
+        unbroadcast: false,
+    }
+}
+
+/// serde_json rendering of the typed v31 entry. The spent-by oracle tests
+/// assert against `serde_json::Value`; production answers go through
+/// `corepc_to_sonic`, and this seam feeds the same typed value to them.
+#[cfg(test)]
+fn entry_to_serde(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> serde_json::Value {
+    serde_json::to_value(entry_to_core(entry, pool))
+        .unwrap_or_else(|err| panic!("serializing mempool entry failed: {err}"))
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn sats_to_btc(sats: u64) -> f64 {
@@ -344,15 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn getmempoolinfo_emits_mempool_sequence_field() {
+    fn getmempoolinfo_uses_core_v31_shape() {
         let ctx = Arc::new(Context::new());
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("getmempoolinfo", &json!([]))
             .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
         assert!(
-            result.get("mempool_sequence").is_some(),
-            "mempool_sequence missing: {result:?}"
+            result.get("mempool_sequence").is_none(),
+            "non-Core mempool_sequence must not be emitted: {result:?}"
         );
     }
 
@@ -422,19 +464,16 @@ mod tests {
     }
 
     #[test]
-    fn getrawmempool_verbose_sequence_flag_flattens_response() {
+    fn getrawmempool_verbose_uses_core_v31_shape() {
         let ctx = Arc::new(Context::new());
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("getrawmempool", &json!([true, true]))
             .unwrap_or_else(|err| panic!("getrawmempool failed: {err}"));
-        let Some(seq) = result
-            .get("mempool_sequence")
-            .and_then(JsonValueTrait::as_u64)
-        else {
-            panic!("mempool_sequence missing: {result:?}");
-        };
-        assert_eq!(seq, 0);
+        assert!(
+            result.get("mempool_sequence").is_none(),
+            "verbose v31 response has no sequence member: {result:?}"
+        );
         assert!(
             result.get("txids").is_none(),
             "verbose response must not use txids wrapper: {result:?}"

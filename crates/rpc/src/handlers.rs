@@ -157,3 +157,37 @@ pub(crate) fn serde_to_sonic(value: &serde_json::Value) -> Result<Value, RpcErro
     let text = serde_json::to_string(value)?;
     Ok(sonic_rs::from_str(&text)?)
 }
+
+/// Serializes a v31 response while matching Core's omission of absent optional
+/// object members. `corepc-types` models those members as `Option`, but its
+/// serializer emits `null`; omitting only object-valued `None`s preserves the
+/// Core wire shape without duplicating the response schema locally.
+pub(crate) fn corepc_to_sonic<T: serde::Serialize>(value: &T) -> Result<Value, RpcError> {
+    let mut value = serde_json::to_value(value)?;
+    strip_absent_object_fields(&mut value);
+    serde_to_sonic(&value)
+}
+
+fn strip_absent_object_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|_, child| {
+                if child.is_null() {
+                    false
+                } else {
+                    strip_absent_object_fields(child);
+                    true
+                }
+            });
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                strip_absent_object_fields(child);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
