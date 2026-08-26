@@ -1909,13 +1909,7 @@ mod tests {
             utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
         }
         assert_eq!(
-            verify_transaction(
-                &fixture.tx,
-                &utxos,
-                fixture.height,
-                0,
-                fixture.flags
-            ),
+            verify_transaction(&fixture.tx, &utxos, fixture.height, 0, fixture.flags),
             Ok(())
         );
     }
@@ -1932,13 +1926,7 @@ mod tests {
         for (index, prevout) in fixture.prevouts.iter().enumerate() {
             utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
         }
-        let result = verify_transaction(
-            &fixture.tx,
-            &utxos,
-            fixture.height,
-            0,
-            fixture.flags,
-        );
+        let result = verify_transaction(&fixture.tx, &utxos, fixture.height, 0, fixture.flags);
         assert!(
             matches!(
                 result,
