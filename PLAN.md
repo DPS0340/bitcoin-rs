@@ -551,11 +551,15 @@ git commit -am "feat(coinstats): muhash3072 running + O(1) gettxoutsetinfo" -m "
 
 ---
 
-### Task 11: `crates/pruning` — block + undo pruner; utreexo-only mode
+### Task 11: block + undo pruner
 
 **Files:**
-- Create: `crates/pruning/src/{lib,policy,block_pruner,undo_pruner,utreexo_only}.rs`
-- Test: `crates/pruning/tests/{prune_then_reorg,utreexo_no_blocks}.rs`
+- Create: `crates/pruning/src/{lib,policy,block_pruner,undo_pruner}.rs`. Merged
+  into `crates/storage/src/pruning/` by issue #164: pruning is a retention
+  policy over rows `storage` already owns, and the separate crate declared
+  three dependencies it never referenced. The utreexo-only coordinator went
+  with the utreexo mode (issue #144).
+- Test: `crates/storage/tests/prune_then_reorg.rs`
 
 - [ ] **Step 1: `PrunePolicy { target_size_mb: u64, keep_below_tip: u32 }`** — match Core's `-prune=` semantics.
 

@@ -313,7 +313,7 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
         let mut batch = self.store.new_batch();
         batch.put(
             bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_pruning::block_undo_key(height, hash),
+            &bitcoin_rs_storage::pruning::block_undo_key(height, hash),
             record,
         );
         self.store.write_deferred(batch)
@@ -326,7 +326,7 @@ impl<S: KvStore> UndoStore for KvUndoStore<S> {
     ) -> Result<Option<Vec<u8>>, StorageError> {
         self.store.get(
             bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_pruning::block_undo_key(height, hash),
+            &bitcoin_rs_storage::pruning::block_undo_key(height, hash),
         )
     }
 
@@ -537,12 +537,12 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
 
         let keys: Vec<_> = requests
             .iter()
-            .map(|&(height, hash)| bitcoin_rs_pruning::block_body_key(height, hash))
+            .map(|&(height, hash)| bitcoin_rs_storage::pruning::block_body_key(height, hash))
             .collect();
         let key_refs: Vec<_> = keys.iter().map(<[u8; 37]>::as_slice).collect();
         let values = self
             .index
-            .get_many_sorted(bitcoin_rs_pruning::BLOCK_DATA_CF, &key_refs)?;
+            .get_many_sorted(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key_refs)?;
         if values.len() != requests.len() {
             return Err(StorageError::InvalidOperation(
                 "snapshot batch returned the wrong number of values",
@@ -572,8 +572,11 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
     ) -> Result<Option<Vec<u8>>, StorageError> {
         let position = match &mut self.positions {
             PositionLookup::Direct => {
-                let key = bitcoin_rs_pruning::block_body_key(height, hash);
-                let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+                let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
+                let Some(encoded) = self
+                    .index
+                    .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+                else {
                     return Ok(None);
                 };
                 BlockFilePosition::decode(&encoded)
@@ -606,7 +609,7 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
         files: Arc<FlatFileBlockStore>,
         data_dir: &std::path::Path,
     ) -> Result<Self, StorageError> {
-        for row in index.iter_prefix(bitcoin_rs_pruning::BLOCK_DATA_CF, b"b")? {
+        for row in index.iter_prefix(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, b"b")? {
             let (key, value) = row?;
             if key.len() == 37 && value.len() != BlockFilePosition::ENCODED_LEN {
                 return Err(StorageError::IncompatibleData(format!(
@@ -630,8 +633,11 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<BlockFilePosition>, StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
-        let Some(encoded) = self.index.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)? else {
+        let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
+        let Some(encoded) = self
+            .index
+            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+        else {
             return Ok(None);
         };
         Ok(BlockFilePosition::decode(&encoded))
@@ -649,10 +655,10 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         hash: bitcoin_rs_primitives::Hash256,
         body: &[u8],
     ) -> Result<(), StorageError> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
         let existing = self
             .index
-            .get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?
+            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
             .map(|bytes| {
                 BlockFilePosition::decode(&bytes).ok_or_else(|| {
                     StorageError::IncompatibleData(
@@ -671,14 +677,18 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         let max_height_key = block_file_max_height_key(position.file_no);
         let max_height = self
             .index
-            .get(bitcoin_rs_pruning::BLOCK_DATA_CF, &max_height_key)?
+            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &max_height_key)?
             .as_deref()
             .and_then(decode_block_file_max_height)
             .map_or(height, |previous| previous.max(height));
         let mut batch = self.index.new_batch();
-        batch.put(bitcoin_rs_pruning::BLOCK_DATA_CF, &key, &position.encode());
         batch.put(
-            bitcoin_rs_pruning::BLOCK_DATA_CF,
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+            &key,
+            &position.encode(),
+        );
+        batch.put(
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
             &max_height_key,
             &encode_block_file_max_height(max_height),
         );

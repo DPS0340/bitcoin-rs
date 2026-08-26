@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-use bitcoin_rs_pruning::policy::CORE_REORG_SAFETY_MARGIN;
-use bitcoin_rs_pruning::{
+use bitcoin_rs_storage::pruning::policy::CORE_REORG_SAFETY_MARGIN;
+use bitcoin_rs_storage::pruning::{
     PrunePolicy, reclaim_staged_flat_block_files, stage_block_and_undo_prune,
 };
 use bitcoin_rs_storage::{ColumnFamily, FlatFileBlockStore, KvStore, WriteBatch};
@@ -408,16 +408,18 @@ impl NodeStorage {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>> {
-        let key = bitcoin_rs_pruning::block_body_key(height, hash);
+        let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Ok(store.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?),
+            Self::RocksDb(store) => {
+                Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?)
+            }
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Ok(store.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?),
+            Self::Fjall(store) => Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => Ok(store.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?),
+            Self::Redb(store) => Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Ok(store.get(bitcoin_rs_pruning::BLOCK_DATA_CF, &key)?),
+            Self::Mdbx(store) => Ok(store.get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?),
         }
     }
 
@@ -427,7 +429,7 @@ impl NodeStorage {
         height: u32,
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<Vec<u8>>> {
-        let key = bitcoin_rs_pruning::block_undo_key(height, hash);
+        let key = bitcoin_rs_storage::pruning::block_undo_key(height, hash);
         match self {
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(store) => Ok(store.get(ColumnFamily::UndoData, &key)?),
@@ -2012,8 +2014,8 @@ mod tests {
         std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
         let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
         store.put(
-            bitcoin_rs_pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_pruning::block_body_key(
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+            &bitcoin_rs_storage::pruning::block_body_key(
                 1,
                 bitcoin_rs_primitives::Hash256::from_le_bytes(&[1_u8; 32]),
             ),
@@ -2262,12 +2264,12 @@ mod tests {
             };
             let mut batch = store.new_batch();
             batch.put(
-                bitcoin_rs_pruning::BLOCK_DATA_CF,
-                &bitcoin_rs_pruning::block_body_key(height, hash),
+                bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+                &bitcoin_rs_storage::pruning::block_body_key(height, hash),
                 &position.encode(),
             );
             batch.put(
-                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
                 &bitcoin_rs_storage::block_file_max_height_key(0),
                 &bitcoin_rs_storage::encode_block_file_max_height(height),
             );
@@ -2278,7 +2280,7 @@ mod tests {
         fn metadata_exists<S: KvStore>(store: &S) -> anyhow::Result<bool> {
             Ok(store
                 .get(
-                    bitcoin_rs_pruning::BLOCK_DATA_CF,
+                    bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
                     &bitcoin_rs_storage::block_file_max_height_key(0),
                 )?
                 .is_some())
@@ -2351,7 +2353,7 @@ mod tests {
         fn seed_file_height<S: KvStore>(store: &S, height: u32) -> anyhow::Result<()> {
             let mut batch = store.new_batch();
             batch.put(
-                bitcoin_rs_pruning::BLOCK_DATA_CF,
+                bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
                 &bitcoin_rs_storage::block_file_max_height_key(0),
                 &bitcoin_rs_storage::encode_block_file_max_height(height),
             );

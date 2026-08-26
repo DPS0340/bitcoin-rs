@@ -330,7 +330,6 @@ dependencies = [
  "bitcoin-rs-mining",
  "bitcoin-rs-p2p",
  "bitcoin-rs-primitives",
- "bitcoin-rs-pruning",
  "bitcoin-rs-rpc",
  "bitcoin-rs-script",
  "bitcoin-rs-storage",
@@ -404,23 +403,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcoin-rs-pruning"
-version = "0.4.0"
-dependencies = [
- "bitcoin",
- "bitcoin-rs-chain",
- "bitcoin-rs-primitives",
- "bitcoin-rs-storage",
- "bitcoin-rs-utxo",
- "parking_lot",
- "proptest",
- "serde_json",
- "tempfile",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "bitcoin-rs-rpc"
 version = "0.4.0"
 dependencies = [
@@ -433,7 +415,6 @@ dependencies = [
  "bitcoin-rs-mining",
  "bitcoin-rs-p2p",
  "bitcoin-rs-primitives",
- "bitcoin-rs-pruning",
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
  "compact_str",
@@ -474,6 +455,7 @@ dependencies = [
 name = "bitcoin-rs-storage"
 version = "0.4.0"
 dependencies = [
+ "bitcoin-rs-primitives",
  "bytemuck",
  "bytes",
  "criterion",
