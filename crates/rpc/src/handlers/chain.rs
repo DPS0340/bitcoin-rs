@@ -1238,13 +1238,7 @@ fn block_json_verbose(
     // serialized block length, identical to `size`.
     let size = i64::try_from(block_bytes.len()).unwrap_or(i64::MAX);
     let weight = block.weight().to_wu();
-    let coinbase_tx = coinbase_transaction(&block).unwrap_or_else(|_| CoinbaseTransaction {
-        version: 0,
-        locktime: 0,
-        sequence: 0,
-        coinbase: String::new(),
-        witness: None,
-    });
+    let coinbase_tx = coinbase_transaction(&block)?;
     let n_tx = i64::try_from(record.tx_count).unwrap_or(i64::MAX);
 
     if verbosity >= 2 {
@@ -2053,6 +2047,26 @@ mod tests {
 
     /// A log record for `header`, either carrying the block or standing in for
     /// one whose body the node no longer has.
+    fn fixture_block(header: bitcoin::block::Header) -> bitcoin::Block {
+        bitcoin::Block {
+            header,
+            txdata: vec![bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint::null(),
+                    script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 1]),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(0),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                }],
+            }],
+        }
+    }
+
     fn record_for(header: bitcoin::block::Header, with_body: bool) -> BlockRecord {
         use bitcoin::hashes::Hash as _;
 
@@ -2060,10 +2074,7 @@ mod tests {
         if !with_body {
             return BlockRecord::synthetic(1, hash);
         }
-        let block = bitcoin::Block {
-            header,
-            txdata: Vec::new(),
-        };
+        let block = fixture_block(header);
         BlockRecord::from_block(1, &block)
     }
 
@@ -2086,14 +2097,8 @@ mod tests {
         let applied_record = record_for(applied_header, with_body);
         let fork_record = record_for(fork_header, with_body);
         if with_body {
-            let applied_block = bitcoin::Block {
-                header: applied_header,
-                txdata: Vec::new(),
-            };
-            let fork_block = bitcoin::Block {
-                header: fork_header,
-                txdata: Vec::new(),
-            };
+            let applied_block = fixture_block(applied_header);
+            let fork_block = fixture_block(fork_header);
             Arc::get_mut(&mut ctx)
                 .expect("unique fork fixture context")
                 .block_body_source = Some(Arc::new(MultiBlockSource {
