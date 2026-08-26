@@ -1955,7 +1955,7 @@ fn prove_window(
             };
             match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
                 &block.txdata,
-                resolved,
+                bitcoin_rs_consensus::ResolvedBlockInputs::new(resolved),
                 context.height,
                 context.locktime_cutoff,
                 #[cfg(feature = "kernel")]
@@ -3118,7 +3118,7 @@ fn verify_block_transactions(
     let mut script_timings = bitcoin_rs_consensus::ScriptStageTimings::default();
     let script_input_result = bitcoin_rs_consensus::verify_block_input_scripts(
         &block.txdata,
-        resolved,
+        bitcoin_rs_consensus::ResolvedBlockInputs::new(resolved),
         height,
         locktime_cutoff,
         flags,
@@ -3129,7 +3129,12 @@ fn verify_block_transactions(
         .record(script_timings.prepare_seconds);
     metrics::histogram!("node.apply_block.script_parallel_seconds")
         .record(script_timings.parallel_seconds);
-    script_input_result?;
+    script_input_result.map_err(|failure| match failure {
+        bitcoin_rs_consensus::BlockCheckFailure::NonScript(error) => ApplyError::Consensus(error),
+        failure @ bitcoin_rs_consensus::BlockCheckFailure::Script(_) => {
+            ApplyError::BlockCheck(failure)
+        }
+    })?;
     tracing::debug!(
         height,
         script_resolution_us = resolution_dur.as_micros(),
@@ -4282,10 +4287,15 @@ mod consensus_rule_tests {
 
         assert!(matches!(
             error,
-            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                input_index: 0,
-                ref reason,
-            }) if reason.starts_with("kernel script verification failed:")
+            ApplyError::BlockCheck(
+                bitcoin_rs_consensus::BlockCheckFailure::Script(
+                    bitcoin_rs_consensus::ScriptFailure {
+                        input_index: 0,
+                        ref reason,
+                        ..
+                    }
+                )
+            ) if reason.starts_with("kernel script verification failed:")
         ));
         Ok(())
     }
@@ -4352,10 +4362,16 @@ mod consensus_rule_tests {
 
         assert!(matches!(
             error,
-            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                input_index: 0,
-                ref reason,
-            }) if reason.starts_with("kernel script verification failed:")
+            ApplyError::BlockCheck(
+                bitcoin_rs_consensus::BlockCheckFailure::Script(
+                    bitcoin_rs_consensus::ScriptFailure {
+                        tx_index: 1,
+                        input_index: 0,
+                        ref reason,
+                        ..
+                    }
+                )
+            ) if reason.starts_with("kernel script verification failed:")
         ));
         Ok(())
     }
@@ -4440,10 +4456,9 @@ mod consensus_rule_tests {
         assert!(
             matches!(
                 error,
-                ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                    input_index: 0,
-                    ..
-                })
+                ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(
+                    bitcoin_rs_consensus::ScriptFailure { input_index: 0, .. }
+                ))
             ),
             "expected earlier-tx Script error at input 0, got {error:?}"
         );
@@ -4755,10 +4770,9 @@ mod consensus_rule_tests {
 
         assert!(matches!(
             error,
-            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                input_index: 0,
-                ..
-            })
+            ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(
+                bitcoin_rs_consensus::ScriptFailure { input_index: 0, .. }
+            ))
         ));
         Ok(())
     }
@@ -4789,10 +4803,9 @@ mod consensus_rule_tests {
 
         assert!(matches!(
             error,
-            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                input_index: 0,
-                ..
-            })
+            ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(
+                bitcoin_rs_consensus::ScriptFailure { input_index: 0, .. }
+            ))
         ));
         Ok(())
     }
@@ -6715,8 +6728,10 @@ mod consensus_rule_tests {
         assert!(
             matches!(
                 outcome,
-                Err(ApplyError::Consensus(
-                    bitcoin_rs_consensus::ConsensusError::Script { input_index: 0, .. }
+                Err(ApplyError::BlockCheck(
+                    bitcoin_rs_consensus::BlockCheckFailure::Script(
+                        bitcoin_rs_consensus::ScriptFailure { input_index: 0, .. }
+                    )
                 ))
             ),
             "trust-gate flip must re-enter ordinary script validation, got {outcome:?}"
@@ -8769,10 +8784,9 @@ mod consensus_rule_tests {
         };
         assert!(matches!(
             err,
-            ApplyError::Consensus(bitcoin_rs_consensus::ConsensusError::Script {
-                input_index: 0,
-                ..
-            })
+            ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(
+                bitcoin_rs_consensus::ScriptFailure { input_index: 0, .. }
+            ))
         ));
         Ok(())
     }

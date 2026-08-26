@@ -29,7 +29,7 @@ proptest! {
             &fixture.tx.0,
             0,
         );
-        prop_assert_eq!(ok, Ok(true));
+        prop_assert_eq!(ok, Ok(()));
     }
 
     #[test]
@@ -85,7 +85,7 @@ fn valid_multi_input_taproot_keypath_spend_executes() {
             &tx,
             input_idx,
         );
-        assert_eq!(ok, Ok(true), "input {input_idx}");
+        assert_eq!(ok, Ok(()), "input {input_idx}");
     }
 }
 

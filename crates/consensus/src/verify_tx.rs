@@ -1,5 +1,7 @@
+#[cfg(not(feature = "kernel"))]
+use bitcoin::sighash::SighashCache;
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 #[cfg(not(feature = "kernel"))]
@@ -8,7 +10,10 @@ use bitcoin_rs_script::VerifyFlags;
 use rayon::prelude::*;
 
 use crate::rust_path::UtxoView;
-use crate::{ConsensusError, MAX_BLOCK_SIGOPS_COST, MAX_MONEY};
+use crate::{
+    BlockCheckFailure, ConsensusError, MAX_BLOCK_SIGOPS_COST, MAX_MONEY, ResolvedBlockInputs,
+    ScriptFailure,
+};
 
 const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 const SEQUENCE_FINAL: u32 = 0xffff_ffff;
@@ -321,26 +326,17 @@ fn verify_input_script_portable(
     Ok(())
 }
 
-/// Per-transaction state retained across the flat block verify phases.
+/// Per-transaction state retained across the block's ordered phases.
 struct PreparedTx<'b> {
     tx_index: usize,
-    prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
+    input_count: usize,
     pre_error: Option<ConsensusError>,
     post_error: Option<ConsensusError>,
-    checks_start: usize,
-    checks_len: usize,
     #[cfg(feature = "kernel")]
     kernel_state: Option<crate::kernel::PreparedKernelTx<bitcoinkernel::TransactionRef<'b>>>,
     #[cfg(not(feature = "kernel"))]
     _block: core::marker::PhantomData<&'b ()>,
 }
-
-/// One deferred per-input script check, indexing back into the prepared txs.
-struct InputCheck {
-    prepared_index: usize,
-    input_index: usize,
-}
-
 /// Sub-stage durations of [`verify_block_input_scripts`], reported to the caller.
 ///
 /// The node layer uses these to attribute the script stage to its serial
@@ -358,31 +354,23 @@ pub struct ScriptStageTimings {
     pub parallel_seconds: f64,
 }
 
-/// Verifies every input script across a block in one flat, block-ordered pass.
+/// Verifies every input script across a block with one job per transaction.
 ///
-/// `resolved[i]` holds transaction `i`'s prevouts in input order (empty for the
-/// coinbase). The node resolves them serially in block order so same-block
-/// spends and overlay semantics stay authoritative. Prevout resolution is order
-/// sensitive; script verification is not, so the per-input checks run
-/// concurrently, yet the first failure is returned in block order (tx ascending,
-/// phase `pre < script < post`, input ascending) — byte-identical to applying
-/// the single-tx path tx by tx in block order.
-///
-/// `timings` receives the durations of the serial preparation and the parallel
-/// input-check fan-out (in seconds). Both are written before the verdict is
-/// returned, so the caller records them on the success and error paths. This
-/// crate has no `metrics` dependency, so the caller owns the histogram recording.
+/// The matrix is immutable after resolution. Each transaction worker owns one
+/// mutable sighash cache and checks its inputs serially; the final scan still
+/// reports block -> transaction -> pre/script/post -> input order.
 pub fn verify_block_input_scripts(
     txs: &[bitcoin::Transaction],
-    resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    resolved: ResolvedBlockInputs,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
     timings: &mut ScriptStageTimings,
     kernel_block: &crate::kernel::KernelBlock,
-) -> Result<(), ConsensusError> {
+) -> Result<(), BlockCheckFailure> {
     let prepare_started = Instant::now();
-    let unit = prepare_block_script_checks(txs, resolved, height, locktime_cutoff, kernel_block)?;
+    let unit = prepare_block_script_checks(txs, resolved, height, locktime_cutoff, kernel_block)
+        .map_err(BlockCheckFailure::NonScript)?;
     timings.prepare_seconds = prepare_started.elapsed().as_secs_f64();
 
     let parallel_started = Instant::now();
@@ -400,41 +388,26 @@ pub fn verify_block_input_scripts(
 }
 
 /// One block's script checks, prepared but not executed.
-///
-/// Holds the borrow into the caller's parsed kernel block, so the block must
-/// outlive every unit built from it.
 pub struct BlockScriptChecks<'b> {
     txs: &'b [bitcoin::Transaction],
+    resolved: Arc<ResolvedBlockInputs>,
     prepared: Vec<PreparedTx<'b>>,
-    checks: Vec<InputCheck>,
 }
 
 /// Which unit failed, and how.
-///
-/// The index is the position in the slice handed to [`verify_prepared_units`],
-/// so a caller batching several blocks learns which one to re-run through the
-/// ordinary path to reproduce the error in its documented position.
 #[derive(Debug)]
 pub struct BatchScriptFailure {
     /// Position of the failing unit.
     pub unit: usize,
     /// The failure, identical to what the single-block path would report.
-    pub error: ConsensusError,
+    pub error: BlockCheckFailure,
 }
 
 /// Resolves one block's order-sensitive transaction state without executing
 /// any script.
-///
-/// # Errors
-///
-/// Returns [`ConsensusError::PrevoutMatrixSize`] when `resolved` does not
-/// cover every transaction. Consensus failures found during preparation are
-/// not errors here: they are retained in transaction order and reported by
-/// [`verify_prepared_units`], because reporting them now would let a later
-/// transaction's cheap failure outrank an earlier one.
 pub fn prepare_block_script_checks<'b>(
     txs: &'b [bitcoin::Transaction],
-    mut resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    resolved: ResolvedBlockInputs,
     height: u32,
     locktime_cutoff: u32,
     kernel_block: &'b crate::kernel::KernelBlock,
@@ -445,17 +418,13 @@ pub fn prepare_block_script_checks<'b>(
             actual: resolved.len(),
         });
     }
-    let (prepared, checks) = prepare_block_input_checks(
-        txs,
-        resolved.as_mut_slice(),
-        height,
-        locktime_cutoff,
-        kernel_block,
-    );
+    let resolved = Arc::new(resolved);
+    let prepared =
+        prepare_block_input_checks(txs, &resolved, height, locktime_cutoff, kernel_block);
     Ok(BlockScriptChecks {
         txs,
+        resolved,
         prepared,
-        checks,
     })
 }
 
@@ -472,57 +441,60 @@ where
     if units.len() != flags_per_unit.len() {
         return Err(BatchScriptFailure {
             unit: 0,
-            error: ConsensusError::Kernel(format!(
+            error: BlockCheckFailure::NonScript(ConsensusError::Kernel(format!(
                 "batch verify needs one flag set per unit: {} units, {} flag sets",
                 units.len(),
                 flags_per_unit.len()
-            )),
+            ))),
         });
     }
 
-    // Offsets are precomputed rather than accumulated during the scan. With a
-    // running counter, reversing the scan order misaligns every slice instead
-    // of simply reporting a different unit, which hides an ordering bug behind
-    // an unrelated symptom and lets an ordering test pass for the wrong reason.
-    let mut offsets = Vec::with_capacity(units.len());
-    let mut total = 0_usize;
-    for unit in units {
-        offsets.push(total);
-        let Some(next) = total.checked_add(unit.checks.len()) else {
-            return Err(layout_failure(0));
-        };
-        total = next;
-    }
-
-    let run = |(unit_index, check): &(usize, &InputCheck)| {
-        let unit = &units[*unit_index];
-        check_input(unit.txs, &unit.prepared, check, flags_per_unit[*unit_index])
-    };
-    let flat: Vec<(usize, &InputCheck)> = units
+    // One job represents one transaction. Inputs stay serial within that job
+    // so its mutable sighash cache is never shared across workers.
+    let jobs: Vec<(usize, usize)> = units
         .iter()
         .enumerate()
-        .flat_map(|(index, unit)| unit.checks.iter().map(move |check| (index, check)))
+        .flat_map(|(unit_index, unit)| {
+            unit.prepared
+                .iter()
+                .enumerate()
+                .filter(|(_, prep)| prep.pre_error.is_none() && prep.input_count > 0)
+                .map(move |(prepared_index, _)| (unit_index, prepared_index))
+        })
         .collect();
-    let results: Vec<Result<(), ConsensusError>> = if total < MIN_PARALLEL_SCRIPT_CHECKS {
-        flat.iter().map(run).collect()
-    } else {
-        SCRIPT_VERIFY_POOL.install(|| flat.par_iter().map(run).collect())
+    let total_inputs: usize = jobs
+        .iter()
+        .map(|(unit_index, prepared_index)| {
+            units[*unit_index].prepared[*prepared_index].input_count
+        })
+        .sum();
+    let run = |(unit_index, prepared_index): &(usize, usize)| {
+        run_prepared_transaction(
+            &units[*unit_index],
+            *prepared_index,
+            flags_per_unit[*unit_index],
+        )
     };
+    let job_results: Vec<Vec<Result<(), BlockCheckFailure>>> =
+        if total_inputs < MIN_PARALLEL_SCRIPT_CHECKS {
+            jobs.iter().map(run).collect()
+        } else {
+            SCRIPT_VERIFY_POOL.install(|| jobs.par_iter().map(run).collect())
+        };
 
-    // Timing must stop here: the ordered scan below is serial attribution work,
-    // not parallel script execution.
     after_parallel();
     before_serial_scan();
 
+    let mut results: Vec<Vec<Vec<Result<(), BlockCheckFailure>>>> = units
+        .iter()
+        .map(|unit| (0..unit.prepared.len()).map(|_| Vec::new()).collect())
+        .collect();
+    for ((unit_index, prepared_index), job_result) in jobs.into_iter().zip(job_results) {
+        results[unit_index][prepared_index] = job_result;
+    }
+
     for (unit_index, unit) in units.iter().enumerate() {
-        let from = offsets[unit_index];
-        let Some(to) = from.checked_add(unit.checks.len()) else {
-            return Err(layout_failure(unit_index));
-        };
-        let Some(slice) = results.get(from..to) else {
-            return Err(layout_failure(unit_index));
-        };
-        match first_prepared_error(&unit.prepared, slice) {
+        match first_prepared_error(&unit.prepared, &results[unit_index]) {
             Ok(Some(error)) => {
                 return Err(BatchScriptFailure {
                     unit: unit_index,
@@ -536,12 +508,31 @@ where
     Ok(())
 }
 
+fn run_prepared_transaction(
+    unit: &BlockScriptChecks<'_>,
+    prepared_index: usize,
+    flags: VerifyFlags,
+) -> Vec<Result<(), BlockCheckFailure>> {
+    let prep = &unit.prepared[prepared_index];
+    #[cfg(not(feature = "kernel"))]
+    let mut cache = SighashCache::new(&unit.txs[prep.tx_index]);
+    (0..prep.input_count)
+        .map(|input_index| {
+            check_input(
+                unit.txs,
+                unit.resolved.as_ref(),
+                &unit.prepared,
+                prepared_index,
+                input_index,
+                flags,
+                #[cfg(not(feature = "kernel"))]
+                &mut cache,
+            )
+        })
+        .collect()
+}
+
 /// Executes prepared script checks and reports the first failure in unit order.
-///
-/// # Errors
-///
-/// Returns the first [`BatchScriptFailure`] in the supplied unit order, or an
-/// internal layout failure when the unit and flag slices do not correspond.
 pub fn verify_prepared_units(
     units: &[BlockScriptChecks<'_>],
     flags_per_unit: &[VerifyFlags],
@@ -555,81 +546,62 @@ pub fn verify_prepared_units(
 fn layout_failure(unit: usize) -> BatchScriptFailure {
     BatchScriptFailure {
         unit,
-        error: ConsensusError::Kernel(
+        error: BlockCheckFailure::NonScript(ConsensusError::Kernel(
             "internal: prepared script-check layout does not match its results".to_owned(),
-        ),
+        )),
     }
 }
 
 /// First failure within one prepared block, in transaction order with phase
 /// `pre < script < post`.
-///
-/// Shared by the single-block and batched entry points on purpose: a second
-/// copy of this ordering is how the two paths would silently disagree about
-/// which error a block produces. A result slice that does not cover a
-/// transaction's checks means this function and its caller disagree about the
-/// layout. That cannot happen from any input, only from a bug here, but it must
-/// never be answered with "no error found": that reports success for scripts
-/// nobody ran.
 fn first_prepared_error(
     prepared: &[PreparedTx<'_>],
-    results: &[Result<(), ConsensusError>],
-) -> Result<Option<ConsensusError>, ()> {
-    for prep in prepared {
+    results: &[Vec<Result<(), BlockCheckFailure>>],
+) -> Result<Option<BlockCheckFailure>, ()> {
+    for (prepared_index, prep) in prepared.iter().enumerate() {
         if let Some(error) = &prep.pre_error {
-            return Ok(Some(error.clone()));
+            return Ok(Some(BlockCheckFailure::NonScript(error.clone())));
         }
-        let Some(to) = prep.checks_start.checked_add(prep.checks_len) else {
+        let Some(slice) = results.get(prepared_index) else {
             return Err(());
         };
-        let Some(slice) = results.get(prep.checks_start..to) else {
+        if slice.len() != prep.input_count {
             return Err(());
-        };
+        }
         for result in slice {
             if let Err(error) = result {
                 return Ok(Some(error.clone()));
             }
         }
         if let Some(error) = &prep.post_error {
-            return Ok(Some(error.clone()));
+            return Ok(Some(BlockCheckFailure::NonScript(error.clone())));
         }
     }
     Ok(None)
 }
-
-/// Resolves order-sensitive transaction state before script checks fan out.
-///
-/// Preparation stops at the first pre-script failure so no later transaction
-/// can outrank it during the final ordered error scan.
 fn prepare_block_input_checks<'b>(
     txs: &[bitcoin::Transaction],
-    resolved: &mut [Vec<Option<bitcoin::TxOut>>],
+    resolved: &ResolvedBlockInputs,
     height: u32,
     locktime_cutoff: u32,
-    // Unused by the portable backend, which verifies rust-bitcoin transactions
-    // directly; kept in the signature so both backends share one call shape.
     #[cfg_attr(
         not(feature = "kernel"),
         expect(unused_variables, reason = "kernel-only")
     )]
     kernel_block: &'b crate::kernel::KernelBlock,
-) -> (Vec<PreparedTx<'b>>, Vec<InputCheck>) {
+) -> Vec<PreparedTx<'b>> {
     let mut prepared = Vec::with_capacity(txs.len());
-    let mut checks = Vec::new();
     for (tx_index, tx) in txs.iter().enumerate() {
-        let resolved_inputs = &mut resolved[tx_index];
         let prep = match prepare_tx_checks(tx, height, locktime_cutoff, |input_index, _| {
-            resolved_inputs.get_mut(input_index).and_then(Option::take)
+            resolved.get(tx_index, input_index).cloned()
         }) {
             Ok(Some(prep)) => prep,
             Ok(None) => {
                 prepared.push(PreparedTx {
                     tx_index,
-                    prevouts: Vec::new(),
+                    input_count: 0,
                     pre_error: None,
                     post_error: None,
-                    checks_start: checks.len(),
-                    checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
                     #[cfg(not(feature = "kernel"))]
@@ -640,11 +612,9 @@ fn prepare_block_input_checks<'b>(
             Err(pre_error) => {
                 prepared.push(PreparedTx {
                     tx_index,
-                    prevouts: Vec::new(),
+                    input_count: 0,
                     pre_error: Some(pre_error),
                     post_error: None,
-                    checks_start: checks.len(),
-                    checks_len: 0,
                     #[cfg(feature = "kernel")]
                     kernel_state: None,
                     #[cfg(not(feature = "kernel"))]
@@ -654,8 +624,6 @@ fn prepare_block_input_checks<'b>(
             }
         };
 
-        // Build retained kernel state before checks so setup failure cannot
-        // leave an InputCheck without its PreparedKernelTx.
         #[cfg(feature = "kernel")]
         let kernel_state = match kernel_block.transaction(tx_index).and_then(|kernel_tx| {
             crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
@@ -664,78 +632,108 @@ fn prepare_block_input_checks<'b>(
             Err(setup_error) => {
                 prepared.push(PreparedTx {
                     tx_index,
-                    prevouts: prep.prevouts,
+                    input_count: 0,
                     pre_error: Some(setup_error),
                     post_error: None,
-                    checks_start: checks.len(),
-                    checks_len: 0,
                     kernel_state: None,
                 });
                 break;
             }
         };
 
-        let prepared_index = prepared.len();
-        let checks_start = checks.len();
-        for input_index in 0..tx.input.len() {
-            checks.push(InputCheck {
-                prepared_index,
-                input_index,
-            });
-        }
-        let checks_len = tx.input.len();
-
         let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
         let stop_after_tx = post_error.is_some();
         prepared.push(PreparedTx {
             tx_index,
-            prevouts: prep.prevouts,
+            input_count: tx.input.len(),
             pre_error: None,
             post_error,
-            checks_start,
-            checks_len,
             #[cfg(feature = "kernel")]
             kernel_state: Some(kernel_state),
             #[cfg(not(feature = "kernel"))]
             _block: core::marker::PhantomData,
         });
-        // This tx's scripts still outrank its post error; that post error makes
-        // every later transaction irrelevant to the ordered verdict.
         if stop_after_tx {
             break;
         }
     }
-    (prepared, checks)
+    prepared
 }
 
-/// Runs one deferred input's script verdict against its retained state. Forks on
-/// `cfg(kernel)` between the kernel and portable engines, sharing `&prepared` and
-/// `&txs` by shared reference only.
-fn check_input(
-    txs: &[bitcoin::Transaction],
+/// Runs one transaction's inputs serially against its retained state.
+fn check_input<'tx>(
+    #[cfg(feature = "kernel")] _txs: &'tx [bitcoin::Transaction],
+    #[cfg(not(feature = "kernel"))] txs: &'tx [bitcoin::Transaction],
+    resolved: &ResolvedBlockInputs,
     prepared: &[PreparedTx<'_>],
-    check: &InputCheck,
+    prepared_index: usize,
+    input_index: usize,
     flags: VerifyFlags,
-) -> Result<(), ConsensusError> {
-    let prep = &prepared[check.prepared_index];
+    #[cfg(not(feature = "kernel"))] cache: &mut SighashCache<&'tx bitcoin::Transaction>,
+) -> Result<(), BlockCheckFailure> {
+    let prep = &prepared[prepared_index];
+    #[cfg(not(feature = "kernel"))]
     let tx = &txs[prep.tx_index];
-    let (_, prevout) = &prep.prevouts[check.input_index];
+    let Some(prevout) = resolved.get(prep.tx_index, input_index) else {
+        return Err(BlockCheckFailure::NonScript(ConsensusError::Kernel(
+            "prepared prevout matrix is missing an input".to_owned(),
+        )));
+    };
     #[cfg(feature = "kernel")]
     {
-        let _ = tx;
-        let kernel_state = prep.kernel_state.as_ref().ok_or_else(|| {
-            ConsensusError::Kernel("clean non-coinbase tx lost prepared kernel state".to_owned())
-        })?;
-        crate::kernel::verify_prepared_input(kernel_state, prevout, check.input_index, flags)
+        let Some(kernel_state) = prep.kernel_state.as_ref() else {
+            return Err(BlockCheckFailure::NonScript(ConsensusError::Kernel(
+                "prepared kernel state is missing an input".to_owned(),
+            )));
+        };
+        crate::kernel::verify_prepared_input(kernel_state, prevout, input_index, flags).map_err(
+            |error| match error {
+                ConsensusError::Script { reason, .. } => BlockCheckFailure::Script(ScriptFailure {
+                    tx_index: prep.tx_index,
+                    input_index,
+                    reason,
+                }),
+                error => BlockCheckFailure::NonScript(error),
+            },
+        )
     }
     #[cfg(not(feature = "kernel"))]
     {
-        let all_prevouts: Vec<&bitcoin::TxOut> =
-            prep.prevouts.iter().map(|(_, spent)| spent).collect();
-        verify_input_script_portable(check.input_index, prevout, &all_prevouts, tx, flags)
+        let input = &tx.input[input_index];
+        let Some(row) = resolved.transaction(prep.tx_index) else {
+            return Err(BlockCheckFailure::NonScript(ConsensusError::Kernel(
+                "prepared transaction row is missing".to_owned(),
+            )));
+        };
+        let Some(all_prevouts) = row
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Option<Vec<&bitcoin::TxOut>>>()
+        else {
+            return Err(BlockCheckFailure::NonScript(
+                ConsensusError::MissingPrevout { input_index },
+            ));
+        };
+        Interpreter
+            .execute_with_prevouts_cached(
+                prevout.script_pubkey.as_bytes(),
+                input.script_sig.as_bytes(),
+                &input.witness.to_vec(),
+                flags,
+                &all_prevouts,
+                tx,
+                input_index,
+                cache,
+            )
+            .map_err(|error| {
+                BlockCheckFailure::Script(ScriptFailure {
+                    tx_index: prep.tx_index,
+                    input_index,
+                    reason: error.to_string(),
+                })
+            })
     }
 }
-
 fn cached_prevout_lookup(
     prevouts: &[(bitcoin::OutPoint, bitcoin::TxOut)],
     cursor: &mut usize,
@@ -813,7 +811,9 @@ mod tests {
         crate::kernel::KernelBlock::parse(&bitcoin::consensus::serialize(&block))
             .unwrap_or_else(|error| panic!("synthetic block must parse: {error}"))
     }
-    use crate::{ConsensusError, rust_path::UtxoView};
+    use crate::{
+        BlockCheckFailure, ConsensusError, ResolvedBlockInputs, ScriptFailure, rust_path::UtxoView,
+    };
 
     #[test]
     fn coinbase_transaction_skips_prevout_lookup() {
@@ -1421,7 +1421,7 @@ mod tests {
         let mut timings = super::ScriptStageTimings::default();
         let single = super::verify_block_input_scripts(
             &txs,
-            resolved.clone(),
+            ResolvedBlockInputs::new(resolved.clone()),
             0,
             0,
             VerifyFlags::MANDATORY,
@@ -1432,11 +1432,20 @@ mod tests {
         let batched = super::verify_prepared_units(&units, &[VerifyFlags::MANDATORY]);
 
         match (single, batched) {
-            (Err(single_error), Err(failure)) => assert_eq!(
-                format!("{single_error}"),
-                format!("{}", failure.error),
-                "batched and single-block verdicts must be identical"
-            ),
+            (Err(single_error), Err(failure)) => {
+                assert_eq!(
+                    single_error, failure.error,
+                    "single-block and batched failures must be identical"
+                );
+                assert!(matches!(
+                    failure.error,
+                    BlockCheckFailure::Script(ScriptFailure {
+                        tx_index: 1,
+                        input_index: 0,
+                        ..
+                    })
+                ));
+            }
             (single, batched) => panic!(
                 "both paths must reject this block: single={:?} batched_ok={}",
                 single.err(),
@@ -1505,7 +1514,13 @@ mod tests {
         resolved: Vec<Vec<Option<TxOut>>>,
         block: &'b crate::kernel::KernelBlock,
     ) -> super::BlockScriptChecks<'b> {
-        match super::prepare_block_script_checks(txs, resolved, 0, 0, block) {
+        match super::prepare_block_script_checks(
+            txs,
+            ResolvedBlockInputs::new(resolved),
+            0,
+            0,
+            block,
+        ) {
             Ok(unit) => unit,
             Err(error) => panic!("test fixture prevout matrix is malformed: {error}"),
         }
@@ -1626,18 +1641,172 @@ mod tests {
         assert_eq!(
             super::verify_block_input_scripts(
                 &txs,
-                Vec::new(),
+                ResolvedBlockInputs::new(Vec::new()),
                 0,
                 0,
                 VerifyFlags::MANDATORY,
                 &mut ScriptStageTimings::default(),
                 &kernel_block_for(&txs)
             ),
-            Err(ConsensusError::PrevoutMatrixSize {
-                expected: 1,
-                actual: 0,
-            })
+            Err(BlockCheckFailure::NonScript(
+                ConsensusError::PrevoutMatrixSize {
+                    expected: 1,
+                    actual: 0,
+                },
+            ))
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "kernel"))]
+    fn portable_structured_script_failure_preserves_transaction_index() {
+        let outpoint = OutPoint {
+            txid: Txid::from_byte_array([9; 32]),
+            vout: 0,
+        };
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![1]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let txs = vec![coinbase_transaction_with_script_sig_len(2), spend];
+        let resolved = ResolvedBlockInputs::new(vec![
+            Vec::new(),
+            vec![Some(TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            })],
+        ]);
+        let block = crate::kernel::KernelBlock::parse(&[]).expect("portable marker");
+        let unit =
+            super::prepare_block_script_checks(&txs, resolved, 0, 0, &block).expect("matrix shape");
+        let failure = super::verify_prepared_units(&[unit], &[VerifyFlags::MANDATORY])
+            .expect_err("non-empty scriptSig must fail portable OP_TRUE");
+        assert!(matches!(
+            failure.error,
+            BlockCheckFailure::Script(ScriptFailure {
+                tx_index: 1,
+                input_index: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn multi_input_transaction_jobs_scan_inputs_in_order() {
+        let first_outpoint = OutPoint {
+            txid: Txid::from_byte_array([1; 32]),
+            vout: 0,
+        };
+        let second_outpoint = OutPoint {
+            txid: Txid::from_byte_array([2; 32]),
+            vout: 0,
+        };
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![
+                true_spending_input(first_outpoint),
+                true_spending_input(second_outpoint),
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(90),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let txs = vec![coinbase_transaction_with_script_sig_len(2), spend];
+        let true_prevout = TxOut {
+            value: Amount::from_sat(100),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let block = kernel_block_for(&txs);
+        let valid = super::prepare_block_script_checks(
+            &txs,
+            ResolvedBlockInputs::new(vec![
+                Vec::new(),
+                vec![Some(true_prevout.clone()), Some(true_prevout)],
+            ]),
+            0,
+            0,
+            &block,
+        )
+        .expect("valid matrix shape");
+        assert!(
+            super::verify_prepared_units(&[valid], &[VerifyFlags::MANDATORY]).is_ok(),
+            "both inputs of one transaction must share a valid worker"
+        );
+
+        let second_invalid = super::prepare_block_script_checks(
+            &txs,
+            ResolvedBlockInputs::new(vec![
+                Vec::new(),
+                vec![
+                    Some(TxOut {
+                        value: Amount::from_sat(100),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    }),
+                    Some(TxOut {
+                        value: Amount::from_sat(100),
+                        script_pubkey: ScriptBuf::new(),
+                    }),
+                ],
+            ]),
+            0,
+            0,
+            &block,
+        )
+        .expect("second-invalid matrix shape");
+        let second_failure =
+            super::verify_prepared_units(&[second_invalid], &[VerifyFlags::MANDATORY])
+                .expect_err("the second input must execute after the first passes");
+        assert!(matches!(
+            second_failure.error,
+            BlockCheckFailure::Script(ScriptFailure {
+                tx_index: 1,
+                input_index: 1,
+                ..
+            })
+        ));
+
+        let invalid = super::prepare_block_script_checks(
+            &txs,
+            ResolvedBlockInputs::new(vec![
+                Vec::new(),
+                vec![
+                    Some(TxOut {
+                        value: Amount::from_sat(100),
+                        script_pubkey: ScriptBuf::new(),
+                    }),
+                    Some(TxOut {
+                        value: Amount::from_sat(100),
+                        script_pubkey: ScriptBuf::new(),
+                    }),
+                ],
+            ]),
+            0,
+            0,
+            &block,
+        )
+        .expect("invalid matrix shape");
+        let failure = super::verify_prepared_units(&[invalid], &[VerifyFlags::MANDATORY])
+            .expect_err("empty scriptPubKeys must reject both inputs");
+        assert!(matches!(
+            failure.error,
+            BlockCheckFailure::Script(ScriptFailure {
+                tx_index: 1,
+                input_index: 0,
+                ..
+            })
+        ));
     }
 
     /// The assignment's required case: an earlier transaction's script failure
@@ -1654,7 +1823,7 @@ mod tests {
         let resolved = vec![Vec::new(), vec![Some(op_equal_txout(100))], vec![None]];
         let result = super::verify_block_input_scripts(
             &txs,
-            resolved,
+            ResolvedBlockInputs::new(resolved),
             0,
             0,
             VerifyFlags::MANDATORY,
@@ -1662,7 +1831,13 @@ mod tests {
             &kernel_block_for(&txs),
         );
         assert!(
-            matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
+            matches!(
+                result,
+                Err(BlockCheckFailure::Script(ScriptFailure {
+                    input_index: 0,
+                    ..
+                }))
+            ),
             "expected tx1 Script error, got {result:?}"
         );
     }
@@ -1679,7 +1854,7 @@ mod tests {
         let resolved = vec![Vec::new(), vec![Some(op_equal_txout(50))]];
         let result = super::verify_block_input_scripts(
             &txs,
-            resolved,
+            ResolvedBlockInputs::new(resolved),
             0,
             0,
             VerifyFlags::MANDATORY,
@@ -1687,7 +1862,13 @@ mod tests {
             &kernel_block_for(&txs),
         );
         assert!(
-            matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
+            matches!(
+                result,
+                Err(BlockCheckFailure::Script(ScriptFailure {
+                    input_index: 0,
+                    ..
+                }))
+            ),
             "expected Script error over InputsLessThanOutputs, got {result:?}"
         );
     }
@@ -1715,7 +1896,7 @@ mod tests {
         ];
         let result = super::verify_block_input_scripts(
             &txs,
-            resolved,
+            ResolvedBlockInputs::new(resolved),
             0,
             0,
             VerifyFlags::MANDATORY,
@@ -1724,10 +1905,12 @@ mod tests {
         );
         assert_eq!(
             result,
-            Err(ConsensusError::InputsLessThanOutputs {
-                input_value: 50,
-                output_value: 100,
-            })
+            Err(BlockCheckFailure::NonScript(
+                ConsensusError::InputsLessThanOutputs {
+                    input_value: 50,
+                    output_value: 100,
+                }
+            ))
         );
     }
 
@@ -1747,7 +1930,7 @@ mod tests {
 
         let result = super::verify_block_input_scripts(
             &txs,
-            resolved,
+            ResolvedBlockInputs::new(resolved),
             0,
             0,
             VerifyFlags::MANDATORY,
@@ -1755,7 +1938,13 @@ mod tests {
             &kernel_block_for(&txs),
         );
         assert!(
-            matches!(result, Err(ConsensusError::Script { input_index: 0, .. })),
+            matches!(
+                result,
+                Err(BlockCheckFailure::Script(ScriptFailure {
+                    input_index: 0,
+                    ..
+                }))
+            ),
             "expected first Script error, got {result:?}"
         );
     }
@@ -1782,7 +1971,7 @@ mod tests {
         assert_eq!(
             super::verify_block_input_scripts(
                 &txs,
-                resolved,
+                ResolvedBlockInputs::new(resolved),
                 0,
                 0,
                 VerifyFlags::MANDATORY,
@@ -1811,15 +2000,21 @@ mod tests {
         ];
         let bad = super::verify_block_input_scripts(
             &bad_txs,
-            bad_resolved,
+            ResolvedBlockInputs::new(bad_resolved),
             0,
             0,
             VerifyFlags::MANDATORY,
             &mut ScriptStageTimings::default(),
-            &kernel_block_for(&txs),
+            &kernel_block_for(&bad_txs),
         );
         assert!(
-            matches!(bad, Err(ConsensusError::Script { input_index: 0, .. })),
+            matches!(
+                bad,
+                Err(BlockCheckFailure::Script(ScriptFailure {
+                    input_index: 0,
+                    ..
+                }))
+            ),
             "expected producing tx Script error, got {bad:?}"
         );
     }
@@ -1942,23 +2137,22 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn parallel_timing_is_captured_before_ordered_error_scan() {
         use std::cell::Cell;
+        use std::sync::Arc;
 
         let prepared: Vec<super::PreparedTx> = (0..10)
             .map(|tx_index| super::PreparedTx {
                 tx_index,
-                prevouts: Vec::new(),
+                input_count: 0,
                 pre_error: None,
                 post_error: None,
-                checks_start: 0,
-                checks_len: 0,
                 kernel_state: None,
             })
             .collect();
         let txs: &[Transaction] = &[];
         let unit = super::BlockScriptChecks {
             txs,
+            resolved: Arc::new(ResolvedBlockInputs::new(Vec::new())),
             prepared,
-            checks: Vec::new(),
         };
         let scan_started = Cell::new(false);
         let mut before_serial_scan = || scan_started.set(true);

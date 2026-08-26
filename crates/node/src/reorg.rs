@@ -501,6 +501,15 @@ fn is_permanent_invalid(error: &ApplyError) -> bool {
                 | bitcoin_rs_consensus::ConsensusError::Kernel(_)
                 | bitcoin_rs_consensus::ConsensusError::Encoding(_)
         ),
+        ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::Script(_)) => true,
+        ApplyError::BlockCheck(bitcoin_rs_consensus::BlockCheckFailure::NonScript(error)) => {
+            !matches!(
+                error,
+                bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
+                    | bitcoin_rs_consensus::ConsensusError::Kernel(_)
+                    | bitcoin_rs_consensus::ConsensusError::Encoding(_)
+            )
+        }
         _ => false,
     }
 }

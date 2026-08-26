@@ -99,6 +99,9 @@ pub enum ApplyError {
     /// Consensus validation rejected the block.
     #[error("consensus: {0}")]
     Consensus(#[from] bitcoin_rs_consensus::ConsensusError),
+    /// A block check failure retaining transaction and input coordinates.
+    #[error("block check: {0}")]
+    BlockCheck(#[from] bitcoin_rs_consensus::BlockCheckFailure),
     /// Block-tree insertion rejected the header.
     #[error("chain: {0}")]
     Chain(#[from] bitcoin_rs_chain::ChainError),
