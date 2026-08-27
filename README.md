@@ -57,15 +57,12 @@ The project reopens several design choices:
   serialization and inter-process communication overhead and lets node
   functionality be compiled and tested as part of the application.
 
-That independence benefits the broader Bitcoin ecosystem. A separately
-designed codebase cross-checks consensus interpretation and reduces the risk of
-correlated implementation failures.
-
 Bitcoin is not defined by the continued preservation of one codebase. **The code
-can change; consensus is what must remain.** `bitcoin-rs` aims to build a better
-Bitcoin implementation: preserve Bitcoin's consensus exactly, then reconsider
-and measure the architecture, performance, integration, and extensibility
-choices around it.
+can change; consensus is what must remain.** `bitcoin-rs` aims to challenge
+Bitcoin Core and build a better Bitcoin implementation. That challenge
+strengthens the Bitcoin ecosystem: a separately designed codebase cross-checks
+consensus interpretation, increases implementation diversity, and reduces the
+risk of correlated implementation failures.
 
 ## Quick start
 
