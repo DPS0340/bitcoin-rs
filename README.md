@@ -22,9 +22,11 @@ bitcoin-rs asks a simple question:
 > **If a Bitcoin full node were designed again today, what would we keep, and
 > what would we change?**
 
-**Why now?** AI changes the economics of independent implementation: work that
-once demanded a large expert team over years can now be attempted by a much
-smaller team. Bitcoin makes that effort unusually verifiable. Bitcoin Core,
+### Why now?
+
+AI changes the economics of independent implementation: work that once demanded
+a large expert team over years can now be attempted by a much smaller team.
+Bitcoin makes that effort unusually verifiable. Bitcoin Core,
 `libbitcoinkernel`, historical chain data, consensus vectors, fuzzing, and
 differential tests provide independent, reproducible ways to verify correctness
 and detect divergence.
