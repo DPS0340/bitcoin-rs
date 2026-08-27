@@ -968,10 +968,16 @@ impl NodeState {
                 )
             })
             .collect();
+        #[cfg(feature = "zmq")]
         let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_publications.is_empty() {
             Arc::new(crate::NoOpZmqPublisher)
         } else {
             Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
+        };
+        #[cfg(not(feature = "zmq"))]
+        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = {
+            let _ = &zmq_publications;
+            Arc::new(crate::NoOpZmqPublisher)
         };
         let (
             mut utxo_set,

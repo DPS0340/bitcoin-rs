@@ -69,6 +69,6 @@ pub use state::{ApplyError, DisconnectError};
 pub use sync::BlockSync;
 pub use txindex_worker::TxIndexRuntime;
 pub use utxo_view::UtxoSetView;
-pub use zmq_publisher::{
-    NoOpZmqPublisher, SequenceEvent, SocketZmqPublisher, TracingZmqPublisher, ZmqPublisher,
-};
+#[cfg(feature = "zmq")]
+pub use zmq_publisher::SocketZmqPublisher;
+pub use zmq_publisher::{NoOpZmqPublisher, SequenceEvent, TracingZmqPublisher, ZmqPublisher};

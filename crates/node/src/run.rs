@@ -556,16 +556,18 @@ pub fn run(mut config: Config) -> Result<()> {
         "bitcoin-rs node booting"
     );
 
+    crate::metrics::start_metrics(state.config().metrics_bind, state.shutdown())?;
+
+    let shutdown = state.shutdown();
     let shutdown_rx: Receiver<()> = if let Some(rx) = injected_shutdown {
         rx
     } else {
         let (tx, rx) = bounded(1);
         // Forwards process signals into our channel; the JoinHandle outlives `run`.
-        let _signal_thread = crate::signal::install_shutdown_handler(tx)?;
+        let _signal_thread =
+            crate::signal::install_shutdown_handler(std::sync::Arc::clone(&shutdown), tx)?;
         rx
     };
-
-    let shutdown = state.shutdown();
     let banned = state.banned_subnets();
     let block_body_source = state.block_body_source();
     let p2p_chain_query: P2pChainQuery = Arc::new(
