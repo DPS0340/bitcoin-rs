@@ -908,6 +908,7 @@ mod tests {
     };
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_mempool::MempoolEntry;
+    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
     use serde_json::Value;
 
     use super::*;
@@ -939,6 +940,38 @@ mod tests {
                 .collect(),
             output: vec![output],
         }
+    }
+
+    fn transaction_with_funded_input(ctx: &Context) -> Transaction {
+        let script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x11; 20]));
+        let funding = transaction(
+            None,
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: script.clone(),
+            },
+        );
+        let txid = ctx.add_transaction(funding);
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            bitcoin_rs_primitives::OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), 0),
+            TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: script.clone(),
+            },
+            false,
+            1,
+        ));
+        ctx.utxo
+            .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
+            .expect("fund test UTXO");
+        transaction(
+            Some(OutPoint { txid, vout: 0 }),
+            TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: script,
+            },
+        )
     }
 
     struct StaticTxIndex {
@@ -1327,7 +1360,7 @@ mod tests {
             ("/mempool/txids".to_owned(), 200, "application/json"),
             ("/mempool/recent".to_owned(), 200, "application/json"),
             ("/fee-estimates".to_owned(), 200, "application/json"),
-            ("/block-template".to_owned(), 200, "application/json"),
+            ("/block-template".to_owned(), 503, "text/plain"),
             ("/address-prefix/bcrt1".to_owned(), 503, "text/plain"),
         ];
         for (path, expected_status, expected_content_type) in routes {
@@ -1339,7 +1372,8 @@ mod tests {
             );
         }
 
-        let raw = serialize(&transaction).to_lower_hex_string();
+        let broadcast_transaction = transaction_with_funded_input(handler.context().as_ref());
+        let raw = serialize(&broadcast_transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("POST /tx is routed");
         assert_eq!(broadcast.status, 200);
         assert_eq!(broadcast.content_type, "text/plain");
@@ -1616,19 +1650,13 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
-        let transaction = transaction(
-            None,
-            TxOut {
-                value: Amount::from_sat(125),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            },
-        );
+        let ctx = Arc::new(Context::new());
+        let transaction = transaction_with_funded_input(&ctx);
         let txid = transaction.compute_txid();
-        let handler = Handler::new(Arc::new(Context::new()));
+        let handler = Handler::new(ctx);
         let raw = serialize(&transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("broadcast route");
         assert_eq!(broadcast.status, 200);
-
         let response = route(&handler, &format!("/tx/{txid}"), "");
         assert_eq!(response.status, 200);
         let value: Value = serde_json::from_slice(&response.body).expect("transaction json");

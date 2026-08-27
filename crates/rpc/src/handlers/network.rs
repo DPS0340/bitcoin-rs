@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
 
 use core::str::FromStr;
+use core::sync::atomic::Ordering;
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -103,12 +105,21 @@ fn optional_u64(params: &Value, index: usize, default: u64) -> Result<u64, RpcEr
         .ok_or(RpcError::InvalidType("parameter must be unsigned integer"))
 }
 
+/// Maps an IP address to Bitcoin Core's `network` field label.
+fn network_name(ip: IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(_) => "ipv4",
+        IpAddr::V6(_) => "ipv6",
+    }
+}
+
 pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let peers = ctx.peers.read();
     let total = peers.len();
     let inbound = peers.iter().filter(|p| p.inbound).count();
     let outbound = total.saturating_sub(inbound);
+    let network_active = ctx.network_active.load(Ordering::SeqCst);
     Ok(json!({
         "version": 10000,
         "subversion": USER_AGENT,
@@ -117,7 +128,7 @@ pub(crate) fn getnetworkinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         "localservicesnames": services_names_from_flags(LOCAL_SERVICES_FLAGS),
         "localrelay": true,
         "timeoffset": 0,
-        "networkactive": true,
+        "networkactive": network_active,
         "connections": total,
         "connections_in": inbound,
         "connections_out": outbound,
@@ -238,13 +249,22 @@ pub(crate) fn clearbanned(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
     Ok(Value::new_null())
 }
 
-pub(crate) fn setnetworkactive(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+pub(crate) fn setnetworkactive(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let array = params_array(params)?;
     let state = array
         .first()
         .and_then(JsonValueTrait::as_bool)
         .ok_or(RpcError::InvalidParams("state must be a boolean"))?;
-    // No-op until P2P kill-switch is wired; echo back the requested state.
+    ctx.network_active.store(state, Ordering::SeqCst);
+    if !state {
+        // Connection owners remove their own lease and peer metadata after
+        // observing cancellation. Clearing this map here would make that
+        // identity check fail and leave stale peers in the registry.
+        let leases = ctx.peer_outbound.read();
+        for lease in leases.values() {
+            lease.cancel();
+        }
+    }
     Ok(json!(state))
 }
 pub(crate) fn ping(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -277,7 +297,9 @@ pub(crate) fn addnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcEr
                 }
             }
 
-            if let Some(sender) = &ctx.p2p_outbound_sender {
+            if ctx.network_active.load(Ordering::Acquire)
+                && let Some(sender) = &ctx.p2p_outbound_sender
+            {
                 match sender.try_send(addr) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) if persist => {}
@@ -303,11 +325,50 @@ pub(crate) fn addnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcEr
     Ok(Value::new_null())
 }
 
-pub(crate) fn disconnectnode(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+pub(crate) fn disconnectnode(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let array = params_array(params)?;
     let address = required_str(params, 0, "address is required")?;
-    SocketAddr::from_str(address)
+    let addr = SocketAddr::from_str(address)
         .map_err(|_| RpcError::InvalidParams("address must be a valid host:port"))?;
-    // TODO(p2p-outbound): wire to a disconnection sender on Context.
+
+    // Optional nodeid — the index reported by `getpeerinfo`, used to
+    // disambiguate when several peers share one address.
+    let nodeid: Option<usize> = array
+        .get(1)
+        .filter(|v| !v.is_null())
+        .and_then(JsonValueTrait::as_u64)
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+
+    // Verify the peer is currently connected before mutating anything.
+    let found = {
+        let peers = ctx.peers.read();
+        match nodeid {
+            Some(id) => id < peers.len() && peers[id].addr == addr,
+            None => peers.iter().any(|p| p.addr == addr),
+        }
+    };
+    if !found {
+        return Err(RpcError::NotFound("Node not found in connected nodes"));
+    }
+
+    // Cancel and drop the outbound lease, if one exists for this address.
+    // Inbound peers have no lease; they are removed from `peers` below and
+    // the connection layer finalises teardown.
+    let lease = ctx.peer_outbound.write().remove(&addr);
+    if let Some(lease) = lease {
+        lease.cancel();
+    }
+
+    // Remove the matching peer from the live registry.
+    let mut peers = ctx.peers.write();
+    if let Some(id) = nodeid {
+        if id < peers.len() && peers[id].addr == addr {
+            peers.remove(id);
+        }
+    } else {
+        peers.retain(|p| p.addr != addr);
+    }
+
     Ok(Value::new_null())
 }
 
@@ -333,6 +394,58 @@ pub(crate) fn getnettotals(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             "time_left_in_cycle": 0
         }
     }))
+}
+
+/// `getnodeaddresses [count]` — returns known peer addresses.
+///
+/// The address source is the live peer registry plus persisted `addnode add`
+/// entries, deduplicated by socket address.  `count` defaults to 1; `0`
+/// returns every known address.  Each entry follows Core's shape:
+/// `{ time, services, address, port, network }`.
+pub(crate) fn getnodeaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let count = optional_u64(params, 0, 1)?;
+
+    let now = epoch_seconds(SystemTime::now());
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut entries: Vec<sonic_rs::Value> = Vec::new();
+
+    // Live peers carry real service flags and handshake times.
+    for peer in ctx.peers.read().iter() {
+        if !seen.insert(peer.addr) {
+            continue;
+        }
+        entries.push(json!({
+            "time": peer.conn_time,
+            "services": peer.services,
+            "address": peer.addr.ip().to_string(),
+            "port": peer.addr.port(),
+            "network": network_name(peer.addr.ip()),
+        }));
+    }
+
+    // Persisted added nodes have no known services; advertise NODE_NETWORK.
+    for &addr in ctx.added_nodes.read().iter() {
+        if !seen.insert(addr) {
+            continue;
+        }
+        entries.push(json!({
+            "time": now,
+            "services": 1_u64,
+            "address": addr.ip().to_string(),
+            "port": addr.port(),
+            "network": network_name(addr.ip()),
+        }));
+    }
+
+    // Core semantics: count == 0 returns all, otherwise truncate to count.
+    if count > 0 {
+        let max = usize::try_from(count).unwrap_or(usize::MAX);
+        if max < entries.len() {
+            entries.truncate(max);
+        }
+    }
+
+    Ok(json!(entries))
 }
 
 #[cfg(test)]
@@ -489,6 +602,30 @@ mod addnode_validation_tests {
     }
 
     #[test]
+    fn addnode_skips_queueing_while_network_is_inactive() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut ctx = Context::new();
+        ctx.p2p_outbound_sender = Some(tx);
+        ctx.network_active.store(false, Ordering::Release);
+        let ctx = Arc::new(ctx);
+
+        let persisted = SocketAddr::from(([127, 0, 0, 1], 8333));
+        let result = addnode(&ctx, &json!(["127.0.0.1:8333", "add"]));
+        assert!(result.is_ok());
+        assert_eq!(ctx.added_nodes.read().as_slice(), &[persisted]);
+        assert!(rx.try_recv().is_err());
+
+        ctx.network_active.store(true, Ordering::Release);
+        assert!(rx.try_recv().is_err());
+        let result = addnode(&ctx, &json!(["127.0.0.2:8333", "onetry"]));
+        assert!(result.is_ok());
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(SocketAddr::from(([127, 0, 0, 2], 8333)))
+        );
+    }
+
+    #[test]
     fn addnode_add_sends_outbound_request() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut ctx = Context::new();
@@ -570,11 +707,39 @@ mod addnode_validation_tests {
     }
 
     #[test]
-    fn disconnectnode_accepts_well_formed_address() {
+    fn disconnectnode_rejects_unconnected_address() {
         let ctx = Arc::new(Context::new());
-        let result = disconnectnode(&ctx, &json!(["127.0.0.1:8333"]))
+        let result = disconnectnode(&ctx, &json!(["127.0.0.1:8333"]));
+        assert!(matches!(result, Err(RpcError::NotFound(_))));
+    }
+
+    #[test]
+    fn disconnectnode_cancels_lease_and_removes_peer() {
+        use bitcoin_rs_p2p::{PeerInfo, PeerLease};
+        use crossbeam_channel::unbounded;
+
+        let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let ctx = Context::new();
+        ctx.peers.write().push(PeerInfo {
+            addr,
+            version: 70_016,
+            services: 9,
+            user_agent: "test".to_owned(),
+            start_height: 0,
+            conn_time: 0,
+            inbound: false,
+        });
+        let (tx, _rx) = unbounded();
+        let lease = PeerLease::new(tx);
+        ctx.peer_outbound.write().insert(addr, lease.clone());
+        let ctx = Arc::new(ctx);
+
+        let result = disconnectnode(&ctx, &json!([addr.to_string().as_str()]))
             .unwrap_or_else(|err| panic!("disconnectnode failed: {err}"));
         assert!(result.is_null());
+        assert!(lease.is_cancelled());
+        assert!(ctx.peer_outbound.read().is_empty());
+        assert!(ctx.peers.read().is_empty());
     }
 }
 
@@ -606,6 +771,52 @@ mod admin_rpc_tests {
         assert!(arr.is_empty());
     }
 
+    #[test]
+    fn setnetworkactive_stores_and_echoes_state() {
+        let ctx = Arc::new(Context::new());
+        let result = setnetworkactive(&ctx, &json!([false]))
+            .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
+        assert_eq!(result.as_bool(), Some(false));
+        assert!(!ctx.network_active.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn setnetworkactive_false_cancels_all_leases() {
+        use bitcoin_rs_p2p::PeerLease;
+        use crossbeam_channel::unbounded;
+
+        let addr_a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.2:8333".parse().unwrap();
+        let ctx = Context::new();
+        let (tx_a, _rx_a) = unbounded();
+        let (tx_b, _rx_b) = unbounded();
+        let lease_a = PeerLease::new(tx_a);
+        let lease_b = PeerLease::new(tx_b);
+        ctx.peer_outbound.write().insert(addr_a, lease_a.clone());
+        ctx.peer_outbound.write().insert(addr_b, lease_b.clone());
+        let ctx = Arc::new(ctx);
+
+        let _ = setnetworkactive(&ctx, &json!([false]))
+            .unwrap_or_else(|err| panic!("setnetworkactive failed: {err}"));
+        assert!(lease_a.is_cancelled());
+        assert!(lease_b.is_cancelled());
+        assert_eq!(ctx.peer_outbound.read().len(), 2);
+    }
+
+    #[test]
+    fn getnetworkinfo_reports_network_active_state() {
+        let ctx = Arc::new(Context::new());
+        ctx.network_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = getnetworkinfo(&ctx, &json!(null))
+            .unwrap_or_else(|err| panic!("getnetworkinfo failed: {err}"));
+        assert_eq!(
+            result
+                .get("networkactive")
+                .and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+    }
     #[test]
     fn setban_accepts_add_and_remove() {
         let ctx = Arc::new(Context::new());
@@ -808,5 +1019,134 @@ mod ban_state_tests {
             panic!("expected array: {result:?}");
         };
         assert_eq!(arr.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod getnodeaddresses_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use bitcoin_rs_p2p::PeerInfo;
+    use sonic_rs::{JsonContainerTrait, JsonValueTrait};
+
+    fn peer(addr: &str, services: u64) -> PeerInfo {
+        PeerInfo {
+            addr: addr.parse().unwrap(),
+            version: 70_016,
+            services,
+            user_agent: "test".to_owned(),
+            start_height: 0,
+            conn_time: 100,
+            inbound: false,
+        }
+    }
+
+    #[test]
+    fn empty_context_returns_empty_array() {
+        let ctx = Arc::new(Context::new());
+        let result = getnodeaddresses(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn returns_live_peer_addresses() {
+        let ctx = Context::new();
+        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        let ctx = Arc::new(ctx);
+        let result = getnodeaddresses(&ctx, &json!([0]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert_eq!(arr.len(), 1);
+        let entry = &arr[0];
+        assert_eq!(
+            entry.get("address").and_then(JsonValueTrait::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            entry.get("port").and_then(JsonValueTrait::as_u64),
+            Some(8333)
+        );
+        assert_eq!(
+            entry.get("services").and_then(JsonValueTrait::as_u64),
+            Some(9)
+        );
+        assert_eq!(
+            entry.get("network").and_then(JsonValueTrait::as_str),
+            Some("ipv4")
+        );
+    }
+
+    #[test]
+    fn deduplicates_peer_and_added_node() {
+        let ctx = Context::new();
+        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        ctx.added_nodes
+            .write()
+            .push("127.0.0.1:8333".parse().unwrap());
+        let ctx = Arc::new(ctx);
+        let result = getnodeaddresses(&ctx, &json!([0]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn count_limits_results() {
+        let ctx = Context::new();
+        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        ctx.peers.write().push(peer("127.0.0.2:8333", 9));
+        ctx.peers.write().push(peer("127.0.0.3:8333", 9));
+        let ctx = Arc::new(ctx);
+        let result = getnodeaddresses(&ctx, &json!([2]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn default_count_returns_one() {
+        let ctx = Context::new();
+        ctx.peers.write().push(peer("127.0.0.1:8333", 9));
+        ctx.peers.write().push(peer("127.0.0.2:8333", 9));
+        let ctx = Arc::new(ctx);
+        let result = getnodeaddresses(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert_eq!(arr.len(), 1);
+    }
+
+    #[test]
+    fn added_nodes_appear_when_no_live_peer() {
+        let ctx = Context::new();
+        ctx.added_nodes
+            .write()
+            .push("10.0.0.1:8333".parse().unwrap());
+        let ctx = Arc::new(ctx);
+        let result = getnodeaddresses(&ctx, &json!([0]))
+            .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("address").and_then(JsonValueTrait::as_str),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            arr[0].get("services").and_then(JsonValueTrait::as_u64),
+            Some(1)
+        );
     }
 }

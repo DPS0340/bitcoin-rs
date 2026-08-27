@@ -28,9 +28,11 @@ fn outbound_ban_short_circuits_before_connect_with_typed_error() -> Result<(), B
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
     let banned = Arc::new(RwLock::new(vec![ban(IpSubnet::from_ip(addr.ip()))]));
+    let network_active = Arc::new(AtomicBool::new(true));
 
     let handle = spawn_outbound_connection(
         addr,
+        network_active,
         Magic::BITCOIN,
         registry,
         outbound,
@@ -70,7 +72,9 @@ fn inbound_ban_drops_connection_pre_handshake() -> Result<(), Box<dyn Error>> {
     drop(helper);
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let network_active = Arc::new(AtomicBool::new(true));
     let listener_shutdown = Arc::clone(&shutdown);
+    let listener_network_active = Arc::clone(&network_active);
     let registry = Arc::new(RwLock::new(Vec::new()));
     let listener_registry = Arc::clone(&registry);
     let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
@@ -87,6 +91,7 @@ fn inbound_ban_drops_connection_pre_handshake() -> Result<(), Box<dyn Error>> {
         serve_with_shutdown(
             addr,
             listener_shutdown,
+            listener_network_active,
             Magic::BITCOIN,
             listener_registry,
             listener_outbound,
@@ -111,6 +116,108 @@ fn inbound_ban_drops_connection_pre_handshake() -> Result<(), Box<dyn Error>> {
     shutdown.store(true, Ordering::Relaxed);
     join_listener(handle)?;
 
+    Ok(())
+}
+
+#[test]
+fn network_inactive_drops_inbound_pre_handshake() -> Result<(), Box<dyn Error>> {
+    let helper = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let addr = helper.local_addr()?;
+    drop(helper);
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let network_active = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(RwLock::new(Vec::new()));
+    let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+    let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
+    let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let banned = Arc::new(RwLock::new(Vec::new()));
+
+    let listener_shutdown = Arc::clone(&shutdown);
+    let listener_network_active = Arc::clone(&network_active);
+    let listener_registry = Arc::clone(&registry);
+    let listener_outbound = Arc::clone(&outbound);
+    let handle = thread::spawn(move || {
+        serve_with_shutdown(
+            addr,
+            listener_shutdown,
+            listener_network_active,
+            Magic::BITCOIN,
+            listener_registry,
+            listener_outbound,
+            headers_tx,
+            blocks_tx,
+            banned,
+        )
+    });
+
+    let mut client = connect_with_retry(addr, Duration::from_secs(1))?;
+    wait_for_disconnect(&mut client, Duration::from_secs(1))?;
+    assert!(registry.read().is_empty());
+
+    shutdown.store(true, Ordering::Relaxed);
+    join_listener(handle)?;
+    Ok(())
+}
+
+#[test]
+fn network_active_blocks_outbound_until_reenabled() -> Result<(), Box<dyn Error>> {
+    let helper = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    helper.set_nonblocking(true)?;
+    let addr = helper.local_addr()?;
+    let accept_helper = helper.try_clone()?;
+    let accept_shutdown = Arc::new(AtomicBool::new(false));
+    let accept_handle = thread::spawn({
+        let accept_shutdown = Arc::clone(&accept_shutdown);
+        move || accept_one_connection(&accept_helper, &accept_shutdown)
+    });
+
+    let network_active = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(RwLock::new(Vec::new()));
+    let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
+    let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
+    let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let banned = Arc::new(RwLock::new(Vec::new()));
+
+    let inactive = spawn_outbound_connection(
+        addr,
+        Arc::clone(&network_active),
+        Magic::BITCOIN,
+        Arc::clone(&registry),
+        Arc::clone(&outbound),
+        headers_tx.clone(),
+        blocks_tx.clone(),
+        Arc::clone(&banned),
+    );
+    let inactive = inactive
+        .join()
+        .map_err(|_| io::Error::other("inactive outbound thread panicked"))?;
+    assert!(
+        inactive.is_ok(),
+        "inactive outbound attempt must exit before TCP connect"
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !accept_handle.is_finished(),
+        "inactive outbound attempt opened a TCP connection"
+    );
+
+    network_active.store(true, Ordering::Release);
+    let active = spawn_outbound_connection(
+        addr,
+        network_active,
+        Magic::BITCOIN,
+        registry,
+        outbound,
+        headers_tx,
+        blocks_tx,
+        banned,
+    );
+    assert!(join_accept(accept_handle)?);
+    let _ = active
+        .join()
+        .map_err(|_| io::Error::other("active outbound thread panicked"))?;
+    accept_shutdown.store(true, Ordering::Relaxed);
     Ok(())
 }
 
