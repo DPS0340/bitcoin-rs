@@ -46,11 +46,10 @@ The project reopens several non-consensus design choices:
   wallets and other applications can build balances and spendable-output views
   without reconstructing coin state from the chain. Transaction history and
   other application views remain derived from that shared foundation.
-- **Core and extensions have separate failure boundaries.** Extensions may
-  consume node state and add capabilities, but they should have their own state,
-  lifecycle, and failure boundaries. Validation and chainstate must remain
-  correct and operable without them: extensions depend on the core; the core
-  does not depend on extensions.
+- **Modularity keeps the core isolated and components composable.**
+  Clear boundaries contain failures and allow components to be reused
+  independently. Third-party integrations can build on the node without
+  becoming dependencies of the core.
 - **Rust-native integration is a primary path.** The full node should be a
   native part of the Rust Bitcoin ecosystem, available through typed,
   in-process interfaces rather than only serialized RPC. This avoids
