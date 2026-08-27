@@ -418,3 +418,59 @@ buys 12 points of the 16 GiB tip-RSS budget. **If G14 tip RSS measures well
 under budget — say below 10 GiB — this complexity is not earning its keep and
 reverting is the right call.** v4 remains in the tree as the equivalence oracle
 and the benchmark's `before` arm, so a revert is a revert, not a rewrite.
+
+## §10 — Mempool cluster limits, and what the typed v31 contract forces
+
+`getmempoolinfo` serializes `corepc_types::v31::GetMempoolInfo`, which is the
+Bitcoin Core v31 response contract. Two of its fields describe policy this node
+had to grow, and one describes a field Core does not emit by default.
+
+### `limitclustercount` / `limitclustersize` report enforced policy
+
+Core 31 replaced ancestor and descendant limits with **cluster** limits. Its
+`init.cpp` describes `-limitancestorcount` and `-limitdescendantcount` as
+*"Deprecated setting ... replaced by cluster limits (see -limitclustercount) and
+only used by wallet for coin selection"*. A cluster is a connected component of
+the mempool spend graph: two children of one parent share a cluster although
+neither is an ancestor of the other.
+
+bitcoin-rs now enforces both, at admission, with Core's defaults —
+`cluster_count` 64 (`DEFAULT_CLUSTER_LIMIT`) and `cluster_size_vbytes` 101,000
+(`DEFAULT_CLUSTER_SIZE_LIMIT_KVB` x 1000). `getmempoolinfo` reads them from the
+pool, so changing a limit changes what is reported.
+
+**These are not the ancestor caps renamed.** The ancestor and descendant limits
+remain enforced as well; Core deprecated them, this node did not, and removing
+them is a policy decision that belongs with the wider mempool-compatibility work
+rather than with a wire-format change. Note also that `max_ancestor_size` is
+`101_000`, the same number as the cluster size limit. That is a coincidence of
+value, not of meaning, and it is why mapping one onto the other looks plausible.
+
+### `optimal` is always false
+
+Core computes it as `m_txgraph->DoWork(0)` — a quick check for a known-optimal
+linearization. This pool orders by fee rate, which is a heuristic, so it never
+claims the bit.
+
+### `fullrbf` is emitted where Core omits it
+
+Core 31 emits `fullrbf` only under `-deprecatedrpc=fullrbf`
+(`rpc/mempool.cpp`). `corepc_types::v31::GetMempoolInfo::full_rbf` is a
+non-optional `bool`, so serializing that struct emits the field unconditionally.
+
+bitcoin-rs therefore returns `fullrbf: true` on every `getmempoolinfo`. **A
+client using the field's presence to detect Core's deprecated-RPC setting will
+read this node wrong.** The value itself is accurate — full-RBF is this node's
+only replacement policy, and acceptance never inspects BIP125 signalling.
+
+This is the general shape of the cost in adopting a typed v31 model: the struct
+decides which fields exist, so a field Core gates behind a runtime flag becomes
+one this node cannot omit without abandoning the type. The compatibility test
+cannot see it either — it deserializes the response back into the same struct,
+so an extra field that the struct declares is exactly what it expects.
+
+### `getpeerinfo.startingheight` is absent
+
+Core 31 does not emit it; the name does not appear anywhere in its source.
+`corepc` keeps the field `Option` for older versions, so this node sends `None`
+and the key is omitted.

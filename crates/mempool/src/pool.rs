@@ -193,6 +193,7 @@ impl Mempool {
         let ancestors = self.ancestor_ids_for_tx(&entry.tx);
         self.check_ancestor_limits(&ancestors, &entry)?;
         self.check_descendant_limits(&ancestors)?;
+        self.check_cluster_limits(&entry)?;
 
         let ancestor_size = ancestors.iter().fold(u64::from(entry.vsize), |total, id| {
             total.saturating_add(
@@ -863,6 +864,111 @@ impl Mempool {
         Ok(())
     }
 
+    /// Returns every entry reachable from `seeds` through spend edges in
+    /// either direction: the union of the connected components they sit in.
+    ///
+    /// This is Bitcoin Core's cluster, and it is deliberately not
+    /// [`Self::metadata_closure`]. That one is ancestors, self, and
+    /// descendants -- a chain through one transaction. A cluster is a
+    /// connected component, so two children of one parent belong to it even
+    /// though neither is an ancestor or a descendant of the other, and a walk
+    /// that only follows the chain silently under-counts every fan-out.
+    ///
+    /// The frontier alternates directions rather than expanding one and then
+    /// the other, because reaching a sibling needs an up-edge followed by a
+    /// down-edge, and reaching a cousin needs that twice.
+    fn cluster_ids_seeded_by(&self, seeds: &[EntryId]) -> Vec<EntryId> {
+        let mut seen: Vec<EntryId> = Vec::new();
+        let mut frontier: Vec<EntryId> = Vec::new();
+        for seed in seeds {
+            if !seen.contains(seed) {
+                seen.push(*seed);
+                frontier.push(*seed);
+            }
+        }
+        while let Some(id) = frontier.pop() {
+            let parents = self.entry(id).map_or_else(Vec::new, |entry| {
+                entry
+                    .tx
+                    .input
+                    .iter()
+                    .filter_map(|input| self.by_txid.get(&input.previous_output.txid).copied())
+                    .collect::<Vec<_>>()
+            });
+            for neighbour in parents.into_iter().chain(self.child_ids(id)) {
+                if !seen.contains(&neighbour) {
+                    seen.push(neighbour);
+                    frontier.push(neighbour);
+                }
+            }
+        }
+        seen.sort_unstable();
+        seen
+    }
+
+    /// Refuses a transaction that would join a cluster over either limit.
+    ///
+    /// The candidate is not in the pool yet, so its cluster is seeded from
+    /// both directions: the in-pool parents it spends, and any in-pool
+    /// transaction that already spends *its* outputs. The second half is not
+    /// hypothetical -- `insert_entry` documents that a transaction can arrive
+    /// after something spending it, through orphan promotion or out-of-order
+    /// relay -- and a seed set of parents alone would miss the descendants
+    /// this transaction is about to connect.
+    fn check_cluster_limits(&self, entry: &MempoolEntry) -> Result<(), PolicyError> {
+        let mut seeds = entry
+            .tx
+            .input
+            .iter()
+            .filter_map(|input| self.by_txid.get(&input.previous_output.txid).copied())
+            .collect::<Vec<_>>();
+        seeds.extend(self.existing_spenders_of(entry.txid, entry.tx.output.len()));
+        if seeds.is_empty() {
+            // A cluster of one. Still checked, so a single oversized
+            // transaction cannot pass a limit its cluster would fail.
+            return cluster_within_limits(1, u64::from(entry.vsize), &self.limits);
+        }
+        let cluster = self.cluster_ids_seeded_by(&seeds);
+        let count = u32::try_from(cluster.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let vsize = cluster.iter().fold(u64::from(entry.vsize), |total, id| {
+            total.saturating_add(self.entry(*id).map_or(0, |member| u64::from(member.vsize)))
+        });
+        cluster_within_limits(count, vsize, &self.limits)
+    }
+
+    /// In-pool entries already spending an output of `txid`.
+    ///
+    /// Keyed by txid rather than [`EntryId`] because the caller's transaction
+    /// has no entry id yet.
+    fn existing_spenders_of(&self, txid: Txid, output_count: usize) -> Vec<EntryId> {
+        let mut spenders = Vec::new();
+        for vout in 0..output_count {
+            let Ok(vout) = u32::try_from(vout) else {
+                continue;
+            };
+            for (_, spender) in self
+                .spending
+                .range(outpoint_range(OutPoint::new(txid, vout)))
+            {
+                if !spenders.contains(spender) {
+                    spenders.push(*spender);
+                }
+            }
+        }
+        spenders
+    }
+
+    /// The cluster limits this pool enforces at admission.
+    ///
+    /// Read by `getmempoolinfo`, which reports enforced policy rather than a
+    /// constant: change a limit and the reported number changes with it.
+    #[must_use]
+    pub const fn cluster_limits(&self) -> (u32, u64) {
+        (self.limits.cluster_count, self.limits.cluster_size_vbytes)
+    }
+
     fn ancestor_ids_for_tx(&self, tx: &Transaction) -> Vec<EntryId> {
         let mut ancestors = Vec::new();
         let mut stack = tx
@@ -997,6 +1103,24 @@ fn apply_fee_delta(fee: u64, delta: i64) -> u64 {
     } else {
         fee.saturating_sub(delta.unsigned_abs())
     }
+}
+
+/// Applies both cluster limits to a candidate cluster's count and vsize.
+///
+/// Separate from the walk so the limits are checked in one place whether or
+/// not the candidate has any in-pool neighbours.
+const fn cluster_within_limits(
+    count: u32,
+    vsize: u64,
+    limits: &MempoolLimits,
+) -> Result<(), PolicyError> {
+    if count > limits.cluster_count {
+        return Err(PolicyError::ClusterCountLimit);
+    }
+    if vsize > limits.cluster_size_vbytes {
+        return Err(PolicyError::ClusterSizeLimit);
+    }
+    Ok(())
 }
 
 const fn outpoint_range(outpoint: OutPoint) -> RangeInclusive<(OutPoint, EntryId)> {
@@ -2339,6 +2463,244 @@ mod spend_index_tests {
             };
         }
         (pool, root_txid)
+    }
+
+    /// A cluster is a connected component, not an ancestor package.
+    ///
+    /// `child_a` and `child_b` both spend the root and neither is an ancestor
+    /// or a descendant of the other, so a walk that follows only the chain
+    /// through one transaction reports a smaller cluster than exists. That is
+    /// the whole difference between `cluster_ids_seeded_by` and
+    /// `metadata_closure`, and it is asserted against `metadata_closure`
+    /// directly so that reusing the wrong one fails here.
+    #[test]
+    fn a_cluster_holds_siblings_that_no_ancestor_walk_reaches() {
+        let (pool, root_txid) = graph_pool();
+        let child_a_txid = child_a_txid_of(&pool, root_txid);
+        let Some(child_a_id) = pool.entry_id_by_txid(&child_a_txid) else {
+            panic!("fixture child_a is missing");
+        };
+
+        let cluster = pool.cluster_ids_seeded_by(&[child_a_id]);
+        let chain = pool.metadata_closure(&[child_a_id]);
+
+        assert_eq!(
+            cluster.len(),
+            pool.len(),
+            "the cluster must span the whole connected component"
+        );
+        assert!(
+            chain.len() < cluster.len(),
+            "this fixture must distinguish the two walks or it proves nothing: chain={} cluster={}",
+            chain.len(),
+            cluster.len()
+        );
+    }
+
+    /// Resolves `child_a` by structure rather than by a hard-coded txid: it is
+    /// the root's child that itself has a child.
+    fn child_a_txid_of(pool: &Mempool, root_txid: Txid) -> Txid {
+        let Some(root_id) = pool.entry_id_by_txid(&root_txid) else {
+            panic!("fixture root is missing");
+        };
+        for child in pool.child_ids(root_id) {
+            if !pool.child_ids(child).is_empty()
+                && let Some(entry) = pool.entry(child)
+            {
+                return entry.txid;
+            }
+        }
+        panic!("fixture has no grandchild-bearing child");
+    }
+
+    /// Admission refuses a transaction that would take the cluster over the
+    /// count limit, and admits the same one when the limit allows it.
+    #[test]
+    fn admission_refuses_a_transaction_over_the_cluster_count_limit() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0);
+        let root = tx_with(&[confirmed], 4, 1);
+        let root_txid = root.compute_txid();
+
+        let build = |limit: u32| {
+            let limits = MempoolLimits {
+                cluster_count: limit,
+                ..MempoolLimits::default()
+            };
+            let mut pool = Mempool::new(limits);
+            let root_entry = MempoolEntry::new(Arc::new(root.clone()), 100, 10_000, 1, 7);
+            let Ok(_id) = pool.insert_entry(root_entry) else {
+                panic!("root must be admitted");
+            };
+            // Two siblings spending distinct root outputs: neither is an
+            // ancestor of the other, so only a cluster walk counts them
+            // together.
+            let mut outcomes = Vec::new();
+            for vout in 0..2_u32 {
+                let child = tx_with(
+                    &[OutPoint::new(root_txid, vout)],
+                    1,
+                    u64::from(vout).saturating_add(2),
+                );
+                let entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7);
+                outcomes.push(pool.insert_entry(entry));
+            }
+            outcomes
+        };
+
+        // Root plus two siblings is three: a limit of two must refuse the
+        // second sibling, and a limit of three must take it.
+        let refused = build(2);
+        assert!(refused[0].is_ok(), "the first sibling fits: {refused:?}");
+        assert!(
+            matches!(
+                refused[1],
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "the second sibling must be refused on cluster count: {refused:?}"
+        );
+
+        let accepted = build(3);
+        assert!(
+            accepted.iter().all(Result::is_ok),
+            "a limit of three admits the whole cluster: {accepted:?}"
+        );
+    }
+
+    /// Admission counts the candidate's cousins, not just its own chain.
+    ///
+    /// ```text
+    ///   A ──vout 0──> B ──vout 0──> D (candidate)
+    ///     ──vout 1──> C
+    /// ```
+    ///
+    /// Seeding from D's only parent B and walking ancestors-and-descendants
+    /// reaches `{A, B}` and stops: C is a sibling of B, so no chain through B
+    /// contains it. The real cluster is `{A, B, C}`, so D is the fourth
+    /// member and a limit of three must refuse it.
+    ///
+    /// This is the case that makes the walk load-bearing at the admission
+    /// site. A fixture where every transaction hangs directly off one root
+    /// cannot separate the two walks -- there the chain through the root
+    /// happens to be the whole component -- and swapping
+    /// `cluster_ids_seeded_by` for `metadata_closure` passes it.
+    #[test]
+    fn admission_counts_a_cousin_that_no_chain_through_the_parent_reaches() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([17_u8; 32]), 0);
+        let a = tx_with(&[confirmed], 2, 1);
+        let a_txid = a.compute_txid();
+        let b = tx_with(&[OutPoint::new(a_txid, 0)], 1, 2);
+        let b_txid = b.compute_txid();
+        let c = tx_with(&[OutPoint::new(a_txid, 1)], 1, 3);
+        let d = tx_with(&[OutPoint::new(b_txid, 0)], 1, 4);
+
+        let limits = MempoolLimits {
+            cluster_count: 3,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+        for tx in [a, b, c] {
+            let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+            else {
+                panic!("the three-member cluster must be admitted under a limit of three");
+            };
+        }
+
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(d), 100, 10_000, 1, 7));
+        assert!(
+            matches!(
+                outcome,
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "C is in D's cluster although no chain through B reaches it: {outcome:?}"
+        );
+    }
+
+    /// The size limit is enforced independently of the count limit.
+    #[test]
+    fn admission_refuses_a_transaction_over_the_cluster_size_limit() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([11_u8; 32]), 0);
+        let root = tx_with(&[confirmed], 2, 1);
+        let root_txid = root.compute_txid();
+
+        let limits = MempoolLimits {
+            // High enough that the count limit cannot be what refuses.
+            cluster_count: 100,
+            cluster_size_vbytes: 250,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(root), 200, 10_000, 1, 7))
+        else {
+            panic!("root must be admitted");
+        };
+        let child = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7));
+        assert!(
+            matches!(
+                outcome,
+                Err(MempoolError::Policy(PolicyError::ClusterSizeLimit))
+            ),
+            "200 + 100 vbytes exceeds a 250-vbyte cluster: {outcome:?}"
+        );
+    }
+
+    /// A transaction already spending the candidate's outputs joins its
+    /// cluster, so the candidate cannot be admitted by looking only upstream.
+    ///
+    /// Reachable in production: `insert_entry` documents that a transaction
+    /// can arrive after something that spends it, through orphan promotion or
+    /// out-of-order relay.
+    #[test]
+    fn a_cluster_includes_transactions_that_already_spend_the_candidate() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([13_u8; 32]), 0);
+        let parent = tx_with(&[confirmed], 1, 1);
+        let parent_txid = parent.compute_txid();
+        let child = tx_with(&[OutPoint::new(parent_txid, 0)], 1, 2);
+
+        let limits = MempoolLimits {
+            cluster_count: 1,
+            ..MempoolLimits::default()
+        };
+        let mut pool = Mempool::new(limits);
+
+        // The child lands first; nothing in the pool is its parent yet.
+        let Ok(_id) = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7))
+        else {
+            panic!("the child must be admitted into an empty pool");
+        };
+        // Now its parent arrives. Seeding the walk from parents alone would
+        // find nothing and admit it into a cluster of two.
+        let outcome = pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7));
+        assert!(
+            matches!(
+                outcome,
+                Err(MempoolError::Policy(PolicyError::ClusterCountLimit))
+            ),
+            "the pre-existing spender must count toward the cluster: {outcome:?}"
+        );
+    }
+
+    /// The defaults are Bitcoin Core's, and the reader follows configuration
+    /// so `getmempoolinfo` cannot report a constant.
+    #[test]
+    fn cluster_limits_default_to_cores_values_and_follow_configuration() {
+        let pool = Mempool::new(MempoolLimits::default());
+        // Core `policy.h`: DEFAULT_CLUSTER_LIMIT{64} and
+        // DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101}, the latter in kvB.
+        assert_eq!(pool.cluster_limits(), (64, 101_000));
+
+        let limits = MempoolLimits {
+            cluster_count: 7,
+            cluster_size_vbytes: 4_242,
+            ..MempoolLimits::default()
+        };
+        let configured = Mempool::new(limits);
+        assert_eq!(
+            configured.cluster_limits(),
+            (7, 4_242),
+            "the reader must follow configuration, or the RPC reports a constant"
+        );
     }
 
     #[test]

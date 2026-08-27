@@ -34,6 +34,7 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
     let min_relay_fee = sat_per_kvb_to_btc(live_min_relay_sat_per_kvb);
     let incremental_relay_fee = sat_per_kvb_to_btc(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
+    let (cluster_count, cluster_size_vbytes) = pool.cluster_limits();
     // `mempoolminfee` rises above `minrelaytxfee` when the pool approaches its
     // `maxmempool` byte limit. Bitcoin Core uses the eviction-floor heuristic:
     // once the pool exceeds 50% of `maxmempool`, new txs must pay strictly
@@ -70,11 +71,17 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         // standard, matching Core's `-permitbaremultisig` default.
         permit_bare_multisig: true,
         max_data_carrier_size: DEFAULT_MAX_DATA_CARRIER_SIZE,
-        // No cluster-mempool accounting exists here. The package limits this
-        // node actually enforces at admission are the ancestor caps, so those
-        // are what the v31 cluster-limit fields report.
-        limit_cluster_count: i64::from(pool.limits.max_ancestors),
-        limit_cluster_size: u64_to_i64(pool.limits.max_ancestor_size),
+        // The limits admission actually enforces, read from the pool rather
+        // than restated here, so changing a limit changes what is reported.
+        //
+        // These are not the ancestor caps. Core 31 deprecated
+        // `-limitancestorcount`/`-limitdescendantcount` and replaced them with
+        // cluster limits, keeping the old pair only for wallet coin selection,
+        // so the two describe different policies -- and `max_ancestor_size`
+        // happening to equal `101_000` as well is a coincidence of value, not
+        // of meaning.
+        limit_cluster_count: i64::from(cluster_count),
+        limit_cluster_size: u64_to_i64(cluster_size_vbytes),
         // Fee-rate priority ordering is a heuristic, not a proven-optimal
         // linearization, so the pool never claims Core's `optimal` bit.
         optimal: false,
@@ -330,6 +337,75 @@ mod tests {
         assert!(
             (min_relay - 0.00001).abs() < 1e-9,
             "expected ~0.00001, got {min_relay}"
+        );
+    }
+
+    /// `limitclustercount` / `limitclustersize` are read from the pool, not
+    /// restated in the handler.
+    ///
+    /// Asserted by changing the configured limits and requiring the response
+    /// to follow. Checking only the defaults would pass just as well against
+    /// two constants written into this file, which is the failure this guards:
+    /// the fields must describe policy the pool enforces, and a handler that
+    /// reports numbers of its own describes nothing.
+    #[test]
+    fn getmempoolinfo_cluster_limits_follow_the_pool_rather_than_a_constant() {
+        let ctx = Arc::new(Context::new());
+        {
+            let mut pool = ctx.mempool.write();
+            *pool = bitcoin_rs_mempool::Mempool::new(bitcoin_rs_mempool::MempoolLimits {
+                cluster_count: 7,
+                cluster_size_vbytes: 4_242,
+                ..bitcoin_rs_mempool::MempoolLimits::default()
+            });
+        }
+
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let result = handler
+            .dispatch("getmempoolinfo", &json!([]))
+            .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
+
+        assert_eq!(
+            result
+                .get("limitclustercount")
+                .and_then(JsonValueTrait::as_i64),
+            Some(7),
+            "limitclustercount must follow the pool: {result:?}"
+        );
+        assert_eq!(
+            result
+                .get("limitclustersize")
+                .and_then(JsonValueTrait::as_i64),
+            Some(4_242),
+            "limitclustersize must follow the pool: {result:?}"
+        );
+    }
+
+    /// The defaults a fresh pool reports are Bitcoin Core's, so a client
+    /// reading them against Core sees the same numbers.
+    #[test]
+    fn getmempoolinfo_defaults_to_cores_cluster_limits() {
+        let ctx = Arc::new(Context::new());
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let result = handler
+            .dispatch("getmempoolinfo", &json!([]))
+            .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
+
+        // Core `policy.h`: DEFAULT_CLUSTER_LIMIT{64},
+        // DEFAULT_CLUSTER_SIZE_LIMIT_KVB{101} expressed in vbytes.
+        assert_eq!(
+            result
+                .get("limitclustercount")
+                .and_then(JsonValueTrait::as_i64),
+            Some(64),
+            "{result:?}"
+        );
+        assert_eq!(
+            result
+                .get("limitclustersize")
+                .and_then(JsonValueTrait::as_i64),
+            Some(101_000),
+            "{result:?}"
         );
     }
 
