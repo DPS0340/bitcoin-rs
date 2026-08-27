@@ -10,18 +10,58 @@ Bitcoin Core uses.
 
 ## Why bitcoin-rs
 
-Script verification runs through libbitcoinkernel, the same library Bitcoin
-Core uses, so the hardest part of consensus is not reimplemented here. The
-block-level rules around it (BIP30, BIP34, weight and coinbase checks, and the
-rest) are this project's own code, and are covered by its own tests.
+Bitcoin Core is the most successful implementation of Bitcoin. Its
+conservatism, stability, and compatibility discipline are major reasons for
+that success. Over time, however, those safeguards also shape which changes are
+practical: existing boundaries accumulate dependencies, and implementation
+choices harden into assumptions that Bitcoin consensus does not require.
 
-Four storage backends are selectable at runtime: fjall, RocksDB, MDBX, and
-redb. An equivalence test replays the same chain through all four and requires
-an identical aggregate hash.
+bitcoin-rs asks a simple question:
 
-There is no in-tree wallet and the node never handles a private key. The RPC
-surface keeps the key-free PSBT utilities and descriptor helpers for
-external-signer workflows.
+> **If a Bitcoin full node were designed again today, what would we keep, and
+> what would we change?**
+
+It is an independent implementation of the same Bitcoin, not a new protocol or
+a different set of consensus rules.
+
+**Why now?** AI makes a serious independent implementation practical for a much
+smaller team, but AI is not the source of truth. Bitcoin Core,
+`libbitcoinkernel`, historical chain data, consensus vectors, fuzzing, and
+differential tests provide independent, reproducible oracles for detecting
+divergence.
+
+That independence benefits the broader Bitcoin ecosystem. A separately
+designed codebase cross-checks consensus interpretation, reduces the risk of
+correlated implementation failures, and helps keep Bitcoin defined by its
+consensus rather than by the behavior or structure of any single implementation.
+
+The project reopens several non-consensus design choices:
+
+- **Performance is a first-class requirement.** Synchronization, storage,
+  memory ownership, concurrency, caching, and indexing can all be reconsidered.
+  Improvements must be demonstrated with matched whole-node benchmarks against
+  Core.
+- **The UTXO set is authoritative coin state.** It is the canonical spendable
+  state maintained by validation. bitcoin-rs exposes it through node APIs so
+  wallets and other applications can build balances and spendable-output views
+  without reconstructing coin state from the chain. Transaction history and
+  other application views remain derived from that shared foundation.
+- **Core and extensions have separate failure boundaries.** Extensions may
+  consume node state and add capabilities, but they should have their own state,
+  lifecycle, and failure boundaries. Validation and chainstate must remain
+  correct and operable without them: extensions depend on the core; the core
+  does not depend on extensions.
+- **Rust-native integration is a primary path.** The full node should be a
+  native part of the Rust Bitcoin ecosystem, available through typed,
+  in-process interfaces rather than only serialized RPC. This avoids
+  serialization and inter-process communication overhead and lets node
+  functionality be compiled and tested as part of the application.
+
+Bitcoin is not defined by the continued preservation of one codebase. **The code
+can change; consensus is what must remain.** `bitcoin-rs` aims to build a better
+Bitcoin implementation: preserve Bitcoin's consensus exactly, then reconsider
+and measure the architecture, performance, integration, and extensibility
+choices around it.
 
 ## Quick start
 
