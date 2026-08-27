@@ -32,16 +32,11 @@ smaller team. Bitcoin makes that effort unusually verifiable. Bitcoin Core,
 differential tests provide independent, reproducible ways to verify correctness
 and detect divergence.
 
-That independence benefits the broader Bitcoin ecosystem. A separately
-designed codebase cross-checks consensus interpretation, reduces the risk of
-correlated implementation failures, and helps keep Bitcoin defined by its
-consensus rather than by the behavior or structure of any single implementation.
-
 **bitcoin-rs can pursue changes that are no longer practical inside Bitcoin
 Core.** It can prototype, measure, and discard bold architectural experiments
 without preserving decades of internal implementation constraints.
 
-The project reopens several non-consensus design choices:
+The project reopens several design choices:
 
 - **Performance is a first-class requirement.** Synchronization, storage,
   memory ownership, concurrency, caching, and indexing can all be reconsidered.
@@ -61,6 +56,10 @@ The project reopens several non-consensus design choices:
   in-process interfaces rather than only serialized RPC. This avoids
   serialization and inter-process communication overhead and lets node
   functionality be compiled and tested as part of the application.
+
+That independence benefits the broader Bitcoin ecosystem. A separately
+designed codebase cross-checks consensus interpretation and reduces the risk of
+correlated implementation failures.
 
 Bitcoin is not defined by the continued preservation of one codebase. **The code
 can change; consensus is what must remain.** `bitcoin-rs` aims to build a better
