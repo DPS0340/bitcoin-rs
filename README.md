@@ -36,26 +36,29 @@ and detect divergence.
 Core.** It can prototype, measure, and discard bold architectural experiments
 without preserving decades of internal implementation constraints.
 
-The project reopens several design choices:
+### What can be improved
 
-- **Performance is a first-class requirement.** Synchronization, storage,
-  memory ownership, concurrency, caching, and indexing can all be reconsidered.
-  Improvements must be demonstrated with matched whole-node benchmarks against
-  Core.
-- **The UTXO set is authoritative coin state.** It is the canonical spendable
-  state maintained by validation. bitcoin-rs exposes it through node APIs so
-  wallets and other applications can build balances and spendable-output views
-  without reconstructing coin state from the chain. Transaction history and
-  other application views remain derived from that shared foundation.
-- **Modularity keeps the core isolated and components composable.**
-  Clear boundaries contain failures and allow components to be reused
-  independently. Third-party integrations can build on the node without
-  becoming dependencies of the core.
-- **Rust-native integration is a primary path.** The full node should be a
-  native part of the Rust Bitcoin ecosystem, available through typed,
-  in-process interfaces rather than only serialized RPC. This avoids
-  serialization and inter-process communication overhead and lets node
-  functionality be compiled and tested as part of the application.
+- **Performance is a first-class requirement.** `bitcoin-rs` is not aiming for
+  parity with Bitcoin Core simply by changing languages. Synchronization,
+  storage, memory ownership, concurrency, caching, I/O, and indexing can all be
+  reconsidered. Improvements must be demonstrated with matched whole-node
+  benchmarks against Core.
+- **The UTXO set is authoritative coin state.** `bitcoin-rs` exposes the state
+  already maintained for validation through node APIs, so wallets and other
+  applications can build on canonical node state instead of reconstructing
+  overlapping views from chain history. Transaction lookup, script history,
+  wallet data, and other application-specific views remain derived and
+  rebuildable.
+- **Modularity keeps the core isolated and components composable.** Clear
+  dependency and failure boundaries keep extensions from destabilizing
+  validation or chainstate while allowing components to be reused independently.
+  Extensions own their state and lifecycle and may build on core capabilities,
+  but they do not become dependencies of the core.
+- **Rust-native integration is a primary path.** Applications and extensions in
+  the Rust Bitcoin ecosystem can attach to the node as typed, in-process
+  components instead of routing through serialized RPC or separate processes.
+  This improves runtime efficiency and simplifies integration and deployment,
+  making the full node a native, composable part of the ecosystem.
 
 Bitcoin is not defined by the continued preservation of one codebase. **The code
 can change; consensus is what must remain.** `bitcoin-rs` aims to challenge
