@@ -24,15 +24,11 @@ bitcoin-rs asks a simple question:
 
 ### Why now?
 
-AI is changing how software is built. Work that once required large
-teams and long development cycles can now be attempted by much smaller teams
-with far faster iteration.
-
-Bitcoin is unusually well suited to this development model. Implementations can
-be checked against Bitcoin Core, `libbitcoinkernel`, historical chain data,
-consensus test vectors, fuzzing, and differential tests. Strong verification
-allows AI-assisted development to move quickly without treating generated code
-as truth.
+AI is changing how software is built. Work that once required large teams and
+long development cycles can now be attempted by much smaller teams with far
+faster iteration. Bitcoin is unusually well suited to this model because
+implementations can be checked against Bitcoin Core, `libbitcoinkernel`,
+historical chain data, consensus test vectors, fuzzing, and differential tests.
 
 **Bitcoin is well suited to AI-native development; Bitcoin Core's development
 culture is not.** Its review process prioritizes minimizing change risk,
