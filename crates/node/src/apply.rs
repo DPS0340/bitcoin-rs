@@ -1511,6 +1511,23 @@ pub fn apply_block(
     apply_block_inner(handles, block, None)
 }
 
+/// Returns after consensus gates that precede the first write, without
+/// persisting the block. BIP22 proposal mode omits proof-of-work.
+pub fn validate_block(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+) -> core::result::Result<(), ApplyError> {
+    use bitcoin::hashes::Hash as _;
+
+    let _transition = handles.begin_chain_transition()?;
+    let block_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&block.block_hash().to_byte_array());
+    let prev_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&block.header.prev_blockhash.to_byte_array());
+    let _ = applied_predecessor(handles, block_hash, prev_hash)?;
+    Ok(())
+}
+
 /// Applies `block` reusing preserved wire-format bytes for body persistence and indexing.
 pub fn apply_block_with_serialized(
     handles: &ApplyHandles,

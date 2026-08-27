@@ -774,6 +774,27 @@ pub trait MiningControl: Send + Sync {
     fn publish_generation(&self);
 }
 
+/// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
+#[must_use]
+pub fn difficulty_for_bits(bits: bitcoin::CompactTarget) -> f64 {
+    let consensus_bits = bits.to_consensus();
+    let mantissa = consensus_bits & 0x00ff_ffff;
+    if mantissa == 0 {
+        return 0.0;
+    }
+    let mut shift = (consensus_bits >> 24) & 0xff;
+    let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
+    while shift < 29 {
+        difficulty *= 256.0;
+        shift += 1;
+    }
+    while shift > 29 {
+        difficulty /= 256.0;
+        shift -= 1;
+    }
+    difficulty
+}
+
 /// Actual progress reported by the node-owned transaction index.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TxIndexInfo {
