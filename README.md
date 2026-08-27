@@ -24,16 +24,21 @@ bitcoin-rs asks a simple question:
 
 ### Why now?
 
-AI changes the economics of independent implementation: work that once demanded
-a large expert team over years can now be attempted by a much smaller team.
-Bitcoin makes that effort unusually verifiable. Bitcoin Core,
-`libbitcoinkernel`, historical chain data, consensus vectors, fuzzing, and
-differential tests provide independent, reproducible ways to verify correctness
-and detect divergence.
+AI is changing how software is built. Work that once required large
+teams and long development cycles can now be attempted by much smaller teams
+with far faster iteration.
 
-**bitcoin-rs can pursue changes that are no longer practical inside Bitcoin
-Core.** It can prototype, measure, and discard bold architectural experiments
-without preserving decades of internal implementation constraints.
+Bitcoin is unusually well suited to this development model. Implementations can
+be checked against Bitcoin Core, `libbitcoinkernel`, historical chain data,
+consensus test vectors, fuzzing, and differential tests. Strong verification
+allows AI-assisted development to move quickly without treating generated code
+as truth.
+
+Bitcoin Core's development model, however, is optimized for stability and
+compatibility, making radical architectural change increasingly expensive.
+
+**That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while using
+an AI-native development process to pursue a better implementation.**
 
 ### What can be improved
 
