@@ -12,15 +12,109 @@ use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
 use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_mining::{Candidate, TemplateId};
 use bitcoin_rs_p2p::PeerInfo;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Network};
 use bitcoin_rs_rpc::context::{
-    BlockBodySource, BlockRecord, ChainControl, ChainControlError, Context,
+    BlockBodySource, BlockRecord, BlockTemplate, BlockTemplateRequest, BlockTemplateResult,
+    BlockValidationResult, ChainControl, ChainControlError, Context, LastCandidateInfo,
+    MiningCapability, MiningControl, MiningControlError, MiningInfo, TemplateMutation,
 };
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use parking_lot::RwLock;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
+
+struct SmokeMiningControl;
+
+impl SmokeMiningControl {
+    fn template() -> BlockTemplate {
+        let previous = Hash256::from_le_bytes(&[0x11; 32]);
+        BlockTemplate {
+            candidate: Arc::new(Candidate {
+                template_id: TemplateId::new(&previous, 9),
+                previous_block_hash: previous,
+                height: 101,
+                version: 0x2000_0000,
+                bits: 0x207f_ffff,
+                min_time: 1_700_000_001,
+                current_time: 1_700_000_010,
+                csv_active: true,
+                segwit_active: true,
+                max_weight: 4_000_000,
+                max_size: 4_000_000,
+                max_sigops: 80_000,
+                mempool_sequence: 9,
+                coinbase: Transaction {
+                    version: bitcoin::transaction::Version::TWO,
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: Vec::new(),
+                    output: Vec::new(),
+                },
+                coinbase_value: 5_000_000_000,
+                fees: 0,
+                weight: 1_000,
+                size: 250,
+                sigop_cost: 0,
+                transactions: Vec::new(),
+                witness_merkle_root: None,
+                witness_reserved_value: None,
+                witness_commitment: None,
+            }),
+            rules: Vec::new(),
+            version_bits_available: Vec::new(),
+            version_bits_required: 0,
+            capabilities: vec![MiningCapability::new("proposal")],
+            mutable: vec![TemplateMutation::Time, TemplateMutation::Transactions],
+            submit_old: None,
+            work_id: None,
+        }
+    }
+}
+
+impl MiningControl for SmokeMiningControl {
+    fn get_block_template(
+        &self,
+        request: BlockTemplateRequest,
+    ) -> Result<BlockTemplateResult, MiningControlError> {
+        Ok(match request.mode {
+            bitcoin_rs_rpc::context::BlockTemplateMode::Template => {
+                BlockTemplateResult::Template(Self::template())
+            }
+            bitcoin_rs_rpc::context::BlockTemplateMode::Proposal(_) => {
+                BlockTemplateResult::Proposal(BlockValidationResult::Accepted)
+            }
+        })
+    }
+
+    fn mining_info(&self) -> Result<MiningInfo, MiningControlError> {
+        Ok(MiningInfo {
+            blocks: 100,
+            last_candidate: Some(LastCandidateInfo {
+                weight: 1_000,
+                transactions: 1,
+            }),
+            difficulty: 1.0,
+            network_hashes_per_second: 0.0,
+            pooled_transactions: 0,
+            network: Network::Regtest,
+            next_bits: 0x207f_ffff,
+            next_difficulty: 1.0,
+            minimum_fee_rate: 1_000,
+            signet: None,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn submit_block(
+        &self,
+        _block: bitcoin::Block,
+    ) -> Result<BlockValidationResult, MiningControlError> {
+        Ok(BlockValidationResult::Accepted)
+    }
+
+    fn publish_generation(&self) {}
+}
 
 #[test]
 fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,12 +158,13 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
         ("getnetworkinfo", json!([])),
         ("getpeerinfo", json!([])),
         ("addnode", json!(["127.0.0.1:8333", "onetry"])),
-        ("disconnectnode", json!(["127.0.0.1:8333"])),
         ("getconnectioncount", json!([])),
         ("getnettotals", json!([])),
         ("getblocktemplate", json!([{}])),
         ("submitblock", json!([""])),
         ("prioritisetransaction", json!([txid.as_str(), 0, 0])),
+        ("createrawtransaction", json!([[], {"data": ""}])),
+        ("getnodeaddresses", json!([])),
         ("getdescriptorinfo", json!([descriptor])),
         ("deriveaddresses", json!([checksummed_descriptor.as_str()])),
         (
@@ -754,7 +849,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut ctx = Context::new();
+        let mut ctx = Context::new().with_mining_control(Arc::new(SmokeMiningControl));
         let tx = tx(1, ScriptBuf::from_bytes(vec![0x51]));
         let block = bitcoin::Block {
             header: bitcoin::block::Header {

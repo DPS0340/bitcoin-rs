@@ -20,6 +20,7 @@ fn serve_with_shutdown_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
     let _unused_stream: Option<TcpStream> = None;
     let shutdown = Arc::new(AtomicBool::new(false));
     let listener_shutdown = Arc::clone(&shutdown);
+    let network_active = Arc::new(AtomicBool::new(true));
     let (tx, rx) = mpsc::channel();
     let registry = Arc::new(parking_lot::RwLock::new(Vec::new()));
     let listener_registry = Arc::clone(&registry);
@@ -32,10 +33,12 @@ fn serve_with_shutdown_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
 
     let listener_outbound = Arc::clone(&outbound);
     let listener_banned = Arc::clone(&banned);
+    let listener_network_active = Arc::clone(&network_active);
     let handle = thread::spawn(move || {
         let result = serve_with_shutdown(
             addr,
             listener_shutdown,
+            listener_network_active,
             Magic::BITCOIN,
             listener_registry,
             listener_outbound,
