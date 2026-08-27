@@ -17,6 +17,7 @@ rocksdb = ["bitcoin-rs-utxo/rocksdb", "bitcoin-rs-storage/rocksdb", "bitcoin-rs-
 fjall = ["bitcoin-rs-utxo/fjall", "bitcoin-rs-storage/fjall", "bitcoin-rs-p2p/fjall"]
 redb = ["bitcoin-rs-utxo/redb", "bitcoin-rs-storage/redb", "bitcoin-rs-p2p/redb"]
 mdbx = ["bitcoin-rs-storage/mdbx"]
+zmq = []
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true

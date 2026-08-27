@@ -1,149 +1,190 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Transaction, Txid};
+use bitcoin::script::PushBytesBuf;
+use bitcoin::{
+    Amount, Denomination, FeeRate, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction,
+    TxIn, TxOut, Txid, Witness, absolute, transaction,
+};
+use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_mempool::standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
+use hashbrown::HashMap;
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
-use crate::context::Context;
+use crate::context::{BlockRecord, Context};
 use crate::error::RpcError;
 use crate::handlers::{optional_bool, params_array, required_str, required_u64};
+use crate::tx_render::{self, TransactionChainContext};
+
+/// Bitcoin Core incremental relay fee default: 1000 sat/kvB.
+const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
+/// Bitcoin Core `DEFAULT_MAX_RAW_TX_FEE_RATE` = 0.10 BTC/kvB.
+const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 
 pub(crate) fn getrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
-    let verbose = optional_bool(params, 1, false)?;
-    let blockhash_str = params_array(params)?
+    let verbose = raw_transaction_verbosity(params)?;
+    let blockhash = params_array(params)?
         .get(2)
-        .and_then(JsonValueTrait::as_str);
-    if let Some(hash_str) = blockhash_str {
-        let hash = Hash256::from_str(hash_str)
-            .map_err(|_| RpcError::InvalidParams("blockhash must be 64 hex characters"))?;
-        let Some(record) = ctx.block_by_hash(hash) else {
-            return Err(RpcError::NotFound("block not found"));
-        };
-        let Some(bytes) = ctx.block_body_bytes(&record) else {
-            return Err(RpcError::NotFound("block data pruned"));
-        };
-        let block: bitcoin::Block = deserialize(&bytes)
-            .map_err(|_| RpcError::Internal("stored block bytes failed decode".to_owned()))?;
-        for tx in &block.txdata {
-            if tx.compute_txid() == txid {
-                if !verbose {
-                    return Ok(json!(serialize(tx).to_lower_hex_string()));
-                }
-                return super::tx_render::tx_to_value(tx);
-            }
-        }
-        return Err(RpcError::NotFound("transaction not in specified block"));
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(RpcError::InvalidType("blockhash must be a string"))
+                .and_then(|hash| {
+                    Hash256::from_str(hash)
+                        .map_err(|_| RpcError::InvalidParams("blockhash must be 64 hex characters"))
+                })
+        })
+        .transpose()?;
+
+    if let Some(hash) = blockhash {
+        let record = ctx
+            .block_by_hash(hash)
+            .ok_or(RpcError::NotFound("block not found"))?;
+        let block = load_block(ctx, &record)?;
+        let tx = block
+            .txdata
+            .iter()
+            .find(|tx| tx.compute_txid() == txid)
+            .ok_or(RpcError::NotFound("transaction not in specified block"))?;
+        return Ok(render_raw_transaction(ctx, tx, verbose, Some(&record)));
     }
-    {
-        let transactions = ctx.transactions.read();
-        if let Some(tx) = transactions.get(&txid) {
-            if !verbose {
-                return Ok(json!(serialize(tx).to_lower_hex_string()));
-            }
-            return super::tx_render::tx_to_value(tx);
-        }
-    }
+
     {
         let pool = ctx.mempool.read();
         if let Some(entry) = pool.entry_by_txid(&txid) {
-            let tx = entry.tx.as_ref();
-            if !verbose {
-                return Ok(json!(serialize(tx).to_lower_hex_string()));
-            }
-            return super::tx_render::tx_to_value(tx);
+            return Ok(render_raw_transaction(
+                ctx,
+                entry.tx.as_ref(),
+                verbose,
+                None,
+            ));
         }
     }
     if let Some(tx_index) = ctx.tx_index.as_ref() {
-        match tx_index.transaction(&txid) {
-            Ok(Some(tx)) => {
-                if !verbose {
-                    return Ok(json!(serialize(&tx).to_lower_hex_string()));
-                }
-                return super::tx_render::tx_to_value(&tx);
-            }
-            Ok(None) => {}
-            Err(error) => return Err(error.into_rpc_error()),
+        let tx = tx_index.transaction(&txid).map_err(RpcError::from)?;
+        if let Some(tx) = tx {
+            let record = tx_index
+                .transaction_height(&txid)
+                .map_err(RpcError::from)?
+                .and_then(|height| ctx.block_by_height(height));
+            return Ok(render_raw_transaction(ctx, &tx, verbose, record.as_ref()));
         }
     }
+
+    // Compatibility cache used by tests and early wiring; not confirmation proof.
+    if let Some(tx) = ctx.transactions.read().get(&txid) {
+        return Ok(render_raw_transaction(ctx, tx, verbose, None));
+    }
+
     Err(RpcError::NotFound("transaction not found"))
 }
 
-fn classify_script(script: &bitcoin::Script) -> &'static str {
-    if script.is_p2tr() {
-        "witness_v1_taproot"
-    } else if script.is_p2wsh() {
-        "witness_v0_scripthash"
-    } else if script.is_p2wpkh() {
-        "witness_v0_keyhash"
-    } else if script.is_p2sh() {
-        "scripthash"
-    } else if script.is_p2pkh() {
-        "pubkeyhash"
-    } else if script.is_p2pk() {
-        "pubkey"
-    } else if script.is_op_return() {
-        "nulldata"
-    } else {
-        "nonstandard"
+fn raw_transaction_verbosity(params: &Value) -> Result<bool, RpcError> {
+    let Some(value) = params_array(params)?.get(1) else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    if let Some(verbose) = value.as_bool() {
+        return Ok(verbose);
+    }
+    match value.as_u64() {
+        Some(0) => Ok(false),
+        Some(1 | 2) => Ok(true),
+        Some(_) => Err(RpcError::InvalidParams("verbosity must be 0, 1, or 2")),
+        None => Err(RpcError::InvalidType(
+            "verbosity must be a boolean or integer",
+        )),
     }
 }
 
-fn script_to_address(
-    script: &bitcoin::Script,
-    chain_network: bitcoin_rs_primitives::Network,
-) -> Option<String> {
-    let network = match chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
-        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
-    };
-    bitcoin::Address::from_script(script, network)
-        .ok()
-        .map(|address| address.to_string())
+fn load_block(ctx: &Context, record: &BlockRecord) -> Result<bitcoin::Block, RpcError> {
+    let bytes = ctx
+        .block_body_bytes(record)
+        .ok_or(RpcError::NotFound("block data pruned"))?;
+    deserialize(&bytes)
+        .map_err(|_| RpcError::Internal("stored block bytes failed decode".to_owned()))
+}
+
+fn render_raw_transaction(
+    ctx: &Context,
+    tx: &Transaction,
+    verbose: bool,
+    record: Option<&BlockRecord>,
+) -> Value {
+    if !verbose {
+        return json!(serialize(tx).to_lower_hex_string());
+    }
+    let chain = record.map(|record| TransactionChainContext {
+        block_hash: bitcoin::BlockHash::from_byte_array(record.hash.to_le_bytes()),
+        confirmations: i64::from(
+            ctx.applied_height()
+                .saturating_sub(record.height)
+                .saturating_add(1),
+        ),
+        block_time: u64::from(record.time),
+        in_active_chain: Some(true),
+    });
+    tx_render::transaction_json(tx, bitcoin_network(ctx.chain_network), chain)
 }
 
 pub(crate) fn gettxout(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let txid = parse_txid(required_str(params, 0, "txid is required")?)?;
     let vout = required_u64(params, 1, "vout is required")?;
     let vout_u32 = u32::try_from(vout).map_err(|_| RpcError::InvalidParams("vout exceeds u32"))?;
-    let outpoint = OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), vout_u32);
-    let Some(live) = ctx.utxo.get_entry(&outpoint) else {
+    let include_mempool = optional_bool(params, 2, true)?;
+    let bitcoin_outpoint = BitcoinOutPoint {
+        txid,
+        vout: vout_u32,
+    };
+    let utxo_outpoint = OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), vout_u32);
+
+    if include_mempool {
+        let pool = ctx.mempool.read();
+        if pool.is_outpoint_spent(&bitcoin_outpoint) {
+            return Ok(Value::new_null());
+        }
+        if let Some(entry) = pool.entry_by_txid(&txid)
+            && let Ok(vout) = usize::try_from(vout_u32)
+            && let Some(output) = entry.tx.output.get(vout)
+        {
+            return Ok(txout_json(ctx, output, 0, false));
+        }
+    }
+
+    let Some(live) = ctx.utxo.get_entry(&utxo_outpoint) else {
         // Spent or never existed: Core-spec returns JSON null.
         return Ok(Value::new_null());
     };
-    let applied = ctx.applied_height();
-    let confirmations = applied.saturating_sub(live.height).saturating_add(1);
-    let script_hex = live.txout.script_pubkey.as_bytes().to_lower_hex_string();
-    let address = script_to_address(&live.txout.script_pubkey, ctx.chain_network);
-    let desc = address.as_deref().map_or_else(
-        || format!("raw({script_hex})"),
-        |addr| format!("addr({addr})"),
-    );
-    let mut script_pubkey = json!({
-        "asm": live.txout.script_pubkey.to_asm_string(),
-        "desc": desc,
-        "hex": script_hex,
-        "type": classify_script(&live.txout.script_pubkey)
-    });
-    if let Some(addr) = address {
-        let _ = script_pubkey.insert("address", json!(addr));
-    }
-    Ok(json!({
+    let confirmations = ctx
+        .applied_height()
+        .saturating_sub(live.height)
+        .saturating_add(1);
+    Ok(txout_json(ctx, &live.txout, confirmations, live.coinbase))
+}
+
+fn txout_json(ctx: &Context, output: &TxOut, confirmations: u32, coinbase: bool) -> Value {
+    json!({
         "bestblock": ctx.best_hash().to_string_be(),
         "confirmations": confirmations,
-        "value": super::tx_render::btc_value(live.txout.value.to_sat()),
-        "scriptPubKey": script_pubkey,
-        "coinbase": live.coinbase
-    }))
+        "value": tx_render::btc_amount_json(output.value),
+        "scriptPubKey": tx_render::script_pub_key_json(
+            &output.script_pubkey,
+            bitcoin_network(ctx.chain_network),
+        ),
+        "coinbase": coinbase
+    })
 }
 
 pub(crate) fn gettxoutproof(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -342,41 +383,205 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
+    let max_feerate = optional_max_feerate(params, 1)?;
     let tx = decode_tx(raw)?;
-    let txid = ctx.add_transaction(tx);
+    let txid = tx.compute_txid();
+
+    // Already-known submissions remain successful.
+    {
+        let pool = ctx.mempool.read();
+        if pool.contains_txid(&txid) {
+            return Ok(json!(txid.to_string()));
+        }
+    }
+    if ctx.transactions.read().contains_key(&txid) {
+        return Ok(json!(txid.to_string()));
+    }
+
+    let fact = {
+        let pool = ctx.mempool.read();
+        let contexts = package_contexts(ctx, &pool, std::slice::from_ref(&tx));
+        evaluate_package_acceptance(&pool, std::slice::from_ref(&tx), &contexts, max_feerate)
+            .into_iter()
+            .next()
+            .ok_or_else(|| RpcError::Internal("package acceptance returned no rows".to_owned()))?
+    };
+
+    if let Some(reason) = fact.reject_reason {
+        return Err(reject_to_rpc_error(&reason));
+    }
+
+    let entry = MempoolEntry::new(
+        Arc::new(tx.clone()),
+        fact.vsize,
+        fact.base_fee.unwrap_or(0),
+        unix_time_secs(),
+        ctx.applied_height(),
+    )
+    .with_sigop_cost(fact.sigop_cost);
+    ctx.mempool
+        .write()
+        .insert_entry(entry)
+        .map_err(|error| RpcError::Internal(error.to_string()))?;
+    let _ = ctx.add_transaction(tx);
     Ok(json!(txid.to_string()))
 }
 
-pub(crate) fn testmempoolaccept(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
-    let raw_txs = params_array(params)?
+pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let array = params_array(params)?;
+    let raw_txs = array
         .first()
         .and_then(|value| value.as_array())
         .ok_or(RpcError::InvalidParams("raw transaction array is required"))?;
-    let mut rows = Vec::with_capacity(raw_txs.len());
+    let max_feerate = optional_max_feerate(params, 1)?;
+
+    let mut txs = Vec::with_capacity(raw_txs.len());
     for raw in raw_txs {
         let Some(raw) = raw.as_str() else {
             return Err(RpcError::InvalidType("raw transaction must be a string"));
         };
-        let decoded = decode_tx(raw);
-        let txid = decoded.as_ref().map_or_else(
-            |_| Hash256::default().to_string_be(),
-            |tx| tx.compute_txid().to_string(),
-        );
-        rows.push(json!({
-            "txid": txid,
-            "wtxid": txid,
-            "allowed": decoded.is_ok(),
-            "vsize": decoded.as_ref().map_or(0, Transaction::vsize),
-            "fees": {"base": 0.0}
-        }));
+        txs.push(decode_tx(raw)?);
+    }
+
+    let pool = ctx.mempool.read();
+    let contexts = package_contexts(ctx, &pool, &txs);
+    let facts = evaluate_package_acceptance(&pool, &txs, &contexts, max_feerate);
+
+    let mut rows = Vec::with_capacity(facts.len());
+    for fact in facts {
+        let mut row = json!({
+            "txid": fact.txid.to_string(),
+            "wtxid": fact.wtxid.to_string(),
+            "allowed": fact.allowed,
+            "vsize": fact.vsize,
+            "weight": fact.weight
+        });
+        if let Some(fee) = fact.base_fee {
+            let _ = row.insert(
+                "fees",
+                json!({ "base": tx_render::btc_amount_json(Amount::from_sat(fee)) }),
+            );
+        }
+        if let Some(reason) = fact.reject_reason {
+            let _ = row.insert("reject-reason", json!(reason.to_string()));
+        }
+        rows.push(row);
     }
     Ok(json!(rows))
 }
 
-pub(crate) fn decoderawtransaction(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+pub(crate) fn decoderawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let raw = required_str(params, 0, "raw transaction is required")?;
     let tx = decode_tx(raw)?;
-    super::tx_render::tx_to_value(&tx)
+    Ok(tx_render::transaction_json(
+        &tx,
+        bitcoin_network(ctx.chain_network),
+        None,
+    ))
+}
+
+pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let array = params_array(params)?;
+    let inputs = array
+        .first()
+        .and_then(|value| value.as_array())
+        .ok_or(RpcError::InvalidParams("inputs must be an array"))?;
+    let outputs = array
+        .get(1)
+        .and_then(|value| value.as_object())
+        .ok_or(RpcError::InvalidParams("outputs must be an object"))?;
+    let locktime = match array.get(2) {
+        None => 0_u32,
+        Some(value) if value.is_null() => 0_u32,
+        Some(value) => {
+            let locktime = value
+                .as_u64()
+                .ok_or(RpcError::InvalidType("locktime must be an integer"))?;
+            u32::try_from(locktime).map_err(|_| RpcError::InvalidParams("locktime exceeds u32"))?
+        }
+    };
+    let replaceable = optional_bool(params, 3, false)?;
+    let default_sequence = if replaceable {
+        Sequence::ENABLE_RBF_NO_LOCKTIME
+    } else {
+        Sequence::MAX
+    };
+
+    let mut tx_inputs = Vec::with_capacity(inputs.len());
+    let mut seen = HashSet::new();
+    for input in inputs {
+        let object = input
+            .as_object()
+            .ok_or(RpcError::InvalidType("input must be an object"))?;
+        let txid = parse_txid(
+            object
+                .get(&"txid")
+                .and_then(JsonValueTrait::as_str)
+                .ok_or(RpcError::InvalidParams("input txid is required"))?,
+        )?;
+        let vout = object
+            .get(&"vout")
+            .and_then(JsonValueTrait::as_u64)
+            .ok_or(RpcError::InvalidParams("input vout is required"))?;
+        let vout = u32::try_from(vout).map_err(|_| RpcError::InvalidParams("vout exceeds u32"))?;
+        if !seen.insert((txid, vout)) {
+            return Err(RpcError::InvalidParams("duplicate input specified"));
+        }
+        let sequence = match object.get(&"sequence") {
+            None => default_sequence,
+            Some(value) => {
+                let sequence = value
+                    .as_u64()
+                    .ok_or(RpcError::InvalidType("sequence must be an integer"))?;
+                Sequence::from_consensus(
+                    u32::try_from(sequence)
+                        .map_err(|_| RpcError::InvalidParams("sequence exceeds u32"))?,
+                )
+            }
+        };
+        tx_inputs.push(TxIn {
+            previous_output: BitcoinOutPoint { txid, vout },
+            script_sig: ScriptBuf::new(),
+            sequence,
+            witness: Witness::default(),
+        });
+    }
+
+    let network = bitcoin_network(ctx.chain_network);
+    let mut tx_outputs = Vec::with_capacity(outputs.len());
+    for (key, value) in outputs {
+        if key == "data" {
+            let data_hex = value
+                .as_str()
+                .ok_or(RpcError::InvalidType("data output must be a hex string"))?;
+            let data = Vec::<u8>::from_hex(data_hex)
+                .map_err(|_| RpcError::InvalidParams("data output must be valid hex"))?;
+            let data = PushBytesBuf::try_from(data)
+                .map_err(|_| RpcError::InvalidParams("data output exceeds maximum push size"))?;
+            tx_outputs.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return(data),
+            });
+            continue;
+        }
+
+        let address = bitcoin::Address::from_str(key)
+            .map_err(|_| RpcError::InvalidParams("invalid Bitcoin address"))?
+            .require_network(network)
+            .map_err(|_| RpcError::InvalidParams("invalid Bitcoin address"))?;
+        tx_outputs.push(TxOut {
+            value: parse_btc_amount(value)?,
+            script_pubkey: address.script_pubkey(),
+        });
+    }
+
+    let tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::from_consensus(locktime),
+        input: tx_inputs,
+        output: tx_outputs,
+    };
+    Ok(json!(serialize(&tx).to_lower_hex_string()))
 }
 
 fn decode_tx(raw: &str) -> Result<Transaction, RpcError> {
@@ -386,6 +591,261 @@ fn decode_tx(raw: &str) -> Result<Transaction, RpcError> {
 
 fn parse_txid(value: &str) -> Result<Txid, RpcError> {
     Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
+}
+
+fn standardness_policy() -> StandardnessPolicy {
+    StandardnessPolicy {
+        dust_relay_fee: FeeRate::DUST,
+        max_datacarrier_bytes: Some(83),
+    }
+}
+
+const fn bitcoin_network(chain_network: bitcoin_rs_primitives::Network) -> bitcoin::Network {
+    match chain_network {
+        bitcoin_rs_primitives::Network::Mainnet => bitcoin::Network::Bitcoin,
+        bitcoin_rs_primitives::Network::Testnet3 => bitcoin::Network::Testnet,
+        bitcoin_rs_primitives::Network::Testnet4 => bitcoin::Network::Testnet4,
+        bitcoin_rs_primitives::Network::Signet => bitcoin::Network::Signet,
+        bitcoin_rs_primitives::Network::Regtest => bitcoin::Network::Regtest,
+    }
+}
+
+fn unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn optional_max_feerate(params: &Value, index: usize) -> Result<Option<u64>, RpcError> {
+    let Some(value) = params_array(params)?.get(index) else {
+        return Ok(Some(DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB));
+    };
+    if value.is_null() {
+        return Ok(Some(DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB));
+    }
+    let btc_per_kvb = if let Some(number) = value.as_f64() {
+        number
+    } else if let Some(text) = value.as_str() {
+        text.parse::<f64>()
+            .map_err(|_| RpcError::InvalidType("maxfeerate must be a number"))?
+    } else {
+        return Err(RpcError::InvalidType("maxfeerate must be a number"));
+    };
+    if !btc_per_kvb.is_finite() || btc_per_kvb < 0.0 {
+        return Err(RpcError::InvalidParams("maxfeerate must be non-negative"));
+    }
+    if btc_per_kvb == 0.0 {
+        return Ok(None);
+    }
+    let sats = Amount::from_btc(btc_per_kvb)
+        .map_err(|_| RpcError::InvalidParams("maxfeerate is out of range"))?
+        .to_sat();
+    Ok(Some(sats))
+}
+
+fn parse_btc_amount(value: &Value) -> Result<Amount, RpcError> {
+    if let Some(number) = value.as_f64() {
+        return Amount::from_btc(number).map_err(|_| RpcError::InvalidParams("Invalid amount"));
+    }
+    if let Some(text) = value.as_str() {
+        return Amount::from_str_in(text, Denomination::Bitcoin)
+            .map_err(|_| RpcError::InvalidParams("Invalid amount"));
+    }
+    Err(RpcError::InvalidType("amount must be a number or string"))
+}
+
+// ---------------------------------------------------------------------------
+// Package acceptance — adapted from R2 to current Mempool/standardness APIs.
+// ---------------------------------------------------------------------------
+
+/// Per-transaction context computed from UTXO and mempool state.
+struct PackageTxContext {
+    fee: u64,
+    vsize: u32,
+    sigop_cost: u32,
+    missing_inputs: bool,
+}
+
+/// Per-transaction acceptance result.
+struct AcceptanceFact {
+    txid: Txid,
+    wtxid: bitcoin::Wtxid,
+    allowed: bool,
+    vsize: u32,
+    weight: u64,
+    base_fee: Option<u64>,
+    sigop_cost: u32,
+    reject_reason: Option<RejectReason>,
+}
+
+/// Reason a transaction was rejected from mempool acceptance.
+enum RejectReason {
+    AlreadyInMempool,
+    MissingInputs,
+    NonStandard(StandardnessError),
+    MaxFeeExceeded,
+    MinRelayFeeNotMet,
+}
+
+impl core::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyInMempool => write!(f, "txn-already-in-mempool"),
+            Self::MissingInputs => write!(f, "missing-inputs"),
+            Self::NonStandard(error) => write!(f, "{error}"),
+            Self::MaxFeeExceeded => write!(f, "max-fee-exceeded"),
+            Self::MinRelayFeeNotMet => write!(f, "min-relay-fee-not-met"),
+        }
+    }
+}
+
+fn reject_to_rpc_error(reason: &RejectReason) -> RpcError {
+    match reason {
+        RejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
+        RejectReason::AlreadyInMempool
+        | RejectReason::MissingInputs
+        | RejectReason::MinRelayFeeNotMet
+        | RejectReason::NonStandard(_) => RpcError::Internal(reason.to_string()),
+    }
+}
+
+fn package_contexts(
+    ctx: &Context,
+    pool: &bitcoin_rs_mempool::Mempool,
+    txs: &[Transaction],
+) -> Vec<PackageTxContext> {
+    let mut package_outputs: HashMap<(Txid, u32), Amount> = HashMap::new();
+    let mut contexts = Vec::with_capacity(txs.len());
+
+    for tx in txs {
+        let mut missing_inputs = false;
+        let mut input_value = 0_u64;
+        let mut prevouts: HashMap<BitcoinOutPoint, TxOut> = HashMap::new();
+
+        for input in &tx.input {
+            if input.previous_output.is_null() {
+                missing_inputs = true;
+                continue;
+            }
+            let key = (input.previous_output.txid, input.previous_output.vout);
+            if let Some(value) = package_outputs.get(&key) {
+                input_value = input_value.saturating_add(value.to_sat());
+                prevouts.insert(
+                    input.previous_output,
+                    TxOut {
+                        value: *value,
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                );
+                continue;
+            }
+            if let Some(parent) = pool.transaction_by_txid(&input.previous_output.txid)
+                && let Ok(vout) = usize::try_from(input.previous_output.vout)
+                && let Some(output) = parent.output.get(vout)
+            {
+                input_value = input_value.saturating_add(output.value.to_sat());
+                prevouts.insert(input.previous_output, output.clone());
+                continue;
+            }
+            let utxo_outpoint = OutPoint::new(
+                Hash256::from_le_bytes(input.previous_output.txid.as_byte_array()),
+                input.previous_output.vout,
+            );
+            if let Some(live) = ctx.utxo.get_entry(&utxo_outpoint) {
+                input_value = input_value.saturating_add(live.txout.value.to_sat());
+                prevouts.insert(input.previous_output, live.txout.clone());
+                continue;
+            }
+            missing_inputs = true;
+        }
+
+        let output_value = tx.output.iter().fold(0_u64, |sum, output| {
+            sum.saturating_add(output.value.to_sat())
+        });
+        let fee = input_value.saturating_sub(output_value);
+        let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+        let sigop_cost =
+            u32::try_from(tx.total_sigop_cost(|outpoint| prevouts.get(outpoint).cloned()))
+                .unwrap_or(u32::MAX);
+
+        contexts.push(PackageTxContext {
+            fee,
+            vsize,
+            sigop_cost,
+            missing_inputs,
+        });
+
+        let txid = tx.compute_txid();
+        for (vout, output) in tx.output.iter().enumerate() {
+            let vout = u32::try_from(vout).unwrap_or(u32::MAX);
+            package_outputs.insert((txid, vout), output.value);
+        }
+    }
+
+    contexts
+}
+
+fn evaluate_package_acceptance(
+    pool: &bitcoin_rs_mempool::Mempool,
+    txs: &[Transaction],
+    contexts: &[PackageTxContext],
+    max_feerate: Option<u64>,
+) -> Vec<AcceptanceFact> {
+    let policy = standardness_policy();
+    let mut facts = Vec::with_capacity(txs.len());
+
+    for (tx, ctx) in txs.iter().zip(contexts) {
+        let txid = tx.compute_txid();
+        let wtxid = tx.compute_wtxid();
+        let vsize = ctx.vsize;
+        let weight = tx.weight().to_wu();
+        let base_fee = if ctx.missing_inputs {
+            None
+        } else {
+            Some(ctx.fee)
+        };
+
+        let reject_reason = if pool.contains_txid(&txid) {
+            Some(RejectReason::AlreadyInMempool)
+        } else if ctx.missing_inputs {
+            Some(RejectReason::MissingInputs)
+        } else {
+            match is_standard_tx(tx, &policy) {
+                Ok(()) => {
+                    // Fee rate checks.
+                    let fee_rate = if ctx.vsize > 0 {
+                        ctx.fee * 1_000 / u64::from(ctx.vsize)
+                    } else {
+                        0
+                    };
+                    if let Some(max_rate) = max_feerate
+                        && fee_rate > max_rate
+                    {
+                        Some(RejectReason::MaxFeeExceeded)
+                    } else if fee_rate < DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB {
+                        Some(RejectReason::MinRelayFeeNotMet)
+                    } else {
+                        None
+                    }
+                }
+                Err(error) => Some(RejectReason::NonStandard(error)),
+            }
+        };
+
+        let allowed = reject_reason.is_none();
+        facts.push(AcceptanceFact {
+            txid,
+            wtxid,
+            allowed,
+            vsize,
+            weight,
+            base_fee,
+            sigop_cost: ctx.sigop_cost,
+            reject_reason,
+        });
+    }
+
+    facts
 }
 
 pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -1542,56 +2002,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod classify_script_tests {
-    use super::*;
-    use bitcoin::ScriptBuf;
-
-    #[test]
-    fn classify_op_return_is_nulldata() {
-        let script = ScriptBuf::new_op_return(b"hello");
-        assert_eq!(classify_script(&script), "nulldata");
-    }
-
-    #[test]
-    fn classify_empty_is_nonstandard() {
-        let script = ScriptBuf::new();
-        assert_eq!(classify_script(&script), "nonstandard");
-    }
-
-    #[test]
-    fn script_to_address_returns_some_for_p2wpkh_on_mainnet() {
-        use bitcoin::hex::FromHex as _;
-
-        let script_hex = "00141111111111111111111111111111111111111111";
-        let bytes = match Vec::<u8>::from_hex(script_hex) {
-            Ok(bytes) => bytes,
-            Err(error) => panic!("hex: {error}"),
-        };
-        let script = ScriptBuf::from_bytes(bytes);
-
-        let address = script_to_address(&script, bitcoin_rs_primitives::Network::Mainnet);
-
-        assert!(
-            address.is_some(),
-            "P2WPKH script must yield mainnet bech32 address"
-        );
-        let Some(addr) = address else {
-            panic!("address");
-        };
-        assert!(
-            addr.starts_with("bc1"),
-            "mainnet P2WPKH should bech32-encode with bc1 prefix: {addr}"
-        );
-    }
-
-    #[test]
-    fn script_to_address_returns_none_for_nonstandard_script() {
-        let script = ScriptBuf::new();
-
-        assert!(script_to_address(&script, bitcoin_rs_primitives::Network::Mainnet).is_none());
-    }
-}
 #[cfg(test)]
 mod gettxout_via_utxo_tests {
     use super::*;

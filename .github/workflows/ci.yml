@@ -77,6 +77,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
       # Library unit tests run with each crate's own default features.
       - run: cargo test --workspace --no-fail-fast
+      # Isolated so node's default `zmq` feature cannot unify this package on.
+      - run: cargo test -p bitcoin-rs-rpc --no-default-features --no-fail-fast
       # Node / binary tests run with the full-node feature set.  -p is
       # required because `--workspace --features` silently ignores --features in
       # a virtual workspace (no root [package] section in the top-level Cargo.toml).
