@@ -36,6 +36,10 @@ designed codebase cross-checks consensus interpretation, reduces the risk of
 correlated implementation failures, and helps keep Bitcoin defined by its
 consensus rather than by the behavior or structure of any single implementation.
 
+**bitcoin-rs can pursue changes that are no longer practical inside Bitcoin
+Core.** It can prototype, measure, and discard bold architectural experiments
+without preserving decades of internal implementation constraints.
+
 The project reopens several non-consensus design choices:
 
 - **Performance is a first-class requirement.** Synchronization, storage,
