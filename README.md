@@ -43,11 +43,14 @@ without preserving decades of internal implementation constraints.
   storage, memory ownership, concurrency, caching, I/O, and indexing can all be
   reconsidered. Improvements must be demonstrated with matched whole-node
   benchmarks against Core.
-- **The UTXO set is authoritative coin state.** `bitcoin-rs` exposes the state
-  already maintained for validation through node APIs, giving wallets and other
-  applications a shared foundation for spendable state. Each application
-  remains free to construct its own views without redefining or rebuilding the
-  node's coin state.
+- **The UTXO set is the node's authoritative coin state.** Much of the Bitcoin
+  application ecosystem grew by rebuilding or duplicating wallet-, Electrum-,
+  and explorer-specific views around the same chain data. `bitcoin-rs`
+  simplifies that boundary: the node owns the canonical UTXO set maintained for
+  validation and exposes a minimal Electrum-compatible index through Esplora,
+  while wallet-specific keys, policies, and metadata remain outside the node.
+  Consumers build on node state; they do not redefine where Bitcoin's coin
+  state lives.
 - **Modularity keeps the core isolated and components composable.** Clear
   dependency and failure boundaries keep extensions from destabilizing
   validation or chainstate while allowing components to be reused independently.
