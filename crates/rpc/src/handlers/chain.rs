@@ -239,8 +239,8 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             "active"
         } else {
             match node.status {
-                NodeStatus::Active | NodeStatus::Stale => "valid-fork",
-                NodeStatus::HeaderValid => "headers-only",
+                NodeStatus::Active | NodeStatus::HeaderValid => "headers-only",
+                NodeStatus::Stale => "valid-fork",
                 NodeStatus::Invalid => "invalid",
             }
         };
@@ -319,7 +319,7 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
             let nblocks = value
                 .as_u64()
                 .ok_or(RpcError::InvalidType("nblocks must be a number"))?;
-            if nblocks > u64::from(tip_height) {
+            if nblocks > 0 && nblocks >= u64::from(tip_height) {
                 return Err(RpcError::InvalidParams(
                     "Invalid block count: should be between 0 and the block's height - 1",
                 ));
@@ -333,7 +333,13 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
             let selected = tree
                 .node(selected_id)
                 .map_err(|error| RpcError::Internal(error.to_string()))?;
-            let total_tx_count = selected.chain_tx_count;
+            let mut total_tx_count = selected.chain_tx_count;
+            if total_tx_count == 0
+                && ctx.applied_hash() == tip_hash
+                && let Some(known) = ctx.chain_tx_count()
+            {
+                total_tx_count = known;
+            }
             let tip_time = selected.header.time;
             if window_block_count == 0 {
                 (total_tx_count, tip_time, 0, 0)
@@ -441,7 +447,7 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
     block_json_verbose(ctx, &record, false, 1)
 }
 
-pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+fn blockstats_record(ctx: &Context, params: &Value) -> Result<BlockRecord, RpcError> {
     let target = params_array(params)?
         .first()
         .ok_or(RpcError::InvalidParams("hash_or_height is required"))?;
@@ -450,13 +456,24 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
             u32::try_from(height).map_err(|_| RpcError::InvalidParams("height exceeds u32"))?;
         ctx.block_by_height(height)
     } else if let Some(hash) = target.as_str() {
-        ctx.block_by_hash(parse_hash(hash)?)
+        let hash = parse_hash(hash)?;
+        let record = ctx.block_by_hash(hash);
+        if let Some(record) = &record
+            && ctx.block_hash_at_height(record.height) != Some(hash)
+        {
+            return Err(RpcError::InvalidParams("Block is not in main chain"));
+        }
+        record
     } else {
         return Err(RpcError::InvalidType(
             "hash_or_height must be string or number",
         ));
-    }
-    .ok_or(RpcError::NotFound("block not found"))?;
+    };
+    record.ok_or(RpcError::NotFound("block not found"))
+}
+
+pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let record = blockstats_record(ctx, params)?;
 
     let (_bytes, block) = decode_block(ctx, &record)?;
     let height = record.height;
@@ -1891,6 +1908,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn getblockstats_rejects_a_stale_block_hash() -> Result<(), Box<dyn std::error::Error>> {
+        let Fork {
+            ctx,
+            fork: fork_hash,
+            ..
+        } = forked_ctx()?;
+        ctx.add_block(BlockRecord::synthetic(1, fork_hash));
+
+        let result = getblockstats(&ctx, &json!([fork_hash.to_string_be()]));
+        assert!(
+            matches!(
+                result,
+                Err(RpcError::InvalidParams("Block is not in main chain"))
+            ),
+            "stale hash must not compute fees from the active index, got {result:?}"
+        );
+        Ok(())
+    }
+
     /// A log record for `header`, either carrying the block or standing in for
     /// one whose body the node no longer has.
     fn record_for(header: bitcoin::block::Header, with_body: bool) -> BlockRecord {
@@ -2421,6 +2458,39 @@ mod tests {
     }
 
     #[test]
+    fn getchaintxstats_uses_applied_atomic_when_per_node_count_is_unset() {
+        use alloc::sync::Arc;
+        use bitcoin::Network;
+
+        let ctx =
+            Context::new().with_chain_tx_count(Arc::new(core::sync::atomic::AtomicU64::new(42)));
+        let ctx = Arc::new(ctx);
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let tip = {
+            let mut tree = ctx.block_tree.write();
+            let id = tree
+                .insert_node(None, genesis.header, NodeStatus::Active)
+                .unwrap_or_else(|err| panic!("insert genesis: {err}"));
+            let node = tree
+                .node(id)
+                .unwrap_or_else(|err| panic!("genesis node: {err}"));
+            TipSnapshot {
+                tip_id: id,
+                height: node.height,
+                chainwork: node.chainwork,
+                hash: node.hash,
+            }
+        };
+        ctx.set_applied_tip(tip);
+        let result = getchaintxstats(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getchaintxstats failed: {err}"));
+        let Some(txcount) = result.get("txcount").and_then(JsonValueTrait::as_u64) else {
+            panic!("txcount missing: {result:?}");
+        };
+        assert_eq!(txcount, 42);
+    }
+
+    #[test]
     fn getchaintxstats_time_reflects_tip_block_header_timestamp() {
         use bitcoin::Network;
 
@@ -2668,6 +2738,54 @@ mod tests {
             result.get("time").and_then(JsonValueTrait::as_u64),
             Some(1_030)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn getchaintxstats_rejects_nblocks_equal_to_selected_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = Arc::new(Context::new());
+        let tip = {
+            let mut tree = ctx.block_tree.write();
+            let mut parent = None;
+            let mut prev = BlockHash::all_zeros();
+            let mut tip = None;
+            for height in 0_u32..4 {
+                let header = Header {
+                    version: Version::ONE,
+                    prev_blockhash: prev,
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time: 1_000_u32.saturating_add(height.saturating_mul(10)),
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce: height,
+                };
+                prev = header.block_hash();
+                let id = tree.insert_node(parent, header, NodeStatus::Active)?;
+                parent = Some(id);
+                let node = tree.node(id)?;
+                tip = Some(TipSnapshot {
+                    tip_id: id,
+                    height: node.height,
+                    chainwork: node.chainwork,
+                    hash: node.hash,
+                });
+            }
+            tip.ok_or("missing tip")?
+        };
+        ctx.set_applied_tip(tip);
+
+        let rejected = getchaintxstats(&ctx, &json!([3]));
+        assert!(
+            matches!(
+                rejected,
+                Err(RpcError::InvalidParams(
+                    "Invalid block count: should be between 0 and the block's height - 1"
+                ))
+            ),
+            "nblocks equal to height must be rejected, got {rejected:?}"
+        );
+        getchaintxstats(&ctx, &json!([2]))
+            .unwrap_or_else(|err| panic!("height - 1 must remain accepted: {err}"));
         Ok(())
     }
 
@@ -3164,6 +3282,58 @@ mod getchaintips_tests {
         assert_eq!(sibling_height, 1);
         Ok(())
     }
+
+    #[test]
+    fn getchaintips_marks_unapplied_best_header_as_headers_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = Arc::new(Context::new());
+        let (genesis_id, genesis_chainwork, genesis_hash) = {
+            let mut tree = ctx.block_tree.write();
+            let genesis = synthetic_header(BlockHash::all_zeros(), 1_000_000);
+            let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
+            let genesis_hash = tree.node(genesis_id)?.hash;
+            let child = synthetic_header(genesis.block_hash(), 1_000_900);
+            let child_id = tree.insert_node(Some(genesis_id), child, NodeStatus::HeaderValid)?;
+            assert_eq!(
+                tree.node(child_id)?.status,
+                NodeStatus::Active,
+                "the heavier header leaf is promoted even before apply"
+            );
+            let genesis_node = tree.node(genesis_id)?;
+            (genesis_id, genesis_node.chainwork, genesis_hash)
+        };
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: genesis_id,
+            height: 0,
+            chainwork: genesis_chainwork,
+            hash: genesis_hash,
+        });
+
+        let result = getchaintips(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getchaintips failed: {err}"));
+        let Some(arr) = result.as_array() else {
+            panic!("expected array: {result:?}");
+        };
+        let headers_only_count = arr
+            .iter()
+            .filter(|tip| {
+                tip.get("status").and_then(JsonValueTrait::as_str) == Some("headers-only")
+            })
+            .count();
+        let valid_fork_count = arr
+            .iter()
+            .filter(|tip| tip.get("status").and_then(JsonValueTrait::as_str) == Some("valid-fork"))
+            .count();
+        assert_eq!(
+            headers_only_count, 1,
+            "unapplied best header must be headers-only: {arr:?}"
+        );
+        assert_eq!(
+            valid_fork_count, 0,
+            "header-first continuation is not a valid-fork: {arr:?}"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -3358,14 +3528,18 @@ mod chaintxstats_durability_tests {
     #[test]
     fn historical_selection_uses_the_selected_nodes_count_and_mtp() {
         let ctx = Context::new();
-        let tip = insert_counted_chain(&ctx, &[1_000, 1_600, 2_200], &[1, 4, 9]);
+        let tip = insert_counted_chain(
+            &ctx,
+            &[1_000, 1_600, 2_200, 2_800, 3_400],
+            &[1, 4, 9, 16, 25],
+        );
         ctx.set_applied_tip(tip.clone());
         let ctx = Arc::new(ctx);
         let mid_hash = {
             let tree = ctx.block_tree.read();
             let id = tree
-                .node_at_height_from(tip.tip_id, 1)
-                .unwrap_or_else(|| panic!("missing height 1"));
+                .node_at_height_from(tip.tip_id, 3)
+                .unwrap_or_else(|| panic!("missing height 3"));
             tree.node(id)
                 .unwrap_or_else(|err| panic!("mid node: {err}"))
                 .hash
@@ -3374,13 +3548,13 @@ mod chaintxstats_durability_tests {
             .unwrap_or_else(|err| panic!("historical getchaintxstats failed: {err}"));
         assert_eq!(
             value.get("txcount").and_then(JsonValueTrait::as_u64),
-            Some(4)
+            Some(16)
         );
         assert_eq!(
             value
                 .get("window_tx_count")
                 .and_then(JsonValueTrait::as_u64),
-            Some(3)
+            Some(7)
         );
         assert_eq!(
             value
@@ -3392,7 +3566,7 @@ mod chaintxstats_durability_tests {
             value
                 .get("window_final_block_height")
                 .and_then(JsonValueTrait::as_u64),
-            Some(1)
+            Some(3)
         );
     }
 
@@ -3412,7 +3586,10 @@ mod chaintxstats_durability_tests {
 
     #[test]
     fn historical_stats_survive_an_empty_block_log() {
-        let ctx = restarted_ctx(Some(42));
+        let ctx = Context::new();
+        let tip = insert_counted_chain(&ctx, &[1_000_000, 1_000_100, TIP_TIME], &[1, 1, 42]);
+        ctx.set_applied_tip(tip);
+        let ctx = Arc::new(ctx);
         assert!(ctx.blocks.read().is_empty());
         let hash = ctx.applied_hash().to_string_be();
         let value = getchaintxstats(&ctx, &json!([1, hash.as_str()]))
@@ -3473,23 +3650,36 @@ mod chaintxstats_durability_tests {
                 .unwrap_or_else(|err| panic!("won: {err}"));
             tree.restore_chain_tx_count(won_id, 8)
                 .unwrap_or_else(|err| panic!("won count: {err}"));
+            let child = bitcoin::block::Header {
+                version: Version::ONE,
+                prev_blockhash: won.block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_300,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 3,
+            };
+            let child_id = tree
+                .insert_node(Some(won_id), child, NodeStatus::Active)
+                .unwrap_or_else(|err| panic!("child: {err}"));
+            tree.restore_chain_tx_count(child_id, 15)
+                .unwrap_or_else(|err| panic!("child count: {err}"));
             let lost_hash = tree
                 .node(lost_id)
                 .unwrap_or_else(|err| panic!("lost node: {err}"))
                 .hash;
-            let won_node = tree
-                .node(won_id)
-                .unwrap_or_else(|err| panic!("won node: {err}"));
+            let child_node = tree
+                .node(child_id)
+                .unwrap_or_else(|err| panic!("child node: {err}"));
             (
                 tree.node(genesis_id)
                     .unwrap_or_else(|err| panic!("genesis node: {err}"))
                     .hash,
                 lost_hash,
                 TipSnapshot {
-                    tip_id: won_id,
-                    height: won_node.height,
-                    chainwork: won_node.chainwork,
-                    hash: won_node.hash,
+                    tip_id: child_id,
+                    height: child_node.height,
+                    chainwork: child_node.chainwork,
+                    hash: child_node.hash,
                 },
             )
         };
@@ -3500,7 +3690,7 @@ mod chaintxstats_durability_tests {
             stats_of(&ctx)
                 .get("txcount")
                 .and_then(JsonValueTrait::as_u64),
-            Some(8),
+            Some(15),
             "default selection must follow the applied branch"
         );
         let err = getchaintxstats(&ctx, &json!([1, lost_hash.to_string_be()])).unwrap_err();
@@ -3512,7 +3702,7 @@ mod chaintxstats_durability_tests {
             .unwrap_or_else(|err| panic!("winning branch stats failed: {err}"));
         assert_eq!(
             value.get("txcount").and_then(JsonValueTrait::as_u64),
-            Some(8)
+            Some(15)
         );
         assert_eq!(
             value
