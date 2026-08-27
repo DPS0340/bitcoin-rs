@@ -46,9 +46,10 @@ without preserving decades of internal implementation constraints.
 - **The UTXO set is the node's authoritative coin state.** Much of the Bitcoin
   application ecosystem grew by rebuilding or duplicating wallet-, Electrum-,
   and explorer-specific views around the same chain data. `bitcoin-rs`
-  simplifies that boundary: the node owns the canonical UTXO set maintained for
-  validation and exposes an integrated Electrum-compatible script index through
-  Esplora, avoiding a separate indexer and duplicate chain ingestion.
+  simplifies that boundary: the node owns the canonical UTXO set used for
+  validation and an integrated script index exposed through Esplora-compatible
+  APIs. This eliminates the need for a separate Electrum server with its own
+  duplicate chain state and ingestion pipeline.
   Wallet-specific keys, policies, and metadata remain outside the node.
   Consumers build on node state; they do not redefine where Bitcoin's coin
   state lives.
