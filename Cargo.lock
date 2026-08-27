@@ -308,6 +308,7 @@ dependencies = [
  "bitcoin-rs-consensus",
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
+ "criterion",
  "parking_lot",
  "proptest",
  "serde",
