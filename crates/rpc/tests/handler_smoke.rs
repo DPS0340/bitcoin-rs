@@ -113,6 +113,30 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[cfg(feature = "zmq")]
+#[test]
+fn getzmqnotifications_dispatches_compiled_notifications() -> Result<(), Box<dyn std::error::Error>>
+{
+    let ctx = Arc::new(Context::new().with_zmq_notifications(vec![
+        bitcoin_rs_rpc::context::ZmqNotification::new("pubhashblock", "tcp://127.0.0.1:28332", 21),
+    ]));
+    let result = Handler::new(ctx).dispatch("getzmqnotifications", &json!([]))?;
+    assert_eq!(result.as_array().map(|items| items.len()), Some(1));
+    assert_eq!(result[0].get("type").as_str(), Some("pubhashblock"));
+    assert_eq!(
+        result[0].get("address").as_str(),
+        Some("tcp://127.0.0.1:28332")
+    );
+    assert_eq!(result[0].get("hwm").as_u64(), Some(21));
+    Ok(())
+}
+
+#[cfg(not(feature = "zmq"))]
+#[test]
+fn getzmqnotifications_is_absent_without_zmq() {
+    let result = Handler::new(Arc::new(Context::new())).dispatch("getzmqnotifications", &json!([]));
+    assert!(matches!(result, Err(RpcError::MethodNotFound(_))));
+}
 #[test]
 fn getblockhash_zero_returns_mainnet_genesis_on_fresh_context()
 -> Result<(), Box<dyn std::error::Error>> {
