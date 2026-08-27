@@ -10,8 +10,9 @@ Bitcoin Core uses.
 
 ## Why bitcoin-rs
 
-Bitcoin Core is the most successful implementation of Bitcoin. Its
-conservatism, stability, and compatibility discipline are major reasons for
+[Bitcoin Core](https://github.com/bitcoin/bitcoin) is the most successful
+implementation of Bitcoin. Its conservatism, stability, and compatibility
+discipline are major reasons for
 that success. Over time, however, those safeguards also shape which changes are
 practical: existing boundaries accumulate dependencies, and implementation
 choices harden into assumptions that Bitcoin consensus does not require.
