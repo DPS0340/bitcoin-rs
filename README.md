@@ -22,9 +22,6 @@ bitcoin-rs asks a simple question:
 > **If a Bitcoin full node were designed again today, what would we keep, and
 > what would we change?**
 
-It is an independent implementation of the same Bitcoin, not a new protocol or
-a different set of consensus rules.
-
 **Why now?** AI changes the economics of independent implementation: work that
 once demanded a large expert team over years can now be attempted by a much
 smaller team. Bitcoin makes that effort unusually verifiable. Bitcoin Core,
