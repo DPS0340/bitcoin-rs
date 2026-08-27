@@ -85,6 +85,9 @@ impl RpcServer {
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
                     stream.set_nonblocking(false)?;
+                    // JSON-RPC exchanges are small request/response pairs;
+                    // disable Nagle to avoid delayed small segments.
+                    stream.set_nodelay(true)?;
                     self.handle_accept(&active, stream)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {

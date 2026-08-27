@@ -310,6 +310,12 @@ fn run_outbound_connection(
 
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(crate::wire::PeerError::Io)?;
+    // Disable Nagle's algorithm: p2p messages (headers, inv, ping/pong,
+    // getdata responses) are small and latency-sensitive, so delayed
+    // small-segment coalescing directly costs round-trip time.
+    stream
+        .set_nodelay(true)
+        .map_err(crate::wire::PeerError::Io)?;
     stream
         .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
         .map_err(crate::wire::PeerError::Io)?;
@@ -463,6 +469,12 @@ fn run_handshake(
 ) -> Result<(), crate::wire::PeerError> {
     stream
         .set_nonblocking(false)
+        .map_err(crate::wire::PeerError::Io)?;
+    // Disable Nagle's algorithm: p2p messages (headers, inv, ping/pong,
+    // getdata responses) are small and latency-sensitive, so delayed
+    // small-segment coalescing directly costs round-trip time.
+    stream
+        .set_nodelay(true)
         .map_err(crate::wire::PeerError::Io)?;
     stream
         .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
