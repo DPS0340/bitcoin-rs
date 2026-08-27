@@ -35,11 +35,14 @@ allows AI-assisted development to move quickly without treating generated code
 as truth.
 
 **Bitcoin is well suited to AI-native development; Bitcoin Core's development
-model is not.** Bitcoin Core is optimized for stability and compatibility,
-making radical architectural change increasingly expensive.
+culture is not.** Its review process prioritizes minimizing change risk,
+rewarding incrementalism, entrenching existing boundaries, and making radical
+architectural experimentation prohibitively expensive.
 
-**That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while using
-an AI-native development process to pursue a better implementation.**
+**That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while
+making bold architectural experimentation practical—build alternatives,
+verify them against reproducible evidence, and keep iterating until better
+designs emerge.**
 
 ### What can be improved
 
