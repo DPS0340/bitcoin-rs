@@ -20,10 +20,14 @@ pub mod error;
 pub mod esplora;
 /// Method dispatch and Core-compatible handlers.
 pub mod handlers;
+/// Semantic Core projections without transport policy.
+pub mod render;
 /// Bitcoin Core-compatible REST endpoints.
 pub mod rest;
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub mod server;
+/// Transaction, block, and header rendering.
+pub mod tx_render;
 
 pub use auth::Auth;
 

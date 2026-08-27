@@ -65,7 +65,7 @@ mdbx = [
     "bitcoin-rs-storage/mdbx",
 ]
 kernel = ["bitcoin-rs-consensus/kernel"]
-zmq = ["dep:zmq"]
+zmq = ["dep:zmq", "bitcoin-rs-rpc/zmq"]
 checksig-census = [
     "kernel",
     "bitcoin-rs-consensus/checksig-census",

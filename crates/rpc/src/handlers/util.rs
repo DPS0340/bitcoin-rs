@@ -4,53 +4,18 @@ use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+use bitcoin::Amount;
 use sonic_rs::{JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{params_array, required_str, required_u64, serde_to_sonic};
+use crate::tx_render::btc_amount_json;
 
 static SERVER_START: OnceLock<Instant> = OnceLock::new();
 
-const BLOCK_VSIZE_TARGET: u64 = 1_000_000;
-const DEFAULT_MIN_FEERATE_SAT_PER_KVB: u64 = 1_000; // 1 sat/vB
-
-fn estimate_feerate_sat_per_kvb(ctx: &Context, conf_target: u64) -> u64 {
-    let mempool = ctx.mempool.read();
-    if mempool.entries.is_empty() {
-        return DEFAULT_MIN_FEERATE_SAT_PER_KVB;
-    }
-
-    let mut buckets: Vec<(u64, u64)> = Vec::new();
-    for (_id, entry) in &mempool.entries {
-        let Some((_, bucket_vsize)) = buckets
-            .iter_mut()
-            .find(|(bucket_rate, _)| *bucket_rate == entry.fee_rate)
-        else {
-            buckets.push((entry.fee_rate, u64::from(entry.vsize)));
-            continue;
-        };
-        *bucket_vsize = bucket_vsize.saturating_add(u64::from(entry.vsize));
-    }
-
-    buckets.sort_unstable_by_key(|bucket| core::cmp::Reverse(bucket.0));
-
-    let target_vsize = BLOCK_VSIZE_TARGET.saturating_mul(conf_target.max(1));
-    let mut cumulative: u64 = 0;
-    let mut threshold = DEFAULT_MIN_FEERATE_SAT_PER_KVB;
-    for (rate, vsize) in &buckets {
-        cumulative = cumulative.saturating_add(*vsize);
-        threshold = *rate;
-        if cumulative >= target_vsize {
-            break;
-        }
-    }
-
-    threshold.max(DEFAULT_MIN_FEERATE_SAT_PER_KVB)
-}
-
-fn sat_per_kvb_to_btc_per_kvb(sat: u64) -> f64 {
-    f64::from(u32::try_from(sat).unwrap_or(u32::MAX)) / 100_000_000.0_f64
+fn conf_target_blocks(conf_target: u64) -> u32 {
+    u32::try_from(conf_target).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -60,12 +25,15 @@ pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcEr
     Ok(json!(secs))
 }
 
-pub(crate) fn getrpcinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+pub(crate) fn getrpcinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
-    // TODO(logpath): wire from Config.log_file once configured.
+    let path = ctx
+        .debug_log_path
+        .as_ref()
+        .ok_or_else(|| RpcError::Internal("debug log path is not configured".to_owned()))?;
     Ok(json!({
         "active_commands": Vec::<String>::new(),
-        "logpath": ""
+        "logpath": path
     }))
 }
 
@@ -76,7 +44,7 @@ pub(crate) fn getmemoryinfo(_ctx: &Arc<Context>, params: &Value) -> Result<Value
         .and_then(JsonValueTrait::as_str)
         .unwrap_or("stats");
     if mode != "stats" {
-        // "mallocinfo" requires XML output; not implemented.
+        // Core's mallocinfo mode emits allocator XML; this node exposes stats only.
         return Err(RpcError::InvalidParams(
             "only mode=stats is supported in this implementation",
         ));
@@ -109,6 +77,7 @@ fn read_linux_rss_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(feature = "zmq")]
 pub(crate) fn getzmqnotifications(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
     let notifications: Vec<_> = ctx
@@ -127,23 +96,42 @@ pub(crate) fn getzmqnotifications(ctx: &Arc<Context>, params: &Value) -> Result<
 
 pub(crate) fn estimatesmartfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
-    let rate_sat_per_kvb = estimate_feerate_sat_per_kvb(ctx, conf_target);
-    let feerate = sat_per_kvb_to_btc_per_kvb(rate_sat_per_kvb);
-    Ok(json!({
-        "feerate": feerate,
-        "blocks": conf_target
-    }))
+    let pool = ctx.mempool.read();
+    match pool.estimate_fee_rate(conf_target_blocks(conf_target)) {
+        Some(rate) => {
+            let mut object = sonic_rs::Object::new();
+            let _ = object.insert(
+                "feerate",
+                btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb())),
+            );
+            let _ = object.insert("blocks", json!(conf_target));
+            Ok(Value::from(object))
+        }
+        None => Ok(json!({
+            "errors": ["Insufficient data or no feerate found"],
+            "blocks": conf_target
+        })),
+    }
 }
 
 pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     let conf_target = required_u64(params, 0, "conf_target is required")?;
-    let rate_sat_per_kvb = estimate_feerate_sat_per_kvb(ctx, conf_target);
-    let feerate = sat_per_kvb_to_btc_per_kvb(rate_sat_per_kvb);
-    Ok(json!({
-        "short": {"feerate": feerate, "decay": 0.962, "scale": 1},
-        "medium": {"feerate": feerate, "decay": 0.962, "scale": 1},
-        "long": {"feerate": feerate, "decay": 0.962, "scale": 1}
-    }))
+    let pool = ctx.mempool.read();
+    let Some(rate) = pool.estimate_fee_rate(conf_target_blocks(conf_target)) else {
+        return Ok(json!({}));
+    };
+    let feerate = btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb()));
+    let mut short = sonic_rs::Object::new();
+    let _ = short.insert("feerate", feerate.clone());
+    let mut medium = sonic_rs::Object::new();
+    let _ = medium.insert("feerate", feerate.clone());
+    let mut long = sonic_rs::Object::new();
+    let _ = long.insert("feerate", feerate);
+    let mut object = sonic_rs::Object::new();
+    let _ = object.insert("short", Value::from(short));
+    let _ = object.insert("medium", Value::from(medium));
+    let _ = object.insert("long", Value::from(long));
+    Ok(Value::from(object))
 }
 
 pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -231,9 +219,9 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     // Match addr(...) wrapper.
     if let Some(inner) = strip_addr_wrapper(payload) {
         if inner.contains('*') {
-            // TODO(miniscript): support ranged addr() once miniscript+derivation
-            // is wired. For now return empty since we cannot enumerate.
-            return Ok(json!([]));
+            return Err(RpcError::MethodDisabled(
+                "ranged descriptors are unavailable without a wallet",
+            ));
         }
         let address = bitcoin::Address::from_str(inner)
             .map_err(|_| RpcError::InvalidParams("addr() contains an invalid address"))?;
@@ -242,9 +230,9 @@ pub(crate) fn deriveaddresses(ctx: &Arc<Context>, params: &Value) -> Result<Valu
             .map_err(|_| RpcError::InvalidParams("addr() address is for the wrong network"))?;
         return Ok(json!([address.to_string()]));
     }
-    // TODO(miniscript): other wrappers (pkh, sh, wpkh, tr, wsh, multi, ...) need
-    // miniscript-based key derivation. Return empty until then.
-    Ok(json!([]))
+    Err(RpcError::MethodDisabled(
+        "only addr() descriptors are available without a wallet",
+    ))
 }
 
 fn required_checked_descriptor_payload(descriptor: &str) -> Result<&str, RpcError> {
@@ -353,17 +341,38 @@ mod tests {
     use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
     #[test]
-    fn estimate_returns_default_when_mempool_empty() {
+    fn estimatesmartfee_reports_unavailable_when_estimator_has_no_history() {
         let ctx = Arc::new(Context::new());
         let result = estimatesmartfee(&ctx, &json!([3]))
             .unwrap_or_else(|err| panic!("estimatesmartfee failed: {err}"));
-        let Some(feerate) = result.get("feerate").and_then(JsonValueTrait::as_f64) else {
-            panic!("feerate missing: {result:?}");
-        };
-        // Default min: 1000 sat/kvB / 100_000_000 = 0.00001
         assert!(
-            feerate > 0.0,
-            "empty mempool should still return a min feerate: {result:?}"
+            result.get("feerate").is_none(),
+            "unavailable estimator must omit feerate: {result:?}"
+        );
+        let Some(errors) = result.get("errors").and_then(JsonContainerTrait::as_array) else {
+            panic!("errors missing: {result:?}");
+        };
+        assert_eq!(
+            errors.first().and_then(JsonValueTrait::as_str),
+            Some("Insufficient data or no feerate found")
+        );
+        assert_eq!(
+            result.get("blocks").and_then(JsonValueTrait::as_u64),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn estimaterawfee_returns_empty_object_when_estimator_unavailable() {
+        let ctx = Arc::new(Context::new());
+        let result = estimaterawfee(&ctx, &json!([2]))
+            .unwrap_or_else(|err| panic!("estimaterawfee failed: {err}"));
+        let Some(object) = result.as_object() else {
+            panic!("expected object, got {result:?}");
+        };
+        assert!(
+            object.is_empty(),
+            "unavailable raw estimate must be empty: {result:?}"
         );
     }
 
@@ -378,18 +387,31 @@ mod tests {
     }
 
     #[test]
-    fn getrpcinfo_returns_active_commands_array_and_logpath() {
+    fn getrpcinfo_requires_a_configured_log_path() {
         let ctx = Arc::new(Context::new());
+        let result = getrpcinfo(&ctx, &json!([]));
+        assert!(
+            matches!(result, Err(RpcError::Internal(message)) if message == "debug log path is not configured")
+        );
+    }
+
+    #[test]
+    fn getrpcinfo_returns_active_commands_and_configured_log_path() {
+        let ctx = Arc::new(
+            Context::new().with_debug_log_path(std::path::PathBuf::from("/tmp/debug.log")),
+        );
         let result =
             getrpcinfo(&ctx, &json!([])).unwrap_or_else(|err| panic!("getrpcinfo failed: {err}"));
-        let Some(active) = result.get("active_commands").and_then(|v| v.as_array()) else {
-            panic!("active_commands missing: {result:?}");
-        };
-        assert!(active.is_empty());
-        let Some(logpath) = result.get("logpath").and_then(|v| v.as_str()) else {
-            panic!("logpath missing: {result:?}");
-        };
-        assert_eq!(logpath, "");
+        assert!(
+            result
+                .get("active_commands")
+                .and_then(|value| value.as_array())
+                .is_some_and(|commands| commands.is_empty())
+        );
+        assert_eq!(
+            result.get("logpath").and_then(|value| value.as_str()),
+            Some("/tmp/debug.log")
+        );
     }
 
     #[test]
@@ -416,6 +438,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "zmq")]
     #[test]
     fn getzmqnotifications_returns_empty_array() {
         use alloc::sync::Arc;
@@ -429,6 +452,7 @@ mod tests {
         assert!(arr.is_empty());
     }
 
+    #[cfg(feature = "zmq")]
     #[test]
     fn getzmqnotifications_returns_active_metadata() {
         use alloc::sync::Arc;
@@ -585,15 +609,11 @@ mod deriveaddresses_tests {
     }
 
     #[test]
-    fn deriveaddresses_empty_for_ranged_descriptors() {
+    fn deriveaddresses_rejects_wallet_only_descriptors() {
         let ctx = Arc::new(Context::new());
         let payload = "wpkh(xpub.../0/*)";
         let checksum = descriptor_checksum(payload).unwrap_or_else(|| panic!("checksum failed"));
-        let result = deriveaddresses(&ctx, &json!([format!("{payload}#{checksum}")]))
-            .unwrap_or_else(|err| panic!("deriveaddresses failed: {err}"));
-        let Some(arr) = result.as_array() else {
-            panic!("expected array: {result:?}");
-        };
-        assert!(arr.is_empty());
+        let result = deriveaddresses(&ctx, &json!([format!("{payload}#{checksum}")]));
+        assert!(matches!(result, Err(RpcError::MethodDisabled(_))));
     }
 }

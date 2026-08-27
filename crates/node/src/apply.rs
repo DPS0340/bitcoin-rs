@@ -2643,6 +2643,8 @@ fn applied_header_tip(
             },
         ));
     }
+    tree.record_applied_tx_count(node_id, tx_count_delta_for(block))?;
+    let node = tree.node(node_id)?;
     Ok(TipSnapshot {
         tip_id: node_id,
         height: node.height,
@@ -8328,6 +8330,15 @@ mod consensus_rule_tests {
             handles.chain_tx_count.load(Ordering::Relaxed),
             2,
             "connecting a one-transaction block moves the count by one"
+        );
+        assert_eq!(
+            handles
+                .block_tree
+                .read()
+                .node(applied.tip_id)?
+                .chain_tx_count,
+            2,
+            "apply must record the per-node count the RPC reads"
         );
 
         let _restored = disconnect_block(&handles, &block)?;

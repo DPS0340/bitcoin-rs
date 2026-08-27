@@ -1,7 +1,9 @@
 use alloc::sync::Arc;
 use core::fmt;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::hex::DisplayHex;
@@ -11,7 +13,6 @@ use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_primitives::{Hash256, Network};
 use compact_str::CompactString;
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
 
@@ -22,6 +23,56 @@ const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 /// Bitcoin Core's `DEFAULT_MAX_TIP_AGE`, 24 hours. Core exposes it as
 /// `-maxtipage`; this node has no such option yet, so the default stands.
 const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
+
+/// Full-block REST responses materialize the block and a response buffer.
+/// Bound concurrent materializations independently of socket connections.
+const MAX_CONCURRENT_REST_BLOCK_RENDERS: usize = 2;
+
+#[derive(Debug)]
+struct RestRenderBudget {
+    in_flight: AtomicUsize,
+}
+
+impl RestRenderBudget {
+    const fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<RestRenderPermit> {
+        let mut in_flight = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if in_flight >= MAX_CONCURRENT_REST_BLOCK_RENDERS {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                in_flight,
+                in_flight + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RestRenderPermit {
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(actual) => in_flight = actual,
+            }
+        }
+    }
+}
+
+pub(crate) struct RestRenderPermit {
+    budget: Arc<RestRenderBudget>,
+}
+
+impl Drop for RestRenderPermit {
+    fn drop(&mut self) {
+        let previous = self.budget.in_flight.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous > 0, "REST render permit count underflowed");
+    }
+}
 
 /// Block metadata made available to RPC handlers without forcing storage I/O.
 ///
@@ -924,6 +975,47 @@ impl TxQueryError {
     }
 }
 
+/// Handles owned by the node and observed by the RPC context.
+#[derive(Clone)]
+pub struct ContextHandles {
+    /// Best header-chain tip.
+    pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// Best fully-applied block tip.
+    pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
+    /// In-memory mempool.
+    pub mempool: Arc<RwLock<Mempool>>,
+    /// Applied block metadata log.
+    pub blocks: Arc<RwLock<BlockLog>>,
+    /// Transactions retained for direct RPC lookup.
+    pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    /// Authoritative UTXO set.
+    pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
+    /// Incremental UTXO statistics.
+    pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+    /// Network state.
+    pub network: Arc<RwLock<NetworkState>>,
+    /// Whether the node accepts or starts P2P connections.
+    pub network_active: Arc<core::sync::atomic::AtomicBool>,
+    /// Connected peer registry.
+    pub peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
+    /// Live per-peer outbound control handles.
+    pub peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
+    /// Shared block tree.
+    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    /// Consensus network.
+    pub chain_network: Network,
+    /// Channel that requests outbound P2P connections.
+    pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
+    /// Manual IP/CIDR bans.
+    pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
+    /// Persisted `addnode add` entries.
+    pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
+    /// Complete transaction-index query adapter.
+    pub tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Generic script-index query adapter.
+    pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+}
+
 /// Shared state consumed by JSON-RPC handlers.
 pub struct Context {
     /// Best-chain tip snapshot published by chain validation.
@@ -963,6 +1055,8 @@ pub struct Context {
     pub prune_service: Option<Arc<dyn PruneService>>,
     /// Optional node-owned chain mutation service.
     pub chain_control: Option<Arc<dyn ChainControl>>,
+    /// Optional node-owned mining coordinator.
+    pub mining_control: Option<Arc<dyn MiningControl>>,
     /// Optional node-owned complete transaction-index query adapter.
     /// `None` when transaction indexing is disabled.
     pub tx_index: Option<Arc<dyn TxIndexQuery>>,
@@ -978,20 +1072,16 @@ pub struct Context {
     /// Network selector used by handlers needing consensus parameters (e.g.
     /// difficulty calculation).
     pub chain_network: Network,
+    /// Live per-peer outbound control handles.
+    pub peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
+    /// Whether outbound and inbound network activity is enabled through RPC.
+    pub network_active: Arc<core::sync::atomic::AtomicBool>,
     /// Shared registry of currently-handshook peers.
     pub peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
     /// Shared in-memory block tree.
     pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
     /// Optional durable block body reader for metadata-only block records.
     pub block_body_source: Option<Arc<dyn BlockBodySource>>,
-    /// Current getblocktemplate long-poll id.
-    pub mining_template_id: Arc<ArcSwap<CompactString>>,
-    /// Receiver notified when mining template inputs change.
-    pub mining_notifications: Receiver<()>,
-    /// Optional outbound channel that submits decoded blocks back to the node's
-    /// `BlockSync::tick` for the canonical apply path. `None` when no node is
-    /// wired (tests, embedded callers).
-    pub inbound_blocks_sender: Option<crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>>,
     /// Optional outbound channel for `addnode` to request new P2P connections.
     /// `None` for embedded/test callers without a live P2P listener.
     pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
@@ -1001,7 +1091,10 @@ pub struct Context {
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
     /// Active ZMQ PUB notifications.
     pub zmq_notifications: Arc<[ZmqNotification]>,
-    mining_sender: Sender<()>,
+    /// Configured node debug-log path for `getrpcinfo`.
+    pub debug_log_path: Option<PathBuf>,
+    /// Limits concurrent full-block REST response materializations.
+    rest_render_budget: Arc<RestRenderBudget>,
 }
 // SAFETY: `Context` is shared by RPC worker threads. Each mutable subsystem
 // handle behind it uses atomics, channels, or locks for interior mutation.
@@ -1031,7 +1124,6 @@ impl Context {
     #[must_use]
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
-        let (mining_sender, mining_notifications) = unbounded();
         let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
             bitcoin_rs_utxo::stats::CoinStats::default(),
         );
@@ -1054,79 +1146,55 @@ impl Context {
             script_index: None,
             prune_service: None,
             chain_control: None,
+            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            mining_control: None,
             network: Arc::new(RwLock::new(NetworkState::default())),
             chain_network: Network::Mainnet,
             peers: Arc::new(RwLock::new(Vec::new())),
             block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
             block_body_source: None,
-            mining_template_id: Arc::new(ArcSwap::from_pointee(CompactString::new("0"))),
-            mining_notifications,
-            inbound_blocks_sender: None,
             p2p_outbound_sender: None,
             banned: Arc::new(parking_lot::RwLock::new(Vec::new())),
             added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
-            mining_sender,
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
         }
     }
-    /// Builds a context that shares pre-existing handles owned elsewhere
-    /// (typically by `bitcoin-rs-node::state::NodeState`).
-    ///
-    /// This is the wiring path for the integration layer: subsystem owners
-    /// pass in their authoritative Arc handles, and RPC handlers observe
-    /// the same state.
+    /// Builds a context that shares pre-existing handles owned elsewhere.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_handles(
-        chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-        mempool: Arc<RwLock<Mempool>>,
-        blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
-        utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
-        coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
-        network: Arc<RwLock<NetworkState>>,
-        mining_template_id: Arc<ArcSwap<CompactString>>,
-        peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
-        block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
-        chain_network: Network,
-        inbound_blocks_sender: Option<crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>>,
-        p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
-        banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
-        added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
-        tx_index: Option<Arc<dyn TxIndexQuery>>,
-        script_index: Option<Arc<dyn ScriptIndexQuery>>,
-    ) -> Self {
-        let (mining_sender, mining_notifications) = unbounded();
+    pub fn from_handles(handles: ContextHandles) -> Self {
         Self {
-            chain_tip,
-            applied_tip,
+            chain_tip: handles.chain_tip,
+            applied_tip: handles.applied_tip,
             chain_transition: Arc::new(Mutex::new(())),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            mempool,
-            blocks,
-            transactions,
-            utxo,
-            coin_stats,
-            tx_index,
+            mempool: handles.mempool,
+            blocks: handles.blocks,
+            transactions: handles.transactions,
+            utxo: handles.utxo,
+            coin_stats: handles.coin_stats,
+            tx_index: handles.tx_index,
             esplora_tx_index: None,
-            script_index,
-            network,
-            chain_network,
-            peers,
-            block_tree,
+            script_index: handles.script_index,
+            network: handles.network,
+            chain_network: handles.chain_network,
+            peers: handles.peers,
+            peer_outbound: handles.peer_outbound,
+            network_active: handles.network_active,
+            block_tree: handles.block_tree,
             block_body_source: None,
-            mining_template_id,
-            mining_notifications,
-            inbound_blocks_sender,
-            p2p_outbound_sender,
-            banned,
-            added_nodes,
+            p2p_outbound_sender: handles.p2p_outbound_sender,
+            banned: handles.banned,
+            added_nodes: handles.added_nodes,
             prune_service: None,
             chain_control: None,
+            mining_control: None,
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
-            mining_sender,
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
         }
     }
 
@@ -1159,6 +1227,13 @@ impl Context {
         self
     }
 
+    /// Attaches the node-owned mining coordinator.
+    #[must_use]
+    pub fn with_mining_control(mut self, mining_control: Arc<dyn MiningControl>) -> Self {
+        self.mining_control = Some(mining_control);
+        self
+    }
+
     /// Shares the node's authoritative connect/disconnect lock with RPC readers.
     #[must_use]
     pub fn with_chain_transition(mut self, chain_transition: Arc<Mutex<()>>) -> Self {
@@ -1177,6 +1252,18 @@ impl Context {
     pub fn with_zmq_notifications(mut self, notifications: Vec<ZmqNotification>) -> Self {
         self.zmq_notifications = Arc::from(notifications);
         self
+    }
+
+    /// Attaches the configured node debug-log path.
+    #[must_use]
+    pub fn with_debug_log_path(mut self, path: PathBuf) -> Self {
+        self.debug_log_path = Some(path);
+        self
+    }
+
+    /// Acquires a bounded full-block REST render slot, if one is available.
+    pub(crate) fn try_acquire_rest_render(&self) -> Option<RestRenderPermit> {
+        self.rest_render_budget.try_acquire()
     }
 
     /// Returns active ZMQ notification metadata.
@@ -1218,12 +1305,9 @@ impl Context {
         difficulty
     }
 
-    /// Publishes a new best-chain tip and wakes getblocktemplate long polls.
+    /// Publishes a new best-chain tip.
     pub fn set_chain_tip(&self, tip: TipSnapshot) {
-        self.mining_template_id
-            .store(Arc::new(CompactString::from(tip.hash.to_string_be())));
         self.chain_tip.store(Some(Arc::new(tip)));
-        let _ignored = self.mining_sender.send(());
     }
 
     /// Publishes a new best-applied-block tip.
@@ -1771,26 +1855,27 @@ mod tests {
         let block_tree = Arc::new(RwLock::new(bitcoin_rs_chain::BlockTree::new()));
         let banned = Arc::new(RwLock::new(Vec::<bitcoin_rs_p2p::BannedSubnet>::new()));
         let added_nodes = Arc::new(RwLock::new(Vec::new()));
-        let ctx = Context::from_handles(
-            Arc::clone(&chain_tip),
-            Arc::clone(&applied_tip),
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Arc::new(RwLock::new(BlockLog::new())),
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::clone(&utxo),
-            Arc::clone(&coin_stats),
-            Arc::new(RwLock::new(NetworkState::default())),
-            Arc::new(ArcSwap::from_pointee(CompactString::new("0"))),
-            Arc::new(RwLock::new(Vec::new())),
-            Arc::clone(&block_tree),
-            Network::Mainnet,
-            None,
-            None,
-            Arc::clone(&banned),
-            Arc::clone(&added_nodes),
-            None,
-            None,
-        );
+        let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
+        let ctx = Context::from_handles(ContextHandles {
+            chain_tip: Arc::clone(&chain_tip),
+            applied_tip: Arc::clone(&applied_tip),
+            mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+            blocks: Arc::new(RwLock::new(BlockLog::new())),
+            transactions: Arc::new(RwLock::new(HashMap::new())),
+            utxo: Arc::clone(&utxo),
+            coin_stats: Arc::clone(&coin_stats),
+            network: Arc::new(RwLock::new(NetworkState::default())),
+            network_active: Arc::clone(&network_active),
+            peers: Arc::new(RwLock::new(Vec::new())),
+            block_tree: Arc::clone(&block_tree),
+            chain_network: Network::Mainnet,
+            p2p_outbound_sender: None,
+            banned: Arc::clone(&banned),
+            added_nodes: Arc::clone(&added_nodes),
+            tx_index: None,
+            script_index: None,
+        });
         assert!(
             Arc::ptr_eq(&ctx.chain_tip, &chain_tip),
             "chain_tip must be shared with caller"
@@ -1812,6 +1897,10 @@ mod tests {
             "block_tree must be shared with caller"
         );
         assert!(
+            Arc::ptr_eq(&ctx.network_active, &network_active),
+            "network activity must be shared with caller"
+        );
+        assert!(
             Arc::ptr_eq(&ctx.banned, &banned),
             "banned must be shared with caller"
         );
@@ -1819,6 +1908,17 @@ mod tests {
             Arc::ptr_eq(&ctx.added_nodes, &added_nodes),
             "added_nodes must be shared with caller"
         );
+    }
+
+    #[test]
+    fn rest_render_budget_releases_dropped_permits() {
+        let ctx = Context::new();
+        let first = ctx.try_acquire_rest_render().expect("first permit");
+        let second = ctx.try_acquire_rest_render().expect("second permit");
+        assert!(ctx.try_acquire_rest_render().is_none());
+        drop(first);
+        assert!(ctx.try_acquire_rest_render().is_some());
+        drop(second);
     }
 
     #[test]
