@@ -34,8 +34,9 @@ consensus test vectors, fuzzing, and differential tests. Strong verification
 allows AI-assisted development to move quickly without treating generated code
 as truth.
 
-Bitcoin Core's development model, however, is optimized for stability and
-compatibility, making radical architectural change increasingly expensive.
+**Bitcoin is well suited to AI-native development; Bitcoin Core's development
+model is not.** Bitcoin Core is optimized for stability and compatibility,
+making radical architectural change increasingly expensive.
 
 **That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while using
 an AI-native development process to pursue a better implementation.**
