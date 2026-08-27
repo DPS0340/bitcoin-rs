@@ -44,11 +44,10 @@ without preserving decades of internal implementation constraints.
   reconsidered. Improvements must be demonstrated with matched whole-node
   benchmarks against Core.
 - **The UTXO set is authoritative coin state.** `bitcoin-rs` exposes the state
-  already maintained for validation through node APIs, so wallets and other
-  applications can build on canonical node state instead of reconstructing
-  overlapping views from chain history. Transaction lookup, script history,
-  wallet data, and other application-specific views remain derived and
-  rebuildable.
+  already maintained for validation through node APIs, giving wallets and other
+  applications a shared foundation for spendable state. Each application
+  remains free to construct its own views without redefining or rebuilding the
+  node's coin state.
 - **Modularity keeps the core isolated and components composable.** Clear
   dependency and failure boundaries keep extensions from destabilizing
   validation or chainstate while allowing components to be reused independently.
