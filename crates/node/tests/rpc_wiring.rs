@@ -36,37 +36,37 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let utxo = Arc::new(UtxoSet::new());
     let coin_stats = state.coin_stats();
     let network = state.network();
+    let network_active = state.network_active();
     let chain_network = state.config().network;
-    let mining_template_id = state.mining_template_id();
     let peers = state.peers();
+    let peer_outbound = state.peer_outbound();
     let block_tree = state.block_tree();
-    let inbound_blocks_sender = state.inbound_blocks_sender();
     let p2p_outbound = Some(state.p2p_outbound_sender());
     let banned = state.banned_subnets();
     let added_nodes = Arc::new(parking_lot::RwLock::new(Vec::new()));
     let Some(tx_index) = state.tx_index_query() else {
         panic!("txindex query engine missing when enabled");
     };
-    let ctx = Context::from_handles(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&mempool),
-        Arc::clone(&blocks),
-        Arc::clone(&transactions),
-        Arc::clone(&utxo),
-        Arc::clone(&coin_stats),
-        Arc::clone(&network),
-        Arc::clone(&mining_template_id),
-        Arc::clone(&peers),
-        Arc::clone(&block_tree),
+    let ctx = Context::from_handles(bitcoin_rs_rpc::context::ContextHandles {
+        chain_tip: Arc::clone(&chain_tip),
+        applied_tip: Arc::clone(&applied_tip),
+        mempool: Arc::clone(&mempool),
+        blocks: Arc::clone(&blocks),
+        transactions: Arc::clone(&transactions),
+        utxo: Arc::clone(&utxo),
+        coin_stats: Arc::clone(&coin_stats),
+        network: Arc::clone(&network),
+        network_active: Arc::clone(&network_active),
         chain_network,
-        Some(inbound_blocks_sender),
-        p2p_outbound,
-        Arc::clone(&banned),
-        Arc::clone(&added_nodes),
-        Some(tx_index),
-        None,
-    )
+        peers: Arc::clone(&peers),
+        peer_outbound: Arc::clone(&peer_outbound),
+        block_tree: Arc::clone(&block_tree),
+        p2p_outbound_sender: p2p_outbound,
+        banned: Arc::clone(&banned),
+        added_nodes: Arc::clone(&added_nodes),
+        tx_index: Some(tx_index),
+        script_index: None,
+    })
     .with_zmq_notifications(state.active_zmq_notifications());
 
     assert!(
@@ -107,23 +107,23 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         Arc::ptr_eq(&ctx.network, &network),
         "network must share identity"
     );
+    assert!(
+        Arc::ptr_eq(&ctx.network_active, &network_active),
+        "network activity must share identity"
+    );
     assert_eq!(
         ctx.chain_network,
         state.config().network,
         "chain_network must match"
     );
-    assert!(
-        Arc::ptr_eq(&ctx.mining_template_id, &mining_template_id),
-        "mining_template_id must share identity"
-    );
     assert!(Arc::ptr_eq(&ctx.peers, &peers), "peers must share identity");
+    assert!(
+        Arc::ptr_eq(&ctx.peer_outbound, &peer_outbound),
+        "peer_outbound must share identity"
+    );
     assert!(
         Arc::ptr_eq(&ctx.block_tree, &block_tree),
         "block_tree must share identity"
-    );
-    assert!(
-        ctx.inbound_blocks_sender.is_some(),
-        "inbound_blocks_sender must be Some"
     );
     assert!(
         ctx.p2p_outbound_sender.is_some(),

@@ -20,7 +20,7 @@ use bitcoin::{
 use bitcoin_rs_chain::{BlockTree, NodeStatus};
 use bitcoin_rs_node::{
     Config, Network,
-    metrics::{MetricValue, MetricsHandle, install_metrics},
+    metrics::{MetricValue, MetricsHandle},
     state::NodeState,
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
@@ -215,7 +215,7 @@ fn print_utxo_fanout_commit_metrics(name: &str, with_listener: bool) {
 
 fn install_diagnostic_metrics() -> MetricsHandle {
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    install_metrics(Some(bind))
+    bitcoin_rs_node::metrics::install_diagnostic_metrics(Some(bind))
         .unwrap_or_else(|error| panic!("install metrics recorder failed: {error}"))
         .unwrap_or_else(|| panic!("metrics recorder was not installed"))
 }

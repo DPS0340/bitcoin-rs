@@ -5,7 +5,7 @@
 //! used by [`crate::crash_recovery`]. Subsystem wiring (chain / utxo / mempool
 //! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
@@ -13,7 +13,6 @@ use bitcoin_rs_rpc::context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
 };
-use compact_str::CompactString;
 use core::fmt;
 use core::mem::size_of;
 use crossbeam_channel::{Receiver, Sender};
@@ -851,6 +850,8 @@ pub struct NodeState {
     blocks: Arc<RwLock<BlockLog>>,
     transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     network: Arc<RwLock<NetworkState>>,
+    /// Shared P2P admission switch controlled by `setnetworkactive`.
+    network_active: Arc<AtomicBool>,
     peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
     /// Per-peer outbound message senders, keyed by remote socket address.
     /// External code pushes messages here; the per-connection thread drains
@@ -865,7 +866,6 @@ pub struct NodeState {
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
     apply_handles: crate::apply::ApplyHandles,
     sync: Arc<crate::BlockSync>,
-    mining_template_id: Arc<ArcSwap<CompactString>>,
     replayed: Mutex<Vec<u32>>,
 }
 
@@ -968,10 +968,16 @@ impl NodeState {
                 )
             })
             .collect();
+        #[cfg(feature = "zmq")]
         let zmq_publisher: Arc<dyn crate::ZmqPublisher> = if zmq_publications.is_empty() {
             Arc::new(crate::NoOpZmqPublisher)
         } else {
             Arc::new(crate::SocketZmqPublisher::bind(&zmq_publications)?)
+        };
+        #[cfg(not(feature = "zmq"))]
+        let zmq_publisher: Arc<dyn crate::ZmqPublisher> = {
+            let _ = &zmq_publications;
+            Arc::new(crate::NoOpZmqPublisher)
         };
         let (
             mut utxo_set,
@@ -1077,13 +1083,13 @@ impl NodeState {
             None => (None, None, None),
         };
         let network = Arc::new(RwLock::new(NetworkState::default()));
+        let network_active = Arc::new(AtomicBool::new(true));
         let peers = Arc::new(RwLock::new(Vec::new()));
         let banned = Arc::new(RwLock::new(Vec::new()));
         let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
         let (p2p_outbound_tx, p2p_outbound_rx_raw) =
             crossbeam_channel::bounded(P2P_OUTBOUND_QUEUE_LIMIT);
         let p2p_outbound_rx = Arc::new(Mutex::new(p2p_outbound_rx_raw));
-        let mining_template_id = Arc::new(ArcSwap::from_pointee(CompactString::new("0")));
         let (inbound_headers_tx, inbound_headers_rx_raw) =
             crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
         let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
@@ -1172,6 +1178,7 @@ impl NodeState {
             blocks,
             transactions,
             network,
+            network_active,
             peers,
             peer_outbound,
             banned,
@@ -1182,7 +1189,6 @@ impl NodeState {
             inbound_blocks_tx,
             inbound_blocks_rx,
             apply_handles,
-            mining_template_id,
             sync,
             replayed: Mutex::new(Vec::new()),
         })
@@ -1398,6 +1404,12 @@ impl NodeState {
         Arc::clone(&self.network)
     }
 
+    /// Returns the shared P2P admission switch exposed to RPC and P2P workers.
+    #[must_use]
+    pub fn network_active(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.network_active)
+    }
+
     /// Returns the shared registry of currently-handshook peers.
     #[must_use]
     pub fn peers(&self) -> Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>> {
@@ -1476,12 +1488,6 @@ impl NodeState {
     #[must_use]
     pub fn sync(&self) -> Arc<crate::BlockSync> {
         Arc::clone(&self.sync)
-    }
-
-    /// Returns the shared getblocktemplate long-poll id.
-    #[must_use]
-    pub fn mining_template_id(&self) -> Arc<ArcSwap<CompactString>> {
-        Arc::clone(&self.mining_template_id)
     }
 
     /// Heights walked by the most recent crash-recovery replay.
@@ -1903,7 +1909,6 @@ mod tests {
         let blocks = state.blocks();
         let transactions = state.transactions();
         let network = state.network();
-        let mining_template_id = state.mining_template_id();
 
         assert!(chain_tip.load().is_none(), "fresh chain tip must be empty");
         assert!(blocks.read().is_empty(), "fresh blocks must be empty");
@@ -1912,7 +1917,6 @@ mod tests {
             "fresh transactions must be empty"
         );
         assert_eq!(network.read().connection_count, 0);
-        assert_eq!(mining_template_id.load().as_str(), "0");
 
         Ok(())
     }
