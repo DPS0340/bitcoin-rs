@@ -24,11 +24,12 @@ bitcoin-rs asks a simple question:
 It is an independent implementation of the same Bitcoin, not a new protocol or
 a different set of consensus rules.
 
-**Why now?** AI makes a serious independent implementation practical for a much
-smaller team, but AI is not the source of truth. Bitcoin Core,
+**Why now?** AI changes the economics of independent implementation: work that
+once demanded a large expert team over years can now be attempted by a much
+smaller team. Bitcoin makes that effort unusually verifiable. Bitcoin Core,
 `libbitcoinkernel`, historical chain data, consensus vectors, fuzzing, and
-differential tests provide independent, reproducible oracles for detecting
-divergence.
+differential tests provide independent, reproducible ways to verify correctness
+and detect divergence.
 
 That independence benefits the broader Bitcoin ecosystem. A separately
 designed codebase cross-checks consensus interpretation, reduces the risk of
