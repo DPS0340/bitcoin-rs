@@ -35,5 +35,10 @@ tracing.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 tempfile = "3"
+
+[[bench]]
+name = "write_message"
+harness = false
