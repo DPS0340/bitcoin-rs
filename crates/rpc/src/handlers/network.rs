@@ -177,6 +177,16 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
                 .map(str::to_owned)
                 .collect(),
             relay_transactions: true,
+            // Not measured. The corepc v31 types make these non-optional, so
+            // the struct emits a number whether or not one exists, and a zero
+            // here is indistinguishable from a peer that has genuinely sent
+            // nothing. The compatibility test cannot tell the difference
+            // either -- it deserializes the response back into this same
+            // struct, so a plausible number is exactly what it expects.
+            //
+            // #107 adds the per-connection counters and the time offset these
+            // want; until it lands, treat every zero below as absent rather
+            // than as measured.
             last_send: 0,
             last_received: 0,
             last_transaction: 0,
@@ -208,6 +218,9 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             addresses_processed: Some(0),
             addresses_rate_limited: Some(0),
             permissions: Vec::new(),
+            // Not measured either, for the same reason as the counters above:
+            // an empty map and a zero are what this node has to send when the
+            // type will not let it send nothing.
             minimum_fee_filter: 0.0,
             bytes_sent_per_message: BTreeMap::new(),
             bytes_received_per_message: BTreeMap::new(),
