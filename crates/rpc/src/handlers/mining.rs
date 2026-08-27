@@ -190,8 +190,11 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
         .and_then(JsonValueTrait::as_i64)
         .or_else(|| array.get(1).and_then(JsonValueTrait::as_i64))
         .ok_or(RpcError::InvalidParams("fee_delta is required"))?;
-    let bumped = ctx.mempool.write().prioritise(txid, fee_delta);
-    Ok(json!(bumped))
+    ctx.mempool
+        .write()
+        .prioritise(txid, fee_delta)
+        .map_err(|_| RpcError::InvalidParams("fee delta would overflow"))?;
+    Ok(json!(true))
 }
 #[cfg(test)]
 mod submitblock_tests {
