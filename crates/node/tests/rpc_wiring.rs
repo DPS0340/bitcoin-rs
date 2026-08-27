@@ -47,26 +47,26 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let Some(tx_index) = state.tx_index_query() else {
         panic!("txindex query engine missing when enabled");
     };
-    let ctx = Context::from_handles(
-        Arc::clone(&chain_tip),
-        Arc::clone(&applied_tip),
-        Arc::clone(&mempool),
-        Arc::clone(&blocks),
-        Arc::clone(&transactions),
-        Arc::clone(&utxo),
-        Arc::clone(&coin_stats),
-        Arc::clone(&network),
-        Arc::clone(&mining_template_id),
-        Arc::clone(&peers),
-        Arc::clone(&block_tree),
+    let ctx = Context::from_handles(bitcoin_rs_rpc::context::ContextHandles {
+        chain_tip: Arc::clone(&chain_tip),
+        applied_tip: Arc::clone(&applied_tip),
+        mempool: Arc::clone(&mempool),
+        blocks: Arc::clone(&blocks),
+        transactions: Arc::clone(&transactions),
+        utxo: Arc::clone(&utxo),
+        coin_stats: Arc::clone(&coin_stats),
+        network: Arc::clone(&network),
         chain_network,
-        Some(inbound_blocks_sender),
-        p2p_outbound,
-        Arc::clone(&banned),
-        Arc::clone(&added_nodes),
-        Some(tx_index),
-        None,
-    )
+        mining_template_id: Arc::clone(&mining_template_id),
+        peers: Arc::clone(&peers),
+        block_tree: Arc::clone(&block_tree),
+        inbound_blocks_sender: Some(inbound_blocks_sender),
+        p2p_outbound_sender: p2p_outbound,
+        banned: Arc::clone(&banned),
+        added_nodes: Arc::clone(&added_nodes),
+        tx_index: Some(tx_index),
+        script_index: None,
+    })
     .with_zmq_notifications(state.active_zmq_notifications());
 
     assert!(
