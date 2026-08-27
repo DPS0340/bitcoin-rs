@@ -343,6 +343,7 @@ fn getindexinfo_returns_txindex_when_indexer_is_available() -> Result<(), Box<dy
 {
     let mut ctx = Context::new();
     ctx.tx_index = Some(Arc::new(FakeTxIndex {
+        transactions: HashMap::new(),
         values: HashMap::new(),
         info: bitcoin_rs_rpc::context::TxIndexInfo {
             synced: false,
@@ -533,6 +534,7 @@ fn removed_wallet_methods_return_method_not_found() {
 }
 
 struct FakeTxIndex {
+    transactions: HashMap<Txid, Transaction>,
     values: HashMap<OutPoint, u64>,
     info: bitcoin_rs_rpc::context::TxIndexInfo,
 }
@@ -540,9 +542,9 @@ struct FakeTxIndex {
 impl bitcoin_rs_rpc::context::TxIndexQuery for FakeTxIndex {
     fn transaction(
         &self,
-        _txid: &Txid,
+        txid: &Txid,
     ) -> Result<Option<Transaction>, bitcoin_rs_rpc::context::TxQueryError> {
-        Ok(None)
+        Ok(self.transactions.get(txid).cloned())
     }
 
     fn outpoint_value(
@@ -568,7 +570,23 @@ fn fee_stats_context(
     let block = fee_block(low_tx.clone(), high_tx.clone());
     let mut ctx = Context::new();
     if let Some(values) = values {
+        let mut transactions = HashMap::new();
+        for label in [21_u8, 22] {
+            transactions.insert(
+                Txid::from_byte_array([label; 32]),
+                Transaction {
+                    version: bitcoin::transaction::Version::TWO,
+                    lock_time: bitcoin::absolute::LockTime::ZERO,
+                    input: Vec::new(),
+                    output: vec![TxOut {
+                        value: Amount::from_sat(10_000),
+                        script_pubkey: ScriptBuf::new(),
+                    }],
+                },
+            );
+        }
         ctx.tx_index = Some(Arc::new(FakeTxIndex {
+            transactions,
             values,
             info: bitcoin_rs_rpc::context::TxIndexInfo {
                 synced: true,
@@ -752,6 +770,7 @@ impl Fixture {
         let mut values = HashMap::new();
         values.insert(outpoint(1), 6_000);
         ctx.tx_index = Some(Arc::new(FakeTxIndex {
+            transactions: HashMap::new(),
             values,
             info: bitcoin_rs_rpc::context::TxIndexInfo {
                 synced: true,
