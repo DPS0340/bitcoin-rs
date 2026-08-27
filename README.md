@@ -47,8 +47,9 @@ without preserving decades of internal implementation constraints.
   application ecosystem grew by rebuilding or duplicating wallet-, Electrum-,
   and explorer-specific views around the same chain data. `bitcoin-rs`
   simplifies that boundary: the node owns the canonical UTXO set maintained for
-  validation and exposes a minimal Electrum-compatible index through Esplora,
-  while wallet-specific keys, policies, and metadata remain outside the node.
+  validation and exposes an integrated Electrum-compatible script index through
+  Esplora, avoiding a separate indexer and duplicate chain ingestion.
+  Wallet-specific keys, policies, and metadata remain outside the node.
   Consumers build on node state; they do not redefine where Bitcoin's coin
   state lives.
 - **Modularity keeps the core isolated and components composable.** Clear
