@@ -71,6 +71,7 @@ impl Handler {
             "getrpcinfo" => util::getrpcinfo(&self.ctx, params),
             "getmemoryinfo" => util::getmemoryinfo(&self.ctx, params),
             "estimaterawfee" => util::estimaterawfee(&self.ctx, params),
+            #[cfg(feature = "zmq")]
             "getzmqnotifications" => util::getzmqnotifications(&self.ctx, params),
             "validateaddress" => util::validateaddress(&self.ctx, params),
             "getdescriptorinfo" => util::getdescriptorinfo(&self.ctx, params),

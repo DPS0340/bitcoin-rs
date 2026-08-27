@@ -579,27 +579,28 @@ pub fn run(mut config: Config) -> Result<()> {
     let peer_registered = sync.peer_registration_handle();
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let rpc_auth = Arc::new(build_rpc_auth(&state.config().rpc_auth)?);
-    let mut rpc_context = bitcoin_rs_rpc::context::Context::from_handles(
-        state.chain_tip(),
-        state.applied_tip(),
-        state.mempool(),
-        state.blocks(),
-        state.transactions(),
-        state.utxo(),
-        state.coin_stats(),
-        state.network(),
-        state.mining_template_id(),
-        state.peers(),
-        state.block_tree(),
-        state.config().network,
-        Some(state.inbound_blocks_sender()),
-        Some(state.p2p_outbound_sender()),
-        Arc::clone(&banned),
-        Arc::new(parking_lot::RwLock::new(Vec::new())),
-        state.tx_index_query(),
-        state.script_index_query(),
-    )
-    .with_esplora_tx_index(state.esplora_tx_index_query());
+    let mut rpc_context =
+        bitcoin_rs_rpc::context::Context::from_handles(bitcoin_rs_rpc::context::ContextHandles {
+            chain_tip: state.chain_tip(),
+            applied_tip: state.applied_tip(),
+            mempool: state.mempool(),
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: state.utxo(),
+            coin_stats: state.coin_stats(),
+            network: state.network(),
+            mining_template_id: state.mining_template_id(),
+            peers: state.peers(),
+            block_tree: state.block_tree(),
+            chain_network: state.config().network,
+            inbound_blocks_sender: Some(state.inbound_blocks_sender()),
+            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+            banned: Arc::clone(&banned),
+            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            tx_index: state.tx_index_query(),
+            script_index: state.script_index_query(),
+        })
+        .with_esplora_tx_index(state.esplora_tx_index_query());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
     rpc_context = rpc_context.with_chain_tx_count(state.chain_tx_count_handle());
     rpc_context =

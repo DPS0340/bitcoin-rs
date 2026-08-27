@@ -109,6 +109,7 @@ fn read_linux_rss_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(feature = "zmq")]
 pub(crate) fn getzmqnotifications(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
     let notifications: Vec<_> = ctx
@@ -416,6 +417,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "zmq")]
     #[test]
     fn getzmqnotifications_returns_empty_array() {
         use alloc::sync::Arc;
@@ -429,6 +431,7 @@ mod tests {
         assert!(arr.is_empty());
     }
 
+    #[cfg(feature = "zmq")]
     #[test]
     fn getzmqnotifications_returns_active_metadata() {
         use alloc::sync::Arc;
