@@ -635,24 +635,35 @@ pub fn run(mut config: Config) -> Result<()> {
     let rpc_auth = Arc::new(build_rpc_auth(&state.config().rpc_auth)?);
     let mut rpc_context =
         bitcoin_rs_rpc::context::Context::from_handles(bitcoin_rs_rpc::context::ContextHandles {
-            chain_tip: state.chain_tip(),
-            applied_tip: state.applied_tip(),
-            mempool: state.mempool(),
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: state.utxo(),
-            coin_stats: state.coin_stats(),
-            network: state.network(),
-            network_active: Arc::clone(&network_active),
-            peers: state.peers(),
-            peer_outbound: state.peer_outbound(),
-            block_tree: state.block_tree(),
-            chain_network: state.config().network,
-            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-            banned: Arc::clone(&banned),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            tx_index: state.tx_index_query(),
-            script_index: state.script_index_query(),
+            chain: bitcoin_rs_rpc::context::ChainHandles {
+                chain_tip: state.chain_tip(),
+                applied_tip: state.applied_tip(),
+                blocks: state.blocks(),
+                transactions: state.transactions(),
+                utxo: state.utxo(),
+                coin_stats: state.coin_stats(),
+                block_tree: state.block_tree(),
+                chain_network: state.config().network,
+            },
+            mempool: bitcoin_rs_rpc::context::MempoolHandles {
+                mempool: state.mempool(),
+            },
+            indexes: bitcoin_rs_rpc::context::IndexHandles {
+                tx_index: state.tx_index_query(),
+                script_index: state.script_index_query(),
+            },
+            network: bitcoin_rs_rpc::context::NetworkHandles {
+                network: state.network(),
+                network_active: Arc::clone(&network_active),
+                peers: state.peers(),
+                peer_outbound: state.peer_outbound(),
+                p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+                banned: Arc::clone(&banned),
+                added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            },
+            mining: bitcoin_rs_rpc::context::MiningHandles {
+                mining_control: Some(Arc::clone(&mining_control)),
+            },
         })
         .with_esplora_tx_index(state.esplora_tx_index_query());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
@@ -666,7 +677,6 @@ pub fn run(mut config: Config) -> Result<()> {
         handles: state.apply_handles(),
     }));
     rpc_context = rpc_context.with_zmq_notifications(state.active_zmq_notifications());
-    rpc_context = rpc_context.with_mining_control(Arc::clone(&mining_control));
     rpc_context = rpc_context.with_debug_log_path(state.data_dir().join("debug.log"));
     let rpc_handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::new(rpc_context)));
     let rpc_server = bitcoin_rs_rpc::RpcServer::bind(

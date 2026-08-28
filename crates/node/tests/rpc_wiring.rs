@@ -48,24 +48,35 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         panic!("txindex query engine missing when enabled");
     };
     let ctx = Context::from_handles(bitcoin_rs_rpc::context::ContextHandles {
-        chain_tip: Arc::clone(&chain_tip),
-        applied_tip: Arc::clone(&applied_tip),
-        mempool: Arc::clone(&mempool),
-        blocks: Arc::clone(&blocks),
-        transactions: Arc::clone(&transactions),
-        utxo: Arc::clone(&utxo),
-        coin_stats: Arc::clone(&coin_stats),
-        network: Arc::clone(&network),
-        network_active: Arc::clone(&network_active),
-        chain_network,
-        peers: Arc::clone(&peers),
-        peer_outbound: Arc::clone(&peer_outbound),
-        block_tree: Arc::clone(&block_tree),
-        p2p_outbound_sender: p2p_outbound,
-        banned: Arc::clone(&banned),
-        added_nodes: Arc::clone(&added_nodes),
-        tx_index: Some(tx_index),
-        script_index: None,
+        chain: bitcoin_rs_rpc::context::ChainHandles {
+            chain_tip: Arc::clone(&chain_tip),
+            applied_tip: Arc::clone(&applied_tip),
+            blocks: Arc::clone(&blocks),
+            transactions: Arc::clone(&transactions),
+            utxo: Arc::clone(&utxo),
+            coin_stats: Arc::clone(&coin_stats),
+            block_tree: Arc::clone(&block_tree),
+            chain_network,
+        },
+        mempool: bitcoin_rs_rpc::context::MempoolHandles {
+            mempool: Arc::clone(&mempool),
+        },
+        indexes: bitcoin_rs_rpc::context::IndexHandles {
+            tx_index: Some(tx_index),
+            script_index: None,
+        },
+        network: bitcoin_rs_rpc::context::NetworkHandles {
+            network: Arc::clone(&network),
+            network_active: Arc::clone(&network_active),
+            peers: Arc::clone(&peers),
+            peer_outbound: Arc::clone(&peer_outbound),
+            p2p_outbound_sender: p2p_outbound,
+            banned: Arc::clone(&banned),
+            added_nodes: Arc::clone(&added_nodes),
+        },
+        mining: bitcoin_rs_rpc::context::MiningHandles {
+            mining_control: None,
+        },
     })
     .with_zmq_notifications(state.active_zmq_notifications());
 

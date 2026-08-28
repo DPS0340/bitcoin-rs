@@ -7,7 +7,7 @@ use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, TxOut, consensus_bytes, deserialize,
 };
-use bitcoin_rs_storage::pruning::policy::CORE_REORG_SAFETY_MARGIN;
+use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
 use hashbrown::HashMap;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 

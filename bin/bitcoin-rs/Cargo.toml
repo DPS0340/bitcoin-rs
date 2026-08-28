@@ -78,3 +78,7 @@ path = "tests/gates/g13_lints_clean.rs"
 [[test]]
 name = "g15_workspace_version_sync"
 path = "tests/gates/g15_workspace_version_sync.rs"
+
+[[test]]
+name = "g17_dependency_direction"
+path = "tests/gates/g17_dependency_direction.rs"

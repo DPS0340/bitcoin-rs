@@ -13,10 +13,6 @@ workspace = true
 
 [features]
 default = []
-rocksdb = ["bitcoin-rs-utxo/rocksdb", "bitcoin-rs-storage/rocksdb", "bitcoin-rs-p2p/rocksdb"]
-fjall = ["bitcoin-rs-utxo/fjall", "bitcoin-rs-storage/fjall", "bitcoin-rs-p2p/fjall"]
-redb = ["bitcoin-rs-utxo/redb", "bitcoin-rs-storage/redb", "bitcoin-rs-p2p/redb"]
-mdbx = ["bitcoin-rs-storage/mdbx"]
 zmq = []
 
 [dependencies]
@@ -28,7 +24,6 @@ bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
 bitcoin-rs-utxo.workspace = true
 bitcoin-rs-mining.workspace = true
-bitcoin-rs-storage.workspace = true
 bitcoin.workspace = true
 miniscript.workspace = true
 sonic-rs.workspace = true
@@ -48,6 +43,10 @@ bitcoin-rs-node = { workspace = true, features = ["fjall"] }
 proptest.workspace = true
 tempfile = "3"
 criterion.workspace = true
+# Bench-only backend: `txoutproof` benchmarks `gettxoutproof` against a real
+# on-disk index. This is a dev-dependency feature, not a passthrough: the rpc
+# crate itself exposes no backend feature and gates no code on one.
+bitcoin-rs-storage = { workspace = true, features = ["rocksdb"] }
 
 [[bench]]
 name = "chaininfo"
@@ -60,4 +59,3 @@ harness = false
 [[bench]]
 name = "txoutproof"
 harness = false
-required-features = ["rocksdb"]

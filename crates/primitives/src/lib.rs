@@ -13,6 +13,8 @@ pub mod header;
 pub mod ids;
 /// Bitcoin network constants.
 pub mod network;
+/// Chain-level policy constants shared across tiers.
+pub mod chain_constants;
 /// Fixed-layout transaction outpoint.
 pub mod outpoint;
 /// Native signature-hash computation for legacy, segwit v0, and taproot.

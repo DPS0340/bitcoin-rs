@@ -15,7 +15,10 @@ use bitcoin_rs_primitives::{
     deserialize as native_deserialize,
 };
 use bitcoin_rs_rpc::Handler;
-use bitcoin_rs_rpc::context::{Context, ContextHandles, MiningControl};
+use bitcoin_rs_rpc::context::{
+    ChainHandles, Context, ContextHandles, IndexHandles, MempoolHandles, MiningControl,
+    MiningHandles, NetworkHandles,
+};
 use bitcoin_rs_utxo::UtxoSet;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
@@ -378,26 +381,36 @@ fn mining_handler(state: &NodeState) -> Handler {
     .with_mempool_update_wait(Duration::ZERO);
     let mining_control: Arc<dyn MiningControl> = Arc::new(coordinator);
     let ctx = Context::from_handles(ContextHandles {
-        chain_tip: state.chain_tip(),
-        applied_tip: state.applied_tip(),
-        mempool: state.mempool(),
-        blocks: state.blocks(),
-        transactions: state.transactions(),
-        utxo: Arc::new(UtxoSet::new()),
-        coin_stats: state.coin_stats(),
-        network: state.network(),
-        network_active: state.network_active(),
-        peers: state.peers(),
-        peer_outbound: state.peer_outbound(),
-        block_tree: state.block_tree(),
-        chain_network: state.config().network,
-        p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-        banned: state.banned_subnets(),
-        added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-        tx_index: None,
-        script_index: None,
-    })
-    .with_mining_control(mining_control);
+        chain: ChainHandles {
+            chain_tip: state.chain_tip(),
+            applied_tip: state.applied_tip(),
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: Arc::new(UtxoSet::new()),
+            coin_stats: state.coin_stats(),
+            block_tree: state.block_tree(),
+            chain_network: state.config().network,
+        },
+        mempool: MempoolHandles {
+            mempool: state.mempool(),
+        },
+        indexes: IndexHandles {
+            tx_index: None,
+            script_index: None,
+        },
+        network: NetworkHandles {
+            network: state.network(),
+            network_active: state.network_active(),
+            peers: state.peers(),
+            peer_outbound: state.peer_outbound(),
+            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+            banned: state.banned_subnets(),
+            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        },
+        mining: MiningHandles {
+            mining_control: Some(mining_control),
+        },
+    });
     Handler::new(Arc::new(ctx))
 }
 

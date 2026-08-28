@@ -982,15 +982,34 @@ impl TxQueryError {
     }
 }
 
-/// Handles owned by the node and observed by the RPC context.
+/// Handles owned by the node and observed by the RPC context, grouped by
+/// node capability: chain, mempool, indexes, network, and mining.
+///
+/// A struct-of-structs grouping, not a trait layer. `Context::from_handles`
+/// consumes one `ContextHandles` value and the handler surface reads only
+/// these capability groups — RPC consumes node capabilities and never names a
+/// storage backend or backend engine type.
 #[derive(Clone)]
 pub struct ContextHandles {
+    /// Chain capability: tips, block log, UTXO set, and block tree.
+    pub chain: ChainHandles,
+    /// Mempool capability: the in-memory transaction pool.
+    pub mempool: MempoolHandles,
+    /// Index capability: transaction and script index query adapters.
+    pub indexes: IndexHandles,
+    /// Network capability: peer registry, reachability, and connection control.
+    pub network: NetworkHandles,
+    /// Mining capability: the template coordinator, when one is attached.
+    pub mining: MiningHandles,
+}
+
+/// Chain capability handles.
+#[derive(Clone)]
+pub struct ChainHandles {
     /// Best header-chain tip.
     pub chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Best fully-applied block tip.
     pub applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    /// In-memory mempool.
-    pub mempool: Arc<RwLock<Mempool>>,
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
@@ -999,6 +1018,31 @@ pub struct ContextHandles {
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO statistics.
     pub coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
+    /// Shared block tree.
+    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
+    /// Consensus network.
+    pub chain_network: Network,
+}
+
+/// Mempool capability handles.
+#[derive(Clone)]
+pub struct MempoolHandles {
+    /// In-memory mempool.
+    pub mempool: Arc<RwLock<Mempool>>,
+}
+
+/// Index capability handles.
+#[derive(Clone)]
+pub struct IndexHandles {
+    /// Complete transaction-index query adapter.
+    pub tx_index: Option<Arc<dyn TxIndexQuery>>,
+    /// Generic script-index query adapter.
+    pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+}
+
+/// Network capability handles.
+#[derive(Clone)]
+pub struct NetworkHandles {
     /// Network state.
     pub network: Arc<RwLock<NetworkState>>,
     /// Whether the node accepts or starts P2P connections.
@@ -1007,20 +1051,19 @@ pub struct ContextHandles {
     pub peers: Arc<RwLock<Vec<bitcoin_rs_p2p::PeerInfo>>>,
     /// Live per-peer outbound control handles.
     pub peer_outbound: Arc<RwLock<HashMap<std::net::SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
-    /// Shared block tree.
-    pub block_tree: Arc<parking_lot::RwLock<bitcoin_rs_chain::BlockTree>>,
-    /// Consensus network.
-    pub chain_network: Network,
     /// Channel that requests outbound P2P connections.
     pub p2p_outbound_sender: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
     /// Manual IP/CIDR bans.
     pub banned: Arc<parking_lot::RwLock<Vec<bitcoin_rs_p2p::BannedSubnet>>>,
     /// Persisted `addnode add` entries.
     pub added_nodes: Arc<parking_lot::RwLock<Vec<std::net::SocketAddr>>>,
-    /// Complete transaction-index query adapter.
-    pub tx_index: Option<Arc<dyn TxIndexQuery>>,
-    /// Generic script-index query adapter.
-    pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+}
+
+/// Mining capability handles.
+#[derive(Clone)]
+pub struct MiningHandles {
+    /// Node-owned mining coordinator. `None` when mining is not wired.
+    pub mining_control: Option<Arc<dyn MiningControl>>,
 }
 
 /// Shared state consumed by JSON-RPC handlers.
@@ -1172,33 +1215,62 @@ impl Context {
     /// Builds a context that shares pre-existing handles owned elsewhere.
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
+        let ContextHandles {
+            chain:
+                ChainHandles {
+                    chain_tip,
+                    applied_tip,
+                    blocks,
+                    transactions,
+                    utxo,
+                    coin_stats,
+                    block_tree,
+                    chain_network,
+                },
+            mempool: MempoolHandles { mempool },
+            indexes: IndexHandles {
+                tx_index,
+                script_index,
+            },
+            network:
+                NetworkHandles {
+                    network,
+                    network_active,
+                    peers,
+                    peer_outbound,
+                    p2p_outbound_sender,
+                    banned,
+                    added_nodes,
+                },
+            mining: MiningHandles { mining_control },
+        } = handles;
         Self {
-            chain_tip: handles.chain_tip,
-            applied_tip: handles.applied_tip,
+            chain_tip,
+            applied_tip,
             chain_transition: Arc::new(Mutex::new(())),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            mempool: handles.mempool,
-            blocks: handles.blocks,
-            transactions: handles.transactions,
-            utxo: handles.utxo,
-            coin_stats: handles.coin_stats,
-            tx_index: handles.tx_index,
+            mempool,
+            blocks,
+            transactions,
+            utxo,
+            coin_stats,
+            tx_index,
             esplora_tx_index: None,
-            script_index: handles.script_index,
-            network: handles.network,
-            chain_network: handles.chain_network,
-            peers: handles.peers,
-            peer_outbound: handles.peer_outbound,
-            network_active: handles.network_active,
-            block_tree: handles.block_tree,
+            script_index,
+            network,
+            chain_network,
+            peers,
+            peer_outbound,
+            network_active,
+            block_tree,
             block_body_source: None,
-            p2p_outbound_sender: handles.p2p_outbound_sender,
-            banned: handles.banned,
-            added_nodes: handles.added_nodes,
+            p2p_outbound_sender,
+            banned,
+            added_nodes,
             prune_service: None,
             chain_control: None,
-            mining_control: None,
+            mining_control,
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -1227,6 +1299,15 @@ impl Context {
         self
     }
 
+    /// Attaches the node-owned mining coordinator to a context built without
+    /// handles (`Context::new`). Production wiring passes the coordinator
+    /// through `ContextHandles::mining` instead.
+    #[must_use]
+    pub fn with_mining_control(mut self, mining_control: Arc<dyn MiningControl>) -> Self {
+        self.mining_control = Some(mining_control);
+        self
+    }
+
     /// Attaches the node-owned chain mutation service.
     #[must_use]
     pub fn with_chain_control(mut self, chain_control: Arc<dyn ChainControl>) -> Self {
@@ -1234,12 +1315,6 @@ impl Context {
         self
     }
 
-    /// Attaches the node-owned mining coordinator.
-    #[must_use]
-    pub fn with_mining_control(mut self, mining_control: Arc<dyn MiningControl>) -> Self {
-        self.mining_control = Some(mining_control);
-        self
-    }
 
     /// Shares the node's authoritative connect/disconnect lock with RPC readers.
     #[must_use]
@@ -1851,24 +1926,35 @@ mod tests {
         let added_nodes = Arc::new(RwLock::new(Vec::new()));
         let network_active = Arc::new(core::sync::atomic::AtomicBool::new(true));
         let ctx = Context::from_handles(ContextHandles {
-            chain_tip: Arc::clone(&chain_tip),
-            applied_tip: Arc::clone(&applied_tip),
-            mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
-            blocks: Arc::new(RwLock::new(BlockLog::new())),
-            transactions: Arc::new(RwLock::new(HashMap::new())),
-            utxo: Arc::clone(&utxo),
-            coin_stats: Arc::clone(&coin_stats),
-            network: Arc::new(RwLock::new(NetworkState::default())),
-            network_active: Arc::clone(&network_active),
-            peers: Arc::new(RwLock::new(Vec::new())),
-            block_tree: Arc::clone(&block_tree),
-            chain_network: Network::Mainnet,
-            p2p_outbound_sender: None,
-            banned: Arc::clone(&banned),
-            added_nodes: Arc::clone(&added_nodes),
-            tx_index: None,
-            script_index: None,
+            chain: ChainHandles {
+                chain_tip: Arc::clone(&chain_tip),
+                applied_tip: Arc::clone(&applied_tip),
+                blocks: Arc::new(RwLock::new(BlockLog::new())),
+                transactions: Arc::new(RwLock::new(HashMap::new())),
+                utxo: Arc::clone(&utxo),
+                coin_stats: Arc::clone(&coin_stats),
+                block_tree: Arc::clone(&block_tree),
+                chain_network: Network::Mainnet,
+            },
+            mempool: MempoolHandles {
+                mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            },
+            indexes: IndexHandles {
+                tx_index: None,
+                script_index: None,
+            },
+            network: NetworkHandles {
+                network: Arc::new(RwLock::new(NetworkState::default())),
+                network_active: Arc::clone(&network_active),
+                peers: Arc::new(RwLock::new(Vec::new())),
+                peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+                p2p_outbound_sender: None,
+                banned: Arc::clone(&banned),
+                added_nodes: Arc::clone(&added_nodes),
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
         });
         assert!(
             Arc::ptr_eq(&ctx.chain_tip, &chain_tip),
