@@ -121,6 +121,7 @@ tempfile = "3"
 proptest.workspace = true
 anyhow.workspace = true
 criterion.workspace = true
+sonic-rs.workspace = true
 
 [[bench]]
 name = "sync_pipeline"
