@@ -155,10 +155,33 @@ fn key_invalidation_rebuilds_after_mempool_sequence_change() -> anyhow::Result<(
     mining.publish_generation();
     let first = expect_template(mining.get_block_template(template_request(None))?);
 
+    // Admission drives the sequence bump under test: since the gateway
+    // change, clear() on an already-empty pool is deliberately a
+    // sequence no-op, so an insert is what invalidates the key.
     {
+        use bitcoin::{
+            Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
+            transaction,
+        };
+        use bitcoin_rs_mempool::MempoolEntry;
+
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([0x41; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
         let mempool = state.mempool();
         let mut guard = mempool.write();
-        guard.clear();
+        guard.insert_entry(MempoolEntry::new(Arc::new(tx), 120, 10_000, 1, 1))?;
     }
     mining.publish_generation();
     let second = expect_template(mining.get_block_template(template_request(None))?);
