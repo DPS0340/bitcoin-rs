@@ -25,6 +25,34 @@ fn main_error(message: impl std::fmt::Display) -> Box<dyn std::error::Error> {
     Box::<std::io::Error>::new(std::io::Error::other(message.to_string())).into()
 }
 
+/// Parses Core's user agent into its dotted version.
+///
+/// Core reports `getnetworkinfo.subversion` in BIP 14 form
+/// (`/Satoshi:<version>(<comment>)/`), e.g. `/Satoshi:31.1.0/` or
+/// `/Satoshi:31.1.0(testsuite)/`. Returns `None` for anything that is not a
+/// Satoshi-format agent.
+fn parse_core_subversion(subversion: &str) -> Option<&str> {
+    let rest = subversion.strip_prefix("/Satoshi:")?;
+    let rest = rest.strip_suffix('/')?;
+    let version = match rest.split_once('(') {
+        Some((version, comment)) => {
+            if !comment.ends_with(')') {
+                return None;
+            }
+            version
+        }
+        None => rest,
+    };
+    let dotted = !version.is_empty()
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if !dotted {
+        return None;
+    }
+    Some(version)
+}
+
 #[test]
 #[ignore = "requires live bitcoind; run scripts/run-p2p-core-interop.sh"]
 fn live_bitcoin_core_p2p_interop_matches_contract() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,9 +73,18 @@ fn live_bitcoin_core_p2p_interop_matches_contract() -> Result<(), Box<dyn std::e
         .get("core_version")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| main_error("evidence missing `core_version`"))?;
+    // Core reports its user agent in BIP 14 form (`/Satoshi:31.1.0/`), not a
+    // bare version; normalize before pinning the 31.x line.
+    let parsed_core_version = parse_core_subversion(core_version).ok_or_else(|| {
+        main_error(format!(
+            "Core subversion {core_version:?} is not Satoshi-format \
+             (`/Satoshi:<version>(<comment>)/`)"
+        ))
+    })?;
     assert!(
-        core_version.starts_with("v31."),
-        "pinned Bitcoin Core 31.x, got {core_version}"
+        parsed_core_version.starts_with("31."),
+        "pinned Bitcoin Core 31.x: raw subversion {core_version:?}, parsed version \
+         {parsed_core_version:?}"
     );
     let magic = evidence
         .get("magic")
@@ -120,4 +157,26 @@ fn live_bitcoin_core_p2p_interop_matches_contract() -> Result<(), Box<dyn std::e
         "bitcoin-rs followed Core's post-handshake blocks over P2P"
     );
     Ok(())
+}
+
+#[test]
+fn parses_satoshi_subversions() {
+    assert_eq!(parse_core_subversion("/Satoshi:31.1.0/"), Some("31.1.0"));
+    assert_eq!(
+        parse_core_subversion("/Satoshi:31.1.0(comment)/"),
+        Some("31.1.0")
+    );
+    assert_eq!(
+        parse_core_subversion("/Satoshi:31.1.0(testsuite)/"),
+        Some("31.1.0")
+    );
+    assert_eq!(parse_core_subversion("/Satoshi:0.21.99/"), Some("0.21.99"));
+}
+
+#[test]
+fn rejects_non_satoshi_subversions() {
+    assert_eq!(parse_core_subversion("/btcwire:0.5.0/btcd:0.23.0/"), None);
+    assert_eq!(parse_core_subversion("/Satoshi:not.a.version/"), None);
+    assert_eq!(parse_core_subversion("/Satoshi:/"), None);
+    assert_eq!(parse_core_subversion(""), None);
 }
