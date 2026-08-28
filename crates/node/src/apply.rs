@@ -1511,6 +1511,23 @@ pub fn apply_block(
     apply_block_inner(handles, block, None)
 }
 
+/// Returns after consensus gates that precede the first write, without
+/// persisting the block. BIP22 proposal mode omits proof-of-work.
+pub fn validate_block(
+    handles: &ApplyHandles,
+    block: &bitcoin::Block,
+) -> core::result::Result<(), ApplyError> {
+    use bitcoin::hashes::Hash as _;
+
+    let _transition = handles.begin_chain_transition()?;
+    let block_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&block.block_hash().to_byte_array());
+    let prev_hash =
+        bitcoin_rs_primitives::Hash256::from_le_bytes(&block.header.prev_blockhash.to_byte_array());
+    let _ = applied_predecessor(handles, block_hash, prev_hash)?;
+    Ok(())
+}
+
 /// Applies `block` reusing preserved wire-format bytes for body persistence and indexing.
 pub fn apply_block_with_serialized(
     handles: &ApplyHandles,
@@ -2626,6 +2643,8 @@ fn applied_header_tip(
             },
         ));
     }
+    tree.record_applied_tx_count(node_id, tx_count_delta_for(block))?;
+    let node = tree.node(node_id)?;
     Ok(TipSnapshot {
         tip_id: node_id,
         height: node.height,
@@ -8311,6 +8330,15 @@ mod consensus_rule_tests {
             handles.chain_tx_count.load(Ordering::Relaxed),
             2,
             "connecting a one-transaction block moves the count by one"
+        );
+        assert_eq!(
+            handles
+                .block_tree
+                .read()
+                .node(applied.tip_id)?
+                .chain_tx_count,
+            2,
+            "apply must record the per-node count the RPC reads"
         );
 
         let _restored = disconnect_block(&handles, &block)?;

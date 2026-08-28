@@ -199,18 +199,22 @@ impl DnsResolver for SystemDnsResolver {
 /// Mirrors Core's `CConnman::fNetworkActive`: flipping the flag never
 /// disconnects existing peers; it only stops new inbound accepts and new
 /// outbound dials while inactive.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkActivity {
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
 }
 
 impl NetworkActivity {
     /// Creates a switch that is active unless `active` is `false`.
     #[must_use]
-    pub const fn new(active: bool) -> Self {
-        Self {
-            active: AtomicBool::new(active),
-        }
+    pub fn new(active: bool) -> Self {
+        Self::from_shared(Arc::new(AtomicBool::new(active)))
+    }
+
+    /// Shares an existing flag with the control plane.
+    #[must_use]
+    pub const fn from_shared(active: Arc<AtomicBool>) -> Self {
+        Self { active }
     }
 
     /// Applies the requested state and returns the state now in effect.

@@ -13,12 +13,28 @@ the same listener continue to require their configured authentication. Select
 the listener with the existing `--rpc-bind` option (or its layered config
 equivalent).
 
-Currently implemented endpoints are:
+The gateway registers these Core REST prefixes:
 
-* `GET /rest/chaininfo.json`
-* `GET /rest/headers/{hash}.json?count=N`
-* `GET /rest/headers/{hash}.hex`
-* `GET /rest/headers/{hash}.bin`
+| Prefix | Formats | Notes |
+| --- | --- | --- |
+| `/rest/tx/{txid}` | JSON, hex, binary | Transaction lookup |
+| `/rest/block/notxdetails/{hash}` | JSON, hex, binary | Block JSON uses transaction IDs |
+| `/rest/block/{hash}` | JSON, hex, binary | Block JSON includes transaction details |
+| `/rest/blockpart/{hash}` | Hex, binary | Raw block payload |
+| `/rest/blockfilter/basic/{hash}` | JSON, hex, binary | Explicitly unavailable: no block-filter index |
+| `/rest/blockfilterheaders/basic/{hash}` | JSON, hex, binary | Explicitly unavailable: no block-filter index |
+| `/rest/chaininfo` | JSON | Chain summary |
+| `/rest/mempool/{info,contents}` | JSON | Mempool summary or contents |
+| `/rest/headers/{hash}` | JSON, hex, binary | Active-chain header walk |
+| `/rest/getutxos[/checkmempool]/{txid}-{vout}...` | JSON, hex, binary | URI-form UTXO lookup; at most 15 outpoints |
+| `/rest/deploymentinfo[/{hash}]` | JSON | Deployment state |
+| `/rest/blockhashbyheight/{height}` | JSON, hex, binary | Block hash by height |
+| `/rest/spenttxouts/{hash}` | JSON, hex, binary | Explicitly unavailable: no undo data |
+
+Full-block `/rest/block` and `/rest/blockpart` requests use a two-request
+materialization budget. When it is full, the gateway returns HTTP 503; retry
+the request after a short delay.
+
 
 Header `count` defaults to 5 and must be in the inclusive range 1–2000.
 Out-of-range, negative, non-numeric, and overflowing values return HTTP 400
@@ -47,13 +63,15 @@ absent until the mempool has per-transaction event sequencing and explicit
 removal reasons.
 
 REST is off by default. With REST disabled, `/rest/*` returns HTTP 404.
-Unknown REST routes also return 404; malformed header inputs and unsupported
-header extensions return 400. A missing header extension returns HTTP 404 with
-`output format not found`, while an unsupported extension such as `.txt`
-returns HTTP 400 with `Invalid hash: <hash>`. This distinction is load-bearing
-for the enforcer: it treats a 404 on `/rest/*` as evidence that REST is not
-enabled, so an unknown or non-active block hash must not produce a misleading
-404.
+Unknown REST routes return HTTP 404. On endpoints that parse a hash, height, or
+outpoint before selecting a format, a missing extension returns HTTP 404 while
+an unknown extension remains part of that parameter and returns HTTP 400.
+`/rest/chaininfo` and `/rest/deploymentinfo` return HTTP 404 for a non-JSON
+format. `/rest/mempool` validates its `info` or `contents` resource first, so
+an unknown suffix returns HTTP 400. Malformed hashes and header `count` values
+return HTTP 400. Probe a known supported endpoint such as
+`/rest/chaininfo.json` to distinguish a disabled REST gateway from an invalid
+request.
 
 The checked-in default Compose stack supplies the REST, `pubsequence`,
 version-check bypass, and drynet4 network settings required to run the

@@ -10,8 +10,81 @@ pub(crate) mod mempool;
 pub(crate) mod mining;
 pub(crate) mod network;
 pub(crate) mod tx;
-pub(crate) mod tx_render;
 pub(crate) mod util;
+
+const CORE_RPC_METHODS: &[&str] = &[
+    "getblockchaininfo",
+    "getdifficulty",
+    "getchaintips",
+    "getchaintxstats",
+    "getblockcount",
+    "getblockhash",
+    "getbestblockhash",
+    "getblock",
+    "getblockheader",
+    "getblockstats",
+    "verifychain",
+    "gettxoutsetinfo",
+    "getindexinfo",
+    "pruneblockchain",
+    "invalidateblock",
+    "scantxoutset",
+    "getrawtransaction",
+    "gettxout",
+    "gettxoutproof",
+    "verifytxoutproof",
+    "sendrawtransaction",
+    "testmempoolaccept",
+    "decoderawtransaction",
+    "createrawtransaction",
+    "combinepsbt",
+    "finalizepsbt",
+    "getmempoolinfo",
+    "getmempoolentry",
+    "getrawmempool",
+    "getmempoolancestors",
+    "getmempooldescendants",
+    "estimatesmartfee",
+    "uptime",
+    "getrpcinfo",
+    "getmemoryinfo",
+    "estimaterawfee",
+    "validateaddress",
+    "getdescriptorinfo",
+    "deriveaddresses",
+    "getnetworkinfo",
+    "getpeerinfo",
+    "ping",
+    "addnode",
+    "disconnectnode",
+    "getconnectioncount",
+    "getnettotals",
+    "getaddednodeinfo",
+    "listbanned",
+    "setban",
+    "clearbanned",
+    "setnetworkactive",
+    "getnodeaddresses",
+    "getblocktemplate",
+    "getmininginfo",
+    "submitblock",
+    "prioritisetransaction",
+];
+
+#[cfg(feature = "zmq")]
+const ZMQ_RPC_METHOD: &str = "getzmqnotifications";
+
+fn is_registered_method(method: &str) -> bool {
+    if CORE_RPC_METHODS.contains(&method) {
+        return true;
+    }
+    #[cfg(feature = "zmq")]
+    {
+        method == ZMQ_RPC_METHOD
+    }
+    #[cfg(not(feature = "zmq"))]
+    false
+}
 
 /// JSON-RPC method dispatcher backed by shared node context.
 #[derive(Clone, Debug)]
@@ -34,6 +107,9 @@ impl Handler {
 
     /// Dispatches one Bitcoin Core-compatible JSON-RPC method.
     pub fn dispatch(&self, method: &str, params: &Value) -> Result<Value, RpcError> {
+        if !is_registered_method(method) {
+            return Err(RpcError::MethodNotFound(method.to_owned()));
+        }
         match method {
             "getblockchaininfo" => chain::getblockchaininfo(&self.ctx, params),
             "getdifficulty" => chain::getdifficulty(&self.ctx, params),
@@ -58,12 +134,12 @@ impl Handler {
             "sendrawtransaction" => tx::sendrawtransaction(&self.ctx, params),
             "testmempoolaccept" => tx::testmempoolaccept(&self.ctx, params),
             "decoderawtransaction" => tx::decoderawtransaction(&self.ctx, params),
+            "createrawtransaction" => tx::createrawtransaction(&self.ctx, params),
             "combinepsbt" => tx::combinepsbt(&self.ctx, params),
             "finalizepsbt" => tx::finalizepsbt(&self.ctx, params),
             "getmempoolinfo" => mempool::getmempoolinfo(&self.ctx, params),
             "getmempoolentry" => mempool::getmempoolentry(&self.ctx, params),
             "getrawmempool" => mempool::getrawmempool(&self.ctx, params),
-            "clearmempool" => mempool::clearmempool(&self.ctx, params),
             "getmempoolancestors" => mempool::getmempoolancestors(&self.ctx, params),
             "getmempooldescendants" => mempool::getmempooldescendants(&self.ctx, params),
             "estimatesmartfee" => util::estimatesmartfee(&self.ctx, params),
@@ -71,6 +147,7 @@ impl Handler {
             "getrpcinfo" => util::getrpcinfo(&self.ctx, params),
             "getmemoryinfo" => util::getmemoryinfo(&self.ctx, params),
             "estimaterawfee" => util::estimaterawfee(&self.ctx, params),
+            #[cfg(feature = "zmq")]
             "getzmqnotifications" => util::getzmqnotifications(&self.ctx, params),
             "validateaddress" => util::validateaddress(&self.ctx, params),
             "getdescriptorinfo" => util::getdescriptorinfo(&self.ctx, params),
@@ -87,11 +164,12 @@ impl Handler {
             "setban" => network::setban(&self.ctx, params),
             "clearbanned" => network::clearbanned(&self.ctx, params),
             "setnetworkactive" => network::setnetworkactive(&self.ctx, params),
+            "getnodeaddresses" => network::getnodeaddresses(&self.ctx, params),
             "getblocktemplate" => mining::getblocktemplate(&self.ctx, params),
             "getmininginfo" => mining::getmininginfo(&self.ctx, params),
             "submitblock" => mining::submitblock(&self.ctx, params),
             "prioritisetransaction" => mining::prioritisetransaction(&self.ctx, params),
-            _ => Err(RpcError::MethodNotFound(method.to_owned())),
+            _ => unreachable!("registered RPC method missing a dispatch arm"),
         }
     }
 }
@@ -156,4 +234,67 @@ pub(crate) fn required_u64(
 pub(crate) fn serde_to_sonic(value: &serde_json::Value) -> Result<Value, RpcError> {
     let text = serde_json::to_string(value)?;
     Ok(sonic_rs::from_str(&text)?)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use alloc::sync::Arc;
+
+    use sonic_rs::json;
+
+    use super::{CORE_RPC_METHODS, Handler};
+    use crate::context::Context;
+    use crate::error::RpcError;
+
+    const POLICY_ABSENCES: &[&str] = &[
+        "clearmempool",
+        "dumpprivkey",
+        "dumpwallet",
+        "importprivkey",
+        "importwallet",
+        "importmulti",
+        "sethdseed",
+    ];
+
+    #[test]
+    fn core_method_registry_has_the_expected_surface() {
+        assert_eq!(CORE_RPC_METHODS.len(), 56);
+        let handler = Handler::new(Arc::new(Context::new()));
+        for method in CORE_RPC_METHODS {
+            assert!(
+                !matches!(
+                    handler.dispatch(method, &json!([])),
+                    Err(RpcError::MethodNotFound(_))
+                ),
+                "{method} is listed but not dispatchable"
+            );
+        }
+        for method in POLICY_ABSENCES {
+            assert!(matches!(
+                handler.dispatch(method, &json!([])),
+                Err(RpcError::MethodNotFound(_))
+            ));
+        }
+    }
+
+    #[cfg(feature = "zmq")]
+    #[test]
+    fn zmq_build_adds_exactly_one_method() {
+        assert_eq!(CORE_RPC_METHODS.len() + 1, 57);
+        let handler = Handler::new(Arc::new(Context::new()));
+        assert!(!matches!(
+            handler.dispatch("getzmqnotifications", &json!([])),
+            Err(RpcError::MethodNotFound(_))
+        ));
+    }
+
+    #[cfg(not(feature = "zmq"))]
+    #[test]
+    fn non_zmq_build_omits_notification_method() {
+        let handler = Handler::new(Arc::new(Context::new()));
+        assert!(matches!(
+            handler.dispatch("getzmqnotifications", &json!([])),
+            Err(RpcError::MethodNotFound(_))
+        ));
+    }
 }

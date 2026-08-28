@@ -225,6 +225,7 @@ pub enum ListenerError {
 pub fn serve_with_shutdown(
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    network_active: Arc<AtomicBool>,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
@@ -235,6 +236,7 @@ pub fn serve_with_shutdown(
     serve_with_shutdown_with_chain_and_sync_wake(
         addr,
         shutdown,
+        network_active,
         magic,
         peer_registry,
         peer_outbound,
@@ -252,6 +254,7 @@ pub fn serve_with_shutdown(
 pub fn serve_with_shutdown_with_chain_and_sync_wake(
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    network_active: Arc<AtomicBool>,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
@@ -262,13 +265,16 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     sync_wake_tx: Option<Sender<()>>,
     peer_registered: PeerRegistrationHandle,
 ) -> Result<(), ListenerError> {
-    let shared = ConnectionShared::from_parts(
+    let mut shared = ConnectionShared::from_parts(
         peer_registry,
         peer_outbound,
         banned,
         chain_query,
         peer_registered,
     );
+    shared.activity = Some(Arc::new(crate::NetworkActivity::from_shared(
+        network_active,
+    )));
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
         blocks_tx: inbound_blocks_tx,
@@ -387,6 +393,7 @@ pub fn serve_with_controls(
 #[allow(clippy::needless_pass_by_value)]
 pub fn spawn_outbound_connection(
     addr: SocketAddr,
+    network_active: Arc<AtomicBool>,
     magic: Magic,
     peer_registry: Arc<RwLock<Vec<crate::PeerInfo>>>,
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
@@ -402,6 +409,7 @@ pub fn spawn_outbound_connection(
         inbound_headers_tx,
         inbound_blocks_tx,
         banned,
+        network_active,
         None,
         None,
         None,
@@ -418,17 +426,21 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
+    network_active: Arc<AtomicBool>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
     peer_registered: PeerRegistrationHandle,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
-    let shared = ConnectionShared::from_parts(
+    let mut shared = ConnectionShared::from_parts(
         peer_registry,
         peer_outbound,
         banned,
         chain_query,
         peer_registered,
     );
+    shared.activity = Some(Arc::new(crate::NetworkActivity::from_shared(
+        network_active,
+    )));
     spawn_outbound(
         addr,
         magic,
@@ -974,6 +986,7 @@ fn generate_nonce(peer_addr: SocketAddr) -> u64 {
 mod outbound_tests {
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use bitcoin::p2p::Magic;
     use parking_lot::RwLock;
@@ -995,6 +1008,7 @@ mod outbound_tests {
 
         let handle = spawn_outbound_connection(
             addr,
+            Arc::new(AtomicBool::new(true)),
             Magic::BITCOIN,
             registry,
             outbound,
