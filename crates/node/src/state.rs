@@ -9,6 +9,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_rpc::context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
@@ -17,6 +18,7 @@ use core::fmt;
 use core::mem::size_of;
 use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -47,6 +49,206 @@ pub(crate) const P2P_OUTBOUND_QUEUE_LIMIT: usize = 8;
 // in-flight request window (`PENDING_BUDGET` = 128) so honest delivery, which
 // wakes the drain on every block, is never throttled.
 pub(crate) const INBOUND_BLOCK_CHANNEL_LIMIT: usize = 256;
+// Bounds chain-event hints between the block-apply commit path and
+// reconciliation consumers (#77). Hints are wake-ups, never data: a consumer
+// that misses one recovers by reconciling `ChainSnapshot` against its own
+// cursor using the chain itself. The bound is single-sourced from the
+// inbound-block bound so both channels share the same flood posture; a full
+// channel drops the hint and never blocks the commit path.
+pub(crate) const CHAIN_HINT_CHANNEL_LIMIT: usize = INBOUND_BLOCK_CHANNEL_LIMIT;
+
+/// A coherent, non-torn view of the applied chain tip.
+///
+/// The only writer replaces the whole cell under one `RwLock`, so a reader
+/// never observes a torn mix of two commit points. This is a live value: it is
+/// never persisted per-event. `epoch` changes only across process restarts,
+/// `sequence` advances once per committed connect/disconnect (`0` means no
+/// committed event yet this run), and the tip fields name the block that
+/// sequence was advanced for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainSnapshot {
+    /// Persisted process epoch, strictly monotonic per data dir.
+    pub epoch: u64,
+    /// Commit counter; starts at `1` on the first `record` of a run.
+    pub sequence: u64,
+    /// Applied tip block hash (genesis hash before the first commit).
+    pub tip_hash: Hash256,
+    /// Applied tip height (`0` at genesis).
+    pub tip_height: u32,
+}
+
+/// Which committed chain event a [`ChainEventHint`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintKind {
+    /// A block was committed onto the tip.
+    Connected,
+    /// The tip moved back to its parent during a disconnect/reorg.
+    Disconnected,
+}
+
+/// Wake-up for reconciliation consumers: one committed connect or disconnect.
+///
+/// Hints are not a replay log and carry no payload to apply. A dropped hint is
+/// not a bug — it loses only the wake-up, and the consumer recovers by
+/// reconciling a fresh [`ChainSnapshot`] against its own cursor using the
+/// chain itself: ancestry via `BlockTree::active_node_at_height` and
+/// `BlockTree::find_common_ancestor` (crates/chain), bodies via
+/// `PruneBodyStore::load_block_body` (`crate::apply`). The `epoch` field is
+/// what makes a persisted consumer cursor `(epoch, sequence)` stale on
+/// restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainEventHint {
+    /// Whether the block was added to or removed from the tip.
+    pub kind: HintKind,
+    /// Height of the block the event committed.
+    pub height: u32,
+    /// Hash of the block the event committed.
+    pub hash: Hash256,
+    /// Process epoch the event belongs to.
+    pub epoch: u64,
+    /// Commit-counter value assigned to this event.
+    pub sequence: u64,
+}
+
+/// Single write path for chain events: [`Self::record`] advances the commit
+/// sequence, replaces the snapshot cell, then emits the hint, in that order.
+///
+/// A consumer woken by a hint therefore always reads a snapshot at least as
+/// fresh as the hint. Production wiring goes through `NodeState::open`;
+/// [`Self::detached`] exists for `ApplyHandles` composition in tests.
+pub struct ChainEventPublisher {
+    epoch: u64,
+    sequence: AtomicU64,
+    snapshot: RwLock<ChainSnapshot>,
+    hints: Sender<ChainEventHint>,
+}
+
+impl ChainEventPublisher {
+    fn new(epoch: u64, initial: ChainSnapshot) -> (Self, Receiver<ChainEventHint>) {
+        let (hints, receiver) = crossbeam_channel::bounded(CHAIN_HINT_CHANNEL_LIMIT);
+        (
+            Self {
+                epoch,
+                sequence: AtomicU64::new(0),
+                snapshot: RwLock::new(initial),
+                hints,
+            },
+            receiver,
+        )
+    }
+
+    /// Publisher detached from any node, for test handle composition only.
+    /// Anchors at an empty tip; records still sequence and publish normally.
+    #[must_use]
+    pub fn detached(epoch: u64) -> (Self, Receiver<ChainEventHint>) {
+        Self::new(
+            epoch,
+            ChainSnapshot {
+                epoch,
+                sequence: 0,
+                tip_hash: Hash256::from_le_bytes(&[0; 32]),
+                tip_height: 0,
+            },
+        )
+    }
+
+    /// Returns the process epoch this publisher stamps events with.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the current snapshot without changing any state.
+    #[must_use]
+    pub fn snapshot(&self) -> ChainSnapshot {
+        *self.snapshot.read()
+    }
+
+    /// Records one committed connect or disconnect.
+    ///
+    /// Publication order is fixed: advance the sequence, replace the snapshot
+    /// cell, then `try_send` the hint. A full hint channel drops the hint and
+    /// never blocks or fails the commit path — consumers reconcile from the
+    /// chain, so only the wake-up is lost. Sequence values start at `1`; a
+    /// snapshot with sequence `0` means no committed event yet.
+    pub fn record(&self, kind: HintKind, height: u32, hash: Hash256) -> ChainEventHint {
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.snapshot.write() = ChainSnapshot {
+            epoch: self.epoch,
+            sequence,
+            tip_hash: hash,
+            tip_height: height,
+        };
+        let hint = ChainEventHint {
+            kind,
+            height,
+            hash,
+            epoch: self.epoch,
+            sequence,
+        };
+        let _ = self.hints.try_send(hint);
+        hint
+    }
+}
+
+const PROCESS_EPOCH_FILE: &str = "process-epoch";
+const PROCESS_EPOCH_TEMP: &str = ".process-epoch.tmp";
+// A u64 in decimal is at most 20 digits; the trailing newline makes 21.
+const PROCESS_EPOCH_MAX_BYTES: u64 = 32;
+
+/// Reads the persisted process epoch; `0` when the data dir has none yet.
+///
+/// A corrupt file is an error, not a reset: silently restarting the counter
+/// would let a new run reuse an epoch old consumer cursors live in.
+fn load_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
+    let bytes =
+        match crate::checkpoint_fs::read_file(dir, PROCESS_EPOCH_FILE, PROCESS_EPOCH_MAX_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {PROCESS_EPOCH_FILE}"));
+            }
+        };
+    let text = core::str::from_utf8(&bytes)
+        .with_context(|| format!("{PROCESS_EPOCH_FILE} is not valid UTF-8"))?;
+    text.trim().parse::<u64>().with_context(|| {
+        format!("{PROCESS_EPOCH_FILE} is corrupt; refusing to start rather than reuse epochs")
+    })
+}
+
+/// Allocates the next process epoch, durably, before first use.
+///
+/// The persisted value is bumped by one and written with the checkpoint
+/// write-temp → sync → rename idiom (the checkpoint.rs `CURRENT` flow) at the
+/// data-dir root — outside the re-writable checkpoint tree, so a checkpoint
+/// wipe or resync can never regress it. A crash before the rename wastes an
+/// epoch number (gaps are fine) and never reuses one.
+///
+/// Allocation is not self-serializing: two processes racing here could both
+/// publish the same value. That twin never becomes observable — every storage
+/// backend takes an exclusive data-dir lock during `NodeState::open`, so the
+/// loser dies before it can write any state that cites its epoch. The storage
+/// lock is the serialization point; do not add one here.
+fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
+    let epoch = load_process_epoch(dir)?
+        .checked_add(1)
+        .context("process epoch counter exhausted")?;
+    let bytes = format!("{epoch}\n").into_bytes();
+    // A temp file left by a crash mid-allocation must not block create_new.
+    let _ = dir.remove_file(PROCESS_EPOCH_TEMP);
+    let mut file = crate::checkpoint_fs::create_file(dir, PROCESS_EPOCH_TEMP)
+        .with_context(|| format!("create {PROCESS_EPOCH_TEMP}"))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write {PROCESS_EPOCH_TEMP}"))?;
+    file.sync_all()
+        .with_context(|| format!("sync {PROCESS_EPOCH_TEMP}"))?;
+    drop(file);
+    dir.rename(PROCESS_EPOCH_TEMP, dir, PROCESS_EPOCH_FILE)
+        .with_context(|| format!("publish {PROCESS_EPOCH_FILE}"))?;
+    crate::checkpoint_fs::sync_dir(dir)
+        .context("sync data dir after allocating the process epoch")?;
+    Ok(epoch)
+}
 
 /// Errors produced when applying a block to the node state.
 #[derive(Debug, thiserror::Error)]
@@ -864,6 +1066,8 @@ pub struct NodeState {
     inbound_headers_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundHeaders>>>,
     inbound_blocks_tx: Sender<bitcoin_rs_p2p::InboundBlock>,
     inbound_blocks_rx: Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>>,
+    chain_events: Arc<ChainEventPublisher>,
+    chain_event_hints_rx: Arc<Mutex<Receiver<ChainEventHint>>>,
     apply_handles: crate::apply::ApplyHandles,
     sync: Arc<crate::BlockSync>,
     replayed: Mutex<Vec<u32>>,
@@ -880,6 +1084,9 @@ impl NodeState {
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
         let checkpoint_data_dir = crate::checkpoint_fs::open_data_dir(&config.data_dir)
             .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
+        // Allocate the process epoch before anything else can consume one:
+        // durable, strictly greater than every earlier run of this data dir.
+        let epoch = allocate_process_epoch(&checkpoint_data_dir)?;
         let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
             network: config.network,
             genesis: config.network.genesis_block_hash(),
@@ -1027,6 +1234,17 @@ impl NodeState {
                 )
             }
         };
+        // Anchor the initial snapshot before `restored_applied_tip` is moved
+        // into the applied-tip slot: a restored node resumes at its restored
+        // tip, a fresh one at genesis, both with an untouched sequence.
+        let initial_snapshot = ChainSnapshot {
+            epoch,
+            sequence: 0,
+            tip_hash: restored_applied_tip
+                .as_ref()
+                .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash),
+            tip_height: restored_applied_tip.as_ref().map_or(0, |tip| tip.height),
+        };
         let coin_stats_listener =
             bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
         // The rolling coin-stats listener does per-coin MuHash + event work on
@@ -1096,6 +1314,10 @@ impl NodeState {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
+        let (chain_events_raw, chain_event_hints_rx_raw) =
+            ChainEventPublisher::new(epoch, initial_snapshot);
+        let chain_events = Arc::new(chain_events_raw);
+        let chain_event_hints_rx = Arc::new(Mutex::new(chain_event_hints_rx_raw));
         let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
@@ -1188,6 +1410,8 @@ impl NodeState {
             inbound_headers_rx,
             inbound_blocks_tx,
             inbound_blocks_rx,
+            chain_events: Arc::clone(&chain_events),
+            chain_event_hints_rx,
             apply_handles,
             sync,
             replayed: Mutex::new(Vec::new()),
@@ -1482,6 +1706,26 @@ impl NodeState {
     #[must_use]
     pub fn inbound_blocks_rx_handle(&self) -> Arc<Mutex<Receiver<bitcoin_rs_p2p::InboundBlock>>> {
         Arc::clone(&self.inbound_blocks_rx)
+    }
+
+    /// Returns the current coherent chain snapshot: the applied tip stamped
+    /// with the process epoch and the commit sequence.
+    #[must_use]
+    pub fn active_chain_snapshot(&self) -> ChainSnapshot {
+        self.chain_events.snapshot()
+    }
+
+    /// Returns the chain-event publisher. The apply path records committed
+    /// connects/disconnects through it; consumers read the snapshot from it.
+    #[must_use]
+    pub fn chain_event_publisher(&self) -> Arc<ChainEventPublisher> {
+        Arc::clone(&self.chain_events)
+    }
+
+    /// Returns the shared hint receiver handle for reconciliation consumers.
+    #[must_use]
+    pub fn chain_event_hints(&self) -> Arc<Mutex<Receiver<ChainEventHint>>> {
+        Arc::clone(&self.chain_event_hints_rx)
     }
 
     /// Returns the shared block-download orchestrator.
@@ -3052,6 +3296,241 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("checkpoint did not publish applied tip"))?;
         assert_eq!(applied.height, tip.height);
         assert_eq!(applied.hash, tip.hash);
+        Ok(())
+    }
+
+    #[test]
+    fn process_epoch_is_strictly_monotonic_across_restart() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let first = NodeState::open(config.clone())?
+            .active_chain_snapshot()
+            .epoch;
+        let second = NodeState::open(config.clone())?
+            .active_chain_snapshot()
+            .epoch;
+        let third = NodeState::open(config)?.active_chain_snapshot().epoch;
+        assert!(first > 0, "a fresh data dir allocates epoch 1, got {first}");
+        assert!(
+            second > first,
+            "restart must never reuse an epoch: {first} -> {second}"
+        );
+        assert!(
+            third > second,
+            "restart must never reuse an epoch: {second} -> {third}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_chain_snapshot_starts_at_genesis_on_fresh_node() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let state = NodeState::open(config.clone())?;
+        let epoch = state.chain_event_publisher().epoch();
+        assert_eq!(
+            state.active_chain_snapshot(),
+            ChainSnapshot {
+                epoch,
+                sequence: 0,
+                tip_hash: config.network.genesis_block_hash(),
+                tip_height: 0,
+            },
+            "a node that committed nothing anchors at genesis with sequence 0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_chain_snapshot_anchors_at_restored_tip_after_restart() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let (tip, first_epoch) = {
+            let state = NodeState::open(config.clone())?;
+            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let tip = state.apply_block(&genesis)?;
+            assert!(matches!(
+                state.write_clean_checkpoint()?,
+                crate::checkpoint::CheckpointWrite::Published { .. }
+            ));
+            (tip, state.active_chain_snapshot().epoch)
+        };
+
+        let resumed = NodeState::open(config)?;
+        assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
+        let snapshot = resumed.active_chain_snapshot();
+        assert_eq!(snapshot.tip_hash, tip.hash);
+        assert_eq!(snapshot.tip_height, tip.height);
+        assert_eq!(
+            snapshot.sequence, 0,
+            "a restart resets the sequence, never the epoch"
+        );
+        assert!(
+            snapshot.epoch > first_epoch,
+            "restart must advance the epoch: {} -> {}",
+            first_epoch,
+            snapshot.epoch
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_publishes_snapshot_and_hints_in_commit_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let state = NodeState::open(config)?;
+        let publisher = state.chain_event_publisher();
+        let epoch = publisher.epoch();
+        let hash_a = Hash256::from_le_bytes(&[0xAA; 32]);
+        let hash_b = Hash256::from_le_bytes(&[0xBB; 32]);
+
+        let first = publisher.record(HintKind::Connected, 1, hash_a);
+        let second = publisher.record(HintKind::Disconnected, 0, hash_b);
+
+        let expected_first = ChainEventHint {
+            kind: HintKind::Connected,
+            height: 1,
+            hash: hash_a,
+            epoch,
+            sequence: 1,
+        };
+        let expected_second = ChainEventHint {
+            kind: HintKind::Disconnected,
+            height: 0,
+            hash: hash_b,
+            epoch,
+            sequence: 2,
+        };
+        assert_eq!(first, expected_first);
+        assert_eq!(second, expected_second);
+        assert_eq!(
+            publisher.snapshot(),
+            state.active_chain_snapshot(),
+            "node and publisher expose one snapshot view"
+        );
+        assert_eq!(
+            state.active_chain_snapshot(),
+            ChainSnapshot {
+                epoch,
+                sequence: 2,
+                tip_hash: hash_b,
+                tip_height: 0,
+            },
+            "the last committed event wins the snapshot cell"
+        );
+
+        let rx = state.chain_event_hints();
+        let mut hints = Vec::new();
+        let hint_rx = rx.lock();
+        while let Ok(hint) = hint_rx.try_recv() {
+            hints.push(hint);
+        }
+        assert_eq!(
+            hints,
+            vec![expected_first, expected_second],
+            "one hint per committed event, in commit order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_drops_hints_when_channel_full() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let state = NodeState::open(config)?;
+        let publisher = state.chain_event_publisher();
+        let rx = state.chain_event_hints();
+        for sequence in 1..=super::CHAIN_HINT_CHANNEL_LIMIT {
+            let sequence = u64::try_from(sequence)?;
+            let mut tip = [0_u8; 32];
+            tip[..8].copy_from_slice(&sequence.to_le_bytes());
+            publisher.record(
+                HintKind::Connected,
+                u32::try_from(sequence)?,
+                Hash256::from_le_bytes(&tip),
+            );
+        }
+
+        // The next record finds a full channel: the hint is dropped by
+        // design, while the commit itself still lands and the snapshot
+        // still advances. Dropping never blocks or fails the commit path.
+        let overflow = publisher.record(
+            HintKind::Connected,
+            u32::try_from(super::CHAIN_HINT_CHANNEL_LIMIT)?,
+            Hash256::from_le_bytes(&[0xFF; 32]),
+        );
+        assert_eq!(
+            overflow.sequence,
+            u64::try_from(super::CHAIN_HINT_CHANNEL_LIMIT)? + 1,
+            "the record itself is sequenced even when its hint is dropped"
+        );
+        assert_eq!(
+            state.active_chain_snapshot(),
+            ChainSnapshot {
+                epoch: publisher.epoch(),
+                sequence: overflow.sequence,
+                tip_hash: Hash256::from_le_bytes(&[0xFF; 32]),
+                tip_height: u32::try_from(super::CHAIN_HINT_CHANNEL_LIMIT)?,
+            },
+        );
+
+        let mut drained = Vec::new();
+        let drain_rx = rx.lock();
+        while let Ok(hint) = drain_rx.try_recv() {
+            drained.push(hint.sequence);
+        }
+        assert_eq!(
+            drained.len(),
+            super::CHAIN_HINT_CHANNEL_LIMIT,
+            "exactly the bounded hints are queued"
+        );
+        assert_eq!(drained[0], 1, "the oldest hint survives at the front");
+        assert_eq!(
+            drained.last().copied(),
+            Some(u64::try_from(super::CHAIN_HINT_CHANNEL_LIMIT)?),
+            "the overflow hint is the one that was dropped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_process_epoch_file_refuses_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        std::fs::create_dir_all(&data_dir)?;
+        std::fs::write(data_dir.join("process-epoch"), b"seven\n")?;
+
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir;
+        config.p2p_listen.clear();
+
+        let Err(error) = NodeState::open(config) else {
+            anyhow::bail!("a corrupt process-epoch file must refuse startup");
+        };
+        assert!(
+            error.to_string().contains("process-epoch"),
+            "the refusal names the corrupt file: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("node").join("process-epoch"))?,
+            b"seven\n",
+            "the refusal must not reset the persisted epoch"
+        );
         Ok(())
     }
 
