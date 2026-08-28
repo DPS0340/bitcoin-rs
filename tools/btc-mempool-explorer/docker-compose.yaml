@@ -84,7 +84,7 @@ services:
     volumes:
       - ./nginx-mempool.conf:/etc/nginx/conf.d/nginx-mempool.conf
     ports:
-      - "127.0.0.1:${MEMPOOL_EXPLORER_PORT:-8080}:8080"
+      - "0.0.0.0:${MEMPOOL_EXPLORER_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://localhost:8080/ | grep -q '<html'"]
       interval: 30s

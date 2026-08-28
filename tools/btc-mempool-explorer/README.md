@@ -31,7 +31,8 @@ MEMPOOL_DATABASE_ROOT_PASSWORD='choose-a-third-long-secret' \
 docker compose up --build
 ```
 
-Open <http://127.0.0.1:8080>. The Bitcoin RPC listener is host-loopback only at
+Open <http://127.0.0.1:8080>. The explorer HTTP port is published on all
+interfaces (`0.0.0.0`). The Bitcoin RPC listener stays host-loopback only at
 <http://127.0.0.1:8332> by default; P2P is published on port `8333`.
 
 The following variables are optional:
@@ -45,7 +46,7 @@ The following variables are optional:
 | `MEMPOOL_DATABASE_ROOT_PASSWORD` | `change-me` | MariaDB root password; set explicitly. |
 | `BITCOIN_RS_RPC_PORT` | `8332` | Loopback host RPC port. |
 | `BITCOIN_RS_P2P_PORT` | `8333` | Host P2P port. |
-| `MEMPOOL_EXPLORER_PORT` | `8080` | Loopback explorer HTTP port. |
+| `MEMPOOL_EXPLORER_PORT` | `8080` | Host explorer HTTP port (`0.0.0.0`). |
 
 All persistent data is stored beneath the repository-root `data/` directory:
 `data/bitcoin-rs`, `data/mempool-cache`, and `data/mempool-db`. Stop the stack
