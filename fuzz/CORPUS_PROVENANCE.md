@@ -25,3 +25,5 @@ Seeds under fuzz/corpus/ were imported from
 Corpora were minimized with cargo fuzz cmin after import; only minimized
 seeds are tracked here. Re-run the script after major decoder changes to
 refresh.
+
+See also docs/contracts/qa-corpus.md for the contracts index and precedence rule.

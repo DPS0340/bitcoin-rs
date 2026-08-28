@@ -79,3 +79,5 @@ version-check bypass, and drynet4 network settings required to run the
 unmodified enforcer. With `pubsequence` now carrying transaction `A`/`R`
 events, the stack enables `--enable-mempool` so the enforcer tracks the
 mempool too.
+
+See also [docs/contracts/external-api.md](contracts/external-api.md) for the API manifest contract and precedence rule.

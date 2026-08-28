@@ -13,6 +13,14 @@ This page maps it to what you might want.
   before assuming it means what it means elsewhere in Bitcoin.
 - [../README.md](../README.md) covers the defaults and the measured benchmark.
 
+## Contracts
+
+[docs/contracts/](contracts/) holds the normative behavior docs. Each one
+states what the code must keep, then names the files and tests that prove
+it. When documents disagree, the contract wins and the drift is a bug. The
+precedence rule and the index of contract pages live in
+[docs/contracts/README.md](contracts/README.md).
+
 ## Reference
 
 - [policies/](policies/) holds the rules a change has to satisfy.
