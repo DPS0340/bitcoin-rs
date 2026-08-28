@@ -49,11 +49,12 @@ fn records(count: u32) -> Vec<BlockRecord> {
     (0..count)
         .map(|height| {
             let mut record = BlockRecord::synthetic(height, hash_for(height));
+            let h = usize::try_from(height).expect("height fits usize");
             // A real record carries the facts a scan reads past. Leaving them
             // zero would still walk the log, but would not fault in the bytes
             // the comparison actually touches.
-            record.body_size = 1_000_000 + (height as usize % 400_000);
-            record.tx_count = 1 + (height as usize % 3_000);
+            record.body_size = 1_000_000 + (h % 400_000);
+            record.tx_count = 1 + (h % 3_000);
             record.time = 1_231_006_505 + height * 600;
             record
         })

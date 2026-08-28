@@ -182,7 +182,7 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
     let mut indexer = Indexer::new(store);
 
     let mut positions = HashMap::new();
-    let mut records = Vec::with_capacity(fixture_blocks as usize);
+    let mut records = Vec::with_capacity(usize::try_from(fixture_blocks).expect("fits usize"));
     let mut first_txid = None;
     let mut last_txid = None;
 
@@ -232,12 +232,14 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
 
     let source = Arc::new(FlatFileBodySource { files, positions });
 
-    let scanning = Arc::new(Context::new().with_block_body_source(Arc::clone(&source) as Arc<_>));
+    let scan_source = Arc::clone(&source);
+    let scanning = Arc::new(Context::new().with_block_body_source(scan_source));
     for record in &records {
         scanning.add_block(record.clone());
     }
 
-    let mut indexed_ctx = Context::new().with_block_body_source(Arc::clone(&source) as Arc<_>);
+    let indexed_source = Arc::clone(&source);
+    let mut indexed_ctx = Context::new().with_block_body_source(indexed_source);
     indexed_ctx.tx_index = Some(Arc::new(FixtureIndexQuery { indexer, source }));
     let indexed = Arc::new(indexed_ctx);
     for record in records {

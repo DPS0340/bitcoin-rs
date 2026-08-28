@@ -87,7 +87,7 @@ fn sendrawtransaction_admits_standard_tx_to_mempool() -> Result<(), Box<dyn std:
 #[test]
 fn sendrawtransaction_rejects_missing_inputs() -> Result<(), RpcError> {
     let ctx = Arc::new(Context::new());
-    let script = ScriptBuf::from_hex(P2WPKH_SCRIPT_HEX).unwrap();
+    let script = ScriptBuf::from_hex(P2WPKH_SCRIPT_HEX).expect("script hex");
     // Reference an outpoint that does not exist anywhere.
     let prevout = OutPoint {
         txid: Txid::from_byte_array([0x99; 32]),
@@ -188,7 +188,7 @@ fn testmempoolaccept_reports_reject_for_already_in_mempool()
 #[test]
 fn testmempoolaccept_reports_reject_for_missing_inputs() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = Arc::new(Context::new());
-    let script = ScriptBuf::from_hex(P2WPKH_SCRIPT_HEX).unwrap();
+    let script = ScriptBuf::from_hex(P2WPKH_SCRIPT_HEX).expect("script hex");
     let prevout = OutPoint {
         txid: Txid::from_byte_array([0x77; 32]),
         vout: 0,

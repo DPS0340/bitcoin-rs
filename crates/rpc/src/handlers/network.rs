@@ -718,7 +718,7 @@ mod addnode_validation_tests {
         use bitcoin_rs_p2p::{PeerInfo, PeerLease};
         use crossbeam_channel::unbounded;
 
-        let addr: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:8333".parse().expect("addr");
         let ctx = Context::new();
         ctx.peers.write().push(PeerInfo {
             addr,
@@ -785,8 +785,8 @@ mod admin_rpc_tests {
         use bitcoin_rs_p2p::PeerLease;
         use crossbeam_channel::unbounded;
 
-        let addr_a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.2:8333".parse().unwrap();
+        let addr_a: SocketAddr = "127.0.0.1:8333".parse().expect("addr");
+        let addr_b: SocketAddr = "127.0.0.2:8333".parse().expect("addr");
         let ctx = Context::new();
         let (tx_a, _rx_a) = unbounded();
         let (tx_b, _rx_b) = unbounded();
@@ -1031,7 +1031,7 @@ mod getnodeaddresses_tests {
 
     fn peer(addr: &str, services: u64) -> PeerInfo {
         PeerInfo {
-            addr: addr.parse().unwrap(),
+            addr: addr.parse().expect("addr"),
             version: 70_016,
             services,
             user_agent: "test".to_owned(),
@@ -1088,7 +1088,7 @@ mod getnodeaddresses_tests {
         ctx.peers.write().push(peer("127.0.0.1:8333", 9));
         ctx.added_nodes
             .write()
-            .push("127.0.0.1:8333".parse().unwrap());
+            .push("127.0.0.1:8333".parse().expect("addr"));
         let ctx = Arc::new(ctx);
         let result = getnodeaddresses(&ctx, &json!([0]))
             .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
@@ -1132,7 +1132,7 @@ mod getnodeaddresses_tests {
         let ctx = Context::new();
         ctx.added_nodes
             .write()
-            .push("10.0.0.1:8333".parse().unwrap());
+            .push("10.0.0.1:8333".parse().expect("addr"));
         let ctx = Arc::new(ctx);
         let result = getnodeaddresses(&ctx, &json!([0]))
             .unwrap_or_else(|err| panic!("getnodeaddresses failed: {err}"));
