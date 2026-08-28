@@ -8842,6 +8842,20 @@ mod consensus_rule_tests {
             let (hash, label) = match event {
                 crate::SequenceEvent::Connected(hash) => (hash, b'C'),
                 crate::SequenceEvent::Disconnected(hash) => (hash, b'D'),
+                // Test-fake arms for the mempool `A`/`R` events; the
+                // production payload mapping lives in `mempool_observer`.
+                crate::SequenceEvent::Added(txid, _) => (
+                    bitcoin_rs_primitives::Hash256::from_le_bytes(
+                        bitcoin::hashes::Hash::as_byte_array(&txid),
+                    ),
+                    b'A',
+                ),
+                crate::SequenceEvent::Removed(txid, _) => (
+                    bitcoin_rs_primitives::Hash256::from_le_bytes(
+                        bitcoin::hashes::Hash::as_byte_array(&txid),
+                    ),
+                    b'R',
+                ),
             };
             let mut next_sequence = self.next_sequence.lock();
             self.events.lock().push((hash, label, *next_sequence));

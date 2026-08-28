@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::entry::fee_rate;
 use crate::fee_estimator::{FeeEstimator, FeeRate};
+use crate::mutation::{MutationChange, MutationOutcome, MutationResult, RemovalReason};
 use crate::{EntryId, MempoolEntry, MempoolLimits, ParetoFront, PolicyError};
 
 /// Script-index key for funding index range scans.
@@ -132,7 +133,12 @@ pub struct Mempool {
     /// admissions record arrivals, non-mined removals record departures, and
     /// `remove_for_block` records confirmations.
     estimator: FeeEstimator,
-    sequence: core::sync::atomic::AtomicU64,
+    /// Mempool sequence: advanced once per emitted mutation change while the
+    /// write lock is held. Reported by [`Mempool::sequence_number`], carried
+    /// in ZMQ `A`/`R` event payloads, and used as the mining generation key's
+    /// mempool component. Failed inserts, no-op removals, clear-on-empty, and
+    /// in-pool prioritisation move nothing.
+    mempool_sequence: u64,
 }
 
 pub(crate) struct PreparedInsert {
@@ -207,8 +213,9 @@ pub struct SnapshotEntry {
 /// captured by [`Mempool::mining_snapshot`] under one read.
 #[derive(Clone, Debug)]
 pub struct MempoolMiningSnapshot {
-    /// Pool sequence at capture. Every admission, removal, and in-pool
-    /// prioritisation moves it; template caches key on it.
+    /// Pool mempool sequence at capture. Every admission and removal change
+    /// moves it; in-pool prioritisation does not (it emits no mutation
+    /// change). Template caches key on it.
     pub sequence: u64,
     /// Entries in modified-priority order. `ancestors` positions and the
     /// order itself both refer to this vector.
@@ -232,15 +239,17 @@ impl Mempool {
             fee_rate_floor: None,
             fee_deltas: HashMap::new(),
             estimator: FeeEstimator::new(),
-            sequence: core::sync::atomic::AtomicU64::new(0),
+            mempool_sequence: 0,
         }
     }
 
     /// Removes all entries from the pool, clears every index and the
-    /// persistent prioritisation overlay, resets the fee history, and bumps
-    /// the sequence counter to signal a wholesale invalidation to
-    /// subscribers.
-    pub fn clear(&mut self) {
+    /// persistent prioritisation overlay, and resets the fee history. Every
+    /// cleared entry commits as one `Removed(Clear)` change — in entry-id
+    /// order — each taking the next mempool sequence value. A clear of an
+    /// already-empty pool commits nothing and moves no sequence.
+    pub fn clear(&mut self) -> MutationResult {
+        let txids: Vec<Txid> = self.entries.iter().map(|(_id, entry)| entry.txid).collect();
         self.entries.clear();
         self.by_txid.clear();
         self.funding.clear();
@@ -252,16 +261,25 @@ impl Mempool {
         self.fee_rate_floor = None;
         self.fee_deltas.clear();
         self.estimator = FeeEstimator::new();
-        self.bump_sequence();
+        let mut changes = Vec::with_capacity(txids.len());
+        for txid in txids {
+            self.push_change(
+                &mut changes,
+                txid,
+                MutationOutcome::Removed(RemovalReason::Clear),
+            );
+        }
+        self.finish_mutation(changes)
     }
 
-    /// Returns the current sequence number. Increments on every admission,
-    /// removal, wholesale clear, and in-pool prioritisation; a delta stored
-    /// for a txid not yet in the pool moves nothing observable and does not
-    /// count.
+    /// Returns the current mempool sequence: a counter advanced once per
+    /// emitted mutation change. `getmempoolinfo`, `getrawmempool` sequence
+    /// reporting, and the mining generation key all read this counter. Failed
+    /// inserts, no-op removals, clear-on-empty, and in-pool prioritisation
+    /// move nothing.
     #[must_use]
-    pub fn sequence_number(&self) -> u64 {
-        self.sequence.load(core::sync::atomic::Ordering::Acquire)
+    pub const fn sequence_number(&self) -> u64 {
+        self.mempool_sequence
     }
 
     /// Returns the configured min-relay-fee rate in sat/kvB.
@@ -270,14 +288,37 @@ impl Mempool {
         self.limits.min_relay_fee_sat_per_kvb
     }
 
-    fn bump_sequence(&self) {
-        let _ = self
-            .sequence
-            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    /// Records one committed change and assigns it the next mempool sequence
+    /// value. Callers hold the write lock for the whole mutation, so
+    /// assignment is total, ordered, and gap-free within a batch.
+    fn push_change(
+        &mut self,
+        changes: &mut Vec<MutationChange>,
+        txid: Txid,
+        outcome: MutationOutcome,
+    ) {
+        self.mempool_sequence = self.mempool_sequence.wrapping_add(1);
+        changes.push(crate::mutation::change(&txid, outcome));
+    }
+
+    /// Wraps an ordered change list into a result, deriving the batch's
+    /// sequence base from the counter the changes just advanced.
+    pub(crate) fn finish_mutation(&self, changes: Vec<MutationChange>) -> MutationResult {
+        let batch_len = u64::try_from(changes.len()).unwrap_or(u64::MAX);
+        let sequence_base = changes
+            .first()
+            .map_or(0, |_| self.mempool_sequence - batch_len + 1);
+        MutationResult {
+            changes,
+            sequence_base,
+        }
     }
 
     /// Inserts an entry after applying ancestor and descendant policy checks.
-    pub fn insert_entry(&mut self, entry: MempoolEntry) -> Result<EntryId, MempoolError> {
+    /// On success the result carries the `Accepted` change followed by any
+    /// post-insert size-limit evictions as `Removed(PolicyEviction)`, in
+    /// commit order.
+    pub fn insert_entry(&mut self, entry: MempoolEntry) -> Result<MutationResult, MempoolError> {
         let prepared = self.validate_insert(entry, &HashSet::new())?;
         Ok(self.commit_insert(prepared))
     }
@@ -341,7 +382,10 @@ impl Mempool {
         Ok(PreparedInsert { entry })
     }
 
-    pub(crate) fn commit_insert(&mut self, prepared: PreparedInsert) -> EntryId {
+    /// Commits a validated insert. The result carries the `Accepted` change
+    /// first, then any post-insert size-limit evictions as
+    /// `Removed(PolicyEviction)` in eviction order.
+    pub(crate) fn commit_insert(&mut self, prepared: PreparedInsert) -> MutationResult {
         let entry = prepared.entry;
         let txid = entry.txid;
         let added_vsize = u64::from(entry.vsize);
@@ -366,9 +410,13 @@ impl Mempool {
         // become reachable once this entry is in the spend indexes.
         let affected = self.metadata_closure(&[id]);
         self.refresh_metadata(&affected);
-        self.bump_sequence();
+        let mut changes = Vec::new();
+        self.push_change(&mut changes, txid, MutationOutcome::Accepted);
         if self.limits.max_total_bytes > 0 && self.total_vsize() > self.limits.max_total_bytes {
-            let _evicted = self.enforce_size_limit(self.limits.max_total_bytes);
+            changes.extend(crate::evict_lowest_fee_packages(
+                self,
+                self.limits.max_total_bytes,
+            ));
         }
         // Fed last, after size-limit eviction: an acceptance that eviction
         // immediately removed must not linger in the estimator's pending set.
@@ -378,7 +426,7 @@ impl Mempool {
         {
             self.estimator.tx_entered(txid, fee_rate, height);
         }
-        id
+        self.finish_mutation(changes)
     }
 
     /// Returns the number of transactions in the mempool.
@@ -475,13 +523,16 @@ impl Mempool {
         self.total_vsize
     }
 
-    /// Evicts the lowest-fee packages until the pool's total vsize is at or below
-    /// `max_bytes`. Returns the evicted entry ids.
+    /// Evicts the lowest-fee packages until the pool's total vsize is at or
+    /// below `max_bytes`. Each evicted entry — and each descendant swept with
+    /// its package — commits as one `Removed(PolicyEviction)` change, in
+    /// eviction commit order.
     ///
-    /// Delegates to the free-function `evict_lowest_fee_packages`; removals bump
-    /// the sequence counter through `remove_entry_and_descendants`.
-    pub fn enforce_size_limit(&mut self, max_bytes: u64) -> Vec<EntryId> {
-        crate::evict_lowest_fee_packages(self, max_bytes)
+    /// Delegates to the free-function `evict_lowest_fee_packages`, which
+    /// removes through `remove_entry_and_descendants_into`.
+    pub fn enforce_size_limit(&mut self, max_bytes: u64) -> MutationResult {
+        let changes = crate::evict_lowest_fee_packages(self, max_bytes);
+        self.finish_mutation(changes)
     }
 
     /// Returns the sum of fees of all entries in the pool, in satoshis.
@@ -717,9 +768,9 @@ impl Mempool {
     /// range; the alternative — saturating — would silently break
     /// additivity, which is this operation's whole contract.
     ///
-    /// The sequence counter moves only when the transaction is in the pool: a
-    /// pre-admission delta changes nothing a template or long-poll waiter can
-    /// observe yet.
+    /// The mempool sequence does not move: prioritisation emits no mutation
+    /// change (only pool membership does), so template consumers are woken
+    /// explicitly by the caller instead of through the sequence.
     pub fn prioritise(&mut self, txid: Txid, fee_delta: i64) -> Result<(), PrioritiseError> {
         let accumulated = self
             .fee_deltas
@@ -747,34 +798,63 @@ impl Mempool {
         // defeated for exactly the packages it was aimed at.
         let affected = self.metadata_closure(&[id]);
         self.refresh_metadata(&affected);
-        self.bump_sequence();
         Ok(())
     }
 
-    /// Removes an entry and all descendants that spend its outputs.
-    pub fn remove_entry_and_descendants(&mut self, id: EntryId) -> Vec<EntryId> {
+    /// Removes an entry and all descendants that spend its outputs. The
+    /// parent commits before its descendants; each removed entry emits one
+    /// `Removed(Explicit)` change.
+    pub fn remove_entry_and_descendants(&mut self, id: EntryId) -> MutationResult {
+        let mut changes = Vec::new();
+        self.remove_entry_and_descendants_into(id, RemovalReason::Explicit, &mut changes);
+        self.finish_mutation(changes)
+    }
+
+    /// Reason-carrying core of [`Mempool::remove_entry_and_descendants`] for
+    /// composite mutations that must tag the removal with their own reason.
+    pub(crate) fn remove_entry_and_descendants_into(
+        &mut self,
+        id: EntryId,
+        reason: RemovalReason,
+        changes: &mut Vec<MutationChange>,
+    ) {
         let mut ids = Vec::new();
         self.collect_descendants_inclusive(id, &mut ids);
         ids.sort_unstable();
         ids.dedup();
-        self.remove_entries(&ids);
-        ids
+        let removals = ids.into_iter().map(|id| (id, reason)).collect::<Vec<_>>();
+        self.remove_entries_with_reasons(&removals, changes);
     }
 
     /// Removes the entry for `txid` along with all descendants that spend
-    /// its outputs. Returns the set of removed entry ids in stable order.
+    /// its outputs, each as one `Removed(Explicit)` change in parent-before-
+    /// descendants order.
     ///
-    /// Returns an empty vector when the txid is not present in the pool.
-    pub fn remove_by_txid(&mut self, txid: &bitcoin::Txid) -> Vec<EntryId> {
+    /// Returns an empty result when the txid is not present in the pool.
+    pub fn remove_by_txid(&mut self, txid: &bitcoin::Txid) -> MutationResult {
+        let mut changes = Vec::new();
+        self.remove_by_txid_into(txid, RemovalReason::Explicit, &mut changes);
+        self.finish_mutation(changes)
+    }
+
+    /// Reason-carrying core of [`Mempool::remove_by_txid`].
+    fn remove_by_txid_into(
+        &mut self,
+        txid: &bitcoin::Txid,
+        reason: RemovalReason,
+        changes: &mut Vec<MutationChange>,
+    ) {
         let Some(id) = self.by_txid.get(txid).copied() else {
-            return Vec::new();
+            return;
         };
-        self.remove_entry_and_descendants(id)
+        self.remove_entry_and_descendants_into(id, reason, changes);
     }
 
     /// Removes the transactions a connected block confirmed, clears their
     /// prioritisation overlays, and records the confirmations in the fee
-    /// history. Returns every removed entry id in stable order.
+    /// history. Every removed entry commits as one `Removed(BlockInclusion)`
+    /// change, in commit order: block-transaction order, each removal
+    /// committing parent before descendants.
     ///
     /// For each block transaction, this mirrors Bitcoin Core's
     /// `removeForBlock`: the entry and its descendants leave the pool, other
@@ -795,7 +875,7 @@ impl Mempool {
         block_txs: &[&Transaction],
         block_txids: &[Txid],
         height: u32,
-    ) -> Vec<EntryId> {
+    ) -> MutationResult {
         assert_eq!(
             block_txs.len(),
             block_txids.len(),
@@ -806,26 +886,28 @@ impl Mempool {
         // not be demoted to a departure before the estimator sees it.
         self.estimator.block_connected(block_txids, height);
 
-        let mut removed = Vec::new();
+        let mut changes = Vec::new();
         for (tx, txid) in block_txs.iter().zip(block_txids) {
-            removed.extend(self.remove_by_txid(txid));
+            self.remove_by_txid_into(txid, RemovalReason::BlockInclusion, &mut changes);
             for conflict in self.conflicts_for(tx) {
-                removed.extend(self.remove_entry_and_descendants(conflict));
+                self.remove_entry_and_descendants_into(
+                    conflict,
+                    RemovalReason::BlockInclusion,
+                    &mut changes,
+                );
             }
             self.fee_deltas.remove(txid);
         }
-        removed.sort_unstable();
-        removed.dedup();
-        removed
+        self.finish_mutation(changes)
     }
 
     /// Removes every entry whose `fee_rate` (sat/kvB) is strictly below
-    /// `threshold_sat_per_kvb`. Returns the evicted transaction ids.
+    /// `threshold_sat_per_kvb`. Every evicted entry — and each descendant
+    /// swept with it — commits as one `Removed(PolicyEviction)` change.
     ///
-    /// Bumps the sequence counter for each successful removal. Use this for
-    /// min-relay-fee tightening or size-bound eviction policies.
+    /// Use this for min-relay-fee tightening or size-bound eviction policies.
     #[must_use]
-    pub fn evict_below_fee_rate(&mut self, threshold_sat_per_kvb: u64) -> Vec<bitcoin::Txid> {
+    pub fn evict_below_fee_rate(&mut self, threshold_sat_per_kvb: u64) -> MutationResult {
         let mut to_evict: Vec<bitcoin::Txid> = Vec::new();
         for (_id, entry) in &self.entries {
             if entry.fee_rate < threshold_sat_per_kvb {
@@ -833,14 +915,11 @@ impl Mempool {
             }
         }
 
-        let mut evicted = Vec::with_capacity(to_evict.len());
+        let mut changes = Vec::with_capacity(to_evict.len());
         for txid in to_evict {
-            let removed = self.remove_by_txid(&txid);
-            if !removed.is_empty() {
-                evicted.push(txid);
-            }
+            self.remove_by_txid_into(&txid, RemovalReason::PolicyEviction, &mut changes);
         }
-        evicted
+        self.finish_mutation(changes)
     }
 
     pub(crate) fn conflicts_for(&self, tx: &Transaction) -> Vec<EntryId> {
@@ -899,16 +978,20 @@ impl Mempool {
         self.by_txid.contains_key(&outpoint.txid)
     }
 
-    fn remove_entries(&mut self, ids: &[EntryId]) {
+    pub(crate) fn remove_entries_with_reasons(
+        &mut self,
+        removals: &[(EntryId, RemovalReason)],
+        changes: &mut Vec<MutationChange>,
+    ) {
         // Collected first: once an entry is out of the slab its ancestors can no
         // longer be walked, and they are exactly the entries whose descendant
         // totals this removal invalidates. Surviving descendants are in the
         // closure too — `remove_entries` is reached from eviction paths that
         // remove arbitrary sets, not only from the one that takes descendants
         // along with their parent.
-        let affected = self.metadata_closure(ids);
-        let mut removed_any = false;
-        for id in ids {
+        let ids: Vec<EntryId> = removals.iter().map(|(id, _reason)| *id).collect();
+        let affected = self.metadata_closure(&ids);
+        for (id, reason) in removals {
             let Some(index) = usize::try_from(*id).ok() else {
                 continue;
             };
@@ -944,8 +1027,8 @@ impl Mempool {
                     .first_key_value()
                     .map(|(&rate, _count)| rate);
             }
-            removed_any = true;
             self.by_txid.remove(&entry.txid);
+            self.push_change(changes, entry.txid, MutationOutcome::Removed(*reason));
             // A departure that is not a confirmation: eviction, replacement,
             // conflict, and reorg removal all free the estimator's pending
             // slot without saying anything about fee-rate success.
@@ -964,9 +1047,6 @@ impl Mempool {
             }
         }
         self.refresh_metadata(&affected);
-        if removed_any {
-            self.bump_sequence();
-        }
     }
 
     fn index_entry(&mut self, id: EntryId) {
@@ -1359,8 +1439,19 @@ mod tests {
     use alloc::vec::Vec;
 
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use bitcoin_rs_primitives::Hash256;
 
     use super::*;
+
+    /// Native consensus-byte txid for change-record comparisons.
+    fn hash_of(txid: &Txid) -> Hash256 {
+        Hash256::from_le_bytes(txid.as_byte_array())
+    }
+
+    /// The txid of every change in a mutation result, in commit order.
+    fn change_txids(result: &crate::mutation::MutationResult) -> Vec<Hash256> {
+        result.changes.iter().map(|change| change.txid).collect()
+    }
 
     #[test]
     fn default_min_relay_fee_is_1_sat_per_vbyte() {
@@ -1737,7 +1828,7 @@ mod tests {
         assert_floor(&pool, Some(1_500), "explicit remove of one duplicate min");
 
         let evicted = pool.evict_below_fee_rate(2_000);
-        assert_eq!(evicted, vec![low_b_txid]);
+        assert_eq!(change_txids(&evicted), vec![hash_of(&low_b_txid)]);
         assert_floor(&pool, Some(5_000), "evict_below remaining min");
 
         let mined = tx(4, Vec::new());
@@ -2058,9 +2149,12 @@ mod tests {
                 script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let id = pool
-            .insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
+        let entry_txid = tx.compute_txid();
+        pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7))
             .expect("insertion succeeds");
+        let id = pool
+            .entry_id_by_txid(&entry_txid)
+            .expect("inserted entry id resolves");
         // A row the entry's inputs never earn.
         pool.spending.insert((indexed, id));
         assert!(matches!(
@@ -2171,12 +2265,15 @@ mod tests {
         };
         let txid = tx.compute_txid();
         let entry = MempoolEntry::new(Arc::new(tx), 123, 4_567, 0, 0);
-        let id = pool.insert_entry(entry)?;
+        pool.insert_entry(entry)?;
 
         let removed = pool.remove_by_txid(&txid);
 
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed.first().copied(), Some(id));
+        assert_eq!(
+            removed.changes.first().map(|change| change.txid),
+            Some(hash_of(&txid))
+        );
         assert_eq!(pool.len(), 0);
         Ok(())
     }
@@ -2186,9 +2283,16 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let parent = tx(1, Vec::new());
         let parent_txid = parent.compute_txid();
-        let parent_id = pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        let parent_id = pool
+            .entry_id_by_txid(&parent_txid)
+            .expect("parent id resolves");
         let child = tx(2, vec![OutPoint::new(parent_txid, 0)]);
-        let child_id = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0))?;
+        let child_txid = child.compute_txid();
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0))?;
+        let child_id = pool
+            .entry_id_by_txid(&child_txid)
+            .expect("child id resolves");
 
         let descendants = pool.descendant_ids_for_entry(parent_id);
 
@@ -2310,13 +2414,22 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let parent = tx(5, Vec::new());
         let parent_txid = parent.compute_txid();
-        let parent_id = pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
+        let parent_id = pool
+            .entry_id_by_txid(&parent_txid)
+            .expect("parent id resolves");
         let child = tx(6, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.compute_txid();
-        let child_id = pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 2_000, 0, 0))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 2_000, 0, 0))?;
+        let child_id = pool
+            .entry_id_by_txid(&child_txid)
+            .expect("child id resolves");
         let grandchild = tx(7, vec![OutPoint::new(child_txid, 0)]);
-        let grandchild_id =
-            pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 100, 3_000, 0, 0))?;
+        let grandchild_txid = grandchild.compute_txid();
+        pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 100, 3_000, 0, 0))?;
+        let grandchild_id = pool
+            .entry_id_by_txid(&grandchild_txid)
+            .expect("grandchild id resolves");
 
         pool.prioritise(child_txid, 500)
             .expect("overlay delta applies");
@@ -2452,11 +2565,16 @@ mod tests {
         let mut pool = Mempool::new(MempoolLimits::default());
         let lower_fee_tx = tx(13, Vec::new());
         let lower_fee_txid = lower_fee_tx.compute_txid();
-        let lower_fee_id =
-            pool.insert_entry(MempoolEntry::new(Arc::new(lower_fee_tx), 100, 1_000, 1, 7))?;
+        pool.insert_entry(MempoolEntry::new(Arc::new(lower_fee_tx), 100, 1_000, 1, 7))?;
+        let lower_fee_id = pool
+            .entry_id_by_txid(&lower_fee_txid)
+            .expect("lower id resolves");
         let higher_fee_tx = tx(14, Vec::new());
-        let higher_fee_id =
-            pool.insert_entry(MempoolEntry::new(Arc::new(higher_fee_tx), 100, 2_000, 2, 7))?;
+        let higher_fee_txid = higher_fee_tx.compute_txid();
+        pool.insert_entry(MempoolEntry::new(Arc::new(higher_fee_tx), 100, 2_000, 2, 7))?;
+        let higher_fee_id = pool
+            .entry_id_by_txid(&higher_fee_txid)
+            .expect("higher id resolves");
 
         assert_eq!(
             pool.pareto.top_n(1).collect::<Vec<_>>(),
@@ -2517,7 +2635,10 @@ mod tests {
 
         pool.prioritise(parent_txid, 2_000).expect("delta applies");
         let bumped = pool.mining_snapshot();
-        assert!(bumped.sequence > snapshot.sequence);
+        assert_eq!(
+            bumped.sequence, snapshot.sequence,
+            "prioritisation emits no mutation change and moves no sequence"
+        );
         let [bumped_parent, bumped_child] = &bumped.entries[..] else {
             panic!("bumped snapshot must hold both entries");
         };
@@ -2639,7 +2760,7 @@ mod tests {
 
         let evicted = pool.evict_below_fee_rate(5_000);
 
-        assert_eq!(evicted, vec![low_txid]);
+        assert_eq!(change_txids(&evicted), vec![hash_of(&low_txid)]);
         assert!(!pool.contains_txid(&low_txid));
         assert!(pool.contains_txid(&high_txid));
         Ok(())
@@ -3183,13 +3304,16 @@ mod spend_index_tests {
         let mut pool = Mempool::new(MempoolLimits::default());
 
         let child_entry = MempoolEntry::new(Arc::new(child), 100, 10_000, 1, 7);
-        let Ok(_child_id) = pool.insert_entry(child_entry) else {
+        if pool.insert_entry(child_entry).is_err() {
             panic!("child insertion failed");
-        };
+        }
         let parent_entry = MempoolEntry::new(Arc::new(parent), 100, 10_000, 1, 7);
-        let Ok(parent_id) = pool.insert_entry(parent_entry) else {
+        if pool.insert_entry(parent_entry).is_err() {
             panic!("parent insertion failed");
-        };
+        }
+        let parent_id = pool
+            .entry_id_by_txid(&parent_txid)
+            .expect("parent id resolves");
 
         assert_eq!(pool.spender_txids(parent_id), vec![child_txid]);
     }

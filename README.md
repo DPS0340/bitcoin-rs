@@ -195,8 +195,9 @@ applied chain is outweighed.
 
 It is still not the node to depend on. A disconnected block's transactions do
 not return to the mempool, and the filter index is not backfilled across a gap.
-The ZMQ `pubsequence` stream now publishes block connect/disconnect events, but
-does not emit mempool `A`/`R` events. `docs/README.md` lists the rest.
+The ZMQ `pubsequence` stream publishes block connect/disconnect events plus
+mempool `A`/`R` events with per-change sequence assignment. `docs/README.md`
+lists the rest.
 
 ## Documentation
 

@@ -5,6 +5,7 @@ use bitcoin::Transaction;
 use hashbrown::HashSet;
 use thiserror::Error;
 
+use crate::mutation::{MutationResult, RemovalReason};
 use crate::pool::tx_fee_rate;
 use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 
@@ -142,26 +143,47 @@ impl Mempool {
         Ok(ReplacementPlan { evicted })
     }
 
-    /// Applies a BIP125 replacement after validation and returns the new entry id.
+    /// Applies a BIP125 replacement after validation and reports the
+    /// committed mutation: each direct conflict commits as
+    /// `Removed(Replaced)`, each descendant swept with a conflict as
+    /// `Removed(Descendant)` (parents before descendants), then the
+    /// replacement's `Accepted` and any post-insert policy evictions. The
+    /// replacement's entry id resolves from the `Accepted` change via
+    /// `entry_id_by_txid`.
     ///
     /// Re-runs conflict checks under the caller's exclusive access so a plan
     /// computed earlier cannot silently race with concurrent admissions.
-    /// Non-conflicting candidates take the same path with an empty eviction set.
+    /// Non-conflicting candidates take the same path with an empty eviction
+    /// set.
     pub fn replace_transaction(
         &mut self,
         candidate: ReplacementCandidate,
         time: u64,
         height: u32,
         sigop_cost: u32,
-    ) -> Result<EntryId, RbfError> {
+    ) -> Result<MutationResult, RbfError> {
         let plan = self.check_replacement(&candidate)?;
+        let direct: HashSet<EntryId> = self.conflicts_for(&candidate.tx).into_iter().collect();
         let entry = MempoolEntry::new(candidate.tx, candidate.vsize, candidate.fee, time, height)
             .with_sigop_cost(sigop_cost);
         let excluded: HashSet<EntryId> = plan.evicted.iter().copied().collect();
         let prepared = self.validate_insert(entry, &excluded)?;
-        for id in plan.evicted {
-            let _ = self.remove_entry_and_descendants(id);
-        }
-        Ok(self.commit_insert(prepared))
+        let mut changes = Vec::new();
+        let removals = plan
+            .evicted
+            .into_iter()
+            .map(|id| {
+                let reason = if direct.contains(&id) {
+                    RemovalReason::Replaced
+                } else {
+                    RemovalReason::Descendant
+                };
+                (id, reason)
+            })
+            .collect::<Vec<_>>();
+        self.remove_entries_with_reasons(&removals, &mut changes);
+        let replacement = self.commit_insert(prepared);
+        changes.extend(replacement.changes);
+        Ok(self.finish_mutation(changes))
     }
 }

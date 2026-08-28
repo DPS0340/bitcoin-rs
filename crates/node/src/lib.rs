@@ -34,6 +34,8 @@ mod g2_muhash;
 pub mod import;
 /// Tracing initialization.
 pub mod logging;
+/// Mempool mutation observer publishing `A`/`R` sequence events.
+pub mod mempool_observer;
 /// Metrics instrumentation and optional exposition.
 pub mod metrics;
 /// Node-owned mining candidate lifecycle coordinator.

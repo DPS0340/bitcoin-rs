@@ -1,20 +1,26 @@
 use alloc::vec::Vec;
 
 use crate::entry::fee_rate;
+use crate::mutation::{MutationChange, RemovalReason};
 use crate::{EntryId, Mempool};
 
-/// Evicts the lowest-fee descendant packages until the pool is at or below `target_size_bytes`.
-pub fn evict_lowest_fee_packages(pool: &mut Mempool, target_size_bytes: u64) -> Vec<EntryId> {
-    let mut evicted = Vec::new();
+/// Evicts the lowest-fee descendant packages until the pool fits.
+///
+/// Shrinks the pool to at or below `target_size_bytes`, returning one
+/// `Removed(PolicyEviction)` change per evicted entry, in eviction
+/// commit order (each package commits parent before its descendants).
+pub fn evict_lowest_fee_packages(
+    pool: &mut Mempool,
+    target_size_bytes: u64,
+) -> Vec<MutationChange> {
+    let mut changes = Vec::new();
     while pool.total_vsize() > target_size_bytes {
         let Some(id) = lowest_fee_package(pool) else {
             break;
         };
-        evicted.extend(pool.remove_entry_and_descendants(id));
+        pool.remove_entry_and_descendants_into(id, RemovalReason::PolicyEviction, &mut changes);
     }
-    evicted.sort_unstable();
-    evicted.dedup();
-    evicted
+    changes
 }
 
 fn lowest_fee_package(pool: &Mempool) -> Option<EntryId> {
@@ -58,11 +64,12 @@ pub fn mempool_min_fee_sat_per_kvb(pool: &Mempool, incremental_relay_fee_sat_per
 #[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
-
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use bitcoin_rs_primitives::Hash256;
 
     use super::{evict_lowest_fee_packages, mempool_min_fee_sat_per_kvb};
+    use crate::mutation::{MutationChange, MutationOutcome, RemovalReason};
     use crate::{Mempool, MempoolEntry, MempoolLimits};
 
     #[test]
@@ -99,10 +106,17 @@ mod tests {
         let high = MempoolEntry::new(Arc::new(tx(2)), 100, 10_000, 1, 1);
         let low = MempoolEntry::new(Arc::new(tx(3)), 100, 1_000, 2, 1);
         pool.insert_entry(high).expect("high");
-        let low_id = pool.insert_entry(low).expect("low");
+        pool.insert_entry(low).expect("low");
 
         let evicted = evict_lowest_fee_packages(&mut pool, 100);
-        assert_eq!(evicted, vec![low_id]);
+        assert_eq!(
+            evicted,
+            vec![MutationChange {
+                txid: Hash256::from_le_bytes(tx(3).compute_txid().as_byte_array()),
+                outcome: MutationOutcome::Removed(RemovalReason::PolicyEviction),
+            }],
+            "the lowest-fee package leaves first, tagged PolicyEviction"
+        );
         assert_eq!(pool.len(), 1);
     }
 

@@ -59,8 +59,9 @@ transition stops the process.
 Reorg handling still does not return disconnected transactions to the mempool.
 That requires one production admission pipeline shared by Esplora broadcast, P2P relay,
 and reorg handling. Production transaction relay is also incomplete. The ZMQ
-`pubsequence` stream publishes block connect/disconnect events, but intentionally
-does not emit mempool `A`/`R` events until mempool event sequencing is redesigned.
+`pubsequence` stream publishes block connect/disconnect events and mempool
+`A`/`R` events with per-change sequence assignment and explicit removal
+reasons.
 
 Also incomplete: metrics coverage and parts of the CLI and RPC surface.
 

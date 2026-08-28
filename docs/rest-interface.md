@@ -58,9 +58,10 @@ bitcoin-rs publishes the Core-compatible `pubsequence` ZMQ topic with block
 connect (`C`) and disconnect (`D`) events. The configured endpoint is reported
 by `getzmqnotifications`, so the unmodified enforcer can discover it through
 its normal startup path rather than requiring an external publisher or an
-explicit `--node-zmq-addr-sequence`. Mempool `A`/`R` events remain intentionally
-absent until the mempool has per-transaction event sequencing and explicit
-removal reasons.
+explicit `--node-zmq-addr-sequence`. Mempool admissions publish `A` events and removals publish `R` events on the
+same topic, each carrying the txid and the mempool sequence assigned to the
+change. A transaction mined in a connected block emits no `R`: the block's
+`C` event covers it, matching Core.
 
 REST is off by default. With REST disabled, `/rest/*` returns HTTP 404.
 Unknown REST routes return HTTP 404. On endpoints that parse a hash, height, or
@@ -75,5 +76,6 @@ request.
 
 The checked-in default Compose stack supplies the REST, `pubsequence`,
 version-check bypass, and drynet4 network settings required to run the
-unmodified enforcer in block-only mode. It deliberately omits `--enable-mempool`
-until `pubsequence` also provides transaction `A`/`R` events.
+unmodified enforcer. With `pubsequence` now carrying transaction `A`/`R`
+events, the stack enables `--enable-mempool` so the enforcer tracks the
+mempool too.

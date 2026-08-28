@@ -216,9 +216,10 @@ keeps its ownership for retry.
 Still open around it: returning a disconnected block's transactions through one
 production admission pipeline shared by Esplora broadcast, P2P relay, and reorg handling;
 and backfilling the filter index after a gap. The `pubsequence` stream publishes
-block connect/disconnect notifications, but intentionally does not publish
-mempool `A`/`R` events: the current mempool counter and mutation reasons cannot
-yet guarantee the enforcer's required contiguous transaction event sequence.
+block connect/disconnect notifications and mempool `A`/`R` events: every mempool
+mutation commits through the `MempoolGateway`, which advances a per-change
+mempool sequence under the write lock, so the enforcer sees a contiguous
+transaction event sequence with explicit removal reasons.
 Raw mempool insertion is not reconsideration because it cannot reconstruct fee,
 policy, conflict, and ancestry metadata.
 
@@ -226,10 +227,13 @@ policy, conflict, and ancestry metadata.
 
 The Core-compatible `pubsequence` ZMQ stream is a unified block-event stream.
 Each event carries the block hash, one label (`C` for connect or `D` for
-disconnect), and a topic-local little-endian `u32` sequence counter. Reorg
-disconnects are emitted tip-first before connects on the replacement branch.
-This implementation deliberately omits mempool `A`/`R` events until the
-mempool has per-transaction sequence assignment and explicit removal reasons.
+disconnect, `A` for mempool admission or `R` for removal), and a topic-local
+little-endian `u32` sequence counter. Reorg disconnects are emitted tip-first
+before connects on the replacement branch. Each `A`/`R` payload carries the
+reversed txid, the label, and the mempool sequence assigned to that change;
+the same counter backs `getmempoolinfo` and `getrawmempool`. A transaction
+mined in a connected block emits no `R` — Core suppresses it behind the
+block's `C` event.
 
 ### Chain control
 

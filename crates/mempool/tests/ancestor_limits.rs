@@ -51,16 +51,22 @@ fn rpc_graph_facts_are_transitive_and_aggregates_are_inclusive() -> Result<(), B
 
     let root = chained_tx(50, outpoint(49, 0));
     let root_txid = root.compute_txid();
-    let root_id = pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 1_000, 1, 1))?;
+    pool.insert_entry(MempoolEntry::new(Arc::new(root), 100, 1_000, 1, 1))?;
+    let root_id = pool.entry_id_by_txid(&root_txid).ok_or("missing root id")?;
 
     let child = chained_tx(51, OutPoint::new(root_txid, 0));
     let child_txid = child.compute_txid();
-    let child_id = pool.insert_entry(MempoolEntry::new(Arc::new(child), 200, 3_000, 2, 1))?;
+    pool.insert_entry(MempoolEntry::new(Arc::new(child), 200, 3_000, 2, 1))?;
+    let child_id = pool
+        .entry_id_by_txid(&child_txid)
+        .ok_or("missing child id")?;
 
     let grandchild = chained_tx(52, OutPoint::new(child_txid, 0));
     let grandchild_txid = grandchild.compute_txid();
-    let grandchild_id =
-        pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 300, 6_000, 3, 1))?;
+    pool.insert_entry(MempoolEntry::new(Arc::new(grandchild), 300, 6_000, 3, 1))?;
+    let grandchild_id = pool
+        .entry_id_by_txid(&grandchild_txid)
+        .ok_or("missing grandchild id")?;
 
     assert_eq!(
         pool.ancestor_ids_for_entry(grandchild_id),
