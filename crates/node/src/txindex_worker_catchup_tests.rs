@@ -124,6 +124,7 @@ impl CatchupFixture {
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled: bitcoin_rs_index::IndexCapabilities::ALL,
             wake_rx,
+            chain_events: crate::txindex_worker::detached_chain_publisher(),
             quiet_period: REVISION_QUIET_PERIOD,
             batch_delay: Duration::ZERO,
         };

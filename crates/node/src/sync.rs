@@ -7400,6 +7400,7 @@ mod tests {
             Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
+            Arc::new(crate::state::ChainEventPublisher::detached(0).0),
         )
     }
 

@@ -1023,6 +1023,8 @@ pub struct ApplyHandles {
     pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
     /// Shared ZMQ-event publisher (default: `NoOpZmqPublisher`).
     pub zmq_publisher: Arc<dyn crate::ZmqPublisher>,
+    /// Chain-event publisher for coherent snapshots and reconciliation hints.
+    pub chain_events: Arc<crate::state::ChainEventPublisher>,
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
     /// Undo storage. Mandatory: see [`UndoStore`].
     pub(crate) undo_store: Arc<dyn UndoStore>,
@@ -1085,6 +1087,7 @@ impl ApplyHandles {
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
         zmq_publisher: Arc<dyn crate::ZmqPublisher>,
+        chain_events: Arc<crate::state::ChainEventPublisher>,
     ) -> Self {
         Self {
             network,
@@ -1099,6 +1102,7 @@ impl ApplyHandles {
             blocks,
             transactions,
             zmq_publisher,
+            chain_events,
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
             g2_muhash_sampler: None,
@@ -1415,6 +1419,11 @@ pub(crate) fn disconnect_block_admitted(
     handles
         .applied_tip
         .store(Some(Arc::new(parent_tip.clone())));
+    handles.chain_events.record(
+        crate::state::HintKind::Disconnected,
+        parent_tip.height,
+        parent_tip.hash,
+    );
     rewind_chain_tx_count(handles, tx_count_delta);
     handles.wake_tx_index();
 
@@ -2542,6 +2551,9 @@ fn apply_block_admitted(
         }
     }
     handles.applied_tip.store(Some(Arc::new(tip.clone())));
+    handles
+        .chain_events
+        .record(crate::state::HintKind::Connected, tip.height, tip.hash);
     advance_chain_tx_count(handles, height, tx_count_delta_for(block));
     handles.wake_tx_index();
     if handles.zmq_publisher.wants_notifications() {
@@ -7490,6 +7502,17 @@ mod consensus_rule_tests {
         ) -> Result<(), bitcoin_rs_index::IndexError> {
             Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
         }
+
+        fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, bitcoin_rs_index::IndexError> {
+            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
+        }
+
+        fn commit_consumer_cursor(
+            &self,
+            _cursor: &[u8],
+        ) -> Result<(), bitcoin_rs_index::IndexError> {
+            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
+        }
     }
 
     impl bitcoin_rs_index::IndexReader for FailAfterStartupTxIndex {
@@ -7531,6 +7554,7 @@ mod consensus_rule_tests {
             None,
             crate::txindex_worker::DEFAULT_BATCH_LIMITS,
             bitcoin_rs_index::IndexCapabilities::ALL,
+            Arc::new(crate::state::ChainEventPublisher::detached(0).0),
             wake_rx,
         )?;
 
@@ -9632,6 +9656,7 @@ mod consensus_rule_tests {
             Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<bitcoin::Txid, Transaction>::new())),
             Arc::new(crate::NoOpZmqPublisher),
+            Arc::new(crate::state::ChainEventPublisher::detached(0).0),
         )
     }
 

@@ -1054,6 +1054,7 @@ fn apply_handles(
         Arc::new(RwLock::new(BlockLog::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
         Arc::new(NoOpZmqPublisher),
+        Arc::new(bitcoin_rs_node::state::ChainEventPublisher::detached(0).0),
     )
 }
 

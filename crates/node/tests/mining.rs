@@ -47,6 +47,31 @@ fn apply_genesis(state: &NodeState) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn advance_mempool_sequence(state: &NodeState) -> anyhow::Result<()> {
+    let mempool = state.mempool();
+    let mut guard = mempool.write();
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(99_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    guard
+        .insert_entry(bitcoin_rs_mempool::MempoolEntry::new(
+            Arc::new(tx),
+            100,
+            10_000,
+            1,
+            7,
+        ))
+        .map_err(|error| anyhow::anyhow!("seed insert failed: {error}"))?;
+    guard.clear();
+    Ok(())
+}
+
 fn open_network(network: Network) -> anyhow::Result<NodeState> {
     let dir = tempfile::tempdir()?;
     let mut config = Config::default_for_network(network);
@@ -155,34 +180,7 @@ fn key_invalidation_rebuilds_after_mempool_sequence_change() -> anyhow::Result<(
     mining.publish_generation();
     let first = expect_template(mining.get_block_template(template_request(None))?);
 
-    // Admission drives the sequence bump under test: since the gateway
-    // change, clear() on an already-empty pool is deliberately a
-    // sequence no-op, so an insert is what invalidates the key.
-    {
-        use bitcoin::{
-            Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-            transaction,
-        };
-        use bitcoin_rs_mempool::MempoolEntry;
-
-        let tx = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([0x41; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        };
-        let mempool = state.mempool();
-        let mut guard = mempool.write();
-        guard.insert_entry(MempoolEntry::new(Arc::new(tx), 120, 10_000, 1, 1))?;
-    }
+    advance_mempool_sequence(&state)?;
     mining.publish_generation();
     let second = expect_template(mining.get_block_template(template_request(None))?);
     assert_ne!(
@@ -296,11 +294,7 @@ fn long_poll_wakes_on_mempool_sequence_change() -> anyhow::Result<()> {
     });
     started_rx.recv_timeout(Duration::from_secs(2))?;
     thread::sleep(Duration::from_millis(50));
-    {
-        let mempool = state.mempool();
-        let mut guard = mempool.write();
-        guard.clear();
-    }
+    advance_mempool_sequence(&state)?;
     mining.publish_generation();
     let result = waiter
         .join()

@@ -154,7 +154,12 @@ impl TxIndexWorker {
     /// to the applied tip stored in `handles`.
     ///
     /// `wake_rx` must be the receiver paired with the `Sender` used to construct
-    /// `runtime`.
+    /// `runtime`. `chain_events` is the publisher whose snapshot the worker
+    /// mirrors into the persisted consumer cursor; its `record` fires at the
+    /// same commit point as the wake, so the worker treats the wake channel as
+    /// its coalesced hint stream and recovers from dropped wakes by
+    /// reconciling fresh snapshots.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         runtime: Arc<TxIndexRuntime>,
         writer: Arc<dyn TxIndexWriter>,
@@ -163,6 +168,7 @@ impl TxIndexWorker {
         body_store: Option<Arc<dyn PruneBodyStore>>,
         batch_limits: PreparedBatchLimits,
         enabled: IndexCapabilities,
+        chain_events: Arc<crate::state::ChainEventPublisher>,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
         let worker = Worker {
@@ -175,6 +181,7 @@ impl TxIndexWorker {
             enabled,
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
+            chain_events,
             batch_delay: FORWARD_BATCH_DELAY,
         };
         let runtime_for_error = Arc::clone(&runtime);
@@ -251,6 +258,17 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         self.prepare_block(height, hash, body)
     }
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError>;
+    fn commit_forward_with_cursor(
+        &self,
+        batch: PreparedBatch,
+        cursor: Option<&[u8]>,
+    ) -> Result<IndexWatermark, IndexError> {
+        let watermark = self.commit_forward(batch)?;
+        if let Some(cursor) = cursor {
+            self.commit_consumer_cursor(cursor)?;
+        }
+        Ok(watermark)
+    }
     fn commit_rollback_one(
         &self,
         prev: Option<IndexWatermark>,
@@ -265,10 +283,25 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let _ = capabilities;
         self.commit_rollback_one(prev, body)
     }
+    fn commit_rollback_one_for_with_cursor(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: Option<&[u8]>,
+    ) -> Result<(), IndexError> {
+        self.commit_rollback_one_for(capabilities, prev, body)?;
+        if let Some(cursor) = cursor {
+            self.commit_consumer_cursor(cursor)?;
+        }
+        Ok(())
+    }
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         let _ = capabilities;
         Err(IndexError::UnsupportedRollback)
     }
+    fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError>;
+    fn commit_consumer_cursor(&self, cursor: &[u8]) -> Result<(), IndexError>;
 }
 
 impl<S> TxIndexWriter for Mutex<IndexWriter<S>>
@@ -306,6 +339,13 @@ where
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
         self.lock().commit_forward(batch)
     }
+    fn commit_forward_with_cursor(
+        &self,
+        batch: PreparedBatch,
+        cursor: Option<&[u8]>,
+    ) -> Result<IndexWatermark, IndexError> {
+        self.lock().commit_forward_with_cursor(batch, cursor)
+    }
 
     fn commit_rollback_one(
         &self,
@@ -324,10 +364,34 @@ where
         self.lock()
             .commit_rollback_one_for(capabilities, prev, body)
     }
+    fn commit_rollback_one_for_with_cursor(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: Option<&[u8]>,
+    ) -> Result<(), IndexError> {
+        self.lock()
+            .commit_rollback_one_for_with_cursor(capabilities, prev, body, cursor)
+    }
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         self.lock().reset_capabilities(capabilities)
     }
+
+    fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
+        self.lock().consumer_cursor()
+    }
+
+    fn commit_consumer_cursor(&self, cursor: &[u8]) -> Result<(), IndexError> {
+        self.lock().commit_consumer_cursor(cursor)
+    }
+}
+
+/// Detached publisher for test worker construction; records still sequence.
+#[cfg(test)]
+pub(crate) fn detached_chain_publisher() -> Arc<crate::state::ChainEventPublisher> {
+    Arc::new(crate::state::ChainEventPublisher::detached(0).0)
 }
 
 struct Worker {
@@ -338,6 +402,7 @@ struct Worker {
     body_store: Option<Arc<dyn PruneBodyStore>>,
     batch_limits: PreparedBatchLimits,
     enabled: IndexCapabilities,
+    chain_events: Arc<crate::state::ChainEventPublisher>,
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
@@ -484,6 +549,7 @@ impl Worker {
                     if self.runtime.revision() != revision_before {
                         continue;
                     }
+                    self.persist_chain_cursor()?;
                     match self.wake_rx.recv_timeout(Duration::from_secs(1)) {
                         Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -710,12 +776,44 @@ impl Worker {
         target: &TipSnapshot,
     ) -> bool {
         let tree = self.block_tree.read();
-        let watermark_hash = Hash256::from_le_bytes(&watermark.hash);
-        let Some(watermark_node) = tree.lookup(watermark_hash) else {
-            return false;
+        crate::reconcile::position_on_active_chain(
+            &tree,
+            Hash256::from_le_bytes(&watermark.hash),
+            watermark.height,
+            target.tip_id,
+        )
+    }
+
+    /// Persists the consumer cursor once the rows provably mirror the live
+    /// snapshot.
+    ///
+    /// The cursor is advisory: it lets a restarted or hint-starved consumer
+    /// trust its position and lets a new epoch invalidate it. It is written
+    /// only when the publisher snapshot names exactly the tip the rows
+    /// reached, so it can never describe rows the store does not hold. The
+    /// publisher briefly lags `applied_tip` inside one commit, so a disagreeing
+    /// snapshot simply skips the write; the next caught-up pass retries.
+    fn persist_chain_cursor(&self) -> Result<(), TxIndexWorkerError> {
+        let loaded_tip = self.applied_tip.load_full();
+        let Some(target) = loaded_tip.as_deref() else {
+            return Ok(());
         };
-        tree.node_at_height_from(target.tip_id, watermark.height)
-            .is_some_and(|id| id == watermark_node)
+        let snapshot = self.chain_events.snapshot();
+        if snapshot.tip_hash != target.hash || snapshot.tip_height != target.height {
+            return Ok(());
+        }
+        let bytes = crate::reconcile::ConsumerCursor::from_snapshot(&snapshot).to_bytes();
+        if self
+            .writer
+            .consumer_cursor()
+            .map_err(TxIndexWorkerError::Index)?
+            .is_some_and(|stored| stored == bytes)
+        {
+            return Ok(());
+        }
+        self.writer
+            .commit_consumer_cursor(&bytes)
+            .map_err(TxIndexWorkerError::Index)
     }
 
     /// Copies one bounded chunk of active-chain identities under one short
@@ -925,8 +1023,16 @@ impl Worker {
         if self.runtime.should_stop() {
             return Err(TxIndexWorkerError::Stopped);
         }
+        let cursor = self.cursor_for_result(capabilities, prev)?;
         self.writer
-            .commit_rollback_one_for(capabilities, prev, &body)
+            .commit_rollback_one_for_with_cursor(
+                capabilities,
+                prev,
+                &body,
+                cursor
+                    .as_ref()
+                    .map(<[u8; crate::reconcile::CURSOR_BYTE_LEN]>::as_slice),
+            )
             .map_err(TxIndexWorkerError::Index)?;
         Ok(prev)
     }
@@ -955,11 +1061,50 @@ impl Worker {
             return Ok(None);
         }
 
+        let endpoint = batch
+            .watermark()
+            .ok_or(TxIndexWorkerError::PendingDurableChanged)?;
+        let capabilities = batch
+            .capabilities()
+            .ok_or(TxIndexWorkerError::PendingDurableChanged)?;
+        let cursor = self.cursor_for_result(capabilities, Some(endpoint))?;
         let watermark = self
             .writer
-            .commit_forward(batch)
+            .commit_forward_with_cursor(
+                batch,
+                cursor
+                    .as_ref()
+                    .map(<[u8; crate::reconcile::CURSOR_BYTE_LEN]>::as_slice),
+            )
             .map_err(TxIndexWorkerError::Index)?;
         Ok(Some(watermark))
+    }
+
+    fn cursor_for_result(
+        &self,
+        capabilities: IndexCapabilities,
+        result: Option<IndexWatermark>,
+    ) -> Result<Option<[u8; crate::reconcile::CURSOR_BYTE_LEN]>, TxIndexWorkerError> {
+        let snapshot = self.chain_events.snapshot();
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        if result.height != snapshot.tip_height || result.hash != snapshot.tip_hash.to_le_bytes() {
+            return Ok(None);
+        }
+        let mut watermarks = self
+            .writer
+            .watermarks()
+            .map_err(TxIndexWorkerError::Index)?;
+        if capabilities.tx_lookup {
+            watermarks.tx_lookup = Some(result);
+        }
+        if capabilities.script_history {
+            watermarks.script_history = Some(result);
+        }
+        let aligned = (!self.enabled.tx_lookup || watermarks.tx_lookup == Some(result))
+            && (!self.enabled.script_history || watermarks.script_history == Some(result));
+        Ok(aligned.then(|| crate::reconcile::ConsumerCursor::from_snapshot(&snapshot).to_bytes()))
     }
 
     fn commit_pending(
@@ -1855,6 +2000,7 @@ mod body_reader_tests {
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled: IndexCapabilities::ALL,
             wake_rx,
+            chain_events: detached_chain_publisher(),
             quiet_period: Duration::ZERO,
             batch_delay: Duration::ZERO,
         };

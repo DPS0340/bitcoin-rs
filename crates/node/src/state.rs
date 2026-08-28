@@ -1267,6 +1267,11 @@ impl NodeState {
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
         let chain_tx_count = Arc::new(AtomicU64::new(restored_chain_tx_count));
         let transactions = Arc::new(RwLock::new(HashMap::new()));
+        // Created before the txindex worker spawn: the worker mirrors this
+        // publisher's snapshot into its persisted consumer cursor.
+        let (chain_events_raw, chain_event_hints_rx_raw) =
+            ChainEventPublisher::new(epoch, initial_snapshot);
+        let chain_events = Arc::new(chain_events_raw);
         let tx_index_open = open_tx_index(&config)?;
         let (tx_index_runtime, tx_index_worker, tx_index_query) = match tx_index_open {
             Some(open) => {
@@ -1293,6 +1298,7 @@ impl NodeState {
                     Some(Arc::clone(&block_body_store)),
                     open.batch_limits,
                     tx_index_capabilities(&config),
+                    Arc::clone(&chain_events),
                     wake_rx,
                 )
                 .context("spawn txindex worker")?;
@@ -1314,9 +1320,6 @@ impl NodeState {
         let (inbound_blocks_tx, inbound_blocks_rx_raw) =
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-        let (chain_events_raw, chain_event_hints_rx_raw) =
-            ChainEventPublisher::new(epoch, initial_snapshot);
-        let chain_events = Arc::new(chain_events_raw);
         let chain_event_hints_rx = Arc::new(Mutex::new(chain_event_hints_rx_raw));
         let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
@@ -1332,6 +1335,7 @@ impl NodeState {
             blocks: Arc::clone(&blocks),
             transactions: Arc::clone(&transactions),
             zmq_publisher: Arc::clone(&zmq_publisher),
+            chain_events: Arc::clone(&chain_events),
             block_body_store: Some(Arc::clone(&block_body_store)),
             undo_store,
             g2_muhash_sampler,

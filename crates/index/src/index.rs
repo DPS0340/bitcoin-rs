@@ -112,6 +112,10 @@ const FORMAT_VERSION_VALUE: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 const TX_LOOKUP_WATERMARK_KEY: &[u8] = &[0x00, b'T'];
 const SCRIPT_HISTORY_WATERMARK_KEY: &[u8] = &[0x00, b'S'];
 const RESET_CAPABILITIES_KEY: &[u8] = &[0x00, b'R'];
+/// Consumer cursor slot (`0x00, b'C'`). Opaque bytes owned by the node-side
+/// reconciliation consumer; data row keys begin with ASCII letters only and
+/// can never collide with the reserved `0x00` prefix.
+const CONSUMER_CURSOR_KEY: &[u8] = &[0x00, b'C'];
 const WATERMARK_LEN: usize = crate::types::HEIGHT_SIZE + 32;
 const RESET_SCAN_LIMIT: PrefixScanLimit = PrefixScanLimit {
     max_rows: 1_000,
@@ -400,7 +404,8 @@ impl PreparedBatch {
         self.blocks
     }
 
-    const fn capabilities(&self) -> Option<IndexCapabilities> {
+    /// Returns the row families represented by the admitted blocks.
+    pub const fn capabilities(&self) -> Option<IndexCapabilities> {
         self.capabilities
     }
 }
@@ -2166,6 +2171,15 @@ impl<S: KvStore> IndexWriter<S> {
 
     /// Atomically connects a bounded batch and advances the durable watermark.
     pub fn commit_forward(&mut self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
+        self.commit_forward_with_cursor(batch, None)
+    }
+
+    /// Atomically connects a bounded batch and optionally advances its consumer cursor.
+    pub fn commit_forward_with_cursor(
+        &mut self,
+        batch: PreparedBatch,
+        cursor: Option<&[u8]>,
+    ) -> Result<IndexWatermark, IndexError> {
         self.ensure_prepared_ready()?;
         if batch.is_empty() {
             return Err(IndexError::NonContiguousPrepared {
@@ -2222,6 +2236,9 @@ impl<S: KvStore> IndexWriter<S> {
             &FORMAT_VERSION_VALUE,
         );
         put_selected_watermarks(&mut store_batch, capabilities, Some(final_watermark));
+        if let Some(cursor) = cursor {
+            store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, cursor);
+        }
         self.indexer.store.write_durable(store_batch)?;
         self.indexer.last_counts = merged.counts();
         Ok(final_watermark)
@@ -2242,6 +2259,17 @@ impl<S: KvStore> IndexWriter<S> {
         capabilities: IndexCapabilities,
         prev: Option<IndexWatermark>,
         body: &[u8],
+    ) -> Result<(), IndexError> {
+        self.commit_rollback_one_for_with_cursor(capabilities, prev, body, None)
+    }
+
+    /// Atomically rolls back one block and optionally advances its consumer cursor.
+    pub fn commit_rollback_one_for_with_cursor(
+        &mut self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        cursor: Option<&[u8]>,
     ) -> Result<(), IndexError> {
         self.ensure_prepared_ready()?;
         let watermarks = self.watermarks()?;
@@ -2306,9 +2334,33 @@ impl<S: KvStore> IndexWriter<S> {
             &FORMAT_VERSION_VALUE,
         );
         put_selected_watermarks(&mut store_batch, capabilities, prev);
+        if let Some(cursor) = cursor {
+            store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, cursor);
+        }
         self.indexer.store.write_deferred(store_batch)?;
         self.indexer.store.flush()?;
         self.indexer.last_counts = prepared.rows.counts();
+        Ok(())
+    }
+
+    /// Loads the opaque consumer cursor bytes, or `None` when none is stored.
+    ///
+    /// The cursor is opaque to this crate: the owning consumer defines the
+    /// encoding and writes it only after its rows reached the position it
+    /// names, so a present cursor always describes committed rows.
+    pub fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError> {
+        Ok(self
+            .indexer
+            .store
+            .get(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY)?)
+    }
+
+    /// Atomically replaces the opaque consumer cursor bytes.
+    pub fn commit_consumer_cursor(&mut self, cursor: &[u8]) -> Result<(), IndexError> {
+        self.ensure_prepared_ready()?;
+        let mut store_batch = self.indexer.store.new_batch();
+        store_batch.put(ColumnFamily::UtxoMeta, CONSUMER_CURSOR_KEY, cursor);
+        self.indexer.store.write_durable(store_batch)?;
         Ok(())
     }
 

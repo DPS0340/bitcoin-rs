@@ -42,6 +42,8 @@ pub mod metrics;
 pub mod mining;
 /// Node-side active-chain view for server-side P2P responders.
 pub mod p2p_chain;
+/// Chain-event reconciliation seam for index consumers.
+pub mod reconcile;
 
 /// Switching the applied chain from one branch to another.
 pub mod reorg;

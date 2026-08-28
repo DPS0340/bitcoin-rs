@@ -218,6 +218,7 @@ fn make_worker(
         batch_limits,
         enabled: bitcoin_rs_index::IndexCapabilities::ALL,
         wake_rx,
+        chain_events: detached_chain_publisher(),
         quiet_period: Duration::ZERO,
         batch_delay: Duration::ZERO,
     };
@@ -781,4 +782,366 @@ fn overflow_block_is_reprepared_and_committed_on_next_pass() {
         (watermark.height, watermark.hash),
         (1, f.a1.1.to_le_bytes())
     );
+}
+
+// ---------------------------------------------------------------------------
+// #77 convergence harness: an interrupted consumer must converge to the same
+// index state as an uninterrupted one.
+// ---------------------------------------------------------------------------
+
+/// Fjall store plus writer, keeping the store handle for state dumps.
+fn fjall_store_writer() -> (tempfile::TempDir, Arc<FjallStore>, Arc<dyn TxIndexWriter>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(FjallStore::open(temp.path()).expect("fjall open"));
+    let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::Mutex::new(
+        bitcoin_rs_index::IndexWriter::open(Arc::clone(&store)).expect("index writer open"),
+    ));
+    (temp, store, writer)
+}
+/// Reserved consumer-cursor slot in `UtxoMeta` (`0x00, b'C'`), mirrored from
+/// the index crate's metadata-key family so the dump can exclude it.
+const CURSOR_META_KEY: &[u8] = &[0x00, b'C'];
+
+/// Drives reconciliation passes until the worker reports `CaughtUp`.
+fn run_until_caught_up(worker: &Worker, pending: &mut Option<PendingForward>) {
+    for pass in 0..64 {
+        if matches!(
+            worker.reconcile_once(pending).expect("reconcile pass"),
+            ReconcileAction::CaughtUp
+        ) {
+            return;
+        }
+        assert!(
+            pass < 63,
+            "consumer did not converge within the pass budget"
+        );
+    }
+}
+
+/// Byte dump of every index row and metadata entry except the epoch-scoped
+/// consumer cursor, whose epoch/sequence legitimately differ across runs.
+fn dump_index_state(store: &FjallStore) -> Vec<(ColumnFamily, Vec<u8>, Vec<u8>)> {
+    let families = [
+        ColumnFamily::TxConfirmed,
+        ColumnFamily::BlockHeaders,
+        ColumnFamily::Funding,
+        ColumnFamily::Spending,
+        ColumnFamily::UtxoMeta,
+    ];
+    let mut rows = Vec::new();
+    for family in families {
+        for pair in store.iter_prefix(family, &[]).expect("index family scan") {
+            let (key, value) = pair.expect("iterable row");
+            if family == ColumnFamily::UtxoMeta && key == CURSOR_META_KEY {
+                continue;
+            }
+            rows.push((family, key, value));
+        }
+    }
+    rows
+}
+
+/// Worker wired to a caller-owned publisher so tests control the epoch and
+/// the recorded event stream.
+fn make_worker_with_events(
+    writer: &Arc<dyn TxIndexWriter>,
+    applied_tip: &Arc<ArcSwapOption<TipSnapshot>>,
+    tree: &Arc<RwLock<BlockTree>>,
+    body_store: Arc<dyn PruneBodyStore>,
+    chain_events: Arc<crate::state::ChainEventPublisher>,
+) -> Worker {
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded(16);
+    let runtime = Arc::new(TxIndexRuntime::new(wake_tx));
+    Worker {
+        runtime,
+        writer: Arc::clone(writer),
+        applied_tip: Arc::clone(applied_tip),
+        block_tree: Arc::clone(tree),
+        body_store: Some(body_store),
+        batch_limits: DEFAULT_BATCH_LIMITS,
+        enabled: IndexCapabilities::ALL,
+        chain_events,
+        wake_rx,
+        quiet_period: Duration::ZERO,
+        batch_delay: Duration::ZERO,
+    }
+}
+
+/// One committed tip transition: publish the applied tip, emit the same
+/// `record` the apply path emits, and reconcile rows plus cursor atomically.
+fn advance_tip(
+    worker: &Worker,
+    applied_tip: &Arc<ArcSwapOption<TipSnapshot>>,
+    publisher: &Arc<crate::state::ChainEventPublisher>,
+    tree: &BlockTree,
+    node_id: NodeId,
+    kind: crate::state::HintKind,
+    pending: &mut Option<PendingForward>,
+) {
+    let tip = Arc::new(tip_for(tree, node_id));
+    applied_tip.store(Some(Arc::clone(&tip)));
+    publisher.record(kind, tip.height, tip.hash);
+    run_until_caught_up(worker, pending);
+}
+
+#[test]
+fn reconciliation_plan_walks_the_tree() {
+    let f = fork_fixture();
+    let tree = f.tree;
+    let b2_tip = tip_for(&tree, f.b2_id);
+
+    // A genesis-anchored consumer on the winning branch only connects forward.
+    let cursor = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 1,
+        height: 0,
+        hash: f.genesis.1,
+    };
+    assert_eq!(
+        crate::reconcile::plan(&cursor, &b2_tip, &tree),
+        crate::reconcile::ReconcilePlan::Forward { from_height: 1 }
+    );
+
+    // An A-branch consumer must roll back to the genesis common ancestor.
+    let cursor = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 1,
+        height: 1,
+        hash: f.a1.1,
+    };
+    assert_eq!(
+        crate::reconcile::plan(&cursor, &b2_tip, &tree),
+        crate::reconcile::ReconcilePlan::RollbackAndForward { ancestor_height: 0 }
+    );
+
+    // A consumer at the live tip is caught up.
+    let cursor = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 3,
+        height: 2,
+        hash: f.b2.1,
+    };
+    assert_eq!(
+        crate::reconcile::plan(&cursor, &b2_tip, &tree),
+        crate::reconcile::ReconcilePlan::CaughtUp
+    );
+    // A cursor the tree never saw asks for a rebuild, not a guess.
+    let cursor = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 1,
+        height: 9,
+        hash: Hash256::from_le_bytes(&[9_u8; 32]),
+    };
+    assert_eq!(
+        crate::reconcile::plan(&cursor, &b2_tip, &tree),
+        crate::reconcile::ReconcilePlan::Rebuild
+    );
+}
+
+#[test]
+fn snapshot_identity_changes_reconcile_from_the_cursor_position() {
+    let f = fork_fixture();
+    let tree = f.tree;
+    let target = tip_for(&tree, f.b2_id);
+    let cursor = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 1,
+        height: 0,
+        hash: f.genesis.1,
+    };
+    let epoch_restart = crate::state::ChainSnapshot {
+        epoch: 2,
+        sequence: 0,
+        tip_hash: f.b2.1,
+        tip_height: 2,
+    };
+    assert_eq!(
+        crate::reconcile::plan_from_snapshot(&cursor, &epoch_restart, &target, &tree),
+        crate::reconcile::ReconcilePlan::Forward { from_height: 1 }
+    );
+
+    let sequence_gap = crate::state::ChainSnapshot {
+        epoch: 1,
+        sequence: 4,
+        tip_hash: f.b2.1,
+        tip_height: 2,
+    };
+    assert_eq!(
+        crate::reconcile::plan_from_snapshot(&cursor, &sequence_gap, &target, &tree),
+        crate::reconcile::ReconcilePlan::Forward { from_height: 1 }
+    );
+
+    let orphan = crate::reconcile::ConsumerCursor {
+        epoch: 1,
+        sequence: 2,
+        height: 1,
+        hash: f.a1.1,
+    };
+    assert_eq!(
+        crate::reconcile::plan_from_snapshot(&orphan, &sequence_gap, &target, &tree),
+        crate::reconcile::ReconcilePlan::RollbackAndForward { ancestor_height: 0 }
+    );
+}
+
+#[test]
+fn consumer_cursor_round_trips_bytes() {
+    let snapshot = crate::state::ChainSnapshot {
+        epoch: 7,
+        sequence: 9,
+        tip_hash: Hash256::from_le_bytes(&[0xAB_u8; 32]),
+        tip_height: 11,
+    };
+    let cursor = crate::reconcile::ConsumerCursor::from_snapshot(&snapshot);
+    let bytes = cursor.to_bytes();
+    assert_eq!(bytes.len(), crate::reconcile::CURSOR_BYTE_LEN);
+    assert_eq!(
+        crate::reconcile::ConsumerCursor::from_bytes(&bytes),
+        Some(cursor)
+    );
+    assert!(crate::reconcile::ConsumerCursor::from_bytes(&bytes[..51]).is_none());
+}
+#[test]
+#[allow(clippy::too_many_lines)]
+fn interrupted_consumer_converges_to_the_uninterrupted_index_state() {
+    let f = fork_fixture();
+    let tree = Arc::new(RwLock::new(f.tree));
+    let tree_guard = tree.read();
+    let genesis_id = tree_guard.lookup(f.genesis.1).expect("genesis node");
+    let b1_id = tree_guard.lookup(f.b1.1).expect("b1 node");
+    let bodies: Arc<dyn PruneBodyStore> = Arc::new(MapBodyStore::new(
+        bodies_map(&[
+            (0, f.genesis.1, &f.genesis.0),
+            (1, f.a1.1, &f.a1.0),
+            (2, f.a2.1, &f.a2.0),
+            (1, f.b1.1, &f.b1.0),
+            (2, f.b2.1, &f.b2.0),
+        ]),
+        None,
+    ));
+
+    // Uninterrupted run (epoch 1): connect A1, disconnect to genesis, follow B.
+    let (temp_a, store_a, writer_a) = fjall_store_writer();
+    let applied_a = make_applied_tip();
+    let (publisher_a_raw, _hints_a) = crate::state::ChainEventPublisher::detached(1);
+    let publisher_a = Arc::new(publisher_a_raw);
+    let worker_a = make_worker_with_events(
+        &writer_a,
+        &applied_a,
+        &tree,
+        Arc::clone(&bodies),
+        Arc::clone(&publisher_a),
+    );
+    let mut pending_a = None;
+    advance_tip(
+        &worker_a,
+        &applied_a,
+        &publisher_a,
+        &tree_guard,
+        f.a1_id,
+        crate::state::HintKind::Connected,
+        &mut pending_a,
+    );
+    advance_tip(
+        &worker_a,
+        &applied_a,
+        &publisher_a,
+        &tree_guard,
+        genesis_id,
+        crate::state::HintKind::Disconnected,
+        &mut pending_a,
+    );
+    advance_tip(
+        &worker_a,
+        &applied_a,
+        &publisher_a,
+        &tree_guard,
+        b1_id,
+        crate::state::HintKind::Connected,
+        &mut pending_a,
+    );
+    advance_tip(
+        &worker_a,
+        &applied_a,
+        &publisher_a,
+        &tree_guard,
+        f.b2_id,
+        crate::state::HintKind::Connected,
+        &mut pending_a,
+    );
+    let uninterrupted = dump_index_state(&store_a);
+    let uninterrupted_cursor = writer_a
+        .consumer_cursor()
+        .expect("read cursor")
+        .expect("cursor persisted for the settled run");
+
+    // Interrupted run: same committed event sequence, but the consumer
+    // restarts under a new epoch after A1, the B1 hint is dropped, and B2 is
+    // published while the consumer is still down.
+    let (temp_b, store_b, writer_b) = fjall_store_writer();
+    let applied_b = make_applied_tip();
+    let (publisher_one_raw, _hints_one) = crate::state::ChainEventPublisher::detached(1);
+    let publisher_one = Arc::new(publisher_one_raw);
+    let worker_one = make_worker_with_events(
+        &writer_b,
+        &applied_b,
+        &tree,
+        Arc::clone(&bodies),
+        Arc::clone(&publisher_one),
+    );
+    let mut pending_b = None;
+    advance_tip(
+        &worker_one,
+        &applied_b,
+        &publisher_one,
+        &tree_guard,
+        f.a1_id,
+        crate::state::HintKind::Connected,
+        &mut pending_b,
+    );
+
+    // Process restart: a fresh epoch takes over; only the store survives.
+    let (publisher_two_raw, _hints_two) = crate::state::ChainEventPublisher::detached(2);
+    let publisher_two = Arc::new(publisher_two_raw);
+    let worker_two = make_worker_with_events(
+        &writer_b,
+        &applied_b,
+        &tree,
+        Arc::clone(&bodies),
+        Arc::clone(&publisher_two),
+    );
+
+    // The B1 event commits but its hint never wakes the consumer; B2 commits
+    // before the first wake finally arrives.
+    publisher_two.record(crate::state::HintKind::Connected, 1, f.b1.1);
+    let b2_tip = Arc::new(tip_for(&tree_guard, f.b2_id));
+    applied_b.store(Some(Arc::clone(&b2_tip)));
+    publisher_two.record(
+        crate::state::HintKind::Connected,
+        b2_tip.height,
+        b2_tip.hash,
+    );
+
+    run_until_caught_up(&worker_two, &mut pending_b);
+
+    let interrupted = dump_index_state(&store_b);
+    assert_eq!(
+        interrupted, uninterrupted,
+        "interrupted consumer must converge to byte-identical index state"
+    );
+
+    let resumed = crate::reconcile::ConsumerCursor::from_bytes(
+        &writer_b
+            .consumer_cursor()
+            .expect("read cursor")
+            .expect("cursor persisted after restart"),
+    )
+    .expect("decode resumed cursor");
+    let original =
+        crate::reconcile::ConsumerCursor::from_bytes(&uninterrupted_cursor).expect("decode");
+    assert_eq!(resumed.height, original.height);
+    assert_eq!(resumed.hash, original.hash);
+    assert_eq!(resumed.epoch, 2, "the new epoch namespaces the cursor");
+    assert_eq!(resumed.sequence, 2);
+    drop(temp_a);
+    drop(temp_b);
 }

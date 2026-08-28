@@ -573,6 +573,7 @@ fn apply_handles_with_coin_stats_and_utxo(
         Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),
+        Arc::new(bitcoin_rs_node::state::ChainEventPublisher::detached(0).0),
     );
     (handles, coin_stats, utxo)
 }
