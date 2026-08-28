@@ -462,6 +462,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "fjall",
+ "metrics",
  "parking_lot",
  "rayon",
  "redb",

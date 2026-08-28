@@ -74,6 +74,7 @@ impl RedbStore {
         let durability_label = match durability {
             Durability::Immediate => "durable",
             Durability::None => "deferred",
+            _ => "other",
         };
         metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
             .increment(1);
@@ -244,6 +245,7 @@ impl RedbTxIndexStore {
         let durability_label = match durability {
             Durability::Immediate => "durable",
             Durability::None => "deferred",
+            _ => "other",
         };
         metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
             .increment(1);

@@ -3,7 +3,9 @@
 //! (no backend floor may raise a share above its allocation).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use bitcoin_rs_storage::cache_budget::{MIN_DBCACHE_BYTES, split_cache_budget};
 use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
@@ -187,10 +189,14 @@ fn redb_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Err
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), filters_share())?;
     metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
-        let mut batch = store.new_batch();
-        batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
+        let mut deferred = store.new_batch();
+        deferred.put(ColumnFamily::BlockBodies, b"deferred-key", b"value");
+        store
+            .write_deferred(deferred)
+            .expect("deferred write");
+        let mut durable = store.new_batch();
+        durable.put(ColumnFamily::BlockBodies, b"durable-key", b"value");
+        store.write_durable(durable).expect("durable write");
     });
     assert_eq!(recorder.counter(&writes_total("redb", "deferred")), 1);
     assert_eq!(recorder.counter(&writes_total("redb", "durable")), 1);
