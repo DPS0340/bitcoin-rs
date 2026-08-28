@@ -29,7 +29,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `getblockcount` | 0.4.0 |  |
 | `getblockhash` | 0.4.0 |  |
 | `getbestblockhash` | 0.4.0 |  |
-| `getblock` | 0.4.0 |  |
+| `getblock` | 0.4.0 | Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape (no prevout source). |
 | `getblockheader` | 0.4.0 |  |
 | `getblockstats` | 0.4.0 |  |
 | `verifychain` | 0.4.0 |  |
@@ -48,7 +48,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `createrawtransaction` | 0.4.0 |  |
 | `combinepsbt` | 0.4.0 |  |
 | `finalizepsbt` | 0.4.0 |  |
-| `getmempoolinfo` | 0.4.0 |  |
+| `getmempoolinfo` | 0.4.0 | Pinned v31 shape; the extra mempool_sequence field Core never had was dropped (crates/rpc/src/handlers/mempool.rs). |
 | `getmempoolentry` | 0.4.0 |  |
 | `getrawmempool` | 0.4.0 |  |
 | `getmempoolancestors` | 0.4.0 |  |
@@ -56,23 +56,23 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `uptime` | 0.4.0 |  |
 | `getrpcinfo` | 0.4.0 |  |
 | `getzmqnotifications` | 0.4.0 | Requires the zmq feature and --enablezmq* startup flags. |
-| `validateaddress` | 0.4.0 |  |
+| `validateaddress` | 0.4.0 | local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs). |
 | `getdescriptorinfo` | 0.4.0 |  |
 | `deriveaddresses` | 0.4.0 |  |
 | `getnetworkinfo` | 0.4.0 |  |
-| `getpeerinfo` | 0.4.0 |  |
+| `getpeerinfo` | 0.4.0 | Pinned v31 shape; telemetry this node does not measure (byte counters, pingwait, addr relay stats) reports Core's zero-value defaults. |
 | `addnode` | 0.4.0 |  |
 | `disconnectnode` | 0.4.0 |  |
 | `getconnectioncount` | 0.4.0 |  |
 | `getnettotals` | 0.4.0 |  |
 | `getaddednodeinfo` | 0.4.0 |  |
-| `listbanned` | 0.4.0 |  |
+| `listbanned` | 0.4.0 | Pinned v22 shape; the pre-v22 ban_reason field is replaced by ban_duration and time_remaining. |
 | `setban` | 0.4.0 |  |
 | `clearbanned` | 0.4.0 |  |
 | `setnetworkactive` | 0.4.0 |  |
 | `getnodeaddresses` | 0.4.0 |  |
-| `getblocktemplate` | 0.4.0 |  |
-| `getmininginfo` | 0.4.0 |  |
+| `getblocktemplate` | 0.4.0 | Pinned v17 template contract; BIP23 submitold/workid extras are not emitted. |
+| `getmininginfo` | 0.4.0 | Pinned v30 shape including bits/target and next-block facts derived from the mining coordinator. |
 | `submitblock` | 0.4.0 |  |
 | `prioritisetransaction` | 0.4.0 |  |
 
@@ -80,10 +80,10 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `scantxoutset` | 0.4.0 | Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). |
+| `scantxoutset` | 0.4.0 | Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). Response uses the v28 scan contract; the status action answers null. |
 | `estimatesmartfee` | 0.4.0 | No estimate_mode handling: Core parses the mode string and rejects unknown values with -8; conf_target is not range-checked against Core's 1-1008 (crates/rpc/src/handlers/util.rs). |
 | `getmemoryinfo` | 0.4.0 | mode=mallocinfo is rejected with an invalid-parameter error instead of returning allocator XML (crates/rpc/src/handlers/util.rs). |
-| `estimaterawfee` | 0.4.0 | Horizon objects carry only feerate; Core adds decay, scale, pass, fail, errors (crates/rpc/src/handlers/util.rs). |
+| `estimaterawfee` | 0.4.0 | local_shape: the fee estimator does not expose Core decay/scale/pass/fail internals, so horizon objects carry feerate only and the no-estimate branch stays {} (crates/rpc/src/handlers/util.rs). |
 | `ping` | 0.4.0 | Answers immediately; Core schedules a P2P ping and reports the seen pong (crates/rpc/src/handlers/network.rs). |
 
 ### Extension

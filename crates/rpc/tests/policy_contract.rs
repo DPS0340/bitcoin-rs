@@ -11,7 +11,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 use std::error::Error;
 
-
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
     Mempool, MempoolEntry, MempoolGateway, MempoolLimits, PolicyError, RbfError,
@@ -21,7 +20,10 @@ use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
 use bitcoin_rs_node::{Config, Network, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
-use bitcoin_rs_rpc::context::{ChainControl, ChainControlError, Context, ContextHandles};
+use bitcoin_rs_rpc::context::{
+    ChainControl, ChainControlError, ChainHandles, Context, ContextHandles, IndexHandles,
+    MempoolHandles, MiningHandles, NetworkHandles,
+};
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
@@ -471,12 +473,14 @@ fn testmempoolaccept_reports_a_policy_verdict_per_row() -> Result<(), Box<dyn Er
     assert_eq!(rows.len(), 5, "one row per submitted tx");
     assert_eq!(allowed(&rows[0]), Some(true));
     assert_eq!(reason(&rows[0]), None);
+    // The typed wire contract serializes amounts as JSON numbers; parity is
+    // value parity (1000 sat == 0.00001 BTC), not decimal spelling.
     let base = rows[0]
         .get("fees")
         .and_then(|fees| fees.get("base"))
-        .and_then(|base| base.as_raw_number().map(|raw| raw.as_str().to_owned()))
+        .and_then(JsonValueTrait::as_f64)
         .ok_or("accepted row must quote its base fee")?;
-    assert_eq!(base, "0.00001000");
+    assert!((base - 0.00001).abs() < 1e-12);
     assert_eq!(reason(&rows[1]).as_deref(), Some("min-relay-fee-not-met"));
     assert_eq!(
         reason(&rows[2]).as_deref(),
@@ -1773,24 +1777,37 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
 
     let handler = Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
-            chain_tip: state.chain_tip(),
-            applied_tip: state.applied_tip(),
-            mempool: state.mempool(),
-            blocks: state.blocks(),
-            transactions: state.transactions(),
-            utxo: state.utxo(),
-            coin_stats: state.coin_stats(),
-            network: state.network(),
-            network_active: state.network_active(),
-            peers: state.peers(),
-            peer_outbound: state.peer_outbound(),
-            block_tree: state.block_tree(),
-            chain_network: Network::Regtest,
-            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
-            banned: state.banned_subnets(),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            tx_index: None,
-            script_index: None,
+            chain: ChainHandles {
+                chain_tip: state.chain_tip(),
+                applied_tip: state.applied_tip(),
+                blocks: state.blocks(),
+                transactions: state.transactions(),
+                utxo: state.utxo(),
+                coin_stats: state.coin_stats(),
+                block_tree: state.block_tree(),
+                chain_network: Network::Regtest,
+            },
+            mempool: MempoolHandles {
+                mempool: state.mempool(),
+            },
+            indexes: IndexHandles {
+                tx_index: None,
+                script_index: None,
+            },
+            network: NetworkHandles {
+                network: state.network(),
+                network_active: state.network_active(),
+                peers: state.peers(),
+                peer_outbound: state.peer_outbound(),
+                p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+                banned: state.banned_subnets(),
+                added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            },
+            mining: MiningHandles {
+                mining_control: None,
+            },
+            filter_index: None,
+            capabilities: None,
         })
         .with_chain_control(Arc::new(NodeInvalidator {
             handles: state.apply_handles(),
@@ -1823,12 +1840,9 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
         ))),
         None,
     );
-    let committed = gateway.reconsider_disconnected(
-        mined_block
-            .txs
-            .iter()
-            .filter(|tx| !is_coinbase(tx))
-            .map(|tx| {
+    let committed =
+        gateway.reconsider_disconnected(mined_block.txs.iter().filter(|tx| !is_coinbase(tx)).map(
+            |tx| {
                 let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
                 MempoolEntry::new(
                     Arc::new(tx.clone()),
@@ -1837,8 +1851,8 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
                     1,
                     REORG_SEED_BLOCKS,
                 )
-            }),
-    );
+            },
+        ));
     assert_eq!(committed.len(), 1, "one admitted candidate: the spend");
     assert!(gateway.read().contains_txid(&spend_txid));
     Ok(())

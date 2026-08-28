@@ -1,5 +1,7 @@
 use alloc::sync::Arc;
+use core::str::FromStr as _;
 
+use bitcoin_rs_primitives::Txid;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value};
 
 use crate::context::Context;
@@ -371,11 +373,10 @@ pub(crate) fn required_u64(
         .ok_or(RpcError::InvalidParams(name))
 }
 
-pub(crate) fn serde_to_sonic(value: &serde_json::Value) -> Result<Value, RpcError> {
-    let text = serde_json::to_string(value)?;
-    Ok(sonic_rs::from_str(&text)?)
+/// Parses one 64-hex-character transaction id, rejecting anything else.
+pub(crate) fn parse_txid(value: &str) -> Result<Txid, RpcError> {
+    Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
 }
-
 #[cfg(test)]
 mod registry_tests {
     use alloc::collections::BTreeSet;

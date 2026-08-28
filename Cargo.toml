@@ -87,6 +87,9 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 
 # Miniscript supplies the key-free PSBT finalizer retained by the RPC crate.
 miniscript = { version = ">=13, <14", default-features = false, features = ["std"] }
+corepc-types = { version = "0.15.0", default-features = false, features = [
+    "std", "serde-deny-unknown-fields",
+] }
 
 # bitcoin_slices: zero-alloc block visitor. Default features list is empty;
 # enable bitcoin + sha2 explicitly.

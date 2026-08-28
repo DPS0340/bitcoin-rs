@@ -1,13 +1,14 @@
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use core::str::FromStr as _;
 
 use bitcoin_rs_mempool::MempoolEntry;
-use bitcoin_rs_primitives::Txid;
-use sonic_rs::{Deserialize as _, Value, json};
+use sonic_rs::Value;
 
+use crate::compat::convert::{i64_saturated, sat_to_btc, signed_sat_to_btc, typed_to_sonic};
 use crate::context::Context;
 use crate::error::RpcError;
-use crate::handlers::{optional_bool, required_str};
+use crate::handlers::{optional_bool, parse_txid, required_str};
+use corepc_types::v31;
 
 // Bitcoin Core default for incremental relay-fee policy until per-node
 // configuration is wired. Units: sat/kvB (the canonical workspace internal).
@@ -20,7 +21,6 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let stats = pool.stats();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
-    let incremental_relay_fee = btc_amount_json(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
     // `mempoolminfee` rises above `minrelaytxfee` when the pool approaches its
     // `maxmempool` byte limit. Bitcoin Core uses the eviction-floor heuristic:
     // once the pool exceeds 50% of `maxmempool`, new txs must pay strictly
@@ -34,23 +34,24 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     } else {
         live_min_relay_sat_per_kvb
     };
-    let mut object = sonic_rs::Object::new();
-    let _ = object.insert("loaded", json!(true));
-    let _ = object.insert("size", json!(stats.txs));
-    let _ = object.insert("bytes", json!(stats.bytes));
-    let _ = object.insert("usage", json!(stats.bytes));
-    let _ = object.insert("total_fee", btc_amount_json(stats.total_fee));
-    let _ = object.insert("maxmempool", json!(maxmempool));
-    let _ = object.insert(
-        "mempoolminfee",
-        btc_amount_json(mempool_min_fee_sat_per_kvb),
-    );
-    let _ = object.insert("minrelaytxfee", btc_amount_json(live_min_relay_sat_per_kvb));
-    let _ = object.insert("incrementalrelayfee", incremental_relay_fee);
-    let _ = object.insert("mempool_sequence", json!(pool.sequence_number()));
-    let _ = object.insert("unbroadcastcount", json!(0));
-    let _ = object.insert("fullrbf", json!(true));
-    Ok(Value::from(object))
+    typed_to_sonic(&v31::GetMempoolInfo {
+        loaded: true,
+        size: i64_saturated(stats.txs),
+        bytes: i64_saturated(stats.bytes),
+        usage: i64_saturated(stats.bytes),
+        total_fee: sat_to_btc(stats.total_fee),
+        max_mempool: i64_saturated(maxmempool),
+        mempool_min_fee: sat_to_btc(mempool_min_fee_sat_per_kvb),
+        min_relay_tx_fee: sat_to_btc(live_min_relay_sat_per_kvb),
+        incremental_relay_fee: sat_to_btc(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB),
+        unbroadcast_count: 0,
+        full_rbf: true,
+        permit_bare_multisig: true,
+        max_data_carrier_size: 83,
+        limit_cluster_count: 64,
+        limit_cluster_size: 101_000,
+        optimal: true,
+    })
 }
 
 pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -59,7 +60,7 @@ pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let entry = pool
         .entry_by_txid(&txid)
         .ok_or(RpcError::NotFound("transaction not in mempool"))?;
-    Ok(mempool_entry_json(entry, &pool))
+    typed_to_sonic(&v31::GetMempoolEntry(mempool_entry_typed(entry, &pool)?))
 }
 
 pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -74,13 +75,13 @@ pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value,
     }
     let pool = ctx.mempool.read();
     if verbose {
-        let mut object = sonic_rs::Object::new();
+        let mut map = BTreeMap::new();
         for txid in pool.iter_txids() {
             if let Some(entry) = pool.entry_by_txid(&txid) {
-                let _ = object.insert(&txid.to_string(), mempool_entry_json(entry, &pool));
+                map.insert(txid.to_string(), mempool_entry_typed(entry, &pool)?);
             }
         }
-        return Ok(Value::from(object));
+        return typed_to_sonic(&v31::GetRawMempoolVerbose(map));
     }
 
     let txids: Vec<String> = pool
@@ -89,12 +90,12 @@ pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         .map(|txid| txid.to_string())
         .collect();
     if include_sequence {
-        return Ok(json!({
-            "txids": txids,
-            "mempool_sequence": pool.sequence_number(),
-        }));
+        return typed_to_sonic(&v31::GetRawMempoolSequence {
+            txids,
+            mempool_sequence: pool.sequence_number(),
+        });
     }
-    Ok(json!(txids))
+    typed_to_sonic(&v31::GetRawMempool(txids))
 }
 
 pub(crate) fn getmempoolancestors(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -105,7 +106,7 @@ pub(crate) fn getmempoolancestors(ctx: &Arc<Context>, params: &Value) -> Result<
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.ancestor_ids_for_entry(id);
-    Ok(render_relatives(&pool, &related_ids, verbose))
+    render_ancestors(&pool, &related_ids, verbose)
 }
 
 pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -116,37 +117,13 @@ pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Resul
         return Err(RpcError::NotFound("transaction not in mempool"));
     };
     let related_ids = pool.descendant_ids_for_entry(id);
-    Ok(render_relatives(&pool, &related_ids, verbose))
+    render_descendants(&pool, &related_ids, verbose)
 }
 
-fn render_relatives(
+fn mempool_entry_typed(
+    entry: &MempoolEntry,
     pool: &bitcoin_rs_mempool::Mempool,
-    ids: &[bitcoin_rs_mempool::EntryId],
-    verbose: bool,
-) -> Value {
-    if verbose {
-        let mut object = sonic_rs::Object::new();
-        for id in ids {
-            if let Some(entry) = pool.entry(*id) {
-                let _ = object.insert(&entry.txid.to_string(), mempool_entry_json(entry, pool));
-            }
-        }
-        Value::from(object)
-    } else {
-        json!(
-            ids.iter()
-                .filter_map(|id| pool.entry(*id))
-                .map(|entry| entry.txid.to_string())
-                .collect::<Vec<_>>()
-        )
-    }
-}
-
-fn parse_txid(value: &str) -> Result<Txid, RpcError> {
-    Txid::from_str(value).map_err(|_| RpcError::InvalidParams("txid must be 64 hex characters"))
-}
-
-fn mempool_entry_json(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> Value {
+) -> Result<v31::MempoolEntry, RpcError> {
     let mut depends = entry
         .tx
         .inputs
@@ -174,76 +151,78 @@ fn mempool_entry_json(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) 
         )
     });
 
-    let mut fees = sonic_rs::Object::new();
-    let _ = fees.insert("base", btc_amount_json(entry.fee));
-    let _ = fees.insert("modified", signed_btc_amount_json(entry.modified_fee()));
-    let _ = fees.insert(
-        "ancestor",
-        signed_btc_amount_json(i128::from(entry.ancestor_fee) + entry.ancestor_fee_delta),
-    );
-    let _ = fees.insert(
-        "descendant",
-        signed_btc_amount_json(i128::from(entry.descendant_fee) + entry.descendant_fee_delta),
-    );
-
-    let mut object = sonic_rs::Object::new();
-    let _ = object.insert("vsize", json!(entry.vsize));
-    let _ = object.insert("weight", json!(entry.weight));
-    let _ = object.insert("time", json!(entry.time));
-    let _ = object.insert("height", json!(entry.height));
-    let _ = object.insert("descendantcount", json!(descendantcount));
-    let _ = object.insert("descendantsize", json!(entry.descendant_size));
-    let _ = object.insert("ancestorcount", json!(ancestorcount));
-    let _ = object.insert("ancestorsize", json!(entry.ancestor_size));
-    let _ = object.insert("wtxid", json!(entry.wtxid.to_string()));
-    let _ = object.insert("fees", Value::from(fees));
-    let _ = object.insert("depends", json!(depends));
-    let _ = object.insert("spentby", json!(spentby));
-    let _ = object.insert("bip125-replaceable", json!(entry.is_replaceable()));
-    let _ = object.insert("unbroadcast", json!(false));
-    Value::from(object)
+    // No cluster diagram is tracked, so `chunk*` fields approximate a
+    // singleton cluster: the transaction's own weight and fee.
+    let fees = v31::MempoolEntryFees {
+        base: sat_to_btc(entry.fee),
+        modified: signed_sat_to_btc(entry.modified_fee()),
+        ancestor: signed_sat_to_btc(i128::from(entry.ancestor_fee) + entry.ancestor_fee_delta),
+        descendant: signed_sat_to_btc(
+            i128::from(entry.descendant_fee) + entry.descendant_fee_delta,
+        ),
+        chunk: sat_to_btc(entry.fee),
+    };
+    Ok(v31::MempoolEntry {
+        vsize: i64_saturated(u64::from(entry.vsize)),
+        weight: i64_saturated(entry.weight),
+        time: i64_saturated(entry.time),
+        height: i64::from(entry.height),
+        descendant_count: i64::from(descendantcount),
+        descendant_size: i64_saturated(entry.descendant_size),
+        ancestor_count: i64::from(ancestorcount),
+        ancestor_size: i64_saturated(entry.ancestor_size),
+        chunk_weight: i64_saturated(entry.weight),
+        wtxid: entry.wtxid.to_string(),
+        fees,
+        depends,
+        spent_by: spentby,
+        bip125_replaceable: entry.is_replaceable(),
+        unbroadcast: false,
+    })
 }
 
-fn btc_amount_json(satoshis: u64) -> Value {
-    signed_btc_amount_json(i128::from(satoshis))
-}
-
-fn signed_btc_amount_json(satoshis: i128) -> Value {
-    let sign = if satoshis.is_negative() { "-" } else { "" };
-    let magnitude = satoshis.unsigned_abs();
-    let whole = magnitude / 100_000_000;
-    let fractional = magnitude % 100_000_000;
-    let text = format!("{sign}{whole}.{fractional:08}");
-    let mut deserializer = sonic_rs::Deserializer::from_str(&text).use_rawnumber();
-    match Value::deserialize(&mut deserializer) {
-        Ok(value) => value,
-        Err(error) => panic!("formatted signed BTC amount was invalid JSON: {error}"),
+fn render_ancestors(
+    pool: &bitcoin_rs_mempool::Mempool,
+    ids: &[bitcoin_rs_mempool::EntryId],
+    verbose: bool,
+) -> Result<Value, RpcError> {
+    if verbose {
+        let mut map = BTreeMap::new();
+        for id in ids {
+            if let Some(entry) = pool.entry(*id) {
+                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool)?);
+            }
+        }
+        return typed_to_sonic(&v31::GetMempoolAncestorsVerbose(map));
     }
+    let names = ids
+        .iter()
+        .filter_map(|id| pool.entry(*id))
+        .map(|entry| entry.txid.to_string())
+        .collect::<Vec<_>>();
+    typed_to_sonic(&v31::GetMempoolAncestors(names))
 }
 
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-mod amount_format_probe {
-    use sonic_rs::JsonValueTrait;
-
-    #[test]
-    fn btc_amount_json_preserves_eight_decimals_as_raw_number() {
-        let value = super::btc_amount_json(3_000);
-        let Some(raw) = value.as_raw_number() else {
-            panic!("expected raw number, got {value:?}");
-        };
-        assert_eq!(raw.as_str(), "0.00003000");
-        assert_eq!(sonic_rs::to_string(&value).unwrap(), "0.00003000");
-
-        let mut object = sonic_rs::Object::new();
-        let _ = object.insert("mempoolminfee", value);
-        let wrapped = sonic_rs::Value::from(object);
-        let field = wrapped.get("mempoolminfee").expect("field");
-        let Some(raw) = field.as_raw_number() else {
-            panic!("object insert lost raw number: {field:?}");
-        };
-        assert_eq!(raw.as_str(), "0.00003000");
+fn render_descendants(
+    pool: &bitcoin_rs_mempool::Mempool,
+    ids: &[bitcoin_rs_mempool::EntryId],
+    verbose: bool,
+) -> Result<Value, RpcError> {
+    if verbose {
+        let mut map = BTreeMap::new();
+        for id in ids {
+            if let Some(entry) = pool.entry(*id) {
+                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool)?);
+            }
+        }
+        return typed_to_sonic(&v31::GetMempoolDescendantsVerbose(map));
     }
+    let names = ids
+        .iter()
+        .filter_map(|id| pool.entry(*id))
+        .map(|entry| entry.txid.to_string())
+        .collect::<Vec<_>>();
+    typed_to_sonic(&v31::GetMempoolDescendants(names))
 }
 
 #[cfg(test)]
@@ -252,6 +231,7 @@ mod mempoolminfee_pressure_tests {
 
     use super::*;
     use sonic_rs::JsonValueTrait;
+    use sonic_rs::json;
 
     #[test]
     fn mempoolminfee_equals_minrelay_when_pool_below_pressure() {
@@ -353,15 +333,19 @@ mod tests {
     }
 
     #[test]
-    fn getmempoolinfo_emits_mempool_sequence_field() {
+    fn getmempoolinfo_omits_mempool_sequence_like_core() {
         let ctx = Arc::new(Context::new());
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("getmempoolinfo", &json!([]))
             .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
+        // Core's getmempoolinfo carries no mempool_sequence; the sequence
+        // counter belongs to `getrawmempool` with sequence=true. The pinned
+        // v31::GetMempoolInfo shape matches, and this defends against a
+        // hand-built field reappearing.
         assert!(
-            result.get("mempool_sequence").is_some(),
-            "mempool_sequence missing: {result:?}"
+            result.get("mempool_sequence").is_none(),
+            "mempool_sequence must stay absent from getmempoolinfo: {result:?}"
         );
     }
 
@@ -583,11 +567,15 @@ mod spentby_tests {
 
     use bitcoin_rs_mempool::{Mempool, MempoolEntry};
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
+    use core::str::FromStr as _;
+    use sonic_rs::json;
 
     use super::*;
 
     fn entry_to_serde(entry: &MempoolEntry, pool: &Mempool) -> serde_json::Value {
-        let rendered = sonic_rs::to_string(&mempool_entry_json(entry, pool))
+        let typed = super::mempool_entry_typed(entry, pool)
+            .unwrap_or_else(|err| panic!("typed mempool entry failed: {err}"));
+        let rendered = sonic_rs::to_string(&typed)
             .unwrap_or_else(|err| panic!("re-encoding mempool entry failed: {err}"));
         serde_json::from_str(&rendered)
             .unwrap_or_else(|err| panic!("re-parsing mempool entry failed: {err}"))

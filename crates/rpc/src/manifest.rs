@@ -212,7 +212,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Response is the pinned corepc v31 verbose contract; verbosity 3 serves the verbosity-2 shape (no prevout source).",
         since: "0.4.0",
     },
     Entry {
@@ -293,7 +293,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Deviation,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs).",
+        notes: "Accepts only addr() scan descriptors; Core supports the full descriptor set (crates/rpc/src/handlers/chain.rs). Response uses the v28 scan contract; the status action answers null.",
         since: "0.4.0",
     },
     Entry {
@@ -392,7 +392,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Pinned v31 shape; the extra mempool_sequence field Core never had was dropped (crates/rpc/src/handlers/mempool.rs).",
         since: "0.4.0",
     },
     Entry {
@@ -473,7 +473,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Deviation,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Horizon objects carry only feerate; Core adds decay, scale, pass, fail, errors (crates/rpc/src/handlers/util.rs).",
+        notes: "local_shape: the fee estimator does not expose Core decay/scale/pass/fail internals, so horizon objects carry feerate only and the no-estimate branch stays {} (crates/rpc/src/handlers/util.rs).",
         since: "0.4.0",
     },
     Entry {
@@ -491,7 +491,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "local_shape (invalid branch): a malformed or wrong-network address is hand-built as Core's sparse {isvalid:false} object because corepc-types models the valid-only fields (address, scriptPubKey, isscript, iswitness) as required and cannot represent that wire shape; valid addresses round-trip the typed v31 contract (crates/rpc/src/handlers/util.rs).",
         since: "0.4.0",
     },
     Entry {
@@ -527,7 +527,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Pinned v31 shape; telemetry this node does not measure (byte counters, pingwait, addr relay stats) reports Core's zero-value defaults.",
         since: "0.4.0",
     },
     Entry {
@@ -590,7 +590,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Pinned v22 shape; the pre-v22 ban_reason field is replaced by ban_duration and time_remaining.",
         since: "0.4.0",
     },
     Entry {
@@ -635,7 +635,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Pinned v17 template contract; BIP23 submitold/workid extras are not emitted.",
         since: "0.4.0",
     },
     Entry {
@@ -644,7 +644,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Implemented,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "",
+        notes: "Pinned v30 shape including bits/target and next-block facts derived from the mining coordinator.",
         since: "0.4.0",
     },
     Entry {

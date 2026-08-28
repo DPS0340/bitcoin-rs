@@ -12,6 +12,9 @@ extern crate alloc;
 
 /// HTTP Basic and cookie authentication.
 pub mod auth;
+/// Bitcoin Core wire-contract boundary: versioned response types and the
+/// sanctioned native<->bitcoin conversions backing them.
+pub mod compat;
 /// Dependency-injected RPC state.
 pub mod context;
 /// JSON-RPC error mapping.

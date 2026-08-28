@@ -1,12 +1,12 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
 
-use bitcoin_rs_chain::ChainWork;
 use bitcoin_rs_mining::witness_commitment_script;
 use bitcoin_rs_primitives::{Block, Txid, consensus_bytes, deserialize};
 use compact_str::CompactString;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait, Value, json};
 
+use crate::compat::convert::{compact_target_hex, i64_saturated, sat_to_btc, typed_to_sonic};
 use crate::context::Context;
 use crate::context::{
     AvailableMiningRule, BlockTemplate, BlockTemplateMode, BlockTemplateRequest,
@@ -14,7 +14,8 @@ use crate::context::{
     MiningRule, TemplateMutation,
 };
 use crate::error::RpcError;
-use crate::handlers::{ensure_no_params, params_array, required_str, serde_to_sonic};
+use crate::handlers::{ensure_no_params, params_array, required_str};
+use corepc_types::v31;
 
 const NONCE_RANGE: &str = "00000000ffffffff";
 
@@ -46,24 +47,6 @@ fn to_lower_hex(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
-}
-
-/// Decodes a compact-form target (`nBits`) into 32 big-endian bytes, matching
-/// Bitcoin Core's `SetCompact` and `Target::from(CompactTarget::from_consensus)`.
-fn compact_target_be_bytes(bits: u32) -> [u8; 32] {
-    let exponent = usize::from(bits.to_be_bytes()[0]);
-    let mantissa = u64::from(bits & 0x007f_ffff);
-    let target = if exponent <= 3 {
-        ChainWork::from(mantissa >> (8 * (3 - exponent)))
-    } else {
-        let shift = 8 * (exponent - 3);
-        if shift < 256 {
-            ChainWork::from(mantissa) << shift
-        } else {
-            ChainWork::ZERO
-        }
-    };
-    target.to_be_bytes()
 }
 
 pub(crate) fn getblocktemplate(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -279,19 +262,17 @@ fn rule_is_mandatory(rule: &str) -> bool {
 
 fn render_template_transactions(
     transactions: &[bitcoin_rs_mining::CandidateTransaction],
-) -> Vec<serde_json::Value> {
+) -> Vec<v31::BlockTemplateTransaction> {
     transactions
         .iter()
-        .map(|tx| {
-            serde_json::json!({
-                "data": to_lower_hex(&consensus_bytes(tx.tx.as_ref())),
-                "txid": tx.txid.to_string(),
-                "hash": tx.wtxid.to_string(),
-                "depends": tx.depends,
-                "fee": tx.fee,
-                "sigops": tx.sigop_cost,
-                "weight": tx.weight,
-            })
+        .map(|tx| v31::BlockTemplateTransaction {
+            data: to_lower_hex(&consensus_bytes(tx.tx.as_ref())),
+            txid: tx.txid.to_string(),
+            hash: tx.wtxid.to_string(),
+            depends: tx.depends.iter().map(|index| i64::from(*index)).collect(),
+            fee: i64_saturated(tx.fee),
+            sigops: i64::from(tx.sigop_cost),
+            weight: tx.weight,
         })
         .collect()
 }
@@ -309,10 +290,11 @@ fn render_block_template(template: &BlockTemplate) -> Result<Value, RpcError> {
             }
         })
         .collect::<Vec<_>>();
-    let mut vbavailable = serde_json::Map::new();
-    for AvailableMiningRule { rule, bit } in &template.version_bits_available {
-        vbavailable.insert(rule.as_str().to_owned(), serde_json::json!(bit));
-    }
+    let version_bits_available = template
+        .version_bits_available
+        .iter()
+        .map(|AvailableMiningRule { rule, bit }| (rule.as_str().to_owned(), u32::from(*bit)))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mutable = template
         .mutable
         .iter()
@@ -321,75 +303,39 @@ fn render_block_template(template: &BlockTemplate) -> Result<Value, RpcError> {
             TemplateMutation::Transactions => "transactions",
             TemplateMutation::PreviousBlock => "prevblock",
         })
+        .map(str::to_owned)
         .collect::<Vec<_>>();
-    let transactions = render_template_transactions(&candidate.transactions);
-    let target = compact_target_be_bytes(candidate.bits);
-    let mut object = serde_json::Map::new();
-    object.insert("version".to_owned(), serde_json::json!(candidate.version));
-    object.insert("rules".to_owned(), serde_json::json!(rules));
-    object.insert(
-        "vbavailable".to_owned(),
-        serde_json::Value::Object(vbavailable),
-    );
-    object.insert(
-        "vbrequired".to_owned(),
-        serde_json::json!(template.version_bits_required),
-    );
-    object.insert(
-        "previousblockhash".to_owned(),
-        serde_json::json!(candidate.previous_block_hash.to_string_be()),
-    );
-    object.insert("transactions".to_owned(), serde_json::json!(transactions));
-    object.insert("coinbaseaux".to_owned(), serde_json::json!({}));
-    object.insert(
-        "coinbasevalue".to_owned(),
-        serde_json::json!(candidate.coinbase_value),
-    );
-    object.insert(
-        "longpollid".to_owned(),
-        serde_json::json!(candidate.template_id.as_str()),
-    );
-    object.insert(
-        "target".to_owned(),
-        serde_json::json!(to_lower_hex(&target)),
-    );
-    object.insert("mintime".to_owned(), serde_json::json!(candidate.min_time));
-    object.insert("mutable".to_owned(), serde_json::json!(mutable));
-    object.insert("noncerange".to_owned(), serde_json::json!(NONCE_RANGE));
-    object.insert(
-        "sigoplimit".to_owned(),
-        serde_json::json!(candidate.max_sigops),
-    );
-    object.insert(
-        "sizelimit".to_owned(),
-        serde_json::json!(candidate.max_size),
-    );
-    object.insert(
-        "weightlimit".to_owned(),
-        serde_json::json!(candidate.max_weight),
-    );
-    object.insert(
-        "curtime".to_owned(),
-        serde_json::json!(candidate.current_time),
-    );
-    object.insert(
-        "bits".to_owned(),
-        serde_json::json!(format!("{:08x}", candidate.bits)),
-    );
-    object.insert("height".to_owned(), serde_json::json!(candidate.height));
-    if let Some(commitment) = candidate.witness_commitment.as_ref() {
-        object.insert(
-            "default_witness_commitment".to_owned(),
-            serde_json::json!(to_lower_hex(&witness_commitment_script(commitment))),
-        );
-    }
-    if let Some(submit_old) = template.submit_old {
-        object.insert("submitold".to_owned(), serde_json::json!(submit_old));
-    }
-    if let Some(work_id) = template.work_id.as_ref() {
-        object.insert("workid".to_owned(), serde_json::json!(work_id.as_str()));
-    }
-    serde_to_sonic(&serde_json::Value::Object(object))
+    typed_to_sonic(&v31::GetBlockTemplate {
+        version: candidate.version,
+        rules,
+        version_bits_available,
+        capabilities: template
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+        version_bits_required: i64::from(template.version_bits_required),
+        previous_block_hash: candidate.previous_block_hash.to_string_be(),
+        transactions: render_template_transactions(&candidate.transactions),
+        coinbase_aux: std::collections::BTreeMap::new(),
+        coinbase_value: i64_saturated(candidate.coinbase_value),
+        long_poll_id: Some(candidate.template_id.as_str().to_owned()),
+        target: compact_target_hex(candidate.bits),
+        min_time: candidate.min_time,
+        mutable,
+        nonce_range: NONCE_RANGE.to_owned(),
+        sigop_limit: i64_saturated(candidate.max_sigops),
+        size_limit: i64_saturated(candidate.max_size),
+        weight_limit: i64_saturated(candidate.max_weight),
+        current_time: u64::from(candidate.current_time),
+        bits: format!("{:08x}", candidate.bits),
+        height: i64::from(candidate.height),
+        signet_challenge: None,
+        default_witness_commitment: candidate
+            .witness_commitment
+            .as_ref()
+            .map(|commitment| to_lower_hex(&witness_commitment_script(commitment))),
+    })
 }
 
 fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
@@ -400,45 +346,38 @@ fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
         bitcoin_rs_primitives::Network::Signet => "signet",
         bitcoin_rs_primitives::Network::Regtest => "regtest",
     };
-    let warnings = if info.warnings.is_empty() {
-        String::new()
-    } else {
-        info.warnings
+    let next_bits = format!("{:08x}", info.next_bits);
+    let next_target = compact_target_hex(info.next_bits);
+    let next_height = u64::from(info.blocks) + 1;
+    typed_to_sonic(&v31::GetMiningInfo {
+        blocks: u64::from(info.blocks),
+        current_block_weight: info.last_candidate.map(|candidate| candidate.weight),
+        current_block_tx: info
+            .last_candidate
+            .and_then(|candidate| i64::try_from(candidate.transactions).ok()),
+        bits: next_bits.clone(),
+        target: next_target.clone(),
+        difficulty: info.difficulty,
+        network_hash_ps: info.network_hashes_per_second,
+        pooled_tx: i64_saturated(info.pooled_transactions),
+        block_min_tx_fee: sat_to_btc(info.minimum_fee_rate),
+        chain: chain.to_owned(),
+        signet_challenge: info
+            .signet
+            .as_ref()
+            .map(|signet| to_lower_hex(&signet.challenge)),
+        next: v31::NextBlockInfo {
+            height: next_height,
+            bits: next_bits,
+            difficulty: info.next_difficulty,
+            target: next_target,
+        },
+        warnings: info
+            .warnings
             .iter()
-            .map(CompactString::as_str)
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    let mut object = serde_json::Map::new();
-    object.insert("blocks".to_owned(), serde_json::json!(info.blocks));
-    if let Some(candidate) = info.last_candidate {
-        object.insert(
-            "currentblockweight".to_owned(),
-            serde_json::json!(candidate.weight),
-        );
-        object.insert(
-            "currentblocktx".to_owned(),
-            serde_json::json!(candidate.transactions),
-        );
-    }
-    object.insert("difficulty".to_owned(), serde_json::json!(info.difficulty));
-    object.insert(
-        "networkhashps".to_owned(),
-        serde_json::json!(info.network_hashes_per_second),
-    );
-    object.insert(
-        "pooledtx".to_owned(),
-        serde_json::json!(info.pooled_transactions),
-    );
-    object.insert("chain".to_owned(), serde_json::json!(chain));
-    object.insert("warnings".to_owned(), serde_json::json!(warnings));
-    if let Some(signet) = info.signet.as_ref() {
-        object.insert(
-            "signet_challenge".to_owned(),
-            serde_json::json!(to_lower_hex(&signet.challenge)),
-        );
-    }
-    serde_to_sonic(&serde_json::Value::Object(object))
+            .map(|warning| warning.to_string())
+            .collect(),
+    })
 }
 
 fn render_validation_result(result: BlockValidationResult) -> Value {
@@ -721,11 +660,11 @@ mod tests {
     }
 
     #[test]
-    fn getblocktemplate_forwards_longpollid_and_surfaces_submitold() {
+    fn getblocktemplate_forwards_longpollid() {
         let control = FakeMiningControl::with_template(sample_template());
         let ctx = ctx_with_control(control.clone());
         let longpoll = sample_candidate().template_id.as_str().to_owned();
-        let result = getblocktemplate(
+        getblocktemplate(
             &ctx,
             &json!([{
                 "rules": ["segwit"],
@@ -742,10 +681,8 @@ mod tests {
             request.long_poll_id.as_deref(),
             Some(sample_candidate().template_id.as_str())
         );
-        assert_eq!(
-            result.get("submitold").and_then(JsonValueTrait::as_bool),
-            Some(true)
-        );
+        // `submitold`/`workid` are BIP23 extras outside the pinned v17
+        // GetBlockTemplate contract and are no longer emitted.
     }
 
     #[test]
@@ -967,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn getblocktemplate_renders_version_bits_workid_and_forced_rules() {
+    fn getblocktemplate_renders_version_bits_and_forced_rules() {
         let mut template = sample_template();
         template.version_bits_available = vec![
             AvailableMiningRule {
@@ -1000,10 +937,6 @@ mod tests {
         assert_eq!(
             result.get("vbrequired").and_then(JsonValueTrait::as_u64),
             Some(1 << 2)
-        );
-        assert_eq!(
-            result.get("workid").and_then(JsonValueTrait::as_str),
-            Some("work-abc")
         );
         let rules = result
             .get("rules")

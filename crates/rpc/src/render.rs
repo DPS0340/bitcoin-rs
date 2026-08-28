@@ -130,7 +130,7 @@ fn header_common_json(header: &Header, chain: &BlockChainContext) -> Value {
 /// BIP141 block weight: `stripped size * 3 + total size`, matching Core's
 /// `GetBlockWeight` (both sizes include the 80-byte header and the tx-count
 /// compact size; `stripped` excludes only the segwit marker/flag/witness).
-fn block_weight(block: &Block) -> u64 {
+pub(crate) fn block_weight(block: &Block) -> u64 {
     let size = u64::try_from(consensus_bytes(block).len()).unwrap_or(u64::MAX);
     u64::try_from(stripped_size(block))
         .unwrap_or(u64::MAX)
@@ -139,7 +139,7 @@ fn block_weight(block: &Block) -> u64 {
 }
 
 /// Stripped size: the full serialization without segwit witness sections.
-fn stripped_size(block: &Block) -> usize {
+pub(crate) fn stripped_size(block: &Block) -> usize {
     80_usize
         .saturating_add(compact_size_len(block.txs.len()))
         .saturating_add(block.txs.iter().map(Tx::base_size).sum())

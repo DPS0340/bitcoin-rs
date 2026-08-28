@@ -1,38 +1,45 @@
 use alloc::sync::Arc;
-use bitcoin::Network as BitcoinNetwork;
 use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
 use bitcoin_rs_chain::{NodeStatus, TipSnapshot};
-use bitcoin_rs_primitives::{
-    Block, BlockHash, Hash256, Header, TxOut, consensus_bytes, deserialize,
-};
 use bitcoin_rs_primitives::chain_constants::CORE_REORG_SAFETY_MARGIN;
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, Network, TxOut, consensus_bytes, deserialize,
+};
+use corepc_types::v31::{self, ChainTips, ChainTipsStatus};
 use hashbrown::HashMap;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
 use super::util::{descriptor_checksum, strip_addr_wrapper};
+use crate::compat::convert::{
+    self, compact_target_hex, i32_saturated, i64_saturated, i64_saturated_len, sat_to_btc,
+    typed_to_sonic, typed_to_sonic_omitting_nulls,
+};
 use crate::context::{BlockRecord, ChainControlError, Context, TxQueryError};
 use crate::error::RpcError;
 use crate::handlers::{ensure_no_params, optional_bool, params_array, required_str, required_u64};
-use crate::render::{BlockChainContext, BlockTxVerbosity};
 
 pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
     let applied_tip = ctx.applied_tip.load_full();
     let applied = applied_tip.as_ref().map_or(0, |tip| tip.height);
     let headers = ctx.height();
-    let (difficulty, time, mediantime) = applied_tip.as_ref().map_or((0.0, 0_u64, 0_u64), |tip| {
-        let tree = ctx.block_tree.read();
-        tree.node(tip.tip_id).map_or((0.0, 0, 0), |node| {
-            (
-                ctx.difficulty_for_bits(node.header.bits),
-                u64::from(node.header.time),
-                u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
-            )
-        })
-    });
+    let (difficulty, time, mediantime, tip_bits) =
+        applied_tip
+            .as_ref()
+            .map_or((0.0, 0_u64, 0_u64, 0_u32), |tip| {
+                let tree = ctx.block_tree.read();
+                tree.node(tip.tip_id).map_or((0.0, 0, 0, 0), |node| {
+                    (
+                        ctx.difficulty_for_bits(node.header.bits),
+                        u64::from(node.header.time),
+                        u64::from(tree.median_time_past_at(tip.tip_id, 11).unwrap_or(0)),
+                        node.header.bits,
+                    )
+                })
+            });
     // Core's estimate when this node knows how many transactions it has
     // verified, and the old height ratio when it does not.
     //
@@ -63,23 +70,12 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     );
     let initialblockdownload = ctx.is_initial_block_download(now);
     let chain = match ctx.chain_network {
-        bitcoin_rs_primitives::Network::Mainnet => "main",
-        bitcoin_rs_primitives::Network::Testnet3 => "test",
-        bitcoin_rs_primitives::Network::Testnet4 => "testnet4",
-        bitcoin_rs_primitives::Network::Signet => "signet",
-        bitcoin_rs_primitives::Network::Regtest => "regtest",
+        Network::Mainnet => "main",
+        Network::Testnet3 => "test",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
     };
-    // Bytes on disk, from whatever owns them.
-    //
-    // The block store knows what its files occupy and shrinks when pruning
-    // deletes one. The record log can only offer the sum of the block sizes it
-    // has seen: records outlive the bodies they describe, so that sum goes on
-    // counting bytes that are gone — under a field name people read to check
-    // that pruning worked. It stays as the fallback for a context with no
-    // durable storage behind it, which is every test fixture and nothing else.
-    //
-    // Either way the read is O(1) and the log's lock — the one block
-    // application takes to append — is released immediately.
     let size_on_disk = ctx
         .block_storage_disk_usage()
         .unwrap_or_else(|| ctx.blocks.read().size_on_disk());
@@ -91,25 +87,28 @@ pub(crate) fn getblockchaininfo(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let chainwork = applied_tip
         .as_deref()
         .map_or_else(|| ctx.chainwork_hex(), chainwork_hex);
-    let mut response = sonic_rs::Object::new();
-    let _ = response.insert(&"chain", chain);
-    let _ = response.insert(&"blocks", applied);
-    let _ = response.insert(&"headers", headers);
-    let _ = response.insert(&"bestblockhash", bestblockhash.as_str());
-    let _ = response.insert(&"difficulty", json!(difficulty));
-    let _ = response.insert(&"time", time);
-    let _ = response.insert(&"mediantime", mediantime);
-    let _ = response.insert(&"verificationprogress", json!(verification_progress));
-    let _ = response.insert(&"initialblockdownload", initialblockdownload);
-    let _ = response.insert(&"chainwork", chainwork.as_str());
-    let _ = response.insert(&"size_on_disk", size_on_disk);
-    let _ = response.insert(&"pruned", prune_status.pruned);
-    if let Some(pruneheight) = prune_status.pruneheight {
-        let _ = response.insert(&"pruneheight", pruneheight);
-    }
-    let warnings = String::new();
-    let _ = response.insert(&"warnings", warnings.as_str());
-    Ok(Value::from(response))
+    let response = v31::GetBlockchainInfo {
+        chain: chain.to_owned(),
+        blocks: i64::from(applied),
+        headers: i64::from(headers),
+        best_block_hash: bestblockhash,
+        bits: format!("{tip_bits:08x}"),
+        target: compact_target_hex(tip_bits),
+        difficulty,
+        time: i64_saturated(time),
+        median_time: i64_saturated(mediantime),
+        verification_progress,
+        initial_block_download: initialblockdownload,
+        chain_work: chainwork,
+        size_on_disk,
+        pruned: prune_status.pruned,
+        prune_height: prune_status.pruneheight.map(i64::from),
+        automatic_pruning: None,
+        prune_target_size: None,
+        signet_challenge: None,
+        warnings: Vec::new(),
+    };
+    typed_to_sonic(&response)
 }
 
 /// UNIX seconds now.
@@ -221,7 +220,7 @@ pub(crate) fn getdifficulty(ctx: &Arc<Context>, params: &Value) -> Result<Value,
             .and_then(|tip| tree.node(tip.tip_id).ok().map(|node| node.header.bits))
             .map_or(0.0, |bits| ctx.difficulty_for_bits(bits))
     };
-    Ok(json!(difficulty))
+    typed_to_sonic(&v31::GetDifficulty(difficulty))
 }
 
 pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -239,17 +238,33 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     }
     let mut tips = Vec::new();
     for leaf_id in tip_ids {
+        let is_active = Some(leaf_id) == active_tip_id;
         let Ok(node) = tree.node(leaf_id) else {
+            // The applied-tip snapshot is the authority on the active tip even
+            // when the tree holds no row for it (fresh wiring, pruned rows):
+            // Core's `active_chain.Contains` marks that tip active regardless.
+            // A non-active id without a row cannot be a tip.
+            if !is_active {
+                continue;
+            }
+            let Some(tip) = active_tip.as_ref() else {
+                continue;
+            };
+            tips.push(ChainTips {
+                height: i64::from(tip.height),
+                hash: tip.hash.to_string_be(),
+                branch_length: 0,
+                status: ChainTipsStatus::Active,
+            });
             continue;
         };
-        let is_active = Some(leaf_id) == active_tip_id;
         let status = if is_active {
-            "active"
+            ChainTipsStatus::Active
         } else {
             match node.status {
-                NodeStatus::Active | NodeStatus::HeaderValid => "headers-only",
-                NodeStatus::Stale => "valid-fork",
-                NodeStatus::Invalid => "invalid",
+                NodeStatus::Active | NodeStatus::HeaderValid => ChainTipsStatus::HeadersOnly,
+                NodeStatus::Stale => ChainTipsStatus::ValidFork,
+                NodeStatus::Invalid => ChainTipsStatus::Invalid,
             }
         };
         let branchlen = if is_active {
@@ -257,41 +272,22 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         } else {
             compute_branchlen(&tree, leaf_id, node.height, active_tip_id)
         };
-        tips.push(json!({
-            "height": node.height,
-            "hash": node.hash.to_string_be(),
-            "branchlen": branchlen,
-            "status": status,
-        }));
+        tips.push(ChainTips {
+            height: i64::from(node.height),
+            hash: node.hash.to_string_be(),
+            branch_length: i64::from(branchlen),
+            status,
+        });
     }
     // Sort with active first, then by height descending.
     tips.sort_by(|a, b| {
-        let a_status = a
-            .get("status")
-            .and_then(JsonValueTrait::as_str)
-            .unwrap_or("");
-        let b_status = b
-            .get("status")
-            .and_then(JsonValueTrait::as_str)
-            .unwrap_or("");
-        match (a_status, b_status) {
-            ("active", "active") => core::cmp::Ordering::Equal,
-            ("active", _) => core::cmp::Ordering::Less,
-            (_, "active") => core::cmp::Ordering::Greater,
-            _ => {
-                let a_height = a
-                    .get("height")
-                    .and_then(JsonValueTrait::as_u64)
-                    .unwrap_or(0);
-                let b_height = b
-                    .get("height")
-                    .and_then(JsonValueTrait::as_u64)
-                    .unwrap_or(0);
-                b_height.cmp(&a_height)
-            }
-        }
+        let a_active = a.status == ChainTipsStatus::Active;
+        let b_active = b.status == ChainTipsStatus::Active;
+        b_active
+            .cmp(&a_active)
+            .then_with(|| b.height.cmp(&a.height))
     });
-    Ok(json!(tips))
+    typed_to_sonic(&v31::GetChainTips(tips))
 }
 
 pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -378,23 +374,24 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         };
     drop(tree);
     let tip_hash_hex = tip_hash.to_string_be();
-    let mut response = sonic_rs::Object::new();
-    let _ = response.insert(&"time", tip_time);
-    let _ = response.insert(&"txcount", total_tx_count);
-    let _ = response.insert(&"window_final_block_hash", tip_hash_hex.as_str());
-    let _ = response.insert(&"window_final_block_height", tip_height);
-    let _ = response.insert(&"window_block_count", window_block_count);
-    if window_block_count > 0 {
-        let _ = response.insert(&"window_interval", window_interval);
-        let _ = response.insert(&"window_tx_count", window_tx_count);
-        if window_interval > 0 {
-            let count_small = u32::try_from(window_tx_count).unwrap_or(u32::MAX);
-            let interval_small = u32::try_from(window_interval).unwrap_or(u32::MAX);
-            let txrate = f64::from(count_small) / f64::from(interval_small);
-            let _ = response.insert(&"txrate", json!(txrate));
-        }
-    }
-    Ok(Value::from(response))
+    let window_open = window_block_count > 0;
+    let tx_rate = if window_open && window_interval > 0 {
+        let count_small = u32::try_from(window_tx_count).unwrap_or(u32::MAX);
+        let interval_small = u32::try_from(window_interval).unwrap_or(u32::MAX);
+        Some(f64::from(count_small) / f64::from(interval_small))
+    } else {
+        None
+    };
+    typed_to_sonic(&v31::GetChainTxStats {
+        time: i64::from(tip_time),
+        tx_count: i64_saturated(total_tx_count),
+        window_final_block_hash: tip_hash_hex,
+        window_final_block_height: i64::from(tip_height),
+        window_block_count: i64_saturated(window_block_count),
+        window_tx_count: window_open.then(|| i64_saturated(window_tx_count)),
+        window_interval: window_open.then(|| i64_saturated(window_interval)),
+        tx_rate,
+    })
 }
 
 /// The applied tip's block timestamp, read from the block tree.
@@ -410,7 +407,7 @@ fn applied_tip_block_time(ctx: &Context) -> Option<u32> {
 
 pub(crate) fn getblockcount(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    Ok(json!(ctx.applied_height()))
+    typed_to_sonic(&v31::GetBlockCount(u64::from(ctx.applied_height())))
 }
 
 pub(crate) fn getblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -418,13 +415,14 @@ pub(crate) fn getblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     let height =
         u32::try_from(height).map_err(|_| RpcError::InvalidParams("height exceeds u32"))?;
     ctx.block_hash_at_height(height)
-        .map(|hash| json!(hash.to_string_be()))
+        .map(|hash| typed_to_sonic(&v31::GetBlockHash(hash.to_string_be())))
+        .transpose()?
         .ok_or(RpcError::NotFound("block height not found"))
 }
 
 pub(crate) fn getbestblockhash(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     ensure_no_params(params)?;
-    Ok(json!(ctx.applied_hash().to_string_be()))
+    typed_to_sonic(&v31::GetBestBlockHash(ctx.applied_hash().to_string_be()))
 }
 
 pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -437,9 +435,9 @@ pub(crate) fn getblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcE
         let Some(block_payload_hex) = ctx.block_body_hex(&record) else {
             return Err(RpcError::NotFound("block data pruned"));
         };
-        return Ok(json!(block_payload_hex));
+        return typed_to_sonic(&v31::GetBlockVerboseZero(block_payload_hex));
     }
-    block_json_verbose(ctx, &record, true, verbosity)
+    block_verbose_typed(ctx, &record, true, verbosity)
 }
 
 pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -450,9 +448,9 @@ pub(crate) fn getblockheader(ctx: &Arc<Context>, params: &Value) -> Result<Value
         .ok_or(RpcError::NotFound("block not found"))?;
     if !verbose {
         let header = decode_header(&record)?;
-        return Ok(json!(crate::render::header_hex(&header)));
+        return typed_to_sonic(&v31::GetBlockHeader(crate::render::header_hex(&header)));
     }
-    block_json_verbose(ctx, &record, false, 1)
+    block_verbose_typed(ctx, &record, false, 1)
 }
 
 fn blockstats_record(ctx: &Context, params: &Value) -> Result<BlockRecord, RpcError> {
@@ -539,37 +537,39 @@ pub(crate) fn getblockstats(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         .unwrap_or(i64::MAX)
         .saturating_sub(i64::try_from(ins).unwrap_or(i64::MAX));
 
-    Ok(json!({
-        "avgfee": fee_fields.avgfee,
-        "avgfeerate": fee_fields.avgfeerate,
-        "avgtxsize": avgtxsize,
-        "blockhash": block_hash.to_string(),
-        "feerate_percentiles": fee_fields.feerate_percentiles,
-        "height": height,
-        "ins": ins,
-        "maxfee": fee_fields.maxfee,
-        "maxfeerate": fee_fields.maxfeerate,
-        "maxtxsize": maxtxsize,
-        "medianfee": fee_fields.medianfee,
-        "mediantime": mediantime,
-        "mediantxsize": mediantxsize,
-        "minfee": fee_fields.minfee,
-        "minfeerate": fee_fields.minfeerate,
-        "mintxsize": mintxsize,
-        "outs": outs,
-        "subsidy": subsidy_sat,
-        "swtotal_size": swtotal_size,
-        "swtotal_weight": swtotal_weight,
-        "swtxs": swtxs,
-        "time": record.time,
-        "total_out": total_out,
-        "total_size": total_size,
-        "total_weight": total_weight,
-        "totalfee": fee_fields.totalfee,
-        "txs": txs,
-        "utxo_increase": utxo_increase,
-        "utxo_size_inc": utxo_size_inc
-    }))
+    typed_to_sonic(&v31::GetBlockStats {
+        average_fee: Some(fee_fields.avgfee),
+        average_fee_rate: Some(fee_fields.avgfeerate),
+        average_tx_size: Some(i64_saturated(avgtxsize)),
+        block_hash: Some(block_hash.to_string()),
+        fee_rate_percentiles: Some(fee_fields.feerate_percentiles),
+        height: Some(i64::from(height)),
+        inputs: Some(i64_saturated(ins)),
+        max_fee: Some(fee_fields.maxfee),
+        max_fee_rate: Some(fee_fields.maxfeerate),
+        max_tx_size: Some(i64_saturated(maxtxsize)),
+        median_fee: Some(fee_fields.medianfee),
+        median_time: Some(i64_saturated(u64::from(mediantime))),
+        median_tx_size: Some(i64_saturated(mediantxsize)),
+        minimum_fee: Some(fee_fields.minfee),
+        minimum_fee_rate: Some(fee_fields.minfeerate),
+        minimum_tx_size: Some(i64_saturated(mintxsize)),
+        outputs: Some(i64_saturated(outs)),
+        subsidy: Some(subsidy_sat),
+        segwit_total_size: Some(i64_saturated(swtotal_size)),
+        segwit_total_weight: Some(swtotal_weight),
+        segwit_txs: Some(i64_saturated(swtxs)),
+        time: Some(i64_saturated(u64::from(record.time))),
+        total_out: Some(total_out),
+        total_size: Some(i64_saturated(total_size)),
+        total_weight: Some(total_weight),
+        total_fee: Some(fee_fields.totalfee),
+        txs: Some(i64_saturated(txs)),
+        utxo_increase: Some(i32_saturated(utxo_increase)),
+        utxo_size_increase: Some(i32_saturated(utxo_size_inc)),
+        utxo_increase_actual: None,
+        utxo_size_increase_actual: None,
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -800,7 +800,7 @@ pub(crate) fn pruneblockchain(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let result = prune_service
         .prune_to_height(requested_height)
         .map_err(|err| RpcError::Internal(err.to_string()))?;
-    Ok(json!(result.pruneheight))
+    typed_to_sonic(&v31::PruneBlockchain(i64::from(result.pruneheight)))
 }
 
 pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -810,7 +810,7 @@ pub(crate) fn invalidateblock(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         .as_ref()
         .ok_or(RpcError::MethodDisabled("invalidateblock is unavailable"))?;
     match control.invalidate_block(hash) {
-        Ok(()) => Ok(json!(null)),
+        Ok(()) => Ok(Value::new_null()),
         Err(ChainControlError::UnknownBlock) => Err(RpcError::NotFound("block not found")),
         Err(ChainControlError::Genesis) => Err(RpcError::InvalidParams(
             "cannot invalidate the genesis block",
@@ -829,11 +829,11 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
     if checklevel == 0 {
         // Bitcoin Core: checklevel 0 reads blocks from disk without per-block verification.
         // bitcoin-rs reports pass since this v1 doesn't surface block-read failures here.
-        return Ok(json!(true));
+        return typed_to_sonic(&v31::VerifyChain(true));
     }
     let tree = ctx.block_tree.read();
     let Some(applied) = ctx.applied_tip.load_full() else {
-        return Ok(json!(true));
+        return typed_to_sonic(&v31::VerifyChain(true));
     };
     let mut cursor = applied.tip_id;
     let mut checked: u32 = 0;
@@ -842,11 +842,11 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             break;
         }
         let Ok(node) = tree.node(cursor) else {
-            return Ok(json!(false));
+            return typed_to_sonic(&v31::VerifyChain(false));
         };
         // L1+: PoW self-consistency check.
         if !compact_target_met_by(node.header.bits, node.header.compute_hash().0) {
-            return Ok(json!(false));
+            return typed_to_sonic(&v31::VerifyChain(false));
         }
         // L2+: Merkle-root sanity when block body is available. Absent blocks
         // (header-only / pruned) skip the merkle check.
@@ -854,11 +854,11 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             if let Some(record) = ctx.block_by_hash(node.hash) {
                 if let Some(bytes) = ctx.block_body_bytes(&record) {
                     if let Ok(block) = deserialize::<Block>(&bytes) {
-                        let txids = block.txids();
+                        let mut txids = block.txids();
                         if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
-                            &block, &txids,
+                            &block, &mut txids,
                         ) {
-                            return Ok(json!(false));
+                            return typed_to_sonic(&v31::VerifyChain(false));
                         }
                     }
                 }
@@ -872,7 +872,7 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
         };
         cursor = parent_id;
     }
-    Ok(json!(true))
+    typed_to_sonic(&v31::VerifyChain(true))
 }
 
 pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -909,24 +909,29 @@ pub(crate) fn gettxoutsetinfo(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         };
         Ok::<_, RpcError>((stats, view.len(), view.record_count(), set_hash))
     })?;
-    let total_amount_btc = crate::tx_render::btc_amount_json(stats.total_amount);
     let disk_size = ctx.utxo.with_stable_view(|view| {
         u64::try_from(view.memory_report().accounted_bytes()).unwrap_or(u64::MAX)
     });
-
-    let bestblock = ctx.applied_hash().to_string_be();
-    let mut response = sonic_rs::Object::new();
-    let _ = response.insert(&"height", ctx.applied_height());
-    let _ = response.insert(&"bestblock", bestblock.as_str());
-    let _ = response.insert(&"txouts", txouts);
-    let _ = response.insert(&"bogosize", stats.bogo_size);
-    let _ = response.insert(&"total_amount", total_amount_btc);
-    let _ = response.insert(&"transactions", transactions);
-    let _ = response.insert(&"disk_size", disk_size);
-    if let Some((field, hash)) = set_hash {
-        let _ = response.insert(&field, hash.as_str());
-    }
-    Ok(Value::from(response))
+    let (hash_serialized_3, muhash) = set_hash.map_or((None, None), |(name, hash)| {
+        if name == "hash_serialized_3" {
+            (Some(hash), None)
+        } else {
+            (None, Some(hash))
+        }
+    });
+    typed_to_sonic_omitting_nulls(&v31::GetTxOutSetInfo {
+        height: i64::from(ctx.applied_height()),
+        best_block: ctx.applied_hash().to_string_be(),
+        transactions: Some(i64_saturated_len(transactions)),
+        tx_outs: i64_saturated(u64::try_from(txouts).unwrap_or(u64::MAX)),
+        bogo_size: i64_saturated(stats.bogo_size),
+        hash_serialized_3,
+        disk_size: Some(i64_saturated(disk_size)),
+        total_amount: sat_to_btc(stats.total_amount),
+        muhash,
+        total_unspendable_amount: None,
+        block_info: None,
+    })
 }
 
 pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -936,7 +941,7 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         if array.is_empty() {
             None
         } else {
-            Some(required_str(params, 0, "index_name must be a string")?)
+            Some(required_str(params, 0, "index_name must be a string")?.to_owned())
         }
     } else {
         return Err(RpcError::InvalidParams("params must be null or array"));
@@ -947,46 +952,40 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
         .as_ref()
         .map(|tx_index| tx_index.index_info())
         .transpose()?;
-    let txindex_entry = txindex_entry.map(|info| {
-        json!({
-            "synced": info.synced,
-            "best_block_height": info.best_block_height,
-        })
+    let txindex_entry = txindex_entry.map(|info| v31::GetIndexInfoName {
+        synced: info.synced,
+        best_block_height: info.best_block_height,
     });
     let filter_entry = ctx
         .filter_index
         .as_ref()
         .map(|filter_index| filter_index.filter_info())
         .transpose()?;
-    let filter_entry = filter_entry.map(|info| {
-        json!({
-            "synced": info.synced,
-            "best_block_height": info.best_block_height,
-        })
+    let filter_entry = filter_entry.map(|info| v31::GetIndexInfoName {
+        synced: info.synced,
+        best_block_height: info.best_block_height,
     });
 
-    match index_name {
-        None => {
-            let mut indexes = sonic_rs::Object::new();
-            if let Some(entry) = txindex_entry {
-                let _ = indexes.insert(&"txindex", entry);
-            }
-            if let Some(entry) = filter_entry {
-                let _ = indexes.insert(&"basicblockfilterindex", entry);
-            }
-
-            Ok(indexes.into())
-        }
-        Some("txindex") => {
-            Ok(txindex_entry.map_or_else(|| json!({}), |entry| json!({ "txindex": entry })))
-        }
-        Some("basicblockfilterindex") => Ok(filter_entry.map_or_else(
-            || json!({}),
-            |entry| json!({ "basicblockfilterindex": entry }),
-        )),
-
-        Some(_) => Ok(json!({})),
+    let mut indexes = alloc::collections::BTreeMap::new();
+    if let Some(entry) = txindex_entry {
+        indexes.insert("txindex".to_owned(), entry);
     }
+    if let Some(entry) = filter_entry {
+        indexes.insert("basicblockfilterindex".to_owned(), entry);
+    }
+    // Core answers a named request with only that index; an unknown name
+    // yields an empty object, as does a name for a disabled index.
+    let selected = match index_name {
+        None => indexes,
+        Some(name) => {
+            let mut selected = alloc::collections::BTreeMap::new();
+            if let Some(entry) = indexes.remove(&name) {
+                selected.insert(name, entry);
+            }
+            selected
+        }
+    };
+    typed_to_sonic(&v31::GetIndexInfo(selected))
 }
 
 /// Bitcoin Core `getblockfilter`.
@@ -1040,7 +1039,7 @@ pub(crate) fn scantxoutset(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
     let action = required_str(params, 0, "action is required")?;
     match action {
         "start" => scantxoutset_addr_scan(ctx, scanobjects_param(params)?),
-        "abort" => Ok(json!(false)),
+        "abort" => typed_to_sonic(&v31::ScanTxOutSetAbort(false)),
         "status" => Ok(Value::new_null()),
         _ => Err(RpcError::InvalidParams(
             "action must be one of: start, abort, status",
@@ -1081,27 +1080,25 @@ fn scantxoutset_addr_scan(
     let scan = scan.map_err(|error| RpcError::Internal(error.to_string()))?;
     let height = tip.as_ref().map_or(0, |tip| tip.height);
     let bestblock = tip.as_ref().map_or_else(Hash256::default, |tip| tip.hash);
-    let (unspents, total_amount) = scan_unspents(&scan, &scan_scripts, height);
-
-    Ok(json!({
-        "success": true,
-        "txouts": scan.txouts,
-        "height": height,
-        "bestblock": bestblock.to_string_be(),
-        "unspents": unspents,
-        "total_amount": crate::tx_render::btc_amount_json(total_amount)
-    }))
+    let (unspents, total_amount) = scan_unspents(ctx, &scan, &scan_scripts, height);
+    typed_to_sonic(&v31::ScanTxOutSetStart {
+        success: true,
+        tx_outs: u64::try_from(scan.txouts).unwrap_or(u64::MAX),
+        height: u64::from(height),
+        best_block: bestblock.to_string_be(),
+        unspents,
+        total_amount: sat_to_btc(total_amount),
+    })
 }
 
 fn parse_scan_scripts(
-    chain_network: bitcoin_rs_primitives::Network,
+    chain_network: Network,
     scanobjects: &sonic_rs::Array,
 ) -> Result<Vec<ScanScript>, RpcError> {
-    let network = bitcoin_network(chain_network);
     let mut scripts = Vec::with_capacity(scanobjects.len());
     for scanobject in scanobjects {
         let descriptor = scanobject_descriptor(scanobject)?;
-        scripts.push(parse_addr_scan_script(descriptor, network)?);
+        scripts.push(parse_addr_scan_script(descriptor, chain_network)?);
     }
     Ok(scripts)
 }
@@ -1156,7 +1153,7 @@ fn validate_scanobject_range(range: &Value) -> Result<(), RpcError> {
 
 fn parse_addr_scan_script(
     descriptor: &str,
-    network: BitcoinNetwork,
+    chain_network: Network,
 ) -> Result<ScanScript, RpcError> {
     let payload = checked_descriptor_payload(descriptor)?;
     if payload.contains('*') {
@@ -1172,7 +1169,7 @@ fn parse_addr_scan_script(
     let Ok(unchecked) = bitcoin::Address::from_str(address_text) else {
         return Err(RpcError::InvalidParams("Address is not valid"));
     };
-    let Ok(address) = unchecked.require_network(network) else {
+    let Ok(address) = unchecked.require_network(convert::bitcoin_network(chain_network)) else {
         return Err(RpcError::InvalidParams("Address is not valid"));
     };
     let payload = format!("addr({address})");
@@ -1201,10 +1198,11 @@ fn checked_descriptor_payload(descriptor: &str) -> Result<&str, RpcError> {
 }
 
 fn scan_unspents(
+    ctx: &Context,
     scan: &bitcoin_rs_utxo::UtxoScan,
     scan_scripts: &[ScanScript],
     applied_height: u32,
-) -> (Vec<Value>, u64) {
+) -> (Vec<v31::ScanTxOutSetUnspent>, u64) {
     let descs = scan_scripts
         .iter()
         .map(|scan| (scan.script_pubkey.as_slice(), scan.desc.as_str()))
@@ -1219,19 +1217,26 @@ fn scan_unspents(
                 .get(utxo.txout.script_pubkey.as_slice())
                 .copied()
                 .unwrap_or("");
-            let outpoint = utxo.outpoint;
-            let txid = outpoint.txid;
-            let vout = outpoint.vout;
-            json!({
-                "txid": txid.to_string(),
-                "vout": vout,
-                "scriptPubKey": hex_encode(&utxo.txout.script_pubkey),
-                "desc": desc,
-                "amount": crate::tx_render::btc_amount_json(utxo.txout.value),
-                "coinbase": utxo.coinbase,
-                "height": utxo.height,
-                "confirmations": scan_confirmations(applied_height, utxo.height)
-            })
+            // Field copies come before any `&self` method: `OutPoint` is
+            // `#[repr(packed)]` (consensus wire layout).
+            let (txid, vout) = {
+                let outpoint = utxo.outpoint;
+                (outpoint.txid, outpoint.vout)
+            };
+            let block_hash = ctx
+                .block_hash_at_height(utxo.height)
+                .map_or_else(|| "0".repeat(64), |hash| hash.to_string());
+            v31::ScanTxOutSetUnspent {
+                txid: txid.to_string(),
+                vout,
+                script_pubkey: hex_encode(&utxo.txout.script_pubkey),
+                descriptor: desc.to_owned(),
+                amount: sat_to_btc(utxo.txout.value),
+                coinbase: utxo.coinbase,
+                height: u64::from(utxo.height),
+                block_hash,
+                confirmations: scan_confirmations(applied_height, utxo.height),
+            }
         })
         .collect();
     (unspents, total_amount)
@@ -1302,14 +1307,14 @@ fn confirmations(ctx: &Context, hash: Hash256, height: u32) -> i64 {
         .saturating_add(1)
 }
 
-fn block_json_verbose(
+fn block_verbose_typed(
     ctx: &Context,
     record: &BlockRecord,
     include_block_fields: bool,
     verbosity: u64,
 ) -> Result<Value, RpcError> {
     let header = decode_header(record)?;
-    let confirmations = confirmations(ctx, Hash256::from(record.hash), record.height);
+    let block_confirmations = confirmations(ctx, Hash256::from(record.hash), record.height);
     let mediantime = ctx
         .median_time_past_for_hash(Hash256::from(record.hash))
         .unwrap_or(0);
@@ -1317,30 +1322,91 @@ fn block_json_verbose(
         .chain_work_hex_for_hash(Hash256::from(record.hash))
         .unwrap_or_else(|| "00".to_owned());
     let next_block_hash = next_applied_block_hash(ctx, record.height);
-    let chain = BlockChainContext {
-        height: record.height,
-        confirmations,
-        mediantime,
-        difficulty: ctx.difficulty_for_bits(header.bits),
-        chainwork_hex,
-        n_tx: u32::try_from(record.tx_count).unwrap_or(u32::MAX),
-        next_block_hash,
-    };
     if !include_block_fields {
-        return Ok(crate::render::header_json(&header, &chain));
+        return typed_to_sonic(&v31::GetBlockHeaderVerbose {
+            hash: record.hash.to_string(),
+            confirmations: block_confirmations,
+            height: i64::from(record.height),
+            version: header.version,
+            version_hex: format!("{:08x}", u32::from_le_bytes(header.version.to_le_bytes())),
+            merkle_root: header.merkle_root.to_string_be(),
+            time: i64::from(header.time),
+            median_time: i64_saturated(u64::from(mediantime)),
+            nonce: i64::from(header.nonce),
+            bits: format!("{:08x}", header.bits),
+            target: compact_target_hex(header.bits),
+            difficulty: ctx.difficulty_for_bits(header.bits),
+            chain_work: chainwork_hex,
+            n_tx: u32::try_from(record.tx_count).unwrap_or(u32::MAX),
+            previous_block_hash: Some(header.prev_blockhash.to_string()),
+            next_block_hash: next_block_hash.map(|hash| hash.to_string()),
+        });
     }
     let (_bytes, block) = decode_block(ctx, record)?;
-    let tx_verbosity = if verbosity >= 2 {
-        BlockTxVerbosity::Full
-    } else {
-        BlockTxVerbosity::Ids
-    };
-    Ok(crate::render::block_json(
-        &block,
-        &chain,
-        tx_verbosity,
-        ctx.chain_network,
-    ))
+    let coinbase_tx = convert::coinbase_transaction_typed(block.txs.first())
+        .ok_or_else(|| RpcError::Internal("block has no coinbase transaction".to_owned()))?;
+    let size = i64_saturated_len(consensus_bytes(&block).len());
+    let stripped_size = i64_saturated_len(crate::render::stripped_size(&block));
+    let weight = crate::render::block_weight(&block);
+    let bits = format!("{:08x}", header.bits);
+    let version_hex = format!("{:08x}", u32::from_le_bytes(header.version.to_le_bytes()));
+    if verbosity < 2 {
+        return typed_to_sonic(&v31::GetBlockVerboseOne {
+            hash: record.hash.to_string(),
+            confirmations: block_confirmations,
+            size,
+            stripped_size: Some(stripped_size),
+            weight,
+            coinbase_tx,
+            height: i64::from(record.height),
+            version: header.version,
+            version_hex,
+            merkle_root: header.merkle_root.to_string_be(),
+            tx: block.txs.iter().map(|tx| tx.txid().to_string()).collect(),
+            time: i64::from(header.time),
+            median_time: Some(i64_saturated(u64::from(mediantime))),
+            nonce: i64::from(header.nonce),
+            bits,
+            target: compact_target_hex(header.bits),
+            difficulty: ctx.difficulty_for_bits(header.bits),
+            chain_work: chainwork_hex,
+            n_tx: i64_saturated_len(record.tx_count),
+            previous_block_hash: Some(header.prev_blockhash.to_string()),
+            next_block_hash: next_block_hash.map(|hash| hash.to_string()),
+        });
+    }
+    // Verbosity 3 serves the verbosity-2 shape here: no prevout source is
+    // wired into block rendering, so per-input prevouts stay absent.
+    let mut txs = Vec::with_capacity(block.txs.len());
+    for tx in &block.txs {
+        txs.push(v31::GetBlockVerboseTwoTransaction {
+            transaction: convert::raw_transaction_verbose(tx, ctx.chain_network, None)?,
+            fee: None,
+        });
+    }
+    typed_to_sonic(&v31::GetBlockVerboseTwo {
+        hash: record.hash.to_string(),
+        confirmations: block_confirmations,
+        size,
+        stripped_size: Some(stripped_size),
+        weight,
+        coinbase_tx,
+        height: i64::from(record.height),
+        version: header.version,
+        version_hex,
+        merkle_root: header.merkle_root.to_string_be(),
+        tx: txs,
+        time: i64::from(header.time),
+        median_time: Some(i64_saturated(u64::from(mediantime))),
+        nonce: i64::from(header.nonce),
+        bits,
+        target: compact_target_hex(header.bits),
+        difficulty: ctx.difficulty_for_bits(header.bits),
+        chain_work: chainwork_hex,
+        n_tx: i64_saturated_len(record.tx_count),
+        previous_block_hash: Some(header.prev_blockhash.to_string()),
+        next_block_hash: next_block_hash.map(|hash| hash.to_string()),
+    })
 }
 
 fn next_applied_block_hash(ctx: &Context, height: u32) -> Option<BlockHash> {
@@ -1353,16 +1419,6 @@ fn next_applied_block_hash(ctx: &Context, height: u32) -> Option<BlockHash> {
     let node_id = tree.node_at_height_from(tip.tip_id, next_height)?;
     let node = tree.node(node_id).ok()?;
     Some(BlockHash::from(node.hash))
-}
-
-const fn bitcoin_network(network: bitcoin_rs_primitives::Network) -> BitcoinNetwork {
-    match network {
-        bitcoin_rs_primitives::Network::Mainnet => BitcoinNetwork::Bitcoin,
-        bitcoin_rs_primitives::Network::Testnet3 => BitcoinNetwork::Testnet,
-        bitcoin_rs_primitives::Network::Testnet4 => BitcoinNetwork::Testnet4,
-        bitcoin_rs_primitives::Network::Signet => BitcoinNetwork::Signet,
-        bitcoin_rs_primitives::Network::Regtest => BitcoinNetwork::Regtest,
-    }
 }
 
 /// WHY-local: the chain crate's compact-target helpers are `pub(crate)`, and
@@ -1821,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn gettxoutsetinfo_with_hash_type_none_omits_both_hashes() {
+    fn gettxoutsetinfo_omits_core_optionals_for_hash_type_none() {
         let ctx = Arc::new(Context::new());
         let result = gettxoutsetinfo(&ctx, &json!(["none"]))
             .unwrap_or_else(|err| panic!("gettxoutsetinfo failed: {err}"));
@@ -1832,6 +1888,14 @@ mod tests {
         assert!(
             result.get("hash_serialized_3").is_none(),
             "hash_serialized_3 should be absent for hash_type=none: {result:?}"
+        );
+        assert!(
+            result.get("total_unspendable_amount").is_none(),
+            "total_unspendable_amount should be absent for hash_type=none: {result:?}"
+        );
+        assert!(
+            result.get("block_info").is_none(),
+            "block_info should be absent for hash_type=none: {result:?}"
         );
         assert!(result.get("height").is_some());
     }
@@ -2041,18 +2105,38 @@ mod tests {
         Ok(())
     }
 
+    /// A structurally plausible stored block: one coinbase transaction, as
+    /// every real block carries. Verbose rendering requires the coinbase, so
+    /// an empty body trips production's typed absence error instead.
+    fn coinbase_only_block(header: Header) -> Block {
+        let coinbase = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![0x51],
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50 * 100_000_000,
+                script_pubkey: vec![0x51],
+            }],
+        };
+        Block {
+            header,
+            txs: vec![coinbase],
+        }
+    }
+
     /// A log record for `header`, either carrying the block or standing in for
     /// one whose body the node no longer has.
     fn record_for(header: Header, with_body: bool) -> BlockRecord {
-        let hash = header.compute_hash().0;
         if !with_body {
+            let hash = header.compute_hash().0;
             return BlockRecord::synthetic(1, BlockHash::from(hash));
         }
-        let block = Block {
-            header,
-            txs: Vec::new(),
-        };
-        BlockRecord::from_block(1, &block)
+        BlockRecord::from_block(1, &coinbase_only_block(header))
     }
 
     /// `getblock` and `getblockheader` both render `confirmations` when a body
@@ -2074,14 +2158,8 @@ mod tests {
         let applied_record = record_for(applied_header, with_body);
         let fork_record = record_for(fork_header, with_body);
         if with_body {
-            let applied_block = Block {
-                header: applied_header,
-                txs: Vec::new(),
-            };
-            let fork_block = Block {
-                header: fork_header,
-                txs: Vec::new(),
-            };
+            let applied_block = coinbase_only_block(applied_header);
+            let fork_block = coinbase_only_block(fork_header);
             Arc::get_mut(&mut ctx)
                 .expect("unique fork fixture context")
                 .block_body_source = Some(Arc::new(MultiBlockSource {
@@ -3234,7 +3312,7 @@ mod pruneblockchain_tests {
 mod getchaintips_tests {
     use alloc::sync::Arc;
 
-    use bitcoin_rs_chain::{ChainWork, TipSnapshot};
+    use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
     use bitcoin_rs_primitives::Hash256;
 
     use super::*;
@@ -3299,6 +3377,41 @@ mod getchaintips_tests {
         };
         assert_eq!(status, "active");
         Ok(())
+    }
+
+    #[test]
+    fn getchaintips_serves_snapshot_tip_without_a_tree_row() {
+        let ctx = Arc::new(Context::new());
+        let hash = Hash256::from_le_bytes(&[42_u8; 32]);
+        ctx.set_applied_tip(TipSnapshot {
+            tip_id: NodeId::new(0),
+            height: 42,
+            chainwork: ChainWork::ZERO,
+            hash,
+        });
+        let tips = getchaintips(&ctx, &json!([]))
+            .unwrap_or_else(|err| panic!("getchaintips failed: {err}"));
+        let Some(list) = tips.as_array() else {
+            panic!("expected array, got {tips:?}");
+        };
+        assert_eq!(list.len(), 1, "the snapshot tip must be listed: {tips:?}");
+        let Some(tip) = list.first() else {
+            panic!("expected first element");
+        };
+        assert_eq!(
+            tip.get("status").and_then(JsonValueTrait::as_str),
+            Some("active"),
+            "applied tip must map to Core's active status: {tip:?}"
+        );
+        assert_eq!(
+            tip.get("hash").and_then(JsonValueTrait::as_str),
+            Some(hash.to_string_be().as_str())
+        );
+        assert_eq!(tip.get("height").and_then(JsonValueTrait::as_i64), Some(42));
+        assert_eq!(
+            tip.get("branchlen").and_then(JsonValueTrait::as_i64),
+            Some(0)
+        );
     }
 
     #[test]
