@@ -152,7 +152,15 @@ pub struct Config {
     pub prune_target_mb: u64,
     /// Whether the transaction index is enabled.
     pub txindex: bool,
-    /// Database cache target in MiB.
+    /// Database cache budget in MiB, divided across the persistent storage
+    /// namespaces (chainstate 70%, txindex 20%, filters 10%; shares of
+    /// disabled namespaces redistribute to chainstate).
+    ///
+    /// Bounds: values are clamped to the byte range
+    /// `[16 MiB, 1 TiB]` — a zero or tiny value clamps up to the 16 MiB floor
+    /// so the engines keep a workable cache, and an overflowing value clamps
+    /// down so share arithmetic stays exact. Effective per-namespace
+    /// capacities are logged at startup (`opened storage backend`).
     pub dbcache_mb: u64,
     /// Tracing filter level used when `RUST_LOG` is unset.
     pub log_level: String,

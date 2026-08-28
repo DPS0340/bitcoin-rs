@@ -443,7 +443,9 @@ enum NodeStorage {
 }
 
 impl NodeStorage {
-    fn open(config: &Config) -> Result<Self> {
+    /// Opens the configured backend for the chainstate namespace with its
+    /// cache share from the process budget.
+    fn open(config: &Config, chainstate_cache_bytes: u64) -> Result<Self> {
         let chainstate_dir = config.data_dir.join("chainstate");
         std::fs::create_dir_all(&chainstate_dir)
             .with_context(|| format!("create chainstate_dir {}", chainstate_dir.display()))?;
@@ -451,21 +453,35 @@ impl NodeStorage {
         match config.storage_backend.as_str() {
             #[cfg(feature = "rocksdb")]
             "rocksdb" => Ok(Self::RocksDb(Arc::new(
-                bitcoin_rs_storage::RocksDbStore::open(&chainstate_dir)
-                    .map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::RocksDbStore::open_with_cache(
+                    &chainstate_dir,
+                    chainstate_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "fjall")]
             "fjall" => Ok(Self::Fjall(Arc::new(
-                bitcoin_rs_storage::FjallStore::open(&chainstate_dir)
-                    .map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::FjallStore::open_with_cache(
+                    &chainstate_dir,
+                    chainstate_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "redb")]
             "redb" => Ok(Self::Redb(Arc::new(
-                bitcoin_rs_storage::RedbStore::open(&chainstate_dir).map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::RedbStore::open_with_cache(
+                    &chainstate_dir,
+                    chainstate_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             ))),
             #[cfg(feature = "mdbx")]
             "mdbx" => Ok(Self::Mdbx(Arc::new(
-                bitcoin_rs_storage::MdbxStore::open(&chainstate_dir).map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::MdbxStore::open_with_cache(
+                    &chainstate_dir,
+                    chainstate_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             ))),
             other => bail!(
                 "unsupported storage backend: {other} (compiled features = {CompiledStorageFeatures})"
@@ -965,7 +981,7 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
     }
 }
 
-fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
+fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<OpenTxIndex>> {
     let enabled = tx_index_capabilities(config);
     if enabled.is_empty() {
         return Ok(None);
@@ -981,7 +997,11 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         #[cfg(feature = "rocksdb")]
         "rocksdb" => {
             let store = Arc::new(
-                bitcoin_rs_storage::RocksDbStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::RocksDbStore::open_with_cache(
+                    &txindex_dir,
+                    txindex_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             );
             Ok(Some(open_tx_index_store(
                 store,
@@ -991,7 +1011,8 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         #[cfg(feature = "fjall")]
         "fjall" => {
             let store = Arc::new(
-                bitcoin_rs_storage::FjallStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::FjallStore::open_with_cache(&txindex_dir, txindex_cache_bytes)
+                    .map_err(anyhow::Error::new)?,
             );
             Ok(Some(open_tx_index_store(
                 store,
@@ -1001,8 +1022,11 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         #[cfg(feature = "redb")]
         "redb" => {
             let store = Arc::new(
-                bitcoin_rs_storage::open_redb_tx_index_store(&txindex_dir)
-                    .map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::open_redb_tx_index_store_with_cache(
+                    &txindex_dir,
+                    txindex_cache_bytes,
+                )
+                .map_err(anyhow::Error::new)?,
             );
             Ok(Some(open_tx_index_store(
                 store,
@@ -1012,7 +1036,8 @@ fn open_tx_index(config: &Config) -> Result<Option<OpenTxIndex>> {
         #[cfg(feature = "mdbx")]
         "mdbx" => {
             let store = Arc::new(
-                bitcoin_rs_storage::MdbxStore::open(&txindex_dir).map_err(anyhow::Error::new)?,
+                bitcoin_rs_storage::MdbxStore::open_with_cache(&txindex_dir, txindex_cache_bytes)
+                    .map_err(anyhow::Error::new)?,
             );
             Ok(Some(open_tx_index_store(
                 store,
@@ -1130,7 +1155,18 @@ impl NodeState {
                 bail!("g14_utxo_commit_samples requires complete G14 UTXO commit IBD window fields")
             }
         };
-        let storage = NodeStorage::open(&config)?;
+        // Divide the process cache budget across the persistent namespaces that
+        // exist in this deployment. Filters have no consumer at this layer yet,
+        // so their share redistributes to chainstate.
+        let cache_budget = bitcoin_rs_storage::clamp_dbcache_bytes(config.dbcache_mb);
+        let cache_shares = bitcoin_rs_storage::split_cache_budget(
+            cache_budget,
+            !tx_index_capabilities(&config).is_empty(),
+            false,
+        );
+        let chainstate_cache_bytes = cache_shares[0].bytes;
+        let txindex_cache_bytes = cache_shares[1].bytes;
+        let storage = NodeStorage::open(&config, chainstate_cache_bytes)?;
         let undo_store = storage.undo_store();
         // Before anything reads the chainstate, let alone serves or syncs it.
         // A node that starts on a torn chainstate builds on it, and every block
@@ -1274,7 +1310,7 @@ impl NodeState {
         let (chain_events_raw, chain_event_hints_rx_raw) =
             ChainEventPublisher::new(epoch, initial_snapshot);
         let chain_events = Arc::new(chain_events_raw);
-        let tx_index_open = open_tx_index(&config)?;
+        let tx_index_open = open_tx_index(&config, txindex_cache_bytes)?;
         let (tx_index_runtime, tx_index_worker, tx_index_query) = match tx_index_open {
             Some(open) => {
                 let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
@@ -1379,7 +1415,10 @@ impl NodeState {
         tracing::info!(
             backend = storage.kind(),
             chainstate_dir = %config.data_dir.join("chainstate").display(),
-            "opened storage backend"
+            chainstate_cache_bytes,
+            txindex_cache_bytes,
+            total_cache_bytes = cache_budget,
+            "opened storage backend with effective cache capacities"
         );
         let data_dir = config.data_dir.clone();
         Ok(Self {

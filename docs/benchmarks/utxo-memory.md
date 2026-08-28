@@ -90,11 +90,12 @@ suggested. The remaining 0.64 GiB is fjall, CoinStats, the block-record log and
 the runtime.
 
 An earlier revision attributed 450 MB of that residual to the configured
-`dbcache`. That was wrong: `Config::dbcache_mb` is parsed but **never reaches a
-backend constructor** — `NodeStorage::open` does not pass it, fjall takes builder
-defaults and RocksDB a fixed 256 MiB block cache. Issue #51 tracks it. The
-residual is therefore not a configured, bounded component the way that claim
-implied, and it has not been attributed.
+`dbcache`. That was wrong at the time: `Config::dbcache_mb` was parsed but never
+reached a backend constructor. **Update:** the budget is now real —
+`dbcache_mb` divides across namespaces and every backend takes its share
+through `open_with_cache` (issue #51). The attribution numbers in this
+document predate that change and a fresh RSS decomposition is needed before
+any residual claim is re-earned.
 
 **The synthetic harness is validated.** Re-run at the measured 3.626 outputs per
 record it predicts 54.6 B/output of payload against 55.1 measured (0.9% apart)

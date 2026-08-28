@@ -27,7 +27,7 @@ sha2.workspace = true
 tempfile = "3"
 
 [features]
-default = ["rocksdb", "fjall", "redb", "mdbx", "kernel", "zmq"]
+default = ["fjall", "redb", "zmq"]
 rocksdb = ["bitcoin-rs-node/rocksdb"]
 fjall = ["bitcoin-rs-node/fjall"]
 redb = ["bitcoin-rs-node/redb"]

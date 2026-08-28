@@ -15,6 +15,10 @@ pub(super) struct BlockStager {
     received_order: VecDeque<Hash256>,
     received_bytes: usize,
     next_received_deadline: Option<Instant>,
+    /// Highest staged-block population observed; feeds the high-water gauge.
+    received_blocks_high_water: usize,
+    /// Highest staged-byte total observed; feeds the high-water gauge.
+    received_bytes_high_water: usize,
 }
 
 #[derive(Debug)]
@@ -65,6 +69,8 @@ impl BlockStager {
             received_order: VecDeque::with_capacity(budget.max_received_blocks),
             received_bytes: 0,
             next_received_deadline: None,
+            received_blocks_high_water: 0,
+            received_bytes_high_water: 0,
         }
     }
 
@@ -74,6 +80,16 @@ impl BlockStager {
 
     pub(super) fn received_bytes(&self) -> usize {
         self.received_bytes
+    }
+
+    /// Highest staged-block population ever observed this run.
+    pub(super) const fn received_high_water(&self) -> usize {
+        self.received_blocks_high_water
+    }
+
+    /// Highest staged-byte total ever observed this run.
+    pub(super) const fn received_bytes_high_water(&self) -> usize {
+        self.received_bytes_high_water
     }
 
     pub(super) fn ready_received_len(&self, next_expected_hash: Option<Hash256>) -> Option<usize> {
@@ -130,6 +146,8 @@ impl BlockStager {
         });
         self.received_order.push_back(hash);
         self.received_bytes = self.received_bytes.saturating_add(bytes);
+        self.received_blocks_high_water = self.received_blocks_high_water.max(self.received.len());
+        self.received_bytes_high_water = self.received_bytes_high_water.max(self.received_bytes);
         self.track_received_deadline(now);
 
         let dropped = if self.is_over_count_budget() {

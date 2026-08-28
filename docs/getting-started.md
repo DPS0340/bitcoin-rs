@@ -74,7 +74,7 @@ Defaults worth knowing:
 | `--network` | mainnet (`mainnet`, `testnet3`, `testnet4`, `signet`, `regtest`) |
 | `--rpc-bind` | `127.0.0.1:8332` on mainnet, the network's Core port otherwise |
 | `--rpc-user` / `--rpc-password` | `bitcoin-rs` / `bitcoin-rs` |
-| `--dbcache-mb` | 450 |
+| `--dbcache-mb` | 450 (clamped to 16–1048576 MiB; split 70/20/10 across chainstate, txindex, and filters, with disabled shares going to chainstate) |
 | `--prune-target-mb` | 0, meaning no pruning |
 | `--txindex` | off |
 | `--scriptindex` | off |

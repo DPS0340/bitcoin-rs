@@ -35,7 +35,7 @@ commit p95 measures 2.4 ms against 50 ms. The ranking reflects that.
 | 2 | B — block-record log never shrinks | 264 B/block, arithmetic below | 241 MiB at tip | **tip RSS** |
 | 3 | F — remaining record encoding | 6 B/output, **projected** | ~1.0 GiB at tip | **tip RSS** |
 | 4 | C — mempool priority index | O(n² log n) rebuild, **not timed** | unknown | none |
-| 5 | D — `dbcache_mb` reaches nothing | verified code absence | unlocks tuning | **tip RSS**, indirectly |
+| 5 | D — `dbcache_mb` reaches nothing | **landed**: budget now reaches every backend via `open_with_cache` | tuning unlocked; re-measure | **tip RSS**, indirectly |
 | 6 | E — one file open per position | 12.00 µs x P, **measured** | ~50 µs per 5-position height | ScriptIndex resolver headroom |
 
 Only **B** and **E** carry measured per-unit costs. **A** and **C** are shapes,
@@ -167,10 +167,16 @@ the workload — here, acceptance and template building, not `insert` in isolati
 
 ## D — `dbcache_mb` never reaches a storage backend
 
+**Update: landed.** The budget now divides across the persistent namespaces
+(chainstate 70%, txindex 20%, filters 10%, disabled shares redistribute to
+chainstate) and every backend accepts its share through
+`open_with_cache` (`crates/storage/src/cache_budget.rs`). The analysis below is
+the historical record of the gap this candidate closed.
+
 Parsed from CLI and `bitcoin.conf` (`crates/node/src/config.rs:162`,
 `crates/node/src/bitcoin_conf_compat.rs:64`), carried through config layering
 (`config.rs:574`), and referenced **nowhere in `crates/storage`** — verified by
-search, zero hits. Tracked as issue #51.
+search, zero hits at the time. Tracked as issue #51.
 
 It has already cost this campaign once: `docs/benchmarks/utxo-memory.md` had to
 retract a claim that 450 MB of residual RSS was the configured `dbcache`, because

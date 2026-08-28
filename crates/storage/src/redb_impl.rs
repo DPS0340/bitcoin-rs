@@ -20,6 +20,12 @@ const TXINDEX_SPENDING: FixedTable<12> = TableDefinition::new("txindex_v1_spendi
 const TXINDEX_BLOCK_HEADERS: FixedTable<80> = TableDefinition::new("txindex_v1_block_headers");
 const TXINDEX_META: ByteTable = TableDefinition::new("txindex_v1_meta");
 
+/// redb's builder-default page-cache capacity for the transaction index.
+const REDB_TXINDEX_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// redb's builder-default page-cache capacity for unbudgeted opens.
+const REDB_DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// redb-backed key-value store.
 pub struct RedbStore {
     db: Database,
@@ -28,8 +34,27 @@ pub struct RedbStore {
 impl RedbStore {
     /// Opens or creates a redb store at `path` with one table per column family.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_cache(path, REDB_DEFAULT_CACHE_BYTES)
+    }
+
+    /// Opens or creates a redb store with an explicit page-cache capacity.
+    ///
+    /// `cache_bytes` bounds redb's in-memory page cache and is configured
+    /// exactly: a budgeted share is never raised above its allocation. Zero
+    /// selects the engine default for unbudgeted opens.
+    pub fn open_with_cache(path: impl AsRef<Path>, cache_bytes: u64) -> Result<Self, StorageError> {
+        let cache_bytes = if cache_bytes == 0 {
+            REDB_DEFAULT_CACHE_BYTES
+        } else {
+            cache_bytes
+        };
+        metrics::gauge!("storage.cache_capacity_bytes", "backend" => "redb")
+            .set(cache_bytes as f64);
         let db_path = database_path(path.as_ref())?;
-        let db = Database::create(db_path).map_err(StorageError::backend)?;
+        let db = Database::builder()
+            .set_cache_size(usize::try_from(cache_bytes).unwrap_or(usize::MAX))
+            .create(db_path)
+            .map_err(StorageError::backend)?;
         let write_txn = db.begin_write().map_err(StorageError::backend)?;
         for cf in ColumnFamily::ALL.iter().copied() {
             let table = write_txn
@@ -46,6 +71,14 @@ impl RedbStore {
         batch: RedbWriteBatch,
         durability: Durability,
     ) -> Result<(), StorageError> {
+        let durability_label = match durability {
+            Durability::Immediate => "durable",
+            Durability::None => "deferred",
+        };
+        metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
+            .increment(1);
+        metrics::histogram!("storage.write_bytes", "backend" => "redb")
+            .record(batch.encoded_bytes as f64);
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(durability)
@@ -128,6 +161,7 @@ impl KvStore for RedbStore {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        metrics::counter!("storage.flushes_total", "backend" => "redb").increment(1);
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         // An empty Immediate commit makes all earlier None commits durable.
         write_txn
@@ -151,8 +185,17 @@ struct RedbTxIndexStore {
 impl RedbTxIndexStore {
     /// Opens or creates a transaction-index store at `path`.
     fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_cache(path, REDB_TXINDEX_DEFAULT_CACHE_BYTES)
+    }
+
+    /// Opens or creates a transaction-index store with an explicit page-cache
+    /// capacity, configured exactly.
+    fn open_with_cache(path: impl AsRef<Path>, cache_bytes: u64) -> Result<Self, StorageError> {
         let db_path = database_path(path.as_ref())?;
-        let db = Database::create(db_path).map_err(StorageError::backend)?;
+        let db = Database::builder()
+            .set_cache_size(usize::try_from(cache_bytes).unwrap_or(usize::MAX))
+            .create(db_path)
+            .map_err(StorageError::backend)?;
         let write_txn = db.begin_write().map_err(StorageError::backend)?;
         drop(
             write_txn
@@ -198,6 +241,14 @@ impl RedbTxIndexStore {
         batch: RedbWriteBatch,
         durability: Durability,
     ) -> Result<(), StorageError> {
+        let durability_label = match durability {
+            Durability::Immediate => "durable",
+            Durability::None => "deferred",
+        };
+        metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
+            .increment(1);
+        metrics::histogram!("storage.write_bytes", "backend" => "redb")
+            .record(batch.encoded_bytes as f64);
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(durability)
@@ -298,6 +349,7 @@ impl KvStore for RedbTxIndexStore {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        metrics::counter!("storage.flushes_total", "backend" => "redb-txindex").increment(1);
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(Durability::Immediate)
@@ -324,10 +376,30 @@ pub fn open_redb_tx_index_store(path: &Path) -> Result<impl KvStore, StorageErro
     RedbTxIndexStore::open(path)
 }
 
+/// Opens the fixed-width redb transaction-index store with an explicit
+/// page-cache capacity. Same tables, same layout; only the cache window
+/// differs from [`open_redb_tx_index_store`]. `cache_bytes` is configured
+/// exactly; zero selects the store default.
+pub fn open_redb_tx_index_store_with_cache(
+    path: &Path,
+    cache_bytes: u64,
+) -> Result<impl KvStore, StorageError> {
+    let cache_bytes = if cache_bytes == 0 {
+        REDB_TXINDEX_DEFAULT_CACHE_BYTES
+    } else {
+        cache_bytes
+    };
+    metrics::gauge!("storage.cache_capacity_bytes", "backend" => "redb-txindex")
+        .set(cache_bytes as f64);
+    RedbTxIndexStore::open_with_cache(path, cache_bytes)
+}
+
 /// redb write-batch adapter.
 #[derive(Default)]
 pub struct RedbWriteBatch {
     ops: Vec<BatchOp>,
+    /// Sum of key and value lengths across ops, for write-path metrics.
+    encoded_bytes: usize,
 }
 
 impl WriteBatch for RedbWriteBatch {
@@ -336,6 +408,7 @@ impl WriteBatch for RedbWriteBatch {
     }
 
     fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
         self.ops.push(BatchOp::Put {
             cf,
             key: key.to_vec(),
@@ -344,6 +417,7 @@ impl WriteBatch for RedbWriteBatch {
     }
 
     fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
         self.ops.push(BatchOp::Delete {
             cf,
             key: key.to_vec(),

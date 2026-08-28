@@ -12,6 +12,19 @@ The backend-neutral storage layer every persisted index and chain-state store si
 
 Note that `block_body_key` and `BLOCK_DATA_CF` are not only pruning concerns: they are the block-body key schema, and the node reads bodies through them on the ordinary path.
 
+## Cache budget
+
+`dbcache` is one process-wide budget. `cache_budget::split_cache_budget` divides
+it across the persistent namespaces — chainstate 70%, txindex 20%, filters 10%
+— flooring each share and handing the remainder (plus every disabled
+namespace's share) to chainstate, so the shares always sum to at most the
+budget. Each backend accepts its namespace's share through `open_with_cache`
+(`open_redb_tx_index_store_with_cache` for the redb transaction index); fjall
+sizes its block cache, redb its page cache, RocksDB its LRU block cache, and
+MDBX its reserved dirty-page pool. Clamping bounds: budgets land in
+`[16 MiB, 1 TiB]`, and the node logs the effective per-namespace capacities at
+startup.
+
 ## Features
 
 - `fjall` (default): enables the fjall-backed `FjallStore`.

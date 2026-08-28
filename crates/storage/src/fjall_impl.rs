@@ -5,6 +5,9 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
 use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
 
+/// Fjall's default block-cache capacity for unbudgeted opens.
+const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Fjall-backed key-value store.
 pub struct FjallStore {
     db: Database,
@@ -14,7 +17,24 @@ pub struct FjallStore {
 impl FjallStore {
     /// Opens or creates a Fjall store at `path` with one keyspace per column family.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_cache(path, FJALL_DEFAULT_CACHE_BYTES)
+    }
+
+    /// Opens or creates a Fjall store with an explicit block-cache capacity.
+    ///
+    /// `cache_bytes` sizes fjall's shared block cache and is configured
+    /// exactly: a budgeted share is never raised above its allocation. Zero
+    /// selects the engine default for unbudgeted opens.
+    pub fn open_with_cache(path: impl AsRef<Path>, cache_bytes: u64) -> Result<Self, StorageError> {
+        let cache_bytes = if cache_bytes == 0 {
+            FJALL_DEFAULT_CACHE_BYTES
+        } else {
+            cache_bytes
+        };
+        metrics::gauge!("storage.cache_capacity_bytes", "backend" => "fjall")
+            .set(cache_bytes as f64);
         let db = Database::builder(path.as_ref())
+            .cache_size(cache_bytes)
             .open()
             .map_err(StorageError::backend)?;
         let mut keyspaces = Vec::with_capacity(ColumnFamily::ALL.len());
@@ -38,6 +58,15 @@ impl FjallStore {
         batch: FjallWriteBatch,
         durability: Option<PersistMode>,
     ) -> Result<(), StorageError> {
+        let durability_label = match durability {
+            Some(PersistMode::SyncAll) => "durable",
+            Some(_) => "deferred",
+            None => "default",
+        };
+        metrics::counter!("storage.writes_total", "backend" => "fjall", "durability" => durability_label)
+            .increment(1);
+        metrics::histogram!("storage.write_bytes", "backend" => "fjall")
+            .record(batch.encoded_bytes as f64);
         let mut fjall_batch = self.db.batch();
         if let Some(durability) = durability {
             fjall_batch = fjall_batch.durability(Some(durability));
@@ -119,6 +148,7 @@ impl KvStore for FjallStore {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        metrics::counter!("storage.flushes_total", "backend" => "fjall").increment(1);
         // Fjall journals are crash-consistent before fsync; SyncAll requests full durability.
         self.db
             .persist(PersistMode::SyncAll)
@@ -151,6 +181,8 @@ fn cached_keyspace<'store>(
 #[derive(Default)]
 pub struct FjallWriteBatch {
     ops: Vec<BatchOp>,
+    /// Sum of key and value lengths across ops, for write-path metrics.
+    encoded_bytes: usize,
 }
 
 impl WriteBatch for FjallWriteBatch {
@@ -159,6 +191,7 @@ impl WriteBatch for FjallWriteBatch {
     }
 
     fn put_value(&mut self, cf: ColumnFamily, key: &[u8], value: Bytes) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len() + value.len());
         self.ops.push(BatchOp::Put {
             cf,
             key: key.to_vec(),
@@ -167,6 +200,7 @@ impl WriteBatch for FjallWriteBatch {
     }
 
     fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
+        self.encoded_bytes = self.encoded_bytes.saturating_add(key.len());
         self.ops.push(BatchOp::Delete {
             cf,
             key: key.to_vec(),

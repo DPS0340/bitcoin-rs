@@ -5,6 +5,8 @@ extern crate alloc;
 
 /// Append-only flat files for immutable block bodies.
 pub mod block_file;
+/// Process cache-budget division shared by the storage backends.
+pub mod cache_budget;
 /// Logical column-family names shared by all storage backends.
 pub mod column_families;
 /// Streaming length-prefixed Core frame reader and writer.
@@ -30,6 +32,7 @@ pub use block_file::{
     FlatFileBlockStore, block_file_max_height_key, decode_block_file_max_height,
     encode_block_file_max_height,
 };
+pub use cache_budget::{CacheBudgetShare, clamp_dbcache_bytes, split_cache_budget};
 pub use column_families::ColumnFamily;
 pub use corpus::{
     CORE_FRAME_HEADER_LEN, CORE_FRAME_MAGIC_LEN, CoreFrameError, CoreFrameMetadata,
@@ -43,6 +46,6 @@ pub use fjall_impl::FjallStore;
 #[cfg(feature = "mdbx")]
 pub use mdbx_impl::MdbxStore;
 #[cfg(feature = "redb")]
-pub use redb_impl::{RedbStore, open_redb_tx_index_store};
+pub use redb_impl::{RedbStore, open_redb_tx_index_store, open_redb_tx_index_store_with_cache};
 #[cfg(feature = "rocksdb")]
 pub use rocksdb_impl::RocksDbStore;

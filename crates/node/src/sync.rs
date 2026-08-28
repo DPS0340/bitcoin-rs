@@ -670,6 +670,7 @@ impl BlockSync {
                     .map(|source| source.addr);
                 match staged {
                     StagedBlock::AlreadyStaged => {
+                        metrics::counter!("node.sync.duplicate_deliveries").increment(1);
                         if let Some(source_peer) = source_peer {
                             window.credit_duplicate_delivery(hash, source_peer);
                         }
@@ -1591,6 +1592,15 @@ impl BlockSync {
         metrics::gauge!("node.sync.pending_bytes").set(metric_count(window.pending_bytes()));
         metrics::gauge!("node.sync.received_blocks").set(metric_count(stager.received_len()));
         metrics::gauge!("node.sync.received_bytes").set(metric_count(stager.received_bytes()));
+        let (pending_blocks_high_water, pending_bytes_high_water) = window.pending_high_water();
+        metrics::gauge!("node.sync.pending_blocks_high_water")
+            .set(metric_count(pending_blocks_high_water));
+        metrics::gauge!("node.sync.pending_bytes_high_water")
+            .set(metric_count(pending_bytes_high_water));
+        metrics::gauge!("node.sync.staged_blocks_high_water")
+            .set(metric_count(stager.received_high_water()));
+        metrics::gauge!("node.sync.staged_bytes_high_water")
+            .set(metric_count(stager.received_bytes_high_water()));
     }
 
     fn record_pending_sync_metrics(&self) {
