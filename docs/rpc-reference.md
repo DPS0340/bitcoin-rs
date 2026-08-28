@@ -35,6 +35,7 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `verifychain` | 0.4.0 |  |
 | `gettxoutsetinfo` | 0.4.0 |  |
 | `getindexinfo` | 0.4.0 |  |
+| `getblockfilter` | 0.4.0 | Requires the --blockfilterindex runtime toggle; without it the handler answers the Core 'Index is not enabled' error (crates/rpc/src/handlers/chain.rs). |
 | `pruneblockchain` | 0.4.0 |  |
 | `invalidateblock` | 0.4.0 |  |
 | `getrawtransaction` | 0.4.0 |  |
@@ -89,14 +90,13 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `getcapabilities` | pending | Planned bitcoin-rs extension reporting compiled/enabled capabilities and index readiness; this row is the contract, the method lands with the extension registry. |
+| `getcapabilities` | 0.4.0 | bitcoin-rs extension reporting compiled/enabled capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/node/src/extensions.rs). |
 
 ### Unimplemented
 
 | surface | since | notes |
 |---|---|---|
 | `dumptxoutset` | n/a | UTXO snapshot dump not implemented. |
-| `getblockfilter` | n/a | No BIP157/158 filter index yet. |
 | `getblockfrompeer` | n/a | No on-demand block fetch from peers. |
 | `getchainstates` | n/a | Not implemented. |
 | `getdeploymentinfo` | n/a | Not implemented over JSON-RPC (the REST /rest/deploymentinfo route exists). |
@@ -214,8 +214,8 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 
 | surface | since | notes |
 |---|---|---|
-| `/rest/blockfilter/` | 0.4.0 | Route registered but answers unavailable: no filter index runs yet (crates/rpc/src/rest.rs). |
-| `/rest/blockfilterheaders/` | 0.4.0 | Route registered but answers unavailable: no filter index runs yet (crates/rpc/src/rest.rs). |
+| `/rest/blockfilter/` | 0.4.0 | Route registered but answers unavailable unless the --blockfilterindex extension is enabled (crates/rpc/src/rest.rs). |
+| `/rest/blockfilterheaders/` | 0.4.0 | Route registered but answers unavailable unless the --blockfilterindex extension is enabled (crates/rpc/src/rest.rs). |
 | `/rest/getutxos` | 0.4.0 | URI-scheme input only; Core also accepts a POST raw-transaction body (crates/rpc/src/rest.rs). |
 | `/rest/spenttxouts/` | 0.4.0 | Always answers undo-unavailable: undo data is not persisted (crates/rpc/src/rest.rs). |
 
@@ -237,4 +237,4 @@ Unimplemented-set derivation: audited against the Bitcoin Core v31.0 source comm
 | `rawtx` | 0.4.0 | Requires the zmq feature and a --zmqpubrawtx endpoint. |
 | `sequence` | 0.4.0 | Requires the zmq feature and a --zmqpubsequence endpoint. Publishes C/D block events and A/R mempool events; A/R carry reversed txid, the label byte, and the mempool sequence as u64 LE (crates/node/src/zmq_publisher.rs). |
 
-Row counts: Implemented 67, Deviation 9, Extension 2, Unimplemented 97 - total 175.
+Row counts: Implemented 68, Deviation 9, Extension 2, Unimplemented 96 - total 175.

@@ -77,6 +77,8 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         mining: bitcoin_rs_rpc::context::MiningHandles {
             mining_control: None,
         },
+        filter_index: None,
+        capabilities: None,
     })
     .with_zmq_notifications(state.active_zmq_notifications());
 

@@ -152,6 +152,8 @@ pub struct Config {
     pub prune_target_mb: u64,
     /// Whether the transaction index is enabled.
     pub txindex: bool,
+/// Whether the BIP157/158 basic block filter index extension is enabled.
+pub blockfilterindex: bool,
     /// Database cache budget in MiB, divided across the persistent storage
     /// namespaces (chainstate 70%, txindex 20%, filters 10%; shares of
     /// disabled namespaces redistribute to chainstate).
@@ -229,6 +231,7 @@ impl fmt::Debug for Config {
             .field("connect", &self.connect)
             .field("prune_target_mb", &self.prune_target_mb)
             .field("txindex", &self.txindex)
+            .field("blockfilterindex", &self.blockfilterindex)
             .field("dbcache_mb", &self.dbcache_mb)
             .field("log_level", &self.log_level)
             .field("metrics_bind", &self.metrics_bind)
@@ -290,6 +293,7 @@ impl Config {
             connect: Vec::new(),
             prune_target_mb: 0,
             txindex: false,
+            blockfilterindex: false,
             dbcache_mb: DEFAULT_DBCACHE_MB,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             metrics_bind: None,
@@ -383,6 +387,16 @@ impl Config {
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
+        }
+        if self.blockfilterindex {
+            ensure!(
+                self.txindex || self.script_index,
+                "blockfilterindex requires txindex"
+            );
+            ensure!(
+                self.prune_target_mb == 0,
+                "blockfilterindex requires prune disabled"
+            );
         }
         match (&self.g2_muhash_samples, self.g2_muhash_tip_height) {
             (Some(_), Some(0)) => bail!("g2_muhash_tip_height must be greater than zero"),
@@ -549,6 +563,9 @@ impl Config {
         if let Some(txindex) = layer.txindex {
             self.txindex = txindex;
         }
+        if let Some(blockfilterindex) = layer.blockfilterindex {
+            self.blockfilterindex = blockfilterindex;
+        }
         if let Some(dbcache_mb) = layer.dbcache_mb {
             self.dbcache_mb = dbcache_mb;
         }
@@ -691,6 +708,12 @@ pub(crate) struct ConfigLayer {
     pub(crate) prune_target_mb: Option<u64>,
     #[arg(long)]
     pub(crate) txindex: Option<bool>,
+    #[arg(
+        long = "blockfilterindex",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub(crate) blockfilterindex: Option<bool>,
     #[arg(long = "dbcache-mb")]
     pub(crate) dbcache_mb: Option<u64>,
     #[arg(long = "log-level")]
@@ -770,6 +793,7 @@ impl ConfigLayer {
                 "BITCOIN_RS_CONNECT" => layer.connect = Some(parse_connect_list(value)?),
                 "BITCOIN_RS_PRUNE_TARGET_MB" => layer.prune_target_mb = Some(value.parse()?),
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
+                "BITCOIN_RS_BLOCKFILTERINDEX" => layer.blockfilterindex = Some(parse_bool(value)?),
                 "BITCOIN_RS_DBCACHE_MB" => layer.dbcache_mb = Some(value.parse()?),
                 "BITCOIN_RS_LOG_LEVEL" => layer.log_level = Some(value.to_owned()),
                 "BITCOIN_RS_METRICS_BIND" => layer.metrics_bind = Some(value.parse()?),

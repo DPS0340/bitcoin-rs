@@ -1048,6 +1048,112 @@ fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<Ope
     }
 }
 
+/// Opens the BIP157/158 filter index extension namespace, if enabled.
+///
+/// The namespace lives at `data_dir/blockfilterindex` and is refused — and
+/// only that namespace — when its stored schema version is foreign or its
+/// rows predate versioning, per `docs/policies/db-migration.md`. The node
+/// keeps starting; the capability reports as disabled.
+#[allow(clippy::too_many_arguments)]
+fn open_filter_index(
+    config: &Config,
+    cache_bytes: u64,
+    applied_tip: Arc<arc_swap::ArcSwapOption<bitcoin_rs_chain::TipSnapshot>>,
+    block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
+    body_store: Arc<dyn crate::apply::PruneBodyStore>,
+    tx_lookup: Option<Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery>>,
+    chain_events: Arc<ChainEventPublisher>,
+    hints: crossbeam_channel::Receiver<ChainEventHint>,
+) -> Result<Option<crate::filterindex_worker::FilterIndexHandle>> {
+    use bitcoin_rs_ext_blockfilterindex::{
+        FilterBatch, FilterStore, FilterStoreOps, NAMESPACE, SCHEMA_VERSION,
+    };
+    if !config.blockfilterindex {
+        return Ok(None);
+    }
+    let namespace_dir = config.data_dir.join(NAMESPACE);
+    std::fs::create_dir_all(&namespace_dir)
+        .with_context(|| format!("create filter index namespace {}", namespace_dir.display()))?;
+    let store: Arc<dyn FilterStoreOps> = match config.storage_backend.as_str() {
+        #[cfg(feature = "rocksdb")]
+        "rocksdb" => Arc::new(FilterStore::new(Arc::new(
+            bitcoin_rs_storage::RocksDbStore::open_with_cache(&namespace_dir, cache_bytes)
+                .map_err(anyhow::Error::new)?,
+        ))),
+        #[cfg(feature = "fjall")]
+        "fjall" => Arc::new(FilterStore::new(Arc::new(
+            bitcoin_rs_storage::FjallStore::open_with_cache(&namespace_dir, cache_bytes)
+                .map_err(anyhow::Error::new)?,
+        ))),
+        #[cfg(feature = "redb")]
+        "redb" => Arc::new(FilterStore::new(Arc::new(
+            bitcoin_rs_storage::RedbStore::open_with_cache(&namespace_dir, cache_bytes)
+                .map_err(anyhow::Error::new)?,
+        ))),
+        #[cfg(feature = "mdbx")]
+        "mdbx" => Arc::new(FilterStore::new(Arc::new(
+            bitcoin_rs_storage::MdbxStore::open_with_cache(&namespace_dir, cache_bytes)
+                .map_err(anyhow::Error::new)?,
+        ))),
+        other => bail!("unsupported storage backend for blockfilterindex: {other}"),
+    };
+
+    // An enabled extension with an incompatible namespace is a configuration
+    // failure. Silently disabling it would lie about the requested capability.
+    match store.schema_version().map_err(anyhow::Error::new)? {
+        Some(version) if version != SCHEMA_VERSION => {
+            bail!(
+                "blockfilterindex schema version {version} is incompatible with {SCHEMA_VERSION}; \
+                 remove or quarantine {} to reindex",
+                namespace_dir.display()
+            );
+        }
+        Some(_) => {}
+        None => {
+            if !store.is_fresh().map_err(anyhow::Error::new)? {
+                bail!(
+                    "blockfilterindex namespace has rows without a schema version; \
+                     remove or quarantine {} to reindex",
+                    namespace_dir.display()
+                );
+            }
+            let mut init = FilterBatch::new();
+            init.put_schema_version();
+            store.apply(init).map_err(anyhow::Error::new)?;
+        }
+    }
+
+    let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+    let runtime = Arc::new(crate::filterindex_worker::FilterIndexRuntime::new(wake_tx));
+    let status = Arc::new(crate::filterindex_worker::FilterIndexStatus::new(
+        Arc::clone(&runtime),
+        Arc::clone(&store),
+        Arc::clone(&applied_tip),
+        Arc::clone(&chain_events),
+    ));
+    let query = Arc::new(crate::filterindex_worker::FilterIndexQueryEngine::new(
+        Arc::clone(&status),
+        Arc::clone(&store),
+    ));
+    let worker = crate::filterindex_worker::FilterIndexWorker::spawn(
+        runtime,
+        store,
+        applied_tip,
+        block_tree,
+        body_store,
+        tx_lookup,
+        chain_events,
+        wake_rx,
+        hints,
+    )
+    .context("spawn filter index worker")?;
+    Ok(Some(crate::filterindex_worker::FilterIndexHandle {
+        status,
+        worker,
+        query,
+    }))
+}
+
 /// Aggregate handle to a running node.
 pub struct NodeState {
     /// Height the last clean checkpoint would restore to, 0 when none exists.
@@ -1066,6 +1172,10 @@ pub struct NodeState {
     tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
     tx_index_worker: Option<crate::txindex_worker::TxIndexWorker>,
     tx_index_query: Option<Arc<crate::txindex_worker::TxIndexQueryEngine>>,
+    /// Enabled BIP157/158 filter index extension, when `--blockfilterindex`.
+    filter_index: Option<crate::filterindex_worker::FilterIndexHandle>,
+    /// Live capability report backing `getcapabilities`.
+    capabilities: Arc<crate::extensions::NodeCapabilities>,
     prune_service: Option<Arc<dyn PruneService>>,
     zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     active_zmq_notifications: Vec<ZmqNotification>,
@@ -1155,17 +1265,19 @@ impl NodeState {
                 bail!("g14_utxo_commit_samples requires complete G14 UTXO commit IBD window fields")
             }
         };
-        // Divide the process cache budget across the persistent namespaces that
-        // exist in this deployment. Filters have no consumer at this layer yet,
-        // so their share redistributes to chainstate.
+        // Divide the process cache budget across the persistent namespaces
+        // that exist in this deployment. The filter share applies when the
+        // blockfilterindex extension is enabled; a disabled namespace's
+        // share redistributes to chainstate.
         let cache_budget = bitcoin_rs_storage::clamp_dbcache_bytes(config.dbcache_mb);
         let cache_shares = bitcoin_rs_storage::split_cache_budget(
             cache_budget,
             !tx_index_capabilities(&config).is_empty(),
-            false,
+            config.blockfilterindex,
         );
         let chainstate_cache_bytes = cache_shares[0].bytes;
         let txindex_cache_bytes = cache_shares[1].bytes;
+        let filter_cache_bytes = cache_shares[2].bytes;
         let storage = NodeStorage::open(&config, chainstate_cache_bytes)?;
         let undo_store = storage.undo_store();
         // Before anything reads the chainstate, let alone serves or syncs it.
@@ -1311,39 +1423,66 @@ impl NodeState {
             ChainEventPublisher::new(epoch, initial_snapshot);
         let chain_events = Arc::new(chain_events_raw);
         let tx_index_open = open_tx_index(&config, txindex_cache_bytes)?;
-        let (tx_index_runtime, tx_index_worker, tx_index_query) = match tx_index_open {
-            Some(open) => {
-                let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
-                let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
-                let body_source: Arc<dyn bitcoin_rs_rpc::context::BlockBodySource> =
-                    Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
-                let block_source = crate::NodeBlockSource::new(Arc::clone(&blocks))
-                    .with_block_body_source(Arc::clone(&body_source))
-                    .with_block_tree(Arc::clone(&block_tree));
-                let query = Arc::new(crate::txindex_worker::TxIndexQueryEngine::new(
-                    Arc::clone(&runtime),
-                    Arc::clone(&open.reader),
-                    block_source,
-                    Arc::clone(&block_tree),
-                    Arc::clone(&applied_tip),
-                    Some(body_source),
-                ));
-                let worker = crate::txindex_worker::TxIndexWorker::spawn(
-                    Arc::clone(&runtime),
-                    open.writer,
-                    Arc::clone(&applied_tip),
-                    Arc::clone(&block_tree),
-                    Some(Arc::clone(&block_body_store)),
-                    open.batch_limits,
-                    tx_index_capabilities(&config),
-                    Arc::clone(&chain_events),
-                    wake_rx,
-                )
-                .context("spawn txindex worker")?;
-                (Some(runtime), Some(worker), Some(query))
-            }
-            None => (None, None, None),
-        };
+        let (tx_index_runtime, tx_index_worker, tx_index_query, tx_query_adapter) =
+            match tx_index_open {
+                Some(open) => {
+                    let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+                    let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
+                    let body_source: Arc<dyn bitcoin_rs_rpc::context::BlockBodySource> =
+                        Arc::new(StoredBlockBodySource::new(Arc::clone(&block_body_store)));
+                    let block_source = crate::NodeBlockSource::new(Arc::clone(&blocks))
+                        .with_block_body_source(Arc::clone(&body_source))
+                        .with_block_tree(Arc::clone(&block_tree));
+                    let query = Arc::new(crate::txindex_worker::TxIndexQueryEngine::new(
+                        Arc::clone(&runtime),
+                        Arc::clone(&open.reader),
+                        block_source,
+                        Arc::clone(&block_tree),
+                        Arc::clone(&applied_tip),
+                        Some(body_source),
+                    ));
+                    let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> =
+                        query.clone();
+                    let worker = crate::txindex_worker::TxIndexWorker::spawn(
+                        Arc::clone(&runtime),
+                        open.writer,
+                        Arc::clone(&applied_tip),
+                        Arc::clone(&block_tree),
+                        Some(Arc::clone(&block_body_store)),
+                        open.batch_limits,
+                        tx_index_capabilities(&config),
+                        Arc::clone(&chain_events),
+                        wake_rx,
+                    )
+                    .context("spawn txindex worker")?;
+                    (Some(runtime), Some(worker), Some(query), Some(adapter))
+                }
+                None => (None, None, None, None),
+            };
+        // The filter extension is the second reconciliation consumer; it
+        // clones the shared hint receiver (hints are wake-ups, never data)
+        // and never touches the txindex namespace.
+        let filter_index = open_filter_index(
+            &config,
+            filter_cache_bytes,
+            Arc::clone(&applied_tip),
+            Arc::clone(&block_tree),
+            Arc::clone(&block_body_store),
+            tx_query_adapter.clone(),
+            Arc::clone(&chain_events),
+            chain_event_hints_rx_raw.clone(),
+        )?;
+        let capabilities = Arc::new(crate::extensions::NodeCapabilities::new(
+            crate::extensions::CapabilityInputs {
+                applied_tip: Arc::clone(&applied_tip),
+                tx_query: tx_query_adapter,
+                tx_runtime: tx_index_runtime.clone(),
+                txindex_enabled: config.txindex || config.script_index,
+                filter_status: filter_index
+                    .as_ref()
+                    .map(|handle| Arc::clone(&handle.status)),
+            },
+        ));
         let network = Arc::new(RwLock::new(NetworkState::default()));
         let network_active = Arc::new(AtomicBool::new(true));
         let peers = Arc::new(RwLock::new(Vec::new()));
@@ -1417,6 +1556,7 @@ impl NodeState {
             chainstate_dir = %config.data_dir.join("chainstate").display(),
             chainstate_cache_bytes,
             txindex_cache_bytes,
+            filter_cache_bytes,
             total_cache_bytes = cache_budget,
             "opened storage backend with effective cache capacities"
         );
@@ -1434,6 +1574,8 @@ impl NodeState {
             tx_index_runtime,
             tx_index_worker,
             tx_index_query,
+            filter_index,
+            capabilities,
             prune_service,
             zmq_publisher,
             active_zmq_notifications,
@@ -1594,6 +1736,27 @@ impl NodeState {
         })
     }
 
+    /// Returns the node-owned basic block-filter index query adapter.
+    ///
+    /// `None` when `--blockfilterindex` is not enabled, preserving the
+    /// absent-filter RPC contract for the default configuration.
+    #[must_use]
+    pub fn filter_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::FilterIndexQuery>> {
+        if !self.config.blockfilterindex {
+            return None;
+        }
+        self.filter_index.as_ref().map(|handle| {
+            let adapter: Arc<dyn bitcoin_rs_rpc::context::FilterIndexQuery> =
+                handle.query.clone();
+            adapter
+        })
+    }
+
+    /// Returns the live capability report provider for `getcapabilities`.
+    #[must_use]
+    pub fn capability_provider(&self) -> Arc<dyn bitcoin_rs_ext_api::CapabilityProvider> {
+        self.capabilities.clone()
+    }
     /// Returns the manual pruning service when pruning is enabled.
     #[must_use]
     pub fn prune_service(&self) -> Option<Arc<dyn PruneService>> {
@@ -1839,6 +2002,9 @@ impl Drop for NodeState {
         }
         if let Some(worker) = self.tx_index_worker.take() {
             worker.join();
+        }
+        if let Some(handle) = self.filter_index.take() {
+            handle.shutdown();
         }
     }
 }

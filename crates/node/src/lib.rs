@@ -28,6 +28,10 @@ pub mod corpus;
 pub mod crash_recovery;
 /// Central synchronous event loop.
 pub mod event_loop;
+/// Extension registry: descriptors, validation, capability report.
+pub mod extensions;
+/// BIP157/158 filter index reconciliation worker and query engine.
+mod filterindex_worker;
 mod g14_utxo_commit;
 mod g2_muhash;
 /// Block import pipeline.

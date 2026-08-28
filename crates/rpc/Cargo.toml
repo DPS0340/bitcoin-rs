@@ -23,6 +23,7 @@ bitcoin-rs-index.workspace = true
 bitcoin-rs-mempool.workspace = true
 bitcoin-rs-p2p.workspace = true
 bitcoin-rs-utxo.workspace = true
+bitcoin-rs-ext-api.workspace = true
 bitcoin-rs-mining.workspace = true
 bitcoin.workspace = true
 miniscript.workspace = true

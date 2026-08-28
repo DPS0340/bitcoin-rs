@@ -261,6 +261,15 @@ pub const MANIFEST: &[Entry] = &[
         since: "0.4.0",
     },
     Entry {
+        name: "getblockfilter",
+        kind: SurfaceKind::Rpc,
+        status: Status::Implemented,
+        feature: "",
+        core_version: CORE_VERSION,
+        notes: "Requires the --blockfilterindex runtime toggle; without it the handler answers the Core 'Index is not enabled' error (crates/rpc/src/handlers/chain.rs).",
+        since: "0.4.0",
+    },
+    Entry {
         name: "pruneblockchain",
         kind: SurfaceKind::Rpc,
         status: Status::Implemented,
@@ -656,15 +665,15 @@ pub const MANIFEST: &[Entry] = &[
         notes: "",
         since: "0.4.0",
     },
-    // -- JSON-RPC: planned bitcoin-rs extension -----------------------------
+    // -- JSON-RPC: bitcoin-rs extension --------------------------------------
     Entry {
         name: "getcapabilities",
         kind: SurfaceKind::Rpc,
         status: Status::Extension,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Planned bitcoin-rs extension reporting compiled/enabled capabilities and index readiness; this row is the contract, the method lands with the extension registry.",
-        since: "pending",
+        notes: "bitcoin-rs extension reporting compiled/enabled capabilities and index lifecycle state (crates/rpc/src/handlers/chain.rs, crates/node/src/extensions.rs).",
+        since: "0.4.0",
     },
     // -- JSON-RPC: Core surface not exposed (blockchain/control) ------------
     Entry {
@@ -674,15 +683,6 @@ pub const MANIFEST: &[Entry] = &[
         feature: "",
         core_version: CORE_VERSION,
         notes: "UTXO snapshot dump not implemented.",
-        since: "n/a",
-    },
-    Entry {
-        name: "getblockfilter",
-        kind: SurfaceKind::Rpc,
-        status: Status::Unimplemented,
-        feature: "",
-        core_version: CORE_VERSION,
-        notes: "No BIP157/158 filter index yet.",
         since: "n/a",
     },
     Entry {
@@ -1585,7 +1585,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Deviation,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Route registered but answers unavailable: no filter index runs yet (crates/rpc/src/rest.rs).",
+        notes: "Route registered but answers unavailable unless the --blockfilterindex extension is enabled (crates/rpc/src/rest.rs).",
         since: "0.4.0",
     },
     Entry {
@@ -1594,7 +1594,7 @@ pub const MANIFEST: &[Entry] = &[
         status: Status::Deviation,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Route registered but answers unavailable: no filter index runs yet (crates/rpc/src/rest.rs).",
+        notes: "Route registered but answers unavailable unless the --blockfilterindex extension is enabled (crates/rpc/src/rest.rs).",
         since: "0.4.0",
     },
     Entry {

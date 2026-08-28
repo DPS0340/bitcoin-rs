@@ -82,3 +82,6 @@ path = "tests/gates/g15_workspace_version_sync.rs"
 [[test]]
 name = "g17_dependency_direction"
 path = "tests/gates/g17_dependency_direction.rs"
+[[test]]
+name = "g16_extension_model"
+path = "tests/gates/g16_extension_model.rs"

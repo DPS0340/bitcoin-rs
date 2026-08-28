@@ -87,6 +87,14 @@ pub(crate) const DISPATCH_TABLE: &[DispatchEntry] = &[
         handler: chain::getindexinfo,
     },
     DispatchEntry {
+        name: "getblockfilter",
+        handler: chain::getblockfilter,
+    },
+    DispatchEntry {
+        name: "getcapabilities",
+        handler: chain::getcapabilities,
+    },
+    DispatchEntry {
         name: "pruneblockchain",
         handler: chain::pruneblockchain,
     },

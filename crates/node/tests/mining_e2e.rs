@@ -410,6 +410,8 @@ fn mining_handler(state: &NodeState) -> Handler {
         mining: MiningHandles {
             mining_control: Some(mining_control),
         },
+        filter_index: None,
+        capabilities: None,
     });
     Handler::new(Arc::new(ctx))
 }

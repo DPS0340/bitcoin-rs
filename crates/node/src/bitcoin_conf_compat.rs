@@ -59,6 +59,7 @@ fn apply_key(layer: &mut ConfigLayer, key: &str, value: &str) {
             layer.p2p_listen = Some(Vec::new());
         }
         "txindex" => layer.txindex = parse_core_bool(value),
+        "blockfilterindex" => layer.blockfilterindex = parse_core_bool(value),
         "dbcache" => {
             if let Ok(dbcache_mb) = value.parse() {
                 layer.dbcache_mb = Some(dbcache_mb);
@@ -170,6 +171,9 @@ impl ConfigLayerMerge for ConfigLayer {
         }
         if other.txindex.is_some() {
             self.txindex = other.txindex;
+        }
+        if other.blockfilterindex.is_some() {
+            self.blockfilterindex = other.blockfilterindex;
         }
         if other.dbcache_mb.is_some() {
             self.dbcache_mb = other.dbcache_mb;

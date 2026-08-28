@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use arc_swap::ArcSwapOption;
 
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_ext_api::CapabilityProvider;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_primitives::{
@@ -896,6 +897,33 @@ pub trait TxIndexQuery: Send + Sync {
     fn index_info(&self) -> Result<TxIndexInfo, TxQueryError>;
 }
 
+/// Actual progress reported by the node-owned basic block-filter index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilterIndexInfo {
+    /// Whether the index has completely caught up to the authoritative chain tip.
+    pub synced: bool,
+    /// Height of the best block whose filter the index can serve.
+    pub best_block_height: u32,
+}
+
+/// Lockless read-only adapter for basic block-filter index queries.
+///
+/// `None` on the context means the index is not enabled; implementations
+/// return [`TxQueryError`] for blocks the index does not cover.
+pub trait FilterIndexQuery: Send + Sync {
+    /// Returns the index's actual durable progress.
+    fn filter_info(&self) -> Result<FilterIndexInfo, TxQueryError>;
+
+    /// Returns the serialized BIP158 basic filter for `block_hash`.
+    ///
+    /// `None` means complete absence: the block is known to the index and
+    /// has no filter row (only possible below the indexed prefix).
+    fn basic_filter(&self, block_hash: Hash256) -> Result<Option<Vec<u8>>, TxQueryError>;
+
+    /// Returns the BIP157 filter header for `block_hash`.
+    fn filter_header(&self, block_hash: Hash256) -> Result<Option<[u8; 32]>, TxQueryError>;
+}
+
 /// One current unspent output indexed for a script.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScriptIndexRecord {
@@ -1001,6 +1029,10 @@ pub struct ContextHandles {
     pub network: NetworkHandles,
     /// Mining capability: the template coordinator, when one is attached.
     pub mining: MiningHandles,
+    /// Complete basic block-filter index query adapter.
+    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
+    /// Live capability report backing the `getcapabilities` extension method.
+    pub capabilities: Option<Arc<dyn CapabilityProvider>>,
 }
 
 /// Chain capability handles.
@@ -1117,6 +1149,11 @@ pub struct Context {
     pub esplora_tx_index: Option<Arc<dyn TxIndexQuery>>,
     /// Optional node-owned generic script-index query adapter.
     pub script_index: Option<Arc<dyn ScriptIndexQuery>>,
+    /// Optional node-owned complete basic block-filter index query adapter.
+    /// `None` when the filter index extension is not enabled.
+    pub filter_index: Option<Arc<dyn FilterIndexQuery>>,
+    /// Live capability report backing the `getcapabilities` extension method.
+    pub capabilities: Option<Arc<dyn CapabilityProvider>>,
     /// Network counters and peers.
     pub network: Arc<RwLock<NetworkState>>,
     /// Network selector used by handlers needing consensus parameters (e.g.
@@ -1194,6 +1231,8 @@ impl Context {
             tx_index: None,
             esplora_tx_index: None,
             script_index: None,
+            filter_index: None,
+            capabilities: None,
             prune_service: None,
             chain_control: None,
             peer_outbound: Arc::new(RwLock::new(HashMap::new())),
@@ -1205,8 +1244,8 @@ impl Context {
             block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
             block_body_source: None,
             p2p_outbound_sender: None,
-            banned: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            banned: Arc::new(RwLock::new(Vec::new())),
+            added_nodes: Arc::new(RwLock::new(Vec::new())),
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
@@ -1243,6 +1282,8 @@ impl Context {
                     added_nodes,
                 },
             mining: MiningHandles { mining_control },
+            filter_index,
+            capabilities,
         } = handles;
         Self {
             chain_tip,
@@ -1258,6 +1299,8 @@ impl Context {
             tx_index,
             esplora_tx_index: None,
             script_index,
+            filter_index,
+            capabilities,
             network,
             chain_network,
             peers,
@@ -1955,6 +1998,8 @@ mod tests {
             mining: MiningHandles {
                 mining_control: None,
             },
+            filter_index: None,
+            capabilities: None,
         });
         assert!(
             Arc::ptr_eq(&ctx.chain_tip, &chain_tip),

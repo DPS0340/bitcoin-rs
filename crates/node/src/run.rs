@@ -587,6 +587,7 @@ pub fn run(mut config: Config) -> Result<()> {
     cap_global_thread_pool();
 
     let injected_shutdown = config.shutdown_signal.take();
+    crate::extensions::validate_extensions(&config)?;
     let state = NodeState::open(config)?;
     if state.resume_source() != crate::state::ResumeSource::Checkpoint {
         crash_recovery::recover_if_needed(&state)?;
@@ -664,10 +665,11 @@ pub fn run(mut config: Config) -> Result<()> {
             mining: bitcoin_rs_rpc::context::MiningHandles {
                 mining_control: Some(Arc::clone(&mining_control)),
             },
+            filter_index: state.filter_index_query(),
+            capabilities: Some(state.capability_provider()),
         })
         .with_esplora_tx_index(state.esplora_tx_index_query());
     rpc_context = rpc_context.with_block_body_source(block_body_source);
-    rpc_context = rpc_context.with_chain_tx_count(state.chain_tx_count_handle());
     rpc_context =
         rpc_context.with_chain_transition(Arc::clone(&state.apply_handles().chain_transition));
     if let Some(prune_service) = state.prune_service() {

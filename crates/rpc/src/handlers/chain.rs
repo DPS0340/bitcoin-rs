@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use bitcoin::Network as BitcoinNetwork;
+use bitcoin::hex::DisplayHex as _;
 use core::str::FromStr as _;
 use core::{fmt, fmt::Write as _};
 
@@ -952,6 +953,17 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             "best_block_height": info.best_block_height,
         })
     });
+    let filter_entry = ctx
+        .filter_index
+        .as_ref()
+        .map(|filter_index| filter_index.filter_info())
+        .transpose()?;
+    let filter_entry = filter_entry.map(|info| {
+        json!({
+            "synced": info.synced,
+            "best_block_height": info.best_block_height,
+        })
+    });
 
     match index_name {
         None => {
@@ -959,15 +971,63 @@ pub(crate) fn getindexinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
             if let Some(entry) = txindex_entry {
                 let _ = indexes.insert(&"txindex", entry);
             }
+            if let Some(entry) = filter_entry {
+                let _ = indexes.insert(&"basicblockfilterindex", entry);
+            }
 
             Ok(indexes.into())
         }
         Some("txindex") => {
             Ok(txindex_entry.map_or_else(|| json!({}), |entry| json!({ "txindex": entry })))
         }
+        Some("basicblockfilterindex") => Ok(filter_entry.map_or_else(
+            || json!({}),
+            |entry| json!({ "basicblockfilterindex": entry }),
+        )),
 
         Some(_) => Ok(json!({})),
     }
+}
+
+/// Bitcoin Core `getblockfilter`.
+///
+/// Serves the BIP158 basic filter for one block from the filter index
+/// extension. Without `--blockfilterindex` the method is registered but
+/// answers the Core-shaped "Index is not enabled" parameter error, matching
+/// Core behavior without the index.
+pub(crate) fn getblockfilter(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    let Some(filter_index) = ctx.filter_index.as_ref() else {
+        return Err(RpcError::InvalidParams("Index is not enabled"));
+    };
+    let block_hash_text = required_str(params, 0, "block hash is required")?;
+    let block_hash = Hash256::from_str_be(block_hash_text)
+        .map_err(|_| RpcError::InvalidParams("block hash must be a 64-character hex string"))?;
+    let filter_type = required_str(params, 1, "filter type is required")?;
+    if filter_type != "basic" {
+        return Err(RpcError::InvalidParams("unknown filtertype"));
+    }
+
+    let filter = filter_index
+        .basic_filter(block_hash)
+        .map_err(TxQueryError::into_rpc_error)?
+        .ok_or(RpcError::NotFound(
+            "Block not available (not fully indexed)",
+        ))?;
+    Ok(json!({ "hex": filter.to_lower_hex_string() }))
+}
+
+/// bitcoin-rs extension `getcapabilities`.
+///
+/// Reports every compiled capability with its compiled/enabled state and
+/// live lifecycle status. Extension surface, not Core parity; declared as
+/// `Status::Extension` in the compatibility manifest.
+pub(crate) fn getcapabilities(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
+    ensure_no_params(params)?;
+    let snapshot = ctx
+        .capabilities
+        .as_ref()
+        .map_or_else(Default::default, |provider| provider.snapshot());
+    Ok(json!({ "capabilities": snapshot.capabilities }))
 }
 
 #[derive(Clone, Debug)]
