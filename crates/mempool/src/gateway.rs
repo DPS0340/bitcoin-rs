@@ -10,6 +10,7 @@
 use alloc::sync::Arc;
 
 use bitcoin_rs_primitives::{Tx, Txid};
+use hashbrown::HashSet;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use crate::EntryId;
@@ -95,6 +96,58 @@ impl MempoolGateway {
     /// Commits `pool.insert_entry` and publishes its result.
     pub fn insert_entry(&self, entry: MempoolEntry) -> Result<MutationResult, MempoolError> {
         self.commit(move |pool| pool.insert_entry(entry))
+    }
+
+    /// Reconsiders transactions that left the pool with a disconnected block.
+    ///
+    /// `entries` must arrive in dependency order — parents before the
+    /// transactions spending them — which is the order the reversed
+    /// disconnect walk produces. Each candidate gets exactly one
+    /// commit-and-publish insert; a candidate the pool refuses is recorded,
+    /// and any later candidate spending a refused txid is withheld, so a
+    /// rejected parent can never leave a partially admitted family behind.
+    /// The same withholding follows a parent whose own successful insert
+    /// removed it again — size-limit eviction, for example — because a
+    /// parent is available to descendants only while it remains in the
+    /// pool: every `Removed` change a committed insert reports marks that
+    /// txid unavailable to the rest of the batch. An empty iterator is a
+    /// no-op: nothing is committed, nothing is published, and the mempool
+    /// sequence does not move.
+    pub fn reconsider_disconnected(
+        &self,
+        entries: impl IntoIterator<Item = MempoolEntry>,
+    ) -> Vec<MutationResult> {
+        let mut refused: HashSet<Txid> = HashSet::new();
+        let mut committed = Vec::new();
+        for entry in entries {
+            let txid = entry.txid;
+            let spends_refused = entry
+                .tx
+                .inputs
+                .iter()
+                .any(|input| refused.contains(&input.previous_output.txid));
+            if spends_refused {
+                refused.insert(txid);
+                continue;
+            }
+            match self.insert_entry(entry) {
+                Ok(result) => {
+                    // A successful insert does not promise the entry stayed:
+                    // the same commit can evict it — or any other entry —
+                    // under size pressure. Whatever the result says left the
+                    // pool is unavailable to later spenders, exactly as if
+                    // the pool had refused it up front.
+                    for removed in result.removed_txids() {
+                        refused.insert(removed);
+                    }
+                    committed.push(result);
+                }
+                Err(_) => {
+                    refused.insert(txid);
+                }
+            }
+        }
+        committed
     }
 
     /// Commits `pool.replace_transaction` and publishes its result.
@@ -706,5 +759,135 @@ mod tests {
         );
         let expected: Vec<u64> = (1..=total).collect();
         assert_eq!(*stream, expected, "publish order must equal commit order");
+    }
+
+    #[test]
+    fn reconsider_disconnected_admits_in_order_once_per_candidate() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let parent = tx(30);
+        let parent_txid = parent.txid();
+        let mut child = tx(31);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+
+        let committed = gateway.reconsider_disconnected([entry(&parent), entry(&child)]);
+
+        assert_eq!(committed.len(), 2, "one committed result per candidate");
+        for result in &committed {
+            assert_eq!(result.changes.len(), 1);
+        }
+        assert_eq!(gateway.read().sequence_number(), 2);
+        let seen = observer.seen.lock();
+        assert_eq!(seen.len(), 2, "one publish per committed candidate");
+        assert_eq!(seen[0].0, hash(&parent_txid), "parent commits first");
+        assert_eq!(
+            seen[1].0,
+            hash(&child.txid()),
+            "child commits second"
+        );
+    }
+
+    #[test]
+    fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
+        let gateway = gateway_with(None);
+        let parent = tx(32);
+        let parent_txid = parent.txid();
+        let mut child = tx(33);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        // Fee 50 over 100 vbytes is 500 sat/kvB, under the 1 000 sat/kvB
+        // floor; the child itself is fine and only the refused parent can
+        // keep it out.
+        let refused_parent = MempoolEntry::new(Arc::new(parent), 100, 50, 1, 7);
+
+        let committed = gateway.reconsider_disconnected([refused_parent, entry(&child)]);
+
+        assert!(
+            committed.is_empty(),
+            "a refused parent must keep its descendant out"
+        );
+        assert!(!gateway.read().contains_txid(&parent_txid));
+        assert!(!gateway.read().contains_txid(&child.txid()));
+    }
+
+    #[test]
+    fn reconsider_disconnected_withholds_descendants_of_an_immediately_evicted_parent() {
+        let observer = Arc::new(RecordingObserver::default());
+        // A 150-byte pool already holding 100 vbytes of high-fee filler: the
+        // parent's own insert succeeds and then immediately evicts the parent
+        // as the lowest-fee package. The child pays far more than everything
+        // else, so once admitted it fits and survives — only the parent's
+        // eviction inside the parent's own MutationResult can keep it out.
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 150,
+                ..MempoolLimits::default()
+            }))),
+            Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>),
+        );
+        let filler_txid = tx(36).txid();
+        gateway
+            .insert_entry(MempoolEntry::new(Arc::new(tx(36)), 100, 9_000, 1, 7))
+            .expect("filler in");
+
+        let parent = tx(34);
+        let parent_txid = parent.txid();
+        let mut child = tx(35);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        let child_txid = child.txid();
+        let parent = MempoolEntry::new(Arc::new(parent), 100, 100, 1, 7);
+        let child = MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 7);
+
+        let committed = gateway.reconsider_disconnected([parent, child]);
+
+        assert_eq!(
+            committed.len(),
+            1,
+            "only the parent's insert commits; the child is withheld"
+        );
+        assert_eq!(
+            committed[0].changes,
+            vec![
+                crate::mutation::change(&parent_txid, MutationOutcome::Accepted),
+                crate::mutation::change(&parent_txid, removed(RemovalReason::PolicyEviction)),
+            ],
+            "the parent was admitted and immediately evicted by its own insert"
+        );
+        let pool = gateway.read();
+        assert!(!pool.contains_txid(&parent_txid));
+        assert!(
+            !pool.contains_txid(&child_txid),
+            "an evicted parent must not admit its descendant"
+        );
+        assert!(
+            pool.contains_txid(&filler_txid),
+            "no orphan replaced the parent"
+        );
+        assert_eq!(
+            pool.sequence_number(),
+            3,
+            "the withheld child assigns nothing"
+        );
+        assert_eq!(
+            *observer.seen.lock(),
+            vec![
+                (hash(&parent_txid), MutationOutcome::Accepted),
+                (hash(&parent_txid), removed(RemovalReason::PolicyEviction)),
+            ],
+            "the parent's two changes publish once each; the child publishes nothing"
+        );
+    }
+
+    #[test]
+    fn reconsider_disconnected_no_ops_on_an_empty_batch() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let before = gateway.read().sequence_number();
+
+        let committed = gateway.reconsider_disconnected([]);
+
+        assert!(committed.is_empty());
+        assert_eq!(gateway.read().sequence_number(), before);
+        assert!(observer.seen.lock().is_empty(), "nothing may publish");
     }
 }

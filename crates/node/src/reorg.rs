@@ -6,11 +6,15 @@
 //! Without it the node follows the chain forward and cannot leave a branch that
 //! loses, which is the difference between a chain follower and a full node.
 
+use std::sync::Arc;
+
 use alloc::vec::Vec;
 
-use bitcoin_rs_chain::{NodeId, ReorgPlan, plan_reorg};
-use bitcoin_rs_primitives::{Block, DecodeError, Hash256};
+use bitcoin_rs_chain::{NodeId, ReorgPlan, current_unix_seconds, plan_reorg};
+use bitcoin_rs_mempool::{MempoolEntry, MempoolGateway, MempoolObserver};
+use bitcoin_rs_primitives::{Block, DecodeError, Hash256, Tx, Txid};
 use bitcoin_rs_storage::StorageError;
+use hashbrown::HashMap;
 
 use crate::apply::ApplyHandles;
 use crate::{ApplyError, DisconnectError};
@@ -69,6 +73,9 @@ pub fn invalidate_block(
         debug_assert_eq!(published_target, target);
 
         let (_, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &transition);
+        if outcome.is_ok() {
+            reconsider_disconnected_transactions(handles, &disconnect);
+        }
         return outcome;
     }
 }
@@ -267,6 +274,7 @@ where
             connected_body(body.hash);
         }
         outcome?;
+        reconsider_disconnected_transactions(handles, &disconnect);
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
         }
@@ -330,6 +338,111 @@ fn execute_loaded_plan(
         }
     }
     (connected, Ok(()))
+}
+
+/// Re-admits the transactions a completed disconnect walk carried out of the
+/// chain.
+///
+/// Core returns disconnected transactions to the mempool so a reorg does not
+/// silently destroy everything the departed branch confirmed. The walk runs
+/// in dependency order — blocks oldest-first, the reverse of the tip-down
+/// disconnect order, and block order within a block, which consensus keeps
+/// topological — so a transaction's inputs are decided before the
+/// transaction spending them is offered. Coinbase transactions are skipped
+/// by structure (`is_coinbase`), never by position: a disconnected coinbase
+/// must never re-enter the mempool.
+///
+/// Pricing reads the post-disconnect UTXO set plus the outputs of
+/// candidates already offered in this batch, because an unconfirmed sibling
+/// output is not a coin yet. A candidate with an unresolvable input is left
+/// out, which also keeps its own unconfirmed descendants out. Each offered
+/// candidate goes through the [`MempoolGateway`] exactly once; a pool
+/// refusal (duplicate, policy floor, package limits) is final and the
+/// transaction is dropped, matching Core's best-effort re-add — and a
+/// parent that its own successful insert immediately evicted (size
+/// pressure) drops its spenders the same way. An empty
+/// disconnect set flows through as the no-op it is.
+fn reconsider_disconnected_transactions(handles: &ApplyHandles, disconnect: &[LoadedBranchBody]) {
+    let height = handles.applied_tip.load_full().map_or(0, |tip| tip.height);
+    let time = u64::from(current_unix_seconds());
+    let mut offered: HashMap<Txid, Vec<u64>> = HashMap::new();
+    let mut entries = Vec::new();
+    for body in disconnect.iter().rev() {
+        for tx in &body.block.txs {
+            if is_coinbase(tx) {
+                continue;
+            }
+            let Some((entry, output_values)) =
+                reconsider_entry(&handles.utxo, tx, time, height, &offered)
+            else {
+                continue;
+            };
+            offered.insert(tx.txid(), output_values);
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    // The sequence observer rides along only when a `--zmq-pub-sequence`
+    // endpoint is configured, exactly as elsewhere on the gateway boundary.
+    let observer: Option<Arc<dyn MempoolObserver>> = if handles.zmq_publisher.wants_notifications()
+    {
+        Some(Arc::new(
+            crate::mempool_observer::MempoolSequenceObserver::new(Arc::clone(
+                &handles.zmq_publisher,
+            )),
+        ))
+    } else {
+        None
+    };
+    let gateway = MempoolGateway::new(Arc::clone(&handles.mempool), observer);
+    // The committed results belong to the observer; re-admission itself is
+    // best-effort and drops whatever the pool refuses.
+    let _ = gateway.reconsider_disconnected(entries);
+}
+
+/// Core's `IsCoinBase`: a single input spending the null prevout (zero txid,
+/// `vout` `u32::MAX`). The derived all-zero outpoint (`vout` 0) is not null.
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
+}
+
+/// Prices `tx` for re-admission, or returns `None` when an input is neither a
+/// restored confirmed coin nor an output of an earlier candidate in the same
+/// batch.
+fn reconsider_entry(
+    utxo: &bitcoin_rs_utxo::UtxoSet,
+    tx: &Tx,
+    time: u64,
+    height: u32,
+    offered: &HashMap<Txid, Vec<u64>>,
+) -> Option<(MempoolEntry, Vec<u64>)> {
+    let mut input_total = 0_u64;
+    for input in &tx.inputs {
+        let outpoint = input.previous_output;
+        if let Some(output) = utxo.get(&outpoint) {
+            input_total = input_total.saturating_add(output.value);
+            continue;
+        }
+        let values = offered.get(&input.previous_output.txid)?;
+        let value = values
+            .get(usize::try_from(input.previous_output.vout).ok()?)
+            .copied()?;
+        input_total = input_total.saturating_add(value);
+    }
+    let output_values: Vec<u64> = tx.outputs.iter().map(|output| output.value).collect();
+    let output_total = output_values
+        .iter()
+        .fold(0_u64, |total, value| total.saturating_add(*value));
+    let fee = input_total.saturating_sub(output_total);
+    let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+    Some((
+        MempoolEntry::new(Arc::new(tx.clone()), vsize, fee, time, height),
+        output_values,
+    ))
 }
 
 fn current_reorg_plan(

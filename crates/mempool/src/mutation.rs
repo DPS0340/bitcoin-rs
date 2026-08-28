@@ -106,4 +106,19 @@ impl MutationResult {
         let offset = u64::try_from(index).ok()?;
         self.sequence_base.checked_add(offset)
     }
+
+    /// The txid of every change that left the pool, in commit order.
+    ///
+    /// Converts each record's native txid back to the pool's `Txid` at
+    /// this seam — the inverse of the `change` helper — so callers
+    /// comparing against entry or wire txids need no conversion of their
+    /// own.
+    #[must_use]
+    pub fn removed_txids(&self) -> Vec<Txid> {
+        self.changes
+            .iter()
+            .filter(|change| matches!(change.outcome, MutationOutcome::Removed(_)))
+            .map(|change| Txid::from(change.txid))
+            .collect()
+    }
 }

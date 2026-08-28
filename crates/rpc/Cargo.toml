@@ -44,6 +44,7 @@ tracing.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+bitcoin-rs-node = { workspace = true, features = ["fjall"] }
 proptest.workspace = true
 tempfile = "3"
 criterion.workspace = true

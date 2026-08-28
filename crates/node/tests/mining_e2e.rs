@@ -282,6 +282,13 @@ fn assemble_from_template(
 /// height 101) with a `MEMPOOL_TX_FEE_SATS` fee; the caller inserts it into
 /// the mempool.
 fn seed_coinbase_spend() -> Tx {
+    seed_coinbase_spend_with_fee(MEMPOOL_TX_FEE_SATS)
+}
+
+/// Builds the transaction spending the height-1 seed coinbase (matured at
+/// height 101) with a caller-chosen fee; the caller inserts it into the
+/// mempool.
+fn seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
     let seed_coinbase = Tx {
         version: 2,
         inputs: vec![TxIn {
@@ -307,11 +314,53 @@ fn seed_coinbase_spend() -> Tx {
             witness: Vec::new(),
         }],
         outputs: vec![TxOut {
-            value: REGTEST_SUBSIDY_SATS - MEMPOOL_TX_FEE_SATS,
+            value: REGTEST_SUBSIDY_SATS - fee_sats,
             script_pubkey: vec![0x51],
         }],
         lock_time: 0,
     }
+}
+
+/// Mines and applies the regtest block at `height` over `prev`: the seed
+/// coinbase plus `txs`, through ordinary validation.
+fn mine_regtest_block(
+    state: &NodeState,
+    prev: Hash256,
+    height: u32,
+    txs: Vec<Tx>,
+) -> Result<Block> {
+    let coinbase = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: null_prevout(),
+            // BIP34 height push plus one pad byte: consensus requires a
+            // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
+            script_sig: [script_push_int(i64::from(height)), script_push_int(0)].concat(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REGTEST_SUBSIDY_SATS,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+    let mut block = Block {
+        header: bitcoin_rs_primitives::Header {
+            version: 0x2000_0000,
+            prev_blockhash: bitcoin_rs_primitives::BlockHash::from(prev),
+            merkle_root: Hash256::from_le_bytes(&[0_u8; 32]),
+            time: SEED_BASE_TIME.saturating_add(SEED_BLOCK_INTERVAL.saturating_mul(height)),
+            bits: REGTEST_BITS,
+            nonce: 0,
+        },
+        txs: std::iter::once(coinbase).chain(txs).collect(),
+    };
+    block.header.merkle_root = compute_merkle_root(&block.txs)
+        .ok_or_else(|| anyhow::anyhow!("mined block must have a merkle root"))?;
+    grind_pow(&mut block)?;
+    state.apply_block(&block)?;
+    Ok(block)
 }
 
 /// Wires the production RPC context exactly like `run()` does, with the real
@@ -508,4 +557,123 @@ fn required_u64(value: &sonic_rs::Value, key: &str) -> Result<u64> {
         .and_then(sonic_rs::JsonValueTrait::as_i64)
         .and_then(|number| u64::try_from(number).ok())
         .ok_or_else(|| anyhow::anyhow!("template field {key} missing or not a number"))
+}
+
+#[test]
+fn invalidateblock_readmits_parent_before_child_in_dependency_order() -> Result<()> {
+    let (state, _guard) = open_regtest()?;
+    apply_genesis(&state)?;
+    let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
+
+    // Parent spends the matured height-1 coinbase; the child spends the
+    // parent. Both pay MEMPOOL_TX_FEE_SATS.
+    let parent = seed_coinbase_spend();
+    let parent_txid = parent.txid();
+    let child = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(parent_txid, 0),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REGTEST_SUBSIDY_SATS - 2 * MEMPOOL_TX_FEE_SATS,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+    let child_txid = child.txid();
+
+    let sequence_before_reorg = {
+        let mempool = state.mempool();
+        let mut guard = mempool.write();
+        for (tx, fee) in [
+            (&parent, MEMPOOL_TX_FEE_SATS),
+            (&child, MEMPOOL_TX_FEE_SATS),
+        ] {
+            let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+            guard.insert_entry(bitcoin_rs_mempool::MempoolEntry::new(
+                Arc::new(tx.clone()),
+                vsize,
+                fee,
+                1,
+                1,
+            ))?;
+        }
+        guard.sequence_number()
+    };
+
+    let block = mine_regtest_block(&state, seed_tip_hash, SEED_BLOCKS + 1, vec![parent, child])?;
+    assert_eq!(
+        state.mempool().read().len(),
+        0,
+        "connect must drain the confirmed pair"
+    );
+    let mined_hash = Hash256::from(block.block_hash());
+
+    bitcoin_rs_node::reorg::invalidate_block(&state.apply_handles(), mined_hash)
+        .map_err(|error| anyhow::anyhow!("invalidateblock failed: {error}"))?;
+
+    let tip = current_tip(&state)?;
+    assert_eq!(tip.height, SEED_BLOCKS, "the mined block must roll back");
+    {
+        let mempool = state.mempool();
+        let pool = mempool.read();
+        assert!(pool.contains_txid(&parent_txid), "the parent returns");
+        assert!(
+            pool.contains_txid(&child_txid),
+            "the child follows its parent"
+        );
+        assert_eq!(pool.len(), 2, "the coinbase must stay out");
+        assert_eq!(
+            pool.sequence_number(),
+            sequence_before_reorg + 4,
+            "connect removes two, reconsideration admits parent then child"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalidateblock_keeps_a_below_floor_parent_and_its_child_out_of_the_mempool() -> Result<()> {
+    let (state, _guard) = open_regtest()?;
+    apply_genesis(&state)?;
+    let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
+
+    // The parent spends the matured seed coinbase but offers a 1-sat fee,
+    // far below the 1 000 sat/kvB relay floor. The child pays well and is
+    // kept out only by its refused parent.
+    let parent = seed_coinbase_spend_with_fee(1);
+    let parent_txid = parent.txid();
+    let child = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(parent_txid, 0),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REGTEST_SUBSIDY_SATS - 1 - 5_000,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+
+    let block = mine_regtest_block(&state, seed_tip_hash, SEED_BLOCKS + 1, vec![parent, child])?;
+    let mined_hash = Hash256::from(block.block_hash());
+    bitcoin_rs_node::reorg::invalidate_block(&state.apply_handles(), mined_hash)
+        .map_err(|error| anyhow::anyhow!("invalidateblock failed: {error}"))?;
+
+    let tip = current_tip(&state)?;
+    assert_eq!(tip.height, SEED_BLOCKS, "the mined block must roll back");
+    let mempool = state.mempool();
+    let pool = mempool.read();
+    assert!(
+        pool.is_empty(),
+        "a refused parent and its withheld child must stay out"
+    );
+    assert!(!pool.contains_txid(&parent_txid));
+    Ok(())
 }

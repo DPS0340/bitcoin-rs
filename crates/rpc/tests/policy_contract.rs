@@ -11,12 +11,17 @@ extern crate alloc;
 use alloc::sync::Arc;
 use std::error::Error;
 
+
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
-    Mempool, MempoolEntry, MempoolLimits, PolicyError, RbfError, ReplacementCandidate,
+    Mempool, MempoolEntry, MempoolGateway, MempoolLimits, PolicyError, RbfError,
+    ReplacementCandidate,
 };
-use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
-use bitcoin_rs_rpc::context::Context;
+use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
+use bitcoin_rs_node::{Config, Network, state::NodeState};
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
+use bitcoin_rs_rpc::context::{ChainControl, ChainControlError, Context, ContextHandles};
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
@@ -1516,5 +1521,325 @@ fn decode_failures_reject_with_invalid_params() -> Result<(), Box<dyn Error>> {
         .err()
         .ok_or("expected a decode rejection")?;
     assert_eq!(error.code(), RpcError::INVALID_PARAMS);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Reorg reconsideration
+// ---------------------------------------------------------------------------
+
+/// Regtest seed-chain constants mirroring the node-side seed shape.
+const REORG_SEED_BLOCKS: u32 = 100;
+const REORG_SEED_BASE_TIME: u32 = 1_296_688_603;
+const REORG_SEED_BLOCK_INTERVAL: u32 = 600;
+const REORG_REGTEST_BITS: u32 = 0x207f_ffff;
+const REORG_SUBSIDY_SATS: u64 = 50 * 100_000_000;
+const REORG_SPEND_FEE_SATS: u64 = 10_000;
+
+/// Routes `invalidateblock` through the production reorg path.
+struct NodeInvalidator {
+    handles: bitcoin_rs_node::apply::ApplyHandles,
+}
+
+impl ChainControl for NodeInvalidator {
+    fn invalidate_block(&self, hash: Hash256) -> core::result::Result<(), ChainControlError> {
+        invalidate_block(&self.handles, hash).map_err(|error| match error {
+            ReorgError::UnknownBlock(_) => ChainControlError::UnknownBlock,
+            ReorgError::CannotInvalidateGenesis => ChainControlError::Genesis,
+            other => ChainControlError::Failed(other.to_string()),
+        })
+    }
+}
+
+fn open_regtest_state() -> Result<(NodeState, tempfile::TempDir), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut config = Config::default_for_network(Network::Regtest);
+    config.data_dir = dir.path().join("node");
+    config.p2p_listen.clear();
+    let state = NodeState::open(config)?;
+    Ok((state, dir))
+}
+
+/// The one-input null-prevout coinbase outpoint (Core `COINBASE_OUTPOINT`).
+fn null_prevout() -> OutPoint {
+    OutPoint::new(Txid::default(), u32::MAX)
+}
+
+/// Minimal script push of a small integer, mirroring rust-bitcoin
+/// `Builder::push_int`: `OP_0` for zero, `OP_N` for 1..=16, otherwise a
+/// length-prefixed little-endian payload (BIP34 heights).
+fn script_push_int(value: i64) -> Vec<u8> {
+    match value {
+        0 => vec![0x00],
+        // `value` is pinned to 1..=16 by the match arm.
+        1..=16 => vec![0x50 + u8::try_from(value).unwrap_or_default()],
+        _ => {
+            let mut payload = Vec::new();
+            let mut magnitude = value.unsigned_abs();
+            while magnitude > 0 {
+                // Low byte only; the shift below consumes it fully.
+                payload.push(u8::try_from(magnitude & 0xff).unwrap_or_default());
+                magnitude >>= 8;
+            }
+            let mut out = Vec::with_capacity(payload.len() + 1);
+            // A small-int push never exceeds 8 payload bytes.
+            out.push(u8::try_from(payload.len()).unwrap_or_default());
+            out.extend(payload);
+            out
+        }
+    }
+}
+
+/// Core `IsCoinBase` shape: exactly one input spending the null prevout.
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output == null_prevout()
+}
+
+fn reorg_seed_coinbase(height: u32) -> Tx {
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: null_prevout(),
+            // BIP34 height push plus one pad byte: consensus requires a
+            // 2..=100 byte coinbase scriptSig (Core bad-cb-length).
+            script_sig: [script_push_int(i64::from(height)), script_push_int(0)].concat(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REORG_SUBSIDY_SATS,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    }
+}
+
+/// The spend of the height-1 seed coinbase with a caller-chosen fee; it
+/// matures exactly at height 101.
+fn reorg_seed_coinbase_spend_with_fee(fee_sats: u64) -> Tx {
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(reorg_seed_coinbase(1).txid(), 0),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REORG_SUBSIDY_SATS - fee_sats,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    }
+}
+
+fn reorg_grind_pow(block: &mut Block) -> Result<(), Box<dyn Error>> {
+    loop {
+        if pow_is_met(block.header.bits, &block.header.compute_hash().into()) {
+            return Ok(());
+        }
+        let Some(next) = block.header.nonce.checked_add(1) else {
+            return Err("nonce exhausted while grinding block".into());
+        };
+        block.header.nonce = next;
+    }
+}
+
+/// Returns true when the header hash, read as a little-endian integer, meets
+/// the compact bits target (Core `CheckProofOfWork` shape).
+fn pow_is_met(bits: u32, hash: &Hash256) -> bool {
+    let exponent = usize::try_from(bits >> 24).unwrap_or(usize::MAX);
+    let mantissa = bits & 0x00ff_ffff;
+    if mantissa == 0 || mantissa & 0x0080_0000 != 0 || exponent > 32 {
+        return false;
+    }
+    let shift = exponent.saturating_sub(3);
+    // Little-endian target bytes: mantissa placed `shift` bytes from the
+    // least-significant end (mantissa is masked below 2^24, so three bytes).
+    let mantissa_le = mantissa.to_le_bytes();
+    let mut target = [0_u8; 32];
+    for (offset, byte) in mantissa_le.iter().take(3).enumerate() {
+        let position = shift + offset;
+        if position < 32 {
+            target[position] = *byte;
+        }
+    }
+    // Both sides are little-endian 32-byte integers: compare from the most
+    // significant byte downward (Core `CheckProofOfWork`).
+    let hash_le = hash.to_le_bytes();
+    for index in (0..32).rev() {
+        match hash_le[index].cmp(&target[index]) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    true
+}
+
+/// Native BIP141-style txid merkle fold with the odd-leaf duplication rule.
+fn compute_merkle_root(txs: &[Tx]) -> Option<Hash256> {
+    if txs.is_empty() {
+        return None;
+    }
+    let mut level: Vec<[u8; 32]> = txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pos in 0..level.len().div_ceil(2) {
+            let left = level[2 * pos];
+            let right = level[(2 * pos + 1).min(level.len() - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(*double_sha256(&pair).as_byte_array());
+        }
+        level = next;
+    }
+    Some(Hash256::from_le_bytes(&level[0]))
+}
+
+/// Mines and applies the regtest block at `height` over `prev`: the seed
+/// coinbase plus `txs`, through ordinary validation.
+fn reorg_mine_and_apply(
+    state: &NodeState,
+    prev: Hash256,
+    height: u32,
+    txs: Vec<Tx>,
+) -> Result<Block, Box<dyn Error>> {
+    let mut block = Block {
+        header: bitcoin_rs_primitives::Header {
+            version: 0x2000_0000,
+            prev_blockhash: bitcoin_rs_primitives::BlockHash::from(prev),
+            merkle_root: Hash256::from_le_bytes(&[0_u8; 32]),
+            time: REORG_SEED_BASE_TIME
+                .saturating_add(REORG_SEED_BLOCK_INTERVAL.saturating_mul(height)),
+            bits: REORG_REGTEST_BITS,
+            nonce: 0,
+        },
+        txs: std::iter::once(reorg_seed_coinbase(height))
+            .chain(txs)
+            .collect(),
+    };
+    block.header.merkle_root =
+        compute_merkle_root(&block.txs).ok_or("mined block must have a merkle root")?;
+    reorg_grind_pow(&mut block)?;
+    state.apply_block(&block)?;
+    Ok(block)
+}
+
+fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>> {
+    let applied = state.applied_tip();
+    let Some(tip) = applied.load_full() else {
+        return Err("applied tip must exist".into());
+    };
+    Ok((tip.hash, tip.height))
+}
+
+#[test]
+fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_the_coinbase()
+-> Result<(), Box<dyn Error>> {
+    let (state, _dir) = open_regtest_state()?;
+    let genesis = Network::Regtest.genesis_block();
+    state.apply_block(&genesis)?;
+    for height in 1..=REORG_SEED_BLOCKS {
+        let (prev, _) = applied_tip_pair(&state)?;
+        reorg_mine_and_apply(&state, prev, height, Vec::new())?;
+    }
+    let (seed_tip, seed_height) = applied_tip_pair(&state)?;
+    assert_eq!(seed_height, REORG_SEED_BLOCKS);
+
+    // The matured spend enters the mempool, then a block at height 101
+    // confirms it and drains the pool.
+    let spend = reorg_seed_coinbase_spend_with_fee(REORG_SPEND_FEE_SATS);
+    let spend_txid = spend.txid();
+    {
+        let mempool = state.mempool();
+        let mut guard = mempool.write();
+        let vsize = u32::try_from(spend.vsize()).unwrap_or(u32::MAX);
+        guard.insert_entry(MempoolEntry::new(
+            Arc::new(spend.clone()),
+            vsize,
+            REORG_SPEND_FEE_SATS,
+            1,
+            REORG_SEED_BLOCKS,
+        ))?;
+    }
+    let mined_block =
+        reorg_mine_and_apply(&state, seed_tip, REORG_SEED_BLOCKS + 1, vec![spend.clone()])?;
+    assert!(
+        state.mempool().read().is_empty(),
+        "connect must drain the confirmed spend"
+    );
+
+    let handler = Handler::new(Arc::new(
+        Context::from_handles(ContextHandles {
+            chain_tip: state.chain_tip(),
+            applied_tip: state.applied_tip(),
+            mempool: state.mempool(),
+            blocks: state.blocks(),
+            transactions: state.transactions(),
+            utxo: state.utxo(),
+            coin_stats: state.coin_stats(),
+            network: state.network(),
+            network_active: state.network_active(),
+            peers: state.peers(),
+            peer_outbound: state.peer_outbound(),
+            block_tree: state.block_tree(),
+            chain_network: Network::Regtest,
+            p2p_outbound_sender: Some(state.p2p_outbound_sender()),
+            banned: state.banned_subnets(),
+            added_nodes: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            tx_index: None,
+            script_index: None,
+        })
+        .with_chain_control(Arc::new(NodeInvalidator {
+            handles: state.apply_handles(),
+        })),
+    ));
+    let mined_hash = mined_block.block_hash();
+    handler.dispatch("invalidateblock", &json!([mined_hash.to_string()]))?;
+
+    let (tip, tip_height) = applied_tip_pair(&state)?;
+    assert_eq!(
+        tip_height, REORG_SEED_BLOCKS,
+        "the mined block must roll back"
+    );
+    assert_eq!(tip, seed_tip, "the seed tip must become active again");
+
+    let raw = handler.dispatch("getrawmempool", &json!([]))?;
+    let entries = raw.as_array().ok_or("getrawmempool must answer an array")?;
+    let txids: Vec<&str> = entries.iter().filter_map(|value| value.as_str()).collect();
+    assert_eq!(
+        txids,
+        vec![spend_txid.to_string()],
+        "the matured spend returns and the coinbase never does"
+    );
+
+    // Pool-path agreement: the same structural filter over a bare gateway
+    // admits the spend once and keeps the coinbase out.
+    let gateway = MempoolGateway::new(
+        Arc::new(parking_lot::RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))),
+        None,
+    );
+    let committed = gateway.reconsider_disconnected(
+        mined_block
+            .txs
+            .iter()
+            .filter(|tx| !is_coinbase(tx))
+            .map(|tx| {
+                let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+                MempoolEntry::new(
+                    Arc::new(tx.clone()),
+                    vsize,
+                    REORG_SPEND_FEE_SATS,
+                    1,
+                    REORG_SEED_BLOCKS,
+                )
+            }),
+    );
+    assert_eq!(committed.len(), 1, "one admitted candidate: the spend");
+    assert!(gateway.read().contains_txid(&spend_txid));
     Ok(())
 }
