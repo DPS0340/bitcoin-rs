@@ -13,12 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bitcoin::Block;
-use bitcoin::consensus::deserialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::hashes::sha256d;
 use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Network, deserialize};
 use bitcoin_rs_rpc::context::BlockBodySource;
 use bitcoin_rs_storage::{CORE_FRAME_HEADER_LEN, CoreFrameError, CoreFrameWriter};
 use serde::{Deserialize, Serialize};
@@ -265,7 +262,7 @@ pub enum CorpusError {
         height: u32,
         /// Consensus decoding failure.
         #[source]
-        source: bitcoin::consensus::encode::Error,
+        source: bitcoin_rs_primitives::DecodeError,
     },
     /// The stored body's block hash differs from the active-chain hash.
     #[error("block body hash mismatch at height {height}: expected {expected}, got {actual}")]
@@ -532,7 +529,7 @@ impl CorpusBlockSource for BlockTreeSource<'_> {
         let hash = node.hash;
         let payload = self
             .body
-            .block_body(height, hash)
+            .block_body(height, BlockHash::from(hash))
             .ok_or(CorpusError::MissingBody { height, hash })?;
         Ok(CorpusBlock { hash, payload })
     }
@@ -555,7 +552,7 @@ impl CorpusBlockSource for RestCorpusSource {
         }
         let hash = Hash256::from_str_be(&reported)
             .map_err(|_| CoreRestError::InvalidHashHex(reported.clone()))?;
-        let computed = Hash256::from_le_bytes(sha256d::Hash::hash(&payload[..80]).as_byte_array());
+        let computed = double_sha256(&payload[..80]);
         if computed != hash {
             return Err(CorpusError::RestHashMismatch {
                 height,
@@ -704,7 +701,7 @@ fn write_corpus_archive(
             let CorpusBlock { hash, payload } = source.next_block(height)?;
             let block: Block = deserialize(&payload)
                 .map_err(|source| CorpusError::InvalidBody { height, source })?;
-            let actual = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+            let actual = Hash256::from(block.block_hash());
             if actual != hash {
                 return Err(CorpusError::BodyHashMismatch {
                     height,
@@ -1336,13 +1333,10 @@ mod tests {
     use std::thread;
     use std::{fs, path::Path};
 
-    use bitcoin::Block;
-    use bitcoin::block::{Header as BlockHeader, Version};
-    use bitcoin::consensus::serialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
     use bitcoin_rs_chain::{BlockTree, NodeStatus};
-    use bitcoin_rs_primitives::{Hash256, Network};
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, Network, consensus_bytes, deserialize,
+    };
     use bitcoin_rs_rpc::context::BlockBodySource;
     use bitcoin_rs_storage::CoreFrameReader;
     use sha2::{Digest as _, Sha256};
@@ -1577,28 +1571,28 @@ mod tests {
     }
 
     fn block_hash256(block: &Block) -> Hash256 {
-        Hash256::from_le_bytes(block.block_hash().as_byte_array())
+        block.block_hash().0
     }
 
     fn make_test_chain(stop: u32) -> (BlockTree, Vec<Block>) {
         let mut tree = BlockTree::new();
         let mut blocks = Vec::new();
-        let mut prev_hash = BlockHash::all_zeros();
+        let mut prev_hash = BlockHash::default();
         for height in 0..=stop {
-            let header = BlockHeader {
-                version: Version::ONE,
+            let header = Header {
+                version: 1,
                 prev_blockhash: prev_hash,
-                merkle_root: TxMerkleNode::all_zeros(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000 + height * 600,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
-            let next_hash = header.block_hash();
+            let next_hash = header.compute_hash();
             tree.insert_header(header, NodeStatus::HeaderValid)
                 .expect("test chain inserts must succeed");
             let block = Block {
                 header,
-                txdata: Vec::new(),
+                txs: Vec::new(),
             };
             blocks.push(block);
             prev_hash = next_hash;
@@ -1607,7 +1601,7 @@ mod tests {
     }
 
     struct MockBodySource {
-        bodies: HashMap<(u32, Hash256), Vec<u8>>,
+        bodies: HashMap<(u32, BlockHash), Vec<u8>>,
     }
 
     impl MockBodySource {
@@ -1620,16 +1614,16 @@ mod tests {
         fn from_blocks(blocks: &[Block]) -> Self {
             let mut bodies = HashMap::new();
             for (height, block) in blocks.iter().enumerate() {
-                let hash = block_hash256(block);
+                let hash = block.block_hash();
                 let height = u32::try_from(height).expect("test chain height fits u32");
-                bodies.insert((height, hash), serialize(block));
+                bodies.insert((height, hash), consensus_bytes(block));
             }
             Self { bodies }
         }
     }
 
     impl BlockBodySource for MockBodySource {
-        fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             self.bodies.get(&(height, hash)).cloned()
         }
     }
@@ -1678,7 +1672,7 @@ mod tests {
         ]);
         assert_eq!(
             payload_len,
-            u32::try_from(serialize(&blocks[0]).len()).expect("payload length fits u32")
+            u32::try_from(consensus_bytes(&blocks[0]).len()).expect("payload length fits u32")
         );
 
         let mut reader = CoreFrameReader::new(
@@ -1690,7 +1684,7 @@ mod tests {
             let record = reader
                 .next_record()?
                 .ok_or_else(|| std::io::Error::other("expected a frame"))?;
-            let expected = serialize(block);
+            let expected = consensus_bytes(block);
             assert_eq!(record.payload, expected, "payload mismatch at height {i}");
             let entry = &manifest.entries[i];
             assert_eq!(
@@ -1745,7 +1739,7 @@ mod tests {
     #[test]
     fn rejects_missing_body_before_manifest() -> Result<(), CorpusError> {
         let (tree, blocks) = make_test_chain(1);
-        let hash0 = block_hash256(&blocks[0]);
+        let hash0 = blocks[0].block_hash();
         let mut source = MockBodySource::from_blocks(&blocks);
         source.bodies.remove(&(0, hash0));
 
@@ -1771,11 +1765,13 @@ mod tests {
     #[test]
     fn rejects_body_hash_mismatch_before_manifest() -> Result<(), CorpusError> {
         let (tree, blocks) = make_test_chain(1);
-        let hash1 = block_hash256(&blocks[1]);
+        let hash1 = blocks[1].block_hash();
         let mut source = MockBodySource::from_blocks(&blocks);
         // Replace the body at height 1 with the serialized block from height 0;
         // it decodes cleanly but its hash does not match the active chain.
-        source.bodies.insert((1, hash1), serialize(&blocks[0]));
+        source
+            .bodies
+            .insert((1, hash1), consensus_bytes(&blocks[0]));
 
         let dir = tempfile::tempdir()?;
         let archive_path = dir.path().join("archive.dat");
@@ -1888,25 +1884,25 @@ mod tests {
     }
 
     fn make_rest_blocks(stop: u32) -> (Vec<Block>, Vec<(String, Vec<u8>)>) {
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
         let mut blocks = vec![genesis.clone()];
-        let mut records = vec![(genesis.block_hash().to_string(), serialize(&genesis))];
+        let mut records = vec![(genesis.block_hash().to_string(), consensus_bytes(&genesis))];
         let mut prev_hash = genesis.block_hash();
         for height in 1..=stop {
-            let header = BlockHeader {
-                version: Version::ONE,
+            let header = Header {
+                version: 1,
                 prev_blockhash: prev_hash,
-                merkle_root: TxMerkleNode::all_zeros(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000 + height * 600,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
-            let next_hash = header.block_hash();
+            let next_hash = header.compute_hash();
             let block = Block {
                 header,
-                txdata: Vec::new(),
+                txs: Vec::new(),
             };
-            records.push((next_hash.to_string(), serialize(&block)));
+            records.push((next_hash.to_string(), consensus_bytes(&block)));
             blocks.push(block);
             prev_hash = next_hash;
         }
@@ -1997,11 +1993,11 @@ mod tests {
     fn rest_corpus_rejects_continuity_break() -> Result<(), CorpusError> {
         let (_, mut records) = make_rest_blocks(2);
         // Make height 2 claim a bogus parent while keeping a valid header hash.
-        let mut tampered = bitcoin::consensus::deserialize::<Block>(&records[2].1).unwrap();
-        tampered.header.prev_blockhash = BlockHash::from_byte_array([0xff; 32]);
+        let mut tampered = deserialize::<Block>(&records[2].1).unwrap();
+        tampered.header.prev_blockhash = BlockHash(Hash256::from_le_bytes(&[0xff; 32]));
         tampered.header.nonce += 1; // re-mine to a new hash
         let new_hash = tampered.block_hash().to_string();
-        records[2] = (new_hash, serialize(&tampered));
+        records[2] = (new_hash, consensus_bytes(&tampered));
 
         let mut source = make_rest_source(records, Network::Regtest);
         let dir = tempfile::tempdir()?;

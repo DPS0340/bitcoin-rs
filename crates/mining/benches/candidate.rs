@@ -10,14 +10,9 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    transaction,
-};
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_mining::{CandidateContext, assemble_candidate};
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn context() -> CandidateContext {
@@ -38,39 +33,39 @@ fn context() -> CandidateContext {
     }
 }
 
-fn independent(label: u64) -> Transaction {
+fn independent(label: u64) -> Tx {
     let mut previous = [0_u8; 32];
     previous[..8].copy_from_slice(&label.to_le_bytes());
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::new(Txid::from_byte_array(previous), 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from(Hash256::from_le_bytes(&previous)), 0),
+            script_sig: vec![],
+            sequence: u32::MAX,
+            witness: vec![],
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(10_000),
-            script_pubkey: ScriptBuf::from_bytes(label.to_le_bytes().to_vec()),
+        outputs: vec![TxOut {
+            value: 10_000,
+            script_pubkey: label.to_le_bytes().to_vec(),
         }],
+        lock_time: 0,
     }
 }
 
-fn child(label: u64, parent: Txid) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn child(label: u64, parent: Txid) -> Tx {
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
             previous_output: OutPoint::new(parent, 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: vec![],
+            sequence: u32::MAX,
+            witness: vec![],
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(9_000),
-            script_pubkey: ScriptBuf::from_bytes(label.to_le_bytes().to_vec()),
+        outputs: vec![TxOut {
+            value: 9_000,
+            script_pubkey: label.to_le_bytes().to_vec(),
         }],
+        lock_time: 0,
     }
 }
 
@@ -100,13 +95,13 @@ fn fill_chains(chains: u64, depth: u64) -> Mempool {
     });
     for chain in 0..chains {
         let mut parent = independent(chain.saturating_mul(1_000));
-        let mut parent_txid = parent.compute_txid();
+        let mut parent_txid = parent.txid();
         mempool
             .insert_entry(MempoolEntry::new(Arc::new(parent), 180, 2_000, chain, 100))
             .expect("chain root inserts");
         for depth_index in 1..depth {
             parent = child(chain.saturating_mul(1_000) + depth_index, parent_txid);
-            parent_txid = parent.compute_txid();
+            parent_txid = parent.txid();
             mempool
                 .insert_entry(MempoolEntry::new(
                     Arc::new(parent),
@@ -132,7 +127,7 @@ fn bench_candidate(c: &mut Criterion) {
     .mining_snapshot();
     let independent_snapshot = fill_independent(2_000).mining_snapshot();
     let chain_snapshot = fill_chains(64, 8).mining_snapshot();
-    let payout = ScriptBuf::from_bytes(vec![0x51]);
+    let payout = vec![0x51];
     let context = context();
     let mut congested = context.clone();
     congested.max_weight = 50_000;

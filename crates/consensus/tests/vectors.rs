@@ -2,11 +2,7 @@
 
 use std::path::Path;
 
-use bitcoin::consensus;
-use bitcoin::hashes::Hash as _;
-use bitcoin::sighash::SighashCache;
-use bitcoin::{Script, Transaction};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{ConsensusDecode, Hash256, SighashCache, Tx, deserialize};
 use serde_json::Value;
 
 #[test]
@@ -82,26 +78,22 @@ fn sighash_vectors_match_bitcoin_cache() {
         let input_index = usize_at(row, 2);
         let hash_type = raw_u32_at(row, 3);
         let expected = hash_at(row, 4);
-        let tx: Transaction = deserialize_hex(tx_hex);
+        let tx: Tx = deserialize_hex(tx_hex);
         let script = decode_hex(script_hex);
         if script.contains(&0xab) {
             skipped_codeseparator = skipped_codeseparator.saturating_add(1);
             continue;
         }
         let cache = SighashCache::new(&tx);
-        let actual = match cache.legacy_signature_hash(
-            input_index,
-            Script::from_bytes(&script),
-            hash_type,
-        ) {
-            Ok(hash) => Hash256::from_le_bytes(hash.as_byte_array()),
+        let actual = match cache.legacy_signature_hash(input_index, &script, hash_type) {
+            Ok(hash) => hash,
             Err(error) => panic!("sighash vector should compute: {error}"),
         };
         assert_eq!(actual, expected);
         matched = matched.saturating_add(1);
     }
     println!(
-        "sighash.json: matched {matched}/{total} legacy sighash vectors; skipped {skipped_codeseparator} OP_CODESEPARATOR vectors unsupported by bitcoin 0.32 cache"
+        "sighash.json: matched {matched}/{total} legacy sighash vectors; skipped {skipped_codeseparator} OP_CODESEPARATOR vectors unsupported by native SighashCache"
     );
     assert!(total > 0);
     assert!(matched > 0);
@@ -126,7 +118,7 @@ fn parse_tx_vectors(name: &str, must_deserialize_all: bool) -> (usize, usize) {
             continue;
         };
         let bytes = decode_hex(tx_hex);
-        if consensus::deserialize::<Transaction>(&bytes).is_ok() {
+        if deserialize::<Tx>(&bytes).is_ok() {
             parsed = parsed.saturating_add(1);
         } else if must_deserialize_all {
             panic!("valid tx vector failed to deserialize");
@@ -147,9 +139,9 @@ fn read_json(name: &str) -> Value {
     }
 }
 
-fn deserialize_hex<T: consensus::Decodable>(hex: &str) -> T {
+fn deserialize_hex<T: ConsensusDecode>(hex: &str) -> T {
     let bytes = decode_hex(hex);
-    match consensus::deserialize(&bytes) {
+    match deserialize(&bytes) {
         Ok(value) => value,
         Err(error) => panic!("hex consensus payload should deserialize: {error}"),
     }

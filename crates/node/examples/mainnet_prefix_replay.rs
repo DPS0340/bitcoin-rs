@@ -17,10 +17,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use bitcoin::consensus::Decodable as _;
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::{DisplayHex as _, FromHex as _};
-use bitcoin::{Block, BlockHash, Weight};
 #[cfg(feature = "checksig-census")]
 use bitcoin_rs_consensus::census_checkpoint;
 use bitcoin_rs_node::Network;
@@ -28,14 +24,15 @@ use bitcoin_rs_node::config::Config;
 use bitcoin_rs_node::corpus::CorpusManifest;
 use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
 use bitcoin_rs_node::state::NodeState;
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, BlockHash, Header, deserialize};
 use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 /// Consensus-maximum serialized block size in bytes, derived from the
 /// maximum block weight (BIP 141). No valid serialized block can be larger.
-#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-const MAX_SERIALIZED_BLOCK_SIZE: u32 = Weight::MAX_BLOCK.to_wu() as u32;
+const MAX_SERIALIZED_BLOCK_SIZE: u32 = 4_000_000;
 const TXINDEX_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TXINDEX_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -137,21 +134,9 @@ fn replay_prefix(
             stop_hash = Some(hash.clone());
         }
         let decode_started = Instant::now();
-        let mut cursor = std::io::Cursor::new(bytes.as_slice());
-        let block = Block::consensus_decode(&mut cursor)
+        // `deserialize` rejects trailing bytes, preserving the framing check.
+        let block = deserialize::<Block>(&bytes)
             .with_context(|| format!("decode block bytes at height {height}"))?;
-        let consumed = cursor.position();
-        let payload_length =
-            u64::try_from(bytes.len()).context("block payload length does not fit u64")?;
-        if consumed != payload_length {
-            let consumed =
-                usize::try_from(consumed).context("decoded block length does not fit usize")?;
-            let trailing = bytes
-                .len()
-                .checked_sub(consumed)
-                .context("decoder consumed beyond the block payload")?;
-            bail!("block payload at height {height} has {trailing} trailing bytes");
-        }
         decode_time += decode_started.elapsed();
 
         let actual_hash = block.block_hash();
@@ -159,7 +144,7 @@ fn replay_prefix(
             bail!("block hash mismatch at height {height}: source {hash}, decoded {actual_hash}");
         }
         if height == 0 {
-            if block.header.prev_blockhash != BlockHash::from_byte_array([0; 32]) {
+            if block.header.prev_blockhash != BlockHash::default() {
                 bail!(
                     "genesis block at height 0 has non-zero prev_blockhash {}",
                     block.header.prev_blockhash
@@ -182,7 +167,7 @@ fn replay_prefix(
         }
         prev_hash = Some(actual_hash);
 
-        tx_count = tx_count.saturating_add(block.txdata.len());
+        tx_count = tx_count.saturating_add(block.txs.len());
         block_bytes = block_bytes.saturating_add(bytes.len());
         // Flushed BEFORE appending when this block would cross the byte cap,
         // which is what `window_len` does: it leaves the crossing block for the
@@ -231,7 +216,7 @@ fn apply_window(
     if blocks.is_empty() {
         return Ok(());
     }
-    let headers: Vec<bitcoin::block::Header> = blocks.iter().map(|block| block.header).collect();
+    let headers: Vec<Header> = blocks.iter().map(|block| block.header).collect();
     {
         let mut tree = handles.block_tree.write();
         bitcoin_rs_chain::header_sync::accept_headers(
@@ -489,19 +474,19 @@ fn file_replay_artifact(
         "measurement_target": "mainnet-prefix-replay",
         "git_head": git_head().ok(),
         "network": "mainnet",
-        "network_magic": inputs.manifest.network_magic.as_slice().to_lower_hex_string(),
+        "network_magic": to_lower_hex(inputs.manifest.network_magic.as_slice()),
         "genesis_hash": inputs.manifest.genesis_hash.to_string_be(),
         "corpus_manifest": {
             "schema": CorpusManifest::SCHEMA,
             "version": CorpusManifest::VERSION,
             "path": &inputs.manifest_path,
             "bytes": inputs.manifest_bytes_len,
-            "sha256": inputs.manifest_sha.as_slice().to_lower_hex_string(),
+            "sha256": to_lower_hex(inputs.manifest_sha.as_slice()),
         },
         "archive": {
             "path": &inputs.blocks_path,
             "bytes": inputs.manifest.archive.size,
-            "sha256": inputs.manifest.archive.sha256.as_slice().to_lower_hex_string(),
+            "sha256": to_lower_hex(inputs.manifest.archive.sha256.as_slice()),
         },
         "start_height": args.start_height,
         "start_hash": &totals.start_hash,
@@ -750,6 +735,40 @@ fn parse_height(value: &str) -> Result<u32> {
         .with_context(|| format!("parse height {value:?}"))
 }
 
+/// Decodes an even-length lowercase or uppercase hex string into bytes.
+fn hex_decode(input: &str) -> Result<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 0xa),
+            b'A'..=b'F' => Some(byte - b'A' + 0xa),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        bail!("hex payload must have even length, got {}", bytes.len());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = nibble(pair[0]).context("block hex payload is not valid hexadecimal")?;
+        let lo = nibble(pair[1]).context("block hex payload is not valid hexadecimal")?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+/// Lowercase hexadecimal encoding of `bytes`, in byte order.
+fn to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 /// Where replay blocks come from: per-call `bitcoin-cli` spawns or a prefetch
 /// thread reading ahead over a persistent REST socket.
 /// Picks the block source, preferring a local Core-framed archive over REST.
@@ -815,7 +834,7 @@ impl BlockSource<'_> {
                 let block_payload_hex =
                     bitcoin_cli(args, ["getblock".to_owned(), hash.clone(), "0".to_owned()])
                         .with_context(|| format!("get block {hash} at height {height}"))?;
-                let bytes = Vec::<u8>::from_hex(block_payload_hex.trim())
+                let bytes = hex_decode(block_payload_hex.trim())
                     .with_context(|| format!("decode block hex at height {height}"))?;
                 Ok((hash, bytes))
             }
@@ -869,10 +888,8 @@ impl BlockSource<'_> {
                 let header = bytes
                     .get(..80)
                     .with_context(|| format!("Core frame payload at height {height} is {} bytes, shorter than a block header", bytes.len()))?;
-                let hash = bitcoin::BlockHash::from_byte_array(
-                    bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array(),
-                );
-                let expected = bitcoin::BlockHash::from_byte_array(*entry.hash.as_byte_array());
+                let hash = BlockHash::from(double_sha256(header));
+                let expected = BlockHash::from(entry.hash);
                 if hash != expected {
                     bail!(
                         "frame header hash mismatch at height {height}: manifest {expected}, archive {hash}"
@@ -909,8 +926,8 @@ impl BlockSource<'_> {
                         if archive_digest != manifest.archive.sha256 {
                             bail!(
                                 "archive SHA-256 mismatch at EOF: manifest {}, read {}",
-                                manifest.archive.sha256.as_slice().to_lower_hex_string(),
-                                archive_digest.as_slice().to_lower_hex_string()
+                                to_lower_hex(manifest.archive.sha256.as_slice()),
+                                to_lower_hex(archive_digest.as_slice())
                             );
                         }
                         Ok(())
@@ -1050,22 +1067,15 @@ fn decode_and_validate_block(
     prev_hash: &mut Option<BlockHash>,
     network: Network,
 ) -> Result<Block> {
-    let mut cursor = std::io::Cursor::new(bytes);
-    let block = Block::consensus_decode(&mut cursor)
+    // `deserialize` rejects trailing bytes, preserving the framing check.
+    let block = deserialize::<Block>(bytes)
         .with_context(|| format!("decode block bytes at height {height}"))?;
-    let consumed = cursor.position();
-    if consumed != u64::try_from(bytes.len()).expect("block length fits u64") {
-        bail!(
-            "block payload at height {height} has {} trailing bytes",
-            bytes.len() - usize::try_from(consumed).expect("decoded block length fits usize")
-        );
-    }
     let actual_hash = block.block_hash();
     if actual_hash.to_string() != hash_str {
         bail!("block hash mismatch at height {height}: source {hash_str}, decoded {actual_hash}");
     }
     if height == 0 {
-        if block.header.prev_blockhash != BlockHash::from_byte_array([0; 32]) {
+        if block.header.prev_blockhash != BlockHash::default() {
             bail!(
                 "genesis block at height 0 has non-zero prev_blockhash {}",
                 block.header.prev_blockhash
@@ -1121,7 +1131,7 @@ fn write_checkpoint_row(
 ) -> Result<()> {
     out.write_all(&height.to_le_bytes())
         .context("write checkpoint height")?;
-    out.write_all(hash.as_byte_array())
+    out.write_all(hash.as_bytes())
         .context("write checkpoint block hash")?;
     out.write_all(&checkpoint.context_rows.to_le_bytes())
         .context("write checkpoint context_rows")?;
@@ -1438,16 +1448,12 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::consensus::Encodable as _;
     use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, consensus_bytes};
     use std::io::Cursor;
 
     fn regtest_genesis_bytes() -> Vec<u8> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let mut bytes = Vec::new();
-        block.consensus_encode(&mut bytes).unwrap();
-        bytes
+        consensus_bytes(&Network::Regtest.genesis_block())
     }
 
     fn write_archive(magic: [u8; 4], payloads: &[&[u8]]) -> Vec<u8> {
@@ -1470,9 +1476,7 @@ mod tests {
             let header = payload
                 .get(..80)
                 .expect("payload must include a block header");
-            let hash = Hash256::from_le_bytes(
-                &bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array(),
-            );
+            let hash = double_sha256(header);
             entries.push(CorpusEntry {
                 height: height as u32,
                 hash,
@@ -1526,9 +1530,7 @@ mod tests {
         let args = args_for_file(archive_temp.path(), manifest_temp.path());
         let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
         let (hash, bytes) = source.fetch(0).unwrap();
-        let expected = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
-            .block_hash()
-            .to_string();
+        let expected = Network::Regtest.genesis_block().block_hash().to_string();
         assert_eq!(hash, expected);
         assert_eq!(bytes, payload);
         let err = source.fetch(1).unwrap_err();
@@ -1806,7 +1808,7 @@ mod tests {
             journal_rows: 3,
             journal_end: 16 + 3 * 56,
         };
-        let hash = BlockHash::from_byte_array([0x42; 32]);
+        let hash = BlockHash::from(Hash256::from_le_bytes(&[0x42; 32]));
         write_checkpoint_row(&mut out, 7, hash, &checkpoint).unwrap();
 
         let row_start = 16;

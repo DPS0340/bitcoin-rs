@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, Hash256, consensus_bytes};
 use hashbrown::{HashMap, hash_map::Entry};
 
 use super::window::SyncBudget;
@@ -19,7 +19,7 @@ pub(super) struct BlockStager {
 
 #[derive(Debug)]
 struct ReceivedBlock {
-    block: bitcoin::Block,
+    block: Block,
     // Preserved P2P wire payload, reused by `apply_block_with_serialized` to
     // skip reserialization. This is a second buffer (~block size) held next to
     // the decoded `block` while it waits for its predecessor, so a fully
@@ -34,7 +34,7 @@ struct ReceivedBlock {
 #[derive(Clone, Debug)]
 pub(super) struct DrainedBlock {
     pub(super) hash: Hash256,
-    pub(super) block: bitcoin::Block,
+    pub(super) block: Block,
     pub(super) serialized: bytes::Bytes,
     received_at: Instant,
     bytes: usize,
@@ -93,7 +93,7 @@ impl BlockStager {
         &mut self,
         hash: Hash256,
         next_expected_hash: Option<Hash256>,
-        block: bitcoin::Block,
+        block: Block,
         serialized: bytes::Bytes,
         now: Instant,
     ) -> StagedBlock {
@@ -154,7 +154,7 @@ impl BlockStager {
 
     /// Clones one staged decoded body and its original wire bytes without
     /// removing it from the bounded staging set.
-    pub(super) fn staged_body(&self, hash: Hash256) -> Option<(bitcoin::Block, bytes::Bytes)> {
+    pub(super) fn staged_body(&self, hash: Hash256) -> Option<(Block, bytes::Bytes)> {
         self.received
             .get(&hash)
             .map(|entry| (entry.block.clone(), entry.serialized.clone()))
@@ -350,31 +350,31 @@ fn received_deadline(received_at: Instant, timeout: Duration) -> Instant {
     received_at + timeout
 }
 
-fn block_size(block: &bitcoin::Block) -> usize {
-    block.total_size()
+fn block_size(block: &Block) -> usize {
+    consensus_bytes(block).len()
 }
 
 #[cfg(test)]
 mod tests {
+    use bitcoin_rs_primitives::{
+        Block, Hash256, Network, OutPoint, Tx, TxIn, TxOut, consensus_bytes,
+    };
     use std::time::{Duration, Instant};
-
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin_rs_primitives::Hash256;
 
     use super::{BlockStager, block_size};
     use crate::sync::default_sync_budget;
 
     #[test]
     fn block_size_matches_consensus_serialized_len() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
 
-        assert_eq!(block_size(&block), serialize(&block).len());
+        assert_eq!(block_size(&block), consensus_bytes(&block).len());
     }
 
     #[test]
     fn drain_expected_prefix_stops_at_first_missing_hash() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut stager = BlockStager::new(default_sync_budget());
         let now = std::time::Instant::now();
@@ -399,8 +399,8 @@ mod tests {
 
     #[test]
     fn staged_body_lookup_preserves_the_entry() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let hash = Hash256::from_le_bytes(&[0x05; 32]);
         let mut stager = BlockStager::new(default_sync_budget());
         stager.insert(
@@ -423,8 +423,8 @@ mod tests {
 
     #[test]
     fn restore_many_restores_tail_byte_accounting() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut stager = BlockStager::new(default_sync_budget());
         let now = std::time::Instant::now();
@@ -452,8 +452,8 @@ mod tests {
 
     #[test]
     fn ready_received_len_requires_next_expected_hash_when_provided() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut stager = BlockStager::new(default_sync_budget());
         let now = std::time::Instant::now();
         let staged = Hash256::from_le_bytes(&[0x31; 32]);
@@ -470,8 +470,8 @@ mod tests {
 
     #[test]
     fn prune_expired_recomputes_deadline_after_dropping_oldest() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut budget = default_sync_budget();
         budget.received_timeout = Duration::from_secs(10);
         let mut stager = BlockStager::new(budget);
@@ -515,8 +515,8 @@ mod tests {
 
     #[test]
     fn duplicate_insert_keeps_original_staged_deadline() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut budget = default_sync_budget();
         budget.received_timeout = Duration::from_secs(10);
@@ -540,8 +540,8 @@ mod tests {
 
     #[test]
     fn insert_eviction_drops_oldest_unprotected_until_budget_fits() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut stager = BlockStager::new(default_sync_budget());
         let now = Instant::now();
@@ -603,8 +603,8 @@ mod tests {
 
     #[test]
     fn insert_eviction_uses_fifo_order_for_same_instant_blocks() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut stager = BlockStager::new(default_sync_budget());
         let now = Instant::now();
         let first = Hash256::from_le_bytes(&[0x61; 32]);
@@ -638,8 +638,8 @@ mod tests {
 
     #[test]
     fn insert_eviction_refreshes_received_deadline() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut budget = default_sync_budget();
         budget.max_received_blocks = 1;
         budget.received_timeout = Duration::from_secs(10);
@@ -663,8 +663,8 @@ mod tests {
 
     #[test]
     fn insert_eviction_skips_stale_order_entries_after_drain() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut stager = BlockStager::new(default_sync_budget());
         let now = Instant::now();
         let first = Hash256::from_le_bytes(&[0x71; 32]);
@@ -696,12 +696,7 @@ mod tests {
         assert!(stager.contains(&third));
         assert!(stager.contains(&incoming));
     }
-
-    /// Builds a block whose `total_size` is exactly `target` bytes by padding
-    /// a single transaction's `script_sig`. Two-pass: the probe build keeps the
-    /// script-length varint in the same width regime as the final build, so one
-    /// adjustment is exact (asserted).
-    fn block_with_total_size(target: usize) -> bitcoin::Block {
+    fn block_with_total_size(target: usize) -> Block {
         let probe = padded_block(target);
         let probe_size = block_size(&probe);
         let padding = target.saturating_mul(2).saturating_sub(probe_size);
@@ -710,22 +705,22 @@ mod tests {
         block
     }
 
-    fn padded_block(script_len: usize) -> bitcoin::Block {
-        bitcoin::Block {
-            header: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header,
-            txdata: vec![bitcoin::Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: vec![bitcoin::TxIn {
-                    previous_output: bitcoin::OutPoint::null(),
-                    script_sig: bitcoin::ScriptBuf::from(vec![0_u8; script_len]),
-                    sequence: bitcoin::Sequence::MAX,
-                    witness: bitcoin::Witness::new(),
+    fn padded_block(script_len: usize) -> Block {
+        Block {
+            header: Network::Regtest.genesis_block().header,
+            txs: vec![Tx {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::default(),
+                    script_sig: vec![0_u8; script_len],
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
                 }],
-                output: vec![bitcoin::TxOut {
-                    value: bitcoin::Amount::ZERO,
-                    script_pubkey: bitcoin::ScriptBuf::new(),
+                outputs: vec![TxOut {
+                    value: 0,
+                    script_pubkey: Vec::new(),
                 }],
+                lock_time: 0,
             }],
         }
     }
@@ -742,7 +737,7 @@ mod tests {
                 .saturating_mul(crate::sync::PENDING_BLOCK_BYTE_ESTIMATE)
         );
         let block = block_with_total_size(crate::sync::PENDING_BLOCK_BYTE_ESTIMATE);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut stager = BlockStager::new(budget);
         let now = Instant::now();
         let window_slots = budget.max_received_blocks;
@@ -769,8 +764,8 @@ mod tests {
 
     #[test]
     fn byte_budget_exhaustion_rejects_incoming_without_evicting_staged() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut budget = default_sync_budget();
         budget.max_received_bytes = block_bytes.saturating_mul(2);
@@ -821,8 +816,8 @@ mod tests {
 
     #[test]
     fn byte_budget_exhaustion_still_accepts_next_expected_block() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let block_bytes = block_size(&block);
         let mut budget = default_sync_budget();
         budget.max_received_bytes = block_bytes.saturating_mul(2);
@@ -868,8 +863,8 @@ mod tests {
 
     #[test]
     fn received_order_compaction_bounds_stale_applied_entries() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = Network::Regtest.genesis_block();
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
         let mut budget = default_sync_budget();
         budget.max_received_blocks = 1;
         let mut stager = BlockStager::new(budget);

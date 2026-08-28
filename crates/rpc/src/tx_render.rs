@@ -3,10 +3,17 @@
 //! Callers supply optional confirmed-chain context. This module never queries
 //! node state and does not choose JSON-RPC versus REST transport policy.
 
-use bitcoin::consensus::encode::serialize;
-use bitcoin::hex::DisplayHex as _;
-use bitcoin::{Amount, BlockHash, Network, Script, Transaction, TxIn, TxOut};
+// WHY rust-bitcoin: address strings, `asm`, and `desc` in RPC response bodies
+// are wire-format strings that must match Bitcoin Core byte-for-byte. They ride
+// the sanctioned rust-bitcoin compat seam (`Address<T>`/`Script` disassembly);
+// all transaction/amount/hash plumbing here is native.
+use bitcoin::Address;
+use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
 use sonic_rs::{Value, json};
+
+use crate::script_util::{
+    is_multisig, is_op_return, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh,
+};
 
 /// Optional confirmed-chain fields projected beside a transaction object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,10 +38,10 @@ pub struct TxPrevout {
     pub generated: bool,
     /// Confirming height of the prevout.
     pub height: u32,
-    /// Prevout value.
-    pub value: Amount,
+    /// Prevout value in satoshis.
+    pub value: u64,
     /// Prevout scriptPubKey.
-    pub script_pubkey: bitcoin::ScriptBuf,
+    pub script_pubkey: Vec<u8>,
 }
 
 /// Exact eight-decimal BTC spelling used by Core JSON amount fields.
@@ -42,8 +49,7 @@ pub struct TxPrevout {
 /// Parsed with sonic's raw-number mode so the decimal spelling survives
 /// serialization instead of being reduced through binary floating point.
 #[must_use]
-pub fn btc_amount_json(amount: Amount) -> Value {
-    let satoshis = amount.to_sat();
+pub fn btc_amount_json(satoshis: u64) -> Value {
     let whole = satoshis / 100_000_000;
     let fractional = satoshis % 100_000_000;
     let text = format!("{whole}.{fractional:08}");
@@ -57,7 +63,7 @@ pub fn btc_amount_json(amount: Amount) -> Value {
 /// Render one transaction in Bitcoin Core's verbose object shape.
 #[must_use]
 pub fn transaction_json(
-    tx: &Transaction,
+    tx: &Tx,
     network: Network,
     chain: Option<TransactionChainContext>,
 ) -> Value {
@@ -67,19 +73,19 @@ pub fn transaction_json(
 /// Render one transaction, optionally including verbosity-2 `fee` and `prevout`.
 #[must_use]
 pub fn transaction_json_with_prevouts(
-    tx: &Transaction,
+    tx: &Tx,
     network: Network,
     chain: Option<TransactionChainContext>,
     prevouts: Option<&[Option<TxPrevout>]>,
 ) -> Value {
-    let txid = tx.compute_txid().to_string();
-    let hash = tx.compute_wtxid().to_string();
+    let txid = tx.txid().to_string();
+    let hash = tx.wtxid().to_string();
     let size = tx.total_size();
-    let weight = tx.weight().to_wu();
+    let weight = tx.weight();
     let vsize = tx.vsize();
-    let coinbase = tx.is_coinbase();
+    let coinbase = is_coinbase(tx);
     let vin: Vec<Value> = tx
-        .input
+        .inputs
         .iter()
         .enumerate()
         .map(|(index, input)| {
@@ -89,7 +95,7 @@ pub fn transaction_json_with_prevouts(
         })
         .collect();
     let vout: Vec<Value> = tx
-        .output
+        .outputs
         .iter()
         .enumerate()
         .map(|(n, output)| output_json(output, n, network))
@@ -98,14 +104,14 @@ pub fn transaction_json_with_prevouts(
     let mut value = json!({
         "txid": txid,
         "hash": hash,
-        "version": i64::from(tx.version.0),
+        "version": i64::from(tx.version),
         "size": size,
         "vsize": vsize,
         "weight": weight,
-        "locktime": tx.lock_time.to_consensus_u32(),
+        "locktime": tx.lock_time,
         "vin": vin,
         "vout": vout,
-        "hex": serialize(tx).to_lower_hex_string()
+        "hex": hex_encode(&consensus_bytes(tx))
     });
     if let Some(chain) = chain {
         let _ = value.insert("blockhash", json!(chain.block_hash.to_string()));
@@ -118,18 +124,19 @@ pub fn transaction_json_with_prevouts(
     }
     if !coinbase
         && let Some(prevouts) = prevouts
-        && prevouts.len() == tx.input.len()
+        && prevouts.len() == tx.inputs.len()
         && prevouts.iter().all(Option::is_some)
     {
         let input_value = prevouts.iter().fold(0_u64, |sum, prevout| {
-            sum.saturating_add(prevout.as_ref().map_or(0, |prevout| prevout.value.to_sat()))
+            sum.saturating_add(prevout.as_ref().map_or(0, |prevout| prevout.value))
         });
-        let output_value = tx.output.iter().fold(0_u64, |sum, output| {
-            sum.saturating_add(output.value.to_sat())
-        });
+        let output_value = tx
+            .outputs
+            .iter()
+            .fold(0_u64, |sum, output| sum.saturating_add(output.value));
         let _ = value.insert(
             "fee",
-            btc_amount_json(Amount::from_sat(input_value.saturating_sub(output_value))),
+            btc_amount_json(input_value.saturating_sub(output_value)),
         );
     }
     value
@@ -137,16 +144,16 @@ pub fn transaction_json_with_prevouts(
 
 /// Render a `scriptPubKey` object in Bitcoin Core's verbose shape.
 #[must_use]
-pub fn script_pub_key_json(script: &bitcoin::ScriptBuf, network: Network) -> Value {
+pub fn script_pub_key_json(script: &[u8], network: Network) -> Value {
     let script_type = classify_script(script);
     let mut value = json!({
         "asm": script_asm(script),
         "desc": script_desc(script, network),
-        "hex": script.as_bytes().to_lower_hex_string(),
+        "hex": hex_encode(script),
         "type": script_type
     });
-    if let Ok(address) = bitcoin::Address::from_script(script, network) {
-        let _ = value.insert("address", json!(address.to_string()));
+    if let Some(address) = script_address(script, network) {
+        let _ = value.insert("address", json!(address));
     }
     value
 }
@@ -159,35 +166,30 @@ fn input_json(
 ) -> Value {
     if coinbase {
         let mut value = json!({
-            "coinbase": input.script_sig.as_bytes().to_lower_hex_string(),
-            "sequence": input.sequence.to_consensus_u32()
+            "coinbase": hex_encode(&input.script_sig),
+            "sequence": input.sequence
         });
         if !input.witness.is_empty() {
-            let witness: Vec<String> = input
-                .witness
-                .iter()
-                .map(bitcoin::hex::DisplayHex::to_lower_hex_string)
-                .collect();
+            let witness: Vec<String> = input.witness.iter().map(|item| hex_encode(item)).collect();
             let _ = value.insert("txinwitness", json!(witness));
         }
         return value;
     }
-
+    let previous_output = input.previous_output;
+    // Field copies come before any `&self` method: `OutPoint` is `#[repr(packed)]`
+    // (consensus wire layout), so field references would be unaligned.
+    let (prev_txid, prev_vout) = (previous_output.txid, previous_output.vout);
     let mut value = json!({
-        "txid": input.previous_output.txid.to_string(),
-        "vout": input.previous_output.vout,
+        "txid": prev_txid.to_string(),
+        "vout": prev_vout,
         "scriptSig": {
             "asm": script_asm(&input.script_sig),
-            "hex": input.script_sig.as_bytes().to_lower_hex_string()
+            "hex": hex_encode(&input.script_sig)
         },
-        "sequence": input.sequence.to_consensus_u32()
+        "sequence": input.sequence
     });
     if !input.witness.is_empty() {
-        let witness: Vec<String> = input
-            .witness
-            .iter()
-            .map(bitcoin::hex::DisplayHex::to_lower_hex_string)
-            .collect();
+        let witness: Vec<String> = input.witness.iter().map(|item| hex_encode(item)).collect();
         let _ = value.insert("txinwitness", json!(witness));
     }
     if let Some(prevout) = prevout {
@@ -212,54 +214,105 @@ fn output_json(output: &TxOut, n: usize, network: Network) -> Value {
     })
 }
 
-fn script_asm(script: &Script) -> String {
-    script.to_asm_string()
+/// A one-input, null-prevout transaction (Core's `IsCoinBase`).
+#[must_use]
+pub fn is_coinbase(tx: &Tx) -> bool {
+    // Core's `COutPoint::IsNull`: zero txid and `u32::MAX` vout. `OutPoint`'s
+    // derived `Default` has vout `0`, which is not the null outpoint.
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output == OutPoint::new(Txid::default(), u32::MAX)
 }
 
-fn script_desc(script: &bitcoin::ScriptBuf, network: Network) -> String {
-    if let Ok(address) = bitcoin::Address::from_script(script, network) {
+fn script_asm(script: &[u8]) -> String {
+    bitcoin::Script::from_bytes(script).to_asm_string()
+}
+
+/// Maps a native network to the rust-bitcoin network for the address seam.
+#[must_use]
+const fn bitcoin_network(network: Network) -> bitcoin::Network {
+    match network {
+        Network::Mainnet => bitcoin::Network::Bitcoin,
+        Network::Testnet3 => bitcoin::Network::Testnet,
+        Network::Testnet4 => bitcoin::Network::Testnet4,
+        Network::Signet => bitcoin::Network::Signet,
+        Network::Regtest => bitcoin::Network::Regtest,
+    }
+}
+
+/// Renders the Core address string for a script, or `None` when the script has
+/// no address form (via the sanctioned rust-bitcoin seam).
+#[must_use]
+fn script_address(script: &[u8], network: Network) -> Option<String> {
+    Address::from_script(
+        bitcoin::Script::from_bytes(script),
+        bitcoin_network(network),
+    )
+    .ok()
+    .map(|address| address.to_string())
+}
+
+fn script_desc(script: &[u8], network: Network) -> String {
+    if let Some(address) = script_address(script, network) {
         return format!("addr({address})");
     }
-    format!("raw({})", script.as_bytes().to_lower_hex_string())
+    format!("raw({})", hex_encode(script))
 }
 
-fn classify_script(script: &Script) -> &'static str {
-    if script.is_p2tr() {
+fn classify_script(script: &[u8]) -> &'static str {
+    if is_p2tr(script) {
         "witness_v1_taproot"
-    } else if script.is_p2wpkh() {
+    } else if is_p2wpkh(script) {
         "witness_v0_keyhash"
-    } else if script.is_p2wsh() {
+    } else if is_p2wsh(script) {
         "witness_v0_scripthash"
-    } else if script.is_p2pkh() {
+    } else if is_p2pkh(script) {
         "pubkeyhash"
-    } else if script.is_p2sh() {
+    } else if is_p2sh(script) {
         "scripthash"
-    } else if script.is_p2pk() {
+    } else if is_p2pk(script) {
         "pubkey"
-    } else if script.is_op_return() {
+    } else if is_op_return(script) {
         "nulldata"
-    } else if script.is_multisig() {
+    } else if is_multisig(script) {
         "multisig"
     } else {
         "nonstandard"
     }
 }
 
+/// Encodes `bytes` as lowercase hexadecimal.
+#[must_use]
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, ScriptBuf, Transaction, TxOut, absolute, transaction};
-    use sonic_rs::JsonValueTrait as _;
+    use bitcoin_rs_primitives::{Hash256, OutPoint};
+    use core::str::FromStr as _;
 
-    fn sample_tx() -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::new(),
+    use sonic_rs::JsonValueTrait;
+
+    /// Core's null outpoint: zero txid, `u32::MAX` vout.
+    fn null_outpoint() -> OutPoint {
+        OutPoint::new(Txid::default(), u32::MAX)
+    }
+
+    fn sample_tx() -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
         }
     }
@@ -267,7 +320,10 @@ mod tests {
     #[test]
     fn in_active_chain_is_omitted_when_none() {
         let chain = TransactionChainContext {
-            block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+            block_hash: BlockHash::from_str(
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .expect("valid hash hex"),
             confirmations: 3,
             block_time: 9,
             in_active_chain: None,
@@ -285,7 +341,7 @@ mod tests {
     #[test]
     fn in_active_chain_is_emitted_when_some() {
         let chain = TransactionChainContext {
-            block_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+            block_hash: BlockHash::from(Hash256::from_le_bytes(&[2; 32])),
             confirmations: 0,
             block_time: 11,
             in_active_chain: Some(false),
@@ -296,6 +352,72 @@ mod tests {
                 .get("in_active_chain")
                 .and_then(sonic_rs::JsonValueTrait::as_bool),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn one_input_null_prevout_is_coinbase() {
+        let mut tx = sample_tx();
+        tx.inputs.push(TxIn {
+            previous_output: null_outpoint(),
+            script_sig: vec![1, 2, 3],
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
+        });
+        assert!(is_coinbase(&tx));
+        tx.inputs.push(TxIn {
+            previous_output: null_outpoint(),
+            script_sig: Vec::new(),
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
+        });
+        assert!(!is_coinbase(&tx));
+    }
+
+    #[test]
+    fn coinbase_input_renders_hex_coinbase_field() {
+        let mut tx = sample_tx();
+        tx.inputs.push(TxIn {
+            previous_output: null_outpoint(),
+            script_sig: vec![0x51],
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
+        });
+        let value = transaction_json(&tx, Network::Regtest, None);
+        let vin = value.get("vin").expect("vin present");
+        let first = &vin[0];
+        assert_eq!(
+            first.get("coinbase").and_then(JsonValueTrait::as_str),
+            Some("51")
+        );
+        assert!(first.get("txid").is_none());
+    }
+
+    #[test]
+    fn p2wpkh_output_classifies_and_addresses_on_regtest() {
+        let tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 5_000,
+                script_pubkey: vec![
+                    0x00, 0x14, 0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c,
+                    0x45, 0xd1, 0xb3, 0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6,
+                ],
+            }],
+        };
+        let value = transaction_json(&tx, Network::Regtest, None);
+        let spk = &value.get("vout").expect("vout")[0]
+            .get("scriptPubKey")
+            .expect("spk");
+        assert_eq!(
+            spk.get("type").and_then(JsonValueTrait::as_str),
+            Some("witness_v0_keyhash")
+        );
+        assert_eq!(
+            spk.get("address").and_then(JsonValueTrait::as_str),
+            Some("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080")
         );
     }
 }

@@ -8,10 +8,7 @@
 use crate::config::ZmqPublication;
 #[cfg(feature = "zmq")]
 use anyhow::{Context as _, Result, bail};
-use bitcoin::Txid;
-#[cfg(any(feature = "zmq", test))]
-use bitcoin::hashes::Hash as _;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Txid};
 #[cfg(feature = "zmq")]
 use core::fmt;
 #[cfg(feature = "zmq")]
@@ -497,7 +494,7 @@ pub(crate) fn sequence_payload(event: SequenceEvent) -> Vec<u8> {
 
 #[cfg(any(feature = "zmq", test))]
 pub(crate) fn hash_body_from_txid(txid: Txid) -> [u8; 32] {
-    let mut body = *txid.as_byte_array();
+    let mut body = *txid.as_bytes();
     body.reverse();
     body
 }
@@ -533,7 +530,7 @@ mod tests {
         assert!(!publisher.wants_rawtx());
         assert!(!publisher.wants_rawblock());
         publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
+        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
         publisher.publish_rawblock(&[]);
         publisher.publish_rawtx(&[]);
         publisher.publish_sequence(SequenceEvent::Connected(Hash256::default()));
@@ -546,7 +543,7 @@ mod tests {
         assert!(publisher.wants_rawtx());
         assert!(publisher.wants_rawblock());
         publisher.publish_hashblock(Hash256::default());
-        publisher.publish_hashtx(bitcoin::Txid::from_byte_array([0; 32]));
+        publisher.publish_hashtx(Txid(Hash256::from_le_bytes(&[0; 32])));
         publisher.publish_rawblock(&[1, 2, 3]);
         publisher.publish_rawtx(&[4, 5, 6]);
         publisher.publish_sequence(SequenceEvent::Disconnected(Hash256::default()));
@@ -588,11 +585,11 @@ mod tests {
 
     #[test]
     fn mempool_event_payloads_carry_reversed_txid_label_and_le_sequence() {
-        let txid = bitcoin::Txid::from_byte_array([
+        let txid = Txid(Hash256::from_le_bytes(&[
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
             24, 25, 26, 27, 28, 29, 30, 31,
-        ]);
-        let mut reversed = *txid.as_byte_array();
+        ]));
+        let mut reversed = *txid.as_bytes();
         reversed.reverse();
 
         let added = sequence_payload(SequenceEvent::Added(txid, 1));
@@ -608,12 +605,7 @@ mod tests {
         assert_eq!(removed[33..], 0xFF00_0000_0000_0042_u64.to_le_bytes());
 
         // A hash256 conversion round-trips through the observer's mapping.
-        assert_eq!(
-            bitcoin::Txid::from_byte_array(
-                Hash256::from_le_bytes(txid.as_byte_array()).to_le_bytes()
-            ),
-            txid
-        );
+        assert_eq!(Txid(Hash256::from_le_bytes(txid.as_bytes())), txid);
     }
 
     #[test]

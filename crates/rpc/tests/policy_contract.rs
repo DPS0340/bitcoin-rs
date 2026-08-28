@@ -11,48 +11,61 @@ extern crate alloc;
 use alloc::sync::Arc;
 use std::error::Error;
 
-use bitcoin::consensus::encode::serialize_hex;
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, WPubkeyHash, Witness,
-};
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
     Mempool, MempoolEntry, MempoolLimits, PolicyError, RbfError, ReplacementCandidate,
 };
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes};
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_rpc::{Handler, RpcError};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
-fn p2wpkh_script() -> ScriptBuf {
-    ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20]))
+fn p2wpkh_script() -> Vec<u8> {
+    // P2WPKH: `OP_0`, push-20, and a fixed 20-byte key hash.
+    [vec![0x00, 0x14], vec![0x11; 20]].concat()
 }
 
-fn op_true_script() -> ScriptBuf {
-    ScriptBuf::from_bytes(vec![0x51])
+fn op_true_script() -> Vec<u8> {
+    vec![0x51]
 }
 
-fn tx(prevout: OutPoint, output_value: u64, sequence: Sequence) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx(prevout: OutPoint, output_value: u64, sequence: u32) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: prevout,
-            script_sig: ScriptBuf::new(),
+            script_sig: Vec::new(),
             sequence,
-            witness: Witness::new(),
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(output_value),
+        outputs: vec![TxOut {
+            value: output_value,
             script_pubkey: p2wpkh_script(),
         }],
     }
 }
 
-fn rpc_txid(tx: &Transaction) -> Txid {
-    tx.compute_txid()
+fn rpc_txid(tx: &Tx) -> Txid {
+    tx.txid()
+}
+
+/// Native consensus hex for RPC submission: the exact wire image the node
+/// decoder consumes.
+fn raw_tx_hex(tx: &Tx) -> String {
+    hex_encode(&consensus_bytes(tx))
+}
+
+/// Encodes `bytes` as lowercase hexadecimal.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 /// Commits one funded UTXO to the context's UTXO set and returns the RPC-side
@@ -60,9 +73,9 @@ fn rpc_txid(tx: &Transaction) -> Txid {
 fn fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
-        bitcoin_rs_primitives::OutPoint::new(Hash256::from_le_bytes(&[label; 32]), 0),
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
         TxOut {
-            value: Amount::from_sat(value),
+            value,
             script_pubkey: p2wpkh_script(),
         },
         false,
@@ -72,7 +85,7 @@ fn fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
         .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
         .unwrap_or_else(|error| panic!("commit_block failed: {error}"));
     OutPoint {
-        txid: Txid::from_byte_array([label; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[label; 32])),
         vout: 0,
     }
 }
@@ -80,7 +93,7 @@ fn fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
 /// The confirmed outpoint `fund_utxo(ctx, label, _)` creates.
 fn confirmed_outpoint(label: u8) -> OutPoint {
     OutPoint {
-        txid: Txid::from_byte_array([label; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[label; 32])),
         vout: 0,
     }
 }
@@ -104,12 +117,12 @@ fn sendrawtransaction_rejects_below_min_relay_fee_and_agrees_with_the_pool()
     let ctx = Arc::new(Context::new());
     let prevout = fund_utxo(&ctx, 0x50, 10_000);
     // fee 1 sat over vsize 82 → ~12 sat/kvB, far below the 1000 sat/kvB floor.
-    let tx = tx(prevout, 9_999, Sequence::MAX);
+    let tx = tx(prevout, 9_999, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&tx)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&tx)]))
             .err()
             .ok_or("expected below-min-relay-fee rejection")?,
     );
@@ -137,8 +150,8 @@ fn sendrawtransaction_rejects_below_min_relay_fee_and_agrees_with_the_pool()
 
 /// One funded input and one 10 000 sat P2WPKH output, so the fee is chosen
 /// exactly by the funding value (rate = fee x 1000 / 82 vB).
-fn funded_fee_tx(ctx: &Context, label: u8, fee: u64) -> Transaction {
-    tx(fund_utxo(ctx, label, 10_000 + fee), 10_000, Sequence::MAX)
+fn funded_fee_tx(ctx: &Context, label: u8, fee: u64) -> Tx {
+    tx(fund_utxo(ctx, label, 10_000 + fee), 10_000, 0xffff_ffff)
 }
 
 #[test]
@@ -149,7 +162,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     let plain = Arc::new(Context::new());
     let ordinary = funded_fee_tx(&plain, 0x80, 1_230);
     let handler = Handler::new(Arc::clone(&plain));
-    handler.dispatch("sendrawtransaction", &json!([serialize_hex(&ordinary)]))?;
+    handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&ordinary)]))?;
     assert!(
         plain.mempool.read().contains_txid(&rpc_txid(&ordinary)),
         "an ordinary between-the-guards tx must admit"
@@ -166,7 +179,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     let handler = Handler::new(Arc::clone(&strict));
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&both)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&both)]))
             .err()
             .ok_or("expected the floor to reject the both-predicates tx")?,
     );
@@ -179,7 +192,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
         "maxfeerate must not be quoted first: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&both)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&both)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -209,7 +222,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
         ..MempoolLimits::default()
     });
     let error = pool
-        .insert_entry(MempoolEntry::new(Arc::new(both.clone()), 82, 1_230, 0, 1))
+        .insert_entry(MempoolEntry::new(Arc::new(both), 82, 1_230, 0, 1))
         .err()
         .ok_or("pool path must also reject")?;
     assert!(matches!(
@@ -224,10 +237,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     let high = funded_fee_tx(&capped, 0x82, 1_230);
     let handler = Handler::new(Arc::clone(&capped));
     let error = handler
-        .dispatch(
-            "sendrawtransaction",
-            &json!([serialize_hex(&high), 0.00005]),
-        )
+        .dispatch("sendrawtransaction", &json!([raw_tx_hex(&high), 0.00005]))
         .err()
         .ok_or("expected the client maxfeerate to reject")?;
     assert_eq!(error.code(), RpcError::INVALID_PARAMS);
@@ -236,10 +246,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
         "unexpected message: {error}"
     );
     let rows = handler
-        .dispatch(
-            "testmempoolaccept",
-            &json!([[serialize_hex(&high)], 0.00005]),
-        )?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&high)], 0.00005]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -267,10 +274,10 @@ fn rpc_outlets_enforce_the_configured_floor() -> Result<(), Box<dyn Error>> {
     let handler = Handler::new(Arc::clone(&ctx));
 
     // 164 sat over 82 vB is exactly 2 000 sat/kvB: below the configured floor.
-    let below = tx(fund_utxo(&ctx, 0x83, 10_164), 10_000, Sequence::MAX);
+    let below = tx(fund_utxo(&ctx, 0x83, 10_164), 10_000, 0xffff_ffff);
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&below)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&below)]))
             .err()
             .ok_or("expected the configured floor to reject")?,
     );
@@ -279,7 +286,7 @@ fn rpc_outlets_enforce_the_configured_floor() -> Result<(), Box<dyn Error>> {
         "unexpected message: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&below)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&below)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -292,8 +299,8 @@ fn rpc_outlets_enforce_the_configured_floor() -> Result<(), Box<dyn Error>> {
     );
 
     // Exactly at the floor admits.
-    let at_floor = tx(fund_utxo(&ctx, 0x84, 10_410), 10_000, Sequence::MAX);
-    handler.dispatch("sendrawtransaction", &json!([serialize_hex(&at_floor)]))?;
+    let at_floor = tx(fund_utxo(&ctx, 0x84, 10_410), 10_000, 0xffff_ffff);
+    handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&at_floor)]))?;
     assert!(
         ctx.mempool.read().contains_txid(&rpc_txid(&at_floor)),
         "exactly-at-floor tx must be pooled"
@@ -329,20 +336,20 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
         // packages at 1 000 and 2 000 sat/kvB.
         let first = tx(
             OutPoint {
-                txid: Txid::from_byte_array([0x85; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[0x85; 32])),
                 vout: 0,
             },
             1_000,
-            Sequence::MAX,
+            0xffff_ffff,
         );
         pool.insert_entry(MempoolEntry::new(Arc::new(first), 100, 100, 0, 1))?;
         let second = tx(
             OutPoint {
-                txid: Txid::from_byte_array([0x86; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[0x86; 32])),
                 vout: 0,
             },
             1_000,
-            Sequence::MAX,
+            0xffff_ffff,
         );
         pool.insert_entry(MempoolEntry::new(Arc::new(second), 100, 200, 0, 1))?;
     }
@@ -355,10 +362,10 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
 
     // 82 sat over 82 vB is exactly 1 000 sat/kvB: clears the configured
     // floor, misses the pressure floor. Both outlets quote the pressure floor.
-    let lukewarm = tx(fund_utxo(&ctx, 0x87, 10_082), 10_000, Sequence::MAX);
+    let lukewarm = tx(fund_utxo(&ctx, 0x87, 10_082), 10_000, 0xffff_ffff);
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&lukewarm)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&lukewarm)]))
             .err()
             .ok_or("expected the pressure floor to reject")?,
     );
@@ -371,7 +378,7 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
         "unexpected message: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&lukewarm)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&lukewarm)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -392,9 +399,9 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
 
     // Control: with no pressure the same rate admits over the same outlets.
     let idle = Arc::new(Context::new());
-    let control = tx(fund_utxo(&idle, 0x88, 10_082), 10_000, Sequence::MAX);
+    let control = tx(fund_utxo(&idle, 0x88, 10_082), 10_000, 0xffff_ffff);
     Handler::new(Arc::clone(&idle))
-        .dispatch("sendrawtransaction", &json!([serialize_hex(&control)]))?;
+        .dispatch("sendrawtransaction", &json!([raw_tx_hex(&control)]))?;
     assert!(
         idle.mempool.read().contains_txid(&rpc_txid(&control)),
         "unpressured control tx must be pooled"
@@ -410,27 +417,27 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
 fn testmempoolaccept_reports_a_policy_verdict_per_row() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
     let funded = fund_utxo(&ctx, 0x51, 10_000);
-    let good = tx(funded, 9_000, Sequence::MAX);
-    let below_min = tx(fund_utxo(&ctx, 0x52, 10_000), 9_999, Sequence::MAX);
-    let nonstandard = Transaction {
-        output: vec![TxOut {
-            value: Amount::from_sat(9_000),
+    let good = tx(funded, 9_000, 0xffff_ffff);
+    let below_min = tx(fund_utxo(&ctx, 0x52, 10_000), 9_999, 0xffff_ffff);
+    let nonstandard = Tx {
+        outputs: vec![TxOut {
+            value: 9_000,
             script_pubkey: op_true_script(),
         }],
-        ..tx(fund_utxo(&ctx, 0x53, 10_000), 9_000, Sequence::MAX)
+        ..tx(fund_utxo(&ctx, 0x53, 10_000), 9_000, 0xffff_ffff)
     };
-    let dust = Transaction {
-        output: vec![TxOut {
-            value: Amount::from_sat(100),
+    let dust = Tx {
+        outputs: vec![TxOut {
+            value: 100,
             script_pubkey: p2wpkh_script(),
         }],
-        ..tx(fund_utxo(&ctx, 0x54, 10_000), 100, Sequence::MAX)
+        ..tx(fund_utxo(&ctx, 0x54, 10_000), 100, 0xffff_ffff)
     };
     // Core 31 accepts v3 under TRUC; bitcoin-rs rejects it at the version
     // gate (deviation ledger, item 5).
-    let version_three = Transaction {
-        version: bitcoin::transaction::Version(3),
-        ..tx(fund_utxo(&ctx, 0x5a, 10_000), 9_000, Sequence::MAX)
+    let version_three = Tx {
+        version: 3,
+        ..tx(fund_utxo(&ctx, 0x5a, 10_000), 9_000, 0xffff_ffff)
     };
 
     let handler = Handler::new(Arc::clone(&ctx));
@@ -438,11 +445,11 @@ fn testmempoolaccept_reports_a_policy_verdict_per_row() -> Result<(), Box<dyn Er
         .dispatch(
             "testmempoolaccept",
             &json!([[
-                serialize_hex(&good),
-                serialize_hex(&below_min),
-                serialize_hex(&nonstandard),
-                serialize_hex(&dust),
-                serialize_hex(&version_three),
+                raw_tx_hex(&good),
+                raw_tx_hex(&below_min),
+                raw_tx_hex(&nonstandard),
+                raw_tx_hex(&dust),
+                raw_tx_hex(&version_three),
             ]]),
         )?
         .as_array()
@@ -498,16 +505,16 @@ fn sendrawtransaction_rejects_oversized_and_nonstandard_txs() -> Result<(), Box<
     let handler = Handler::new(Arc::clone(&ctx));
 
     // 3400 P2WPKH outputs ≈ 435 000 weight units > 400 000.
-    let mut oversized = tx(fund_utxo(&ctx, 0x55, 10_000), 1_000, Sequence::MAX);
-    oversized.output = (0..3_400)
+    let mut oversized = tx(fund_utxo(&ctx, 0x55, 10_000), 1_000, 0xffff_ffff);
+    oversized.outputs = (0..3_400)
         .map(|_| TxOut {
-            value: Amount::from_sat(1_000),
+            value: 1_000,
             script_pubkey: p2wpkh_script(),
         })
         .collect();
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&oversized)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&oversized)]))
             .err()
             .ok_or("expected oversized rejection")?,
     );
@@ -516,16 +523,16 @@ fn sendrawtransaction_rejects_oversized_and_nonstandard_txs() -> Result<(), Box<
         "unexpected message: {message}"
     );
 
-    let weird = Transaction {
-        output: vec![TxOut {
-            value: Amount::from_sat(9_000),
+    let weird = Tx {
+        outputs: vec![TxOut {
+            value: 9_000,
             script_pubkey: op_true_script(),
         }],
-        ..tx(fund_utxo(&ctx, 0x56, 10_000), 9_000, Sequence::MAX)
+        ..tx(fund_utxo(&ctx, 0x56, 10_000), 9_000, 0xffff_ffff)
     };
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&weird)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&weird)]))
             .err()
             .ok_or("expected non-standard rejection")?,
     );
@@ -542,10 +549,10 @@ fn sendrawtransaction_rejects_oversized_and_nonstandard_txs() -> Result<(), Box<
 fn insert_original(
     ctx: &Context,
     label: u8,
-    sequence: Sequence,
+    sequence: u32,
     vsize: u32,
     fee: u64,
-) -> Result<Transaction, Box<dyn Error>> {
+) -> Result<Tx, Box<dyn Error>> {
     let original = tx(fund_utxo(ctx, label, 100_000), 92_000, sequence);
     ctx.mempool.write().insert_entry(MempoolEntry::new(
         Arc::new(original.clone()),
@@ -561,14 +568,14 @@ fn insert_original(
 fn sendrawtransaction_applies_an_rbf_replacement_and_sweeps_the_conflicts()
 -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let original = insert_original(&ctx, 0x60, Sequence::ENABLE_RBF_NO_LOCKTIME, 4_000, 8_000)?;
+    let original = insert_original(&ctx, 0x60, 0xffff_fffd, 4_000, 8_000)?;
     // A conflicting spend of the SAME confirmed outpoint. Its 10 000 sat fee
     // pays the 8 000 sat original (rule 3), its own 82 vB of incremental fee
     // (rule 4), and outranks the original's 2000 sat/kvB stored rate (rule 6).
-    let replacement = tx(confirmed_outpoint(0x60), 90_000, Sequence::MAX);
+    let replacement = tx(confirmed_outpoint(0x60), 90_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
-    let result = handler.dispatch("sendrawtransaction", &json!([serialize_hex(&replacement)]))?;
+    let result = handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))?;
     assert_eq!(
         result.as_str().map(ToString::to_string),
         Some(rpc_txid(&replacement).to_string())
@@ -601,13 +608,13 @@ fn sendrawtransaction_applies_an_rbf_replacement_and_sweeps_the_conflicts()
 #[test]
 fn sendrawtransaction_rejects_nonsignaling_replacements_with_rule1() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let original = insert_original(&ctx, 0x61, Sequence::MAX, 4_000, 8_000)?;
-    let replacement = tx(confirmed_outpoint(0x61), 90_000, Sequence::MAX);
+    let original = insert_original(&ctx, 0x61, 0xffff_ffff, 4_000, 8_000)?;
+    let replacement = tx(confirmed_outpoint(0x61), 90_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&replacement)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))
             .err()
             .ok_or("expected rule 1 rejection")?,
     );
@@ -626,24 +633,24 @@ fn sendrawtransaction_rejects_nonsignaling_replacements_with_rule1() -> Result<(
 fn sendrawtransaction_rejects_rule2_replacements_adding_unconfirmed_inputs()
 -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let original = insert_original(&ctx, 0x98, Sequence::ENABLE_RBF_NO_LOCKTIME, 4_000, 8_000)?;
+    let original = insert_original(&ctx, 0x98, 0xffff_fffd, 4_000, 8_000)?;
     // An unrelated pooled tx whose output the replacement would add.
-    let unrelated = tx(fund_utxo(&ctx, 0x99, 10_000), 9_000, Sequence::MAX);
+    let unrelated = tx(fund_utxo(&ctx, 0x99, 10_000), 9_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
-    handler.dispatch("sendrawtransaction", &json!([serialize_hex(&unrelated)]))?;
+    handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&unrelated)]))?;
 
     // Inputs 100 000 + 9 000 - 100 000 = 9 000 sat over ~150 vB: clears the
     // floor and every other gate; only rule 2 can reject it.
     let replacement = tx_spending(
         &[
-            (confirmed_outpoint(0x98), Sequence::MAX),
-            (OutPoint::new(rpc_txid(&unrelated), 0), Sequence::MAX),
+            (confirmed_outpoint(0x98), 0xffff_ffff),
+            (OutPoint::new(rpc_txid(&unrelated), 0), 0xffff_ffff),
         ],
         100_000,
     );
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&replacement)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))
             .err()
             .ok_or("expected rule 2 rejection")?,
     );
@@ -652,7 +659,7 @@ fn sendrawtransaction_rejects_rule2_replacements_adding_unconfirmed_inputs()
         "unexpected message: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&replacement)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&replacement)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -683,14 +690,14 @@ fn sendrawtransaction_rejects_rule2_replacements_adding_unconfirmed_inputs()
 fn sendrawtransaction_rejects_rule3_replacements_that_underpay_evicted_fees()
 -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let original = insert_original(&ctx, 0x9a, Sequence::ENABLE_RBF_NO_LOCKTIME, 4_000, 8_000)?;
+    let original = insert_original(&ctx, 0x9a, 0xffff_fffd, 4_000, 8_000)?;
     // 4 000 sat < the 8 000 sat direct conflict: rule 3 rejects before any
     // rate rule applies (48 780 sat/kvB clears the floor comfortably).
-    let replacement = tx(confirmed_outpoint(0x9a), 96_000, Sequence::MAX);
+    let replacement = tx(confirmed_outpoint(0x9a), 96_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&replacement)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))
             .err()
             .ok_or("expected rule 3 rejection")?,
     );
@@ -699,7 +706,7 @@ fn sendrawtransaction_rejects_rule3_replacements_that_underpay_evicted_fees()
         "unexpected message: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&replacement)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&replacement)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -731,11 +738,7 @@ fn sendrawtransaction_rejects_rule6_replacements_that_do_not_improve_the_rate()
     let ctx = Arc::new(Context::new());
     // Original at 4 000 vsize / 8 000 sat fee = 2 000 sat/kvB stored rate,
     // funded at 200 000 so the replacement has fee headroom to tune.
-    let original = tx(
-        fund_utxo(&ctx, 0x9b, 200_000),
-        192_000,
-        Sequence::ENABLE_RBF_NO_LOCKTIME,
-    );
+    let original = tx(fund_utxo(&ctx, 0x9b, 200_000), 192_000, 0xffff_fffd);
     ctx.mempool.write().insert_entry(MempoolEntry::new(
         Arc::new(original.clone()),
         4_000,
@@ -765,7 +768,7 @@ fn sendrawtransaction_rejects_rule6_replacements_that_do_not_improve_the_rate()
     let handler = Handler::new(Arc::clone(&ctx));
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&replacement)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))
             .err()
             .ok_or("expected rule 6 rejection")?,
     );
@@ -774,7 +777,7 @@ fn sendrawtransaction_rejects_rule6_replacements_that_do_not_improve_the_rate()
         "unexpected message: {message}"
     );
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&replacement)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&replacement)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -811,7 +814,7 @@ fn sendrawtransaction_rejects_rule6_replacements_that_do_not_improve_the_rate()
 fn assert_both_rpcs_agree_on_replacement_rejection(
     handler: &Handler,
     tx_hex: &str,
-    tx: &Transaction,
+    tx: &Tx,
     expected_reason_fragment: &str,
     expected_rbf_error: RbfError,
     pool: &Mempool,
@@ -858,9 +861,9 @@ fn assert_both_rpcs_agree_on_replacement_rejection(
         // 100_000 - fee, the fee is 100_000 - output_value.
         let input_value = 100_000_u64;
         let output_value = tx
-            .output
+            .outputs
             .iter()
-            .fold(0_u64, |sum, o| sum.saturating_add(o.value.to_sat()));
+            .fold(0_u64, |sum, o| sum.saturating_add(o.value));
         input_value.saturating_sub(output_value)
     };
     let candidate = ReplacementCandidate::new(Arc::new(tx.clone()), vsize, fee, 1_000);
@@ -875,13 +878,13 @@ fn assert_both_rpcs_agree_on_replacement_rejection(
 #[test]
 fn bip125_rule1_nonsignaling_originals_reject_on_both_rpcs() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let original = insert_original(&ctx, 0xa1, Sequence::MAX, 4_000, 8_000)?;
-    let replacement = tx(confirmed_outpoint(0xa1), 90_000, Sequence::MAX);
+    let original = insert_original(&ctx, 0xa1, 0xffff_ffff, 4_000, 8_000)?;
+    let replacement = tx(confirmed_outpoint(0xa1), 90_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
     let _row = assert_both_rpcs_agree_on_replacement_rejection(
         &handler,
-        &serialize_hex(&replacement),
+        &raw_tx_hex(&replacement),
         &replacement,
         "BIP125 rule 1",
         RbfError::Rule1NoOptIn,
@@ -898,16 +901,16 @@ fn bip125_rule4_replacement_must_pay_incremental_relay_fee_on_both_rpcs()
 -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
     // Original: RBF-signaling, 4 000 vB, 8 000 sat fee.
-    let _original = insert_original(&ctx, 0xa4, Sequence::ENABLE_RBF_NO_LOCKTIME, 4_000, 8_000)?;
+    let _original = insert_original(&ctx, 0xa4, 0xffff_fffd, 4_000, 8_000)?;
     // Replacement spends the same outpoint, pays 8 000 sat fee (equal to
     // evicted fee) but does NOT pay the incremental relay fee on top:
     // incremental = 82 vB * 1_000 / 1_000 = 82 sat; 8_000 - 8_000 = 0 < 82.
-    let replacement = tx(confirmed_outpoint(0xa4), 92_000, Sequence::MAX);
+    let replacement = tx(confirmed_outpoint(0xa4), 92_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
     let _row = assert_both_rpcs_agree_on_replacement_rejection(
         &handler,
-        &serialize_hex(&replacement),
+        &raw_tx_hex(&replacement),
         &replacement,
         "BIP125 rule 4",
         RbfError::Rule4InsufficientIncrementalFee,
@@ -926,14 +929,14 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
         pool.limits.max_ancestors = 200;
         pool.limits.max_descendants = 200;
     }
-    let original = insert_original(&ctx, 0xa5, Sequence::ENABLE_RBF_NO_LOCKTIME, 4_000, 8_000)?;
+    let original = insert_original(&ctx, 0xa5, 0xffff_fffd, 4_000, 8_000)?;
     let original_txid = rpc_txid(&original);
     // Chain 100 descendants from the original, each at 50 vB / 100 sat fee.
     {
         let mut pool = ctx.mempool.write();
         let mut prev = OutPoint::new(original_txid, 0);
         for i in 0..100_u32 {
-            let child = tx(prev, 400, Sequence::MAX);
+            let child = tx(prev, 400, 0xffff_ffff);
             prev = OutPoint::new(rpc_txid(&child), 0);
             pool.insert_entry(MempoolEntry::new(Arc::new(child), 50, 100, u64::from(i), 1))?;
         }
@@ -941,12 +944,12 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
     // Replacement spends the same confirmed outpoint, fee 20_000.
     // Evicted fee = 8_000 + 100*100 = 18_000; 20_000 > 18_000 + 82 (rule 4).
     // Eviction count = 101 > 100 (rule 5).
-    let replacement = tx(confirmed_outpoint(0xa5), 80_000, Sequence::MAX);
+    let replacement = tx(confirmed_outpoint(0xa5), 80_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
     let _row = assert_both_rpcs_agree_on_replacement_rejection(
         &handler,
-        &serialize_hex(&replacement),
+        &raw_tx_hex(&replacement),
         &replacement,
         "BIP125 rule 5",
         RbfError::Rule5TooManyEvictions,
@@ -961,16 +964,16 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
 
 /// Builds a 25-tx unconfirmed chain in the pool starting from a fictional
 /// confirmed root, all entries at the 1000 sat/kvB boundary.
-fn chain_pool(ctx: &Context) -> Result<Vec<Transaction>, Box<dyn Error>> {
+fn chain_pool(ctx: &Context) -> Result<Vec<Tx>, Box<dyn Error>> {
     let mut pool = ctx.mempool.write();
     let mut txs = Vec::new();
     let mut previous = OutPoint {
-        txid: Txid::from_byte_array([0x62; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[0x62; 32])),
         vout: 0,
     };
     for _ in 0..25 {
-        let next = tx(previous, 1_000, Sequence::MAX);
-        previous = OutPoint::new(next.compute_txid(), 0);
+        let next = tx(previous, 1_000, 0xffff_ffff);
+        previous = OutPoint::new(next.txid(), 0);
         pool.insert_entry(MempoolEntry::new(
             Arc::new(next.clone()),
             4_000,
@@ -998,7 +1001,7 @@ fn sendrawtransaction_enforces_ancestor_count_limits_at_admission() -> Result<()
 
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&follower)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&follower)]))
             .err()
             .ok_or("expected TooManyAncestors rejection")?,
     );
@@ -1010,17 +1013,17 @@ fn sendrawtransaction_enforces_ancestor_count_limits_at_admission() -> Result<()
     // Pool-path agreement: the gate lives in the pool's insert path.
     let mut pool = Mempool::new(MempoolLimits::default());
     let mut previous = OutPoint {
-        txid: Txid::from_byte_array([0x62; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[0x62; 32])),
         vout: 0,
     };
     for _ in 0..25 {
-        let next = tx(previous, 1_000, Sequence::MAX);
-        previous = OutPoint::new(next.compute_txid(), 0);
+        let next = tx(previous, 1_000, 0xffff_ffff);
+        previous = OutPoint::new(next.txid(), 0);
         pool.insert_entry(MempoolEntry::new(Arc::new(next), 4_000, 4_000, 0, 1))?;
     }
     let error = pool
         .insert_entry(MempoolEntry::new(
-            Arc::new(tx(previous, 1_000, Sequence::MAX)),
+            Arc::new(tx(previous, 1_000, 0xffff_ffff)),
             82,
             10_000,
             0,
@@ -1037,26 +1040,26 @@ fn sendrawtransaction_enforces_ancestor_count_limits_at_admission() -> Result<()
 
 /// Builds the 26th chain member that also spends a funded confirmed outpoint,
 /// so its fee is high and its only failing gate is the ancestor limit.
-fn tx_multi_child(funded: &OutPoint, tip: &Transaction) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![
+fn tx_multi_child(funded: &OutPoint, tip: &Tx) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![
             TxIn {
                 previous_output: *funded,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             },
             TxIn {
-                previous_output: OutPoint::new(tip.compute_txid(), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                previous_output: OutPoint::new(tip.txid(), 0),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             },
         ],
-        output: vec![TxOut {
-            value: Amount::from_sat(90_000),
+        outputs: vec![TxOut {
+            value: 90_000,
             script_pubkey: p2wpkh_script(),
         }],
     }
@@ -1076,7 +1079,7 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_ancestor_count_limits()
 
     // Preview must reject — the 26th unconfirmed ancestor exceeds the limit.
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&follower)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&follower)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -1098,7 +1101,7 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_ancestor_count_limits()
     // Admission must reject with the same class.
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&follower)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&follower)]))
             .err()
             .ok_or("expected admission to enforce the limit")?,
     );
@@ -1107,17 +1110,17 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_ancestor_count_limits()
     // Pool-path agreement: the direct insert gate rejects the same package.
     let mut pool = Mempool::new(MempoolLimits::default());
     let mut previous = OutPoint {
-        txid: Txid::from_byte_array([0x93; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[0x93; 32])),
         vout: 0,
     };
     for _ in 0..25 {
-        let next = tx(previous, 1_000, Sequence::MAX);
-        previous = OutPoint::new(next.compute_txid(), 0);
+        let next = tx(previous, 1_000, 0xffff_ffff);
+        previous = OutPoint::new(next.txid(), 0);
         pool.insert_entry(MempoolEntry::new(Arc::new(next), 4_000, 4_000, 0, 1))?;
     }
     let error = pool
         .insert_entry(MempoolEntry::new(
-            Arc::new(tx(previous, 1_000, Sequence::MAX)),
+            Arc::new(tx(previous, 1_000, 0xffff_ffff)),
             4_000,
             4_000,
             0,
@@ -1133,41 +1136,41 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_ancestor_count_limits()
 }
 
 /// Multi-input variant of `tx`, used for replacement and fan-out shapes.
-fn tx_spending(inputs: &[(OutPoint, Sequence)], output_value: u64) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: inputs
+fn tx_spending(inputs: &[(OutPoint, u32)], output_value: u64) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: inputs
             .iter()
             .map(|(prevout, sequence)| TxIn {
                 previous_output: *prevout,
-                script_sig: ScriptBuf::new(),
+                script_sig: Vec::new(),
                 sequence: *sequence,
-                witness: Witness::new(),
+                witness: Vec::new(),
             })
             .collect(),
-        output: vec![TxOut {
-            value: Amount::from_sat(output_value),
+        outputs: vec![TxOut {
+            value: output_value,
             script_pubkey: p2wpkh_script(),
         }],
     }
 }
 
 /// Multi-output variant of `tx`, used for the descendant-count parent.
-fn tx_outputs(prevout: OutPoint, sequence: Sequence, values: &[u64]) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx_outputs(prevout: OutPoint, sequence: u32, values: &[u64]) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: prevout,
-            script_sig: ScriptBuf::new(),
+            script_sig: Vec::new(),
             sequence,
-            witness: Witness::new(),
+            witness: Vec::new(),
         }],
-        output: values
+        outputs: values
             .iter()
             .map(|value| TxOut {
-                value: Amount::from_sat(*value),
+                value: *value,
                 script_pubkey: p2wpkh_script(),
             })
             .collect(),
@@ -1176,19 +1179,19 @@ fn tx_outputs(prevout: OutPoint, sequence: Sequence, values: &[u64]) -> Transact
 
 /// One funded input and `count` identical P2WPKH outputs, used to tune a
 /// replacement's real vsize against its fee (the rule-6 shape).
-fn many_output_tx(prevout: OutPoint, value_each: u64, count: usize) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn many_output_tx(prevout: OutPoint, value_each: u64, count: usize) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: prevout,
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }],
-        output: vec![
+        outputs: vec![
             TxOut {
-                value: Amount::from_sat(value_each),
+                value: value_each,
                 script_pubkey: p2wpkh_script(),
             };
             count
@@ -1205,13 +1208,13 @@ fn sendrawtransaction_enforces_ancestor_size_limits_at_admission() -> Result<(),
     let tip = {
         let mut pool = ctx.mempool.write();
         let mut previous = OutPoint {
-            txid: Txid::from_byte_array([0x94; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[0x94; 32])),
             vout: 0,
         };
         let mut tip = None;
         for _ in 0..3 {
-            let next = tx(previous, 1_000, Sequence::MAX);
-            previous = OutPoint::new(next.compute_txid(), 0);
+            let next = tx(previous, 1_000, 0xffff_ffff);
+            previous = OutPoint::new(next.txid(), 0);
             pool.insert_entry(MempoolEntry::new(
                 Arc::new(next.clone()),
                 4_000,
@@ -1228,7 +1231,7 @@ fn sendrawtransaction_enforces_ancestor_size_limits_at_admission() -> Result<(),
 
     // Preview must reject — ancestor size 12 000 + 82 > 12 000.
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&follower)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&follower)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -1249,7 +1252,7 @@ fn sendrawtransaction_enforces_ancestor_size_limits_at_admission() -> Result<(),
 
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&follower)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&follower)]))
             .err()
             .ok_or("expected AncestorSizeLimit rejection")?,
     );
@@ -1268,17 +1271,17 @@ fn sendrawtransaction_enforces_ancestor_size_limits_at_admission() -> Result<(),
         ..MempoolLimits::default()
     });
     let mut previous = OutPoint {
-        txid: Txid::from_byte_array([0x94; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[0x94; 32])),
         vout: 0,
     };
     for _ in 0..3 {
-        let next = tx(previous, 1_000, Sequence::MAX);
-        previous = OutPoint::new(next.compute_txid(), 0);
+        let next = tx(previous, 1_000, 0xffff_ffff);
+        previous = OutPoint::new(next.txid(), 0);
         pool.insert_entry(MempoolEntry::new(Arc::new(next), 4_000, 4_000, 0, 1))?;
     }
     let error = pool
         .insert_entry(MempoolEntry::new(
-            Arc::new(tx(previous, 1_000, Sequence::MAX)),
+            Arc::new(tx(previous, 1_000, 0xffff_ffff)),
             4_000,
             4_000,
             0,
@@ -1304,17 +1307,17 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
         let mut pool = ctx.mempool.write();
         let parent = tx_outputs(
             OutPoint {
-                txid: Txid::from_byte_array([0x96; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[0x96; 32])),
                 vout: 0,
             },
-            Sequence::MAX,
+            0xffff_ffff,
             &[1_000, 2_000],
         );
         let parent_txid = rpc_txid(&parent);
         pool.insert_entry(MempoolEntry::new(Arc::new(parent), 4_000, 4_000, 0, 1))?;
         let parent_out = OutPoint::new(parent_txid, 0);
         for value in 1_000_u64..1_024 {
-            let child = tx(parent_out, value, Sequence::MAX);
+            let child = tx(parent_out, value, 0xffff_ffff);
             pool.insert_entry(MempoolEntry::new(Arc::new(child), 4_000, 4_000, 0, 1))?;
         }
         parent_txid
@@ -1323,8 +1326,8 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
     // every other gate; only the parent's descendant count can reject it.
     let child = tx_spending(
         &[
-            (OutPoint::new(parent_txid, 1), Sequence::MAX),
-            (fund_utxo(&ctx, 0x97, 100_000), Sequence::MAX),
+            (OutPoint::new(parent_txid, 1), 0xffff_ffff),
+            (fund_utxo(&ctx, 0x97, 100_000), 0xffff_ffff),
         ],
         91_000,
     );
@@ -1332,7 +1335,7 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
 
     // Preview must reject — the parent's descendant count exceeds the limit.
     let rows = handler
-        .dispatch("testmempoolaccept", &json!([[serialize_hex(&child)]]))?
+        .dispatch("testmempoolaccept", &json!([[raw_tx_hex(&child)]]))?
         .as_array()
         .ok_or("expected an array of results")?
         .clone();
@@ -1353,7 +1356,7 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
 
     let message = internal_message(
         &handler
-            .dispatch("sendrawtransaction", &json!([serialize_hex(&child)]))
+            .dispatch("sendrawtransaction", &json!([raw_tx_hex(&child)]))
             .err()
             .ok_or("expected TooManyDescendants rejection")?,
     );
@@ -1366,20 +1369,20 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
     // Pool-path agreement: the direct insert gate rejects the same package.
     let mut pool = Mempool::new(MempoolLimits::default());
     let root = OutPoint {
-        txid: Txid::from_byte_array([0x96; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[0x96; 32])),
         vout: 0,
     };
-    let parent = tx_outputs(root, Sequence::MAX, &[1_000, 2_000]);
-    let parent_txid = parent.compute_txid();
+    let parent = tx_outputs(root, 0xffff_ffff, &[1_000, 2_000]);
+    let parent_txid = parent.txid();
     let parent_out = OutPoint::new(parent_txid, 0);
     pool.insert_entry(MempoolEntry::new(Arc::new(parent), 4_000, 4_000, 0, 1))?;
     for value in 1_000_u64..1_024 {
-        let child = tx(parent_out, value, Sequence::MAX);
+        let child = tx(parent_out, value, 0xffff_ffff);
         pool.insert_entry(MempoolEntry::new(Arc::new(child), 4_000, 4_000, 0, 1))?;
     }
     let error = pool
         .insert_entry(MempoolEntry::new(
-            Arc::new(tx(OutPoint::new(parent_txid, 1), 9_999, Sequence::MAX)),
+            Arc::new(tx(OutPoint::new(parent_txid, 1), 9_999, 0xffff_ffff)),
             4_000,
             4_000,
             0,
@@ -1399,20 +1402,20 @@ fn sendrawtransaction_admission_evicts_the_lowest_fee_packages_under_size_pressu
 -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
     let root = |label: u8| OutPoint {
-        txid: Txid::from_byte_array([label; 32]),
+        txid: Txid(Hash256::from_le_bytes(&[label; 32])),
         vout: 0,
     };
     let (high_txid, low_txid, mid_txid) = {
         let mut pool = ctx.mempool.write();
         // Three independent packages at 3 000 / 1 000 / 2 000 sat/kvB.
-        let high = tx(root(0x90), 1_000, Sequence::MAX);
-        let high_txid = high.compute_txid();
+        let high = tx(root(0x90), 1_000, 0xffff_ffff);
+        let high_txid = high.txid();
         pool.insert_entry(MempoolEntry::new(Arc::new(high), 1_000, 3_000, 0, 1))?;
-        let low = tx(root(0x91), 1_000, Sequence::MAX);
-        let low_txid = low.compute_txid();
+        let low = tx(root(0x91), 1_000, 0xffff_ffff);
+        let low_txid = low.txid();
         pool.insert_entry(MempoolEntry::new(Arc::new(low), 1_000, 1_000, 0, 1))?;
-        let mid = tx(root(0x92), 1_000, Sequence::MAX);
-        let mid_txid = mid.compute_txid();
+        let mid = tx(root(0x92), 1_000, 0xffff_ffff);
+        let mid_txid = mid.txid();
         pool.insert_entry(MempoolEntry::new(Arc::new(mid), 1_000, 2_000, 0, 1))?;
         // Shrink after filling: eviction runs only inside insert paths.
         pool.limits.max_total_bytes = 2_000;
@@ -1420,10 +1423,10 @@ fn sendrawtransaction_admission_evicts_the_lowest_fee_packages_under_size_pressu
     };
     // 6 000 sat over 82 vB clears the pressure floor the eviction candidate
     // faces (cheapest evictable 1 000 + incremental 1 000 = 2 000 sat/kvB).
-    let overflow = tx(fund_utxo(&ctx, 0x93, 106_000), 100_000, Sequence::MAX);
+    let overflow = tx(fund_utxo(&ctx, 0x93, 106_000), 100_000, 0xffff_ffff);
     let handler = Handler::new(Arc::clone(&ctx));
 
-    let result = handler.dispatch("sendrawtransaction", &json!([serialize_hex(&overflow)]))?;
+    let result = handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&overflow)]))?;
     assert_eq!(
         result.as_str().map(ToString::to_string),
         Some(rpc_txid(&overflow).to_string())
@@ -1459,21 +1462,21 @@ fn sendrawtransaction_admission_evicts_the_lowest_fee_packages_under_size_pressu
 #[test]
 fn testmempoolaccept_and_sendrawtransaction_agree_on_each_class() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    let good = tx(fund_utxo(&ctx, 0x70, 10_000), 9_000, Sequence::MAX);
-    let below_min = tx(fund_utxo(&ctx, 0x71, 10_000), 9_999, Sequence::MAX);
-    let nonstandard = Transaction {
-        output: vec![TxOut {
-            value: Amount::from_sat(9_000),
+    let good = tx(fund_utxo(&ctx, 0x70, 10_000), 9_000, 0xffff_ffff);
+    let below_min = tx(fund_utxo(&ctx, 0x71, 10_000), 9_999, 0xffff_ffff);
+    let nonstandard = Tx {
+        outputs: vec![TxOut {
+            value: 9_000,
             script_pubkey: op_true_script(),
         }],
-        ..tx(fund_utxo(&ctx, 0x72, 10_000), 9_000, Sequence::MAX)
+        ..tx(fund_utxo(&ctx, 0x72, 10_000), 9_000, 0xffff_ffff)
     };
-    let dust = Transaction {
-        output: vec![TxOut {
-            value: Amount::from_sat(100),
+    let dust = Tx {
+        outputs: vec![TxOut {
+            value: 100,
             script_pubkey: p2wpkh_script(),
         }],
-        ..tx(fund_utxo(&ctx, 0x73, 10_000), 100, Sequence::MAX)
+        ..tx(fund_utxo(&ctx, 0x73, 10_000), 100, 0xffff_ffff)
     };
     let txs = [&good, &below_min, &nonstandard, &dust];
 
@@ -1481,7 +1484,7 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_each_class() -> Result<(), 
     let rows = handler
         .dispatch(
             "testmempoolaccept",
-            &json!([txs.iter().map(serialize_hex).collect::<Vec<_>>()]),
+            &json!([txs.iter().map(|tx| raw_tx_hex(tx)).collect::<Vec<_>>()]),
         )?
         .as_array()
         .ok_or("expected an array of results")?
@@ -1494,7 +1497,7 @@ fn testmempoolaccept_and_sendrawtransaction_agree_on_each_class() -> Result<(), 
             .and_then(JsonValueTrait::as_bool)
             .ok_or("row missing allowed")?;
         // The submission verdict must match the preview verdict per row.
-        let submitted = handler.dispatch("sendrawtransaction", &json!([serialize_hex(tx)]));
+        let submitted = handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(tx)]));
         assert_eq!(
             submitted.is_ok(),
             preview_allowed,

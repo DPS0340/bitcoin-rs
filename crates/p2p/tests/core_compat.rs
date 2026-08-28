@@ -15,14 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bitcoin::block::{Header, Version};
-use bitcoin::consensus::{Decodable, serialize};
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::CommandString;
 use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
 use bitcoin::p2p::{Magic, ServiceFlags};
-use bitcoin::pow::CompactTarget;
-use bitcoin::{Block, BlockHash, TxMerkleNode, Txid};
+use bitcoin::{BlockHash, Txid};
 use bitcoin_rs_p2p::Message;
 use bitcoin_rs_p2p::dispatch::{
     ChainQuery, InventoryResponse, MAX_HEADERS_RESPONSE, dispatch_inbound,
@@ -36,6 +33,9 @@ use bitcoin_rs_p2p::wire::{
     write_message,
 };
 use bitcoin_rs_p2p::{BannedSubnet, InboundBlock, InboundHeaders, Peer, PeerLease, PeerState};
+use bitcoin_rs_primitives::{
+    Block, BlockHash as NativeBlockHash, Hash256, Header, consensus_bytes,
+};
 use bitcoin_rs_primitives::{Network, USER_AGENT};
 use hashbrown::HashMap;
 
@@ -44,6 +44,15 @@ use hashbrown::HashMap;
 // ---------------------------------------------------------------------------
 
 const REGTEST_GENESIS_HEX: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+/// Convert native `BlockHash` to bitcoin `BlockHash` for envelope types.
+fn btc_bh(hash: NativeBlockHash) -> BlockHash {
+    BlockHash::from_byte_array(*hash.as_bytes())
+}
+
+/// Convert bitcoin `BlockHash` to native `BlockHash` for payload lookups.
+fn native_bh(hash: &BlockHash) -> NativeBlockHash {
+    NativeBlockHash(Hash256::from_le_bytes(hash.as_byte_array()))
+}
 
 /// `(network, Core magic, Core default P2P port)` for every supported network.
 const NETWORK_TABLE: [(Network, Magic, u16); 5] = [
@@ -56,7 +65,7 @@ const NETWORK_TABLE: [(Network, Magic, u16); 5] = [
 
 fn genesis_block() -> Result<Block, Box<dyn Error>> {
     let bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-    Ok(Block::consensus_decode(&mut bytes.as_slice())?)
+    Ok(Block::consensus_decode(&bytes)?)
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -87,11 +96,11 @@ fn child_headers(parent: &Header, count: usize) -> Vec<Header> {
     let mut current = *parent;
     for _ in 0..count {
         let next = Header {
-            version: Version::ONE,
-            prev_blockhash: current.block_hash(),
-            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            version: 1,
+            prev_blockhash: current.compute_hash(),
+            merkle_root: Hash256::default(),
             time: current.time + 1,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         };
         headers.push(next);
@@ -100,15 +109,15 @@ fn child_headers(parent: &Header, count: usize) -> Vec<Header> {
     headers
 }
 
-fn headers_into_blocks(headers: &[Header]) -> HashMap<BlockHash, Block> {
+fn headers_into_blocks(headers: &[Header]) -> HashMap<NativeBlockHash, Block> {
     headers
         .iter()
         .map(|header| {
             (
-                header.block_hash(),
+                header.compute_hash(),
                 Block {
                     header: *header,
-                    txdata: Vec::new(),
+                    txs: Vec::new(),
                 },
             )
         })
@@ -123,18 +132,18 @@ fn headers_into_blocks(headers: &[Header]) -> HashMap<BlockHash, Block> {
 /// header, and only active-chain bodies are served (`notfound` otherwise).
 struct FakeChain {
     active: Vec<Header>,
-    bodies: HashMap<BlockHash, Block>,
+    bodies: HashMap<NativeBlockHash, Block>,
 }
 
 impl FakeChain {
-    fn new(active: Vec<Header>, bodies: HashMap<BlockHash, Block>) -> Self {
+    fn new(active: Vec<Header>, bodies: HashMap<NativeBlockHash, Block>) -> Self {
         Self { active, bodies }
     }
 
-    fn active_height(&self, hash: &BlockHash) -> Option<u32> {
+    fn active_height(&self, hash: &NativeBlockHash) -> Option<u32> {
         self.active
             .iter()
-            .position(|header| header.block_hash() == *hash)
+            .position(|header| header.compute_hash() == *hash)
             .and_then(|position| u32::try_from(position).ok())
     }
 
@@ -147,8 +156,8 @@ impl FakeChain {
 impl ChainQuery for FakeChain {
     fn headers_after(
         &self,
-        locator_hashes: &[BlockHash],
-        stop_hash: BlockHash,
+        locator_hashes: &[NativeBlockHash],
+        stop_hash: NativeBlockHash,
         limit: usize,
     ) -> Vec<Header> {
         if limit == 0 {
@@ -159,7 +168,7 @@ impl ChainQuery for FakeChain {
             let anchored = self
                 .active_height(&stop_hash)
                 .and_then(|height| self.header_at(height))
-                .filter(|header| header.block_hash() == stop_hash);
+                .filter(|header| header.compute_hash() == stop_hash);
             return anchored.map_or_else(Vec::new, |header| vec![*header]);
         }
 
@@ -169,13 +178,13 @@ impl ChainQuery for FakeChain {
             .find_map(|hash| self.active_height(hash))
             .and_then(|height| height.checked_add(1))
             .unwrap_or(1);
-        let has_stop = stop_hash != BlockHash::all_zeros();
+        let has_stop = stop_hash != NativeBlockHash::default();
         let mut headers = Vec::new();
         while height <= tip_height && headers.len() < limit {
             let Some(header) = self.header_at(height) else {
                 break;
             };
-            let reached_stop = has_stop && header.block_hash() == stop_hash;
+            let reached_stop = has_stop && header.compute_hash() == stop_hash;
             headers.push(*header);
             if reached_stop {
                 break;
@@ -195,13 +204,14 @@ impl ChainQuery for FakeChain {
                 response.not_found.push(*item);
                 continue;
             };
-            let active = self.active_height(&hash).is_some();
+            let native = native_bh(&hash);
+            let active = self.active_height(&native).is_some();
             let known = self
                 .bodies
-                .get(&hash)
-                .is_some_and(|block| block.block_hash() == hash);
+                .get(&native)
+                .is_some_and(|block| block.block_hash() == native);
             if active && known {
-                response.blocks.push(self.bodies[&hash].clone());
+                response.blocks.push(self.bodies[&native].clone());
             } else {
                 response.not_found.push(*item);
             }
@@ -240,12 +250,15 @@ fn version_for_handshake() -> Message {
     Message::Version(version_message(1, 0))
 }
 
-fn get_headers(locator: Vec<BlockHash>, stop: BlockHash) -> Message {
-    Message::GetHeaders(GetHeadersMessage::new(locator, stop))
+fn get_headers(locator: Vec<NativeBlockHash>, stop: NativeBlockHash) -> Message {
+    Message::GetHeaders(GetHeadersMessage::new(
+        locator.into_iter().map(btc_bh).collect(),
+        btc_bh(stop),
+    ))
 }
 
-fn locator_hashes(headers: &[Header]) -> Vec<BlockHash> {
-    headers.iter().map(Header::block_hash).collect()
+fn locator_hashes(headers: &[Header]) -> Vec<NativeBlockHash> {
+    headers.iter().map(Header::compute_hash).collect()
 }
 
 /// Builds one raw v1 frame (magic, command, length, checksum, payload).
@@ -409,20 +422,20 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     // A locator hit at height 1 serves heights 2..=tip.
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(vec![headers[0].block_hash()], BlockHash::all_zeros()),
+        &get_headers(vec![headers[0].compute_hash()], NativeBlockHash::default()),
         Some(&chain),
     )?;
     let [Message::Headers(served)] = response.as_slice() else {
         return Err("expected one headers response".into());
     };
     assert_eq!(served.len(), 3);
-    assert_eq!(served[0].block_hash(), headers[1].block_hash());
-    assert_eq!(served[2].block_hash(), headers[3].block_hash());
+    assert_eq!(served[0].compute_hash(), headers[1].compute_hash());
+    assert_eq!(served[2].compute_hash(), headers[3].compute_hash());
 
     // Stop hash truncates the walk inclusive, like Core's getheaders.
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(locator_hashes(&headers), headers[2].block_hash()),
+        &get_headers(locator_hashes(&headers), headers[2].compute_hash()),
         Some(&chain),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
@@ -434,26 +447,26 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
         "locator hit at height 1; serves heights 2..=3"
     );
     assert_eq!(
-        served.last().map(Header::block_hash),
-        Some(headers[2].block_hash())
+        served.last().map(Header::compute_hash),
+        Some(headers[2].compute_hash())
     );
 
     // Empty locator + known stop answers exactly the stop header (node contract).
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(Vec::new(), headers[3].block_hash()),
+        &get_headers(Vec::new(), headers[3].compute_hash()),
         Some(&chain),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
         return Err("expected headers response".into());
     };
     assert_eq!(served.len(), 1);
-    assert_eq!(served[0].block_hash(), headers[3].block_hash());
+    assert_eq!(served[0].compute_hash(), headers[3].compute_hash());
 
     // Empty locator + zero stop answers nothing.
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(Vec::new(), BlockHash::all_zeros()),
+        &get_headers(Vec::new(), NativeBlockHash::default()),
         Some(&chain),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
@@ -473,7 +486,7 @@ fn headers_responses_truncate_at_the_core_2000_limit() -> Result<(), Box<dyn Err
     // Core clients send at most 101 locator hashes even on long chains.
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(locator_hashes(&headers[..101]), BlockHash::all_zeros()),
+        &get_headers(locator_hashes(&headers[..101]), NativeBlockHash::default()),
         Some(&chain),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
@@ -490,12 +503,12 @@ fn oversized_getheaders_locator_disconnects_before_state_mutation() -> Result<()
     let headers = child_headers(&genesis.header, 2);
     let chain = FakeChain::new(headers.clone(), HashMap::new());
     let mut peer = ready_peer(Magic::REGTEST)?;
-    let locator = vec![headers[0].block_hash(); MAX_LOCATOR_HASHES + 1];
+    let locator = vec![headers[0].compute_hash(); MAX_LOCATOR_HASHES + 1];
 
     let error = expect_protocol_error(
         dispatch_inbound_with_chain(
             &mut peer,
-            &get_headers(locator, BlockHash::all_zeros()),
+            &get_headers(locator, NativeBlockHash::default()),
             Some(&chain),
         ),
         "Core disconnects oversized locators",
@@ -532,8 +545,9 @@ fn inv_getdata_relay_round_trip_serves_blocks_and_notfounds_misses() -> Result<(
     assert_eq!(response, vec![Message::GetData(vec![tx_inv])]);
 
     // getdata over known + missing inventory serves blocks and notfounds the rest.
-    let known = Inventory::Block(genesis.block_hash());
-    let mut missing_hash = genesis.block_hash().to_byte_array();
+    let genesis_hash = genesis.block_hash();
+    let known = Inventory::Block(btc_bh(genesis_hash));
+    let mut missing_hash = *genesis_hash.as_bytes();
     missing_hash[0] ^= 0xff;
     let missing = Inventory::Block(BlockHash::from_byte_array(missing_hash));
     let response = dispatch_inbound_with_chain(
@@ -561,7 +575,7 @@ fn inv_getdata_relay_round_trip_serves_blocks_and_notfounds_misses() -> Result<(
         return Err("expected block on the wire".into());
     };
     assert_eq!(decoded_block.block_hash(), genesis.block_hash());
-    assert_eq!(raw.as_ref(), serialize(&genesis).as_slice());
+    assert_eq!(raw.as_ref(), consensus_bytes(&genesis).as_slice());
     Ok(())
 }
 
@@ -595,7 +609,7 @@ fn inbound_block_and_tx_messages_decode_and_leave_no_response() -> Result<(), Bo
     assert!(responses.is_empty());
 
     let coinbase = genesis
-        .txdata
+        .txs
         .first()
         .ok_or("genesis carries a coinbase transaction")?
         .clone();
@@ -723,7 +737,7 @@ fn decode_only_messages_are_accepted_silently_per_policy() -> Result<(), Box<dyn
     let responses = dispatch_inbound_with_chain(
         &mut peer,
         &Message::GetBlocks(GetBlocksMessage::new(
-            vec![genesis.block_hash()],
+            vec![btc_bh(genesis.block_hash())],
             BlockHash::all_zeros(),
         )),
         Some(&chain),
@@ -786,12 +800,12 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
 
     // Before the reorg: a locator anchored at the stale tip has nothing newer.
     // The fallback entry is the common ancestor (the fork point itself).
-    let stale_tip = branch_a.last().ok_or("branch A tip")?.block_hash();
-    let fork_point = shared.last().ok_or("shared prefix")?.block_hash();
+    let stale_tip = branch_a.last().ok_or("branch A tip")?.compute_hash();
+    let fork_point = shared.last().ok_or("shared prefix")?.compute_hash();
     let locator = vec![stale_tip, fork_point];
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(locator.clone(), BlockHash::all_zeros()),
+        &get_headers(locator.clone(), NativeBlockHash::default()),
         Some(&state),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
@@ -811,15 +825,15 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
     // so the peer now receives branch B's headers from the fork point.
     let response = dispatch_inbound_with_chain(
         &mut peer,
-        &get_headers(locator, BlockHash::all_zeros()),
+        &get_headers(locator, NativeBlockHash::default()),
         Some(&state),
     )?;
     let Some(Message::Headers(served)) = response.first() else {
         return Err("expected headers response".into());
     };
     assert_eq!(served.len(), 2);
-    assert_eq!(served[0].block_hash(), branch_b[0].block_hash());
-    assert_eq!(served[1].block_hash(), branch_b[1].block_hash());
+    assert_eq!(served[0].compute_hash(), branch_b[0].compute_hash());
+    assert_eq!(served[1].compute_hash(), branch_b[1].compute_hash());
 
     // Stale-fork bodies become notfound; new-chain bodies are served.
     // Responses emit served blocks first, then one notfound for the misses —
@@ -827,15 +841,18 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
     let response = dispatch_inbound_with_chain(
         &mut peer,
         &Message::GetData(vec![
-            Inventory::Block(branch_a[0].block_hash()),
-            Inventory::Block(branch_b[0].block_hash()),
+            Inventory::Block(btc_bh(branch_a[0].compute_hash())),
+            Inventory::Block(btc_bh(branch_b[0].compute_hash())),
         ]),
         Some(&state),
     )?;
     match response.as_slice() {
         [Message::Block(block), Message::NotFound(items)] => {
-            assert_eq!(block.block_hash(), branch_b[0].block_hash());
-            assert_eq!(items, &vec![Inventory::Block(branch_a[0].block_hash())]);
+            assert_eq!(block.block_hash(), branch_b[0].compute_hash());
+            assert_eq!(
+                items,
+                &vec![Inventory::Block(btc_bh(branch_a[0].compute_hash()))]
+            );
         }
         other => return Err(format!("unexpected post-reorg relay response {other:?}").into()),
     }
@@ -850,12 +867,12 @@ fn restart_rebuild_serves_identical_answers_to_peers() -> Result<(), Box<dyn Err
     bodies.insert(genesis.block_hash(), genesis.clone());
 
     let before = FakeChain::new(headers.clone(), bodies.clone());
-    let queries: [Vec<BlockHash>; 3] = [
-        vec![headers[0].block_hash()],
+    let queries: [Vec<NativeBlockHash>; 3] = [
+        vec![headers[0].compute_hash()],
         locator_hashes(&headers),
         Vec::new(),
     ];
-    let stops = [BlockHash::all_zeros(), headers[2].block_hash()];
+    let stops = [NativeBlockHash::default(), headers[2].compute_hash()];
 
     let mut cases = Vec::new();
     for locator in &queries {
@@ -873,8 +890,8 @@ fn restart_rebuild_serves_identical_answers_to_peers() -> Result<(), Box<dyn Err
         })
         .collect();
     let inventory = vec![
-        Inventory::Block(genesis.block_hash()),
-        Inventory::Block(headers[1].block_hash()),
+        Inventory::Block(btc_bh(genesis.block_hash())),
+        Inventory::Block(btc_bh(headers[1].compute_hash())),
         Inventory::Transaction(Txid::from_byte_array([3u8; 32])),
     ];
     let expected_response = before.blocks_for_inventory(&inventory);

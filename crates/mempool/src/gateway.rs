@@ -9,7 +9,7 @@
 
 use alloc::sync::Arc;
 
-use bitcoin::{Transaction, Txid};
+use bitcoin_rs_primitives::{Tx, Txid};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 
 use crate::EntryId;
@@ -121,7 +121,7 @@ impl MempoolGateway {
     /// Commits `pool.remove_for_block` and publishes its result.
     pub fn remove_for_block(
         &self,
-        block_txs: &[&Transaction],
+        block_txs: &[&Tx],
         block_txids: &[Txid],
         height: u32,
     ) -> MutationResult {
@@ -221,34 +221,32 @@ mod tests {
     use crate::{Mempool, MempoolEntry, MempoolLimits};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use parking_lot::{Mutex, RwLock};
 
-    fn tx(label: u8) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([label; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn tx(label: u8) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFF,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51, label],
             }],
         }
     }
 
-    fn entry(tx: &Transaction) -> MempoolEntry {
+    fn entry(tx: &Tx) -> MempoolEntry {
         MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7)
     }
 
     fn hash(txid: &Txid) -> Hash256 {
-        Hash256::from_le_bytes(txid.as_byte_array())
+        Hash256::from_le_bytes(txid.as_bytes())
     }
 
     /// Records the txid and outcome of every change the observer sees.
@@ -281,6 +279,11 @@ mod tests {
         )
     }
 
+    /// Clones a concrete observer as its trait object without an `as` cast.
+    fn dyn_observer<T: MempoolObserver + 'static>(observer: &Arc<T>) -> Arc<dyn MempoolObserver> {
+        observer.clone()
+    }
+
     fn removed(reason: RemovalReason) -> MutationOutcome {
         MutationOutcome::Removed(reason)
     }
@@ -288,12 +291,12 @@ mod tests {
     #[test]
     fn accepted_and_removed_events_arrive_in_commit_order() {
         let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
 
         let parent = tx(1);
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let mut child = tx(2);
-        child.input[0].previous_output = OutPoint::new(parent_txid, 0);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
         gateway.insert_entry(entry(&parent)).expect("parent in");
         gateway.insert_entry(entry(&child)).expect("child in");
         gateway.remove_by_txid(&parent_txid);
@@ -303,13 +306,10 @@ mod tests {
             *seen,
             vec![
                 (hash(&parent_txid), MutationOutcome::Accepted),
-                (hash(&child.compute_txid()), MutationOutcome::Accepted),
+                (hash(&child.txid()), MutationOutcome::Accepted),
                 (hash(&parent_txid), removed(RemovalReason::Explicit)),
                 // The child sweeps with its parent, after it.
-                (
-                    hash(&child.compute_txid()),
-                    removed(RemovalReason::Explicit)
-                ),
+                (hash(&child.txid()), removed(RemovalReason::Explicit)),
             ],
             "one event per change, in commit order"
         );
@@ -318,10 +318,10 @@ mod tests {
     #[test]
     fn remove_for_block_reports_block_inclusion_not_explicit() {
         let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
 
         let mined = tx(3);
-        let mined_txid = mined.compute_txid();
+        let mined_txid = mined.txid();
         gateway.insert_entry(entry(&mined)).expect("in");
         observer.seen.lock().clear();
         gateway.remove_for_block(&[&mined], &[mined_txid], 8);
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn failed_insert_and_noop_remove_publish_nothing() {
         let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
         let before = gateway.read().sequence_number();
 
         // Below the default min-relay floor (1_000 sat/kvB): rejected before
@@ -344,7 +344,7 @@ mod tests {
         let poor = MempoolEntry::new(Arc::new(tx(4)), 100, 50, 1, 7);
         assert!(gateway.insert_entry(poor).is_err());
         let stranger = tx(5);
-        gateway.remove_by_txid(&stranger.compute_txid());
+        gateway.remove_by_txid(&stranger.txid());
         gateway.clear();
 
         assert!(observer.seen.lock().is_empty());
@@ -358,20 +358,20 @@ mod tests {
     #[test]
     fn replacement_tags_direct_conflicts_and_descendants() {
         let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>));
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
 
         let parent = tx(6);
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         gateway.insert_entry(entry(&parent)).expect("parent in");
         let mut child = tx(7);
-        child.input[0].previous_output = OutPoint::new(parent_txid, 0);
-        child.input[0].sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
-        let child_txid = child.compute_txid();
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        child.inputs[0].sequence = 0xFFFF_FFFD;
+        let child_txid = child.txid();
         gateway.insert_entry(entry(&child)).expect("child in");
         let mut grandchild = tx(8);
-        grandchild.input[0].previous_output = OutPoint::new(child_txid, 0);
-        grandchild.input[0].sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
-        let grandchild_txid = grandchild.compute_txid();
+        grandchild.inputs[0].previous_output = OutPoint::new(child_txid, 0);
+        grandchild.inputs[0].sequence = 0xFFFF_FFFD;
+        let grandchild_txid = grandchild.txid();
         gateway
             .insert_entry(entry(&grandchild))
             .expect("grandchild in");
@@ -381,9 +381,9 @@ mod tests {
         // the direct conflict (Replaced) and the grandchild sweeps with it
         // (Descendant). The parent survives.
         let mut replacement = tx(9);
-        replacement.input[0].previous_output = OutPoint::new(parent_txid, 0);
-        replacement.input[0].sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
-        let replacement_txid = replacement.compute_txid();
+        replacement.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        replacement.inputs[0].sequence = 0xFFFF_FFFD;
+        let replacement_txid = replacement.txid();
         let result = gateway
             .replace_transaction(
                 crate::ReplacementCandidate::new(Arc::new(replacement), 100, 5_000, 1),
@@ -419,7 +419,7 @@ mod tests {
         let gateway = gateway_with(Some(Arc::new(PanickingObserver)));
 
         let committed = tx(9);
-        let committed_txid = committed.compute_txid();
+        let committed_txid = committed.txid();
         gateway
             .insert_entry(entry(&committed))
             .expect("still returns");
@@ -443,9 +443,9 @@ mod tests {
     fn sequence_base_matches_per_change_assignment() {
         let gateway = gateway_with(None);
         let parent = tx(11);
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let mut child = tx(12);
-        child.input[0].previous_output = OutPoint::new(parent_txid, 0);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
         gateway.insert_entry(entry(&parent)).expect("in");
         gateway.insert_entry(entry(&child)).expect("in");
         let removed = gateway.remove_by_txid(&parent_txid);
@@ -468,7 +468,7 @@ mod tests {
                 max_total_bytes: 150,
                 ..MempoolLimits::default()
             }))),
-            Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>),
+            Some(dyn_observer(&observer)),
         );
 
         let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
@@ -482,12 +482,12 @@ mod tests {
             "the eviction is part of the insert"
         );
         assert_eq!(result.changes[0].outcome, MutationOutcome::Accepted);
-        assert_eq!(result.changes[0].txid, hash(&tx(14).compute_txid()));
+        assert_eq!(result.changes[0].txid, hash(&tx(14).txid()));
         assert_eq!(
             result.changes[1].outcome,
             MutationOutcome::Removed(RemovalReason::PolicyEviction)
         );
-        assert_eq!(result.changes[1].txid, hash(&tx(13).compute_txid()));
+        assert_eq!(result.changes[1].txid, hash(&tx(13).txid()));
         // Sequences are contiguous across the batch and assigned in order.
         assert_eq!(result.sequence_base, 2);
         assert_eq!(result.sequence_of(1), Some(3));
@@ -586,10 +586,10 @@ mod tests {
         });
         let gateway = Arc::new(MempoolGateway::new(
             Arc::clone(&pool),
-            Some(Arc::clone(&observer) as Arc<dyn MempoolObserver>),
+            Some(dyn_observer(&observer)),
         ));
 
-        let first_txid = tx(20).compute_txid();
+        let first_txid = tx(20).txid();
         let first = Arc::clone(&gateway);
         let first_handle =
             std::thread::spawn(move || first.insert_entry(entry(&tx(20))).expect("first in"));
@@ -597,7 +597,7 @@ mod tests {
             .recv_timeout(core::time::Duration::from_secs(10))
             .expect("first observer call started");
 
-        let second_txid = tx(21).compute_txid();
+        let second_txid = tx(21).txid();
         let second = Arc::clone(&gateway);
         let second_handle =
             std::thread::spawn(move || second.insert_entry(entry(&tx(21))).expect("second in"));
@@ -677,9 +677,7 @@ mod tests {
         const CYCLES: usize = 1_500;
         const MEMBER_LABELS: [u8; 4] = [20, 21, 22, 23];
         let observer = Arc::new(SequenceStreamObserver::default());
-        let gateway = Arc::new(gateway_with(Some(
-            Arc::clone(&observer) as Arc<dyn MempoolObserver>
-        )));
+        let gateway = Arc::new(gateway_with(Some(dyn_observer(&observer))));
 
         let handles: Vec<_> = MEMBER_LABELS
             .iter()
@@ -687,7 +685,7 @@ mod tests {
                 let gateway = Arc::clone(&gateway);
                 std::thread::spawn(move || {
                     let member = tx(label);
-                    let member_txid = member.compute_txid();
+                    let member_txid = member.txid();
                     for _ in 0..CYCLES {
                         gateway.insert_entry(entry(&member)).expect("admitted");
                         gateway.remove_by_txid(&member_txid);
@@ -699,10 +697,10 @@ mod tests {
             handle.join().expect("mutator thread");
         }
 
-        let total = (MEMBER_LABELS.len() * CYCLES * 2) as u64;
+        let total = u64::try_from(MEMBER_LABELS.len() * CYCLES * 2).expect("change count fits u64");
         let stream = observer.stream.lock();
         assert_eq!(
-            stream.len() as u64,
+            u64::try_from(stream.len()).expect("stream length fits u64"),
             total,
             "every committed change published exactly once"
         );

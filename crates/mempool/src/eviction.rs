@@ -64,9 +64,7 @@ pub fn mempool_min_fee_sat_per_kvb(pool: &Mempool, incremental_relay_fee_sat_per
 #[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 
     use super::{evict_lowest_fee_packages, mempool_min_fee_sat_per_kvb};
     use crate::mutation::{MutationChange, MutationOutcome, RemovalReason};
@@ -112,7 +110,7 @@ mod tests {
         assert_eq!(
             evicted,
             vec![MutationChange {
-                txid: Hash256::from_le_bytes(tx(3).compute_txid().as_byte_array()),
+                txid: Hash256::from_le_bytes(tx(3).txid().as_bytes()),
                 outcome: MutationOutcome::Removed(RemovalReason::PolicyEviction),
             }],
             "the lowest-fee package leaves first, tagged PolicyEviction"
@@ -140,19 +138,19 @@ mod tests {
         assert_eq!(mempool_min_fee_sat_per_kvb(&pool, 1_000), 5_000);
     }
 
-    fn tx(label: u8) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([label; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn tx(label: u8) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51, label],
             }],
         }
     }

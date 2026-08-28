@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 
-use bitcoin::Txid;
+use bitcoin_rs_primitives::Txid;
 use hashbrown::HashMap;
 
 /// Bucket fee-rate growth numerator: each bucket's lower bound is 5% above
@@ -369,19 +369,19 @@ fn build_buckets() -> Vec<Bucket> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
+    use bitcoin_rs_primitives::Hash256;
 
     fn test_txid(n: u8) -> Txid {
         let mut bytes = [0u8; 32];
         bytes[0] = n;
-        Txid::from_byte_array(bytes)
+        Txid(Hash256::from_le_bytes(&bytes))
     }
 
     /// A txid spread over more than 256 values, for the capacity test.
     fn wide_txid(n: u32) -> Txid {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&n.to_le_bytes());
-        Txid::from_byte_array(bytes)
+        Txid(Hash256::from_le_bytes(&bytes))
     }
 
     fn assert_estimator_state_eq(left: &FeeEstimator, right: &FeeEstimator) {

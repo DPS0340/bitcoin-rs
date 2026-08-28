@@ -260,7 +260,6 @@ dependencies = [
 name = "bitcoin-rs-index"
 version = "0.4.0"
 dependencies = [
- "bitcoin",
  "bitcoin-rs-primitives",
  "bitcoin-rs-storage",
  "bitcoin_slices",
@@ -271,6 +270,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror",
  "tracing",
@@ -282,7 +282,6 @@ name = "bitcoin-rs-mempool"
 version = "0.4.0"
 dependencies = [
  "arc-swap",
- "bitcoin",
  "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
  "bitcoin-rs-script",
@@ -292,6 +291,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "serde_json",
+ "sha2 0.11.0",
  "slab",
  "smallvec",
  "thiserror",
@@ -304,17 +304,13 @@ name = "bitcoin-rs-mining"
 version = "0.4.0"
 dependencies = [
  "bitcoin",
- "bitcoin-rs-chain",
  "bitcoin-rs-consensus",
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
+ "bitcoin-rs-script",
  "criterion",
- "parking_lot",
  "proptest",
- "serde",
- "serde_json",
  "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -395,10 +391,10 @@ name = "bitcoin-rs-primitives"
 version = "0.4.0"
 dependencies = [
  "bitcoin",
- "bitcoin_hashes",
  "bytemuck",
  "proptest",
  "ruint",
+ "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tinyvec",
@@ -429,6 +425,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sonic-rs",
  "tempfile",
  "thiserror",

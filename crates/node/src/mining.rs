@@ -13,11 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
-use bitcoin::ScriptBuf;
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::Mempool;
 use bitcoin_rs_mining::{Candidate, CandidateContext, TemplateId, assemble_candidate};
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Block, Hash256, Network};
 use bitcoin_rs_rpc::context::{
     AvailableMiningRule, BlockTemplate, BlockTemplateMode, BlockTemplateRequest,
     BlockTemplateResult, BlockValidationResult, LastCandidateInfo, MiningCapability, MiningControl,
@@ -138,7 +137,7 @@ pub struct MiningCoordinator {
     block_tree: Arc<RwLock<BlockTree>>,
     mempool: Arc<RwLock<Mempool>>,
     apply_handles: ApplyHandles,
-    coinbase_script: ScriptBuf,
+    coinbase_script: Vec<u8>,
     shutdown: Arc<AtomicBool>,
     /// Wall clock used for long-poll cooldowns.
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -152,7 +151,7 @@ impl MiningCoordinator {
     /// Builds a coordinator over the shared applied-chain and mempool handles.
     ///
     /// `coinbase_script` is required and stored immutably. Pass
-    /// [`ScriptBuf::new`] for transport-only template assembly when the node
+    /// `Vec::new()` for transport-only template assembly when the node
     /// does not own a miner payout script.
     #[must_use]
     pub fn new(
@@ -161,7 +160,7 @@ impl MiningCoordinator {
         block_tree: Arc<RwLock<BlockTree>>,
         mempool: Arc<RwLock<Mempool>>,
         apply_handles: ApplyHandles,
-        coinbase_script: ScriptBuf,
+        coinbase_script: Vec<u8>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -400,7 +399,7 @@ impl MiningCoordinator {
             previous_block_hash: chain.previous_block_hash,
             height: chain.height,
             version: chain.version,
-            bits: chain.bits.to_consensus(),
+            bits: chain.bits,
             min_time: chain.min_time,
             current_time: current_time.max(chain.min_time),
             locktime_cutoff: chain.locktime_cutoff(current_time.max(chain.min_time)),
@@ -461,17 +460,15 @@ impl MiningCoordinator {
         }
     }
 
-    fn propose(&self, block: &bitcoin::Block) -> BlockValidationResult {
+    fn propose(&self, block: &Block) -> BlockValidationResult {
         match apply::validate_block(&self.apply_handles, block) {
             Ok(()) => BlockValidationResult::Accepted,
             Err(error) => map_apply_error(error),
         }
     }
 
-    fn submit(&self, block: &bitcoin::Block) -> Result<BlockValidationResult, MiningControlError> {
-        use bitcoin::hashes::Hash as _;
-
-        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    fn submit(&self, block: &Block) -> Result<BlockValidationResult, MiningControlError> {
+        let block_hash: Hash256 = block.block_hash().into();
         {
             let tree = self.block_tree.read();
             if let Some(node_id) = tree.lookup(block_hash) {
@@ -530,7 +527,7 @@ impl MiningCoordinator {
                         })?;
                 (
                     difficulty_for_bits(tip_bits),
-                    next.bits.to_consensus(),
+                    next.bits,
                     difficulty_for_bits(next.bits),
                 )
             }
@@ -605,10 +602,7 @@ impl MiningControl for MiningCoordinator {
         self.mining_info_snapshot()
     }
 
-    fn submit_block(
-        &self,
-        block: bitcoin::Block,
-    ) -> Result<BlockValidationResult, MiningControlError> {
+    fn submit_block(&self, block: Block) -> Result<BlockValidationResult, MiningControlError> {
         self.submit(&block)
     }
 
@@ -701,11 +695,34 @@ fn signet_info(network: Network) -> Option<SignetMiningInfo> {
     if network != Network::Signet {
         return None;
     }
-    let challenge = match ScriptBuf::from_hex(DEFAULT_SIGNET_CHALLENGE) {
-        Ok(challenge) => challenge,
-        Err(error) => panic!("Bitcoin Core's default Signet challenge is invalid: {error}"),
-    };
+    let challenge = hex_decode(DEFAULT_SIGNET_CHALLENGE)
+        .unwrap_or_else(|| panic!("Bitcoin Core's default Signet challenge is invalid hex"));
     Some(SignetMiningInfo { challenge })
+}
+
+/// Decodes a lowercase hex string to bytes. Returns `None` on invalid input.
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.as_bytes().iter();
+    while let Some(&hi) = chars.next() {
+        let &lo = chars.next()?;
+        let high = decode_nibble(hi)?;
+        let low = decode_nibble(lo)?;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
+fn decode_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -713,7 +730,7 @@ mod generation_key_tests {
     use super::{GenerationKey, parse_long_poll_id};
     use alloc::sync::Arc;
     use bitcoin_rs_mining::{Candidate, TemplateId};
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, Tx, TxOut};
 
     #[test]
     fn long_poll_round_trips_template_id() {
@@ -754,17 +771,16 @@ mod generation_key_tests {
     #[test]
     fn candidate_cache_evicts_the_oldest_entry_at_the_bound() {
         use alloc::sync::Arc;
-        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
         use bitcoin_rs_mining::Candidate;
 
         let mut state = super::CoordinatorState::new();
-        let coinbase = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+        let coinbase = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
         let mut first_id = None;
@@ -812,7 +828,6 @@ mod generation_key_tests {
     }
 
     fn sample_candidate(previous: Hash256, csv_active: bool, segwit_active: bool) -> Candidate {
-        use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
         Candidate {
             template_id: TemplateId::new(&previous, 1),
             previous_block_hash: previous,
@@ -827,13 +842,13 @@ mod generation_key_tests {
             max_size: 4_000_000,
             max_sigops: 80_000,
             mempool_sequence: 1,
-            coinbase: Transaction {
-                version: bitcoin::transaction::Version::TWO,
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: Vec::new(),
-                output: vec![TxOut {
-                    value: Amount::from_sat(50),
-                    script_pubkey: ScriptBuf::new(),
+            coinbase: Tx {
+                version: 2,
+                lock_time: 0,
+                inputs: Vec::new(),
+                outputs: vec![TxOut {
+                    value: 50,
+                    script_pubkey: Vec::new(),
                 }],
             },
             coinbase_value: 50,

@@ -15,8 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{Amount, ScriptBuf};
-use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
 use bitcoin_rs_utxo::{
     BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoInserted, UtxoRemoved, UtxoSet,
 };
@@ -113,8 +112,8 @@ fn txout(seed: u64) -> TxOut {
     script.extend_from_slice(&[0x00, 0x20]);
     script.extend_from_slice(&txid(seed).to_le_bytes());
     TxOut {
-        value: Amount::from_sat(5_000 + seed),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 5_000 + seed,
+        script_pubkey: script,
     }
 }
 
@@ -126,7 +125,7 @@ fn synthetic_workload(seed: u64, shape: ShardShape) -> SyntheticWorkload {
 
     for i in 0_u64..ENTRY_COUNT {
         let spend_seed = next_u64(&mut rng);
-        let outpoint = OutPoint::new(shaped_txid(spend_seed, i, shape), 0);
+        let outpoint = OutPoint::new(shaped_txid(spend_seed, i, shape).into(), 0);
         spends.push(SyntheticEntry {
             outpoint,
             txout: txout(spend_seed),
@@ -137,8 +136,8 @@ fn synthetic_workload(seed: u64, shape: ShardShape) -> SyntheticWorkload {
 
     for i in 0_u64..ENTRY_COUNT {
         let add_seed = next_u64(&mut rng).wrapping_add(i);
-        let outpoint = OutPoint::new(shaped_txid(add_seed, i, shape), 0);
-        let shard = usize::from(outpoint.txid.prefix8()[0]);
+        let outpoint = OutPoint::new(shaped_txid(add_seed, i, shape).into(), 0);
+        let shard = usize::from(outpoint.txid.as_bytes()[0]);
         distribution[shard] = distribution[shard].saturating_add(1);
         adds.push(SyntheticEntry {
             outpoint,
@@ -187,7 +186,7 @@ fn same_txid_churn_case(seed: u64) -> (UtxoSet, BlockChanges) {
     for vout in 0_u32..256 {
         let seed = seed.wrapping_add(u64::from(vout));
         preload.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
+            OutPoint::new(live_txid.into(), vout),
             txout(seed),
             false,
             1,
@@ -198,12 +197,12 @@ fn same_txid_churn_case(seed: u64) -> (UtxoSet, BlockChanges) {
     }
 
     for vout in 0_u32..128 {
-        changes.remove(OutPoint::new(live_txid, vout));
+        changes.remove(OutPoint::new(live_txid.into(), vout));
     }
     for vout in 256_u32..384 {
         let seed = seed.wrapping_add(u64::from(vout));
         changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
+            OutPoint::new(live_txid.into(), vout),
             txout(seed),
             false,
             2,
@@ -221,7 +220,7 @@ fn same_txid_full_spend_case(seed: u64) -> (UtxoSet, BlockChanges) {
 
     for vout in 0_u32..64 {
         let seed = seed.wrapping_add(u64::from(vout));
-        let outpoint = OutPoint::new(live_txid, vout);
+        let outpoint = OutPoint::new(live_txid.into(), vout);
         preload.add(UtxoAdd::new(outpoint, txout(seed), false, 1));
         changes.remove(outpoint);
     }
@@ -240,7 +239,7 @@ fn same_txid_high_vout_full_spend_case(seed: u64) -> (UtxoSet, BlockChanges) {
 
     for vout in 64_u32..128 {
         let seed = seed.wrapping_add(u64::from(vout));
-        let outpoint = OutPoint::new(live_txid, vout);
+        let outpoint = OutPoint::new(live_txid.into(), vout);
         preload.add(UtxoAdd::new(outpoint, txout(seed), false, 1));
         changes.remove(outpoint);
     }
@@ -259,7 +258,7 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
         BlockChanges::with_capacity(SPEND_PROXY_FANOUT.saturating_mul(2), SPEND_PROXY_FANOUT);
 
     for vout in 0..SPEND_PROXY_FANOUT {
-        let outpoint = OutPoint::new(source_txid, u32::try_from(vout).unwrap_or(0));
+        let outpoint = OutPoint::new(source_txid.into(), u32::try_from(vout).unwrap_or(0));
         preload.add(UtxoAdd::new(
             outpoint,
             spend_proxy_coinbase_txout(),
@@ -275,7 +274,7 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
     let coinbase_txid = txid(seed.wrapping_add(2));
     for vout in 0..SPEND_PROXY_FANOUT {
         changes.add(UtxoAdd::new(
-            OutPoint::new(coinbase_txid, u32::try_from(vout).unwrap_or(0)),
+            OutPoint::new(coinbase_txid.into(), u32::try_from(vout).unwrap_or(0)),
             spend_proxy_coinbase_txout(),
             true,
             SPEND_PROXY_SPEND_HEIGHT,
@@ -287,7 +286,8 @@ fn spend_fanout_case(seed: u64) -> (UtxoSet, BlockChanges) {
                 txid(
                     seed.wrapping_add(3)
                         .wrapping_add(u64::try_from(index).unwrap_or(0)),
-                ),
+                )
+                .into(),
                 0,
             ),
             spend_proxy_spend_txout(),
@@ -316,7 +316,7 @@ fn interleaved_same_txid_churn_case(seed: u64) -> (UtxoSet, BlockChanges) {
     for vout in 0_u32..INTERLEAVED_VOUTS_PER_TXID {
         for (tx_index, txid) in txids.iter().enumerate() {
             let tx_index = u64::try_from(tx_index).unwrap_or(0);
-            let outpoint = OutPoint::new(*txid, vout);
+            let outpoint = OutPoint::new(Txid::from(*txid), vout);
             preload.add(UtxoAdd::new(
                 outpoint,
                 txout(seed.wrapping_add(tx_index).wrapping_add(u64::from(vout))),
@@ -334,7 +334,7 @@ fn interleaved_same_txid_churn_case(seed: u64) -> (UtxoSet, BlockChanges) {
         for (tx_index, txid) in txids.iter().enumerate() {
             let tx_index = u64::try_from(tx_index).unwrap_or(0);
             changes.add(UtxoAdd::new(
-                OutPoint::new(*txid, vout),
+                OutPoint::new(Txid::from(*txid), vout),
                 txout(
                     seed.wrapping_add(0x1000)
                         .wrapping_add(tx_index)
@@ -375,15 +375,15 @@ fn synthetic_listener_case(seed: u64, shape: ShardShape) -> (UtxoSet, BlockChang
 
 fn spend_proxy_coinbase_txout() -> TxOut {
     TxOut {
-        value: Amount::from_sat(SPEND_PROXY_COINBASE_OUTPUT_VALUE),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+        script_pubkey: vec![0x51],
     }
 }
 
 fn spend_proxy_spend_txout() -> TxOut {
     TxOut {
-        value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        value: SPEND_PROXY_SPEND_OUTPUT_VALUE,
+        script_pubkey: vec![0x51],
     }
 }
 
@@ -662,10 +662,10 @@ fn bench_spend_fanout(c: &mut Criterion) {
 fn bench_matched_lookup(c: &mut Criterion) {
     let (set, _changes) = same_txid_churn_case(0x0102_0304);
     let live_txid = txid(0x0102_0304);
-    let first = OutPoint::new(live_txid, 0);
-    let middle = OutPoint::new(live_txid, 127);
-    let last = OutPoint::new(live_txid, 255);
-    let miss = OutPoint::new(live_txid, 256);
+    let first = OutPoint::new(live_txid.into(), 0);
+    let middle = OutPoint::new(live_txid.into(), 127);
+    let last = OutPoint::new(live_txid.into(), 255);
+    let miss = OutPoint::new(live_txid.into(), 256);
 
     c.bench_function("utxo_commit/same_txid_lookup_get_first", |b| {
         b.iter(|| black_box(set.get(black_box(&first))));

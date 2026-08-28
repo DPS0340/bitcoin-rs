@@ -1,10 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::time::Instant;
 
+use bitcoin_rs_primitives::{OutPoint, Tx, TxOut, Txid};
 #[cfg(not(feature = "kernel"))]
 use bitcoin_rs_script::Interpreter;
-use bitcoin_rs_script::VerifyFlags;
+use bitcoin_rs_script::script::instructions;
+use bitcoin_rs_script::{
+    Instruction, VerifyFlags, count_segwit, count_tx_legacy, is_p2sh, is_witness_program, opcode,
+};
 use rayon::prelude::*;
 
 use crate::rust_path::UtxoView;
@@ -78,13 +82,13 @@ static SCRIPT_VERIFY_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 ///
 /// Callers choose the timestamp cutoff: block header time before BIP113, previous-tip MTP after.
 #[must_use]
-pub fn is_final_tx(tx: &bitcoin::Transaction, block_height: u32, locktime_cutoff: u32) -> bool {
+pub fn is_final_tx(tx: &Tx, block_height: u32, locktime_cutoff: u32) -> bool {
     is_final_tx_with_locktime_cutoff(tx, block_height, locktime_cutoff)
 }
 
 /// Verifies that a coinbase transaction's scriptSig length is within consensus bounds.
-pub fn verify_coinbase_script_sig_size(tx: &bitcoin::Transaction) -> Result<(), ConsensusError> {
-    if let Some(input) = tx.input.first().filter(|_| tx.is_coinbase()) {
+pub fn verify_coinbase_script_sig_size(tx: &Tx) -> Result<(), ConsensusError> {
+    if let Some(input) = tx.inputs.first().filter(|_| is_coinbase(tx)) {
         let len = input.script_sig.len();
         if !(MIN_COINBASE_SCRIPT_SIG_SIZE..=MAX_COINBASE_SCRIPT_SIG_SIZE).contains(&len) {
             return Err(ConsensusError::CoinbaseScriptSigSize { len });
@@ -93,16 +97,22 @@ pub fn verify_coinbase_script_sig_size(tx: &bitcoin::Transaction) -> Result<(), 
     Ok(())
 }
 
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1 && is_null_outpoint(&tx.inputs[0].previous_output)
+}
+
+/// Core's `OutPoint::IsNull`: null hash plus `NULL_INDEX` (`u32::MAX`), the
+/// coinbase marker. The derived all-zero outpoint (`vout` 0) is not null.
+fn is_null_outpoint(outpoint: &OutPoint) -> bool {
+    outpoint.txid == Txid::default() && outpoint.vout == u32::MAX
+}
+
 /// Returns `true` iff the transaction is locktime-final at `block_height` and `locktime_cutoff`.
 ///
 /// Callers choose the timestamp cutoff: block header time before BIP113, previous-tip MTP after.
 #[must_use]
-fn is_final_tx_with_locktime_cutoff(
-    tx: &bitcoin::Transaction,
-    block_height: u32,
-    locktime_cutoff: u32,
-) -> bool {
-    let lock_time = tx.lock_time.to_consensus_u32();
+fn is_final_tx_with_locktime_cutoff(tx: &Tx, block_height: u32, locktime_cutoff: u32) -> bool {
+    let lock_time = tx.lock_time;
     if lock_time == 0 {
         return true;
     }
@@ -116,10 +126,9 @@ fn is_final_tx_with_locktime_cutoff(
         return true;
     }
 
-    let sequence_final = bitcoin::Sequence::from_consensus(SEQUENCE_FINAL);
-    tx.input
+    tx.inputs
         .iter()
-        .all(|input| input.sequence == sequence_final)
+        .all(|input| input.sequence == SEQUENCE_FINAL)
 }
 
 /// Verifies non-contextual and input-script transaction rules for a transaction.
@@ -128,7 +137,7 @@ fn is_final_tx_with_locktime_cutoff(
 /// BIP113 activation and previous-tip MTP after. A `locktime_cutoff` of `0` retains the
 /// old non-contextual behavior for callers that do not have an MTP.
 pub fn verify_transaction(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     prevouts: &impl UtxoView,
     height: u32,
     locktime_cutoff: u32,
@@ -144,7 +153,7 @@ pub fn verify_transaction(
 /// prevouts, missing prevouts, input/output value balance, and sigop limits. Skips
 /// kernel/script script execution. This is the assume-valid entry.
 pub fn verify_transaction_non_script(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     prevouts: &impl UtxoView,
     height: u32,
     locktime_cutoff: u32,
@@ -160,7 +169,7 @@ pub fn verify_transaction_non_script(
 }
 
 fn verify_transaction_with_locktime_cutoff(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     prevouts: &impl UtxoView,
     height: u32,
     locktime_cutoff: u32,
@@ -183,8 +192,11 @@ fn verify_transaction_with_locktime_cutoff(
         crate::kernel::verify_tx_scripts(tx, &prep.prevouts, flags)?;
         #[cfg(not(feature = "kernel"))]
         {
-            let all_prevouts: Vec<&bitcoin::TxOut> =
-                prep.prevouts.iter().map(|(_, prevout)| prevout).collect();
+            let all_prevouts: Vec<TxOut> = prep
+                .prevouts
+                .iter()
+                .map(|(_, prevout)| prevout.clone())
+                .collect();
             for (input_index, (_, prevout)) in prep.prevouts.iter().enumerate() {
                 verify_input_script_portable(input_index, prevout, &all_prevouts, tx, flags)?;
             }
@@ -197,7 +209,7 @@ fn verify_transaction_with_locktime_cutoff(
 /// Resolved per-transaction state carried from the pre-phase into the script and
 /// post phases.
 struct TxPrep {
-    prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
+    prevouts: Vec<(OutPoint, TxOut)>,
     input_value: u64,
     output_value: u64,
 }
@@ -208,10 +220,10 @@ struct TxPrep {
 /// resolves each input's prevout. Returns `Ok(None)` for an accepted coinbase
 /// (no inputs to verify) and `Ok(Some(prep))` for a clean non-coinbase tx.
 fn prepare_tx_checks(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     height: u32,
     locktime_cutoff: u32,
-    mut lookup: impl FnMut(usize, &bitcoin::OutPoint) -> Option<bitcoin::TxOut>,
+    mut lookup: impl FnMut(usize, &OutPoint) -> Option<TxOut>,
 ) -> Result<Option<TxPrep>, ConsensusError> {
     if !is_final_tx_with_locktime_cutoff(tx, height, locktime_cutoff) {
         return Err(ConsensusError::Bip {
@@ -219,27 +231,27 @@ fn prepare_tx_checks(
             reason: format!(
                 "non-final transaction at height {height} locktime cutoff \
                  {locktime_cutoff}: locktime {}",
-                tx.lock_time.to_consensus_u32()
+                tx.lock_time
             ),
         });
     }
 
-    if tx.input.is_empty() {
+    if tx.inputs.is_empty() {
         return Err(ConsensusError::EmptyInputs);
     }
-    if tx.output.is_empty() {
+    if tx.outputs.is_empty() {
         return Err(ConsensusError::EmptyOutputs);
     }
 
     let output_value = total_output_value(tx)?;
-    if tx.is_coinbase() {
+    if is_coinbase(tx) {
         verify_coinbase_script_sig_size(tx)?;
         return Ok(None);
     }
 
-    let mut seen = BTreeSet::new();
-    for (input_index, input) in tx.input.iter().enumerate() {
-        if input.previous_output.is_null() {
+    let mut seen = HashSet::new();
+    for (input_index, input) in tx.inputs.iter().enumerate() {
+        if is_null_outpoint(&input.previous_output) {
             return Err(ConsensusError::NullPrevout { input_index });
         }
         if !seen.insert(input.previous_output) {
@@ -248,12 +260,12 @@ fn prepare_tx_checks(
     }
 
     let mut input_value = 0u64;
-    let mut prevouts = Vec::with_capacity(tx.input.len());
-    for (input_index, input) in tx.input.iter().enumerate() {
+    let mut prevouts = Vec::with_capacity(tx.inputs.len());
+    for (input_index, input) in tx.inputs.iter().enumerate() {
         let prevout = lookup(input_index, &input.previous_output)
             .ok_or(ConsensusError::MissingPrevout { input_index })?;
         input_value = input_value
-            .checked_add(prevout.value.to_sat())
+            .checked_add(prevout.value)
             .ok_or(ConsensusError::OutputValueOverflow)?;
         prevouts.push((input.previous_output, prevout));
     }
@@ -267,10 +279,7 @@ fn prepare_tx_checks(
 
 /// Runs a transaction's deferred post-checks: input/output value balance and the
 /// sigop-cost limit, reusing the resolved prevouts.
-fn finalize_tx_value_and_sigops(
-    tx: &bitcoin::Transaction,
-    prep: &TxPrep,
-) -> Result<(), ConsensusError> {
+fn finalize_tx_value_and_sigops(tx: &Tx, prep: &TxPrep) -> Result<(), ConsensusError> {
     if prep.input_value < prep.output_value {
         return Err(ConsensusError::InputsLessThanOutputs {
             input_value: prep.input_value,
@@ -278,11 +287,8 @@ fn finalize_tx_value_and_sigops(
         });
     }
 
-    let mut sigop_lookup_cursor = 0usize;
-    let sigop_cost = u32::try_from(tx.total_sigop_cost(|outpoint| {
-        cached_prevout_lookup(&prep.prevouts, &mut sigop_lookup_cursor, outpoint)
-    }))
-    .unwrap_or(u32::MAX);
+    let _ = 0usize;
+    let sigop_cost = total_sigop_cost(tx, &prep.prevouts);
     if sigop_cost > MAX_BLOCK_SIGOPS_COST {
         return Err(ConsensusError::SigopsLimit {
             cost: sigop_cost,
@@ -297,18 +303,17 @@ fn finalize_tx_value_and_sigops(
 #[cfg(not(feature = "kernel"))]
 fn verify_input_script_portable(
     input_index: usize,
-    prevout: &bitcoin::TxOut,
-    all_prevouts: &[&bitcoin::TxOut],
-    tx: &bitcoin::Transaction,
+    prevout: &TxOut,
+    all_prevouts: &[TxOut],
+    tx: &Tx,
     flags: VerifyFlags,
 ) -> Result<(), ConsensusError> {
-    let input = &tx.input[input_index];
-    let witness = input.witness.to_vec();
+    let input = &tx.inputs[input_index];
     Interpreter
         .execute_with_prevouts(
-            prevout.script_pubkey.as_bytes(),
-            input.script_sig.as_bytes(),
-            &witness,
+            &prevout.script_pubkey,
+            &input.script_sig,
+            &input.witness,
             flags,
             all_prevouts,
             tx,
@@ -324,7 +329,7 @@ fn verify_input_script_portable(
 /// Per-transaction state retained across the flat block verify phases.
 struct PreparedTx<'b> {
     tx_index: usize,
-    prevouts: Vec<(bitcoin::OutPoint, bitcoin::TxOut)>,
+    prevouts: Vec<(OutPoint, TxOut)>,
     pre_error: Option<ConsensusError>,
     post_error: Option<ConsensusError>,
     checks_start: usize,
@@ -373,8 +378,8 @@ pub struct ScriptStageTimings {
 /// returned, so the caller records them on the success and error paths. This
 /// crate has no `metrics` dependency, so the caller owns the histogram recording.
 pub fn verify_block_input_scripts(
-    txs: &[bitcoin::Transaction],
-    resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    txs: &[Tx],
+    resolved: Vec<Vec<Option<TxOut>>>,
     height: u32,
     locktime_cutoff: u32,
     flags: VerifyFlags,
@@ -404,7 +409,7 @@ pub fn verify_block_input_scripts(
 /// Holds the borrow into the caller's parsed kernel block, so the block must
 /// outlive every unit built from it.
 pub struct BlockScriptChecks<'b> {
-    txs: &'b [bitcoin::Transaction],
+    txs: &'b [Tx],
     prepared: Vec<PreparedTx<'b>>,
     checks: Vec<InputCheck>,
 }
@@ -433,8 +438,8 @@ pub struct BatchScriptFailure {
 /// [`verify_prepared_units`], because reporting them now would let a later
 /// transaction's cheap failure outrank an earlier one.
 pub fn prepare_block_script_checks<'b>(
-    txs: &'b [bitcoin::Transaction],
-    mut resolved: Vec<Vec<Option<bitcoin::TxOut>>>,
+    txs: &'b [Tx],
+    mut resolved: Vec<Vec<Option<TxOut>>>,
     height: u32,
     locktime_cutoff: u32,
     kernel_block: &'b crate::kernel::KernelBlock,
@@ -602,8 +607,8 @@ fn first_prepared_error(
 /// Preparation stops at the first pre-script failure so no later transaction
 /// can outrank it during the final ordered error scan.
 fn prepare_block_input_checks<'b>(
-    txs: &[bitcoin::Transaction],
-    resolved: &mut [Vec<Option<bitcoin::TxOut>>],
+    txs: &[Tx],
+    resolved: &mut [Vec<Option<TxOut>>],
     height: u32,
     locktime_cutoff: u32,
     // Unused by the portable backend, which verifies rust-bitcoin transactions
@@ -658,7 +663,7 @@ fn prepare_block_input_checks<'b>(
         // leave an InputCheck without its PreparedKernelTx.
         #[cfg(feature = "kernel")]
         let kernel_state = match kernel_block.transaction(tx_index).and_then(|kernel_tx| {
-            crate::kernel::prepare_kernel_tx(kernel_tx, tx.input.len(), &prep.prevouts)
+            crate::kernel::prepare_kernel_tx(kernel_tx, tx.inputs.len(), &prep.prevouts)
         }) {
             Ok(state) => state,
             Err(setup_error) => {
@@ -677,13 +682,13 @@ fn prepare_block_input_checks<'b>(
 
         let prepared_index = prepared.len();
         let checks_start = checks.len();
-        for input_index in 0..tx.input.len() {
+        for input_index in 0..tx.inputs.len() {
             checks.push(InputCheck {
                 prepared_index,
                 input_index,
             });
         }
-        let checks_len = tx.input.len();
+        let checks_len = tx.inputs.len();
 
         let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
         let stop_after_tx = post_error.is_some();
@@ -712,7 +717,7 @@ fn prepare_block_input_checks<'b>(
 /// `cfg(kernel)` between the kernel and portable engines, sharing `&prepared` and
 /// `&txs` by shared reference only.
 fn check_input(
-    txs: &[bitcoin::Transaction],
+    txs: &[Tx],
     prepared: &[PreparedTx<'_>],
     check: &InputCheck,
     flags: VerifyFlags,
@@ -730,17 +735,20 @@ fn check_input(
     }
     #[cfg(not(feature = "kernel"))]
     {
-        let all_prevouts: Vec<&bitcoin::TxOut> =
-            prep.prevouts.iter().map(|(_, spent)| spent).collect();
+        let all_prevouts: Vec<TxOut> = prep
+            .prevouts
+            .iter()
+            .map(|(_, spent)| spent.clone())
+            .collect();
         verify_input_script_portable(check.input_index, prevout, &all_prevouts, tx, flags)
     }
 }
 
 fn cached_prevout_lookup(
-    prevouts: &[(bitcoin::OutPoint, bitcoin::TxOut)],
+    prevouts: &[(OutPoint, TxOut)],
     cursor: &mut usize,
-    outpoint: &bitcoin::OutPoint,
-) -> Option<bitcoin::TxOut> {
+    outpoint: &OutPoint,
+) -> Option<TxOut> {
     if prevouts.is_empty() {
         return None;
     }
@@ -764,10 +772,10 @@ fn cached_prevout_lookup(
     Some(txout.clone())
 }
 
-fn total_output_value(tx: &bitcoin::Transaction) -> Result<u64, ConsensusError> {
-    tx.output.iter().try_fold(0u64, |sum, output| {
+fn total_output_value(tx: &Tx) -> Result<u64, ConsensusError> {
+    tx.outputs.iter().try_fold(0u64, |sum, output| {
         let next = sum
-            .checked_add(output.value.to_sat())
+            .checked_add(output.value)
             .ok_or(ConsensusError::OutputValueOverflow)?;
         if next > MAX_MONEY {
             Err(ConsensusError::OutputValueOverflow)
@@ -777,19 +785,76 @@ fn total_output_value(tx: &bitcoin::Transaction) -> Result<u64, ConsensusError> 
     })
 }
 
+fn total_sigop_cost(tx: &Tx, prevouts: &[(OutPoint, TxOut)]) -> u32 {
+    let mut cost = count_tx_legacy(tx).saturating_mul(4);
+    let mut cursor = 0_usize;
+    for input in &tx.inputs {
+        let Some(prevout) = cached_prevout_lookup(prevouts, &mut cursor, &input.previous_output)
+        else {
+            continue;
+        };
+        let redeem_script = last_push(&input.script_sig);
+        if is_p2sh(&prevout.script_pubkey) {
+            if let Some(redeem) = redeem_script {
+                cost = cost.saturating_add(count_accurate(redeem).saturating_mul(4));
+            }
+        }
+        let witness_program = if is_witness_program(&prevout.script_pubkey) {
+            Some(prevout.script_pubkey.as_slice())
+        } else {
+            redeem_script.filter(|script| is_witness_program(script))
+        };
+        if let Some(program) = witness_program {
+            cost = cost.saturating_add(count_segwit(program, &input.witness));
+        }
+    }
+    cost
+}
+
+fn last_push(script: &[u8]) -> Option<&[u8]> {
+    let mut last = None;
+    for instruction in instructions(script) {
+        match instruction.ok()? {
+            Instruction::PushBytes(bytes) => last = Some(bytes),
+            Instruction::Op(_) => last = None,
+        }
+    }
+    last
+}
+
+fn count_accurate(script: &[u8]) -> u32 {
+    let mut count = 0_u32;
+    let mut pushed_number = None;
+    for instruction in instructions(script) {
+        match instruction {
+            Ok(Instruction::Op(opcode::OP_CHECKSIG | opcode::OP_CHECKSIGVERIFY)) => {
+                count = count.saturating_add(1);
+                pushed_number = None;
+            }
+            Ok(Instruction::Op(opcode::OP_CHECKMULTISIG | opcode::OP_CHECKMULTISIGVERIFY)) => {
+                count = count.saturating_add(u32::from(pushed_number.unwrap_or(20)));
+                pushed_number = None;
+            }
+            Ok(Instruction::Op(op)) => pushed_number = opcode::decode_pushnum(op),
+            Ok(Instruction::PushBytes(_)) => pushed_number = None,
+            Err(_) => break,
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, collections::BTreeMap};
+    use std::cell::Cell;
 
     use bitcoin::hashes::Hash as _;
-    #[cfg(feature = "kernel")]
-    use bitcoin::opcodes::all::OP_EQUAL;
-    use bitcoin::script::Builder;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-        transaction,
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+        deserialize,
     };
-    use bitcoin_rs_script::VerifyFlags;
+    #[cfg(feature = "kernel")]
+    use bitcoin_rs_script::opcode::{OP_EQUAL, OP_HASH160};
+    use bitcoin_rs_script::{VerifyFlags, push_data, push_int};
 
     use super::{
         ScriptStageTimings, is_final_tx_with_locktime_cutoff, verify_coinbase_script_sig_size,
@@ -798,40 +863,46 @@ mod tests {
 
     /// Wraps `txs` in a block and parses it the way production does, so tests
     /// exercise the real one-shot parse rather than a stand-in.
-    fn kernel_block_for(txs: &[Transaction]) -> crate::kernel::KernelBlock {
-        let block = bitcoin::Block {
-            header: bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
-                prev_blockhash: bitcoin::BlockHash::all_zeros(),
-                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+    fn kernel_block_for(txs: &[Tx]) -> crate::kernel::KernelBlock {
+        let block = Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 0,
-                bits: bitcoin::CompactTarget::from_consensus(0x2000_ffff),
+                bits: 0x2000_ffff,
                 nonce: 0,
             },
-            txdata: txs.to_vec(),
+            txs: txs.to_vec(),
         };
-        crate::kernel::KernelBlock::parse(&bitcoin::consensus::serialize(&block))
+        crate::kernel::KernelBlock::parse(&consensus_bytes(&block))
             .unwrap_or_else(|error| panic!("synthetic block must parse: {error}"))
     }
     use crate::{ConsensusError, rust_path::UtxoView};
 
+    impl UtxoView for hashbrown::HashMap<OutPoint, TxOut> {
+        fn lookup(&self, outpoint: &OutPoint) -> Option<TxOut> {
+            self.get(outpoint).cloned()
+        }
+    }
+
     #[test]
     fn coinbase_transaction_skips_prevout_lookup() {
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![1, 1]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![1, 1],
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let utxos = BTreeMap::new();
+        let utxos = hashbrown::HashMap::new();
         assert_eq!(
             verify_transaction(&tx, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
@@ -842,7 +913,7 @@ mod tests {
     fn coinbase_script_sig_size_rejects_invalid_lengths() {
         for len in [0, 1, 101] {
             let tx = coinbase_transaction_with_script_sig_len(len);
-            let utxos = BTreeMap::new();
+            let utxos = hashbrown::HashMap::new();
             let expected = Err(ConsensusError::CoinbaseScriptSigSize { len });
 
             assert_eq!(verify_coinbase_script_sig_size(&tx), expected);
@@ -855,7 +926,7 @@ mod tests {
 
     #[test]
     fn coinbase_script_sig_size_accepts_valid_boundaries() {
-        let utxos = BTreeMap::new();
+        let utxos = hashbrown::HashMap::new();
         for len in [2, 100] {
             let tx = coinbase_transaction_with_script_sig_len(len);
 
@@ -870,24 +941,24 @@ mod tests {
     #[test]
     fn duplicate_non_coinbase_input_is_rejected() {
         let outpoint = OutPoint {
-            txid: Txid::from_byte_array([1; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[1; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![spending_input(outpoint), spending_input(outpoint)],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![spending_input(outpoint), spending_input(outpoint)],
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             outpoint,
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 100,
+                script_pubkey: push_int(1),
             },
         );
         assert_eq!(
@@ -899,35 +970,35 @@ mod tests {
     #[test]
     fn verify_transaction_accepts_multi_input_true_scripts() {
         let first = OutPoint {
-            txid: Txid::from_byte_array([1; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[1; 32])),
             vout: 0,
         };
         let second = OutPoint {
-            txid: Txid::from_byte_array([2; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[2; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![true_spending_input(first), true_spending_input(second)],
-            output: vec![TxOut {
-                value: Amount::from_sat(75),
-                script_pubkey: ScriptBuf::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![true_spending_input(first), true_spending_input(second)],
+            outputs: vec![TxOut {
+                value: 75,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             first,
             TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 50,
+                script_pubkey: push_int(1),
             },
         );
         utxos.insert(
             second,
             TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 50,
+                script_pubkey: push_int(1),
             },
         );
 
@@ -940,35 +1011,35 @@ mod tests {
     #[test]
     fn verify_transaction_reuses_prevouts_for_sigop_counting() {
         let first = OutPoint {
-            txid: Txid::from_byte_array([11; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[11; 32])),
             vout: 0,
         };
         let second = OutPoint {
-            txid: Txid::from_byte_array([12; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[12; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![true_spending_input(first), true_spending_input(second)],
-            output: vec![TxOut {
-                value: Amount::from_sat(75),
-                script_pubkey: ScriptBuf::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![true_spending_input(first), true_spending_input(second)],
+            outputs: vec![TxOut {
+                value: 75,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             first,
             TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 50,
+                script_pubkey: push_int(1),
             },
         );
         utxos.insert(
             second,
             TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 50,
+                script_pubkey: push_int(1),
             },
         );
         let view = CountingUtxoView::new(utxos);
@@ -977,42 +1048,42 @@ mod tests {
             verify_transaction(&tx, &view, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
-        assert_eq!(view.lookup_count(), tx.input.len());
+        assert_eq!(view.lookup_count(), tx.inputs.len());
     }
 
     #[test]
     #[cfg(not(feature = "kernel"))]
     fn verify_transaction_routes_taproot_spends_to_interpreter() {
         let first = OutPoint {
-            txid: Txid::from_byte_array([5; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[5; 32])),
             vout: 0,
         };
         let second = OutPoint {
-            txid: Txid::from_byte_array([6; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[6; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![true_spending_input(first), true_spending_input(second)],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![true_spending_input(first), true_spending_input(second)],
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             first,
             TxOut {
-                value: Amount::from_sat(50),
+                value: 50,
                 script_pubkey: p2tr_script_pubkey(),
             },
         );
         utxos.insert(
             second,
             TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+                value: 50,
+                script_pubkey: push_int(1),
             },
         );
 
@@ -1030,9 +1101,8 @@ mod tests {
     #[test]
     #[cfg(not(feature = "kernel"))]
     fn verify_transaction_accepts_valid_multi_input_taproot_keypath() {
-        use bitcoin::key::TapTweak;
-        use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
-        use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+        use secp256k1::{Keypair, Message, Scalar, Secp256k1, SecretKey, XOnlyPublicKey};
+        use sha2::{Digest, Sha256};
 
         let secp = Secp256k1::new();
         let seeds = [1u8, 2u8];
@@ -1043,54 +1113,70 @@ mod tests {
             let secret =
                 SecretKey::from_slice(&[seed; 32]).unwrap_or_else(|_| panic!("secret key"));
             let keypair = Keypair::from_secret_key(&secp, &secret);
-            let tweaked = TapTweak::tap_tweak(keypair, &secp, None);
-            let (output_key, _) = tweaked.public_parts();
+            // BIP341 key-only tweak: t = TaggedHash("TapTweak", x_only_pubkey || [0u8; 32])
+            let (xonly, _) = XOnlyPublicKey::from_keypair(&keypair);
+            let tag = {
+                let mut h = Sha256::new();
+                h.update(b"TapTweak");
+                h.finalize()
+            };
+            let mut tweak_hash = Sha256::new();
+            tweak_hash.update(tag);
+            tweak_hash.update(tag);
+            tweak_hash.update(xonly.serialize());
+            tweak_hash.update([0u8; 32]); // empty merkle root
+            let tweak_arr: [u8; 32] = tweak_hash.finalize().into();
+            let tweak = Scalar::from_be_bytes(tweak_arr).unwrap_or_else(|_| panic!("tweak scalar"));
+            let tweaked_keypair = keypair
+                .add_xonly_tweak(&secp, &tweak)
+                .unwrap_or_else(|e| panic!("tweak: {e}"));
+            let (output_key, _) = XOnlyPublicKey::from_keypair(&tweaked_keypair);
             let outpoint = OutPoint {
-                txid: Txid::from_byte_array([seed; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[seed; 32])),
                 vout: u32::try_from(index).unwrap_or_else(|_| panic!("vout")),
             };
             outpoints.push(outpoint);
+            let mut script_pubkey = Vec::with_capacity(34);
+            script_pubkey.push(0x51); // OP_1
+            script_pubkey.push(0x20); // push 32 bytes
+            script_pubkey.extend_from_slice(&output_key.serialize());
             prevouts.push(TxOut {
-                value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
+                value: 50_000,
+                script_pubkey,
             });
-            keypairs.push(tweaked);
+            keypairs.push(tweaked_keypair);
         }
 
-        let mut tx = Transaction {
-            version: transaction::Version(2),
-            lock_time: absolute::LockTime::ZERO,
-            input: outpoints
+        let mut tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: outpoints
                 .iter()
                 .copied()
                 .map(|previous_output| TxIn {
                     previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: vec![TxOut {
-                value: Amount::from_sat(99_000),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+            outputs: vec![TxOut {
+                value: 99_000,
+                script_pubkey: push_int(1),
             }],
         };
 
         for (input_idx, keypair) in keypairs.iter().enumerate() {
             let mut cache = SighashCache::new(&tx);
             let sighash = cache
-                .taproot_key_spend_signature_hash(
-                    input_idx,
-                    &Prevouts::All(&prevouts),
-                    TapSighashType::Default,
-                )
+                .taproot_signature_hash(input_idx, &prevouts, None, None, Sighash::Default)
                 .unwrap_or_else(|_| panic!("taproot sighash"));
-            let message = Message::from_digest(*sighash.as_byte_array());
-            let signature = secp.sign_schnorr(&message, keypair.as_keypair());
-            tx.input[input_idx].witness = Witness::from_slice(&[signature.serialize().to_vec()]);
+            let message = Message::from_digest(sighash.to_le_bytes());
+            let signature = secp.sign_schnorr(&message, keypair);
+            tx.inputs[input_idx].witness = vec![signature.serialize().to_vec()];
         }
 
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         for (outpoint, prevout) in outpoints.into_iter().zip(prevouts) {
             utxos.insert(outpoint, prevout);
         }
@@ -1105,29 +1191,29 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn kernel_accepts_non_taproot_spend_with_script_sig_data() {
         let outpoint = OutPoint {
-            txid: Txid::from_byte_array([7; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[7; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: Builder::new().push_int(7).push_int(7).into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: [push_int(7), push_int(7)].concat(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             outpoint,
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
+                value: 100,
+                script_pubkey: vec![OP_EQUAL],
             },
         );
 
@@ -1144,29 +1230,29 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn kernel_rejects_script_sig_mismatch_with_kernel_verdict() {
         let outpoint = OutPoint {
-            txid: Txid::from_byte_array([8; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[8; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: Builder::new().push_int(7).push_int(8).into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: [push_int(7), push_int(8)].concat(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             outpoint,
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
+                value: 100,
+                script_pubkey: vec![OP_EQUAL],
             },
         );
 
@@ -1188,29 +1274,29 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn kernel_skip_scripts_entry_accepts_invalid_script() {
         let outpoint = OutPoint {
-            txid: Txid::from_byte_array([9; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[9; 32])),
             vout: 0,
         };
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+        let tx = Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: Builder::new().push_int(7).push_int(8).into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: [push_int(7), push_int(8)].concat(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         utxos.insert(
             outpoint,
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
+                value: 100,
+                script_pubkey: vec![OP_EQUAL],
             },
         );
 
@@ -1226,21 +1312,21 @@ mod tests {
 
     #[test]
     fn verify_transaction_rejects_non_final_height_lock() {
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::from_consensus(200),
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::from_consensus(0),
-                witness: Witness::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 200,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence: 0,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Vec::new(),
             }],
         };
-        let utxos = BTreeMap::new();
+        let utxos = hashbrown::HashMap::new();
 
         let result = verify_transaction(&tx, &utxos, 100, 0, VerifyFlags::MANDATORY);
 
@@ -1252,18 +1338,18 @@ mod tests {
 
     #[test]
     fn timestamp_locktime_uses_caller_supplied_cutoff() {
-        let tx = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::from_consensus(500_000_100),
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::from_consensus(0),
-                witness: Witness::new(),
+        let tx = Tx {
+            version: 1,
+            lock_time: 500_000_100,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence: 0,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Vec::new(),
             }],
         };
 
@@ -1274,25 +1360,25 @@ mod tests {
     #[test]
     fn transaction_paths_share_locktime_and_coinbase_rules() {
         let coinbase = coinbase_transaction_with_script_sig_len(2);
-        let utxos = BTreeMap::new();
+        let utxos = hashbrown::HashMap::new();
 
         assert_eq!(
             verify_transaction(&coinbase, &utxos, 0, 0, VerifyFlags::MANDATORY),
             Ok(())
         );
 
-        let non_final = Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::from_consensus(500_000_100),
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::from_consensus(0),
-                witness: Witness::new(),
+        let non_final = Tx {
+            version: 1,
+            lock_time: 500_000_100,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: Vec::new(),
+                sequence: 0,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: Vec::new(),
             }],
         };
 
@@ -1305,9 +1391,9 @@ mod tests {
     fn spending_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
-            script_sig: Builder::new().push_int(1).into_script(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: push_int(1),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }
     }
 
@@ -1450,8 +1536,6 @@ mod tests {
     #[test]
     #[cfg(feature = "kernel")]
     fn each_unit_is_checked_under_its_own_flags() {
-        use bitcoin::opcodes::all::{OP_EQUAL, OP_HASH160};
-
         let first_txs = vec![
             coinbase_transaction_with_script_sig_len(2),
             spend_tx(vec![true_spending_input(outpoint(9))], 50),
@@ -1462,21 +1546,22 @@ mod tests {
         let redeem_script = [0_u8];
         let redeem_hash = bitcoin::hashes::hash160::Hash::hash(&redeem_script);
         let p2sh_output = TxOut {
-            value: Amount::from_sat(50),
-            script_pubkey: Builder::new()
-                .push_opcode(OP_HASH160)
-                .push_slice(redeem_hash.to_byte_array())
-                .push_opcode(OP_EQUAL)
-                .into_script(),
+            value: 50,
+            script_pubkey: [
+                vec![OP_HASH160],
+                push_data(&redeem_hash.to_byte_array()),
+                vec![OP_EQUAL],
+            ]
+            .concat(),
         };
         let second_txs = vec![
             coinbase_transaction_with_script_sig_len(2),
             spend_tx(
                 vec![TxIn {
                     previous_output: outpoint(10),
-                    script_sig: Builder::new().push_slice(redeem_script).into_script(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: push_data(&redeem_script),
+                    sequence: 0xffff_ffff,
+                    witness: Vec::new(),
                 }],
                 50,
             ),
@@ -1501,7 +1586,7 @@ mod tests {
 
     #[cfg(feature = "kernel")]
     fn prepared_unit<'b>(
-        txs: &'b [Transaction],
+        txs: &'b [Tx],
         resolved: Vec<Vec<Option<TxOut>>>,
         block: &'b crate::kernel::KernelBlock,
     ) -> super::BlockScriptChecks<'b> {
@@ -1514,19 +1599,19 @@ mod tests {
     fn true_spending_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }
     }
 
     struct CountingUtxoView {
-        utxos: BTreeMap<OutPoint, TxOut>,
+        utxos: hashbrown::HashMap<OutPoint, TxOut>,
         lookups: Cell<usize>,
     }
 
     impl CountingUtxoView {
-        fn new(utxos: BTreeMap<OutPoint, TxOut>) -> Self {
+        fn new(utxos: hashbrown::HashMap<OutPoint, TxOut>) -> Self {
             Self {
                 utxos,
                 lookups: Cell::new(0),
@@ -1546,27 +1631,27 @@ mod tests {
     }
 
     #[cfg(not(feature = "kernel"))]
-    fn p2tr_script_pubkey() -> ScriptBuf {
+    fn p2tr_script_pubkey() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(34);
         bytes.push(0x51);
         bytes.push(0x20);
         bytes.extend_from_slice(&[7; 32]);
-        ScriptBuf::from_bytes(bytes)
+        bytes
     }
 
-    fn coinbase_transaction_with_script_sig_len(len: usize) -> Transaction {
-        Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![1; len]),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn coinbase_transaction_with_script_sig_len(len: usize) -> Tx {
+        Tx {
+            version: 1,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![1; len],
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 50,
+                script_pubkey: Vec::new(),
             }],
         }
     }
@@ -1574,16 +1659,16 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn op1_txout(value: u64) -> TxOut {
         TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: Builder::new().push_int(1).into_script(),
+            value,
+            script_pubkey: push_int(1),
         }
     }
 
     #[cfg(feature = "kernel")]
     fn op_equal_txout(value: u64) -> TxOut {
         TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: Builder::new().push_opcode(OP_EQUAL).into_script(),
+            value,
+            script_pubkey: vec![OP_EQUAL],
         }
     }
 
@@ -1593,21 +1678,21 @@ mod tests {
     fn mismatch_input(outpoint: OutPoint) -> TxIn {
         TxIn {
             previous_output: outpoint,
-            script_sig: Builder::new().push_int(7).push_int(8).into_script(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: [push_int(7), push_int(8)].concat(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }
     }
 
     #[cfg(feature = "kernel")]
-    fn spend_tx(inputs: Vec<TxIn>, output_value: u64) -> Transaction {
-        Transaction {
-            version: transaction::Version(1),
-            lock_time: absolute::LockTime::ZERO,
-            input: inputs,
-            output: vec![TxOut {
-                value: Amount::from_sat(output_value),
-                script_pubkey: Builder::new().push_int(1).into_script(),
+    fn spend_tx(inputs: Vec<TxIn>, output_value: u64) -> Tx {
+        Tx {
+            version: 1,
+            lock_time: 0,
+            inputs,
+            outputs: vec![TxOut {
+                value: output_value,
+                script_pubkey: push_int(1),
             }],
         }
     }
@@ -1615,7 +1700,7 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn outpoint(seed: u8) -> OutPoint {
         OutPoint {
-            txid: Txid::from_byte_array([seed; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[seed; 32])),
             vout: 0,
         }
     }
@@ -1768,11 +1853,11 @@ mod tests {
     fn same_block_spend_resolves_and_verifies() {
         let tx1 = spend_tx(vec![true_spending_input(outpoint(1))], 100);
         let tx1_out = OutPoint {
-            txid: tx1.compute_txid(),
+            txid: tx1.txid(),
             vout: 0,
         };
         let tx2 = spend_tx(vec![true_spending_input(tx1_out)], 90);
-        let tx1_output = tx1.output[0].clone();
+        let tx1_output = tx1.outputs[0].clone();
         let txs = vec![coinbase_transaction_with_script_sig_len(2), tx1, tx2];
         let resolved = vec![
             Vec::new(),
@@ -1794,11 +1879,11 @@ mod tests {
 
         let bad_tx1 = spend_tx(vec![mismatch_input(outpoint(1))], 100);
         let bad_out = OutPoint {
-            txid: bad_tx1.compute_txid(),
+            txid: bad_tx1.txid(),
             vout: 0,
         };
         let bad_tx2 = spend_tx(vec![true_spending_input(bad_out)], 90);
-        let bad_tx1_output = bad_tx1.output[0].clone();
+        let bad_tx1_output = bad_tx1.outputs[0].clone();
         let bad_txs = vec![
             coinbase_transaction_with_script_sig_len(2),
             bad_tx1,
@@ -1834,7 +1919,7 @@ mod tests {
     // fixture without pulling in a BIP342 VM or new dependencies.
 
     struct TaprootScriptPathFixture {
-        tx: Transaction,
+        tx: Tx,
         prevouts: Vec<TxOut>,
         flags: VerifyFlags,
         height: u32,
@@ -1873,19 +1958,19 @@ mod tests {
         let json = include_str!("../tests/vectors/scripts/taproot_scriptpath_spend.json");
         let file: TaprootScriptPathFile = serde_json::from_str(json)
             .unwrap_or_else(|error| panic!("taproot scriptpath fixture parses: {error}"));
-        let tx: Transaction = bitcoin::consensus::encode::deserialize(&decode_hex(&file.tx_hex))
+        let tx: Tx = deserialize(&decode_hex(&file.tx_hex))
             .unwrap_or_else(|error| panic!("taproot scriptpath tx hex decodes: {error}"));
         assert_eq!(
             file.prevouts.len(),
-            tx.input.len(),
+            tx.inputs.len(),
             "taproot scriptpath fixture: prevout count must match input count"
         );
         let prevouts = file
             .prevouts
             .iter()
             .map(|prevout| TxOut {
-                value: Amount::from_sat(prevout.amount_sat),
-                script_pubkey: ScriptBuf::from_bytes(decode_hex(&prevout.script_hex)),
+                value: prevout.amount_sat,
+                script_pubkey: decode_hex(&prevout.script_hex),
             })
             .collect::<Vec<_>>();
         let flags = VerifyFlags::from_core_names(&file.flags)
@@ -1905,9 +1990,9 @@ mod tests {
     #[cfg(feature = "kernel")]
     fn verify_transaction_accepts_mainnet_taproot_scriptpath_spend() {
         let fixture = load_taproot_scriptpath_fixture();
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         for (index, prevout) in fixture.prevouts.iter().enumerate() {
-            utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
+            utxos.insert(fixture.tx.inputs[index].previous_output, prevout.clone());
         }
         assert_eq!(
             verify_transaction(&fixture.tx, &utxos, fixture.height, 0, fixture.flags),
@@ -1923,9 +2008,9 @@ mod tests {
     #[cfg(not(feature = "kernel"))]
     fn verify_transaction_rejects_mainnet_taproot_scriptpath_under_portable() {
         let fixture = load_taproot_scriptpath_fixture();
-        let mut utxos = BTreeMap::new();
+        let mut utxos = hashbrown::HashMap::new();
         for (index, prevout) in fixture.prevouts.iter().enumerate() {
-            utxos.insert(fixture.tx.input[index].previous_output, prevout.clone());
+            utxos.insert(fixture.tx.inputs[index].previous_output, prevout.clone());
         }
         let result = verify_transaction(&fixture.tx, &utxos, fixture.height, 0, fixture.flags);
         assert!(
@@ -1954,7 +2039,7 @@ mod tests {
                 kernel_state: None,
             })
             .collect();
-        let txs: &[Transaction] = &[];
+        let txs: &[Tx] = &[];
         let unit = super::BlockScriptChecks {
             txs,
             prepared,

@@ -158,7 +158,7 @@ struct InboundSyncSinks {
 }
 
 impl InboundSyncSinks {
-    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin::block::Header>) {
+    fn send_headers(&self, source: crate::PeerSource, headers: Vec<bitcoin_rs_primitives::Header>) {
         if let Err(error) = self.headers_tx.send(crate::InboundHeaders {
             headers,
             source: Some(source),
@@ -172,7 +172,7 @@ impl InboundSyncSinks {
     fn send_block(
         &self,
         source: crate::PeerSource,
-        block: bitcoin::Block,
+        block: bitcoin_rs_primitives::Block,
         serialized: bytes::Bytes,
     ) {
         if let Err(error) = self.blocks_tx.send(crate::InboundBlock {
@@ -877,13 +877,13 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                 let responses =
                     crate::dispatch::dispatch_inbound_with_chain(peer, &message, chain_query)?;
                 match message {
-                    bitcoin::p2p::message::NetworkMessage::Headers(headers) => {
+                    crate::Message::Headers(headers) => {
                         inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
                     }
-                    bitcoin::p2p::message::NetworkMessage::Block(block) => {
+                    crate::Message::Block(block) => {
                         inbound_sync_sinks.send_block(lease.source(peer_addr), block, raw);
                     }
-                    bitcoin::p2p::message::NetworkMessage::Pong(nonce) => {
+                    crate::Message::Pong(nonce) => {
                         lease.stats().complete_ping(nonce, unix_micros());
                     }
                     _ => {}
@@ -1150,10 +1150,14 @@ mod lease_tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], 8333));
         let (tx, _rx) = crossbeam_channel::unbounded();
         let lease = crate::PeerLease::new(tx);
-        let source = lease.source(addr);
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let serialized = bytes::Bytes::from(bitcoin::consensus::encode::serialize(&block));
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block_bytes = bitcoin::consensus::encode::serialize(&genesis);
+        let block = bitcoin_rs_primitives::Block::consensus_decode(&block_bytes)
+            .map_err(|_| panic!("genesis block must decode natively"))
+            .unwrap();
+        let serialized = bytes::Bytes::from(block_bytes);
 
+        let source = lease.source(addr);
         sinks.send_headers(source, Vec::new());
         sinks.send_block(source, block, serialized.clone());
 

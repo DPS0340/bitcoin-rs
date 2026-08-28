@@ -5,19 +5,18 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
+// Wire seam: `GetHeadersMessage` locator/stop hashes remain bitcoin:: wire types,
+// so byte-array access on them needs the retained `Hash` trait.
+use bitcoin::BlockHash as WireBlockHash;
 use bitcoin::hashes::Hash as _;
-use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::{
-    Amount, BlockHash, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
-    Txid, Witness, absolute, transaction,
-};
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
 use bitcoin_rs_node::{
     BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
-use bitcoin_rs_primitives::{Hash256, OutPoint};
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, deserialize};
 use bitcoin_rs_utxo::UtxoSet;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use crossbeam_channel::{bounded, unbounded};
@@ -66,14 +65,14 @@ fn tick_sends_getheaders_to_best_peer_above_our_height() -> Result<(), Box<dyn s
     sync.tick();
 
     let received = rx.try_recv()?;
-    let NetworkMessage::GetHeaders(getheaders) = received else {
+    let Message::GetHeaders(getheaders) = received else {
         panic!("expected getheaders");
     };
     let genesis_hash =
-        BlockHash::from_byte_array(Network::Regtest.genesis_block_hash().to_le_bytes());
+        WireBlockHash::from_byte_array(Network::Regtest.genesis_block_hash().to_le_bytes());
     assert_eq!(getheaders.locator_hashes.len(), 1);
     assert_eq!(getheaders.locator_hashes.first(), Some(&genesis_hash));
-    assert_eq!(getheaders.stop_hash, BlockHash::all_zeros());
+    assert_eq!(getheaders.stop_hash, WireBlockHash::all_zeros());
     Ok(())
 }
 
@@ -342,7 +341,7 @@ fn tick_buffers_out_of_order_blocks_until_parent_arrives() -> Result<(), Box<dyn
     assert_eq!(applied.height, 2);
     assert_eq!(
         applied.hash,
-        bitcoin_rs_primitives::Hash256::from_le_bytes(block_two.block_hash().as_byte_array())
+        bitcoin_rs_primitives::Hash256::from_le_bytes(block_two.block_hash().as_bytes())
     );
     assert_eq!(
         coin_stats.snapshot(),
@@ -403,35 +402,32 @@ fn tick_applies_non_coinbase_spend_and_updates_utxo_and_coinstats()
                 .last()
                 .ok_or_else(|| std::io::Error::other("missing final block"))?
                 .block_hash()
-                .as_byte_array(),
+                .as_bytes(),
         )
     );
     assert!(
-        utxo.get(&primitive_outpoint(fixture.mature_coinbase_outpoint))
-            .is_none(),
+        utxo.get(&fixture.mature_coinbase_outpoint).is_none(),
         "mature coinbase prevout must be removed by the height-101 spend",
     );
     assert!(
-        utxo.get(&primitive_outpoint(fixture.funding_outpoint))
-            .is_none(),
+        utxo.get(&fixture.funding_outpoint).is_none(),
         "funding prevout must be removed by the height-102 spend",
     );
     assert!(
-        utxo.get(&primitive_outpoint(fixture.spend_outpoint))
-            .is_some(),
+        utxo.get(&fixture.spend_outpoint).is_some(),
         "height-102 spend output must remain live",
     );
 
-    let block_refs: Vec<&bitcoin::Block> = fixture.blocks.iter().collect();
+    let block_refs: Vec<&Block> = fixture.blocks.iter().collect();
     assert_eq!(coin_stats.snapshot(), expected_coin_stats(&block_refs)?);
     Ok(())
 }
 
 struct SpendChainFixture {
-    blocks: Vec<bitcoin::Block>,
-    mature_coinbase_outpoint: BitcoinOutPoint,
-    funding_outpoint: BitcoinOutPoint,
-    spend_outpoint: BitcoinOutPoint,
+    blocks: Vec<Block>,
+    mature_coinbase_outpoint: OutPoint,
+    funding_outpoint: OutPoint,
+    spend_outpoint: OutPoint,
 }
 
 fn non_coinbase_spend_chain() -> Result<SpendChainFixture, Box<dyn std::error::Error>> {
@@ -448,18 +444,12 @@ fn non_coinbase_spend_chain() -> Result<SpendChainFixture, Box<dyn std::error::E
         )?);
     }
 
-    let mature_coinbase_outpoint = BitcoinOutPoint {
-        txid: blocks[1].txdata[0].compute_txid(),
-        vout: 0,
-    };
-    let mature_coinbase_txout = blocks[1].txdata[0].output[0].clone();
+    let mature_coinbase_outpoint = OutPoint::new(blocks[1].txs[0].txid(), 0);
+    let mature_coinbase_txout = blocks[1].txs[0].outputs[0].clone();
     let funding_tx =
         spend_to_op_true(mature_coinbase_outpoint, mature_coinbase_txout.value, 1_000)?;
-    let funding_outpoint = BitcoinOutPoint {
-        txid: funding_tx.compute_txid(),
-        vout: 0,
-    };
-    let funding_txout = funding_tx.output[0].clone();
+    let funding_outpoint = OutPoint::new(funding_tx.txid(), 0);
+    let funding_txout = funding_tx.outputs[0].clone();
     let funding_block = child_block_with_transactions(
         blocks
             .last()
@@ -470,10 +460,7 @@ fn non_coinbase_spend_chain() -> Result<SpendChainFixture, Box<dyn std::error::E
     blocks.push(funding_block);
 
     let spend_tx = spend_to_op_true(funding_outpoint, funding_txout.value, 1_000)?;
-    let spend_outpoint = BitcoinOutPoint {
-        txid: spend_tx.compute_txid(),
-        vout: 0,
-    };
+    let spend_outpoint = OutPoint::new(spend_tx.txid(), 0);
     let spend_block = child_block_with_transactions(
         blocks
             .last()
@@ -491,29 +478,27 @@ fn non_coinbase_spend_chain() -> Result<SpendChainFixture, Box<dyn std::error::E
     })
 }
 
-fn expected_coin_stats(
-    blocks: &[&bitcoin::Block],
-) -> Result<CoinStats, Box<dyn std::error::Error>> {
+fn expected_coin_stats(blocks: &[&Block]) -> Result<CoinStats, Box<dyn std::error::Error>> {
     let mut stats = CoinStats::default();
     let mut live_outputs = HashMap::<OutPoint, (TxOut, u32, bool)>::new();
     for (height, block) in blocks.iter().enumerate() {
         let height = u32::try_from(height)?;
         if height == 0 {
-            stats.finish_block(height, u64::try_from(block.txdata.len())?);
+            stats.finish_block(height, u64::try_from(block.txs.len())?);
             continue;
         }
-        for tx in &block.txdata {
-            let txid = Hash256::from_le_bytes(tx.compute_txid().as_byte_array());
-            for (vout, txout) in tx.output.iter().enumerate() {
+        for tx in &block.txs {
+            let txid = tx.txid();
+            for (vout, txout) in tx.outputs.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, u32::try_from(vout)?);
-                stats.insert_utxo(&outpoint, txout, height, tx.is_coinbase());
-                live_outputs.insert(outpoint, (txout.clone(), height, tx.is_coinbase()));
+                stats.insert_utxo(&outpoint, txout, height, is_coinbase(tx));
+                live_outputs.insert(outpoint, (txout.clone(), height, is_coinbase(tx)));
             }
-            if tx.is_coinbase() {
+            if is_coinbase(tx) {
                 continue;
             }
-            for input in &tx.input {
-                let outpoint = primitive_outpoint(input.previous_output);
+            for input in &tx.inputs {
+                let outpoint = input.previous_output;
                 let Some((txout, output_height, coinbase)) = live_outputs.remove(&outpoint) else {
                     return Err(std::io::Error::other(format!(
                         "missing expected prevout {outpoint:?}"
@@ -523,9 +508,17 @@ fn expected_coin_stats(
                 stats.remove_utxo(&outpoint, &txout, output_height, coinbase);
             }
         }
-        stats.finish_block(height, u64::try_from(block.txdata.len())?);
+        stats.finish_block(height, u64::try_from(block.txs.len())?);
     }
     Ok(stats)
+}
+
+/// A one-input, null-prevout transaction (Core's `IsCoinBase`).
+fn is_coinbase(tx: &Tx) -> bool {
+    match tx.inputs.as_slice() {
+        [input] => input.previous_output == OutPoint::new(Txid::default(), u32::MAX),
+        _ => false,
+    }
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -571,104 +564,87 @@ fn apply_handles_with_coin_stats_and_utxo(
         None,
         Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
         Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
-        Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
+        Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),
         Arc::new(bitcoin_rs_node::state::ChainEventPublisher::detached(0).0),
     );
     (handles, coin_stats, utxo)
 }
 
-fn regtest_genesis_block() -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
-    use bitcoin::consensus::Decodable as _;
-
+fn regtest_genesis_block() -> Result<Block, Box<dyn std::error::Error>> {
     let bytes = hex_decode(REGTEST_GENESIS_HEX)?;
-    let mut cursor = std::io::Cursor::new(bytes.as_slice());
-    Ok(bitcoin::Block::consensus_decode(&mut cursor)?)
+    Ok(deserialize(&bytes)?)
 }
 
-fn child_coinbase_block(
-    parent: &bitcoin::Block,
-    height: u8,
-) -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
+fn child_coinbase_block(parent: &Block, height: u8) -> Result<Block, Box<dyn std::error::Error>> {
     child_coinbase_block_with_script(
         parent,
         height,
-        parent.txdata[0].output[0].script_pubkey.clone(),
+        parent.txs[0].outputs[0].script_pubkey.clone(),
     )
 }
 
 fn child_coinbase_block_with_script(
-    parent: &bitcoin::Block,
+    parent: &Block,
     height: u8,
-    script_pubkey: ScriptBuf,
-) -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
+    script_pubkey: Vec<u8>,
+) -> Result<Block, Box<dyn std::error::Error>> {
     let mut block = parent.clone();
     block.header.prev_blockhash = parent.block_hash();
     block.header.time = parent.header.time.saturating_add(1);
-    block.txdata.truncate(1);
-    block.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![1, height]);
-    block.txdata[0].output[0].script_pubkey = script_pubkey;
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .ok_or_else(|| std::io::Error::other("child block should have merkle root"))?;
+    block.txs.truncate(1);
+    block.txs[0].inputs[0].script_sig = vec![1, height];
+    block.txs[0].outputs[0].script_pubkey = script_pubkey;
+    block.header.merkle_root = merkle_root(&block.txs);
     mine_block_to_declared_target(&mut block)?;
     Ok(block)
 }
 
 fn child_block_with_transactions(
-    parent: &bitcoin::Block,
+    parent: &Block,
     height: u8,
-    transactions: Vec<Transaction>,
-) -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
+    transactions: Vec<Tx>,
+) -> Result<Block, Box<dyn std::error::Error>> {
     let mut block = child_coinbase_block(parent, height)?;
-    block.txdata.extend(transactions);
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .ok_or_else(|| std::io::Error::other("child block should have merkle root"))?;
+    block.txs.extend(transactions);
+    block.header.merkle_root = merkle_root(&block.txs);
     mine_block_to_declared_target(&mut block)?;
     Ok(block)
 }
 
 fn spend_to_op_true(
-    previous_output: BitcoinOutPoint,
-    previous_value: Amount,
+    previous_output: OutPoint,
+    previous_value: u64,
     fee: u64,
-) -> Result<Transaction, Box<dyn std::error::Error>> {
+) -> Result<Tx, Box<dyn std::error::Error>> {
     let value = previous_value
-        .to_sat()
         .checked_sub(fee)
         .ok_or_else(|| std::io::Error::other("spend fee exceeds previous output value"))?;
-    Ok(Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+    Ok(Tx {
+        version: 2,
+        inputs: vec![TxIn {
             previous_output,
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
+        outputs: vec![TxOut {
+            value,
             script_pubkey: op_true_script(),
         }],
+        lock_time: 0,
     })
 }
 
-fn op_true_script() -> ScriptBuf {
-    ScriptBuf::from_bytes(vec![0x51])
+fn op_true_script() -> Vec<u8> {
+    vec![0x51]
 }
 
-fn primitive_outpoint(outpoint: BitcoinOutPoint) -> OutPoint {
-    OutPoint::new(
-        Hash256::from_le_bytes(outpoint.txid.as_byte_array()),
-        outpoint.vout,
-    )
-}
-
-fn mine_block_to_declared_target(
-    block: &mut bitcoin::Block,
-) -> Result<(), Box<dyn std::error::Error>> {
-    while block.header.validate_pow(block.header.target()).is_err() {
+fn mine_block_to_declared_target(block: &mut Block) -> Result<(), Box<dyn std::error::Error>> {
+    while !pow_met(
+        block.header.bits,
+        Hash256::from(block.header.compute_hash()),
+    ) {
         block.header.nonce = block
             .header
             .nonce
@@ -676,6 +652,52 @@ fn mine_block_to_declared_target(
             .ok_or_else(|| std::io::Error::other("exhausted nonce while mining test block"))?;
     }
     Ok(())
+}
+
+/// Regtest-easy compact-target `PoW` check over the hash as a 256-bit
+/// little-endian integer (mirrors `chain::pow::compact_is_met_by` for the
+/// >3-exponent, 3-byte-mantissa forms these fixtures mine).
+fn pow_met(bits: u32, hash: Hash256) -> bool {
+    let exponent = bits >> 24;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent <= 3 || exponent > 32 || mantissa > 0x00ff_ffff {
+        return false;
+    }
+    let bytes = hash.as_byte_array();
+    let lo = usize::try_from(exponent).unwrap_or(32) - 3;
+    let window =
+        u32::from(bytes[lo]) | u32::from(bytes[lo + 1]) << 8 | u32::from(bytes[lo + 2]) << 16;
+    window <= mantissa
+        && bytes[usize::try_from(exponent).unwrap_or(32)..]
+            .iter()
+            .all(|&byte| byte == 0)
+}
+
+/// Consensus merkle fold: pairwise double-SHA256 over little-endian txid
+/// bytes, duplicating the last leaf on odd levels.
+#[allow(clippy::expect_used)]
+fn merkle_root(txs: &[Tx]) -> Hash256 {
+    let mut hashes: Vec<[u8; 32]> = txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+    if hashes.is_empty() {
+        return Hash256::default();
+    }
+    while hashes.len() > 1 {
+        if hashes.len() % 2 == 1 {
+            let last = hashes.last().expect("odd merkle level has a last leaf");
+            hashes.push(*last);
+        }
+        hashes = hashes
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut buffer = [0_u8; 64];
+                buffer[..32].copy_from_slice(&pair[0]);
+                buffer[32..].copy_from_slice(&pair[1]);
+                double_sha256(&buffer).to_le_bytes()
+            })
+            .collect();
+    }
+    let root = hashes.first().expect("merkle fold reduces to one root");
+    Hash256::from_le_bytes(root)
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -787,9 +809,7 @@ fn apply_buffers_g14_utxo_commit_samples_until_stop_height()
     let genesis = regtest_genesis_block()?;
     let block1 = child_coinbase_block(&genesis, 1)?;
     let start_hash = Network::Regtest.genesis_block_hash().to_string_be();
-    let stop_hash =
-        bitcoin_rs_primitives::Hash256::from_le_bytes(block1.block_hash().as_byte_array())
-            .to_string_be();
+    let stop_hash = Hash256::from_le_bytes(block1.block_hash().as_bytes()).to_string_be();
     let mut config = Config::default_for_network(Network::Regtest);
     config.data_dir = temp.path().join("node");
     config.storage_backend = "redb".to_owned();

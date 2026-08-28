@@ -11,16 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwapOption;
-use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::consensus::serialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, Block, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-    absolute, block, transaction,
-};
 use bitcoin_rs_chain::NodeStatus;
 use bitcoin_rs_index::{IndexWatermark, IndexWriter};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::encode::{consensus_bytes, double_sha256};
+use bitcoin_rs_primitives::{Hash256, Header, Network, TxIn, TxOut};
 use bitcoin_rs_storage::{PrefixScanLimit, StorageError};
 use parking_lot::Mutex;
 
@@ -93,16 +87,16 @@ struct CatchupFixture {
 
 impl CatchupFixture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let genesis = genesis_block(Network::Regtest);
-        let genesis_hash = Hash256::from_le_bytes(genesis.block_hash().as_byte_array());
+        let genesis = Network::Regtest.genesis_block();
 
+        let genesis_hash = genesis.block_hash().0;
         let mut tree = BlockTree::new();
         tree.insert_header(genesis.header, NodeStatus::HeaderValid)?;
         let a = branch(&mut tree, genesis.block_hash(), 0xaa)?;
         let b = branch(&mut tree, genesis.block_hash(), 0xbb)?;
 
         let mut bodies = MapBodyStore::new();
-        bodies.insert(0, genesis_hash, serialize(&genesis));
+        bodies.insert(0, genesis_hash, consensus_bytes(&genesis));
         for block in a.iter().chain(b.iter()) {
             bodies.insert(block.height, block.hash, block.body.clone());
         }
@@ -166,7 +160,7 @@ impl CatchupFixture {
             .a
             .iter()
             .filter(|block| !self.b.iter().any(|other| other.hash == block.hash))
-            .flat_map(|block| block.block.txdata.iter().map(Transaction::compute_txid))
+            .flat_map(|block| block.block.txs.iter().map(Tx::txid))
             .collect();
         let writer = self.writer.lock();
         let snapshot = writer.snapshot()?;
@@ -180,44 +174,48 @@ impl CatchupFixture {
     }
 }
 
+fn unlimited_scan() -> PrefixScanLimit {
+    PrefixScanLimit {
+        max_rows: usize::MAX,
+        max_bytes: usize::MAX,
+    }
+}
 /// Mines two parent-linked blocks with distinct coinbase scripts so every
 /// block hash differs, inserting each header into `tree`.
 fn branch(
     tree: &mut BlockTree,
-    mut prev: bitcoin::BlockHash,
+    mut prev: BlockHash,
     label: u8,
 ) -> Result<Vec<FixtureBlock>, Box<dyn std::error::Error>> {
     let mut blocks = Vec::new();
     for height in 1..=2 {
         let mut block = Block {
-            header: block::Header {
-                version: block::Version::ONE,
+            header: Header {
+                version: 1,
                 prev_blockhash: prev,
-                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                merkle_root: Hash256::default(),
                 time: height,
-                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             },
-            txdata: vec![coinbase(label, height)],
+            txs: vec![coinbase(label, height)],
         };
-        block.header.merkle_root = block
-            .compute_merkle_root()
-            .expect("fixture block has a merkle root");
-        let target = block.header.target();
-        while block.header.validate_pow(target).is_err() {
+        block.header.merkle_root = merkle_root(&block)
+            .ok_or_else(|| std::io::Error::other("fixture block has a merkle root"))?;
+        while !pow_met(block.header.bits, block.block_hash().0) {
             block.header.nonce = block
                 .header
                 .nonce
                 .checked_add(1)
-                .expect("fixture nonce space");
+                .ok_or_else(|| std::io::Error::other("fixture nonce space"))?;
         }
         let block_hash = block.block_hash();
-        let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
+        let hash = block_hash.0;
         tree.insert_header(block.header, NodeStatus::HeaderValid)?;
         blocks.push(FixtureBlock {
             height,
             hash,
-            body: serialize(&block),
+            body: consensus_bytes(&block),
             block,
         });
         prev = block_hash;
@@ -225,28 +223,64 @@ fn branch(
     Ok(blocks)
 }
 
-fn coinbase(label: u8, height: u32) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![label, height.to_le_bytes()[0]]),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+fn coinbase(label: u8, height: u32) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::default(),
+            script_sig: vec![label, height.to_le_bytes()[0]],
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        outputs: vec![TxOut {
+            value: 50,
+            script_pubkey: vec![0x51],
         }],
     }
 }
 
-fn unlimited_scan() -> PrefixScanLimit {
-    PrefixScanLimit {
-        max_rows: usize::MAX,
-        max_bytes: usize::MAX,
+/// Regtest-easy compact-target `PoW` check over the hash as a 256-bit
+/// little-endian integer (mirrors `chain::pow::compact_is_met_by` for the
+/// >3-exponent, 3-byte-mantissa forms these fixtures mine).
+fn pow_met(bits: u32, hash: Hash256) -> bool {
+    let exponent = u8::try_from(bits >> 24).unwrap_or(0);
+    let mantissa = bits & 0x007f_ffff;
+    if exponent <= 3 || exponent > 32 || mantissa > 0x00ff_ffff {
+        return false;
     }
+    let bytes = hash.as_byte_array();
+    let low = usize::from(exponent - 3);
+    let window =
+        u32::from(bytes[low]) | u32::from(bytes[low + 1]) << 8 | u32::from(bytes[low + 2]) << 16;
+    window <= mantissa && bytes[usize::from(exponent)..].iter().all(|&byte| byte == 0)
+}
+
+/// Pairwise double-SHA256 fold over little-endian txid bytes, duplicating the
+/// last leaf on odd levels (the native stand-in for `compute_merkle_root`).
+fn merkle_root(block: &Block) -> Option<Hash256> {
+    let mut leaves: Vec<[u8; 32]> = block
+        .txs
+        .iter()
+        .map(|tx| tx.txid().0.to_le_bytes())
+        .collect();
+    if leaves.is_empty() {
+        return None;
+    }
+    while leaves.len() > 1 {
+        let original_len = leaves.len();
+        let mut next = Vec::with_capacity(original_len.div_ceil(2));
+        for pos in 0..original_len.div_ceil(2) {
+            let left = leaves[2 * pos];
+            let right = leaves[(2 * pos + 1).min(original_len - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(double_sha256(&pair).to_le_bytes());
+        }
+        leaves = next;
+    }
+    Some(Hash256::from_le_bytes(&leaves[0]))
 }
 
 #[test]

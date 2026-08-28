@@ -4,18 +4,37 @@ use core::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use bitcoin::Amount;
 use sonic_rs::{JsonValueTrait, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{params_array, required_str, required_u64, serde_to_sonic};
-use crate::tx_render::btc_amount_json;
 
 static SERVER_START: OnceLock<Instant> = OnceLock::new();
 
 fn conf_target_blocks(conf_target: u64) -> u32 {
     u32::try_from(conf_target).unwrap_or(u32::MAX)
+}
+
+fn to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn btc_amount_json(satoshis: u64) -> Value {
+    let whole = satoshis / 100_000_000;
+    let fractional = satoshis % 100_000_000;
+    let text = format!("{whole}.{fractional:08}");
+    let mut deserializer = sonic_rs::Deserializer::from_str(&text).use_rawnumber();
+    match sonic_rs::Deserialize::deserialize(&mut deserializer) {
+        Ok(value) => value,
+        Err(error) => panic!("formatted unsigned BTC amount was invalid JSON: {error}"),
+    }
 }
 
 pub(crate) fn uptime(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -100,10 +119,7 @@ pub(crate) fn estimatesmartfee(ctx: &Arc<Context>, params: &Value) -> Result<Val
     match pool.estimate_fee_rate(conf_target_blocks(conf_target)) {
         Some(rate) => {
             let mut object = sonic_rs::Object::new();
-            let _ = object.insert(
-                "feerate",
-                btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb())),
-            );
+            let _ = object.insert("feerate", btc_amount_json(rate.as_sat_per_kvb()));
             let _ = object.insert("blocks", json!(conf_target));
             Ok(Value::from(object))
         }
@@ -120,7 +136,7 @@ pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let Some(rate) = pool.estimate_fee_rate(conf_target_blocks(conf_target)) else {
         return Ok(json!({}));
     };
-    let feerate = btc_amount_json(Amount::from_sat(rate.as_sat_per_kvb()));
+    let feerate = btc_amount_json(rate.as_sat_per_kvb());
     let mut short = sonic_rs::Object::new();
     let _ = short.insert("feerate", feerate.clone());
     let mut medium = sonic_rs::Object::new();
@@ -136,8 +152,6 @@ pub(crate) fn estimaterawfee(ctx: &Arc<Context>, params: &Value) -> Result<Value
 
 pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     use core::str::FromStr as _;
-
-    use bitcoin::hex::DisplayHex as _;
 
     let address_str = required_str(params, 0, "address is required")?;
     let network = match ctx.chain_network {
@@ -155,7 +169,7 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     };
 
     let script = address.script_pubkey();
-    let script_hex = script.as_bytes().to_lower_hex_string();
+    let script_hex = to_lower_hex(script.as_bytes());
     let address_canon = address.to_string();
     let mut response = serde_json::Map::new();
     response.insert("isvalid".to_owned(), serde_json::Value::Bool(true));
@@ -185,7 +199,7 @@ pub(crate) fn validateaddress(ctx: &Arc<Context>, params: &Value) -> Result<Valu
         if bytes.len() >= 2 {
             response.insert(
                 "witness_program".to_owned(),
-                serde_json::Value::String(bytes[2..].to_lower_hex_string()),
+                serde_json::Value::String(to_lower_hex(&bytes[2..])),
             );
         }
     }
@@ -405,8 +419,8 @@ mod tests {
         assert!(
             result
                 .get("active_commands")
-                .and_then(|value| value.as_array())
-                .is_some_and(|commands| commands.is_empty())
+                .and_then(Value::as_array)
+                .is_some_and(sonic_rs::Array::is_empty)
         );
         assert_eq!(
             result.get("logpath").and_then(|value| value.as_str()),

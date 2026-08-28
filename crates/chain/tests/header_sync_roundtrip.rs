@@ -1,15 +1,9 @@
 //! Header synchronization integration tests.
-use bitcoin::{
-    BlockHash, TxMerkleNode,
-    block::{Header as BlockHeader, Version},
-    hashes::Hash as _,
-    pow::CompactTarget,
-};
 use bitcoin_rs_chain::header_sync::{next_work_required, validate_header_nbits};
 use bitcoin_rs_chain::{
-    BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
+    BlockHeader, BlockTree, ChainError, Network, NodeStatus, accept_headers, current_unix_seconds,
 };
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{BlockHash, Hash256};
 
 #[test]
 fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
@@ -40,7 +34,7 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
     );
 
     let mut tampered = headers[0];
-    tampered.bits = CompactTarget::from_consensus(0x2200_ffff);
+    tampered.bits = 0x2200_ffff;
     let err = match accept_headers(
         &mut BlockTree::new(),
         &[tampered],
@@ -59,12 +53,12 @@ fn accepts_valid_headers_across_batches_and_rejects_bad_bits()
 fn rejects_post_genesis_header_as_empty_tree_root() {
     let genesis = genesis_header();
     let child = mine_header_with(
-        genesis.block_hash(),
+        genesis.compute_hash(),
         1,
         genesis.time + Network::Regtest.target_spacing_seconds(),
         genesis.bits,
     );
-    let prev_hash = Hash256::from_le_bytes(child.prev_blockhash.as_byte_array());
+    let prev_hash = Hash256::from_le_bytes(child.prev_blockhash.as_bytes());
     let mut tree = BlockTree::new();
 
     let err = match accept_headers(
@@ -85,12 +79,12 @@ fn rejects_post_genesis_header_as_empty_tree_root() {
 fn rejects_non_retarget_header_that_does_not_inherit_parent_bits_before_insertion()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let parent_bits = CompactTarget::from_consensus(0x207e_ffff);
-    let easier_child_bits = CompactTarget::from_consensus(0x207f_ffff);
-    let parent = mine_header_with(BlockHash::all_zeros(), 0, 0, parent_bits);
+    let parent_bits = 0x207e_ffff_u32;
+    let easier_child_bits = 0x207f_ffff_u32;
+    let parent = mine_header_with(BlockHash::default(), 0, 0, parent_bits);
     let parent_id = tree.insert_node(None, parent, NodeStatus::HeaderValid)?;
     let child = mine_header_with(
-        parent.block_hash(),
+        parent.compute_hash(),
         1,
         Network::Regtest.target_spacing_seconds(),
         easier_child_bits,
@@ -118,16 +112,16 @@ fn rejects_non_retarget_header_that_does_not_inherit_parent_bits_before_insertio
 fn rejects_retarget_header_that_keeps_parent_bits_when_timespan_clamps()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let bits = CompactTarget::from_consensus(0x1d00_ffff);
+    let bits = 0x1d00_ffff_u32;
     let interval = Network::Mainnet.retarget_interval();
-    let mut prev_hash = BlockHash::all_zeros();
+    let mut prev_hash = BlockHash::default();
     let mut parent = None;
     let mut parent_id = None;
 
     for height in 0..interval {
         let header = raw_header_with(prev_hash, height, height, bits);
         let id = tree.insert_node(parent, header, NodeStatus::HeaderValid)?;
-        prev_hash = header.block_hash();
+        prev_hash = header.compute_hash();
         parent = Some(id);
         parent_id = Some(id);
     }
@@ -147,7 +141,7 @@ fn rejects_retarget_header_that_keeps_parent_bits_when_timespan_clamps()
     else {
         panic!("expected nBits mismatch, got {err:?}");
     };
-    assert_eq!(actual, bits.to_consensus());
+    assert_eq!(actual, bits);
     assert_eq!(height, interval);
     assert_ne!(
         expected, actual,
@@ -160,8 +154,8 @@ fn rejects_retarget_header_that_keeps_parent_bits_when_timespan_clamps()
 fn next_work_required_is_exactly_what_validate_header_nbits_enforces()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let bits = CompactTarget::from_consensus(0x207e_ffff);
-    let parent = raw_header_with(BlockHash::all_zeros(), 0, 0, bits);
+    let bits = 0x207e_ffff_u32;
+    let parent = raw_header_with(BlockHash::default(), 0, 0, bits);
     let parent_id = tree.insert_node(None, parent, NodeStatus::HeaderValid)?;
     let candidate_time = Network::Regtest.target_spacing_seconds();
 
@@ -170,21 +164,14 @@ fn next_work_required_is_exactly_what_validate_header_nbits_enforces()
     let expected = next_work_required(&tree, parent_id, candidate_time, Network::Regtest)?;
     assert_eq!(expected, bits);
 
-    let candidate = raw_header_with(parent.block_hash(), 1, candidate_time, expected);
+    let candidate = raw_header_with(parent.compute_hash(), 1, candidate_time, expected);
     validate_header_nbits(&tree, parent_id, &candidate, Network::Regtest)?;
 
-    let wrong = raw_header_with(
-        parent.block_hash(),
-        1,
-        candidate_time,
-        CompactTarget::from_consensus(0x207e_fffe),
-    );
+    let wrong = raw_header_with(parent.compute_hash(), 1, candidate_time, 0x207e_fffe_u32);
     let Err(err) = validate_header_nbits(&tree, parent_id, &wrong, Network::Regtest) else {
         return Err("bits other than next_work_required must be rejected".into());
     };
-    assert!(
-        matches!(err, ChainError::NbitsMismatch { expected, .. } if expected == bits.to_consensus())
-    );
+    assert!(matches!(err, ChainError::NbitsMismatch { expected, .. } if expected == bits));
     Ok(())
 }
 
@@ -192,8 +179,8 @@ fn next_work_required_is_exactly_what_validate_header_nbits_enforces()
 fn next_work_required_recovers_minimum_difficulty_past_the_spacing_window()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let bits = CompactTarget::from_consensus(0x1b0e_3ea6);
-    let parent = raw_header_with(BlockHash::all_zeros(), 0, 0, bits);
+    let bits = 0x1b0e_3ea6_u32;
+    let parent = raw_header_with(BlockHash::default(), 0, 0, bits);
     let parent_id = tree.insert_node(None, parent, NodeStatus::HeaderValid)?;
     let spacing = Network::Testnet3.target_spacing_seconds();
 
@@ -212,7 +199,7 @@ fn next_work_required_recovers_minimum_difficulty_past_the_spacing_window()
             spacing.saturating_mul(2).saturating_add(1),
             Network::Testnet3
         )?,
-        CompactTarget::from_consensus(0x1d00_ffff)
+        0x1d00_ffff_u32
     );
     Ok(())
 }
@@ -253,7 +240,7 @@ fn duplicate_genesis_in_overlapping_batch_returns_original_ids_and_inserts_only_
         "duplicate first child returns the original NodeId"
     );
     for (i, header) in overlapping.iter().enumerate() {
-        let expected = Hash256::from_le_bytes(header.block_hash().as_byte_array());
+        let expected = Hash256::from_le_bytes(header.compute_hash().as_bytes());
         assert_eq!(
             tree.node(second[i])?.hash,
             expected,
@@ -279,7 +266,7 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
 -> Result<(), Box<dyn std::error::Error>> {
     let genesis = genesis_header();
     let active_child = mine_header_with(
-        genesis.block_hash(),
+        genesis.compute_hash(),
         1,
         genesis.time + Network::Regtest.target_spacing_seconds(),
         genesis.bits,
@@ -300,14 +287,14 @@ fn duplicate_equal_work_competing_child_returns_original_id_and_does_not_reorg()
     assert_eq!(tip_before.tip_id, active_tip_id);
 
     let competing = mine_header_with(
-        genesis.block_hash(),
+        genesis.compute_hash(),
         1,
         genesis.time + 3 * Network::Regtest.target_spacing_seconds(),
         genesis.bits,
     );
     assert_ne!(
-        active_child.block_hash(),
-        competing.block_hash(),
+        active_child.compute_hash(),
+        competing.compute_hash(),
         "competing child must have a different hash"
     );
 
@@ -381,7 +368,7 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
     assert_eq!(tip_before.height, 1);
 
     let mut invalid_unknown = headers[2];
-    invalid_unknown.bits = CompactTarget::from_consensus(0x2200_ffff);
+    invalid_unknown.bits = 0x2200_ffff;
 
     let batch = [headers[0], headers[1], invalid_unknown];
     let err = match accept_headers(&mut tree, &batch, Network::Regtest, current_unix_seconds()) {
@@ -412,18 +399,18 @@ fn invalid_unknown_suffix_after_duplicate_inputs_propagates_consensus_error_with
 fn mine_headers(count: u32) -> Vec<BlockHeader> {
     let mut headers = Vec::new();
     let genesis = genesis_header();
-    let mut prev = genesis.block_hash();
+    let mut prev = genesis.compute_hash();
     headers.push(genesis);
     for height in 1..count {
         let header = mine_header(prev, height);
-        prev = header.block_hash();
+        prev = header.compute_hash();
         headers.push(header);
     }
     headers
 }
 
 fn genesis_header() -> BlockHeader {
-    bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).header
+    Network::Regtest.genesis_block().header
 }
 
 /// Regtest genesis timestamp. Headers must advance past it, because the
@@ -435,44 +422,43 @@ fn mine_header(prev_blockhash: BlockHash, height: u32) -> BlockHeader {
         prev_blockhash,
         height,
         GENESIS_TIME.saturating_add(height),
-        CompactTarget::from_consensus(0x207f_ffff),
+        0x207f_ffff,
     )
 }
 
-fn mine_header_with(
-    prev_blockhash: BlockHash,
-    height: u32,
-    time: u32,
-    bits: CompactTarget,
-) -> BlockHeader {
+/// Differential proof-of-work oracle: checks that the header hash satisfies
+/// the compact target, using bitcoin's compact-target decode and comparison.
+fn pow_is_met(bits: u32, hash: &BlockHash) -> bool {
+    use bitcoin::hashes::Hash as _;
+    let target =
+        bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits));
+    target.is_met_by(bitcoin::BlockHash::from_byte_array(*hash.as_bytes()))
+}
+
+fn mine_header_with(prev_blockhash: BlockHash, height: u32, time: u32, bits: u32) -> BlockHeader {
     let mut merkle = [0_u8; 32];
     merkle[..4].copy_from_slice(&height.to_le_bytes());
     let mut header = BlockHeader {
-        version: Version::ONE,
+        version: 1,
         prev_blockhash,
-        merkle_root: TxMerkleNode::from_byte_array(merkle),
+        merkle_root: Hash256::from_le_bytes(&merkle),
         time,
         bits,
         nonce: 0,
     };
-    while !header.target().is_met_by(header.block_hash()) {
+    while !pow_is_met(header.bits, &header.compute_hash()) {
         header.nonce = header.nonce.wrapping_add(1);
     }
     header
 }
 
-fn raw_header_with(
-    prev_blockhash: BlockHash,
-    height: u32,
-    time: u32,
-    bits: CompactTarget,
-) -> BlockHeader {
+fn raw_header_with(prev_blockhash: BlockHash, height: u32, time: u32, bits: u32) -> BlockHeader {
     let mut merkle = [0_u8; 32];
     merkle[..4].copy_from_slice(&height.to_le_bytes());
     BlockHeader {
-        version: Version::ONE,
+        version: 1,
         prev_blockhash,
-        merkle_root: TxMerkleNode::from_byte_array(merkle),
+        merkle_root: Hash256::from_le_bytes(&merkle),
         time,
         bits,
         nonce: 0,

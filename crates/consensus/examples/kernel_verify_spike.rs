@@ -59,12 +59,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use bitcoin::consensus::Decodable as _;
-use bitcoin::hashes::Hash as _;
-use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use bitcoin_rs_consensus::UtxoView;
 use bitcoin_rs_consensus::kernel::KernelContext;
-use bitcoin_rs_primitives::{Hash256, Network, Tx};
+use bitcoin_rs_primitives::{Block, Hash256, Network, OutPoint, Tx, TxOut, Txid, consensus_bytes};
 use bitcoin_rs_script::VerifyFlags;
 use rayon::prelude::*;
 use serde_json::json;
@@ -235,6 +232,11 @@ struct SampleBlock {
     prevouts: Vec<PrevoutRec>,
 }
 
+/// Returns `true` for the one-input, null-prevout coinbase shape.
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1 && tx.inputs[0].previous_output == OutPoint::default()
+}
+
 fn extract_corpus(args: &Args) -> Result<()> {
     let stop_height = args
         .stop_height
@@ -272,31 +274,31 @@ fn extract_corpus(args: &Args) -> Result<()> {
 
     for height in 0..=stop_height {
         let raw = fetch_block(&mut client, height)?;
-        let block = bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(raw.as_slice()))
+        let block = Block::consensus_decode(&raw)
             .with_context(|| format!("decode block at height {height}"))?;
 
         let mut prevouts = Vec::new();
-        for tx in &block.txdata {
-            if !tx.is_coinbase() {
-                for (input_index, input) in tx.input.iter().enumerate() {
+        for tx in &block.txs {
+            if !is_coinbase(tx) {
+                for (input_index, input) in tx.inputs.iter().enumerate() {
                     let rec = utxo.remove(&input.previous_output).with_context(|| {
                         format!(
                             "missing prevout {} at height {height} txid {} input {input_index}",
                             input.previous_output,
-                            tx.compute_txid()
+                            tx.txid()
                         )
                     })?;
                     prevouts.push(rec);
                 }
             }
-            let txid = tx.compute_txid();
-            for (vout, output) in tx.output.iter().enumerate() {
+            let txid = tx.txid();
+            for (vout, output) in tx.outputs.iter().enumerate() {
                 let vout = u32::try_from(vout).context("vout exceeds u32")?;
                 utxo.insert(
-                    OutPoint { txid, vout },
+                    OutPoint::new(txid, vout),
                     PrevoutRec {
-                        amount: output.value.to_sat(),
-                        script: output.script_pubkey.to_bytes(),
+                        amount: output.value,
+                        script: output.script_pubkey.clone(),
                     },
                 );
             }
@@ -448,7 +450,7 @@ impl UtxoView for PrevoutMap {
 /// and kernel parse inside `verify_tx` stay inside it.
 struct WorkItem {
     tx: Tx,
-    txid: bitcoin::Txid,
+    txid: Txid,
     prevouts: PrevoutMap,
     height: u32,
     flags: VerifyFlags,
@@ -458,33 +460,32 @@ struct WorkItem {
 fn build_work_items(corpus: &[SampleBlock]) -> Result<Vec<WorkItem>> {
     let mut items = Vec::new();
     for sample in corpus {
-        let block =
-            bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(sample.raw.as_slice()))
-                .with_context(|| format!("decode corpus block at height {}", sample.height))?;
-        let block_hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
-        let flags = production_verify_flags(Network::Mainnet, sample.height, block_hash);
+        let block = Block::consensus_decode(&sample.raw)
+            .with_context(|| format!("decode corpus block at height {}", sample.height))?;
+        let block_hash = block.block_hash();
+        let flags = production_verify_flags(Network::Mainnet, sample.height, block_hash.0);
         let mut prevouts = sample.prevouts.iter();
-        for tx in &block.txdata {
-            if tx.is_coinbase() {
+        for tx in &block.txs {
+            if is_coinbase(tx) {
                 continue;
             }
-            let mut map = hashbrown::HashMap::with_capacity(tx.input.len());
-            for input in &tx.input {
+            let mut map = hashbrown::HashMap::with_capacity(tx.inputs.len());
+            for input in &tx.inputs {
                 let rec = prevouts.next().with_context(|| {
                     format!("corpus prevout underrun at height {}", sample.height)
                 })?;
                 map.insert(
                     input.previous_output,
                     TxOut {
-                        value: Amount::from_sat(rec.amount),
-                        script_pubkey: ScriptBuf::from_bytes(rec.script.clone()),
+                        value: rec.amount,
+                        script_pubkey: rec.script.clone(),
                     },
                 );
             }
             items.push(WorkItem {
-                txid: tx.compute_txid(),
-                input_count: tx.input.len(),
-                tx: Tx(tx.clone()),
+                txid: tx.txid(),
+                input_count: tx.inputs.len(),
+                tx: tx.clone(),
                 prevouts: PrevoutMap(map),
                 height: sample.height,
                 flags,
@@ -514,12 +515,12 @@ fn verify_item(kernel: &KernelContext, item: &WorkItem) -> Result<()> {
 /// On a rejection, re-runs each input individually through the kernel to name
 /// the failing input index — `verify_tx`'s error does not carry it.
 fn diagnose_failing_input(item: &WorkItem) -> String {
-    let tx_bytes = bitcoin::consensus::encode::serialize(&item.tx.0);
+    let tx_bytes = consensus_bytes(&item.tx);
     let Ok(kernel_tx) = bitcoinkernel::Transaction::new(&tx_bytes) else {
         return "kernel tx parse failed".to_owned();
     };
-    let mut spent = Vec::with_capacity(item.tx.0.input.len());
-    for (input_index, input) in item.tx.0.input.iter().enumerate() {
+    let mut spent = Vec::with_capacity(item.tx.inputs.len());
+    for (input_index, input) in item.tx.inputs.iter().enumerate() {
         let Some(prevout) = item.prevouts.lookup(&input.previous_output) else {
             return format!("input {input_index}: prevout missing");
         };
@@ -528,10 +529,10 @@ fn diagnose_failing_input(item: &WorkItem) -> String {
     let mut scripts = Vec::with_capacity(spent.len());
     let mut amounts = Vec::with_capacity(spent.len());
     for (input_index, prevout) in spent.iter().enumerate() {
-        let Ok(script) = bitcoinkernel::ScriptPubkey::new(prevout.script_pubkey.as_bytes()) else {
+        let Ok(script) = bitcoinkernel::ScriptPubkey::new(&prevout.script_pubkey) else {
             return format!("input {input_index}: prevout script rejected by kernel");
         };
-        let Ok(amount) = i64::try_from(prevout.value.to_sat()) else {
+        let Ok(amount) = i64::try_from(prevout.value) else {
             return format!("input {input_index}: amount exceeds i64");
         };
         scripts.push(script);
@@ -571,7 +572,7 @@ fn measure(corpus: &[SampleBlock], items: &[WorkItem], args: &Args) -> Result<se
         items.len()
     );
 
-    let kernel = KernelContext::new(bitcoin::Network::Bitcoin)
+    let kernel = KernelContext::new(Network::Mainnet)
         .map_err(|error| anyhow::anyhow!("create kernel context: {error}"))?;
 
     // Untimed correctness pass: every pristine input must verify OK.

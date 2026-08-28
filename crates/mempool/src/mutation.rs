@@ -9,9 +9,7 @@
 
 use alloc::vec::Vec;
 
-use bitcoin::Txid;
-use bitcoin::hashes::Hash as _;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Hash256, Txid};
 
 /// Why an entry left the pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +57,7 @@ pub struct MutationChange {
 /// this seam.
 pub(crate) fn change(txid: &Txid, outcome: MutationOutcome) -> MutationChange {
     MutationChange {
-        txid: Hash256::from_le_bytes(txid.as_byte_array()),
+        txid: Hash256::from(*txid),
         outcome,
     }
 }

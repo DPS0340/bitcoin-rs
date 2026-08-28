@@ -1,9 +1,6 @@
-use bitcoin::Txid;
 #[cfg(test)]
-use bitcoin::hashes::Hash as _;
-#[cfg(test)]
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_primitives::OutPoint;
+use bitcoin_rs_primitives::Tx;
+use bitcoin_rs_primitives::{Block, OutPoint, Txid, consensus_bytes};
 use hashbrown::HashSet;
 
 pub(super) type SameBlockSpentSet = HashSet<OutPoint>;
@@ -24,28 +21,20 @@ pub(super) struct ApplyScratch {
 
 impl ApplyScratch {
     #[cfg(test)]
-    pub(super) fn new(block: &bitcoin::Block, include_raw_txs: bool) -> Self {
-        let txids = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect();
+    pub(super) fn new(block: &Block, include_raw_txs: bool) -> Self {
+        let txids = block.txs.iter().map(Tx::txid).collect();
         Self::with_txids(block, include_raw_txs, txids)
     }
 
     #[cfg(test)]
-    pub(super) fn with_txids(
-        block: &bitcoin::Block,
-        include_raw_txs: bool,
-        txids: Vec<Txid>,
-    ) -> Self {
+    pub(super) fn with_txids(block: &Block, include_raw_txs: bool, txids: Vec<Txid>) -> Self {
         let capacities = ApplyScratchCapacities {
-            created_outputs: block.txdata.iter().map(|tx| tx.output.len()).sum(),
+            created_outputs: block.txs.iter().map(|tx| tx.outputs.len()).sum(),
             spent_inputs: block
-                .txdata
+                .txs
                 .iter()
-                .filter(|tx| !tx.is_coinbase())
-                .map(|tx| tx.input.len())
+                .filter(|tx| !is_coinbase(tx))
+                .map(|tx| tx.inputs.len())
                 .sum(),
         };
         let (same_block_spent, same_block_spent_input_count) =
@@ -61,21 +50,21 @@ impl ApplyScratch {
     }
 
     pub(super) fn from_prepared_parts(
-        block: &bitcoin::Block,
+        block: &Block,
         include_raw_txs: bool,
         txids: Vec<Txid>,
         capacities: ApplyScratchCapacities,
         same_block_spent: Option<SameBlockSpentSet>,
         same_block_spent_input_count: usize,
     ) -> Self {
-        debug_assert_eq!(txids.len(), block.txdata.len());
-        let mut raw_txs = include_raw_txs.then(|| Vec::with_capacity(block.txdata.len()));
+        debug_assert_eq!(txids.len(), block.txs.len());
+        let mut raw_txs = include_raw_txs.then(|| Vec::with_capacity(block.txs.len()));
         let created_capacity = capacities.created_outputs;
         let spent_capacity = capacities.spent_inputs;
 
         if let Some(raw_txs) = &mut raw_txs {
-            for tx in &block.txdata {
-                raw_txs.push(bitcoin::consensus::encode::serialize(tx));
+            for tx in &block.txs {
+                raw_txs.push(consensus_bytes(tx));
             }
         }
         let same_block_spent_len = same_block_spent
@@ -119,7 +108,7 @@ impl ApplyScratch {
 
 #[cfg(test)]
 fn detect_same_block_spends(
-    block: &bitcoin::Block,
+    block: &Block,
     txids: &[Txid],
     spent_capacity: usize,
 ) -> (Option<SameBlockSpentSet>, usize) {
@@ -127,31 +116,28 @@ fn detect_same_block_spends(
         return (None, 0);
     }
 
-    let mut seen_txids = HashSet::with_capacity(block.txdata.len());
+    let mut seen_txids = HashSet::with_capacity(block.txs.len());
     let mut same_block_spent = None;
     let mut same_block_spent_input_count = 0usize;
-    for (tx, txid) in block.txdata.iter().zip(txids) {
-        if !tx.is_coinbase() {
-            for input in &tx.input {
-                let previous_txid =
-                    Hash256::from_le_bytes(input.previous_output.txid.as_byte_array());
-                if seen_txids.contains(&previous_txid) {
+    for (tx, txid) in block.txs.iter().zip(txids) {
+        if !is_coinbase(tx) {
+            for input in &tx.inputs {
+                if seen_txids.contains(&input.previous_output.txid) {
                     same_block_spent
                         .get_or_insert_with(|| HashSet::with_capacity(spent_capacity))
-                        .insert(internal_outpoint(&input.previous_output));
+                        .insert(input.previous_output);
                     same_block_spent_input_count = same_block_spent_input_count.saturating_add(1);
                 }
             }
         }
-        seen_txids.insert(Hash256::from_le_bytes(txid.as_byte_array()));
+        seen_txids.insert(*txid);
     }
     (same_block_spent, same_block_spent_input_count)
 }
 
 #[cfg(test)]
-fn internal_outpoint(outpoint: &bitcoin::OutPoint) -> OutPoint {
-    OutPoint::new(
-        Hash256::from_le_bytes(outpoint.txid.as_byte_array()),
-        outpoint.vout,
-    )
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
 }

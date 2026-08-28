@@ -1,10 +1,16 @@
+//! Script verification entry points over the native transaction type.
+//!
+//! The interpreter executes taproot key-path spends natively (BIP341 Schnorr
+//! verification against the native sighash engine); non-taproot spend classes
+//! are handled by the verification backend wired into the consensus crate.
+
 use std::borrow::Cow;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::{Script, ScriptBuf, Witness};
-use bitcoin_rs_primitives::TxOut;
+use bitcoin_rs_primitives::{Sighash, SighashCache, Tx, TxOut};
+use secp256k1::{Message, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use thiserror::Error;
+
+use crate::script::is_p2tr;
 
 /// Verification flags passed to the delegated consensus script engine.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -217,7 +223,7 @@ impl Interpreter {
     /// Executes a script spend through the enabled script backend.
     ///
     /// When `script_sig` and `witness` already match the bytes stored on
-    /// `tx.input[input_idx]` — true for every block/mempool validation caller,
+    /// `tx.inputs[input_idx]` — true for every block/mempool validation caller,
     /// which reads them straight off the transaction — `tx` is used as-is with
     /// no clone. Only callers that pass substitute bytes (e.g. vector tests
     /// grafting a foreign witness) pay for a clone to splice them in.
@@ -235,7 +241,7 @@ impl Interpreter {
         witness: &[Vec<u8>],
         flags: VerifyFlags,
         prevout: &TxOut,
-        tx: &bitcoin::Transaction,
+        tx: &Tx,
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
         self.execute_with_prevouts(
@@ -243,7 +249,7 @@ impl Interpreter {
             script_sig,
             witness,
             flags,
-            &[prevout],
+            std::slice::from_ref(prevout),
             tx,
             input_idx,
         )
@@ -251,67 +257,70 @@ impl Interpreter {
 
     /// Executes a script spend with the complete ordered prevout set.
     ///
-    /// `prevouts` must be aligned with `tx.input` (same length, input order).
-    /// BIP341 key-path sighsashes commit to every spent output, so multi-input
-    /// taproot spends require the full slice via [`Prevouts::All`].
+    /// `prevouts` must be aligned with `tx.inputs` (same length, input order).
+    /// BIP341 key-path sighashes commit to every spent output, so multi-input
+    /// taproot spends require the full slice.
     pub fn execute_with_prevouts(
         &self,
         script_pubkey: &[u8],
         script_sig: &[u8],
         witness: &[Vec<u8>],
         flags: VerifyFlags,
-        prevouts: &[&TxOut],
-        tx: &bitcoin::Transaction,
+        prevouts: &[TxOut],
+        tx: &Tx,
         input_idx: usize,
     ) -> Result<bool, ScriptError> {
-        let inputs = tx.input.len();
-        let out_of_range = ScriptError::InputIndexOutOfRange {
-            index: input_idx,
-            inputs,
-        };
-        let input = tx.input.get(input_idx).ok_or(out_of_range)?;
+        let inputs = tx.inputs.len();
+        let input = tx
+            .inputs
+            .get(input_idx)
+            .ok_or(ScriptError::InputIndexOutOfRange {
+                index: input_idx,
+                inputs,
+            })?;
         // `execute` forwards a one-element slice for the current input. Full-set
-        // callers pass `prevouts.len() == tx.input.len()` in input order.
+        // callers pass `prevouts.len() == tx.inputs.len()` in input order.
         let prevout = if prevouts.len() == inputs {
-            *prevouts
+            prevouts
                 .get(input_idx)
                 .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
         } else if prevouts.len() == 1 {
-            prevouts[0]
+            prevouts
+                .first()
+                .ok_or(ScriptError::TaprootPrevoutsUnavailable)?
         } else {
             return Err(ScriptError::TaprootPrevoutsUnavailable);
         };
 
-        let matches_tx = input.script_sig.as_bytes() == script_sig
+        let matches_tx = input.script_sig.as_slice() == script_sig
             && input.witness.len() == witness.len()
             && input
                 .witness
                 .iter()
-                .zip(witness)
-                .all(|(stored, provided)| stored == provided.as_slice());
-        let spending: Cow<'_, bitcoin::Transaction> = if matches_tx {
+                .zip(witness.iter())
+                .all(|(stored, provided)| stored == provided);
+        let spending: Cow<'_, Tx> = if matches_tx {
             Cow::Borrowed(tx)
         } else {
             let mut grafted = tx.clone();
             let grafted_input =
                 grafted
-                    .input
+                    .inputs
                     .get_mut(input_idx)
                     .ok_or(ScriptError::InputIndexOutOfRange {
                         index: input_idx,
                         inputs,
                     })?;
-            grafted_input.script_sig = ScriptBuf::from_bytes(script_sig.to_vec());
-            grafted_input.witness = Witness::from_slice(witness);
+            grafted_input.script_sig = script_sig.to_vec();
+            grafted_input.witness = witness.to_vec();
             Cow::Owned(grafted)
         };
 
-        let script = Script::from_bytes(script_pubkey);
-        if script.is_p2tr() && flags.contains(VerifyFlags::TAPROOT) {
-            return verify_taproot_keypath(&spending, input_idx, script, witness, prevouts);
+        if is_p2tr(script_pubkey) && flags.contains(VerifyFlags::TAPROOT) {
+            return verify_taproot_keypath(&spending, input_idx, script_pubkey, witness, prevouts);
         }
 
-        verify_non_taproot_portable(input_idx, prevout, &spending, script, flags)
+        verify_non_taproot_portable(input_idx, prevout, &spending, script_pubkey)
     }
 }
 
@@ -320,18 +329,17 @@ impl Interpreter {
 fn verify_non_taproot_portable(
     input_idx: usize,
     _prevout: &TxOut,
-    spending: &bitcoin::Transaction,
-    script: &Script,
-    _flags: VerifyFlags,
+    spending: &Tx,
+    script_pubkey: &[u8],
 ) -> Result<bool, ScriptError> {
     let input = spending
-        .input
+        .inputs
         .get(input_idx)
         .ok_or(ScriptError::InputIndexOutOfRange {
             index: input_idx,
-            inputs: spending.input.len(),
+            inputs: spending.inputs.len(),
         })?;
-    if script.as_bytes() == [0x51] && input.script_sig.is_empty() && input.witness.is_empty() {
+    if script_pubkey == [0x51] && input.script_sig.is_empty() && input.witness.is_empty() {
         return Ok(true);
     }
 
@@ -341,39 +349,39 @@ fn verify_non_taproot_portable(
 }
 
 fn verify_taproot_keypath(
-    spending: &bitcoin::Transaction,
+    spending: &Tx,
     input_idx: usize,
-    script: &Script,
+    script_pubkey: &[u8],
     witness: &[Vec<u8>],
-    prevouts: &[&TxOut],
+    prevouts: &[TxOut],
 ) -> Result<bool, ScriptError> {
-    if prevouts.len() != spending.input.len() {
+    if prevouts.len() != spending.inputs.len() {
         return Err(ScriptError::TaprootPrevoutsUnavailable);
     }
     let signature_bytes = taproot_keypath_signature(witness)?;
-    let (signature_bytes, sighash_type) = match signature_bytes.len() {
-        64 => (signature_bytes, TapSighashType::Default),
-        65 => {
-            let sighash_type = TapSighashType::from_consensus_u8(signature_bytes[64])
-                .map_err(|error| ScriptError::Verification(error.to_string()))?;
-            (&signature_bytes[..64], sighash_type)
-        }
+    let sighash_type = match signature_bytes.len() {
+        64 => Sighash::Default,
+        65 => Sighash::from_consensus_u8(signature_bytes[64])
+            .map_err(|error| ScriptError::Verification(error.to_string()))?,
         len => {
             return Err(ScriptError::Verification(format!(
                 "taproot key-path signature length {len} is not 64 or 65 bytes"
             )));
         }
     };
-    let signature = bitcoin::secp256k1::schnorr::Signature::from_slice(signature_bytes)
+    let xonly_key = script_pubkey
+        .get(2..34)
+        .ok_or_else(|| ScriptError::Verification("taproot program is not 32 bytes".to_owned()))?;
+    let signature = Signature::from_slice(signature_bytes)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
-    let public_key = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&script.as_bytes()[2..34])
+    let public_key = XOnlyPublicKey::from_slice(xonly_key)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
     let mut cache = SighashCache::new(spending);
     let sighash = cache
-        .taproot_key_spend_signature_hash(input_idx, &Prevouts::All(prevouts), sighash_type)
+        .taproot_signature_hash(input_idx, prevouts, None, None, sighash_type)
         .map_err(|error| ScriptError::Verification(error.to_string()))?;
-    let message = bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array());
-    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let message = Message::from_digest(*sighash.as_byte_array());
+    let secp = Secp256k1::verification_only();
     secp.verify_schnorr(&signature, &message, &public_key)
         .map(|()| true)
         .map_err(|error| ScriptError::Verification(error.to_string()))
@@ -393,11 +401,7 @@ fn taproot_keypath_signature(witness: &[Vec<u8>]) -> Result<&[u8], ScriptError> 
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-        transaction,
-    };
+    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut, Txid};
 
     use super::{Interpreter, ScriptError, VerifyFlags};
 
@@ -406,13 +410,13 @@ mod tests {
         let interpreter = Interpreter;
         let tx = unsigned_spend();
         let prevout = TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: 50_000,
+            script_pubkey: vec![0x51],
         };
 
         assert_eq!(
             interpreter.execute(
-                prevout.script_pubkey.as_bytes(),
+                &prevout.script_pubkey,
                 &[],
                 &[],
                 VerifyFlags::MANDATORY,
@@ -429,23 +433,20 @@ mod tests {
         ));
     }
 
-    fn unsigned_spend() -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([1; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn unsigned_spend() -> Tx {
+        Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), 0),
+                script_sig: Vec::new(),
+                sequence: 0xffff_fffe,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(49_000),
-                script_pubkey: ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 49_000,
+                script_pubkey: Vec::new(),
             }],
+            lock_time: 0,
         }
     }
 }

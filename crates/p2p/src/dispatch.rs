@@ -1,5 +1,6 @@
-use bitcoin::block::{BlockHash, Header};
+use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
 
 use crate::fsm::step;
 use crate::handshake::feature_messages;
@@ -16,7 +17,7 @@ pub use crate::wire::MAX_LOCATOR_HASHES;
 #[derive(Debug, Default)]
 pub struct InventoryResponse {
     /// Locally available active-chain blocks, sent as `block` messages.
-    pub blocks: Vec<bitcoin::Block>,
+    pub blocks: Vec<Block>,
     /// Inventory that cannot be served by this node.
     pub not_found: Vec<Inventory>,
 }
@@ -98,12 +99,14 @@ pub fn dispatch_inbound_with_chain<S>(
 }
 
 fn headers_response(chain: Option<&dyn ChainQuery>, request: &GetHeadersMessage) -> Message {
+    let locator_hashes: Vec<BlockHash> = request
+        .locator_hashes
+        .iter()
+        .map(|h| BlockHash(Hash256::from_le_bytes(h.as_byte_array())))
+        .collect();
+    let stop_hash = BlockHash(Hash256::from_le_bytes(request.stop_hash.as_byte_array()));
     let mut headers = chain.map_or_else(Vec::new, |chain| {
-        chain.headers_after(
-            &request.locator_hashes,
-            request.stop_hash,
-            MAX_HEADERS_RESPONSE,
-        )
+        chain.headers_after(&locator_hashes, stop_hash, MAX_HEADERS_RESPONSE)
     });
     headers.truncate(MAX_HEADERS_RESPONSE);
     Message::Headers(headers)
@@ -130,7 +133,7 @@ fn data_responses(chain: Option<&dyn ChainQuery>, items: &[Inventory]) -> Vec<Me
 }
 
 fn ensure_block_locator_within_bounds(
-    locator_hashes: &[BlockHash],
+    locator_hashes: &[bitcoin::BlockHash],
     error: &'static str,
 ) -> Result<(), PeerError> {
     if locator_hashes.len() > MAX_LOCATOR_HASHES {
@@ -150,12 +153,10 @@ fn ensure_inventory_request_within_bounds(items: &[Inventory]) -> Result<(), Pee
 mod tests {
     use std::io::Cursor;
 
-    use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::Magic;
     use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
-    use bitcoin::pow::CompactTarget;
-    use bitcoin::{Block, TxMerkleNode};
+    use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
 
     use super::{
         ChainQuery, InventoryResponse, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, dispatch_inbound,
@@ -175,10 +176,10 @@ mod tests {
     impl FakeChain {
         fn with_headers(count: u32) -> Self {
             let mut headers = Vec::new();
-            let mut prev = bitcoin::BlockHash::all_zeros();
+            let mut prev = BlockHash::default();
             for nonce in 0..count {
                 let header = test_header(prev, nonce);
-                prev = header.block_hash();
+                prev = header.compute_hash();
                 headers.push(header);
             }
             Self {
@@ -192,8 +193,8 @@ mod tests {
     impl ChainQuery for FakeChain {
         fn headers_after(
             &self,
-            _locator_hashes: &[bitcoin::BlockHash],
-            _stop_hash: bitcoin::BlockHash,
+            _locator_hashes: &[BlockHash],
+            _stop_hash: BlockHash,
             limit: usize,
         ) -> Vec<Header> {
             self.headers.iter().take(limit).copied().collect()
@@ -214,8 +215,8 @@ mod tests {
     impl ChainQuery for GreedyHeaders {
         fn headers_after(
             &self,
-            _locator_hashes: &[bitcoin::BlockHash],
-            _stop_hash: bitcoin::BlockHash,
+            _locator_hashes: &[BlockHash],
+            _stop_hash: BlockHash,
             _limit: usize,
         ) -> Vec<Header> {
             self.headers.clone()
@@ -325,13 +326,15 @@ mod tests {
         let mut chain = FakeChain::with_headers(1);
         let block = Block {
             header: chain.headers[0],
-            txdata: Vec::new(),
+            txs: Vec::new(),
         };
         let missing = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array([7; 32]));
         chain.blocks.push(block);
         chain.not_found.push(missing);
         let message = Message::GetData(vec![
-            Inventory::Block(chain.headers[0].block_hash()),
+            Inventory::Block(bitcoin::BlockHash::from_byte_array(
+                *chain.headers[0].compute_hash().as_bytes(),
+            )),
             missing,
         ]);
         let mut peer = ready_peer();
@@ -341,7 +344,7 @@ mod tests {
         let [Message::Block(found), Message::NotFound(not_found)] = responses.as_slice() else {
             panic!("expected block plus notfound, got {responses:?}");
         };
-        assert_eq!(found.block_hash(), chain.headers[0].block_hash());
+        assert_eq!(found.block_hash(), chain.headers[0].compute_hash());
         assert_eq!(not_found, &vec![missing]);
         Ok(())
     }
@@ -403,13 +406,13 @@ mod tests {
         peer
     }
 
-    fn test_header(prev_blockhash: bitcoin::BlockHash, nonce: u32) -> Header {
+    fn test_header(prev_blockhash: BlockHash, nonce: u32) -> Header {
         Header {
-            version: Version::from_consensus(1),
+            version: 1,
             prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::from_le_bytes(&[0; 32]),
             time: nonce,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce,
         }
     }

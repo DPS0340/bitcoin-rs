@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use bitcoin::hashes::Hash as _;
+use bitcoin_rs_primitives::{Block, Hash256, Tx, Txid, encode::double_sha256};
 use parking_lot::RwLock;
 
 #[cfg(feature = "redb")]
@@ -293,12 +293,8 @@ fn ingest_with_precomputed_txids_matches_standard_ingest() -> Result<(), Box<dyn
 {
     let height = 170_u32;
     let block_bytes = read_fixture(height)?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)?;
-    let txids = block
-        .txdata
-        .iter()
-        .map(bitcoin::Transaction::compute_txid)
-        .collect::<Vec<_>>();
+    let block = Block::consensus_decode(&block_bytes)?;
+    let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
 
     assert_precomputed_ingest_matches_standard(&block_bytes, height, &txids)
 }
@@ -307,12 +303,8 @@ fn ingest_with_precomputed_txids_matches_standard_ingest() -> Result<(), Box<dyn
 fn ingest_with_verified_txids_matches_standard_ingest() -> Result<(), Box<dyn std::error::Error>> {
     let height = 170_u32;
     let block_bytes = read_fixture(height)?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)?;
-    let txids = block
-        .txdata
-        .iter()
-        .map(bitcoin::Transaction::compute_txid)
-        .collect::<Vec<_>>();
+    let block = Block::consensus_decode(&block_bytes)?;
+    let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
 
     assert_verified_ingest_matches_standard(&block_bytes, height, &txids)
 }
@@ -331,8 +323,8 @@ fn ingest_with_same_length_wrong_precomputed_txids_falls_back_to_standard_ingest
 -> Result<(), Box<dyn std::error::Error>> {
     let height = 170_u32;
     let block_bytes = read_fixture(height)?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&block_bytes)?;
-    let stale_txids = vec![bitcoin::Txid::from_byte_array([0x42; 32]); block.txdata.len()];
+    let block = Block::consensus_decode(&block_bytes)?;
+    let stale_txids = vec![Txid(Hash256::from_le_bytes(&[0x42; 32])); block.txs.len()];
 
     assert_precomputed_ingest_matches_standard(&block_bytes, height, &stale_txids)
 }
@@ -347,7 +339,7 @@ fn read_fixture(height: u32) -> Result<Vec<u8>, std::io::Error> {
 fn assert_precomputed_ingest_matches_standard(
     block: &[u8],
     height: u32,
-    txids: &[bitcoin::Txid],
+    txids: &[Txid],
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_ingest_matches_standard(block, height, |indexer| {
         indexer.ingest_block_with_txids(block, height, txids)
@@ -357,7 +349,7 @@ fn assert_precomputed_ingest_matches_standard(
 fn assert_verified_ingest_matches_standard(
     block: &[u8],
     height: u32,
-    txids: &[bitcoin::Txid],
+    txids: &[Txid],
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_ingest_matches_standard(block, height, |indexer| {
         indexer.ingest_block_with_verified_txids(block, height, txids)
@@ -387,7 +379,7 @@ fn assert_ingest_matches_standard(
 }
 
 fn block_hash(body: &[u8]) -> [u8; 32] {
-    bitcoin::BlockHash::hash(&body[..80]).to_byte_array()
+    double_sha256(&body[..80]).to_le_bytes()
 }
 
 fn parent_hash(body: &[u8]) -> [u8; 32] {
@@ -579,8 +571,8 @@ fn snapshot_scan_preserves_position_values() -> Result<(), Box<dyn std::error::E
     let store = Arc::new(MemoryStore::default());
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&body)?;
-    let txid = block.txdata[0].compute_txid();
+    let block = Block::consensus_decode(&body)?;
+    let txid = block.txs[0].txid();
     let prepared = writer.prepare_block(0, block_hash(&body), &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
@@ -996,9 +988,9 @@ fn redb_snapshot_preserves_position_values() -> Result<(), Box<dyn std::error::E
     let store = Arc::new(bitcoin_rs_storage::open_redb_tx_index_store(temp.path())?);
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
-    let block: bitcoin::Block = bitcoin::consensus::deserialize(&body)?;
-    let txid = block.txdata[0].compute_txid();
-    let scripthash = ScriptHash::new(&block.txdata[0].output[0].script_pubkey);
+    let block = Block::consensus_decode(&body)?;
+    let txid = block.txs[0].txid();
+    let scripthash = ScriptHash::new(&block.txs[0].outputs[0].script_pubkey);
     let prepared = writer.prepare_block(0, block_hash(&body), &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,

@@ -1,16 +1,11 @@
 //! Deep reorganization planner integration tests.
-use bitcoin::{
-    BlockHash, TxMerkleNode,
-    block::{Header as BlockHeader, Version},
-    hashes::Hash as _,
-    pow::CompactTarget,
-};
-use bitcoin_rs_chain::{BlockTree, CachedState, NodeId, NodeStatus, plan_reorg};
+use bitcoin_rs_chain::{BlockHeader, BlockTree, CachedState, NodeId, NodeStatus, plan_reorg};
+use bitcoin_rs_primitives::{BlockHash, Hash256};
 
 #[test]
 fn plans_deep_reorg_to_common_fork() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let genesis = mine_header(BlockHash::all_zeros(), 0, 0);
+    let genesis = mine_header(BlockHash::default(), 0, 0);
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
 
     let mut trunk = vec![genesis_id];
@@ -48,7 +43,7 @@ fn plans_deep_reorg_to_common_fork() -> Result<(), Box<dyn std::error::Error>> {
 fn invalidate_subtree_clears_bip9_cache_entries_of_the_invalid_branch_only()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = BlockTree::new();
-    let genesis = mine_header(BlockHash::all_zeros(), 0, 0);
+    let genesis = mine_header(BlockHash::default(), 0, 0);
     let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
 
     let mut trunk_tip = genesis_id;
@@ -93,8 +88,19 @@ fn mine_child(
     height: u32,
     branch: u8,
 ) -> Result<BlockHeader, Box<dyn std::error::Error>> {
-    let parent_hash = BlockHash::from_byte_array(tree.node(parent)?.hash.to_le_bytes());
+    let parent_hash = BlockHash::from(Hash256::from_le_bytes(
+        &tree.node(parent)?.hash.to_le_bytes(),
+    ));
     Ok(mine_header(parent_hash, height, branch))
+}
+
+/// Differential proof-of-work oracle: checks that the header hash satisfies
+/// the compact target, using bitcoin's compact-target decode and comparison.
+fn pow_is_met(bits: u32, hash: &BlockHash) -> bool {
+    use bitcoin::hashes::Hash as _;
+    let target =
+        bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits));
+    target.is_met_by(bitcoin::BlockHash::from_byte_array(*hash.as_bytes()))
 }
 
 fn mine_header(prev_blockhash: BlockHash, height: u32, branch: u8) -> BlockHeader {
@@ -102,14 +108,14 @@ fn mine_header(prev_blockhash: BlockHash, height: u32, branch: u8) -> BlockHeade
     merkle[..4].copy_from_slice(&height.to_le_bytes());
     merkle[4] = branch;
     let mut header = BlockHeader {
-        version: Version::ONE,
+        version: 1,
         prev_blockhash,
-        merkle_root: TxMerkleNode::from_byte_array(merkle),
+        merkle_root: Hash256::from_le_bytes(&merkle),
         time: height,
-        bits: CompactTarget::from_consensus(0x207f_ffff),
+        bits: 0x207f_ffff,
         nonce: 0,
     };
-    while !header.target().is_met_by(header.block_hash()) {
+    while !pow_is_met(header.bits, &header.compute_hash()) {
         header.nonce = header.nonce.wrapping_add(1);
     }
     header

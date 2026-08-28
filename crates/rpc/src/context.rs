@@ -4,14 +4,13 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::path::PathBuf;
 
 use arc_swap::ArcSwapOption;
-use bitcoin::consensus::encode::serialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::hex::DisplayHex;
-use bitcoin::{Block, OutPoint, Transaction, Txid};
+
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_index::ScriptHash;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
+};
 use compact_str::CompactString;
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
@@ -27,6 +26,17 @@ const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
 /// Full-block REST responses materialize the block and a response buffer.
 /// Bound concurrent materializations independently of socket connections.
 const MAX_CONCURRENT_REST_BLOCK_RENDERS: usize = 2;
+
+/// Encodes `bytes` as lowercase hexadecimal.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
 
 #[derive(Debug)]
 struct RestRenderBudget {
@@ -81,7 +91,7 @@ impl Drop for RestRenderPermit {
 #[derive(Clone, Debug)]
 pub struct BlockRecord {
     /// Block hash in conventional big-endian hex order.
-    pub hash: Hash256,
+    pub hash: BlockHash,
     /// Height in the active chain.
     pub height: u32,
     /// Serialized block byte length.
@@ -393,7 +403,7 @@ pub fn record_at_height_hash(
         index = index.saturating_sub(1);
     }
     while index < records.len() && records[index].height == height {
-        if records[index].hash == hash {
+        if Hash256::from(records[index].hash) == hash {
             return Some(&records[index]);
         }
         index += 1;
@@ -412,11 +422,11 @@ pub struct BlockBodyMetadata {
 /// Storage-backed block body reader used when block records keep only metadata.
 pub trait BlockBodySource: Send + Sync {
     /// Returns serialized block bytes for `height` and `hash`, if available.
-    fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>>;
+    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>>;
 
     /// Returns indexed body facts. Implementations that cannot answer without
     /// I/O may leave this absent; header-only callers then remain header-only.
-    fn block_body_metadata(&self, _height: u32, _hash: Hash256) -> Option<BlockBodyMetadata> {
+    fn block_body_metadata(&self, _height: u32, _hash: BlockHash) -> Option<BlockBodyMetadata> {
         None
     }
 
@@ -448,7 +458,7 @@ pub trait BlockBodySource: Send + Sync {
     fn block_body_range(
         &self,
         _height: u32,
-        _hash: Hash256,
+        _hash: BlockHash,
         _offset: u32,
         _len: u32,
     ) -> Option<Vec<u8>> {
@@ -459,27 +469,25 @@ pub trait BlockBodySource: Send + Sync {
 impl BlockRecord {
     /// Builds a record from a decoded Bitcoin block.
     ///
-    /// The record is metadata only: `body_size` is measured by
-    /// [`Block::total_size`], never by serializing the block a second time.
+    /// The record is metadata only: `body_size` is the native consensus-encoded length.
     #[must_use]
     pub fn from_block(height: u32, block: &Block) -> Self {
-        let block_hash = block.block_hash();
-        let hash = Hash256::from_le_bytes(block_hash.as_byte_array());
+        let hash = block.block_hash();
         Self {
             hash,
             height,
-            body_size: block.total_size(),
+            body_size: consensus_bytes(block).len(),
             // Not stored: the block tree holds this block's header, and
             // `Context::header_record` supplies it on the way out.
             header: None,
-            tx_count: block.txdata.len(),
+            tx_count: block.txs.len(),
             time: block.header.time,
         }
     }
 
     /// Builds a synthetic record used by tests and empty-state scaffolds.
     #[must_use]
-    pub fn synthetic(height: u32, hash: Hash256) -> Self {
+    pub fn synthetic(height: u32, hash: BlockHash) -> Self {
         Self {
             hash,
             height,
@@ -509,7 +517,7 @@ impl BlockRecord {
     pub fn header_hex(&self) -> String {
         self.header
             .as_ref()
-            .map_or_else(String::new, |bytes| bytes.to_lower_hex_string())
+            .map_or_else(String::new, |bytes| hex_encode(bytes.as_slice()))
     }
 }
 
@@ -763,7 +771,7 @@ pub struct LastCandidateInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignetMiningInfo {
     /// Consensus signet challenge script.
-    pub challenge: bitcoin::ScriptBuf,
+    pub challenge: Vec<u8>,
 }
 
 /// Authoritative semantic state returned by [`MiningControl::mining_info`].
@@ -827,8 +835,7 @@ pub trait MiningControl: Send + Sync {
 
 /// Returns the f64 difficulty for `bits` using Bitcoin Core's calculation.
 #[must_use]
-pub fn difficulty_for_bits(bits: bitcoin::CompactTarget) -> f64 {
-    let consensus_bits = bits.to_consensus();
+pub fn difficulty_for_bits(consensus_bits: u32) -> f64 {
     let mantissa = consensus_bits & 0x00ff_ffff;
     if mantissa == 0 {
         return 0.0;
@@ -872,7 +879,7 @@ pub enum TxQueryError {
 /// Lockless read-only adapter for complete transaction-index queries.
 pub trait TxIndexQuery: Send + Sync {
     /// Resolves a confirmed transaction, returning `None` only after complete absence is proven.
-    fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError>;
+    fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError>;
     /// Resolves a confirmed prevout value, returning `None` only after complete absence is proven.
     fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError>;
     /// Resolves the height of the block confirming `txid`, without materializing the transaction.
@@ -987,7 +994,7 @@ pub struct ContextHandles {
     /// Applied block metadata log.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Transactions retained for direct RPC lookup.
-    pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    pub transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     /// Authoritative UTXO set.
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO statistics.
@@ -1046,7 +1053,7 @@ pub struct Context {
     /// Block records already available without blocking storage readers.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Raw transactions indexed by txid for Core transaction RPCs.
-    pub transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    pub transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     /// UTXO set snapshot handle used by chain metadata RPCs.
     pub utxo: Arc<bitcoin_rs_utxo::UtxoSet>,
     /// Incremental UTXO-set statistics.
@@ -1286,13 +1293,12 @@ impl Context {
     /// changing the repeated 256 scaling into an equivalent exponentiation can
     /// change the final floating-point bit.
     #[must_use]
-    pub fn difficulty_for_bits(&self, bits: bitcoin::CompactTarget) -> f64 {
-        let consensus_bits = bits.to_consensus();
-        let mantissa = consensus_bits & 0x00ff_ffff;
+    pub fn difficulty_for_bits(&self, bits: u32) -> f64 {
+        let mantissa = bits & 0x00ff_ffff;
         if mantissa == 0 {
             return 0.0;
         }
-        let mut shift = (consensus_bits >> 24) & 0xff;
+        let mut shift = (bits >> 24) & 0xff;
         let mut difficulty = f64::from(0x0000_ffff_u32) / f64::from(mantissa);
         while shift < 29 {
             difficulty *= 256.0;
@@ -1321,8 +1327,8 @@ impl Context {
     }
 
     /// Stores a decoded transaction for transaction lookup RPCs.
-    pub fn add_transaction(&self, tx: Transaction) -> Txid {
-        let txid = tx.compute_txid();
+    pub fn add_transaction(&self, tx: Tx) -> Txid {
+        let txid = tx.txid();
         self.transactions.write().insert(txid, tx);
         txid
     }
@@ -1474,13 +1480,13 @@ impl Context {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         Some(BlockRecord {
-            hash,
+            hash: BlockHash::from(hash),
             height: node.height,
             body_size: 0,
             // The one place a header is produced. Every constructor leaves the
             // field empty, so the tree node reached here is the single source of
             // truth for what a block's header is.
-            header: serialize(&node.header).try_into().ok().map(Box::new),
+            header: consensus_bytes(&node.header).try_into().ok().map(Box::new),
             tx_count: 0,
             time: node.header.time,
         })
@@ -1516,7 +1522,7 @@ impl Context {
             if let Some(metadata) = self
                 .block_body_source
                 .as_ref()
-                .and_then(|source| source.block_body_metadata(record.height, hash))
+                .and_then(|source| source.block_body_metadata(record.height, BlockHash::from(hash)))
             {
                 record.body_size = metadata.body_size;
                 record.tx_count = metadata.tx_count;
@@ -1538,13 +1544,9 @@ impl Context {
             return self.hash_at_height_from_tip(&tip, height);
         }
         if height == 0 {
-            return Some(Hash256::from_le_bytes(
-                bitcoin::blockdata::constants::genesis_block(bitcoin_network(self.chain_network))
-                    .block_hash()
-                    .as_byte_array(),
-            ));
+            return Some(self.chain_network.genesis_block_hash());
         }
-        record_at_height(&self.blocks.read(), height).map(|candidate| candidate.hash)
+        record_at_height(&self.blocks.read(), height).map(|candidate| Hash256::from(candidate.hash))
     }
 
     /// Returns a known block by hash.
@@ -1585,7 +1587,7 @@ impl Context {
     /// Returns lowercase serialized block hex from durable body storage.
     #[must_use]
     pub fn block_body_hex(&self, record: &BlockRecord) -> Option<String> {
-        Some(self.block_body_bytes(record)?.to_lower_hex_string())
+        Some(hex_encode(&self.block_body_bytes(record)?))
     }
 
     /// Returns the median-time-past at the block with `hash`, or `None` if the
@@ -1612,7 +1614,7 @@ impl Context {
         let tree = self.block_tree.read();
         let node = tree.node_by_hash(hash)?;
         let bytes: [u8; 32] = node.chainwork.to_be_bytes();
-        Some(bytes.to_lower_hex_string())
+        Some(hex_encode(&bytes))
     }
 
     /// Returns the hash of the block at `height + 1` on the active chain.
@@ -1630,17 +1632,8 @@ impl Context {
     }
 }
 
-fn bitcoin_network(network: Network) -> bitcoin::Network {
-    match network {
-        Network::Mainnet => bitcoin::Network::Bitcoin,
-        Network::Testnet3 => bitcoin::Network::Testnet,
-        Network::Testnet4 => bitcoin::Network::Testnet4,
-        Network::Signet => bitcoin::Network::Signet,
-        Network::Regtest => bitcoin::Network::Regtest,
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1666,7 +1659,8 @@ mod tests {
                 // Distinct per record, not per height: the duplicates have to be
                 // distinguishable by hash or the walk has nothing to walk.
                 hash[0] = u8::try_from(index).unwrap_or(0);
-                let mut record = BlockRecord::synthetic(height, Hash256::from_le_bytes(&hash));
+                let mut record =
+                    BlockRecord::synthetic(height, BlockHash::from(Hash256::from_le_bytes(&hash)));
                 record.time = 1_000 + u32::try_from(index).unwrap_or(0);
                 record
             })
@@ -1695,7 +1689,7 @@ mod tests {
                     .iter()
                     .find(|candidate| candidate.hash == *hash && candidate.height == height);
                 assert_eq!(
-                    record_at_height_hash(&records, height, *hash).map(|r| r.time),
+                    record_at_height_hash(&records, height, Hash256::from(*hash)).map(|r| r.time),
                     scanned.map(|r| r.time),
                     "search and scan disagree at height {height}"
                 );
@@ -1734,7 +1728,7 @@ mod tests {
 
         for (hash, time) in duplicates {
             assert_eq!(
-                record_at_height_hash(&records, 3, hash).map(|r| r.time),
+                record_at_height_hash(&records, 3, Hash256::from(hash)).map(|r| r.time),
                 Some(time),
                 "a record at a duplicated height was not reachable by its hash"
             );
@@ -1778,19 +1772,19 @@ mod tests {
         let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
         let second = Hash256::from_le_bytes(&[0x22_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(0, Hash256::from_le_bytes(&[0x00_u8; 32])),
-            BlockRecord::synthetic(1, first),
-            BlockRecord::synthetic(1, second),
-            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+            BlockRecord::synthetic(0, BlockHash::from(Hash256::from_le_bytes(&[0x00_u8; 32]))),
+            BlockRecord::synthetic(1, BlockHash::from(first)),
+            BlockRecord::synthetic(1, BlockHash::from(second)),
+            BlockRecord::synthetic(2, BlockHash::from(Hash256::from_le_bytes(&[0x33_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height_hash(&records, 1, second).map(|record| record.hash),
+            record_at_height_hash(&records, 1, second).map(|record| Hash256::from(record.hash)),
             Some(second),
             "the second record at the height must be reachable, not just the first"
         );
         assert_eq!(
-            record_at_height_hash(&records, 1, first).map(|record| record.hash),
+            record_at_height_hash(&records, 1, first).map(|record| Hash256::from(record.hash)),
             Some(first)
         );
         assert!(
@@ -1809,13 +1803,13 @@ mod tests {
     fn record_at_height_returns_the_first_record_of_a_duplicate_height() {
         let first = Hash256::from_le_bytes(&[0x11_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(1, first),
-            BlockRecord::synthetic(1, Hash256::from_le_bytes(&[0x22_u8; 32])),
-            BlockRecord::synthetic(2, Hash256::from_le_bytes(&[0x33_u8; 32])),
+            BlockRecord::synthetic(1, BlockHash::from(first)),
+            BlockRecord::synthetic(1, BlockHash::from(Hash256::from_le_bytes(&[0x22_u8; 32]))),
+            BlockRecord::synthetic(2, BlockHash::from(Hash256::from_le_bytes(&[0x33_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height(&records, 1).map(|record| record.hash),
+            record_at_height(&records, 1).map(|record| Hash256::from(record.hash)),
             Some(first),
             "the dense index lands on the second duplicate; the first must win"
         );
@@ -1829,13 +1823,13 @@ mod tests {
     fn record_at_height_does_not_trust_the_index_on_a_sparse_log() {
         let wanted = Hash256::from_le_bytes(&[0x44_u8; 32]);
         let records = vec![
-            BlockRecord::synthetic(10, Hash256::from_le_bytes(&[0x0a_u8; 32])),
-            BlockRecord::synthetic(11, wanted),
-            BlockRecord::synthetic(12, Hash256::from_le_bytes(&[0x0c_u8; 32])),
+            BlockRecord::synthetic(10, BlockHash::from(Hash256::from_le_bytes(&[0x0a_u8; 32]))),
+            BlockRecord::synthetic(11, BlockHash::from(wanted)),
+            BlockRecord::synthetic(12, BlockHash::from(Hash256::from_le_bytes(&[0x0c_u8; 32]))),
         ];
 
         assert_eq!(
-            record_at_height(&records, 11).map(|record| record.hash),
+            record_at_height(&records, 11).map(|record| Hash256::from(record.hash)),
             Some(wanted),
             "a log that does not start at zero must still resolve by search"
         );
@@ -1923,15 +1917,14 @@ mod tests {
 
     #[test]
     fn new_context_wires_utxo_commits_to_coin_stats() {
-        use bitcoin::{Amount, ScriptBuf};
-        use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+        use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
         use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
 
         let ctx = Context::new();
-        let outpoint = OutPoint::new(Hash256::from_le_bytes(&[1_u8; 32]), 0);
+        let outpoint = OutPoint::new(Txid(Hash256::from_le_bytes(&[1_u8; 32])), 0);
         let txout = TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: ScriptBuf::new(),
+            value: 125_000,
+            script_pubkey: Vec::new(),
         };
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(outpoint, txout, true, 7));
@@ -1947,17 +1940,14 @@ mod tests {
 
     #[test]
     fn block_record_from_block_is_metadata_only() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
         let record = BlockRecord::from_block(0, &block);
 
-        assert_eq!(
-            record.hash,
-            Hash256::from_le_bytes(block.block_hash().as_byte_array())
-        );
+        assert_eq!(record.hash, block.block_hash());
         assert_eq!(record.height, 0);
-        assert_eq!(record.body_size, block.total_size());
+        assert_eq!(record.body_size, consensus_bytes(&block).len());
         assert_eq!(record.header, None);
-        assert_eq!(record.tx_count, block.txdata.len());
+        assert_eq!(record.tx_count, block.txs.len());
         assert_eq!(record.time, block.header.time);
     }
 
@@ -1965,18 +1955,18 @@ mod tests {
     fn context_reads_metadata_only_block_record_from_body_source() {
         struct SingleBlockSource {
             height: u32,
-            hash: Hash256,
+            hash: BlockHash,
             body: Vec<u8>,
         }
 
         impl BlockBodySource for SingleBlockSource {
-            fn block_body(&self, height: u32, hash: Hash256) -> Option<Vec<u8>> {
+            fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
                 (height == self.height && hash == self.hash).then(|| self.body.clone())
             }
         }
 
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let body = serialize(&block);
+        let block = Network::Regtest.genesis_block();
+        let body = consensus_bytes(&block);
         let record = BlockRecord::from_block(0, &block);
         let source = Arc::new(SingleBlockSource {
             height: 0,
@@ -1986,12 +1976,12 @@ mod tests {
         let ctx = Context::new().with_block_body_source(source);
         ctx.add_block(record.clone());
 
-        assert_eq!(record.body_size, block.total_size());
+        assert_eq!(record.body_size, consensus_bytes(&block).len());
         assert_eq!(
             ctx.block_body_bytes(&record).as_deref(),
             Some(body.as_slice())
         );
-        let expected_hex = body.to_lower_hex_string();
+        let expected_hex = hex_encode(&body);
         assert_eq!(
             ctx.block_body_hex(&record).as_deref(),
             Some(expected_hex.as_str())
@@ -2015,7 +2005,7 @@ mod tests {
     /// This test is here so that reverting the box fails loudly.
     #[test]
     fn a_record_costs_64_bytes_and_carries_no_header() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
 
         assert_eq!(
             core::mem::size_of::<BlockRecord>(),
@@ -2024,7 +2014,7 @@ mod tests {
         );
         for record in [
             BlockRecord::from_block(0, &block),
-            BlockRecord::synthetic(0, Hash256::default()),
+            BlockRecord::synthetic(0, BlockHash::default()),
         ] {
             assert!(
                 record.header_bytes().is_none(),
@@ -2042,20 +2032,20 @@ mod tests {
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn header_hex_is_unchanged_by_sourcing_the_header_from_the_tree() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
         {
             let mut tree = ctx.block_tree.write();
             let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
         }
-        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let hash = Hash256::from(block.block_hash());
         let Some(record) = ctx.record_for_hash(hash) else {
             panic!("the tree knows this hash");
         };
 
         assert_eq!(
             record.header_hex(),
-            serialize(&block.header).to_lower_hex_string()
+            hex_encode(&consensus_bytes(&block.header))
         );
         assert_eq!(record.header_hex().len(), SERIALIZED_BLOCK_HEADER_LEN * 2);
     }
@@ -2069,14 +2059,14 @@ mod tests {
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn record_for_hash_answers_with_the_tree_header_for_a_cached_record() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = Network::Regtest.genesis_block();
         let ctx = Arc::new(Context::new());
         {
             let mut tree = ctx.block_tree.write();
             let _ = tree.insert_node(None, block.header, bitcoin_rs_chain::NodeStatus::Active);
         }
         let cached = BlockRecord::from_block(0, &block);
-        let hash = cached.hash;
+        let hash = Hash256::from(cached.hash);
         let expected_body_size = cached.body_size;
         let expected_tx_count = cached.tx_count;
         assert!(cached.header_bytes().is_none(), "the log stores no header");
@@ -2087,7 +2077,7 @@ mod tests {
         };
         assert_eq!(
             record.header_bytes().map(<[u8; 80]>::as_slice),
-            Some(serialize(&block.header).as_slice()),
+            Some(consensus_bytes(&block.header).as_slice()),
             "the resolved record must carry the tree's header"
         );
         assert_eq!(
@@ -2108,7 +2098,7 @@ mod tests {
     fn block_by_hash_ignores_log_records_the_tree_does_not_know() {
         let ctx = Context::new();
         let hash = Hash256::from_le_bytes(&[3_u8; 32]);
-        ctx.add_block(BlockRecord::synthetic(3, hash));
+        ctx.add_block(BlockRecord::synthetic(3, BlockHash::from(hash)));
 
         assert!(ctx.record_for_hash(hash).is_none());
         assert!(ctx.block_by_hash(hash).is_none());
@@ -2119,7 +2109,8 @@ mod tests {
     /// what they saw.
     #[test]
     fn synthetic_record_has_no_header_and_renders_empty_hex() {
-        let record = BlockRecord::synthetic(7, Hash256::from_le_bytes(&[3_u8; 32]));
+        let record =
+            BlockRecord::synthetic(7, BlockHash::from(Hash256::from_le_bytes(&[3_u8; 32])));
 
         assert!(record.header_bytes().is_none());
         assert!(record.header_hex().is_empty());
@@ -2133,18 +2124,16 @@ mod tests {
     /// dropped the header from this path failed no test before this one existed.
     #[test]
     fn tree_derived_record_carries_the_header() {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
-        let header = bitcoin::block::Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+        let header = Header {
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1_000_000,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 7,
         };
         let hash = {
@@ -2160,21 +2149,16 @@ mod tests {
         let record = ctx.record_for_hash(hash).expect("tree resolves the hash");
 
         assert_eq!(
-            record.header_bytes().map(|bytes| bytes.as_slice()),
-            Some(serialize(&header).as_slice()),
+            record.header_bytes().map(|bytes| &bytes[..]),
+            Some(consensus_bytes(&header).as_slice()),
             "the tree-derived record must carry the header the tree holds"
         );
-        assert_eq!(
-            record.header_hex(),
-            serialize(&header).to_lower_hex_string()
-        );
+        assert_eq!(record.header_hex(), hex_encode(&consensus_bytes(&header)));
     }
     #[test]
     fn block_by_height_returns_record_after_add_block() {
-        use bitcoin_rs_primitives::Hash256;
-
         let ctx = Context::new();
-        let record = BlockRecord::synthetic(42, Hash256::default());
+        let record = BlockRecord::synthetic(42, BlockHash::default());
         ctx.add_block(record);
 
         let Some(found) = ctx.block_by_height(42) else {
@@ -2193,29 +2177,27 @@ mod tests {
     #[test]
     fn block_by_height_prefers_tree_identity_over_stale_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
         let (child_hash, stale_hash) = {
             let mut tree = ctx.block_tree.write();
-            let genesis = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let genesis = Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-            let mut child = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let mut child = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_900,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             child.nonce = 1;
@@ -2228,7 +2210,7 @@ mod tests {
             // Stale cache entry at the SAME height as the tree child but with a
             // different hash. The active-tree identity must win over this cache.
             let stale_hash = Hash256::from_le_bytes(&[0xa5_u8; 32]);
-            ctx.add_block(BlockRecord::synthetic(1, stale_hash));
+            ctx.add_block(BlockRecord::synthetic(1, BlockHash::from(stale_hash)));
             (child_hash, stale_hash)
         };
 
@@ -2237,7 +2219,8 @@ mod tests {
             .block_by_height(1)
             .ok_or_else(|| std::io::Error::other("tree child missing at height 1"))?;
         assert_eq!(
-            found.hash, child_hash,
+            found.hash,
+            BlockHash::from(child_hash),
             "active-tree identity must win over a stale cached hash"
         );
         assert_eq!(found.height, 1);
@@ -2247,29 +2230,27 @@ mod tests {
     #[test]
     fn height_lookups_follow_applied_tip_when_header_fork_leads()
     -> Result<(), Box<dyn std::error::Error>> {
-        use bitcoin::block::Version;
-        use bitcoin::hashes::Hash as _;
-        use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
         use bitcoin_rs_chain::NodeStatus;
+        use bitcoin_rs_primitives::Header;
 
         let ctx = Context::new();
         let (applied_tip, header_tip) = {
             let mut tree = ctx.block_tree.write();
-            let genesis = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let genesis = Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1_000_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             };
             let genesis_id = tree.insert_node(None, genesis, NodeStatus::Active)?;
-            let applied = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let applied = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_900,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 1,
             };
             let applied_id = tree.insert_node(Some(genesis_id), applied, NodeStatus::Active)?;
@@ -2278,21 +2259,21 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("missing applied tip"))?;
             assert_eq!(applied_tip.tip_id, applied_id);
 
-            let fork = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let fork = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_000_901,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 2,
             };
             let fork_id = tree.insert_node(Some(genesis_id), fork, NodeStatus::HeaderValid)?;
-            let fork_tip = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: fork.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let fork_tip = Header {
+                version: 1,
+                prev_blockhash: fork.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_001_800,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 3,
             };
             let header_tip_id =
@@ -2306,7 +2287,7 @@ mod tests {
 
         ctx.set_applied_tip((*applied_tip).clone());
         ctx.set_chain_tip((*header_tip).clone());
-        ctx.add_block(BlockRecord::synthetic(2, header_tip.hash));
+        ctx.add_block(BlockRecord::synthetic(2, BlockHash::from(header_tip.hash)));
 
         assert_eq!(
             ctx.active_hash_at_height(1),
@@ -2315,7 +2296,8 @@ mod tests {
         );
         assert_eq!(ctx.block_hash_at_height(1), Some(applied_tip.hash));
         assert_eq!(
-            ctx.block_by_height(1).map(|record| record.hash),
+            ctx.block_by_height(1)
+                .map(|record| Hash256::from(record.hash)),
             Some(applied_tip.hash)
         );
         assert!(ctx.block_hash_at_height(2).is_none());

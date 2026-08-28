@@ -10,7 +10,6 @@
 //! validators full validation applies. The tree's `Bip9Cache` memoizes only
 //! this module's deployment-state walks.
 
-use bitcoin::pow::CompactTarget;
 use bitcoin_rs_chain::{
     BlockTree, CachedState, ChainError, header_sync,
     node::{BlockHeader, NodeId},
@@ -66,7 +65,7 @@ pub struct MiningChainContext {
     /// `LockedIn` deployment bit.
     pub version: i32,
     /// Compact target the candidate's nBits must equal.
-    pub bits: CompactTarget,
+    pub bits: u32,
     /// Earliest timestamp the candidate may carry: previous-tip MTP + 1.
     pub min_time: u32,
     /// Median time past of the previous tip over the BIP113 window.
@@ -310,7 +309,7 @@ impl DeploymentContext for BlockTreeContext<'_> {
     fn block_version(&self, height: u32) -> Option<i32> {
         let node_id = self.tree.node_at_height_from(self.start_tip_id, height)?;
         let node = self.tree.node(node_id).ok()?;
-        Some(node.header.version.to_consensus())
+        Some(node.header.version)
     }
 
     fn median_time_past(&self, height: u32, window: usize) -> Option<u32> {
@@ -321,12 +320,9 @@ impl DeploymentContext for BlockTreeContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::block::{Header, Version};
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
     use bitcoin_rs_chain::{BlockTree, ChainError, node::NodeStatus};
     use bitcoin_rs_consensus::DeploymentContext;
-    use bitcoin_rs_primitives::{Hash256, Network};
+    use bitcoin_rs_primitives::{BlockHash, Hash256, Header, Network};
 
     use super::{
         BlockTreeContext, MiningChainContext, check_candidate_header, contextual_softfork_state,
@@ -339,11 +335,11 @@ mod tests {
 
     fn synthetic_header_with_version(prev_blockhash: BlockHash, time: u32, version: i32) -> Header {
         Header {
-            version: Version::from_consensus(version),
+            version,
             prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         }
     }
@@ -351,8 +347,8 @@ mod tests {
     #[test]
     fn block_version_returns_header_version_at_height() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
-        let header_0 = synthetic_header(BlockHash::all_zeros(), 1_000_000);
-        let header_0_hash = header_0.block_hash();
+        let header_0 = synthetic_header(BlockHash::default(), 1_000_000);
+        let header_0_hash = header_0.compute_hash();
         tree.insert_header(header_0, NodeStatus::HeaderValid)?;
         let header_1 = synthetic_header(header_0_hash, 1_000_600);
         let tip = tree.insert_header(header_1, NodeStatus::HeaderValid)?;
@@ -367,11 +363,11 @@ mod tests {
     #[test]
     fn median_time_past_returns_window_median() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
-        let mut prev = BlockHash::all_zeros();
+        let mut prev = BlockHash::default();
         let mut tip = None;
         for i in 0..11_u32 {
             let header = synthetic_header(prev, 1_000_000 + i * 600);
-            prev = header.block_hash();
+            prev = header.compute_hash();
             tip = Some(tree.insert_header(header, NodeStatus::HeaderValid)?);
         }
         let Some(tip) = tip else {
@@ -434,7 +430,7 @@ mod tests {
     #[test]
     fn mining_context_resolves_regtest_candidate_facts() -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
-        let chain_bits = CompactTarget::from_consensus(0x207f_fffe);
+        let chain_bits: u32 = 0x207f_fffe;
         let tip = append_chain_with_bits(&mut tree, 12, 1_000_000, |_| 0x2000_0000, chain_bits)?;
         let tip_hash = tree.node(tip)?.hash;
         let tip_time = 1_000_000 + 11 * 600;
@@ -462,7 +458,7 @@ mod tests {
         // A candidate timestamp past the 2*spacing window recovers minimum
         // difficulty: exactly the regtest proof-of-work limit.
         let recovered = MiningChainContext::resolve(&tree, Network::Regtest, tip, tip_time + 1201)?;
-        assert_eq!(recovered.bits, CompactTarget::from_consensus(0x207f_ffff));
+        assert_eq!(recovered.bits, 0x207f_ffff);
 
         // Resolving against a node the tree does not hold is an error, not a guess.
         let unknown = bitcoin_rs_chain::node::NodeId::new(u32::MAX);
@@ -530,24 +526,20 @@ mod tests {
     fn check_candidate_header_shares_full_validation_verdicts()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut tree = BlockTree::new();
-        let chain_bits = CompactTarget::from_consensus(0x207f_fffe);
+        let chain_bits: u32 = 0x207f_fffe;
         let tip = append_chain_with_bits(&mut tree, 12, 1_000_000, |_| 0x2000_0000, chain_bits)?;
         let context = MiningChainContext::resolve(&tree, Network::Regtest, tip, 1_003_600 + 600)?;
-        let tip_blockhash = BlockHash::from_byte_array(context.previous_block_hash.to_le_bytes());
+        let tip_blockhash = BlockHash(context.previous_block_hash);
 
         // The context's own facts satisfy the dry-run: what a candidate is
         // built from is exactly what validation accepts.
         let candidate = candidate_header(tip_blockhash, context.min_time, context.bits);
-        let hash = Hash256::from_le_bytes(candidate.block_hash().as_byte_array());
+        let hash = candidate.compute_hash().0;
         check_candidate_header(&tree, Network::Regtest, tip, &candidate, hash, u32::MAX)?;
 
         // Wrong bits draw the same error a full apply would produce.
-        let bad_bits = candidate_header(
-            tip_blockhash,
-            context.min_time,
-            CompactTarget::from_consensus(0x207f_fffd),
-        );
-        let hash = Hash256::from_le_bytes(bad_bits.block_hash().as_byte_array());
+        let bad_bits = candidate_header(tip_blockhash, context.min_time, 0x207f_fffd);
+        let hash = bad_bits.compute_hash().0;
         assert!(matches!(
             check_candidate_header(&tree, Network::Regtest, tip, &bad_bits, hash, u32::MAX),
             Err(ChainError::NbitsMismatch { .. })
@@ -555,7 +547,7 @@ mod tests {
 
         // A timestamp at the previous-tip MTP is not strictly greater than it.
         let early = candidate_header(tip_blockhash, context.prev_median_time_past, context.bits);
-        let hash = Hash256::from_le_bytes(early.block_hash().as_byte_array());
+        let hash = early.compute_hash().0;
         assert!(matches!(
             check_candidate_header(&tree, Network::Regtest, tip, &early, hash, u32::MAX),
             Err(ChainError::TimestampTooEarly { .. })
@@ -563,11 +555,11 @@ mod tests {
         Ok(())
     }
 
-    fn candidate_header(prev_blockhash: BlockHash, time: u32, bits: CompactTarget) -> Header {
+    fn candidate_header(prev_blockhash: BlockHash, time: u32, bits: u32) -> Header {
         Header {
-            version: Version::from_consensus(0x2000_0000),
+            version: 0x2000_0000,
             prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time,
             bits,
             nonce: 0,
@@ -580,13 +572,7 @@ mod tests {
         start_time: u32,
         version_at: impl Fn(u32) -> i32,
     ) -> Result<bitcoin_rs_chain::node::NodeId, Box<dyn std::error::Error>> {
-        append_chain_with_bits(
-            tree,
-            len,
-            start_time,
-            version_at,
-            CompactTarget::from_consensus(0x207f_ffff),
-        )
+        append_chain_with_bits(tree, len, start_time, version_at, 0x207f_ffff)
     }
 
     fn append_chain_with_bits(
@@ -594,9 +580,9 @@ mod tests {
         len: u32,
         start_time: u32,
         version_at: impl Fn(u32) -> i32,
-        bits: CompactTarget,
+        bits: u32,
     ) -> Result<bitcoin_rs_chain::node::NodeId, Box<dyn std::error::Error>> {
-        let mut prev = BlockHash::all_zeros();
+        let mut prev = BlockHash::default();
         let mut tip = None;
         for height in 0..len {
             let mut header = synthetic_header_with_version(
@@ -605,7 +591,7 @@ mod tests {
                 version_at(height),
             );
             header.bits = bits;
-            prev = header.block_hash();
+            prev = header.compute_hash();
             tip = Some(tree.insert_header(header, NodeStatus::HeaderValid)?);
         }
         let Some(tip) = tip else {

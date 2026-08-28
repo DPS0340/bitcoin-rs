@@ -1,14 +1,13 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
 
-use bitcoin::{Amount, Txid};
 use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_primitives::Txid;
 use sonic_rs::{Deserialize as _, Value, json};
 
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{optional_bool, required_str};
-use crate::tx_render::btc_amount_json;
 
 // Bitcoin Core default for incremental relay-fee policy until per-node
 // configuration is wired. Units: sat/kvB (the canonical workspace internal).
@@ -21,8 +20,7 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let stats = pool.stats();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
-    let incremental_relay_fee =
-        btc_amount_json(Amount::from_sat(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB));
+    let incremental_relay_fee = btc_amount_json(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
     // `mempoolminfee` rises above `minrelaytxfee` when the pool approaches its
     // `maxmempool` byte limit. Bitcoin Core uses the eviction-floor heuristic:
     // once the pool exceeds 50% of `maxmempool`, new txs must pay strictly
@@ -41,19 +39,13 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
     let _ = object.insert("size", json!(stats.txs));
     let _ = object.insert("bytes", json!(stats.bytes));
     let _ = object.insert("usage", json!(stats.bytes));
-    let _ = object.insert(
-        "total_fee",
-        btc_amount_json(Amount::from_sat(stats.total_fee)),
-    );
+    let _ = object.insert("total_fee", btc_amount_json(stats.total_fee));
     let _ = object.insert("maxmempool", json!(maxmempool));
     let _ = object.insert(
         "mempoolminfee",
-        btc_amount_json(Amount::from_sat(mempool_min_fee_sat_per_kvb)),
+        btc_amount_json(mempool_min_fee_sat_per_kvb),
     );
-    let _ = object.insert(
-        "minrelaytxfee",
-        btc_amount_json(Amount::from_sat(live_min_relay_sat_per_kvb)),
-    );
+    let _ = object.insert("minrelaytxfee", btc_amount_json(live_min_relay_sat_per_kvb));
     let _ = object.insert("incrementalrelayfee", incremental_relay_fee);
     let _ = object.insert("mempool_sequence", json!(pool.sequence_number()));
     let _ = object.insert("unbroadcastcount", json!(0));
@@ -157,7 +149,7 @@ fn parse_txid(value: &str) -> Result<Txid, RpcError> {
 fn mempool_entry_json(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) -> Value {
     let mut depends = entry
         .tx
-        .input
+        .inputs
         .iter()
         .map(|input| input.previous_output.txid)
         .filter(|txid| pool.contains_txid(txid))
@@ -183,7 +175,7 @@ fn mempool_entry_json(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) 
     });
 
     let mut fees = sonic_rs::Object::new();
-    let _ = fees.insert("base", btc_amount_json(Amount::from_sat(entry.fee)));
+    let _ = fees.insert("base", btc_amount_json(entry.fee));
     let _ = fees.insert("modified", signed_btc_amount_json(entry.modified_fee()));
     let _ = fees.insert(
         "ancestor",
@@ -212,6 +204,10 @@ fn mempool_entry_json(entry: &MempoolEntry, pool: &bitcoin_rs_mempool::Mempool) 
     Value::from(object)
 }
 
+fn btc_amount_json(satoshis: u64) -> Value {
+    signed_btc_amount_json(i128::from(satoshis))
+}
+
 fn signed_btc_amount_json(satoshis: i128) -> Value {
     let sign = if satoshis.is_negative() { "-" } else { "" };
     let magnitude = satoshis.unsigned_abs();
@@ -228,12 +224,11 @@ fn signed_btc_amount_json(satoshis: i128) -> Value {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod amount_format_probe {
-    use bitcoin::Amount;
     use sonic_rs::JsonValueTrait;
 
     #[test]
     fn btc_amount_json_preserves_eight_decimals_as_raw_number() {
-        let value = crate::tx_render::btc_amount_json(Amount::from_sat(3_000));
+        let value = super::btc_amount_json(3_000);
         let Some(raw) = value.as_raw_number() else {
             panic!("expected raw number, got {value:?}");
         };
@@ -276,13 +271,13 @@ mod mempoolminfee_pressure_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
-    use bitcoin::hashes::Hash as _;
 
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
     use bitcoin_rs_mempool::MempoolEntry;
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use sonic_rs::{JsonContainerTrait, JsonValueTrait, json};
 
     use super::*;
@@ -420,9 +415,9 @@ mod tests {
     {
         let ctx = Arc::new(Context::new());
         let parent = tx(1, Vec::new());
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let child = tx(2, vec![OutPoint::new(parent_txid, 0)]);
-        let child_txid = child.compute_txid().to_string();
+        let child_txid = child.txid().to_string();
         {
             let mut pool = ctx.mempool.write();
             pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
@@ -446,10 +441,10 @@ mod tests {
     fn getmempoolancestors_walks_real_ancestor_graph() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = Arc::new(Context::new());
         let parent = tx(3, Vec::new());
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let parent_txid_string = parent_txid.to_string();
         let child = tx(4, vec![OutPoint::new(parent_txid, 0)]);
-        let child_txid = child.compute_txid();
+        let child_txid = child.txid();
         {
             let mut pool = ctx.mempool.write();
             pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
@@ -473,31 +468,31 @@ mod tests {
     fn getmempoolentry_emits_depends_when_input_spends_mempool_tx() {
         let ctx = Arc::new(Context::new());
         let handler = crate::Handler::new(Arc::clone(&ctx));
-        let parent = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1_000),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        let parent = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
             }],
         };
-        let parent_txid = parent.compute_txid();
-        let child = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint {
+        let parent_txid = parent.txid();
+        let child = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
                     txid: parent_txid,
                     vout: 0,
                 },
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: Vec::new(),
+            outputs: Vec::new(),
         };
-        let child_txid = child.compute_txid();
+        let child_txid = child.txid();
         {
             let mut pool = ctx.mempool.write();
             let parent_entry =
@@ -523,24 +518,24 @@ mod tests {
     #[test]
     fn getmempoolentry_bip125_replaceable_reflects_input_sequence() {
         let ctx = Arc::new(Context::new());
-        let rbf_tx = bitcoin::Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([0xaa; 32]),
+        let rbf_tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid(Hash256::from_le_bytes(&[0xaa; 32])),
                     vout: 0,
                 },
-                script_sig: bitcoin::ScriptBuf::new(),
-                sequence: bitcoin::Sequence(0x0000_0001),
-                witness: bitcoin::Witness::new(),
+                script_sig: Vec::new(),
+                sequence: 0x0000_0001,
+                witness: Vec::new(),
             }],
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1_000),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51],
             }],
         };
-        let rbf_txid = rbf_tx.compute_txid();
+        let rbf_txid = rbf_tx.txid();
         {
             let mut pool = ctx.mempool.write();
             let Ok(_) = pool.insert_entry(MempoolEntry::new(Arc::new(rbf_tx), 100, 10_000, 1, 7))
@@ -560,22 +555,22 @@ mod tests {
         );
     }
 
-    fn tx(label: u8, previous_outputs: Vec<OutPoint>) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: previous_outputs
+    fn tx(label: u8, previous_outputs: Vec<OutPoint>) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: previous_outputs
                 .into_iter()
                 .map(|previous_output| TxIn {
                     previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000 + u64::from(label)),
-                script_pubkey: ScriptBuf::from_bytes(vec![label]),
+            outputs: vec![TxOut {
+                value: 5_000 + u64::from(label),
+                script_pubkey: vec![label],
             }],
         }
     }
@@ -586,9 +581,8 @@ mod spentby_tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
 
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
     use bitcoin_rs_mempool::{Mempool, MempoolEntry};
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 
     use super::*;
 
@@ -607,9 +601,9 @@ mod spentby_tests {
     fn spentby_by_scanning_every_entry(pool: &Mempool, txid: Txid) -> Vec<String> {
         let mut spentby = Vec::new();
         for (_id, candidate) in &pool.entries {
-            for input in &candidate.tx.input {
+            for input in &candidate.tx.inputs {
                 if input.previous_output.txid == txid {
-                    spentby.push(candidate.tx.compute_txid().to_string());
+                    spentby.push(candidate.tx.txid().to_string());
                     break;
                 }
             }
@@ -619,27 +613,25 @@ mod spentby_tests {
         spentby
     }
 
-    fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: inputs
+    fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: inputs
                 .iter()
                 .map(|previous_output| TxIn {
                     previous_output: *previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence(0xFFFF_FFFD),
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: 0xFFFF_FFFD,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: (0..outputs)
+            outputs: (0..outputs)
                 .map(|vout| TxOut {
-                    value: Amount::from_sat(
-                        10_000_u64
-                            .saturating_add(u64::from(vout))
-                            .saturating_add(tag.saturating_mul(1_000)),
-                    ),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    value: 10_000_u64
+                        .saturating_add(u64::from(vout))
+                        .saturating_add(tag.saturating_mul(1_000)),
+                    script_pubkey: vec![0x51],
                 })
                 .collect(),
         }
@@ -659,25 +651,29 @@ mod spentby_tests {
     /// reaches it twice — the case a missing dedup shows up in, and the case a
     /// fixture where every child spends one output cannot reach.
     fn graph_ctx() -> (Arc<Context>, Txid) {
-        let confirmed = OutPoint::new(Txid::from_byte_array([7_u8; 32]), 0);
+        let confirmed = OutPoint::new(Txid(Hash256::from_le_bytes(&[7_u8; 32])), 0);
         let root = tx_with(&[confirmed], 3, 1);
-        let root_txid = root.compute_txid();
+        let root_txid = root.txid();
         let child_a = tx_with(&[OutPoint::new(root_txid, 0)], 1, 2);
-        let child_a_txid = child_a.compute_txid();
+        let child_a_txid = child_a.txid();
         let child_b = tx_with(
             &[OutPoint::new(root_txid, 1), OutPoint::new(root_txid, 2)],
             1,
             3,
         );
         let child_c = tx_with(&[OutPoint::new(child_a_txid, 0)], 1, 4);
-        let loner = tx_with(&[OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0)], 1, 5);
+        let loner = tx_with(
+            &[OutPoint::new(Txid(Hash256::from_le_bytes(&[9_u8; 32])), 0)],
+            1,
+            5,
+        );
 
         // `spentby` is rendered in txid order, but the spend index answers in
         // `EntryId` — that is, insertion — order. Insert the root's two spenders
         // highest-txid-first so the two orders are opposite: a rendering that
         // forgets to sort then produces a visibly different list, instead of
         // passing because the fixture happened to be inserted in order already.
-        let root_spenders = if child_a.compute_txid() > child_b.compute_txid() {
+        let root_spenders = if child_a.txid() > child_b.txid() {
             [child_a, child_b]
         } else {
             [child_b, child_a]

@@ -5,9 +5,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use std::error::Error;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_mempool::{MempoolEntry, ParetoFront, SortedParetoFront};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 
 #[test]
 fn top_n_returns_highest_rate_entries() -> Result<(), Box<dyn Error>> {
@@ -157,19 +156,19 @@ fn entries_with_identical_priority_fields_are_all_retained() {
     assert_eq!(ids, (0_u32..8).collect::<Vec<_>>());
 }
 
-fn tx(label: u8) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx(label: u8) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: outpoint(label, 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+        outputs: vec![TxOut {
+            value: 1_000,
+            script_pubkey: vec![0x51, label],
         }],
     }
 }
@@ -177,5 +176,5 @@ fn tx(label: u8) -> Transaction {
 fn outpoint(label: u8, vout: u32) -> OutPoint {
     let mut bytes = [0_u8; 32];
     bytes[0] = label;
-    OutPoint::new(Txid::from_byte_array(bytes), vout)
+    OutPoint::new(Txid(Hash256::from_le_bytes(&bytes)), vout)
 }

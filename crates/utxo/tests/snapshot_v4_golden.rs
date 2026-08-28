@@ -17,7 +17,6 @@
 
 use std::io::Cursor;
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{
     BlockChanges, UtxoAdd, UtxoSet, hash_serialized_3, read_snapshot, write_snapshot,
@@ -77,10 +76,10 @@ fn golden_fixture() -> UtxoSet {
                 _ => seed.wrapping_mul(7_919).wrapping_add(54_321),
             };
             changes.add(UtxoAdd::new(
-                OutPoint::new(txid(seed), u32::try_from(vout).unwrap_or(0)),
+                OutPoint::new(txid(seed).into(), u32::try_from(vout).unwrap_or(0)),
                 TxOut {
-                    value: Amount::from_sat(value),
-                    script_pubkey: ScriptBuf::from_bytes(script),
+                    value,
+                    script_pubkey: script,
                 },
                 seed % 11 == 0,
                 u32::try_from(seed).unwrap_or(0) * 137,
@@ -93,10 +92,10 @@ fn golden_fixture() -> UtxoSet {
     let wide = txid(900_001);
     for vout in [0_u32, 1, 7, 8, 9, 63, 64, 65, 1_000, 70_000, u32::MAX] {
         changes.add(UtxoAdd::new(
-            OutPoint::new(wide, vout),
+            OutPoint::new(wide.into(), vout),
             TxOut {
-                value: Amount::from_sat(u64::from(vout) + 1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51; 22]),
+                value: u64::from(vout) + 1,
+                script_pubkey: vec![0x51; 22],
             },
             false,
             840_000,
@@ -105,19 +104,19 @@ fn golden_fixture() -> UtxoSet {
 
     // The two ends of the script length range.
     changes.add(UtxoAdd::new(
-        OutPoint::new(txid(900_002), 0),
+        OutPoint::new(txid(900_002).into(), 0),
         TxOut {
-            value: Amount::from_sat(7),
-            script_pubkey: ScriptBuf::from_bytes(Vec::new()),
+            value: 7,
+            script_pubkey: Vec::new(),
         },
         true,
         1,
     ));
     changes.add(UtxoAdd::new(
-        OutPoint::new(txid(900_003), 0),
+        OutPoint::new(txid(900_003).into(), 0),
         TxOut {
-            value: Amount::from_sat(u64::MAX),
-            script_pubkey: ScriptBuf::from_bytes(vec![0xAB; 2_048]),
+            value: u64::MAX,
+            script_pubkey: vec![0xAB; 2_048],
         },
         false,
         u32::MAX >> 1,

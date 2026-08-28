@@ -1,8 +1,7 @@
 //! Commit/get round-trip coverage for a synthetic UTXO set.
 use std::sync::Arc;
 
-use bitcoin::{Amount, ScriptBuf};
-use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, varint};
+use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid, varint};
 use bitcoin_rs_utxo::{
     BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoCommittedEvent, UtxoError,
     UtxoInserted, UtxoKey, UtxoRemoved, UtxoSet, hash_serialized_3,
@@ -118,8 +117,8 @@ fn txout(seed: u64) -> TxOut {
     script.extend_from_slice(&[0x51, 0x20]);
     script.extend_from_slice(&seed.to_le_bytes());
     TxOut {
-        value: Amount::from_sat(1_000 + seed),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 1_000 + seed,
+        script_pubkey: script,
     }
 }
 
@@ -148,8 +147,9 @@ fn expected_hash_serialized_3(
     sorted.sort_unstable_by(|left, right| {
         left.0
             .txid
+            .0
             .to_le_bytes()
-            .cmp(&right.0.txid.to_le_bytes())
+            .cmp(&right.0.txid.0.to_le_bytes())
             .then_with(|| {
                 let left_vout = left.0.vout;
                 let right_vout = right.0.vout;
@@ -159,12 +159,12 @@ fn expected_hash_serialized_3(
 
     let mut engine = Sha256::new();
     for (outpoint, txout, coinbase, height) in sorted {
-        engine.update(outpoint.txid.to_le_bytes());
+        engine.update(outpoint.txid.0.to_le_bytes());
         engine.update(outpoint.vout.to_le_bytes());
         let code = (*height << 1) | u32::from(*coinbase);
         engine.update(code.to_le_bytes());
-        engine.update(txout.value.to_sat().to_le_bytes());
-        let script = txout.script_pubkey.as_bytes();
+        engine.update(txout.value.to_le_bytes());
+        let script = txout.script_pubkey.as_slice();
         let script_len = u64::try_from(script.len())?;
         let encoded_len = varint::encode(script_len);
         engine.update(encoded_len.as_slice());
@@ -198,7 +198,7 @@ fn commit_roundtrips_ten_thousand_outputs() -> Result<(), Box<dyn std::error::Er
     let mut expected = Vec::with_capacity(10_000);
 
     for i in 0_u64..10_000 {
-        let outpoint = OutPoint::new(txid(i), u32::try_from(i % 4)?);
+        let outpoint = OutPoint::new(txid(i).into(), u32::try_from(i % 4)?);
         let txout = txout(i);
         expected.push((outpoint, txout.clone()));
         changes.add(UtxoAdd::new(outpoint, txout, false, 100));
@@ -216,7 +216,7 @@ fn commit_roundtrips_ten_thousand_outputs() -> Result<(), Box<dyn std::error::Er
 #[test]
 fn invalid_add_does_not_apply_removes_in_same_commit() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
-    let retained = OutPoint::new(txid(10), 0);
+    let retained = OutPoint::new(txid(10).into(), 0);
     let retained_txout = txout(10);
     let mut initial = BlockChanges::default();
     initial.add(UtxoAdd::new(retained, retained_txout.clone(), false, 1));
@@ -225,10 +225,10 @@ fn invalid_add_does_not_apply_removes_in_same_commit() -> Result<(), Box<dyn std
     let mut invalid = BlockChanges::default();
     invalid.remove(retained);
     invalid.add(UtxoAdd::new(
-        OutPoint::new(txid(12), 0),
+        OutPoint::new(txid(12).into(), 0),
         TxOut {
-            value: Amount::from_sat(12),
-            script_pubkey: ScriptBuf::from_bytes(vec![0; usize::from(u16::MAX) + 1]),
+            value: 12,
+            script_pubkey: vec![0; usize::from(u16::MAX) + 1],
         },
         false,
         2,
@@ -246,7 +246,7 @@ fn invalid_add_does_not_apply_removes_in_same_commit() -> Result<(), Box<dyn std
         "unexpected error: {error}"
     );
     assert_eq!(set.get(&retained), Some(retained_txout));
-    assert_eq!(set.get(&OutPoint::new(txid(12), 0)), None);
+    assert_eq!(set.get(&OutPoint::new(txid(12).into(), 0)), None);
     Ok(())
 }
 
@@ -254,7 +254,7 @@ fn invalid_add_does_not_apply_removes_in_same_commit() -> Result<(), Box<dyn std
 fn get_entry_surfaces_coinbase_and_height() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let mut changes = BlockChanges::default();
-    let outpoint = OutPoint::new(txid(42), 0);
+    let outpoint = OutPoint::new(txid(42).into(), 0);
     let txout = txout(42);
 
     changes.add(UtxoAdd::new(outpoint, txout.clone(), true, 123));
@@ -274,8 +274,8 @@ fn get_entry_surfaces_coinbase_and_height() -> Result<(), Box<dyn std::error::Er
 fn scan_script_pubkeys_returns_matching_live_outputs() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let mut changes = BlockChanges::default();
-    let first = OutPoint::new(txid(52), 0);
-    let second = OutPoint::new(txid(53), 0);
+    let first = OutPoint::new(txid(52).into(), 0);
+    let second = OutPoint::new(txid(53).into(), 0);
     let first_txout = txout(52);
     let second_txout = txout(53);
 
@@ -300,13 +300,13 @@ fn has_live_outputs_for_txid_tracks_any_remaining_vout() -> Result<(), Box<dyn s
     let live_txid = txid(77);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 1),
+        OutPoint::new(live_txid.into(), 1),
         txout(77),
         false,
         200,
     ));
     changes.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 2),
+        OutPoint::new(live_txid.into(), 2),
         txout(78),
         false,
         200,
@@ -317,13 +317,13 @@ fn has_live_outputs_for_txid_tracks_any_remaining_vout() -> Result<(), Box<dyn s
     assert!(!set.has_live_outputs_for_txid(&txid(79)));
 
     let mut first_spend = BlockChanges::default();
-    first_spend.remove(OutPoint::new(live_txid, 1));
+    first_spend.remove(OutPoint::new(live_txid.into(), 1));
     set.commit_block(&first_spend, &txid(80))?;
 
     assert!(set.has_live_outputs_for_txid(&live_txid));
 
     let mut final_spend = BlockChanges::default();
-    final_spend.remove(OutPoint::new(live_txid, 2));
+    final_spend.remove(OutPoint::new(live_txid.into(), 2));
     set.commit_block(&final_spend, &txid(81))?;
 
     assert!(!set.has_live_outputs_for_txid(&live_txid));
@@ -342,13 +342,13 @@ fn listener_batches_inserts_without_crossing_overwrite_boundary()
 
     let mut initial = BlockChanges::default();
     initial.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 0),
+        OutPoint::new(live_txid.into(), 0),
         txout(600),
         false,
         300,
     ));
     initial.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 1),
+        OutPoint::new(live_txid.into(), 1),
         txout(601),
         true,
         300,
@@ -358,19 +358,19 @@ fn listener_batches_inserts_without_crossing_overwrite_boundary()
 
     let mut overwrite = BlockChanges::default();
     overwrite.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 2),
+        OutPoint::new(live_txid.into(), 2),
         txout(603),
         false,
         301,
     ));
     overwrite.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 1),
+        OutPoint::new(live_txid.into(), 1),
         txout(604),
         false,
         301,
     ));
     overwrite.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 3),
+        OutPoint::new(live_txid.into(), 3),
         txout(605),
         true,
         301,
@@ -385,9 +385,18 @@ fn listener_batches_inserts_without_crossing_overwrite_boundary()
             ListenerEvent::InsertBatch(vec![1, 3]),
         ]
     );
-    assert_eq!(set.get(&OutPoint::new(live_txid, 1)), Some(txout(604)));
-    assert_eq!(set.get(&OutPoint::new(live_txid, 2)), Some(txout(603)));
-    assert_eq!(set.get(&OutPoint::new(live_txid, 3)), Some(txout(605)));
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 1)),
+        Some(txout(604))
+    );
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 2)),
+        Some(txout(603))
+    );
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 3)),
+        Some(txout(605))
+    );
     Ok(())
 }
 
@@ -400,9 +409,9 @@ fn listener_emits_explicit_removes_before_add_batches_in_single_shard_commit()
         events: Arc::clone(&events),
     }));
     let live_txid = txid(620);
-    let first = OutPoint::new(live_txid, 0);
-    let second = OutPoint::new(live_txid, 1);
-    let third = OutPoint::new(live_txid, 2);
+    let first = OutPoint::new(live_txid.into(), 0);
+    let second = OutPoint::new(live_txid.into(), 1);
+    let third = OutPoint::new(live_txid.into(), 2);
 
     let mut initial = BlockChanges::default();
     initial.add(UtxoAdd::new(first, txout(620), false, 302));
@@ -441,7 +450,7 @@ fn listener_full_record_spend_preserves_remove_input_order()
     let mut initial = BlockChanges::default();
     for vout in 0_u32..4 {
         initial.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
+            OutPoint::new(live_txid.into(), vout),
             txout(u64::from(vout) + 625),
             false,
             303,
@@ -452,7 +461,7 @@ fn listener_full_record_spend_preserves_remove_input_order()
 
     let mut spend = BlockChanges::default();
     for vout in [3_u32, 0, 2, 1] {
-        spend.remove(OutPoint::new(live_txid, vout));
+        spend.remove(OutPoint::new(live_txid.into(), vout));
     }
     set.commit_block(&spend, &txid(627))?;
 
@@ -483,9 +492,9 @@ fn listener_batches_parallel_multi_shard_event_multiset() -> Result<(), Box<dyn 
     let mut inserts = Vec::new();
     for shard in 0_u8..20 {
         let txid = txid_in_shard(shard, u64::from(shard) + 630);
-        assert_eq!(UtxoKey::from_txid(&txid).shard(), shard);
-        let remove = OutPoint::new(txid, u32::from(shard));
-        let insert = OutPoint::new(txid, u32::from(shard) + 100);
+        assert_eq!(UtxoKey::from_txid(&Txid::from(txid)).shard(), shard);
+        let remove = OutPoint::new(txid.into(), u32::from(shard));
+        let insert = OutPoint::new(txid.into(), u32::from(shard) + 100);
         removes.push(remove);
         inserts.push(insert);
         initial.add(UtxoAdd::new(
@@ -543,10 +552,10 @@ fn listener_batches_small_multi_shard_commits() -> Result<(), Box<dyn std::error
     let mut set = UtxoSet::new();
 
     let mut initial = BlockChanges::default();
-    let first_remove = OutPoint::new(txid_in_shard(0, 650), 0);
-    let second_remove = OutPoint::new(txid_in_shard(1, 651), 1);
-    let first_insert = OutPoint::new(txid_in_shard(0, 652), 100);
-    let second_insert = OutPoint::new(txid_in_shard(1, 653), 101);
+    let first_remove = OutPoint::new(txid_in_shard(0, 650).into(), 0);
+    let second_remove = OutPoint::new(txid_in_shard(1, 651).into(), 1);
+    let first_insert = OutPoint::new(txid_in_shard(0, 652).into(), 100);
+    let second_insert = OutPoint::new(txid_in_shard(1, 653).into(), 101);
     initial.add(UtxoAdd::new(first_remove, txout(650), false, 306));
     initial.add(UtxoAdd::new(second_remove, txout(651), false, 306));
     set.commit_block(&initial, &txid(654))?;
@@ -586,10 +595,10 @@ fn same_txid_churn_preserves_live_outputs_and_record_shape()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(700);
-    let first = OutPoint::new(live_txid, 0);
-    let second = OutPoint::new(live_txid, 1);
-    let third = OutPoint::new(live_txid, 2);
-    let fourth = OutPoint::new(live_txid, 3);
+    let first = OutPoint::new(live_txid.into(), 0);
+    let second = OutPoint::new(live_txid.into(), 1);
+    let third = OutPoint::new(live_txid.into(), 2);
+    let fourth = OutPoint::new(live_txid.into(), 3);
     let first_txout = txout(701);
     let second_txout = txout(702);
     let third_txout = txout(703);
@@ -626,10 +635,10 @@ fn borrowed_commit_matches_owned_commit_for_same_txid_churn()
     let owned_set = UtxoSet::new();
     let borrowed_set = UtxoSet::new();
     let live_txid = txid(7_700);
-    let first = OutPoint::new(live_txid, 0);
-    let second = OutPoint::new(live_txid, 1);
-    let third = OutPoint::new(live_txid, 2);
-    let fourth = OutPoint::new(live_txid, 3);
+    let first = OutPoint::new(live_txid.into(), 0);
+    let second = OutPoint::new(live_txid.into(), 1);
+    let third = OutPoint::new(live_txid.into(), 2);
+    let fourth = OutPoint::new(live_txid.into(), 3);
     let second_txout = txout(7_702);
     let fourth_txout = txout(7_704);
     let initial_adds = vec![
@@ -677,18 +686,18 @@ fn borrowed_commit_matches_owned_commit_for_same_txid_churn()
 #[test]
 fn borrowed_commit_preserves_invalid_add_atomicity() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
-    let retained = OutPoint::new(txid(8_010), 0);
+    let retained = OutPoint::new(txid(8_010).into(), 0);
     let retained_txout = txout(8_010);
     let mut initial = BlockChanges::default();
     initial.add(UtxoAdd::new(retained, retained_txout.clone(), false, 1));
     set.commit_block(&initial, &txid(8_011))?;
 
-    let invalid_outpoint = OutPoint::new(txid(8_012), 0);
+    let invalid_outpoint = OutPoint::new(txid(8_012).into(), 0);
     let invalid_adds = vec![(
         invalid_outpoint,
         TxOut {
-            value: Amount::from_sat(8_012),
-            script_pubkey: ScriptBuf::from_bytes(vec![0; usize::from(u16::MAX) + 1]),
+            value: 8_012,
+            script_pubkey: vec![0; usize::from(u16::MAX) + 1],
         },
         false,
         2,
@@ -723,13 +732,13 @@ fn borrowed_commit_duplicate_vout_overwrite_matches_owned_listener_events()
 
     let mut initial = BlockChanges::default();
     initial.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 0),
+        OutPoint::new(live_txid.into(), 0),
         txout(8_600),
         false,
         300,
     ));
     initial.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 1),
+        OutPoint::new(live_txid.into(), 1),
         txout(8_601),
         true,
         300,
@@ -738,9 +747,9 @@ fn borrowed_commit_duplicate_vout_overwrite_matches_owned_listener_events()
     events.lock().clear();
 
     let borrowed_adds = vec![
-        (OutPoint::new(live_txid, 2), txout(8_603), false, 301),
-        (OutPoint::new(live_txid, 1), txout(8_604), false, 301),
-        (OutPoint::new(live_txid, 3), txout(8_605), true, 301),
+        (OutPoint::new(live_txid.into(), 2), txout(8_603), false, 301),
+        (OutPoint::new(live_txid.into(), 1), txout(8_604), false, 301),
+        (OutPoint::new(live_txid.into(), 3), txout(8_605), true, 301),
     ];
     let borrowed = borrowed_changes(&borrowed_adds, &[]);
     set.commit_borrowed_block(&borrowed, &txid(8_606))?;
@@ -753,9 +762,18 @@ fn borrowed_commit_duplicate_vout_overwrite_matches_owned_listener_events()
             ListenerEvent::InsertBatch(vec![1, 3]),
         ]
     );
-    assert_eq!(set.get(&OutPoint::new(live_txid, 1)), Some(txout(8_604)));
-    assert_eq!(set.get(&OutPoint::new(live_txid, 2)), Some(txout(8_603)));
-    assert_eq!(set.get(&OutPoint::new(live_txid, 3)), Some(txout(8_605)));
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 1)),
+        Some(txout(8_604))
+    );
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 2)),
+        Some(txout(8_603))
+    );
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 3)),
+        Some(txout(8_605))
+    );
     Ok(())
 }
 
@@ -763,8 +781,8 @@ fn borrowed_commit_duplicate_vout_overwrite_matches_owned_listener_events()
 fn vout_64_roundtrips_through_public_utxo_api() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(88);
-    let low = OutPoint::new(live_txid, 63);
-    let high = OutPoint::new(live_txid, 64);
+    let low = OutPoint::new(live_txid.into(), 63);
+    let high = OutPoint::new(live_txid.into(), 64);
     let low_txout = txout(88);
     let high_txout = txout(89);
     let mut changes = BlockChanges::default();
@@ -813,7 +831,7 @@ fn high_vout_full_record_delete_removes_all_outputs_in_one_commit()
     let mut spend = BlockChanges::default();
 
     for vout in 64_u32..128 {
-        let outpoint = OutPoint::new(live_txid, vout);
+        let outpoint = OutPoint::new(live_txid.into(), vout);
         preload.add(UtxoAdd::new(
             outpoint,
             txout(1_000 + u64::from(vout)),
@@ -830,7 +848,7 @@ fn high_vout_full_record_delete_removes_all_outputs_in_one_commit()
     set.commit_block(&spend, &txid(95))?;
 
     for vout in 64_u32..128 {
-        assert_eq!(set.get(&OutPoint::new(live_txid, vout)), None);
+        assert_eq!(set.get(&OutPoint::new(live_txid.into(), vout)), None);
     }
     assert!(!set.has_live_outputs_for_txid(&live_txid));
     assert_eq!(set.record_count(), 0);
@@ -845,10 +863,10 @@ fn hash_serialized_3_matches_independent_core_serialization_for_unsorted_utxos()
     let set = UtxoSet::new();
     let mut changes = BlockChanges::default();
     let entries = vec![
-        (OutPoint::new(txid(30), 2), txout(30), false, 210),
-        (OutPoint::new(txid(10), 1), txout(10), true, 208),
-        (OutPoint::new(txid(30), 0), txout(31), false, 210),
-        (OutPoint::new(txid(20), 3), txout(20), true, 209),
+        (OutPoint::new(txid(30).into(), 2), txout(30), false, 210),
+        (OutPoint::new(txid(10).into(), 1), txout(10), true, 208),
+        (OutPoint::new(txid(30).into(), 0), txout(31), false, 210),
+        (OutPoint::new(txid(20).into(), 3), txout(20), true, 209),
     ];
 
     for (outpoint, txout, coinbase, height) in &entries {
@@ -868,8 +886,8 @@ fn same_prefix_txids_do_not_collide_in_get_or_remove_paths()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let prefix = 0xfeed_face_cafe_beef_u64;
-    let first = OutPoint::new(txid_with_prefix(prefix, 1), 0);
-    let second = OutPoint::new(txid_with_prefix(prefix, 2), 0);
+    let first = OutPoint::new(txid_with_prefix(prefix, 1).into(), 0);
+    let second = OutPoint::new(txid_with_prefix(prefix, 2).into(), 0);
     let first_txout = txout(101);
     let second_txout = txout(202);
     let mut changes = BlockChanges::default();
@@ -894,8 +912,8 @@ fn full_record_delete_uses_full_txid_and_preserves_collision_peer()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let prefix = 0xfeed_face_cafe_beef_u64;
-    let first = OutPoint::new(txid_with_prefix(prefix, 10), 0);
-    let second = OutPoint::new(txid_with_prefix(prefix, 11), 0);
+    let first = OutPoint::new(txid_with_prefix(prefix, 10).into(), 0);
+    let second = OutPoint::new(txid_with_prefix(prefix, 11).into(), 0);
     let second_txout = txout(202);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(first, txout(101), false, 1));
@@ -908,7 +926,7 @@ fn full_record_delete_uses_full_txid_and_preserves_collision_peer()
 
     assert_eq!(set.get(&first), None);
     assert_eq!(set.get(&second), Some(second_txout));
-    assert!(set.has_live_outputs_for_txid(&second.txid));
+    assert!(set.has_live_outputs_for_txid(&second.txid.0));
     assert_eq!(set.record_count(), 1);
     assert_eq!(set.len(), 1);
     Ok(())
@@ -918,8 +936,8 @@ fn full_record_delete_uses_full_txid_and_preserves_collision_peer()
 fn duplicate_remove_does_not_fast_delete_unspent_vout() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(700);
-    let removed = OutPoint::new(live_txid, 0);
-    let retained = OutPoint::new(live_txid, 1);
+    let removed = OutPoint::new(live_txid.into(), 0);
+    let retained = OutPoint::new(live_txid.into(), 1);
     let retained_txout = txout(701);
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(removed, txout(700), false, 1));
@@ -942,8 +960,8 @@ fn duplicate_remove_does_not_fast_delete_unspent_vout() -> Result<(), Box<dyn st
 fn height_u32_max_with_both_coinbase_states_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(800);
-    let first = OutPoint::new(live_txid, 0);
-    let second = OutPoint::new(live_txid, 1);
+    let first = OutPoint::new(live_txid.into(), 0);
+    let second = OutPoint::new(live_txid.into(), 1);
     let first_txout = txout(800);
     let second_txout = txout(801);
 
@@ -973,7 +991,7 @@ fn height_u32_max_with_both_coinbase_states_roundtrips() -> Result<(), Box<dyn s
 fn vout_u32_max_roundtrips_and_spends() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(810);
-    let max_vout_op = OutPoint::new(live_txid, u32::MAX);
+    let max_vout_op = OutPoint::new(live_txid.into(), u32::MAX);
     let txout_val = txout(810);
 
     let mut changes = BlockChanges::default();
@@ -1004,38 +1022,38 @@ fn zero_and_unequal_script_lengths_roundtrip_and_scan() -> Result<(), Box<dyn st
     let set = UtxoSet::new();
     let live_txid = txid(820);
 
-    let script_empty = ScriptBuf::new();
-    let script_1b = ScriptBuf::from_bytes(vec![0x51]);
-    let script_34b = ScriptBuf::from_bytes(vec![0x00; 34]);
-    let script_520b = ScriptBuf::from_bytes(vec![0x51; 520]);
-    let script_10kb = ScriptBuf::from_bytes(vec![0x52; 10_000]);
+    let script_empty = Vec::new();
+    let script_1b = vec![0x51];
+    let script_34b = vec![0x00; 34];
+    let script_520b = vec![0x51; 520];
+    let script_10kb = vec![0x52; 10_000];
 
     let txout_empty = TxOut {
-        value: Amount::from_sat(100),
+        value: 100,
         script_pubkey: script_empty.clone(),
     };
     let txout_1b = TxOut {
-        value: Amount::from_sat(200),
+        value: 200,
         script_pubkey: script_1b,
     };
     let txout_34b = TxOut {
-        value: Amount::from_sat(300),
+        value: 300,
         script_pubkey: script_34b,
     };
     let txout_520b = TxOut {
-        value: Amount::from_sat(400),
+        value: 400,
         script_pubkey: script_520b,
     };
     let txout_10kb = TxOut {
-        value: Amount::from_sat(500),
+        value: 500,
         script_pubkey: script_10kb.clone(),
     };
 
-    let op0 = OutPoint::new(live_txid, 0);
-    let op1 = OutPoint::new(live_txid, 1);
-    let op2 = OutPoint::new(live_txid, 2);
-    let op3 = OutPoint::new(live_txid, 3);
-    let op4 = OutPoint::new(live_txid, 4);
+    let op0 = OutPoint::new(live_txid.into(), 0);
+    let op1 = OutPoint::new(live_txid.into(), 1);
+    let op2 = OutPoint::new(live_txid.into(), 2);
+    let op3 = OutPoint::new(live_txid.into(), 3);
+    let op4 = OutPoint::new(live_txid.into(), 4);
 
     let mut changes = BlockChanges::default();
     changes.add(UtxoAdd::new(op0, txout_empty.clone(), false, 10));
@@ -1080,7 +1098,7 @@ fn owned_commit_repeated_same_vout_overwrite_in_single_run()
         events: Arc::clone(&events),
     }));
     let live_txid = txid(830);
-    let op = OutPoint::new(live_txid, 0);
+    let op = OutPoint::new(live_txid.into(), 0);
 
     let txout1 = txout(830);
     let txout2 = txout(831);
@@ -1107,8 +1125,8 @@ fn owned_commit_repeated_same_vout_overwrite_in_single_run()
 fn multi_shard_invalid_add_preserves_commit_rejection_atomicity()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
-    let shard0_op = OutPoint::new(txid_in_shard(0, 100), 0);
-    let shard1_op = OutPoint::new(txid_in_shard(1, 100), 0);
+    let shard0_op = OutPoint::new(txid_in_shard(0, 100).into(), 0);
+    let shard1_op = OutPoint::new(txid_in_shard(1, 100).into(), 0);
     let shard0_txout = txout(100);
     let shard1_txout = txout(101);
 
@@ -1120,16 +1138,16 @@ fn multi_shard_invalid_add_preserves_commit_rejection_atomicity()
     let mut invalid_changes = BlockChanges::default();
     invalid_changes.remove(shard0_op);
     invalid_changes.add(UtxoAdd::new(
-        OutPoint::new(txid_in_shard(0, 101), 0),
+        OutPoint::new(txid_in_shard(0, 101).into(), 0),
         txout(102),
         false,
         11,
     ));
     invalid_changes.add(UtxoAdd::new(
-        OutPoint::new(txid_in_shard(1, 101), 0),
+        OutPoint::new(txid_in_shard(1, 101).into(), 0),
         TxOut {
-            value: Amount::from_sat(103),
-            script_pubkey: ScriptBuf::from_bytes(vec![0; usize::from(u16::MAX) + 1]),
+            value: 103,
+            script_pubkey: vec![0; usize::from(u16::MAX) + 1],
         },
         false,
         11,
@@ -1144,8 +1162,14 @@ fn multi_shard_invalid_add_preserves_commit_rejection_atomicity()
     // Verify rejection atomicity across shards
     assert_eq!(set.get(&shard0_op), Some(shard0_txout));
     assert_eq!(set.get(&shard1_op), Some(shard1_txout));
-    assert_eq!(set.get(&OutPoint::new(txid_in_shard(0, 101), 0)), None);
-    assert_eq!(set.get(&OutPoint::new(txid_in_shard(1, 101), 0)), None);
+    assert_eq!(
+        set.get(&OutPoint::new(txid_in_shard(0, 101).into(), 0)),
+        None
+    );
+    assert_eq!(
+        set.get(&OutPoint::new(txid_in_shard(1, 101).into(), 0)),
+        None
+    );
     assert_eq!(set.len(), 2);
     Ok(())
 }
@@ -1154,21 +1178,21 @@ fn multi_shard_invalid_add_preserves_commit_rejection_atomicity()
 fn hash_serialized_3_matches_independent_core_serialization_for_edge_cases()
 -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
-    let op1 = OutPoint::new(txid(840), 0);
-    let op2 = OutPoint::new(txid(841), u32::MAX);
-    let op3 = OutPoint::new(txid(842), 64);
+    let op1 = OutPoint::new(txid(840).into(), 0);
+    let op2 = OutPoint::new(txid(841).into(), u32::MAX);
+    let op3 = OutPoint::new(txid(842).into(), 64);
 
     let txout1 = TxOut {
-        value: Amount::from_sat(0),
-        script_pubkey: ScriptBuf::new(),
+        value: 0,
+        script_pubkey: Vec::new(),
     };
     let txout2 = TxOut {
-        value: Amount::from_sat(u64::MAX),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51; 520]),
+        value: u64::MAX,
+        script_pubkey: vec![0x51; 520],
     };
     let txout3 = TxOut {
-        value: Amount::from_sat(12_345),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+        value: 12_345,
+        script_pubkey: vec![0x6a],
     };
 
     let mut changes = BlockChanges::default();

@@ -1,12 +1,13 @@
-//! Script verification, sigop counting, sighash caching, and taproot helpers.
+//! Script verification, sigop counting, and native script utilities.
 //!
 //! ## V1 implementation note
 //!
-//! Per-script execution delegates to `bitcoin::Script::verify_with_flags`
-//! (Core's canonical Rust port, audited). The hand-rolled per-opcode dispatcher
-//! from PLAN.md Task 3 Step 2 is a follow-up: when introduced, it lives behind
-//! a `hand-rolled` cargo feature and is gated by a parity-vs-bitcoin-crate test.
-//! Public surface is stable across the swap.
+//! The interpreter executes taproot key-path spends natively (local BIP341
+//! Schnorr verification); the remaining spend classes are served by the
+//! verification backend wired into the consensus crate. The hand-rolled
+//! per-opcode dispatcher from PLAN.md Task 3 Step 2 stays a follow-up: when
+//! introduced, it lives behind a `hand-rolled` cargo feature and is gated by
+//! a parity test. Public surface is stable across the swap.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -14,10 +15,8 @@
 pub mod batch;
 /// Script verification wrapper.
 pub mod interpreter;
-/// Opcode re-exports and local opcode newtype.
-pub mod opcodes;
-/// Signature hash cache wrapper.
-pub mod sighash_cache;
+/// Native script parsing, classification, and building helpers.
+pub mod script;
 /// Signature operation counters.
 pub mod sigops;
 /// Bounded stack infrastructure for the future hand-rolled interpreter.
@@ -26,13 +25,10 @@ pub mod stack;
 pub mod taproot;
 
 pub use interpreter::{Interpreter, ScriptError, VerifyFlags};
+pub use script::{
+    EarlyEndOfScript, Instruction, Instructions, is_multisig, is_op_return, is_p2a, is_p2pk,
+    is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh, is_p2wsh, is_push_only, is_witness_program,
+    minimal_non_dust, opcode, p2pk_pubkey_bytes, push_data, push_int, witness_program,
+};
+pub use sigops::{count_block, count_legacy, count_segwit, count_taproot, count_tx_legacy};
 pub use stack::{ScriptItem, Stack, StackError};
-
-/// Borrowed script type from the `bitcoin` crate.
-pub type Script = bitcoin::Script;
-/// Owned script buffer from the `bitcoin` crate.
-pub type ScriptBuf = bitcoin::ScriptBuf;
-/// Project transaction wrapper.
-pub type Tx = bitcoin_rs_primitives::Tx;
-/// Canonical transaction output type.
-pub type TxOut = bitcoin_rs_primitives::TxOut;

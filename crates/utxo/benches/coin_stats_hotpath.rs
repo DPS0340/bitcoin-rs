@@ -10,7 +10,6 @@ static GLOBAL_MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::hint::black_box;
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener, MuHash3072};
 use bitcoin_rs_utxo::{
@@ -43,8 +42,10 @@ impl CoinFixture {
         let mut encoded = Vec::with_capacity(ENTRY_COUNT);
         let shared_txid = txid(ENTRY_COUNT);
         for index in 0..ENTRY_COUNT {
-            let outpoint = OutPoint::new(txid(index), u32::try_from(index % 64).unwrap_or(0));
-            let same_txid_outpoint = OutPoint::new(shared_txid, u32::try_from(index).unwrap_or(0));
+            let outpoint =
+                OutPoint::new(txid(index).into(), u32::try_from(index % 64).unwrap_or(0));
+            let same_txid_outpoint =
+                OutPoint::new(shared_txid.into(), u32::try_from(index).unwrap_or(0));
             let txout = txout(index);
             encoded.push(preencoded_coin(&outpoint, &txout, 100, true));
             outpoints.push(outpoint);
@@ -335,7 +336,10 @@ fn coinstats_listener_commit_case(
     for index in 0..ENTRY_COUNT {
         let add_index = index.saturating_add(ENTRY_COUNT);
         changes.add(UtxoAdd::new(
-            OutPoint::new(txid(add_index), u32::try_from(add_index % 64).unwrap_or(0)),
+            OutPoint::new(
+                txid(add_index).into(),
+                u32::try_from(add_index % 64).unwrap_or(0),
+            ),
             txout(add_index),
             false,
             101,
@@ -351,7 +355,7 @@ fn coinstats_listener_spend_fanout_commit_case() -> (UtxoSet, BlockChanges) {
     let source_txid = txid(0x51_0000);
     let mut preload = BlockChanges::with_capacity(SPEND_PROXY_FANOUT, 0);
     for vout in 0..SPEND_PROXY_FANOUT {
-        let outpoint = OutPoint::new(source_txid, u32::try_from(vout).unwrap_or(0));
+        let outpoint = OutPoint::new(source_txid.into(), u32::try_from(vout).unwrap_or(0));
         let txout = spend_proxy_coinbase_txout();
         stats.insert_utxo(&outpoint, &txout, SPEND_PROXY_SOURCE_HEIGHT, true);
         preload.add(UtxoAdd::new(
@@ -368,12 +372,15 @@ fn coinstats_listener_spend_fanout_commit_case() -> (UtxoSet, BlockChanges) {
     let mut changes =
         BlockChanges::with_capacity(SPEND_PROXY_FANOUT.saturating_mul(2), SPEND_PROXY_FANOUT);
     for vout in 0..SPEND_PROXY_FANOUT {
-        changes.remove(OutPoint::new(source_txid, u32::try_from(vout).unwrap_or(0)));
+        changes.remove(OutPoint::new(
+            source_txid.into(),
+            u32::try_from(vout).unwrap_or(0),
+        ));
     }
     let coinbase_txid = txid(0x52_0000);
     for vout in 0..SPEND_PROXY_FANOUT {
         changes.add(UtxoAdd::new(
-            OutPoint::new(coinbase_txid, u32::try_from(vout).unwrap_or(0)),
+            OutPoint::new(coinbase_txid.into(), u32::try_from(vout).unwrap_or(0)),
             spend_proxy_coinbase_txout(),
             true,
             SPEND_PROXY_SPEND_HEIGHT,
@@ -381,7 +388,7 @@ fn coinstats_listener_spend_fanout_commit_case() -> (UtxoSet, BlockChanges) {
     }
     for index in 0..SPEND_PROXY_FANOUT {
         changes.add(UtxoAdd::new(
-            OutPoint::new(txid(0x53_0000_usize.saturating_add(index)), 0),
+            OutPoint::new(txid(0x53_0000_usize.saturating_add(index)).into(), 0),
             spend_proxy_spend_txout(),
             false,
             SPEND_PROXY_SPEND_HEIGHT,
@@ -411,7 +418,7 @@ fn coinstats_two_shard_commit_case_with_listener(
     let mut preload = BlockChanges::with_capacity(count, 0);
     let mut stats = CoinStats::new();
     for index in 0..count {
-        let outpoint = OutPoint::new(two_shard_txid(index), 0);
+        let outpoint = OutPoint::new(two_shard_txid(index).into(), 0);
         let txout = txout(index);
         stats.insert_utxo(&outpoint, &txout, 100, true);
         preload.add(UtxoAdd::new(outpoint, txout, true, 100));
@@ -424,12 +431,12 @@ fn coinstats_two_shard_commit_case_with_listener(
 
     let mut changes = BlockChanges::with_capacity(count, count);
     for index in 0..count {
-        changes.remove(OutPoint::new(two_shard_txid(index), 0));
+        changes.remove(OutPoint::new(two_shard_txid(index).into(), 0));
     }
     for index in 0..count {
         let add_index = index.saturating_add(count);
         changes.add(UtxoAdd::new(
-            OutPoint::new(two_shard_txid(add_index), 0),
+            OutPoint::new(two_shard_txid(add_index).into(), 0),
             txout(add_index),
             false,
             101,
@@ -444,9 +451,9 @@ fn preencoded_coin(op: &OutPoint, txout: &TxOut, height: u32, coinbase: bool) ->
     out.extend_from_slice(op.as_bytes());
     let coinbase_bit = u32::from(coinbase);
     out.extend_from_slice(&((height << 1) | coinbase_bit).to_le_bytes());
-    out.extend_from_slice(&txout.value.to_sat().to_le_bytes());
+    out.extend_from_slice(&txout.value.to_le_bytes());
     encode_compact_size_into(&mut out, txout.script_pubkey.len());
-    out.extend_from_slice(txout.script_pubkey.as_bytes());
+    out.extend_from_slice(txout.script_pubkey.as_slice());
     out
 }
 
@@ -477,22 +484,22 @@ fn txout(index: usize) -> TxOut {
     script.extend_from_slice(&[0x00, 0x20]);
     script.extend_from_slice(&txid(index).to_le_bytes());
     TxOut {
-        value: Amount::from_sat(50_000 + u64::try_from(index).unwrap_or(u64::MAX)),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 50_000 + u64::try_from(index).unwrap_or(u64::MAX),
+        script_pubkey: script,
     }
 }
 
 fn spend_proxy_coinbase_txout() -> TxOut {
     TxOut {
-        value: Amount::from_sat(SPEND_PROXY_COINBASE_OUTPUT_VALUE),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+        script_pubkey: vec![0x51],
     }
 }
 
 fn spend_proxy_spend_txout() -> TxOut {
     TxOut {
-        value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        value: SPEND_PROXY_SPEND_OUTPUT_VALUE,
+        script_pubkey: vec![0x51],
     }
 }
 

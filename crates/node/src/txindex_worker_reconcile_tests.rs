@@ -6,14 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
-use bitcoin::{
-    Amount, Block, BlockHash, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
-    block::Header as BlockHeader, block::Version, consensus::encode::serialize, hashes::Hash as _,
-    pow::CompactTarget, script::Builder,
-};
 use bitcoin_rs_chain::{BlockTree, NodeId, NodeStatus, TipSnapshot};
 use bitcoin_rs_index::PreparedBatchLimits;
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::encode::{consensus_bytes, double_sha256};
+use bitcoin_rs_primitives::{Hash256, Header as BlockHeader, TxIn, TxOut};
+use bitcoin_rs_script::script::push_int;
 use bitcoin_rs_storage::{ColumnFamily, FjallStore, KvStore as _, StorageError, WriteBatch as _};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
@@ -85,45 +82,67 @@ impl PruneBodyStore for MapBodyStore {
     }
 }
 
-fn coinbase_tx(height: u32, extra: i64) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: bitcoin::OutPoint::null(),
-            script_sig: Builder::new()
-                .push_int(i64::from(height))
-                .push_int(extra)
-                .into_script(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+fn coinbase_tx(height: u32, extra: i64) -> Tx {
+    let mut script_sig = push_int(i64::from(height));
+    script_sig.extend_from_slice(&push_int(extra));
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::default(),
+            script_sig,
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::new(),
+        outputs: vec![TxOut {
+            value: 1,
+            script_pubkey: Vec::new(),
         }],
     }
 }
 
 fn mine_block(prev_hash: Hash256, height: u32, extra: i64) -> (Block, Hash256) {
-    let prev_blockhash = BlockHash::from_byte_array(prev_hash.to_le_bytes());
-    let txdata = vec![coinbase_tx(height, extra)];
     let mut block = Block {
         header: BlockHeader {
-            version: Version::ONE,
-            prev_blockhash,
-            merkle_root: TxMerkleNode::all_zeros(),
+            version: 1,
+            prev_blockhash: BlockHash(prev_hash),
+            merkle_root: Hash256::default(),
             time: height,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         },
-        txdata,
+        txs: vec![coinbase_tx(height, extra)],
     };
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .unwrap_or_else(TxMerkleNode::all_zeros);
-    let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    block.header.merkle_root = merkle_root(&block).unwrap_or_default();
+    let hash = block.block_hash().0;
     (block, hash)
+}
+
+/// Pairwise double-SHA256 fold over little-endian txid bytes, duplicating the
+/// last leaf on odd levels (the native stand-in for `compute_merkle_root`).
+fn merkle_root(block: &Block) -> Option<Hash256> {
+    let mut leaves: Vec<[u8; 32]> = block
+        .txs
+        .iter()
+        .map(|tx| tx.txid().0.to_le_bytes())
+        .collect();
+    if leaves.is_empty() {
+        return None;
+    }
+    while leaves.len() > 1 {
+        let original_len = leaves.len();
+        let mut next = Vec::with_capacity(original_len.div_ceil(2));
+        for pos in 0..original_len.div_ceil(2) {
+            let left = leaves[2 * pos];
+            let right = leaves[(2 * pos + 1).min(original_len - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(double_sha256(&pair).to_le_bytes());
+        }
+        leaves = next;
+    }
+    Some(Hash256::from_le_bytes(&leaves[0]))
 }
 
 struct ForkFixture {
@@ -187,7 +206,7 @@ fn tip_for(tree: &BlockTree, node_id: NodeId) -> TipSnapshot {
 fn bodies_map(bodies: &[(u32, Hash256, &Block)]) -> BodyMap {
     bodies
         .iter()
-        .map(|(height, hash, block)| ((*height, hash.to_le_bytes()), serialize(block)))
+        .map(|(height, hash, block)| ((*height, hash.to_le_bytes()), consensus_bytes(*block)))
         .collect()
 }
 
@@ -707,7 +726,7 @@ fn missing_rollback_identity_resets_and_rebuilds_selected_capabilities() {
     ));
 
     let mut corrupt = store.new_batch();
-    corrupt.delete(ColumnFamily::BlockHeaders, &serialize(&f.a2.0.header));
+    corrupt.delete(ColumnFamily::BlockHeaders, &consensus_bytes(&f.a2.0.header));
     store.write_durable(corrupt).expect("remove identity row");
     let b2_tip = Arc::new(tip_for(&tree.read(), f.b2_id));
     applied_tip.store(Some(Arc::clone(&b2_tip)));

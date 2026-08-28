@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use bitcoin::hashes::Hash as _;
+use bitcoin_rs_primitives::{Block, OutPoint, Tx, Txid, encode, varint};
 use bitcoin_rs_storage::{
     ColumnFamily, KvSnapshot, KvStore, PrefixScanLimit, StorageError, WriteBatch,
 };
@@ -142,14 +142,14 @@ pub struct IndexWatermark {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ScriptHistoryEntry {
     /// Transaction identifier.
-    pub txid: bitcoin::Txid,
+    pub txid: Txid,
     /// Confirming block height.
     pub height: u32,
 }
 
 impl ScriptHistoryEntry {
     /// Creates a confirmed script-history entry.
-    pub const fn confirmed(txid: bitcoin::Txid, height: u32) -> Self {
+    pub const fn confirmed(txid: Txid, height: u32) -> Self {
         Self { txid, height }
     }
 }
@@ -540,7 +540,7 @@ impl<S: KvStore> Indexer<S> {
         let rows = self.iter_funding_rows(scripthash)?;
         let mut entries = Vec::new();
         let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
+        let mut cached_block: Option<Block> = None;
         for row in &rows {
             let height = row.height();
             if last_height != Some(height) {
@@ -550,21 +550,16 @@ impl<S: KvStore> Indexer<S> {
             let Some(block) = cached_block.as_ref() else {
                 continue;
             };
-            for tx in &block.txdata {
+            for tx in &block.txs {
                 let mut matched = false;
-                for output in &tx.output {
-                    if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes())
-                        == scripthash
-                    {
+                for output in &tx.outputs {
+                    if crate::ScriptHash::from_script_bytes(&output.script_pubkey) == scripthash {
                         matched = true;
                         break;
                     }
                 }
                 if matched {
-                    entries.push(crate::ScriptHistoryEntry::confirmed(
-                        tx.compute_txid(),
-                        height,
-                    ));
+                    entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
                 }
             }
         }
@@ -587,7 +582,7 @@ impl<S: KvStore> Indexer<S> {
     /// Iterates confirmed transaction-id rows for `txid` with their row values.
     fn iter_txid_rows_with_values(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
     ) -> Result<Vec<(crate::HashPrefixRow, Vec<u8>)>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
@@ -606,7 +601,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
         Ok(self
             .resolve_unspent_outputs_with_height(scripthash, source)?
             .into_iter()
@@ -627,7 +622,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64)>, IndexError> {
         Ok(self
             .resolve_unspent_outputs_with_height_scan(scripthash, source)?
             .into_iter()
@@ -644,7 +639,7 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64, u32)>, IndexError> {
         let rows = self.iter_funding_rows_with_values(scripthash)?;
         let mut outputs = Vec::new();
         for (row, value) in &rows {
@@ -670,11 +665,11 @@ impl<S: KvStore> Indexer<S> {
         &self,
         scripthash: crate::ScriptHash,
         source: &B,
-    ) -> Result<Vec<(bitcoin::Txid, u32, u64, u32)>, IndexError> {
+    ) -> Result<Vec<(Txid, u32, u64, u32)>, IndexError> {
         let rows = self.iter_funding_rows(scripthash)?;
         let mut outputs = Vec::new();
         let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
+        let mut cached_block: Option<Block> = None;
         for row in &rows {
             let height = row.height();
             if last_height != Some(height) {
@@ -684,18 +679,16 @@ impl<S: KvStore> Indexer<S> {
             let Some(block) = cached_block.as_ref() else {
                 continue;
             };
-            for tx in &block.txdata {
-                let txid = tx.compute_txid();
-                for (vout_idx, output) in tx.output.iter().enumerate() {
-                    if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes())
-                        != scripthash
-                    {
+            for tx in &block.txs {
+                let txid = tx.txid();
+                for (vout_idx, output) in tx.outputs.iter().enumerate() {
+                    if crate::ScriptHash::from_script_bytes(&output.script_pubkey) != scripthash {
                         continue;
                     }
                     let Ok(vout) = u32::try_from(vout_idx) else {
                         continue;
                     };
-                    outputs.push((txid, vout, output.value.to_sat(), height));
+                    outputs.push((txid, vout, output.value, height));
                 }
             }
         }
@@ -709,7 +702,7 @@ impl<S: KvStore> Indexer<S> {
     /// prefix is lossy as above.
     pub fn iter_spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
     ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = SpendingPrefixRow::scan_prefix(outpoint);
         let iter = self.store.iter_prefix(ColumnFamily::Spending, &prefix)?;
@@ -721,10 +714,7 @@ impl<S: KvStore> Indexer<S> {
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the txid's scan
     /// prefix, decoded from `ColumnFamily::TxConfirmed`. The 8-byte prefix is
     /// lossy; multiple txids can share a prefix.
-    pub fn iter_txid_rows(
-        &self,
-        txid: &bitcoin::Txid,
-    ) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
+    pub fn iter_txid_rows(&self, txid: &Txid) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
         collect_prefix_rows(iter)
@@ -741,9 +731,9 @@ impl<S: KvStore> Indexer<S> {
     /// the full 32-byte txid before returning.
     pub fn resolve_transaction<B: BlockSource + ?Sized>(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &B,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         let rows = self.iter_txid_rows_with_values(&txid)?;
         for (row, value) in &rows {
             let height = row.height();
@@ -751,7 +741,7 @@ impl<S: KvStore> Indexer<S> {
                 let found = positions
                     .iter()
                     .filter_map(|position| transaction_at(height, *position, source))
-                    .find(|tx| tx.compute_txid() == txid);
+                    .find(|tx| tx.txid() == txid);
                 if let Some(tx) = found {
                     return Ok(Some(tx));
                 }
@@ -761,8 +751,8 @@ impl<S: KvStore> Indexer<S> {
             // both are answered correctly by scanning; "not found" is never
             // reported on the strength of positions alone.
             if let Some(block) = source.block_at_height(height) {
-                for tx in &block.txdata {
-                    if tx.compute_txid() == txid {
+                for tx in &block.txs {
+                    if tx.txid() == txid {
                         return Ok(Some(tx.clone()));
                     }
                 }
@@ -778,12 +768,12 @@ impl<S: KvStore> Indexer<S> {
     /// oracle and the `before` arm of the `resolve_transaction` benchmark group.
     pub fn resolve_transaction_scan<B: BlockSource + ?Sized>(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &B,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         let rows = self.iter_txid_rows(&txid)?;
         let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
+        let mut cached_block: Option<Block> = None;
         for row in &rows {
             let height = row.height();
             if last_height != Some(height) {
@@ -793,8 +783,8 @@ impl<S: KvStore> Indexer<S> {
             let Some(block) = cached_block.as_ref() else {
                 continue;
             };
-            for tx in &block.txdata {
-                if tx.compute_txid() == txid {
+            for tx in &block.txs {
+                if tx.txid() == txid {
                     return Ok(Some(tx.clone()));
                 }
             }
@@ -811,7 +801,7 @@ impl<S: KvStore> Indexer<S> {
     /// in transaction-broadcast and prevout-value lookups.
     pub fn resolve_outpoint_value<B: BlockSource + ?Sized>(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &B,
     ) -> Result<Option<u64>, IndexError> {
         let Some(tx) = self.resolve_transaction(outpoint.txid, source)? else {
@@ -820,7 +810,7 @@ impl<S: KvStore> Indexer<S> {
         let Ok(vout_idx) = usize::try_from(outpoint.vout) else {
             return Ok(None);
         };
-        Ok(tx.output.get(vout_idx).map(|output| output.value.to_sat()))
+        Ok(tx.outputs.get(vout_idx).map(|output| output.value))
     }
 
     /// Resolves a transaction by txid and returns it alongside the block
@@ -835,12 +825,12 @@ impl<S: KvStore> Indexer<S> {
     /// fetch cost per candidate height.
     pub fn resolve_tx_with_height<B: BlockSource + ?Sized>(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &B,
-    ) -> Result<Option<(bitcoin::Transaction, u32)>, IndexError> {
+    ) -> Result<Option<(Tx, u32)>, IndexError> {
         let rows = self.iter_txid_rows(&txid)?;
         let mut last_height: Option<u32> = None;
-        let mut cached_block: Option<bitcoin::Block> = None;
+        let mut cached_block: Option<Block> = None;
         for row in &rows {
             let height = row.height();
             if last_height != Some(height) {
@@ -850,8 +840,8 @@ impl<S: KvStore> Indexer<S> {
             let Some(block) = cached_block.as_ref() else {
                 continue;
             };
-            for tx in &block.txdata {
-                if tx.compute_txid() == txid {
+            for tx in &block.txs {
+                if tx.txid() == txid {
                     return Ok(Some((tx.clone(), height)));
                 }
             }
@@ -947,7 +937,7 @@ impl<S: KvStore> Indexer<S> {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let (rows, txid_count) =
             pending_rows_for_block(block, height, TxidSource::Validate(txids))?;
@@ -966,7 +956,7 @@ impl<S: KvStore> Indexer<S> {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let (rows, txid_count) = pending_rows_for_block(block, height, TxidSource::Trusted(txids))?;
         if txids.len() != txid_count {
@@ -982,12 +972,12 @@ impl<S: KvStore> Indexer<S> {
     /// consensus serialization of `block` as `serialized_block`.
     pub fn ingest_decoded_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         serialized_block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
-        if txids.len() != block.txdata.len() {
+        if txids.len() != block.txs.len() {
             return self.ingest_block_with_verified_txids(serialized_block, height, txids);
         }
         let rows = pending_rows_for_decoded_block(block, height, txids)?;
@@ -1016,17 +1006,13 @@ impl<S: KvStore> Indexer<S> {
     /// deleted.
     pub fn rollback_block(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
     ) -> Result<IndexRowCounts, IndexError> {
         // Buffered rows must reach the store before the deletes, or a later
         // end_batch would write back the block being disconnected.
         self.flush()?;
-        let txids: Vec<bitcoin::Txid> = block
-            .txdata
-            .iter()
-            .map(bitcoin::Transaction::compute_txid)
-            .collect();
+        let txids: Vec<Txid> = block.txs.iter().map(Tx::txid).collect();
         self.rollback_block_inner(block, height, &txids)
     }
 
@@ -1039,12 +1025,12 @@ impl<S: KvStore> Indexer<S> {
     /// mismatched input.
     pub fn rollback_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         self.flush()?;
-        if txids.len() != block.txdata.len() {
+        if txids.len() != block.txs.len() {
             return self.rollback_block(block, height);
         }
         self.rollback_block_inner(block, height, txids)
@@ -1052,9 +1038,9 @@ impl<S: KvStore> Indexer<S> {
 
     fn rollback_block_inner(
         &self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let mut rows = pending_rows_for_decoded_block(block, height, txids)?;
         rows.sort();
@@ -1240,12 +1226,12 @@ fn pending_rows_for_block(
 }
 
 fn pending_rows_for_decoded_block(
-    block: &bitcoin::Block,
+    block: &Block,
     height: u32,
-    txids: &[bitcoin::Txid],
+    txids: &[Txid],
 ) -> Result<PendingRows, IndexError> {
     let mut rows = PendingRows::default();
-    let header_bytes = bitcoin::consensus::encode::serialize(&block.header);
+    let header_bytes = encode::consensus_bytes(&block.header);
     let Some(header) = HeaderRow::from_header_bytes(&header_bytes) else {
         return Err(IndexError::InvalidHeaderLength {
             len: header_bytes.len(),
@@ -1258,12 +1244,13 @@ fn pending_rows_for_decoded_block(
     // transaction starts after the header and the count, and each subsequent one
     // starts a `total_size()` further on. `both_ingest_paths_write_identical_row_values`
     // pins this against the byte offsets the zero-copy path measures directly.
-    let prologue = crate::types::HEADER_ROW_SIZE + bitcoin::VarInt::from(block.txdata.len()).size();
+    let prologue = crate::types::HEADER_ROW_SIZE
+        + varint::encode(u64::try_from(block.txs.len()).unwrap_or(u64::MAX)).len();
     let mut offset = u32::try_from(prologue).map_err(|_| IndexError::UnaddressablePosition {
         offset: u64::try_from(prologue).unwrap_or(u64::MAX),
     })?;
 
-    for (tx, txid) in block.txdata.iter().zip(txids) {
+    for (tx, txid) in block.txs.iter().zip(txids) {
         let byte_len =
             u32::try_from(tx.total_size()).map_err(|_| IndexError::UnaddressablePosition {
                 offset: u64::from(offset),
@@ -1279,14 +1266,14 @@ fn pending_rows_for_decoded_block(
             row: TxidRow::row(txid, height),
             position,
         });
-        for tx_in in &tx.input {
-            if !tx_in.previous_output.is_null() {
+        for tx_in in &tx.inputs {
+            if !is_null_outpoint(&tx_in.previous_output) {
                 rows.spending_rows
                     .push(SpendingPrefixRow::row(&tx_in.previous_output, height));
             }
         }
-        for tx_out in &tx.output {
-            if !is_op_return_script(tx_out.script_pubkey.as_bytes()) {
+        for tx_out in &tx.outputs {
+            if !is_op_return_script(&tx_out.script_pubkey) {
                 let scripthash = ScriptHash::new(&tx_out.script_pubkey);
                 rows.funding_rows.push(PositionedRow {
                     row: ScriptHashRow::row(scripthash, height),
@@ -1579,7 +1566,7 @@ impl Visitor for IndexBlockVisitor<'_> {
             TxidSource::Validate(txids) => {
                 if let Some(txid) = txids.get(self.txid_count) {
                     let computed = tx.txid_sha2();
-                    let txid_bytes: &[u8] = txid.as_ref();
+                    let txid_bytes: &[u8] = txid.as_bytes();
                     if txid_bytes == computed.as_slice() {
                         self.push_txid_row(txid_bytes, position);
                     } else {
@@ -1592,7 +1579,7 @@ impl Visitor for IndexBlockVisitor<'_> {
             }
             TxidSource::Trusted(txids) => {
                 if let Some(txid) = txids.get(self.txid_count) {
-                    let txid_bytes: &[u8] = txid.as_ref();
+                    let txid_bytes: &[u8] = txid.as_bytes();
                     self.push_txid_row(txid_bytes, position);
                 } else {
                     let txid = tx.txid_sha2();
@@ -1636,6 +1623,10 @@ fn is_null_prevout(prevout: &bsl::OutPoint<'_>) -> bool {
     prevout.vout() == u32::MAX && prevout.txid().iter().all(|byte| *byte == 0)
 }
 
+fn is_null_outpoint(outpoint: &OutPoint) -> bool {
+    outpoint.vout == u32::MAX && outpoint.txid.as_bytes().iter().all(|&byte| byte == 0)
+}
+
 #[inline]
 fn is_op_return_script(script: &[u8]) -> bool {
     matches!(script.first(), Some(0x6a))
@@ -1644,8 +1635,8 @@ fn is_op_return_script(script: &[u8]) -> bool {
 #[derive(Clone, Copy)]
 enum TxidSource<'a> {
     Compute,
-    Validate(&'a [bitcoin::Txid]),
-    Trusted(&'a [bitcoin::Txid]),
+    Validate(&'a [Txid]),
+    Trusted(&'a [Txid]),
 }
 
 /// Reads and decodes the single transaction a position names.
@@ -1658,9 +1649,9 @@ fn transaction_at<B: BlockSource + ?Sized>(
     height: u32,
     position: crate::types::TxPosition,
     source: &B,
-) -> Option<bitcoin::Transaction> {
+) -> Option<Tx> {
     let bytes = source.block_bytes_at_height(height, position.offset(), position.byte_len())?;
-    bitcoin::consensus::encode::deserialize::<bitcoin::Transaction>(&bytes).ok()
+    Tx::consensus_decode(&bytes).ok()
 }
 
 /// Resolves one funding row's history entries from its positions.
@@ -1682,10 +1673,7 @@ fn positioned_history<B: BlockSource + ?Sized>(
         if !funds_scripthash(&tx, scripthash) {
             return None;
         }
-        entries.push(crate::ScriptHistoryEntry::confirmed(
-            tx.compute_txid(),
-            height,
-        ));
+        entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
     }
     Some(entries)
 }
@@ -1700,12 +1688,9 @@ fn scan_height_history<B: BlockSource + ?Sized>(
     let Some(block) = source.block_at_height(height) else {
         return;
     };
-    for tx in &block.txdata {
+    for tx in &block.txs {
         if funds_scripthash(tx, scripthash) {
-            entries.push(crate::ScriptHistoryEntry::confirmed(
-                tx.compute_txid(),
-                height,
-            ));
+            entries.push(crate::ScriptHistoryEntry::confirmed(tx.txid(), height));
         }
     }
 }
@@ -1718,7 +1703,7 @@ fn positioned_unspent_outputs<B: BlockSource + ?Sized>(
     height: u32,
     value: &[u8],
     source: &B,
-) -> Option<Vec<(bitcoin::Txid, u32, u64, u32)>> {
+) -> Option<Vec<(Txid, u32, u64, u32)>> {
     let positions = crate::types::TxPositionValue::decode(value)?;
     let mut outputs = Vec::new();
     for position in positions {
@@ -1737,12 +1722,12 @@ fn scan_height_unspent_outputs<B: BlockSource + ?Sized>(
     scripthash: crate::ScriptHash,
     height: u32,
     source: &B,
-    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+    outputs: &mut Vec<(Txid, u32, u64, u32)>,
 ) {
     let Some(block) = source.block_at_height(height) else {
         return;
     };
-    for tx in &block.txdata {
+    for tx in &block.txs {
         append_matching_outputs(tx, scripthash, height, outputs);
     }
 }
@@ -1750,28 +1735,28 @@ fn scan_height_unspent_outputs<B: BlockSource + ?Sized>(
 /// Appends `(txid, vout, value, height)` for every output of `tx` matching
 /// `scripthash`, computing the txid only once a match is found.
 fn append_matching_outputs(
-    tx: &bitcoin::Transaction,
+    tx: &Tx,
     scripthash: crate::ScriptHash,
     height: u32,
-    outputs: &mut Vec<(bitcoin::Txid, u32, u64, u32)>,
+    outputs: &mut Vec<(Txid, u32, u64, u32)>,
 ) {
-    let mut computed_txid: Option<bitcoin::Txid> = None;
-    for (vout_idx, output) in tx.output.iter().enumerate() {
-        if crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) != scripthash {
+    let mut computed_txid: Option<Txid> = None;
+    for (vout_idx, output) in tx.outputs.iter().enumerate() {
+        if crate::ScriptHash::from_script_bytes(&output.script_pubkey) != scripthash {
             continue;
         }
         let Ok(vout) = u32::try_from(vout_idx) else {
             continue;
         };
-        let txid = *computed_txid.get_or_insert_with(|| tx.compute_txid());
-        outputs.push((txid, vout, output.value.to_sat(), height));
+        let txid = *computed_txid.get_or_insert_with(|| tx.txid());
+        outputs.push((txid, vout, output.value, height));
     }
 }
 
-fn funds_scripthash(tx: &bitcoin::Transaction, scripthash: crate::ScriptHash) -> bool {
-    tx.output.iter().any(|output| {
-        crate::ScriptHash::from_script_bytes(output.script_pubkey.as_bytes()) == scripthash
-    })
+fn funds_scripthash(tx: &Tx, scripthash: crate::ScriptHash) -> bool {
+    tx.outputs
+        .iter()
+        .any(|output| crate::ScriptHash::from_script_bytes(&output.script_pubkey) == scripthash)
 }
 
 fn collect_prefix_rows_with_values(
@@ -1842,7 +1827,7 @@ pub trait TxIndexSnapshot: Send + Sync {
     /// Scans confirmed-transaction rows for `txid`.
     fn transaction_rows(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError>;
     /// Scans funding rows for `scripthash`.
@@ -1854,7 +1839,7 @@ pub trait TxIndexSnapshot: Send + Sync {
     /// Scans spending rows for `outpoint`.
     fn spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError>;
 }
@@ -1905,7 +1890,7 @@ impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
 
     fn transaction_rows(
         &self,
-        txid: &bitcoin::Txid,
+        txid: &Txid,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError> {
         self.scan(
@@ -1929,7 +1914,7 @@ impl TxIndexSnapshot for StoreTxIndexSnapshot<'_> {
 
     fn spending_rows(
         &self,
-        outpoint: &bitcoin::OutPoint,
+        outpoint: &OutPoint,
         limit: PrefixScanLimit,
     ) -> Result<TxIndexScan, IndexError> {
         self.scan(
@@ -2145,7 +2130,7 @@ impl<S: KvStore> IndexWriter<S> {
         let (mut rows, _txid_count, header) =
             pending_rows_for_block_with_header(body, height, TxidSource::Compute, capabilities)?;
         let header = header.ok_or(IndexError::InvalidHeaderLength { len: 0 })?;
-        let actual_hash = bitcoin::BlockHash::hash(header.as_slice()).to_byte_array();
+        let actual_hash = encode::double_sha256(header.as_slice()).to_le_bytes();
         if actual_hash != hash {
             return Err(IndexError::BlockIdentityMismatch {
                 height,
@@ -2426,7 +2411,7 @@ pub trait IndexerLike: Send + Sync {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = txids;
         self.ingest_block(block, height)
@@ -2441,7 +2426,7 @@ pub trait IndexerLike: Send + Sync {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         self.ingest_block_with_txids(block, height, txids)
     }
@@ -2453,10 +2438,10 @@ pub trait IndexerLike: Send + Sync {
     /// [`IndexerLike::ingest_block_with_verified_txids`].
     fn ingest_decoded_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         serialized_block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = block;
         self.ingest_block_with_verified_txids(serialized_block, height, txids)
@@ -2471,11 +2456,7 @@ pub trait IndexerLike: Send + Sync {
     /// is consistent, and `ScriptIndex` queries would then serve transactions
     /// that are no longer in the chain. Failing loudly is the only safe
     /// default. Concrete indexers that persist rows override this.
-    fn rollback_block(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
+    fn rollback_block(&mut self, block: &Block, height: u32) -> Result<IndexRowCounts, IndexError> {
         let _ = (block, height);
         Err(IndexError::UnsupportedRollback)
     }
@@ -2487,9 +2468,9 @@ pub trait IndexerLike: Send + Sync {
     /// ignoring `txids` and delegating to [`IndexerLike::rollback_block`].
     fn rollback_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         let _ = txids;
         self.rollback_block(block, height)
@@ -2509,9 +2490,9 @@ pub trait IndexerLike: Send + Sync {
     /// does not support transaction lookup.
     fn resolve_transaction(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &dyn BlockSource,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         let _ = (txid, source);
         Ok(None)
     }
@@ -2525,7 +2506,7 @@ pub trait IndexerLike: Send + Sync {
     /// in transaction-broadcast and prevout-value lookups.
     fn resolve_outpoint_value(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &dyn BlockSource,
     ) -> Result<Option<u64>, IndexError>;
 }
@@ -2581,7 +2562,7 @@ enum FormatMarker {
 /// database, peer fetch).
 pub trait BlockSource {
     /// Returns the Bitcoin block at `height` on the active chain, if known.
-    fn block_at_height(&self, height: u32) -> Option<bitcoin::Block>;
+    fn block_at_height(&self, height: u32) -> Option<Block>;
 
     /// Returns `len` serialized bytes starting `offset` bytes into the active
     /// block at `height`, without materializing or decoding the whole body.
@@ -2611,7 +2592,7 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_block_with_txids(self, block, height, txids)
     }
@@ -2620,34 +2601,30 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
         &mut self,
         block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_block_with_verified_txids(self, block, height, txids)
     }
 
     fn ingest_decoded_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         serialized_block: &[u8],
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::ingest_decoded_block_with_verified_txids(self, block, serialized_block, height, txids)
     }
 
-    fn rollback_block(
-        &mut self,
-        block: &bitcoin::Block,
-        height: u32,
-    ) -> Result<IndexRowCounts, IndexError> {
+    fn rollback_block(&mut self, block: &Block, height: u32) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block(self, block, height)
     }
 
     fn rollback_block_with_verified_txids(
         &mut self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
-        txids: &[bitcoin::Txid],
+        txids: &[Txid],
     ) -> Result<IndexRowCounts, IndexError> {
         Self::rollback_block_with_verified_txids(self, block, height, txids)
     }
@@ -2662,15 +2639,15 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
 
     fn resolve_transaction(
         &self,
-        txid: bitcoin::Txid,
+        txid: Txid,
         source: &dyn BlockSource,
-    ) -> Result<Option<bitcoin::Transaction>, IndexError> {
+    ) -> Result<Option<Tx>, IndexError> {
         Self::resolve_transaction(self, txid, source)
     }
 
     fn resolve_outpoint_value(
         &self,
-        outpoint: bitcoin::OutPoint,
+        outpoint: OutPoint,
         source: &dyn BlockSource,
     ) -> Result<Option<u64>, IndexError> {
         Self::resolve_outpoint_value(self, outpoint, source)
@@ -2681,11 +2658,9 @@ impl<S: KvStore + Send + Sync + 'static> IndexerLike for Indexer<S> {
 mod tests {
     use std::sync::Arc;
 
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{
-        Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid,
+        consensus_bytes,
     };
     use bitcoin_rs_storage::{ColumnFamily, KvStore, RocksDbStore};
 
@@ -2705,13 +2680,13 @@ mod tests {
 
     #[test]
     fn iter_funding_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let script = ScriptBuf::from_bytes(vec![0x51, 0x01]);
+        let script = vec![0x51, 0x01];
         let tx = tx(spent_outpoint(1, 0), script.clone());
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
-        let scripthash = ScriptHash::from_script_bytes(script.as_bytes());
+        let scripthash = ScriptHash::from_script_bytes(&script);
         assert_eq!(
             indexer.iter_funding_rows(scripthash)?,
             vec![ScriptHashRow::row(scripthash, HEIGHT)]
@@ -2722,10 +2697,10 @@ mod tests {
     #[test]
     fn iter_spending_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
         let outpoint = spent_outpoint(2, 3);
-        let tx = tx(outpoint, ScriptBuf::from_bytes(vec![0x51, 0x02]));
+        let tx = tx(outpoint, vec![0x51, 0x02]);
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
         assert_eq!(
             indexer.iter_spending_rows(&outpoint)?,
@@ -2736,14 +2711,11 @@ mod tests {
 
     #[test]
     fn iter_txid_rows_returns_indexed_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let tx = tx(
-            spent_outpoint(4, 5),
-            ScriptBuf::from_bytes(vec![0x51, 0x03]),
-        );
-        let txid = tx.compute_txid();
+        let tx = tx(spent_outpoint(4, 5), vec![0x51, 0x03]);
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block(vec![tx])), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&block(vec![tx])), HEIGHT)?;
 
         let rows = indexer.iter_txid_rows(&txid)?;
         assert!(rows.contains(&TxidRow::row(&txid, HEIGHT)));
@@ -2753,34 +2725,30 @@ mod tests {
     #[test]
     fn decoded_verified_txid_ingest_matches_serialized_ingest()
     -> Result<(), Box<dyn std::error::Error>> {
-        let coinbase = tx(OutPoint::null(), ScriptBuf::from_bytes(vec![0x51, 0x04]));
-        let spender = Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+        let coinbase = tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51, 0x04]);
+        let spender = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output: spent_outpoint(9, 1),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![
+            outputs: vec![
                 TxOut {
-                    value: Amount::from_sat(5_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x05]),
+                    value: 5_000,
+                    script_pubkey: vec![0x51, 0x05],
                 },
                 TxOut {
-                    value: Amount::from_sat(0),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x00]),
+                    value: 0,
+                    script_pubkey: vec![0x6a, 0x01, 0x00],
                 },
             ],
         };
         let block = block(vec![coinbase, spender]);
-        let block_bytes = serialize(&block);
-        let txids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let block_bytes = consensus_bytes(&block);
+        let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
         let (_serialized_dir, mut serialized_indexer) = indexer()?;
         let (_decoded_dir, mut decoded_indexer) = indexer()?;
 
@@ -2805,17 +2773,14 @@ mod tests {
     fn decoded_verified_txid_ingest_mismatch_falls_back_to_serialized_ingest()
     -> Result<(), Box<dyn std::error::Error>> {
         let decoded_block = block(vec![tx(
-            OutPoint::null(),
-            ScriptBuf::from_bytes(vec![0x51, 0x08]),
+            OutPoint::new(Txid::default(), u32::MAX),
+            vec![0x51, 0x08],
         )]);
         let serialized_block = block(vec![
-            tx(OutPoint::null(), ScriptBuf::from_bytes(vec![0x51, 0x06])),
-            tx(
-                spent_outpoint(10, 0),
-                ScriptBuf::from_bytes(vec![0x51, 0x07]),
-            ),
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51, 0x06]),
+            tx(spent_outpoint(10, 0), vec![0x51, 0x07]),
         ]);
-        let serialized_block_bytes = serialize(&serialized_block);
+        let serialized_block_bytes = consensus_bytes(&serialized_block);
         let (_serialized_dir, mut serialized_indexer) = indexer()?;
         let (_decoded_dir, mut decoded_indexer) = indexer()?;
 
@@ -2838,18 +2803,18 @@ mod tests {
     #[test]
     fn resolve_script_history_returns_entries_for_funded_scripthash()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2863,19 +2828,19 @@ mod tests {
     #[test]
     fn resolve_unspent_outputs_returns_txid_vout_value_for_funded_scripthash()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
-        let value = output.value.to_sat();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
+        let value = output.value;
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2890,15 +2855,15 @@ mod tests {
     #[test]
     fn resolve_transaction_returns_coinbase_for_genesis_block_indexed_at_height_zero()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
         let coinbase = tx.clone();
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2913,14 +2878,14 @@ mod tests {
     #[test]
     fn resolve_transaction_returns_none_when_indexed_height_is_not_visible()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2935,15 +2900,15 @@ mod tests {
     #[test]
     fn resolve_tx_with_height_returns_genesis_coinbase_at_height_zero()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
         let coinbase = tx.clone();
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -2959,9 +2924,9 @@ mod tests {
     fn resolve_tx_with_height_returns_none_for_unknown_txid()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, indexer) = indexer()?;
-        let txid = bitcoin::Txid::from_byte_array([0xff; 32]);
+        let txid = Txid(Hash256::from_le_bytes(&[0xff; 32]));
         let source = FakeSource {
-            block: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+            block: Network::Regtest.genesis_block(),
             target_height: 0,
         };
 
@@ -2972,20 +2937,20 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_returns_genesis_coinbase_subsidy()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
             target_height: 0,
         };
-        let outpoint = bitcoin::OutPoint { txid, vout: 0 };
+        let outpoint = OutPoint { txid, vout: 0 };
         let value = indexer.resolve_outpoint_value(outpoint, &source)?;
 
         assert_eq!(value, Some(5_000_000_000));
@@ -2995,14 +2960,14 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_via_indexerlike_dyn_source() -> Result<(), Box<dyn std::error::Error>>
     {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -3010,7 +2975,7 @@ mod tests {
         };
         let dyn_indexer: &dyn super::IndexerLike = &indexer;
         let dyn_source: &dyn super::BlockSource = &source;
-        let outpoint = bitcoin::OutPoint { txid, vout: 0 };
+        let outpoint = OutPoint { txid, vout: 0 };
         let value = dyn_indexer.resolve_outpoint_value(outpoint, dyn_source)?;
 
         assert_eq!(value, Some(5_000_000_000));
@@ -3020,20 +2985,20 @@ mod tests {
     #[test]
     fn resolve_outpoint_value_returns_none_for_vout_out_of_range()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let txid = tx.compute_txid();
+        let txid = tx.txid();
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
             target_height: 0,
         };
-        let outpoint = bitcoin::OutPoint { txid, vout: 99 };
+        let outpoint = OutPoint { txid, vout: 99 };
 
         assert_eq!(indexer.resolve_outpoint_value(outpoint, &source)?, None);
         Ok(())
@@ -3043,12 +3008,12 @@ mod tests {
     fn resolve_outpoint_value_returns_none_for_unknown_txid()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, indexer) = indexer()?;
-        let outpoint = bitcoin::OutPoint {
-            txid: bitcoin::Txid::from_byte_array([0xff; 32]),
+        let outpoint = OutPoint {
+            txid: Txid(Hash256::from_le_bytes(&[0xff; 32])),
             vout: 0,
         };
         let source = FakeSource {
-            block: bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest),
+            block: Network::Regtest.genesis_block(),
             target_height: 0,
         };
 
@@ -3059,19 +3024,19 @@ mod tests {
     #[test]
     fn resolve_unspent_outputs_with_height_returns_funding_height()
     -> Result<(), Box<dyn std::error::Error>> {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let Some(tx) = block.txdata.first() else {
+        let block = Network::Regtest.genesis_block();
+        let Some(tx) = block.txs.first() else {
             return Err(std::io::Error::other("genesis block has no transactions").into());
         };
-        let Some(output) = tx.output.first() else {
+        let Some(output) = tx.outputs.first() else {
             return Err(std::io::Error::other("genesis transaction has no outputs").into());
         };
-        let scripthash = ScriptHash::from_script_bytes(output.script_pubkey.as_bytes());
-        let txid = tx.compute_txid();
-        let value = output.value.to_sat();
+        let scripthash = ScriptHash::from_script_bytes(&output.script_pubkey);
+        let txid = tx.txid();
+        let value = output.value;
         let (_dir, mut indexer) = indexer()?;
 
-        indexer.ingest_block(&serialize(&block), 0)?;
+        indexer.ingest_block(&consensus_bytes(&block), 0)?;
 
         let source = FakeSource {
             block,
@@ -3101,14 +3066,8 @@ mod tests {
     /// spend, so funding and spending rows both exist alongside txid and header
     /// rows.
     fn rollback_fixture_block() -> Block {
-        let funded = tx(
-            OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-            ScriptBuf::from_bytes(vec![0x51]),
-        );
-        let spender = tx(
-            OutPoint::new(funded.compute_txid(), 0),
-            ScriptBuf::from_bytes(vec![0x52]),
-        );
+        let funded = tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51]);
+        let spender = tx(OutPoint::new(funded.txid(), 0), vec![0x52]);
         block(vec![funded, spender])
     }
 
@@ -3119,7 +3078,7 @@ mod tests {
         let candidate = rollback_fixture_block();
         let before = stored_rows(&indexer)?;
 
-        let written = indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        let written = indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         let after_ingest = stored_rows(&indexer)?;
         assert!(
             after_ingest.len() > before.len(),
@@ -3155,22 +3114,16 @@ mod tests {
     fn last_counts_remains_ingest_after_rollback() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
         let old = rollback_fixture_block();
-        let old_written = indexer.ingest_block(&serialize(&old), HEIGHT)?;
+        let old_written = indexer.ingest_block(&consensus_bytes(&old), HEIGHT)?;
         let _ = indexer.rollback_block(&old, HEIGHT)?;
 
         // A replacement at the same height with a different shape so its
         // ingest counts differ from the old block's rollback counts.
         let replacement = block(vec![
-            tx(
-                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-                ScriptBuf::from_bytes(vec![0x51]),
-            ),
-            tx(
-                OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
-                ScriptBuf::from_bytes(vec![0x52]),
-            ),
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x51]),
+            tx(OutPoint::new(Txid::default(), u32::MAX), vec![0x52]),
         ]);
-        let replacement_written = indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        let replacement_written = indexer.ingest_block(&consensus_bytes(&replacement), HEIGHT)?;
         assert_ne!(
             replacement_written, old_written,
             "replacement counts must differ from the old block's counts"
@@ -3204,7 +3157,7 @@ mod tests {
     fn repeated_rollback_is_not_an_error() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
         let candidate = rollback_fixture_block();
-        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
 
         indexer.rollback_block(&candidate, HEIGHT)?;
         let after_first = stored_rows(&indexer)?;
@@ -3227,7 +3180,7 @@ mod tests {
         let candidate = rollback_fixture_block();
 
         indexer.begin_batch();
-        indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         indexer.rollback_block(&candidate, HEIGHT)?;
         indexer.end_batch()?;
 
@@ -3294,7 +3247,7 @@ mod tests {
         {
             let store = Arc::new(RocksDbStore::open(dir.path())?);
             let mut indexer = Indexer::new(store);
-            indexer.ingest_block(&serialize(&candidate), HEIGHT)?;
+            indexer.ingest_block(&consensus_bytes(&candidate), HEIGHT)?;
         }
         let store = Arc::new(RocksDbStore::open(dir.path())?);
         let before = stored_rows(&Indexer::new(Arc::clone(&store)))?;
@@ -3335,7 +3288,7 @@ mod tests {
             &self,
             _txid: Txid,
             _source: &dyn BlockSource,
-        ) -> Result<Option<Transaction>, super::IndexError> {
+        ) -> Result<Option<Tx>, super::IndexError> {
             Ok(None)
         }
 
@@ -3369,31 +3322,31 @@ mod tests {
     fn a_repeated_rollback_leaves_a_replacement_blocks_rows_alone()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, mut indexer) = indexer()?;
-        let shared_script = ScriptBuf::from_bytes(vec![0x51]);
+        let shared_script = vec![0x51];
 
         // Two different blocks at the same height that both pay the same
         // script, so their funding rows collide.
         // The shared `block` fixture pins a zero merkle root, so the nonce is
         // what distinguishes these two headers.
         let mut old_block = block(vec![tx(
-            OutPoint::new(Txid::from_byte_array([0xa1; 32]), 0),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0xa1; 32])), 0),
             shared_script.clone(),
         )]);
         old_block.header.nonce = 1;
         let mut replacement = block(vec![tx(
-            OutPoint::new(Txid::from_byte_array([0xb2; 32]), 0),
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[0xb2; 32])), 0),
             shared_script,
         )]);
         replacement.header.nonce = 2;
         assert_ne!(
-            old_block.header.block_hash(),
-            replacement.header.block_hash(),
+            old_block.block_hash(),
+            replacement.block_hash(),
             "the two blocks must differ, or there is nothing to confuse"
         );
 
-        indexer.ingest_block(&serialize(&old_block), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&old_block), HEIGHT)?;
         indexer.rollback_block(&old_block, HEIGHT)?;
-        indexer.ingest_block(&serialize(&replacement), HEIGHT)?;
+        indexer.ingest_block(&consensus_bytes(&replacement), HEIGHT)?;
         indexer.flush()?;
         let after_replacement = stored_rows(&indexer)?;
         assert!(
@@ -3441,41 +3394,38 @@ mod tests {
         Ok(rows)
     }
 
-    fn block(txdata: Vec<Transaction>) -> Block {
+    fn block(txs: Vec<Tx>) -> Block {
         Block {
-            header: block::Header {
-                version: block::Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 0,
-                bits: CompactTarget::from_consensus(0),
+                bits: 0,
                 nonce: 0,
             },
-            txdata,
+            txs,
         }
     }
 
-    fn tx(previous_output: OutPoint, script_pubkey: ScriptBuf) -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
+    fn tx(previous_output: OutPoint, script_pubkey: Vec<u8>) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
                 previous_output,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(5_000),
+            outputs: vec![TxOut {
+                value: 5_000,
                 script_pubkey,
             }],
         }
     }
 
     fn spent_outpoint(label: u8, vout: u32) -> OutPoint {
-        OutPoint {
-            txid: Txid::from_byte_array([label; 32]),
-            vout,
-        }
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), vout)
     }
 }

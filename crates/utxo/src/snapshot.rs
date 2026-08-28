@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use bitcoin_rs_primitives::{Hash256, varint};
+use bitcoin_rs_primitives::{Hash256, Txid, varint};
 use hashbrown::HashSet;
 use sha2::{Digest, Sha256};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -415,7 +415,7 @@ fn read_snapshot_outputs(
 }
 
 fn validate_snapshot_key(key: UtxoKey, txid: Hash256, shard_idx: u8) -> Result<(), UtxoError> {
-    if UtxoKey::from_txid(&txid) != key {
+    if UtxoKey::from_txid(&Txid::from(txid)) != key {
         return Err(UtxoError::SnapshotTxidPrefixMismatch);
     }
     if key.shard() != shard_idx {

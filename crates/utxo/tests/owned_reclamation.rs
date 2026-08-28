@@ -4,7 +4,6 @@
 //! overwrites, and undo; asserts live outputs, `record_count`,
 //! `hash_serialized_3`, and listener `MuHash` return to the reference state
 //! without calling any maintenance API.
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{BlockChanges, UndoBatch, UtxoAdd, UtxoSet, aggregate_hash};
 
@@ -29,8 +28,8 @@ fn txout(seed: u64) -> TxOut {
     script.extend_from_slice(&[0x51, 0x08]);
     script.extend_from_slice(&seed.to_le_bytes());
     TxOut {
-        value: Amount::from_sat(10_000 + seed),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 10_000 + seed,
+        script_pubkey: script,
     }
 }
 
@@ -50,7 +49,7 @@ fn owned_reclamation_preserves_live_entries_after_churn() -> Result<(), Box<dyn 
             pending.remove(outpoint);
         } else {
             let seed = i + 100_000;
-            let outpoint = OutPoint::new(txid(seed), u32::try_from(seed % 7)?);
+            let outpoint = OutPoint::new(txid(seed).into(), u32::try_from(seed % 7)?);
             let txout = txout(seed);
             live.push((outpoint, txout.clone()));
             pending.add(UtxoAdd::new(outpoint, txout, false, 300));
@@ -85,7 +84,7 @@ fn owned_reclamation_same_txid_partial_then_full_spend_releases_record()
     let mut preload = BlockChanges::default();
     for vout in 0_u32..8 {
         preload.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
+            OutPoint::new(live_txid.into(), vout),
             txout(u64::from(vout)),
             false,
             1,
@@ -97,7 +96,7 @@ fn owned_reclamation_same_txid_partial_then_full_spend_releases_record()
     // Partial spend: remove half.
     let mut partial = BlockChanges::default();
     for vout in 0_u32..4 {
-        partial.remove(OutPoint::new(live_txid, vout));
+        partial.remove(OutPoint::new(live_txid.into(), vout));
     }
     set.commit_block(&partial, &txid(100))?;
     assert!(set.has_live_outputs_for_txid(&live_txid));
@@ -105,7 +104,7 @@ fn owned_reclamation_same_txid_partial_then_full_spend_releases_record()
     // Full spend: remove the rest.
     let mut full = BlockChanges::default();
     for vout in 4_u32..8 {
-        full.remove(OutPoint::new(live_txid, vout));
+        full.remove(OutPoint::new(live_txid.into(), vout));
     }
     set.commit_block(&full, &txid(101))?;
     assert!(!set.has_live_outputs_for_txid(&live_txid));
@@ -126,7 +125,7 @@ fn owned_reclamation_bip30_overwrite_does_not_accumulate_garbage()
     // Add vout 0.
     let mut add1 = BlockChanges::default();
     add1.add(UtxoAdd::new(
-        OutPoint::new(live_txid, 0),
+        OutPoint::new(live_txid.into(), 0),
         txout(1),
         false,
         1,
@@ -138,7 +137,7 @@ fn owned_reclamation_bip30_overwrite_does_not_accumulate_garbage()
     for i in 1_u64..50 {
         let mut overwrite = BlockChanges::default();
         overwrite.add(UtxoAdd::new(
-            OutPoint::new(live_txid, 0),
+            OutPoint::new(live_txid.into(), 0),
             txout(100 + i),
             false,
             2,
@@ -147,7 +146,10 @@ fn owned_reclamation_bip30_overwrite_does_not_accumulate_garbage()
     }
 
     // The latest value must win.
-    assert_eq!(set.get(&OutPoint::new(live_txid, 0)), Some(txout(149)));
+    assert_eq!(
+        set.get(&OutPoint::new(live_txid.into(), 0)),
+        Some(txout(149))
+    );
     assert_eq!(set.record_count(), 1);
     assert_eq!(set.len(), 1);
 
@@ -162,8 +164,8 @@ fn owned_reclamation_undo_restores_state() -> Result<(), Box<dyn std::error::Err
 
     // Block 1: add tx1:vout0 and tx2:vout0.
     let mut block1 = BlockChanges::default();
-    let add1 = UtxoAdd::new(OutPoint::new(tx1, 0), txout(1), false, 1);
-    let add2 = UtxoAdd::new(OutPoint::new(tx2, 0), txout(2), false, 1);
+    let add1 = UtxoAdd::new(OutPoint::new(tx1.into(), 0), txout(1), false, 1);
+    let add2 = UtxoAdd::new(OutPoint::new(tx2.into(), 0), txout(2), false, 1);
     block1.add(add1.clone());
     block1.add(add2);
     set.commit_block(&block1, &txid(10_000))?;
@@ -172,20 +174,20 @@ fn owned_reclamation_undo_restores_state() -> Result<(), Box<dyn std::error::Err
     // Block 2: spend tx1:vout0, add tx3:vout0.
     let mut block2 = BlockChanges::default();
     let mut undo = UndoBatch::default();
-    block2.remove(OutPoint::new(tx1, 0));
+    block2.remove(OutPoint::new(tx1.into(), 0));
     undo.restore(add1);
-    let add3 = UtxoAdd::new(OutPoint::new(txid(3000), 0), txout(3), false, 2);
+    let add3 = UtxoAdd::new(OutPoint::new(txid(3000).into(), 0), txout(3), false, 2);
     block2.add(add3);
-    undo.remove(OutPoint::new(txid(3000), 0));
+    undo.remove(OutPoint::new(txid(3000).into(), 0));
     set.commit_block(&block2, &txid(10_001))?;
 
     // Undo block 2.
     set.undo_block(&undo)?;
     let hash_after = bitcoin_rs_utxo::hash_serialized_3(&set)?;
     assert_eq!(hash_after, hash_before);
-    assert_eq!(set.get(&OutPoint::new(tx1, 0)), Some(txout(1)));
-    assert_eq!(set.get(&OutPoint::new(tx2, 0)), Some(txout(2)));
-    assert_eq!(set.get(&OutPoint::new(txid(3000), 0)), None);
+    assert_eq!(set.get(&OutPoint::new(tx1.into(), 0)), Some(txout(1)));
+    assert_eq!(set.get(&OutPoint::new(tx2.into(), 0)), Some(txout(2)));
+    assert_eq!(set.get(&OutPoint::new(txid(3000).into(), 0)), None);
 
     Ok(())
 }
@@ -199,7 +201,7 @@ fn owned_reclamation_high_fanout_partial_spend_then_small_live_set_churn()
     let mut preload = BlockChanges::default();
     for vout in 0_u32..500 {
         preload.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
+            OutPoint::new(live_txid.into(), vout),
             txout(u64::from(vout) + 5000),
             false,
             100,
@@ -212,13 +214,13 @@ fn owned_reclamation_high_fanout_partial_spend_then_small_live_set_churn()
     // 2. High-fanout partial spend: spend 490 outputs, leaving 10 live outputs
     let mut partial_spend = BlockChanges::default();
     for vout in 0_u32..490 {
-        partial_spend.remove(OutPoint::new(live_txid, vout));
+        partial_spend.remove(OutPoint::new(live_txid.into(), vout));
     }
     set.commit_block(&partial_spend, &txid(5002))?;
     assert_eq!(set.len(), 10);
     assert_eq!(set.record_count(), 1);
     for vout in 490_u32..500 {
-        assert!(set.get(&OutPoint::new(live_txid, vout)).is_some());
+        assert!(set.get(&OutPoint::new(live_txid.into(), vout)).is_some());
     }
 
     // 3. Small-live-set churn on remaining outputs across 20 iterations
@@ -227,7 +229,7 @@ fn owned_reclamation_high_fanout_partial_spend_then_small_live_set_churn()
         // Replace one remaining output with updated height/txout
         let target_vout = 490 + u32::try_from(i % 10)?;
         churn.add(UtxoAdd::new(
-            OutPoint::new(live_txid, target_vout),
+            OutPoint::new(live_txid.into(), target_vout),
             txout(6000 + i),
             i % 2 == 0,
             u32::try_from(105 + i)?,
@@ -251,7 +253,7 @@ fn owned_reclamation_full_record_reclamation_after_multi_tx_sweep()
         let current_txid = txid(6000 + t);
         for vout in 0_u32..64 {
             preload.add(UtxoAdd::new(
-                OutPoint::new(current_txid, vout),
+                OutPoint::new(current_txid.into(), vout),
                 txout(u64::from(vout) + t * 100),
                 false,
                 200,
@@ -267,7 +269,7 @@ fn owned_reclamation_full_record_reclamation_after_multi_tx_sweep()
     for t in 0_u64..10 {
         let current_txid = txid(6000 + t);
         for vout in 0_u32..64 {
-            sweep.remove(OutPoint::new(current_txid, vout));
+            sweep.remove(OutPoint::new(current_txid.into(), vout));
         }
     }
     set.commit_block(&sweep, &txid(7001))?;
@@ -284,7 +286,7 @@ fn owned_reclamation_full_record_reclamation_after_multi_tx_sweep()
     let mut readd = BlockChanges::default();
     for t in 0_u64..5 {
         readd.add(UtxoAdd::new(
-            OutPoint::new(txid(8000 + t), 0),
+            OutPoint::new(txid(8000 + t).into(), 0),
             txout(8000 + t),
             true,
             300,

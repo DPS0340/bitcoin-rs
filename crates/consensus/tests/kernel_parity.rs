@@ -4,7 +4,7 @@
 #[test]
 #[ignore = "kernel parity requires libboost-dev and the kernel CI job"]
 fn kernel_context_builds_for_mainnet() {
-    bitcoin_rs_consensus::kernel::KernelContext::new(bitcoin::Network::Bitcoin)
+    bitcoin_rs_consensus::kernel::KernelContext::new(bitcoin_rs_primitives::Network::Mainnet)
         .unwrap_or_else(|error| panic!("kernel context should build: {error}"));
 }
 

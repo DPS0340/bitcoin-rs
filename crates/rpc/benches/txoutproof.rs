@@ -32,18 +32,22 @@
 // a win. Panicking is the correct outcome, so `expect` is deliberate here.
 #![allow(clippy::expect_used)]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::{
-    Amount, Block, CompactTarget, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
-    Txid, Witness, absolute, block, transaction,
+    Amount, Block as BitcoinBlock, CompactTarget, ScriptBuf, Sequence,
+    Transaction as BitcoinTransaction, TxIn as BitcoinTxIn, TxMerkleNode, TxOut as BitcoinTxOut,
+    Txid as BitcoinTxid, Witness, absolute, block, transaction,
 };
 use bitcoin_rs_index::{BlockSource, Indexer};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{
+    Block as NativeBlock, BlockHash, Hash256, Tx as NativeTx, Txid as NativeTxid,
+    deserialize as native_deserialize,
+};
 use bitcoin_rs_rpc::Handler;
 use bitcoin_rs_rpc::context::{
     BlockBodySource, BlockRecord, Context, TxIndexInfo, TxIndexQuery, TxQueryError,
@@ -72,16 +76,20 @@ struct FlatFileBodySource {
 }
 
 impl BlockBodySource for FlatFileBodySource {
-    fn block_body(&self, height: u32, _hash: Hash256) -> Option<Vec<u8>> {
-        let (position, hash) = self.positions.get(&height)?;
-        self.files.load(*position, height, *hash).ok()?
+    fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+        let (position, stored) = self.positions.get(&height)?;
+        if *stored != *hash.as_bytes() {
+            return None;
+        }
+        self.files.load(*position, height, *stored).ok()?
     }
 }
 
 impl BlockSource for FlatFileBodySource {
-    fn block_at_height(&self, height: u32) -> Option<Block> {
-        let bytes = self.block_body(height, Hash256::from_le_bytes(&[0_u8; 32]))?;
-        bitcoin::consensus::encode::deserialize(&bytes).ok()
+    fn block_at_height(&self, height: u32) -> Option<NativeBlock> {
+        let (position, hash) = self.positions.get(&height)?;
+        let bytes = self.files.load(*position, height, *hash).ok()??;
+        native_deserialize(&bytes).ok()
     }
 }
 
@@ -89,7 +97,7 @@ impl BlockSource for FlatFileBodySource {
 ///
 /// The handler now talks to `TxIndexQuery`, whose production implementor lives
 /// in `bitcoin-rs-node` and cannot be reached from here without a dependency
-/// cycle. This stands in for it over the *same* RocksDB index and the *same*
+/// cycle. This stands in for it over the *same* `RocksDB` index and the *same*
 /// flat block files, so the measured cost is a real row lookup plus a real body
 /// read — not a `HashMap` hit, which would zero out the index's own cost and
 /// inflate the reported win.
@@ -104,11 +112,14 @@ struct FixtureIndexQuery {
 }
 
 impl TxIndexQuery for FixtureIndexQuery {
-    fn transaction(&self, _txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+    fn transaction(&self, _txid: &NativeTxid) -> Result<Option<NativeTx>, TxQueryError> {
         unreachable!("gettxoutproof does not materialize transactions")
     }
 
-    fn outpoint_value(&self, _outpoint: &bitcoin::OutPoint) -> Result<Option<u64>, TxQueryError> {
+    fn outpoint_value(
+        &self,
+        _outpoint: &bitcoin_rs_primitives::OutPoint,
+    ) -> Result<Option<u64>, TxQueryError> {
         unreachable!("gettxoutproof does not resolve prevout values")
     }
 
@@ -119,7 +130,7 @@ impl TxIndexQuery for FixtureIndexQuery {
         })
     }
 
-    fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+    fn transaction_height(&self, txid: &NativeTxid) -> Result<Option<u32>, TxQueryError> {
         self.indexer
             .resolve_tx_with_height(*txid, self.source.as_ref())
             .map(|found| found.map(|(_, height)| height))
@@ -140,19 +151,19 @@ fn empty_header() -> block::Header {
 
 /// A transaction whose txid is a function of its seed, so every fixture
 /// transaction is distinct and the index has real work to disambiguate.
-fn filler_tx(seed: u64) -> Transaction {
+fn filler_tx(seed: u64) -> BitcoinTransaction {
     let mut script = [0_u8; 32];
     script[..8].copy_from_slice(&seed.to_le_bytes());
-    Transaction {
+    BitcoinTransaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+        input: vec![BitcoinTxIn {
             previous_output: bitcoin::OutPoint::null(),
             script_sig: ScriptBuf::from_bytes(seed.to_le_bytes().to_vec()),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
+        output: vec![BitcoinTxOut {
             value: Amount::from_sat(1_000),
             script_pubkey: ScriptBuf::from_bytes(script.to_vec()),
         }],
@@ -169,9 +180,9 @@ struct Fixture {
     /// Context with no `tx_index` at all: the `before` arm.
     scanning: Arc<Context>,
     /// Txid planted in the first fixture block — the scan's best case.
-    first_txid: Txid,
+    first_txid: BitcoinTxid,
     /// Txid planted in the last fixture block — the scan's worst case.
-    last_txid: Txid,
+    last_txid: BitcoinTxid,
 }
 
 fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
@@ -197,7 +208,7 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
             })
             .collect::<Vec<_>>();
 
-        let mut block = Block {
+        let mut block = BitcoinBlock {
             header: empty_header(),
             txdata,
         };
@@ -208,7 +219,7 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
         let planted = block
             .txdata
             .first()
-            .map(Transaction::compute_txid)
+            .map(BitcoinTransaction::compute_txid)
             .expect("fixture block has transactions");
         if index == 0 {
             first_txid = Some(planted);
@@ -226,7 +237,7 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
         positions.insert(height, (position, hash));
         records.push(BlockRecord::synthetic(
             height,
-            Hash256::from_le_bytes(&hash),
+            BlockHash(Hash256::from_le_bytes(&hash)),
         ));
     }
 
@@ -278,7 +289,7 @@ fn build_fixture(fixture_blocks: u32, txs_per_block: usize) -> Fixture {
     }
 }
 
-fn dispatch_proof(ctx: &Arc<Context>, txid: Txid) -> sonic_rs::Value {
+fn dispatch_proof(ctx: &Arc<Context>, txid: BitcoinTxid) -> sonic_rs::Value {
     Handler::new(Arc::clone(ctx))
         .dispatch("gettxoutproof", &json!([[txid.to_string()]]))
         .expect("gettxoutproof failed")

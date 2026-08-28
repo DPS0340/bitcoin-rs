@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bitcoin::Transaction;
+use bitcoin_rs_primitives::Tx;
 use hashbrown::HashSet;
 use thiserror::Error;
 
@@ -13,7 +13,7 @@ use crate::{EntryId, Mempool, MempoolEntry, MempoolError};
 #[derive(Clone, Debug)]
 pub struct ReplacementCandidate {
     /// Replacement transaction.
-    pub tx: Arc<Transaction>,
+    pub tx: Arc<Tx>,
     /// Replacement virtual size in vbytes.
     pub vsize: u32,
     /// Replacement fee in satoshis.
@@ -25,7 +25,7 @@ pub struct ReplacementCandidate {
 impl ReplacementCandidate {
     /// Builds a replacement candidate.
     #[must_use]
-    pub const fn new(tx: Arc<Transaction>, vsize: u32, fee: u64, min_relay_fee_rate: u64) -> Self {
+    pub const fn new(tx: Arc<Tx>, vsize: u32, fee: u64, min_relay_fee_rate: u64) -> Self {
         Self {
             tx,
             vsize,
@@ -100,12 +100,12 @@ impl Mempool {
             .flat_map(|entry| {
                 entry
                     .tx
-                    .input
+                    .inputs
                     .iter()
                     .map(|input| input.previous_output.txid)
             })
             .collect::<HashSet<_>>();
-        for input in &candidate.tx.input {
+        for input in &candidate.tx.inputs {
             if self.is_unconfirmed_outpoint(input.previous_output)
                 && !original_parent_txids.contains(&input.previous_output.txid)
             {

@@ -23,7 +23,6 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::print_stdout)]
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoMemoryReport, UtxoSet};
 
@@ -52,7 +51,7 @@ fn fill_bytes(seed: u64, out: &mut [u8]) {
 ///
 /// The exact mix matters less than the sizes: the encoding stores the script
 /// verbatim, so bytes per output track these lengths directly.
-fn script_for(index: u64) -> ScriptBuf {
+fn script_for(index: u64) -> Vec<u8> {
     let mut program = [0_u8; 32];
     fill_bytes(index, &mut program);
     match index % 10 {
@@ -60,27 +59,27 @@ fn script_for(index: u64) -> ScriptBuf {
         0..=3 => {
             let mut bytes = vec![0x00, 0x14];
             bytes.extend_from_slice(&program[..20]);
-            ScriptBuf::from_bytes(bytes)
+            bytes
         }
         // P2PKH, 25 bytes.
         4..=6 => {
             let mut bytes = vec![0x76, 0xa9, 0x14];
             bytes.extend_from_slice(&program[..20]);
             bytes.extend_from_slice(&[0x88, 0xac]);
-            ScriptBuf::from_bytes(bytes)
+            bytes
         }
         // P2SH, 23 bytes.
         7 => {
             let mut bytes = vec![0xa9, 0x14];
             bytes.extend_from_slice(&program[..20]);
             bytes.push(0x87);
-            ScriptBuf::from_bytes(bytes)
+            bytes
         }
         // P2TR, 34 bytes.
         _ => {
             let mut bytes = vec![0x51, 0x20];
             bytes.extend_from_slice(&program);
-            ScriptBuf::from_bytes(bytes)
+            bytes
         }
     }
 }
@@ -222,9 +221,9 @@ fn main() {
             let txid = Hash256::from_le_bytes(&txid_bytes);
             for vout in 0..outputs_for(index, mean_x100) {
                 changes.add(UtxoAdd {
-                    outpoint: OutPoint::new(txid, vout),
+                    outpoint: OutPoint::new(txid.into(), vout),
                     txout: TxOut {
-                        value: Amount::from_sat(1_000 + index % 100_000),
+                        value: 1_000 + index % 100_000,
                         script_pubkey: script_for(index.wrapping_add(u64::from(vout))),
                     },
                     coinbase: index.is_multiple_of(1_000),
@@ -253,7 +252,7 @@ fn main() {
                 fill_bytes(spent_from, &mut old_bytes);
                 let old_txid = Hash256::from_le_bytes(&old_bytes);
                 for vout in 0..outputs_for(spent_from, mean_x100) {
-                    changes.remove(OutPoint::new(old_txid, vout));
+                    changes.remove(OutPoint::new(old_txid.into(), vout));
                 }
                 spent_from += 1;
 
@@ -262,9 +261,9 @@ fn main() {
                 let new_txid = Hash256::from_le_bytes(&new_bytes);
                 for vout in 0..outputs_for(index, mean_x100) {
                     changes.add(UtxoAdd {
-                        outpoint: OutPoint::new(new_txid, vout),
+                        outpoint: OutPoint::new(new_txid.into(), vout),
                         txout: TxOut {
-                            value: Amount::from_sat(1_000 + index % 100_000),
+                            value: 1_000 + index % 100_000,
                             script_pubkey: script_for(index.wrapping_add(u64::from(vout))),
                         },
                         coinbase: false,

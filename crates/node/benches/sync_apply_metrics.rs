@@ -8,15 +8,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bitcoin::absolute;
-use bitcoin::block::Header;
-use bitcoin::hashes::Hash as _;
-use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::script::Builder;
-use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, transaction,
-};
 use bitcoin_rs_chain::{BlockTree, NodeStatus};
 use bitcoin_rs_node::{
     Config, Network,
@@ -24,7 +15,9 @@ use bitcoin_rs_node::{
     state::NodeState,
 };
 use bitcoin_rs_p2p::{Message, PeerInfo};
-use bitcoin_rs_primitives::{Hash256, OutPoint as PrimitiveOutPoint};
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid};
+use bitcoin_rs_script::script::push_int;
 use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
 use crossbeam_channel::unbounded;
@@ -396,7 +389,7 @@ impl StagedSyncApplyFixture {
             .try_recv()
             .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
         {
-            NetworkMessage::GetData(inventory) => inventory.len(),
+            Message::GetData(inventory) => inventory.len(),
             other => panic!("expected production getdata, got {other:?}"),
         };
         assert_eq!(getdata_count, self.blocks.len());
@@ -514,7 +507,7 @@ fn proxy_blocks(count: u32) -> Vec<Block> {
     let mut blocks = Vec::with_capacity(
         usize::try_from(count).unwrap_or_else(|error| panic!("invalid proxy count: {error}")),
     );
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let genesis = Network::Regtest.genesis_block();
     blocks.push(genesis.clone());
     let mut parent = genesis;
     for height in 1..count {
@@ -526,7 +519,7 @@ fn proxy_blocks(count: u32) -> Vec<Block> {
 }
 
 fn populate_sync_header_chain(tree: &mut BlockTree, body_blocks: u32) -> Vec<Block> {
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let genesis = Network::Regtest.genesis_block();
     let genesis_id = tree
         .insert_node(None, genesis.header, NodeStatus::HeaderValid)
         .unwrap_or_else(|error| panic!("regtest genesis header insert failed: {error}"));
@@ -549,7 +542,7 @@ fn populate_sync_header_chain(tree: &mut BlockTree, body_blocks: u32) -> Vec<Blo
         } else {
             header_time = header_time.saturating_add(1);
             let header = child_header(prev_hash, header_time);
-            prev_hash = header.block_hash();
+            prev_hash = header.compute_hash();
             header
         };
         tip_id = tree
@@ -563,7 +556,7 @@ fn fanout_proxy_blocks(count: u32) -> Vec<Block> {
     let mut blocks = Vec::with_capacity(
         usize::try_from(count).unwrap_or_else(|error| panic!("invalid fanout count: {error}")),
     );
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let genesis = Network::Regtest.genesis_block();
     blocks.push(genesis.clone());
     let mut parent = genesis;
     for height in 1..count {
@@ -576,11 +569,11 @@ fn fanout_proxy_blocks(count: u32) -> Vec<Block> {
 
 fn child_header(prev_blockhash: BlockHash, time: u32) -> Header {
     Header {
-        version: bitcoin::block::Version::ONE,
+        version: 1,
         prev_blockhash,
-        merkle_root: TxMerkleNode::all_zeros(),
+        merkle_root: Hash256::default(),
         time,
-        bits: CompactTarget::from_consensus(0x207f_ffff),
+        bits: 0x207f_ffff,
         nonce: 0,
     }
 }
@@ -612,12 +605,12 @@ fn synthetic_peer(addr: SocketAddr) -> PeerInfo {
 
 fn fanout_utxo_changes(height: u32) -> BlockChanges {
     let transaction = fanout_coinbase_transaction(height);
-    let txid = transaction.compute_txid();
+    let txid = transaction.txid();
     let mut changes = BlockChanges::default();
-    for (vout, txout) in transaction.output.iter().enumerate() {
+    for (vout, txout) in transaction.outputs.iter().enumerate() {
         let vout = u32::try_from(vout).unwrap_or_else(|error| panic!("invalid vout: {error}"));
         changes.add(UtxoAdd::new(
-            PrimitiveOutPoint::new(Hash256::from_le_bytes(&txid.to_byte_array()), vout),
+            OutPoint::new(txid, vout),
             txout.clone(),
             true,
             height,
@@ -628,19 +621,19 @@ fn fanout_utxo_changes(height: u32) -> BlockChanges {
 
 fn block_utxo_changes(block: &Block, height: u32) -> BlockChanges {
     let mut changes = BlockChanges::default();
-    for transaction in &block.txdata {
-        let coinbase = transaction.is_coinbase();
+    for transaction in &block.txs {
+        let coinbase = transaction.inputs.len() == 1
+            && transaction.inputs[0].previous_output == OutPoint::new(Txid::default(), u32::MAX);
         if !coinbase {
-            for input in &transaction.input {
-                changes.remove(primitive_outpoint(input.previous_output));
+            for input in &transaction.inputs {
+                changes.remove(input.previous_output);
             }
         }
-        let txid = transaction.compute_txid();
-        let txid = Hash256::from_le_bytes(&txid.to_byte_array());
-        for (vout, txout) in transaction.output.iter().enumerate() {
+        let txid = transaction.txid();
+        for (vout, txout) in transaction.outputs.iter().enumerate() {
             let vout = u32::try_from(vout).unwrap_or_else(|error| panic!("invalid vout: {error}"));
             changes.add(UtxoAdd::new(
-                PrimitiveOutPoint::new(txid, vout),
+                OutPoint::new(txid, vout),
                 txout.clone(),
                 coinbase,
                 height,
@@ -648,13 +641,6 @@ fn block_utxo_changes(block: &Block, height: u32) -> BlockChanges {
         }
     }
     changes
-}
-
-fn primitive_outpoint(outpoint: OutPoint) -> PrimitiveOutPoint {
-    PrimitiveOutPoint::new(
-        Hash256::from_le_bytes(&outpoint.txid.to_byte_array()),
-        outpoint.vout,
-    )
 }
 
 fn height_hash(height: u32) -> Hash256 {
@@ -671,7 +657,7 @@ fn spend_heavy_proxy_blocks() -> Vec<Block> {
         .saturating_sub(1);
     let capacity = usize::try_from(spend_end_height.saturating_add(1))
         .unwrap_or_else(|error| panic!("invalid spend proxy capacity: {error}"));
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let genesis = Network::Regtest.genesis_block();
     let mut blocks = Vec::with_capacity(capacity);
     blocks.push(genesis.clone());
     let mut parent = genesis;
@@ -693,18 +679,16 @@ fn spend_heavy_proxy_blocks() -> Vec<Block> {
 fn child_coinbase_block(parent: &Block, height: u32) -> Block {
     let mut block = Block {
         header: Header {
-            version: bitcoin::block::Version::ONE,
+            version: 1,
             prev_blockhash: parent.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: parent.header.time.saturating_add(1),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         },
-        txdata: vec![coinbase_transaction(height)],
+        txs: vec![coinbase_transaction(height)],
     };
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .unwrap_or_else(|| panic!("proxy block should have merkle root"));
+    block.header.merkle_root = block_merkle_root(&block);
     mine_block_to_declared_target(&mut block);
     block
 }
@@ -712,124 +696,176 @@ fn child_coinbase_block(parent: &Block, height: u32) -> Block {
 fn child_fanout_coinbase_block(parent: &Block, height: u32) -> Block {
     let mut block = Block {
         header: Header {
-            version: bitcoin::block::Version::ONE,
+            version: 1,
             prev_blockhash: parent.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: parent.header.time.saturating_add(1),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         },
-        txdata: vec![fanout_coinbase_transaction(height)],
+        txs: vec![fanout_coinbase_transaction(height)],
     };
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .unwrap_or_else(|| panic!("fanout proxy block should have merkle root"));
+    block.header.merkle_root = block_merkle_root(&block);
     mine_block_to_declared_target(&mut block);
     block
 }
 
 fn child_spend_fanout_block(parent: &Block, height: u32, source_block: &Block) -> Block {
     let source_coinbase = source_block
-        .txdata
+        .txs
         .first()
         .unwrap_or_else(|| panic!("spend-heavy source block missing coinbase"));
-    let source_txid = source_coinbase.compute_txid();
-    let mut txdata = Vec::with_capacity(
+    let source_txid = source_coinbase.txid();
+    let mut txs = Vec::with_capacity(
         usize::try_from(SPEND_PROXY_FANOUT.saturating_add(1))
             .unwrap_or_else(|error| panic!("invalid spend proxy fanout: {error}")),
     );
-    txdata.push(fanout_coinbase_transaction(height));
+    txs.push(fanout_coinbase_transaction(height));
     for vout in 0..SPEND_PROXY_FANOUT {
-        txdata.push(spend_proxy_transaction(source_txid, vout));
+        txs.push(spend_proxy_transaction(source_txid, vout));
     }
     let mut block = Block {
         header: Header {
-            version: bitcoin::block::Version::ONE,
+            version: 1,
             prev_blockhash: parent.block_hash(),
-            merkle_root: TxMerkleNode::all_zeros(),
+            merkle_root: Hash256::default(),
             time: parent.header.time.saturating_add(1),
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         },
-        txdata,
+        txs,
     };
-    block.header.merkle_root = block
-        .compute_merkle_root()
-        .unwrap_or_else(|| panic!("spend-heavy proxy block should have merkle root"));
+    block.header.merkle_root = block_merkle_root(&block);
     mine_block_to_declared_target(&mut block);
     block
 }
 
-fn coinbase_transaction(height: u32) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
+fn coinbase_transaction(height: u32) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
             script_sig: coinbase_script_sig(height),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_0000_0000),
-            script_pubkey: ScriptBuf::new(),
+        outputs: vec![TxOut {
+            value: 50_0000_0000,
+            script_pubkey: Vec::new(),
         }],
     }
 }
 
-fn fanout_coinbase_transaction(height: u32) -> Transaction {
+fn fanout_coinbase_transaction(height: u32) -> Tx {
     let outputs = (0..SPEND_PROXY_FANOUT)
         .map(|_| TxOut {
-            value: Amount::from_sat(SPEND_PROXY_COINBASE_OUTPUT_VALUE),
-            script_pubkey: Builder::new().push_int(1).into_script(),
+            value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+            script_pubkey: push_int(1),
         })
         .collect();
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
             script_sig: coinbase_script_sig(height),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: outputs,
+        outputs,
     }
 }
 
-fn spend_proxy_transaction(prev_txid: Txid, vout: u32) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: prev_txid,
-                vout,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+fn spend_proxy_transaction(prev_txid: Txid, vout: u32) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(prev_txid, vout),
+            script_sig: Vec::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
-            script_pubkey: Builder::new().push_int(1).into_script(),
+        outputs: vec![TxOut {
+            value: SPEND_PROXY_SPEND_OUTPUT_VALUE,
+            script_pubkey: push_int(1),
         }],
     }
 }
 
-fn coinbase_script_sig(height: u32) -> ScriptBuf {
+fn coinbase_script_sig(height: u32) -> Vec<u8> {
     let mut script = Vec::with_capacity(5);
     script.push(4);
     script.extend_from_slice(&height.to_le_bytes());
-    ScriptBuf::from_bytes(script)
+    script
 }
 
 fn mine_block_to_declared_target(block: &mut Block) {
-    while block.header.validate_pow(block.header.target()).is_err() {
+    while !pow_met(block.header.bits, &block.block_hash()) {
         block.header.nonce = block
             .header
             .nonce
             .checked_add(1)
             .unwrap_or_else(|| panic!("exhausted nonce while mining proxy block"));
     }
+}
+
+/// Consensus merkle root over the block's txids: pairwise double-SHA256 with
+/// the last leaf duplicated on odd levels.
+fn block_merkle_root(block: &Block) -> Hash256 {
+    let mut leaves: Vec<[u8; 32]> = block.txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+    while leaves.len() > 1 {
+        let original_len = leaves.len();
+        let mut next = Vec::with_capacity(original_len.div_ceil(2));
+        for pos in 0..original_len.div_ceil(2) {
+            let left = leaves[2 * pos];
+            let right = leaves[(2 * pos + 1).min(original_len - 1)];
+            let mut pair = [0_u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(double_sha256(&pair).to_le_bytes());
+        }
+        leaves = next;
+    }
+    Hash256::from_le_bytes(&leaves[0])
+}
+
+/// Decodes a 256-bit compact target into little-endian bytes. Negative,
+/// overflowed, and zero-mantissa encodings decode to an unreachable zero.
+fn compact_to_target(bits: u32) -> [u8; 32] {
+    let exponent = usize::from(u8::try_from(bits >> 24).unwrap_or(0));
+    let mantissa = u64::from(bits & 0x007f_ffff);
+    let mut target = [0_u8; 32];
+    if mantissa == 0 || bits & 0x0080_0000 != 0 || exponent > 34 {
+        return target;
+    }
+    let mantissa_bytes = mantissa.to_le_bytes();
+    if exponent >= 3 {
+        let offset = exponent - 3;
+        for (index, byte) in mantissa_bytes.iter().enumerate().take(3) {
+            if let Some(slot) = target.get_mut(offset + index) {
+                *slot = *byte;
+            }
+        }
+    } else {
+        let shifted = mantissa >> (8 * (3 - exponent));
+        target[..8].copy_from_slice(&shifted.to_le_bytes());
+    }
+    target
+}
+
+/// Returns true when `hash` is at or below the compact target, comparing the
+/// little-endian byte arrays from the most significant end.
+fn pow_met(bits: u32, hash: &BlockHash) -> bool {
+    let target = compact_to_target(bits);
+    let hash_le = hash.as_bytes();
+    for index in (0..32).rev() {
+        match hash_le[index].cmp(&target[index]) {
+            std::cmp::Ordering::Less => return true,
+            std::cmp::Ordering::Greater => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    true
 }

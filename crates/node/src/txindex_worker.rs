@@ -17,9 +17,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::hashes::Hash as _;
-use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_index::{
     HashPrefixRow, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
@@ -28,6 +25,7 @@ use bitcoin_rs_index::{
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, BlockHash, OutPoint, Tx, Txid, deserialize};
 use bitcoin_rs_rpc::context::{
     BlockBodySource, ScriptHistoryRecord, ScriptIndexQuery, ScriptIndexRecord, ScriptIndexSnapshot,
     SpendingRecord, TxIndexInfo, TxIndexQuery, TxQueryError,
@@ -1362,7 +1360,7 @@ impl TxIndexQueryEngine {
         hash: Hash256,
     ) -> Result<Block, TxQueryError> {
         budget.reserve_body_read(MAX_SERIALIZED_BLOCK_BYTES)?;
-        let bytes = self.resolve_block_body_bytes(height, hash)?;
+        let bytes = self.resolve_block_body_bytes(height, BlockHash::from(hash))?;
         budget.charge_body_bytes(bytes.len())?;
         Self::verify_block(&bytes, height, hash)
     }
@@ -1370,7 +1368,7 @@ impl TxIndexQueryEngine {
     fn resolve_block_body_bytes(
         &self,
         height: u32,
-        hash: Hash256,
+        hash: BlockHash,
     ) -> Result<Vec<u8>, TxQueryError> {
         if let Some(body_source) = self.body_source.as_ref() {
             if let Some(bytes) = body_source.block_body(height, hash) {
@@ -1390,7 +1388,7 @@ impl TxIndexQueryEngine {
         let block = deserialize::<Block>(bytes).map_err(|_| {
             TxQueryError::Storage(format!("corrupt serialized block at height {height}").into())
         })?;
-        let decoded = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let decoded = block.block_hash().0;
         if decoded != hash {
             return Err(TxQueryError::Storage(
                 format!("block identity mismatch at height {height}").into(),
@@ -1424,7 +1422,7 @@ impl TxIndexQueryEngine {
         budget: &mut QueryBudget,
         height: u32,
         position: TxPosition,
-    ) -> Result<Option<Transaction>, TxQueryError> {
+    ) -> Result<Option<Tx>, TxQueryError> {
         let hash = self.resolve_hash_at_height(height, tip)?;
         let Some(body_source) = self.body_source.as_ref() else {
             return Ok(None);
@@ -1432,16 +1430,19 @@ impl TxIndexQueryEngine {
         let byte_len = usize::try_from(position.byte_len())
             .map_err(|_| TxQueryError::Storage("transaction position length overflow".into()))?;
         budget.reserve_body_read(byte_len)?;
-        let Some(bytes) =
-            body_source.block_body_range(height, hash, position.offset(), position.byte_len())
-        else {
+        let Some(bytes) = body_source.block_body_range(
+            height,
+            BlockHash::from(hash),
+            position.offset(),
+            position.byte_len(),
+        ) else {
             return Ok(None);
         };
         budget.charge_body_bytes(bytes.len())?;
         if bytes.len() != byte_len {
             return Ok(None);
         }
-        Ok(deserialize::<Transaction>(&bytes).ok())
+        Ok(deserialize::<Tx>(&bytes).ok())
     }
 
     fn transaction_from_full_block(
@@ -1450,13 +1451,13 @@ impl TxIndexQueryEngine {
         budget: &mut QueryBudget,
         height: u32,
         txid: &Txid,
-    ) -> Result<Option<Transaction>, TxQueryError> {
+    ) -> Result<Option<Tx>, TxQueryError> {
         let hash = self.resolve_hash_at_height(height, tip)?;
         let block = self.resolve_block(budget, height, hash)?;
         Ok(block
-            .txdata
+            .txs
             .into_iter()
-            .find(|transaction| transaction.compute_txid() == *txid))
+            .find(|transaction| transaction.txid() == *txid))
     }
 
     fn transaction_for(
@@ -1465,7 +1466,7 @@ impl TxIndexQueryEngine {
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         txid: &Txid,
-    ) -> Result<Option<Transaction>, TxQueryError> {
+    ) -> Result<Option<Tx>, TxQueryError> {
         Ok(self
             .locate_transaction_for(snapshot, tip, budget, txid)?
             .map(|(_, transaction)| transaction))
@@ -1485,7 +1486,7 @@ impl TxIndexQueryEngine {
         tip: &TipSnapshot,
         budget: &mut QueryBudget,
         txid: &Txid,
-    ) -> Result<Option<(u32, Transaction)>, TxQueryError> {
+    ) -> Result<Option<(u32, Tx)>, TxQueryError> {
         let limit = budget.next_scan_limit()?;
         let scan = snapshot
             .transaction_rows(txid, limit)
@@ -1507,7 +1508,7 @@ impl TxIndexQueryEngine {
             };
             let position = positions[0];
             match self.resolve_positioned_transaction(tip, budget, height, position)? {
-                Some(transaction) if transaction.compute_txid() == *txid => {
+                Some(transaction) if transaction.txid() == *txid => {
                     return Ok(Some((height, transaction)));
                 }
                 _ => {
@@ -1535,7 +1536,7 @@ impl TxIndexQueryEngine {
         };
         let vout = usize::try_from(outpoint.vout)
             .map_err(|_| TxQueryError::Storage("outpoint vout overflow".into()))?;
-        Ok(tx.output.get(vout).map(|o| o.value.to_sat()))
+        Ok(tx.outputs.get(vout).map(|o| o.value))
     }
 
     fn scan_funding_rows(
@@ -1567,20 +1568,20 @@ impl TxIndexQueryEngine {
     }
 
     fn collect_funding_outputs(
-        transaction: &Transaction,
+        transaction: &Tx,
         height: u32,
         scripthash: ScriptHash,
         outputs: &mut Vec<(Txid, u32, u64, u32)>,
     ) -> Result<bool, TxQueryError> {
-        let txid = transaction.compute_txid();
+        let txid = transaction.txid();
         let before = outputs.len();
-        for (vout_idx, output) in transaction.output.iter().enumerate() {
+        for (vout_idx, output) in transaction.outputs.iter().enumerate() {
             if ScriptHash::new(&output.script_pubkey) != scripthash {
                 continue;
             }
             let vout = u32::try_from(vout_idx)
                 .map_err(|_| TxQueryError::Storage("vout overflow".into()))?;
-            outputs.push((txid, vout, output.value.to_sat(), height));
+            outputs.push((txid, vout, output.value, height));
         }
         Ok(outputs.len() != before)
     }
@@ -1599,7 +1600,7 @@ impl TxIndexQueryEngine {
             let Some(positions) = Self::validated_positions(&row.value) else {
                 let hash = self.resolve_hash_at_height(height, tip)?;
                 let block = self.resolve_block(budget, height, hash)?;
-                for transaction in &block.txdata {
+                for transaction in &block.txs {
                     Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
                 }
                 continue;
@@ -1626,7 +1627,7 @@ impl TxIndexQueryEngine {
             outputs.truncate(row_start);
             let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
-            for transaction in &block.txdata {
+            for transaction in &block.txs {
                 Self::collect_funding_outputs(transaction, height, scripthash, &mut outputs)?;
             }
         }
@@ -1650,16 +1651,16 @@ impl TxIndexQueryEngine {
             last_height = Some(height);
             let hash = self.resolve_hash_at_height(height, tip)?;
             let block = self.resolve_block(budget, height, hash)?;
-            for transaction in &block.txdata {
+            for transaction in &block.txs {
                 let Some(vin) = transaction
-                    .input
+                    .inputs
                     .iter()
                     .position(|input| input.previous_output == *outpoint)
                 else {
                     continue;
                 };
                 return Ok(Some(SpendingRecord {
-                    txid: transaction.compute_txid(),
+                    txid: transaction.txid(),
                     height,
                     vin: u32::try_from(vin)
                         .map_err(|_| TxQueryError::Storage("vin overflow".into()))?,
@@ -1811,7 +1812,7 @@ impl TxIndexQueryEngine {
 }
 
 impl TxIndexQuery for TxIndexQueryEngine {
-    fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+    fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
         self.with_snapshot(IndexCapabilities::TX_LOOKUP, |snapshot, tip, budget| {
             self.transaction_for(snapshot, tip, budget, txid)
         })
@@ -1869,9 +1870,8 @@ impl ScriptIndexQuery for TxIndexQueryEngine {
 mod body_reader_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use bitcoin::Network;
-    use bitcoin::blockdata::constants::genesis_block;
     use bitcoin_rs_chain::NodeStatus;
+    use bitcoin_rs_primitives::{Network, consensus_bytes};
     use bitcoin_rs_storage::StorageError;
 
     use super::*;
@@ -1960,8 +1960,8 @@ mod body_reader_tests {
 
     #[test]
     fn catch_up_uses_one_body_reader_session() -> Result<(), Box<dyn std::error::Error>> {
-        let block = genesis_block(Network::Regtest);
-        let hash = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let block = Network::Regtest.genesis_block();
+        let hash = block.block_hash().0;
         let mut tree = BlockTree::new();
         let tip_id = tree.insert_header(block.header, NodeStatus::HeaderValid)?;
         let node = tree.node(tip_id)?;
@@ -1985,7 +1985,7 @@ mod body_reader_tests {
         let body_store = Arc::new(SessionBodyStore {
             height: tip.height,
             hash,
-            body: bitcoin::consensus::serialize(&block),
+            body: consensus_bytes(&block),
             readers: AtomicUsize::new(0),
             prefetches: AtomicUsize::new(0),
             session_loads: AtomicUsize::new(0),

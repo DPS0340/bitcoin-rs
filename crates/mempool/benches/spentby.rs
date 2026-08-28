@@ -15,35 +15,34 @@
 // PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
 #![allow(missing_docs)]
 // A fixture that fails to build has no meaningful degraded mode here: a pool
-// that silently stayed empty would be timed as a fast return and reported as a
-// win. Panicking is the correct outcome, so `expect` is confined to setup.
+// that silently stayed empty would be timed as a fast return and reported as
+// a win. Panicking is the correct outcome, so `expect` is confined to setup.
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin_rs_mempool::{EntryId, Mempool, MempoolEntry, MempoolLimits};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Transaction {
-    Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: inputs
+fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: inputs
             .iter()
             .map(|previous_output| TxIn {
                 previous_output: *previous_output,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFF,
+                witness: Vec::new(),
             })
             .collect(),
-        output: (0..outputs)
+        outputs: (0..outputs)
             .map(|vout| TxOut {
-                value: Amount::from_sat(10_000 + u64::from(vout) + tag * 1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                value: 10_000 + u64::from(vout) + tag * 1_000,
+                script_pubkey: vec![0x51],
             })
             .collect(),
     }
@@ -61,9 +60,9 @@ fn pool_with(pairs: u64) -> Mempool {
     for pair in 0..pairs {
         let mut seed = [0_u8; 32];
         seed[..8].copy_from_slice(&pair.to_le_bytes());
-        let funding = OutPoint::new(Txid::from_byte_array(seed), 0);
+        let funding = OutPoint::new(Txid(Hash256::from_le_bytes(&seed)), 0);
         let parent = tx_with(&[funding], 2, pair);
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let child = tx_with(&[OutPoint::new(parent_txid, 0)], 1, pair);
         for tx in [parent, child] {
             let entry = MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7);
@@ -79,12 +78,12 @@ fn pool_with(pairs: u64) -> Mempool {
 fn spentby_by_scan(pool: &Mempool) -> Vec<Vec<String>> {
     let mut rendered = Vec::with_capacity(pool.len());
     for (_index, entry) in &pool.entries {
-        let txid = entry.tx.compute_txid();
+        let txid = entry.tx.txid();
         let mut spentby = Vec::new();
         for (_candidate_index, candidate) in &pool.entries {
-            for input in &candidate.tx.input {
+            for input in &candidate.tx.inputs {
                 if input.previous_output.txid == txid {
-                    spentby.push(candidate.tx.compute_txid().to_string());
+                    spentby.push(candidate.tx.txid().to_string());
                     break;
                 }
             }

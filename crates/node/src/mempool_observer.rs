@@ -7,9 +7,8 @@
 
 use std::sync::Arc;
 
-use bitcoin::Txid;
-use bitcoin::hashes::Hash as _;
 use bitcoin_rs_mempool::{MempoolObserver, MutationOutcome, MutationResult, RemovalReason};
+use bitcoin_rs_primitives::Txid;
 
 use crate::zmq_publisher::{SequenceEvent, ZmqPublisher};
 
@@ -44,7 +43,7 @@ impl MempoolObserver for MempoolSequenceObserver {
             let Some(sequence) = result.sequence_of(offset) else {
                 continue;
             };
-            let txid = Txid::from_byte_array(change.txid.to_le_bytes());
+            let txid = Txid(change.txid);
             match change.outcome {
                 MutationOutcome::Accepted => {
                     self.publisher
@@ -67,12 +66,10 @@ impl MempoolObserver for MempoolSequenceObserver {
 mod tests {
     use super::MempoolSequenceObserver;
     use crate::zmq_publisher::{SequenceEvent, ZmqNotifier, ZmqPublisher, sequence_payload};
-    use bitcoin::hashes::Hash as _;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
     use bitcoin_rs_mempool::{
         Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver,
     };
-    use bitcoin_rs_primitives::Hash256;
+    use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
 
@@ -110,29 +107,29 @@ mod tests {
         }
     }
 
-    fn tx(label: u8) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([label; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
+    fn tx(label: u8) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+            outputs: vec![TxOut {
+                value: 1_000,
+                script_pubkey: vec![0x51, label],
             }],
         }
     }
 
-    fn entry(tx: &Transaction) -> MempoolEntry {
+    fn entry(tx: &Tx) -> MempoolEntry {
         MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7)
     }
 
     fn expected_body(txid: &Txid, label: u8, sequence: u64) -> Vec<u8> {
-        let mut body = *txid.as_byte_array();
+        let mut body = *txid.as_bytes();
         body.reverse();
         let mut expected = body.to_vec();
         expected.push(label);
@@ -156,7 +153,7 @@ mod tests {
     fn admission_publishes_one_a_frame_with_core_payload_bytes() {
         let (gateway, publisher) = wired_gateway();
         let admitted = tx(1);
-        let txid = admitted.compute_txid();
+        let txid = admitted.txid();
 
         gateway.insert_entry(entry(&admitted)).expect("in");
 
@@ -170,10 +167,10 @@ mod tests {
     fn explicit_removal_publishes_r_frames_in_commit_order() {
         let (gateway, publisher) = wired_gateway();
         let parent = tx(2);
-        let parent_txid = parent.compute_txid();
+        let parent_txid = parent.txid();
         let mut child = tx(3);
-        child.input[0].previous_output = OutPoint::new(parent_txid, 0);
-        let child_txid = child.compute_txid();
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        let child_txid = child.txid();
         gateway.insert_entry(entry(&parent)).expect("parent in");
         gateway.insert_entry(entry(&child)).expect("child in");
         publisher.sequence_bodies.lock().clear();
@@ -195,7 +192,7 @@ mod tests {
     fn block_inclusion_suppresses_r_frames() {
         let (gateway, publisher) = wired_gateway();
         let mined = tx(4);
-        let mined_txid = mined.compute_txid();
+        let mined_txid = mined.txid();
         gateway.insert_entry(entry(&mined)).expect("in");
         publisher.sequence_bodies.lock().clear();
 
@@ -233,8 +230,8 @@ mod tests {
         assert_eq!(
             *bodies,
             vec![
-                expected_body(&tx(6).compute_txid(), b'A', 2),
-                expected_body(&tx(5).compute_txid(), b'R', 3),
+                expected_body(&tx(6).txid(), b'A', 2),
+                expected_body(&tx(5).txid(), b'R', 3),
             ],
             "accepted commits first, then its policy eviction"
         );

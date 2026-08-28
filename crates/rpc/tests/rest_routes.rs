@@ -6,6 +6,10 @@
 //! than proving the constant against itself, and cover representative
 //! supported formats and error paths.
 
+// A route fixture that fails to resolve is a test failure, and panicking
+// reports it at the call site. `expect` is deliberate.
+#![allow(clippy::expect_used)]
+
 use std::sync::Arc;
 
 use bitcoin_rs_rpc::context::Context;

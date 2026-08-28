@@ -1,8 +1,6 @@
 #[cfg(feature = "kernel")]
 mod enabled {
-    use bitcoin::consensus::encode;
-    use bitcoin::{Network, OutPoint, TxOut};
-    use bitcoin_rs_primitives::Tx;
+    use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxOut, Txid, consensus_bytes};
     use bitcoin_rs_script::VerifyFlags;
 
     use crate::ConsensusError;
@@ -22,14 +20,14 @@ mod enabled {
     /// `spent_outputs`, so a short slice would otherwise leave trailing inputs
     /// silently unverified.
     pub fn verify_tx_scripts(
-        tx: &bitcoin::Transaction,
+        tx: &Tx,
         spent_outputs: &[(OutPoint, TxOut)],
         flags: VerifyFlags,
     ) -> Result<(), ConsensusError> {
-        let tx_bytes = encode::serialize(tx);
+        let tx_bytes = consensus_bytes(tx);
         let kernel_tx = bitcoinkernel::Transaction::new(&tx_bytes)
             .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
-        let prepared = prepare_kernel_tx(kernel_tx, tx.input.len(), spent_outputs)?;
+        let prepared = prepare_kernel_tx(kernel_tx, tx.inputs.len(), spent_outputs)?;
         for (input_index, (_, prevout)) in spent_outputs.iter().enumerate() {
             verify_prepared_input(&prepared, prevout, input_index, flags)?;
         }
@@ -42,7 +40,8 @@ mod enabled {
     /// `CTransaction` hashes itself while deserializing, using the SHA-256
     /// implementation Core selects at runtime (`avx2(8way)` on this host), so
     /// every txid comes out of this parse for free and the per-transaction
-    /// `encode::serialize` + `Transaction::new` round-trip disappears with it.
+    /// serialization + `bitcoinkernel::Transaction::new` round-trip disappears
+    /// with it.
     pub struct KernelBlock {
         block: bitcoinkernel::Block,
     }
@@ -56,10 +55,9 @@ mod enabled {
         }
 
         /// Txids in block order, taken from the hashes the parse already
-        /// computed. Verified byte-identical to `compute_txid` over mainnet
+        /// computed. Verified byte-identical to native `Tx::txid` over mainnet
         /// `0..150_000` (1.7M transactions, zero mismatches).
-        pub fn txids(&self) -> Result<Vec<bitcoin::Txid>, ConsensusError> {
-            use bitcoin::hashes::Hash as _;
+        pub fn txids(&self) -> Result<Vec<Txid>, ConsensusError> {
             use bitcoinkernel::prelude::*;
 
             (0..self.block.transaction_count())
@@ -68,7 +66,7 @@ mod enabled {
                         .block
                         .transaction(index)
                         .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
-                    Ok(bitcoin::Txid::from_byte_array(tx.txid().to_bytes()))
+                    Ok(Txid(Hash256::from_le_bytes(&tx.txid().to_bytes())))
                 })
                 .collect()
         }
@@ -132,9 +130,9 @@ mod enabled {
         input_index: usize,
         flags: VerifyFlags,
     ) -> Result<(), ConsensusError> {
-        let script = bitcoinkernel::ScriptPubkey::new(prevout.script_pubkey.as_bytes())
+        let script = bitcoinkernel::ScriptPubkey::new(&prevout.script_pubkey)
             .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
-        let amount = i64::try_from(prevout.value.to_sat())
+        let amount = i64::try_from(prevout.value)
             .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
         bitcoinkernel::verify(
             &script,
@@ -160,8 +158,8 @@ mod enabled {
         /// Creates a kernel context for a network.
         pub fn new(network: Network) -> Result<Self, ConsensusError> {
             let chain_type = match network {
-                Network::Bitcoin => bitcoinkernel::ChainType::Mainnet,
-                Network::Testnet => bitcoinkernel::ChainType::Testnet,
+                Network::Mainnet => bitcoinkernel::ChainType::Mainnet,
+                Network::Testnet3 => bitcoinkernel::ChainType::Testnet,
                 Network::Testnet4 => bitcoinkernel::ChainType::Testnet4,
                 Network::Signet => bitcoinkernel::ChainType::Signet,
                 Network::Regtest => bitcoinkernel::ChainType::Regtest,
@@ -183,7 +181,7 @@ mod enabled {
         ) -> Result<(), ConsensusError> {
             let _ = &self.ctx;
             let spent = collect_spent_outputs(tx, prevouts)?;
-            verify_tx_scripts(&tx.0, &spent, flags)
+            verify_tx_scripts(tx, &spent, flags)
         }
     }
 
@@ -191,7 +189,7 @@ mod enabled {
         tx: &Tx,
         prevouts: &impl UtxoView,
     ) -> Result<Vec<(OutPoint, TxOut)>, ConsensusError> {
-        tx.0.input
+        tx.inputs
             .iter()
             .enumerate()
             .map(|(input_index, input)| {
@@ -204,9 +202,9 @@ mod enabled {
     }
 
     fn kernel_txout(prevout: &TxOut) -> Result<bitcoinkernel::TxOut, ConsensusError> {
-        let script = bitcoinkernel::ScriptPubkey::new(prevout.script_pubkey.as_bytes())
+        let script = bitcoinkernel::ScriptPubkey::new(&prevout.script_pubkey)
             .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
-        let amount = i64::try_from(prevout.value.to_sat())
+        let amount = i64::try_from(prevout.value)
             .map_err(|error| ConsensusError::Kernel(error.to_string()))?;
         Ok(bitcoinkernel::TxOut::new(&script, amount))
     }
@@ -226,11 +224,12 @@ pub struct KernelContext;
 /// Portable-build stand-in for the kernel's one-shot block parse.
 ///
 /// The kernel build gets every txid out of `libbitcoinkernel`'s parse for free.
-/// Without the kernel there is no such parse, so this decodes with rust-bitcoin
-/// and hashes each transaction. That is slower than the kernel path by design:
-/// the portable backend exists for differential testing, not for throughput.
+/// Without the kernel there is no such parse, so this decodes with the native
+/// primitives and hashes each transaction. That is slower than the kernel path
+/// by design: the portable backend exists for differential testing, not for
+/// throughput.
 pub struct KernelBlock {
-    txids: Vec<bitcoin::Txid>,
+    txids: Vec<bitcoin_rs_primitives::Txid>,
 }
 
 #[cfg(not(feature = "kernel"))]
@@ -240,13 +239,13 @@ impl KernelBlock {
     /// # Errors
     /// Returns [`ConsensusError::Kernel`] if `raw_block` is not a valid block.
     pub fn parse(raw_block: &[u8]) -> Result<Self, crate::ConsensusError> {
-        let block: bitcoin::Block = bitcoin::consensus::deserialize(raw_block)
+        let block = bitcoin_rs_primitives::Block::consensus_decode(raw_block)
             .map_err(|error| crate::ConsensusError::Kernel(error.to_string()))?;
         Ok(Self {
             txids: block
-                .txdata
+                .txs
                 .iter()
-                .map(bitcoin::Transaction::compute_txid)
+                .map(bitcoin_rs_primitives::Tx::txid)
                 .collect(),
         })
     }
@@ -255,7 +254,7 @@ impl KernelBlock {
     ///
     /// # Errors
     /// Never fails in this build; the signature matches the kernel one.
-    pub fn txids(&self) -> Result<Vec<bitcoin::Txid>, crate::ConsensusError> {
+    pub fn txids(&self) -> Result<Vec<bitcoin_rs_primitives::Txid>, crate::ConsensusError> {
         Ok(self.txids.clone())
     }
 

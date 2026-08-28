@@ -26,6 +26,8 @@ pub mod manifest;
 pub mod render;
 /// Bitcoin Core-compatible REST endpoints.
 pub mod rest;
+/// Byte-level script helpers mirrored from `bitcoin-rs-script` (see module docs).
+pub mod script_util;
 /// Synchronous HTTP/1.1 JSON-RPC server.
 pub mod server;
 /// Transaction, block, and header rendering.

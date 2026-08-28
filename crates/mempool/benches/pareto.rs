@@ -23,12 +23,8 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    transaction,
-};
 use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits, ParetoFront, SortedParetoFront};
+use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 /// Index fill sizes. The largest is far below a Core-default mempool (~10^5
@@ -50,23 +46,23 @@ fn spread_fee(seed: u64) -> u64 {
     (seed.wrapping_mul(2_654_435_761) % 100_000).saturating_add(1)
 }
 
-fn distinct_tx(seed: u64) -> Transaction {
+fn distinct_tx(seed: u64) -> Tx {
     let mut previous = [0_u8; 32];
     previous[..8].copy_from_slice(&seed.to_le_bytes());
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             // Distinct prevouts: entries that conflict would be rejected rather
             // than accepted, and the fill would measure the rejection path.
-            previous_output: OutPoint::new(Txid::from_byte_array(previous), 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&previous)), 0),
+            script_sig: Vec::new(),
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(10_000),
-            script_pubkey: ScriptBuf::from_bytes(seed.to_le_bytes().to_vec()),
+        outputs: vec![TxOut {
+            value: 10_000,
+            script_pubkey: seed.to_le_bytes().to_vec(),
         }],
     }
 }

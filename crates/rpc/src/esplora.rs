@@ -18,14 +18,16 @@ use alloc::sync::Arc;
 
 use core::str::FromStr as _;
 
-use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::{Hash as _, sha256d};
+// WHY rust-bitcoin: `/tx/:id/merkleblock-proof` returns the serialized
+// rust-bitcoin `MerkleBlock`; no native merkle-proof builder exists in-tree
+// (sanctioned compat seam).
+use bitcoin::consensus::encode::serialize;
+use bitcoin::hashes::Hash as _;
 use bitcoin::hex::{DisplayHex as _, FromHex as _};
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Block, OutPoint, Transaction, Txid};
 use bitcoin_rs_index::ScriptHash;
-#[cfg(test)]
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::encode::double_sha256;
+use bitcoin_rs_primitives::{Block, Hash256, OutPoint, Tx, Txid, consensus_bytes, deserialize};
 use serde_json::json;
 use sonic_rs::{JsonValueTrait as _, json as sonic_json};
 
@@ -200,9 +202,10 @@ fn tx(ctx: &Context, id: &str) -> Response {
     )
 }
 fn tx_hex(ctx: &Context, id: &str) -> Response {
-    Projection::new(ctx)
-        .required_transaction(id)
-        .map_or_else(|r| r, |(tx, _)| text(serialize(&tx).to_lower_hex_string()))
+    Projection::new(ctx).required_transaction(id).map_or_else(
+        |r| r,
+        |(tx, _)| text(consensus_bytes(&tx).to_lower_hex_string()),
+    )
 }
 fn tx_raw(ctx: &Context, id: &str) -> Response {
     Projection::new(ctx).required_transaction(id).map_or_else(
@@ -211,7 +214,7 @@ fn tx_raw(ctx: &Context, id: &str) -> Response {
             status: 200,
             reason: "OK",
             content_type: "application/octet-stream",
-            body: serialize(&tx),
+            body: consensus_bytes(&tx),
         },
     )
 }
@@ -225,9 +228,16 @@ fn tx_status(ctx: &Context, id: &str) -> Response {
 fn tx_merkleblock_proof(ctx: &Context, id: &str) -> Response {
     confirmed_block(ctx, id).map_or_else(
         |r| r,
-        |(_, block, txid)| {
-            let proof =
-                MerkleBlock::from_block_with_predicate(&block, |candidate| *candidate == txid);
+        |(record, bytes, txid)| {
+            // MerkleBlock construction requires bitcoin::Block (sanctioned seam).
+            let Ok(block) = bitcoin::consensus::encode::deserialize::<bitcoin::Block>(&bytes)
+            else {
+                return internal("stored block body is corrupt");
+            };
+            let proof = MerkleBlock::from_block_with_predicate(&block, |candidate| {
+                candidate.as_byte_array() == txid.as_bytes()
+            });
+            let _ = record;
             text(serialize(&proof).to_lower_hex_string())
         },
     )
@@ -236,12 +246,11 @@ fn tx_merkleblock_proof(ctx: &Context, id: &str) -> Response {
 fn tx_merkle_proof(ctx: &Context, id: &str) -> Response {
     confirmed_block(ctx, id).map_or_else(
         |r| r,
-        |(record, block, txid)| {
-            let txids = block
-                .txdata
-                .iter()
-                .map(Transaction::compute_txid)
-                .collect::<Vec<_>>();
+        |(record, bytes, txid)| {
+            let Ok(block) = deserialize::<Block>(&bytes) else {
+                return internal("stored block body is corrupt");
+            };
+            let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
             let Some(position) = txids.iter().position(|candidate| *candidate == txid) else {
                 return internal("confirmed transaction is absent from its block");
             };
@@ -258,19 +267,18 @@ fn tx_merkle_proof(ctx: &Context, id: &str) -> Response {
 fn confirmed_block(
     ctx: &Context,
     id: &str,
-) -> Result<(crate::context::BlockRecord, Block, Txid), Response> {
+) -> Result<(crate::context::BlockRecord, Vec<u8>, Txid), Response> {
     let (transaction, Some(status)) = Projection::new(ctx).required_transaction(id)? else {
         return Err(not_found());
     };
-    let txid = transaction.compute_txid();
+    let txid = transaction.txid();
     let record = ctx
         .block_by_height(status.height)
         .ok_or_else(|| unavailable("confirming block unavailable"))?;
     let bytes = ctx
         .block_body_bytes(&record)
         .ok_or_else(|| unavailable("confirming block body unavailable"))?;
-    let block = deserialize(&bytes).map_err(|_| internal("stored block body is corrupt"))?;
-    Ok((record, block, txid))
+    Ok((record, bytes, txid))
 }
 
 fn merkle_proof(mut level: Vec<Txid>, mut position: usize) -> Vec<String> {
@@ -286,9 +294,9 @@ fn merkle_proof(mut level: Vec<Txid>, mut position: usize) -> Vec<String> {
         for pair in level.chunks(2) {
             let right = pair.get(1).unwrap_or(&pair[0]);
             let mut bytes = [0_u8; 64];
-            bytes[..32].copy_from_slice(&pair[0].to_byte_array());
-            bytes[32..].copy_from_slice(&right.to_byte_array());
-            next.push(Txid::from_raw_hash(sha256d::Hash::hash(&bytes)));
+            bytes[..32].copy_from_slice(pair[0].as_bytes());
+            bytes[32..].copy_from_slice(right.as_bytes());
+            next.push(Txid(double_sha256(&bytes)));
         }
         level = next;
         position /= 2;
@@ -305,12 +313,12 @@ fn tx_outspend(ctx: &Context, id: &str, vout: &str) -> Response {
         |r| r,
         |(transaction, _)| {
             let Some(_) = transaction
-                .output
+                .outputs
                 .get(usize::try_from(vout).unwrap_or(usize::MAX))
             else {
                 return not_found();
             };
-            outspend(&projection, OutPoint::new(transaction.compute_txid(), vout))
+            outspend(&projection, OutPoint::new(transaction.txid(), vout))
                 .map_or_else(|r| r, json_response)
         },
     )
@@ -328,15 +336,15 @@ fn tx_outspends(ctx: &Context, id: &str) -> Response {
 
 fn outspends_for_transaction(
     projection: &Projection<'_>,
-    transaction: &Transaction,
+    transaction: &Tx,
 ) -> Result<Vec<Outspend>, Response> {
     transaction
-        .output
+        .outputs
         .iter()
         .enumerate()
         .map(|(vout, _)| {
             let vout = u32::try_from(vout).map_err(|_| internal("output index is too large"))?;
-            outspend(projection, OutPoint::new(transaction.compute_txid(), vout))
+            outspend(projection, OutPoint::new(transaction.txid(), vout))
         })
         .collect()
 }
@@ -400,7 +408,8 @@ fn block_status(ctx: &Context, text_hash: &str) -> Response {
         Ok(record) => record,
         Err(response) => return response,
     };
-    let in_best_chain = ctx.active_hash_at_height(record.height) == Some(record.hash);
+    let in_best_chain =
+        ctx.active_hash_at_height(record.height) == Some(Hash256::from(record.hash));
     json_response(BlockStatus {
         in_best_chain,
         height: record.height,
@@ -430,34 +439,31 @@ fn block_txs(ctx: &Context, h: &str, start: usize) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
-    block_transaction_values(
-        ctx,
-        &record,
-        block.txdata.iter().skip(start).take(CHAIN_PAGE),
-    )
-    .map_or_else(|r| r, json_response)
+    block_transaction_values(ctx, &record, block.txs.iter().skip(start).take(CHAIN_PAGE))
+        .map_or_else(|r| r, json_response)
 }
 
 fn block_transaction_values<'a>(
     ctx: &Context,
     record: &crate::context::BlockRecord,
-    transactions: impl IntoIterator<Item = &'a Transaction>,
+    transactions: impl IntoIterator<Item = &'a Tx>,
 ) -> Result<Vec<TransactionValue>, Response> {
     // A record fetched by hash can be from a losing branch. Do not reuse the
     // active block at the same height for its transactions' confirmation data.
-    let block_status =
-        (ctx.active_hash_at_height(record.height) == Some(record.hash)).then_some(Confirmation {
-            height: record.height,
-            hash: record.hash,
-            time: record.time,
-        });
+    let block_status = (ctx.active_hash_at_height(record.height)
+        == Some(Hash256::from(record.hash)))
+    .then_some(Confirmation {
+        height: record.height,
+        hash: record.hash,
+        time: record.time,
+    });
     let projection = Projection::new(ctx);
     transactions
         .into_iter()
         .map(|tx| {
             let state = match block_status {
                 Some(state) => Some(state),
-                None => projection.confirmation(&tx.compute_txid())?,
+                None => projection.confirmation(&tx.txid())?,
             };
             projection.transaction_value(tx, state)
         })
@@ -470,9 +476,9 @@ fn block_txids(ctx: &Context, h: &str) -> Response {
     };
     json_response(
         block
-            .txdata
+            .txs
             .iter()
-            .map(|tx| tx.compute_txid().to_string())
+            .map(|tx| tx.txid().to_string())
             .collect::<Vec<_>>(),
     )
 }
@@ -485,9 +491,9 @@ fn block_txid(ctx: &Context, h: &str, index: &str) -> Response {
         Err(response) => return response,
     };
     block
-        .txdata
+        .txs
         .get(index)
-        .map_or_else(not_found, |tx| text(tx.compute_txid().to_string()))
+        .map_or_else(not_found, |tx| text(tx.txid().to_string()))
 }
 fn blocks(ctx: &Context, start_height: Option<u32>) -> Response {
     let start = start_height.unwrap_or_else(|| ctx.applied_height());
@@ -513,7 +519,7 @@ fn internal_block_txs(ctx: &Context, hash: &str) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
-    block_transaction_values(ctx, &record, block.txdata.iter()).map_or_else(|r| r, json_response)
+    block_transaction_values(ctx, &record, block.txs.iter()).map_or_else(|r| r, json_response)
 }
 
 fn internal_mempool_txs(ctx: &Context, last: Option<&str>, query: &str) -> Response {
@@ -636,7 +642,7 @@ fn internal_outspend(
         return Ok(Outspend::unspent());
     };
     let Some(_) = transaction
-        .output
+        .outputs
         .get(usize::try_from(vout).unwrap_or(usize::MAX))
     else {
         return Ok(Outspend::unspent());
@@ -686,9 +692,11 @@ fn mempool_recent(ctx: &Context) -> Response {
                 txid: entry.txid.to_string(),
                 fee: entry.fee,
                 vsize: entry.vsize,
-                value: entry.tx.output.iter().fold(0_u64, |sum, output| {
-                    sum.saturating_add(output.value.to_sat())
-                }),
+                value: entry
+                    .tx
+                    .outputs
+                    .iter()
+                    .fold(0_u64, |sum, output| sum.saturating_add(output.value)),
             })
             .collect::<Vec<_>>(),
     )
@@ -801,7 +809,7 @@ fn address_transaction_summary(ctx: &Context, h: ScriptHash) -> Response {
         Ok(activity) => activity,
         Err(response) => return response,
     };
-    let mut funded = std::collections::BTreeMap::<bitcoin::Txid, u64>::new();
+    let mut funded = std::collections::BTreeMap::<Txid, u64>::new();
     for row in &activity.confirmed_funding {
         let total = funded.entry(row.txid).or_default();
         *total = total.saturating_add(row.value);
@@ -898,16 +906,14 @@ fn internal(m: &str) -> Response {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use bitcoin::{
-        Amount, Block, BlockHash, CompactTarget, ScriptBuf, TxIn, TxMerkleNode, TxOut, Witness,
-        absolute, block::Version, hashes::Hash as _, transaction,
-    };
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_mempool::MempoolEntry;
+    use bitcoin_rs_primitives::{BlockHash, Header, TxIn, TxOut};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
     use serde_json::Value;
 
@@ -915,48 +921,100 @@ mod tests {
 
     struct SingleBlockSource {
         height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
+        hash: BlockHash,
         body: Vec<u8>,
     }
 
     impl crate::context::BlockBodySource for SingleBlockSource {
-        fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             (height == self.height && hash == self.hash).then(|| self.body.clone())
         }
     }
 
-    fn transaction(input: Option<OutPoint>, output: TxOut) -> Transaction {
-        Transaction {
-            version: transaction::Version(2),
-            lock_time: absolute::LockTime::ZERO,
-            input: input
+    fn transaction(input: Option<OutPoint>, output: TxOut) -> Tx {
+        Tx {
+            version: 2,
+            inputs: input
                 .into_iter()
                 .map(|previous_output| TxIn {
                     previous_output,
-                    script_sig: ScriptBuf::new(),
-                    sequence: bitcoin::Sequence::MAX,
-                    witness: Witness::new(),
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                    witness: Vec::new(),
                 })
                 .collect(),
-            output: vec![output],
+            outputs: vec![output],
+            lock_time: 0,
         }
     }
 
-    fn transaction_with_funded_input(ctx: &Context) -> Transaction {
-        let script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x11; 20]));
+    /// Core's null outpoint: zero txid, `u32::MAX` vout.
+    fn null_outpoint() -> OutPoint {
+        OutPoint::new(Txid::default(), u32::MAX)
+    }
+
+    /// Folds txids into the block merkle root the consensus encoder builds,
+    /// so fixture blocks carry self-consistent identity.
+    fn fixture_merkle_root(txids: &[Txid]) -> Hash256 {
+        if let [single] = txids {
+            return single.0;
+        }
+        let next = txids
+            .chunks(2)
+            .map(|pair| {
+                let right = pair.get(1).unwrap_or(&pair[0]);
+                let mut bytes = [0_u8; 64];
+                bytes[..32].copy_from_slice(pair[0].as_bytes());
+                bytes[32..].copy_from_slice(right.as_bytes());
+                Txid(double_sha256(&bytes))
+            })
+            .collect::<Vec<_>>();
+        fixture_merkle_root(&next)
+    }
+
+    /// A native one-transaction block standing in for the network genesis the
+    /// fixtures previously pulled from the rust-bitcoin crate.
+    fn fixture_genesis() -> Block {
+        let mut block = Block {
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
+                time: 1_700_000_000,
+                bits: 0x207f_ffff,
+                nonce: 1,
+            },
+            txs: vec![transaction(
+                Some(null_outpoint()),
+                TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: vec![0x51],
+                },
+            )],
+        };
+        block.header.merkle_root = fixture_merkle_root(&block.txids());
+        block
+    }
+
+    fn transaction_with_funded_input(ctx: &Context) -> Tx {
+        // p2wpkh scriptPubKey: OP_0 <20-byte key hash>.
+        let script = vec![
+            0x00, 0x14, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+        ];
         let funding = transaction(
             None,
             TxOut {
-                value: Amount::from_sat(10_000),
+                value: 10_000,
                 script_pubkey: script.clone(),
             },
         );
         let txid = ctx.add_transaction(funding);
         let mut changes = BlockChanges::default();
         changes.add(UtxoAdd::new(
-            bitcoin_rs_primitives::OutPoint::new(Hash256::from_le_bytes(txid.as_byte_array()), 0),
+            OutPoint::new(txid, 0),
             TxOut {
-                value: Amount::from_sat(10_000),
+                value: 10_000,
                 script_pubkey: script.clone(),
             },
             false,
@@ -966,21 +1024,21 @@ mod tests {
             .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
             .expect("fund test UTXO");
         transaction(
-            Some(OutPoint { txid, vout: 0 }),
+            Some(OutPoint::new(txid, 0)),
             TxOut {
-                value: Amount::from_sat(9_000),
+                value: 9_000,
                 script_pubkey: script,
             },
         )
     }
 
     struct StaticTxIndex {
-        transaction: Transaction,
+        transaction: Tx,
         height: Option<u32>,
     }
 
     impl StaticTxIndex {
-        fn new(transaction: Transaction) -> Self {
+        fn new(transaction: Tx) -> Self {
             Self {
                 transaction,
                 height: None,
@@ -989,23 +1047,24 @@ mod tests {
     }
 
     impl crate::context::TxIndexQuery for StaticTxIndex {
-        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
-            Ok((self.transaction.compute_txid() == *txid).then(|| self.transaction.clone()))
+        fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
+            Ok((self.transaction.txid() == *txid).then(|| self.transaction.clone()))
         }
 
         fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
-            Ok((self.transaction.compute_txid() == outpoint.txid)
+            let (out_txid, out_vout) = (outpoint.txid, outpoint.vout);
+            Ok((self.transaction.txid() == out_txid)
                 .then(|| {
                     self.transaction
-                        .output
-                        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+                        .outputs
+                        .get(usize::try_from(out_vout).unwrap_or(usize::MAX))
                 })
                 .flatten()
-                .map(|output| output.value.to_sat()))
+                .map(|output| output.value))
         }
 
         fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
-            Ok((self.transaction.compute_txid() == *txid)
+            Ok((self.transaction.txid() == *txid)
                 .then_some(self.height)
                 .flatten())
         }
@@ -1019,17 +1078,17 @@ mod tests {
     }
 
     struct CountingTxIndex {
-        transactions: Vec<Transaction>,
+        transactions: Vec<Tx>,
         calls: Arc<AtomicUsize>,
     }
 
     impl crate::context::TxIndexQuery for CountingTxIndex {
-        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+        fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .transactions
                 .iter()
-                .find(|transaction| transaction.compute_txid() == *txid)
+                .find(|transaction| transaction.txid() == *txid)
                 .cloned())
         }
 
@@ -1045,35 +1104,36 @@ mod tests {
         }
     }
 
-    struct FixtureTxIndex(Vec<(Transaction, u32)>);
+    struct FixtureTxIndex(Vec<(Tx, u32)>);
 
     impl crate::context::TxIndexQuery for FixtureTxIndex {
-        fn transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TxQueryError> {
+        fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
             Ok(self
                 .0
                 .iter()
-                .find(|(transaction, _)| transaction.compute_txid() == *txid)
+                .find(|(transaction, _)| transaction.txid() == *txid)
                 .map(|(transaction, _)| transaction.clone()))
         }
 
         fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
+            let (out_txid, out_vout) = (outpoint.txid, outpoint.vout);
             Ok(self
                 .0
                 .iter()
-                .find(|(transaction, _)| transaction.compute_txid() == outpoint.txid)
+                .find(|(transaction, _)| transaction.txid() == out_txid)
                 .and_then(|(transaction, _)| {
                     transaction
-                        .output
-                        .get(usize::try_from(outpoint.vout).unwrap_or(usize::MAX))
+                        .outputs
+                        .get(usize::try_from(out_vout).unwrap_or(usize::MAX))
                 })
-                .map(|output| output.value.to_sat()))
+                .map(|output| output.value))
         }
 
         fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
             Ok(self
                 .0
                 .iter()
-                .find(|(transaction, _)| transaction.compute_txid() == *txid)
+                .find(|(transaction, _)| transaction.txid() == *txid)
                 .map(|(_, height)| *height))
         }
 
@@ -1179,46 +1239,54 @@ mod tests {
         }
     }
 
-    fn contract_fixture()
-    -> Result<(Handler, Transaction, Block, String), Box<dyn std::error::Error>> {
-        let target = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([2; 20]));
-        let address =
-            bitcoin::Address::from_script(&target, bitcoin::Network::Regtest)?.to_string();
+    fn contract_fixture() -> Result<(Handler, Tx, Block, String), Box<dyn std::error::Error>> {
+        // p2wpkh scriptPubKey for key hash [2; 20]; the address string rides
+        // the sanctioned rust-bitcoin Address seam.
+        let target = {
+            let mut script = Vec::with_capacity(22);
+            script.push(0x00);
+            script.push(0x14);
+            script.extend_from_slice(&[2; 20]);
+            script
+        };
+        let address = bitcoin::Address::from_script(
+            bitcoin::Script::from_bytes(&target),
+            bitcoin::Network::Regtest,
+        )?
+        .to_string();
         let mut transaction = transaction(
             None,
             TxOut {
-                value: Amount::from_sat(5_000_000_000),
+                value: 5_000_000_000,
                 script_pubkey: target,
             },
         );
-        transaction.input.push(TxIn {
-            previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![1, 1]),
-            sequence: bitcoin::Sequence::MAX,
-            witness: Witness::new(),
+        transaction.inputs.push(TxIn {
+            previous_output: null_outpoint(),
+            script_sig: vec![1, 1],
+            sequence: u32::MAX,
+            witness: Vec::new(),
         });
         let mut block = Block {
-            header: bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: BlockHash::all_zeros(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            header: Header {
+                version: 1,
+                prev_blockhash: BlockHash::default(),
+                merkle_root: Hash256::default(),
                 time: 1_700_000_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 1,
             },
-            txdata: vec![transaction.clone()],
+            txs: vec![transaction.clone()],
         };
-        block.header.merkle_root = block
-            .compute_merkle_root()
-            .ok_or_else(|| std::io::Error::other("fixture merkle root missing"))?;
+        block.header.merkle_root = fixture_merkle_root(&block.txids());
         let record = crate::context::BlockRecord::from_block(0, &block);
-        let txid = transaction.compute_txid();
+        let txid = transaction.txid();
         let mut context = Context::new();
         context.chain_network = bitcoin_rs_primitives::Network::Regtest;
         context.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 0,
             hash: record.hash,
-            body: serialize(&block),
+            body: consensus_bytes(&block),
         }));
         context.add_block(record);
         let tip = {
@@ -1261,13 +1329,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     fn bitcoin_esplora_surface_matches_documented_routes_and_content_types()
     -> Result<(), Box<dyn std::error::Error>> {
         let (handler, transaction, block, address) = contract_fixture()?;
-        let txid = transaction.compute_txid().to_string();
+        let txid = transaction.txid().to_string();
         let block_hash = block.block_hash().to_string();
-        let script_hash = ScriptHash::new(&transaction.output[0].script_pubkey)
+        let script_hash = ScriptHash::new(&transaction.outputs[0].script_pubkey)
             .to_byte_array()
             .to_lower_hex_string();
         let routes = [
@@ -1373,7 +1441,7 @@ mod tests {
         }
 
         let broadcast_transaction = transaction_with_funded_input(handler.context().as_ref());
-        let raw = serialize(&broadcast_transaction).to_lower_hex_string();
+        let raw = consensus_bytes(&broadcast_transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("POST /tx is routed");
         assert_eq!(broadcast.status, 200);
         assert_eq!(broadcast.content_type, "text/plain");
@@ -1399,7 +1467,7 @@ mod tests {
         }
 
         let (handler, transaction, block, address) = contract_fixture()?;
-        let txid = transaction.compute_txid().to_string();
+        let txid = transaction.txid().to_string();
         let block_hash = block.block_hash().to_string();
         let transaction_value: Value =
             serde_json::from_slice(&route(&handler, &format!("/tx/{txid}"), "").body)?;
@@ -1427,7 +1495,7 @@ mod tests {
         );
         assert_eq!(
             transaction_value["vin"][0]["txid"],
-            json!(Txid::all_zeros().to_string())
+            json!(Txid::default().to_string())
         );
         assert_eq!(transaction_value["vin"][0]["vout"], json!(u32::MAX));
         assert!(transaction_value["vin"][0]["prevout"].is_null());
@@ -1554,9 +1622,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn composed_response_retries_when_the_applied_tip_identity_changes() {
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = fixture_genesis();
         let mut context = Context::new();
         context.add_block(crate::context::BlockRecord::from_block(0, &block));
         let tip = {
@@ -1580,16 +1647,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn internal_mempool_routes_return_live_transactions() {
         let transaction = transaction(
             None,
             TxOut {
-                value: Amount::from_sat(125),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                value: 125,
+                script_pubkey: vec![0x51],
             },
         );
-        let txid = transaction.compute_txid();
+        let txid = transaction.txid();
         let ctx = Arc::new(Context::new());
         ctx.mempool
             .write()
@@ -1608,11 +1674,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn mempool_backend_extension_surface_uses_the_same_projections()
     -> Result<(), Box<dyn std::error::Error>> {
         let (handler, transaction, block, address) = contract_fixture()?;
-        let txid = transaction.compute_txid().to_string();
+        let txid = transaction.txid().to_string();
         let ids = serde_json::to_vec(&vec![txid.clone()])?;
         let outpoints = serde_json::to_vec(&vec![format!("{txid}:0")])?;
 
@@ -1648,13 +1713,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn broadcast_transaction_is_immediately_visible_as_unconfirmed() {
         let ctx = Arc::new(Context::new());
         let transaction = transaction_with_funded_input(&ctx);
-        let txid = transaction.compute_txid();
+        let txid = transaction.txid();
         let handler = Handler::new(ctx);
-        let raw = serialize(&transaction).to_lower_hex_string();
+        let raw = consensus_bytes(&transaction).to_lower_hex_string();
         let broadcast = route_post(&handler, "/tx", raw.as_bytes()).expect("broadcast route");
         assert_eq!(broadcast.status, 200);
         let response = route(&handler, &format!("/tx/{txid}"), "");
@@ -1664,15 +1728,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn history_hydrates_only_the_requested_chain_page() {
-        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let target = vec![0x51];
         let transactions = (1_u64..=30)
             .map(|value| {
                 transaction(
                     None,
                     TxOut {
-                        value: Amount::from_sat(value),
+                        value,
                         script_pubkey: target.clone(),
                     },
                 )
@@ -1682,7 +1745,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, transaction)| ScriptHistoryRecord {
-                txid: transaction.compute_txid(),
+                txid: transaction.txid(),
                 height: u32::try_from(index + 1).expect("fixture height fits u32"),
             })
             .collect::<Vec<_>>();
@@ -1691,7 +1754,7 @@ mod tests {
         for record in &records {
             ctx.add_block(crate::context::BlockRecord::synthetic(
                 record.height,
-                Hash256::from_le_bytes(&[0; 32]),
+                BlockHash::default(),
             ));
         }
         ctx.script_index = Some(Arc::new(StaticScriptIndex {
@@ -1712,16 +1775,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn address_statistics_read_no_transactions_beyond_the_script_index() {
-        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let target = vec![0x51];
         let script_hash = ScriptHash::new(&target);
         let transactions = (1_u64..=30)
             .map(|value| {
                 transaction(
                     None,
                     TxOut {
-                        value: Amount::from_sat(value),
+                        value,
                         script_pubkey: target.clone(),
                     },
                 )
@@ -1731,7 +1793,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, transaction)| ScriptHistoryRecord {
-                txid: transaction.compute_txid(),
+                txid: transaction.txid(),
                 height: u32::try_from(index + 1).expect("fixture height fits u32"),
             })
             .collect::<Vec<_>>();
@@ -1739,7 +1801,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, transaction)| ScriptIndexRecord {
-                txid: transaction.compute_txid(),
+                txid: transaction.txid(),
                 height: u32::try_from(index + 1).expect("fixture height fits u32"),
                 value: u64::try_from(index + 1).expect("fixture value fits u64"),
                 vout: 0,
@@ -1750,7 +1812,7 @@ mod tests {
         for record in &history {
             ctx.add_block(crate::context::BlockRecord::synthetic(
                 record.height,
-                Hash256::from_le_bytes(&[0; 32]),
+                BlockHash::default(),
             ));
         }
         ctx.script_index = Some(Arc::new(StaticScriptIndex {
@@ -1787,11 +1849,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn mempool_spender_of_a_confirmed_target_output_remains_in_activity_and_stats() {
-        let target = ScriptBuf::from_bytes(vec![0x51]);
+        let target = vec![0x51];
         let confirmed = ScriptIndexRecord {
-            txid: Txid::from_byte_array([3; 32]),
+            txid: Txid(Hash256::from_le_bytes(&[3; 32])),
             height: 42,
             value: 125,
             vout: 0,
@@ -1799,8 +1860,8 @@ mod tests {
         let spending = transaction(
             Some(OutPoint::new(confirmed.txid, confirmed.vout)),
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+                value: 100,
+                script_pubkey: vec![0x52],
             },
         );
         let mut ctx = Context::new();
@@ -1845,7 +1906,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn utxo_and_outspend_use_their_dedicated_index_queries() {
         let history_calls = Arc::new(AtomicUsize::new(0));
         let unspent_calls = Arc::new(AtomicUsize::new(0));
@@ -1866,7 +1926,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            !outspend(&projection, OutPoint::null())
+            !outspend(&projection, null_outpoint())
                 .expect("outspend query")
                 .spent
         );
@@ -1876,20 +1936,19 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn transaction_projection_uses_internal_lookup_for_prevout_and_fee() {
         let parent = transaction(
             None,
             TxOut {
-                value: Amount::from_sat(125),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                value: 125,
+                script_pubkey: vec![0x51],
             },
         );
         let child = transaction(
-            Some(OutPoint::new(parent.compute_txid(), 0)),
+            Some(OutPoint::new(parent.txid(), 0)),
             TxOut {
-                value: Amount::from_sat(100),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+                value: 100,
+                script_pubkey: vec![0x52],
             },
         );
         let mut ctx = Context::new();
@@ -1910,41 +1969,43 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn stale_block_transactions_do_not_inherit_active_chain_status()
     -> Result<(), Box<dyn std::error::Error>> {
+        // Null-prevout coinbase shape: a zero-input tx cannot be consensus
+        // encoded into a decodable body (the 0x00 vin count reads as the
+        // segwit marker, matching Core), so required_block would reject it.
         let transaction = transaction(
-            None,
+            Some(null_outpoint()),
             TxOut {
-                value: Amount::from_sat(125),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                value: 125,
+                script_pubkey: vec![0x51],
             },
         );
-        let genesis = bitcoin::block::Header {
-            version: Version::ONE,
-            prev_blockhash: BlockHash::all_zeros(),
-            merkle_root: TxMerkleNode::all_zeros(),
+        let genesis = Header {
+            version: 1,
+            prev_blockhash: BlockHash::default(),
+            merkle_root: Hash256::default(),
             time: 1_000,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
+            bits: 0x207f_ffff,
             nonce: 0,
         };
         let stale_block = Block {
-            header: bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            header: Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 2_000,
-                bits: CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 2,
             },
-            txdata: vec![transaction.clone()],
+            txs: vec![transaction.clone()],
         };
         let stale_record = crate::context::BlockRecord::from_block(1, &stale_block);
         let mut ctx = Context::new();
         ctx.block_body_source = Some(Arc::new(SingleBlockSource {
             height: 1,
             hash: stale_record.hash,
-            body: serialize(&stale_block),
+            body: consensus_bytes(&stale_block),
         }));
         ctx.add_block(stale_record.clone());
         {
@@ -1959,12 +2020,12 @@ mod tests {
             // insert and only reorgs on strictly greater chainwork. The stale
             // block had equal work and was inserted first, so it became the
             // active tip. Give the active chain a lower target so it wins.
-            let active = bitcoin::block::Header {
-                version: Version::ONE,
-                prev_blockhash: genesis.block_hash(),
-                merkle_root: TxMerkleNode::all_zeros(),
+            let active = Header {
+                version: 1,
+                prev_blockhash: genesis.compute_hash(),
+                merkle_root: Hash256::default(),
                 time: 1_500,
-                bits: CompactTarget::from_consensus(0x1d00_ffff),
+                bits: 0x1d00_ffff,
                 nonce: 1,
             };
             tree.insert_node(Some(genesis_id), active, NodeStatus::Active)?;
@@ -1975,8 +2036,13 @@ mod tests {
         }
         ctx.esplora_tx_index = Some(Arc::new(StaticTxIndex::new(transaction)));
 
-        let response = block_txs(&ctx, &stale_record.hash.to_string_be(), 0);
-        assert_eq!(response.status, 200);
+        let response = block_txs(&ctx, &stale_record.hash.to_string(), 0);
+        assert_eq!(
+            response.status,
+            200,
+            "block_txs failed: {}",
+            String::from_utf8_lossy(&response.body)
+        );
         let rendered: Value = serde_json::from_slice(&response.body)?;
         assert_eq!(rendered[0]["status"], json!({"confirmed":false}));
         Ok(())

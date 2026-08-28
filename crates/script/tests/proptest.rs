@@ -1,16 +1,34 @@
-//! Property tests for delegated script execution over signed synthetic spends.
+//! Property tests for native taproot key-path execution over signed spends.
+//!
+//! The signing side deliberately uses rust-bitcoin's sighash + Schnorr APIs as
+//! an independent oracle: if the native interpreter's BIP341 digest diverged,
+//! these spends would stop verifying.
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::script::Builder;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    transaction,
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut as OracleTxOut, Txid, Witness,
+    absolute, transaction,
 };
-use bitcoin_rs_primitives::Tx;
+use bitcoin_rs_primitives::{Tx, TxOut};
 use bitcoin_rs_script::{Interpreter, ScriptError, VerifyFlags};
 use proptest::prelude::*;
+
+/// Consensus-bytes round-trip from the rust-bitcoin oracle types to native types.
+fn to_native(tx: &Transaction) -> Tx {
+    let bytes = bitcoin::consensus::serialize(tx);
+    bitcoin_rs_primitives::deserialize(&bytes)
+        .unwrap_or_else(|error| panic!("oracle transaction must decode natively: {error}"))
+}
+
+fn to_native_prevout(prevout: &OracleTxOut) -> TxOut {
+    TxOut {
+        value: prevout.value.to_sat(),
+        script_pubkey: prevout.script_pubkey.as_bytes().to_vec(),
+    }
+}
 
 proptest! {
     #[test]
@@ -18,15 +36,16 @@ proptest! {
         let Some(fixture) = signed_p2tr(byte) else {
             return Ok(());
         };
-        let witness = fixture.tx.0.input[0].witness.to_vec();
+        let input = &fixture.tx.inputs[0];
+        let witness = input.witness.clone();
         let interpreter = Interpreter;
         let ok = interpreter.execute(
-            fixture.prevout.script_pubkey.as_bytes(),
-            fixture.tx.0.input[0].script_sig.as_bytes(),
+            &fixture.prevout.script_pubkey,
+            &input.script_sig,
             &witness,
             VerifyFlags::MANDATORY,
             &fixture.prevout,
-            &fixture.tx.0,
+            &fixture.tx,
             0,
         );
         prop_assert_eq!(ok, Ok(true));
@@ -40,16 +59,17 @@ proptest! {
         let Some(fixture) = signed_p2tr(byte) else {
             return Ok(());
         };
-        let mut witness = fixture.tx.0.input[0].witness.to_vec();
+        let mut witness = fixture.tx.inputs[0].witness.clone();
         witness.push(extra);
+        let input = &fixture.tx.inputs[0];
         let interpreter = Interpreter;
         let ok = interpreter.execute(
-            fixture.prevout.script_pubkey.as_bytes(),
-            fixture.tx.0.input[0].script_sig.as_bytes(),
+            &fixture.prevout.script_pubkey,
+            &input.script_sig,
             &witness,
             VerifyFlags::MANDATORY,
             &fixture.prevout,
-            &fixture.tx.0,
+            &fixture.tx,
             0,
         );
         prop_assert!(
@@ -69,19 +89,20 @@ proptest! {
 /// `Interpreter::execute` only receives the single input's prevout.
 #[test]
 fn valid_multi_input_taproot_keypath_spend_executes() {
-    let Some((tx, prevouts)) = signed_multi_input_p2tr([1, 2]) else {
+    let Some((oracle_tx, oracle_prevouts)) = signed_multi_input_p2tr([1, 2]) else {
         return;
     };
+    let tx = to_native(&oracle_tx);
+    let prevouts: Vec<TxOut> = oracle_prevouts.iter().map(to_native_prevout).collect();
     let interpreter = Interpreter;
-    let prevout_refs: Vec<&TxOut> = prevouts.iter().collect();
     for (input_idx, prevout) in prevouts.iter().enumerate() {
-        let witness = tx.input[input_idx].witness.to_vec();
+        let witness = tx.inputs[input_idx].witness.clone();
         let ok = interpreter.execute_with_prevouts(
-            prevout.script_pubkey.as_bytes(),
-            tx.input[input_idx].script_sig.as_bytes(),
+            &prevout.script_pubkey,
+            &tx.inputs[input_idx].script_sig,
             &witness,
             VerifyFlags::MANDATORY,
-            &prevout_refs,
+            &prevouts,
             &tx,
             input_idx,
         );
@@ -100,7 +121,7 @@ fn signed_p2tr(byte: u8) -> Option<SpendFixture> {
     let keypair = Keypair::from_secret_key(&secp, &secret);
     let tweaked = bitcoin::key::TapTweak::tap_tweak(keypair, &secp, None);
     let (output_key, _) = tweaked.public_parts();
-    let prevout = TxOut {
+    let prevout = OracleTxOut {
         value: Amount::from_sat(50_000),
         script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
     };
@@ -118,8 +139,8 @@ fn signed_p2tr(byte: u8) -> Option<SpendFixture> {
     let signature = secp.sign_schnorr(&message, tweaked.as_keypair());
     tx.input[0].witness = Witness::from_slice(&[signature.serialize().to_vec()]);
     Some(SpendFixture {
-        prevout,
-        tx: Tx(tx),
+        prevout: to_native_prevout(&prevout),
+        tx: to_native(&tx),
     })
 }
 
@@ -127,7 +148,7 @@ fn signed_p2tr(byte: u8) -> Option<SpendFixture> {
 ///
 /// Signatures are produced with rust-bitcoin sighash/schnorr APIs independently of the
 /// interpreter under test.
-fn signed_multi_input_p2tr(seeds: [u8; 2]) -> Option<(Transaction, Vec<TxOut>)> {
+fn signed_multi_input_p2tr(seeds: [u8; 2]) -> Option<(Transaction, Vec<OracleTxOut>)> {
     let secp = Secp256k1::new();
     let mut keypairs = Vec::with_capacity(seeds.len());
     let mut prevouts = Vec::with_capacity(seeds.len());
@@ -136,7 +157,7 @@ fn signed_multi_input_p2tr(seeds: [u8; 2]) -> Option<(Transaction, Vec<TxOut>)> 
         let keypair = Keypair::from_secret_key(&secp, &secret);
         let tweaked = bitcoin::key::TapTweak::tap_tweak(keypair, &secp, None);
         let (output_key, _) = tweaked.public_parts();
-        prevouts.push(TxOut {
+        prevouts.push(OracleTxOut {
             value: Amount::from_sat(50_000),
             script_pubkey: ScriptBuf::new_p2tr_tweaked(output_key),
         });
@@ -159,7 +180,7 @@ fn signed_multi_input_p2tr(seeds: [u8; 2]) -> Option<(Transaction, Vec<TxOut>)> 
                 witness: Witness::new(),
             })
             .collect(),
-        output: vec![TxOut {
+        output: vec![OracleTxOut {
             value: Amount::from_sat(99_000),
             script_pubkey: Builder::new().push_int(1).into_script(),
         }],
@@ -195,7 +216,7 @@ fn unsigned_spend(byte: u8) -> Transaction {
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
+        output: vec![OracleTxOut {
             value: Amount::from_sat(49_000),
             script_pubkey: Builder::new().push_int(1).into_script(),
         }],

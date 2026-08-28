@@ -30,7 +30,7 @@
 
 use std::hint::black_box;
 
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{BlockHash, Hash256};
 use bitcoin_rs_rpc::context::{BlockRecord, record_at_height_hash};
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -48,7 +48,7 @@ fn hash_for(height: u32) -> Hash256 {
 fn records(count: u32) -> Vec<BlockRecord> {
     (0..count)
         .map(|height| {
-            let mut record = BlockRecord::synthetic(height, hash_for(height));
+            let mut record = BlockRecord::synthetic(height, BlockHash::from(hash_for(height)));
             let h = usize::try_from(height).expect("height fits usize");
             // A real record carries the facts a scan reads past. Leaving them
             // zero would still walk the log, but would not fault in the bytes
@@ -69,7 +69,7 @@ fn records(count: u32) -> Vec<BlockRecord> {
 fn scan_for(records: &[BlockRecord], height: u32, hash: Hash256) -> Option<&BlockRecord> {
     records
         .iter()
-        .find(|candidate| candidate.hash == hash && candidate.height == height)
+        .find(|candidate| candidate.hash == BlockHash::from(hash) && candidate.height == height)
 }
 
 fn bench_lookup(c: &mut Criterion) {

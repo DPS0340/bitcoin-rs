@@ -629,7 +629,7 @@ pub fn run(mut config: Config) -> Result<()> {
             state.block_tree(),
             state.mempool(),
             state.apply_handles(),
-            bitcoin::ScriptBuf::new(),
+            Vec::new(),
             Arc::clone(&shutdown),
         ));
     let rpc_auth = Arc::new(build_rpc_auth(&state.config().rpc_auth)?);
@@ -894,9 +894,7 @@ mod tests {
         config.metrics_bind = None;
 
         let state = crate::state::NodeState::open(config.clone())?;
-        state.apply_block(&bitcoin::blockdata::constants::genesis_block(
-            bitcoin::Network::Regtest,
-        ))?;
+        state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         drop(state);
         let current_path = config
@@ -937,9 +935,7 @@ mod tests {
         config.connect = vec!["127.0.0.1:1".to_owned()];
 
         let state = crate::state::NodeState::open(config.clone())?;
-        state.apply_block(&bitcoin::blockdata::constants::genesis_block(
-            bitcoin::Network::Regtest,
-        ))?;
+        state.apply_block(&bitcoin_rs_primitives::Network::Regtest.genesis_block())?;
         state.write_clean_checkpoint()?;
         drop(state);
 

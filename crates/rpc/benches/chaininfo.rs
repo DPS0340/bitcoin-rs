@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use bitcoin_rs_chain::{ChainWork, NodeId, TipSnapshot};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{BlockHash, Hash256};
 use bitcoin_rs_rpc::Handler;
 use bitcoin_rs_rpc::context::{BlockRecord, Context, chain_stats};
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -38,7 +38,8 @@ fn context_with_records(count: u32) -> Arc<Context> {
         for height in 0..count {
             let mut hash = [0_u8; 32];
             hash[..4].copy_from_slice(&height.to_le_bytes());
-            let mut record = BlockRecord::synthetic(height, Hash256::from_le_bytes(&hash));
+            let mut record =
+                BlockRecord::synthetic(height, BlockHash::from(Hash256::from_le_bytes(&hash)));
             let h = usize::try_from(height).expect("height fits usize");
             // A real record carries the facts the stats read. Leaving them zero
             // would still walk the log, but would not fault in the bytes the

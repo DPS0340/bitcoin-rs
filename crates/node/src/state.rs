@@ -6,10 +6,9 @@
 //! / index / p2p / rpc / script_index) parks here as the integration point matures.
 
 use arc_swap::ArcSwapOption;
-use bitcoin::consensus::encode::deserialize;
-use bitcoin::{Transaction, Txid};
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, Tx, Txid, deserialize};
 use bitcoin_rs_rpc::context::{
     BlockBodyMetadata, BlockBodySource, BlockLog, NetworkState, PruneResult, PruneService,
     PruneServiceError, PruneStatus, ZmqNotification,
@@ -320,7 +319,7 @@ pub enum ApplyError {
     #[error("undo record cannot restore spent output {txid}:{vout}")]
     UndoPrevoutMissing {
         /// Transaction id of the unresolvable spend.
-        txid: bitcoin_rs_primitives::Hash256,
+        txid: bitcoin_rs_primitives::Txid,
         /// Output index of the unresolvable spend.
         vout: u32,
     },
@@ -504,7 +503,7 @@ impl NodeStorage {
         block_files: &Arc<FlatFileBlockStore>,
         block_body_store: &Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: &Arc<AtomicU32>,
     ) -> Result<Arc<dyn PruneService>> {
@@ -655,8 +654,8 @@ impl StoredBlockBodySource {
 }
 
 impl BlockBodySource for StoredBlockBodySource {
-    fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::Hash256) -> Option<Vec<u8>> {
-        self.store.load_block_body(height, hash).ok().flatten()
+    fn block_body(&self, height: u32, hash: bitcoin_rs_primitives::BlockHash) -> Option<Vec<u8>> {
+        self.store.load_block_body(height, hash.0).ok().flatten()
     }
 
     fn disk_usage(&self) -> Option<u64> {
@@ -666,7 +665,7 @@ impl BlockBodySource for StoredBlockBodySource {
     fn block_body_range(
         &self,
         height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
+        hash: bitcoin_rs_primitives::BlockHash,
         offset: u32,
         len: u32,
     ) -> Option<Vec<u8>> {
@@ -676,7 +675,10 @@ impl BlockBodySource for StoredBlockBodySource {
         // hot path for every ScriptIndex history call now, and an I/O error that
         // silently degrades into a full block scan is exactly the failure that
         // would otherwise show up only as unexplained latency.
-        match self.store.load_block_body_range(height, hash, offset, len) {
+        match self
+            .store
+            .load_block_body_range(height, hash.0, offset, len)
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::debug!(
@@ -694,10 +696,10 @@ impl BlockBodySource for StoredBlockBodySource {
     fn block_body_metadata(
         &self,
         height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
+        hash: bitcoin_rs_primitives::BlockHash,
     ) -> Option<BlockBodyMetadata> {
         self.store
-            .block_body_metadata(height, hash)
+            .block_body_metadata(height, hash.0)
             .ok()
             .flatten()
             .map(|(body_size, tx_count)| BlockBodyMetadata {
@@ -734,7 +736,7 @@ pub struct NodePruneService<S: KvStore> {
     block_files: Arc<FlatFileBlockStore>,
     block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
     blocks: Arc<RwLock<BlockLog>>,
-    transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     authority: crate::apply::PruneAuthority,
     pruneheight: Mutex<Option<u32>>,
     /// Height the last clean checkpoint would restore to, 0 when none exists.
@@ -751,7 +753,7 @@ impl<S: KvStore> NodePruneService<S> {
         block_files: Arc<FlatFileBlockStore>,
         block_body_store: Arc<dyn crate::apply::PruneBodyStore>,
         blocks: Arc<RwLock<BlockLog>>,
-        transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+        transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         authority: crate::apply::PruneAuthority,
         durable_tip_height: Arc<AtomicU32>,
     ) -> Result<Self> {
@@ -798,7 +800,7 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             .checked_add(policy.retention_depth())
             .ok_or_else(|| PruneServiceError::failed("prune height overflow"))?;
 
-        let prune_candidates: Vec<(u32, bitcoin_rs_primitives::Hash256, usize)> = {
+        let prune_candidates: Vec<(u32, bitcoin_rs_primitives::BlockHash, usize)> = {
             let blocks = self.blocks.read();
             blocks
                 .iter()
@@ -814,18 +816,18 @@ impl<S: KvStore> PruneService for NodePruneService<S> {
             }
             let bytes = self
                 .block_body_store
-                .load_block_body(height, hash)
+                .load_block_body(height, hash.0)
                 .map_err(|error| PruneServiceError::failed(error.to_string()))?
                 .unwrap_or_default();
             if bytes.is_empty() {
                 continue;
             }
-            let block = deserialize::<bitcoin::Block>(&bytes).map_err(|error| {
+            let block = deserialize::<Block>(&bytes).map_err(|error| {
                 PruneServiceError::failed(format!(
                     "stored block body at height {height} failed decode: {error}"
                 ))
             })?;
-            pruned_txids.extend(block.txdata.iter().map(Transaction::compute_txid));
+            pruned_txids.extend(block.txs.iter().map(Tx::txid));
         }
         let mut batch = self.store.new_batch();
         let (block_outcome, undo_outcome, prunable_files) = stage_block_and_undo_prune(
@@ -1050,7 +1052,7 @@ pub struct NodeState {
     chain_tx_count: Arc<AtomicU64>,
     block_tree: Arc<RwLock<bitcoin_rs_chain::BlockTree>>,
     blocks: Arc<RwLock<BlockLog>>,
-    transactions: Arc<RwLock<HashMap<Txid, Transaction>>>,
+    transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
     network: Arc<RwLock<NetworkState>>,
     /// Shared P2P admission switch controlled by `setnetworkactive`.
     network_active: Arc<AtomicBool>,
@@ -1622,7 +1624,7 @@ impl NodeState {
 
     /// Returns the shared txid → transaction map exposed to RPC handlers.
     #[must_use]
-    pub fn transactions(&self) -> Arc<RwLock<HashMap<Txid, Transaction>>> {
+    pub fn transactions(&self) -> Arc<RwLock<HashMap<Txid, Tx>>> {
         Arc::clone(&self.transactions)
     }
 
@@ -1776,17 +1778,14 @@ impl NodeState {
     /// Synthetically applies `block` as the next tip after consensus checks.
     ///
     /// Delegates to `crate::apply::apply_block` over the shared handles.
-    pub fn apply_block(
-        &self,
-        block: &bitcoin::Block,
-    ) -> core::result::Result<TipSnapshot, ApplyError> {
+    pub fn apply_block(&self, block: &Block) -> core::result::Result<TipSnapshot, ApplyError> {
         crate::apply::apply_block(&self.apply_handles, block)
     }
 
     #[cfg(test)]
     pub(crate) fn check_coinbase_maturity(
         &self,
-        block: &bitcoin::Block,
+        block: &Block,
         height: u32,
     ) -> core::result::Result<(), ApplyError> {
         crate::apply::check_coinbase_maturity(&self.apply_handles, block, height)
@@ -1808,7 +1807,10 @@ impl Drop for NodeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::Hash as _;
+    use bitcoin_rs_primitives::encode::double_sha256;
+    use bitcoin_rs_primitives::{
+        Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, consensus_bytes,
+    };
     use bitcoin_rs_rpc::context::BlockRecord;
 
     fn publish_applied_tip_height(state: &NodeState, height: u32) {
@@ -2126,7 +2128,7 @@ mod tests {
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
         let tx = state.inbound_blocks_sender();
-        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // No `tick` drains the channel in this unit test, so it fills to the
         // bound; the block past the limit must be rejected rather than queued
         // (the OOM-flood guard), proving backpressure engages at the producer.
@@ -2204,30 +2206,25 @@ mod tests {
 
     #[test]
     fn apply_block_persists_body_under_pruning_key_when_pruning_disabled() -> anyhow::Result<()> {
-        use bitcoin::blockdata::constants::genesis_block;
-        use bitcoin::consensus::encode::serialize;
-        use bitcoin::hashes::Hash as _;
-
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 0;
         let state = NodeState::open(config)?;
-        let block = genesis_block(bitcoin::Network::Regtest);
-        let hash =
-            bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
+        let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
 
         assert!(state.prune_service().is_none());
         state.apply_block(&block)?;
 
         assert_eq!(
             state.blocks.read().first().map(|record| record.body_size),
-            Some(serialize(&block).len())
+            Some(consensus_bytes(&block).len())
         );
         assert_eq!(
             state.block_body_store.load_block_body(0, hash)?.as_deref(),
-            Some(serialize(&block).as_slice())
+            Some(consensus_bytes(&block).as_slice())
         );
         Ok(())
     }
@@ -2288,14 +2285,9 @@ mod tests {
 
     #[test]
     fn apply_block_with_serialized_persists_same_body_as_apply_block() -> anyhow::Result<()> {
-        use bitcoin::blockdata::constants::genesis_block;
-        use bitcoin::consensus::encode::serialize;
-        use bitcoin::hashes::Hash as _;
-
-        let block = genesis_block(bitcoin::Network::Regtest);
-        let hash =
-            bitcoin_rs_primitives::Hash256::from_le_bytes(block.block_hash().as_byte_array());
-        let serialized = bytes::Bytes::from(serialize(&block));
+        let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let hash = Hash256::from_le_bytes(block.block_hash().as_bytes());
+        let serialized = bytes::Bytes::from(consensus_bytes(&block));
 
         let dir_a = tempfile::tempdir()?;
         let mut config_a = crate::Config::default_for_network(crate::Network::Regtest);
@@ -2348,8 +2340,8 @@ mod tests {
                 "a node that has applied nothing cannot know the count"
             );
 
-            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-            let genesis_tx_count = u64::try_from(genesis.txdata.len())?;
+            let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+            let genesis_tx_count = u64::try_from(genesis.txs.len())?;
             let _tip = state.apply_block(&genesis)?;
             let counted = state.chain_tx_count_handle().load(Ordering::Relaxed);
             assert_eq!(counted, genesis_tx_count, "genesis establishes the count");
@@ -2404,7 +2396,7 @@ mod tests {
                 .undo_store
                 .persist_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
-                hash,
+                hash: BlockHash::from(hash),
                 height,
                 body_size: 1,
                 header: None,
@@ -2464,7 +2456,7 @@ mod tests {
                 .undo_store
                 .persist_undo(height, hash, b"undo-body")?;
             state.blocks.write().push(BlockRecord {
-                hash,
+                hash: BlockHash::from(hash),
                 height,
                 body_size: 1,
                 header: None,
@@ -2600,8 +2592,6 @@ mod tests {
     /// what makes the first worth having.
     #[test]
     fn pruning_a_block_file_reduces_the_reported_disk_size() -> anyhow::Result<()> {
-        use bitcoin::blockdata::constants::genesis_block;
-
         fn seed_file_height<S: KvStore>(store: &S, height: u32) -> anyhow::Result<()> {
             let mut batch = store.new_batch();
             batch.put(
@@ -2632,7 +2622,7 @@ mod tests {
 
         let state = NodeState::open(config)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
-        let block = genesis_block(bitcoin::Network::Regtest);
+        let block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         // The hash is not needed: this test counts bytes in files, not bodies.
         let record = BlockRecord::from_block(10, &block);
         let record_sum_before = u64::try_from(record.body_size)?;
@@ -2690,10 +2680,6 @@ mod tests {
 
     #[test]
     fn manual_prune_removes_pruned_block_transactions_from_cache() -> anyhow::Result<()> {
-        use bitcoin::blockdata::constants::genesis_block;
-        use bitcoin::consensus::encode::serialize;
-        use bitcoin::hashes::Hash as _;
-
         let dir = tempfile::tempdir()?;
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("node");
@@ -2702,13 +2688,13 @@ mod tests {
         let state = NodeState::open(config)?;
         publish_applied_tip_height(&state, 11 + CORE_REORG_SAFETY_MARGIN);
 
-        let pruned_block = genesis_block(bitcoin::Network::Regtest);
-        let pruned_hash = bitcoin_rs_primitives::Hash256::from_le_bytes(
-            pruned_block.block_hash().as_byte_array(),
-        );
-        state
-            .block_body_store
-            .persist_block_body(10, pruned_hash, &serialize(&pruned_block))?;
+        let pruned_block = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let pruned_hash = Hash256::from_le_bytes(pruned_block.block_hash().as_bytes());
+        state.block_body_store.persist_block_body(
+            10,
+            pruned_hash,
+            &consensus_bytes(&pruned_block),
+        )?;
         state
             .apply_handles()
             .undo_store
@@ -2718,15 +2704,15 @@ mod tests {
             .write()
             .push(BlockRecord::from_block(10, &pruned_block));
 
-        let pruned_tx = pruned_block.txdata[0].clone();
-        let pruned_txid = pruned_tx.compute_txid();
-        let unrelated_tx = Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: Vec::new(),
-            output: Vec::new(),
+        let pruned_tx = pruned_block.txs[0].clone();
+        let pruned_txid = pruned_tx.txid();
+        let unrelated_tx = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
         };
-        let unrelated_txid = unrelated_tx.compute_txid();
+        let unrelated_txid = unrelated_tx.txid();
 
         {
             let mut transactions = state.transactions.write();
@@ -2940,7 +2926,7 @@ mod tests {
         let blocks = Arc::new(RwLock::new(BlockLog::new()));
         let hash = bitcoin_rs_primitives::Hash256::from_le_bytes(&[10_u8; 32]);
         blocks.write().push(BlockRecord {
-            hash,
+            hash: BlockHash::from(hash),
             height: 10,
             body_size: 1,
             header: None,
@@ -3016,7 +3002,7 @@ mod tests {
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let genesis_tip = state.apply_block(&genesis)?;
         let expected_utxo_hash = state.utxo().with_stable_view(stable_hash)?;
         let expected_stats = state.coin_stats().snapshot();
@@ -3055,7 +3041,7 @@ mod tests {
         assert_eq!(next_tip.height, 1);
         assert_eq!(
             next_tip.hash.to_le_bytes(),
-            next.block_hash().to_byte_array()
+            next.block_hash().0.to_le_bytes()
         );
         let listener_after_apply = resumed.coin_stats().snapshot();
         let mut rescanned = resumed.utxo().with_stable_view(|view| {
@@ -3111,7 +3097,7 @@ mod tests {
             config.data_dir = dir.path().join(backend);
             config.storage_backend = backend.to_owned();
             config.p2p_listen.clear();
-            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
             let state = NodeState::open(config.clone())?;
             state.apply_block(&genesis)?;
             state.write_clean_checkpoint()?;
@@ -3135,7 +3121,7 @@ mod tests {
         config.g2_muhash_samples = Some(samples.clone());
         config.g2_muhash_tip_height = Some(2);
         let state = NodeState::open(config)?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
         let before = state.coin_stats().snapshot();
         state.write_clean_checkpoint()?;
@@ -3180,7 +3166,7 @@ mod tests {
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
         let state = NodeState::open(config)?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
         assert!(matches!(
             state.write_clean_checkpoint()?,
@@ -3283,7 +3269,7 @@ mod tests {
         config.data_dir = data_dir;
         config.p2p_listen.clear();
         let state = NodeState::open(config.clone())?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         let tip = state.apply_block(&genesis)?;
         let generation = state.publish_checkpoint()?;
         assert!(
@@ -3360,7 +3346,7 @@ mod tests {
 
         let (tip, first_epoch) = {
             let state = NodeState::open(config.clone())?;
-            let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+            let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
             let tip = state.apply_block(&genesis)?;
             assert!(matches!(
                 state.write_clean_checkpoint()?,
@@ -3538,37 +3524,35 @@ mod tests {
         Ok(())
     }
 
-    fn mined_regtest_child(prev_blockhash: bitcoin::BlockHash) -> anyhow::Result<bitcoin::Block> {
-        let coinbase = bitcoin::Transaction {
-            version: bitcoin::transaction::Version::TWO,
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![bitcoin::TxIn {
-                previous_output: bitcoin::OutPoint::null(),
-                script_sig: bitcoin::ScriptBuf::from_bytes(vec![1, 1]),
-                sequence: bitcoin::Sequence::MAX,
-                witness: bitcoin::Witness::new(),
+    fn mined_regtest_child(prev_blockhash: BlockHash) -> anyhow::Result<Block> {
+        let coinbase = Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![1, 1],
+                sequence: u32::MAX,
+                witness: Vec::new(),
             }],
-            output: vec![bitcoin::TxOut {
-                value: bitcoin::Amount::from_sat(1),
-                script_pubkey: bitcoin::ScriptBuf::new(),
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
             }],
         };
-        let mut block = bitcoin::Block {
-            header: bitcoin::block::Header {
-                version: bitcoin::block::Version::ONE,
+        let mut block = Block {
+            header: Header {
+                version: 1,
                 prev_blockhash,
-                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                merkle_root: Hash256::default(),
                 time: 1_296_688_603,
-                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                bits: 0x207f_ffff,
                 nonce: 0,
             },
-            txdata: vec![coinbase],
+            txs: vec![coinbase],
         };
-        block.header.merkle_root = block
-            .compute_merkle_root()
+        block.header.merkle_root = merkle_root(&block.txs)
             .ok_or_else(|| std::io::Error::other("test block has no merkle root"))?;
-        let target = block.header.target();
-        while block.header.validate_pow(target).is_err() {
+        while !pow_met(block.header.bits, block.block_hash().0) {
             block.header.nonce = block
                 .header
                 .nonce
@@ -3576,5 +3560,46 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("test nonce exhausted"))?;
         }
         Ok(block)
+    }
+
+    /// Pairwise double-SHA256 fold over little-endian txid bytes, duplicating
+    /// the last leaf on odd levels (the native stand-in for
+    /// `compute_merkle_root`).
+    fn merkle_root(txs: &[Tx]) -> Option<Hash256> {
+        let mut leaves: Vec<[u8; 32]> = txs.iter().map(|tx| *tx.txid().as_bytes()).collect();
+        if leaves.is_empty() {
+            return None;
+        }
+        while leaves.len() > 1 {
+            let original_len = leaves.len();
+            let mut next = Vec::with_capacity(original_len.div_ceil(2));
+            for pos in 0..original_len.div_ceil(2) {
+                let left = leaves[2 * pos];
+                let right = leaves[(2 * pos + 1).min(original_len - 1)];
+                let mut pair = [0_u8; 64];
+                pair[..32].copy_from_slice(&left);
+                pair[32..].copy_from_slice(&right);
+                next.push(double_sha256(&pair).to_le_bytes());
+            }
+            leaves = next;
+        }
+        Some(Hash256::from_le_bytes(&leaves[0]))
+    }
+
+    /// Regtest-easy compact-target `PoW` check over the hash as a 256-bit
+    /// little-endian integer (mirrors `chain::pow::compact_is_met_by` for the
+    /// >3-exponent, 3-byte-mantissa forms these fixtures mine).
+    fn pow_met(bits: u32, hash: Hash256) -> bool {
+        let exponent = u8::try_from(bits >> 24).unwrap_or(0);
+        let mantissa = bits & 0x007f_ffff;
+        if exponent <= 3 || exponent > 32 || mantissa > 0x00ff_ffff {
+            return false;
+        }
+        let bytes = hash.as_byte_array();
+        let low = usize::from(exponent - 3);
+        let window = u32::from(bytes[low])
+            | u32::from(bytes[low + 1]) << 8
+            | u32::from(bytes[low + 2]) << 16;
+        window <= mantissa && bytes[usize::from(exponent)..].iter().all(|&byte| byte == 0)
     }
 }

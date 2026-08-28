@@ -1,6 +1,5 @@
 //! Coinstats persistence round-trip tests.
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
 use bitcoin_rs_utxo::stats::coin_stats::COIN_STATS_ENCODED_LEN;
@@ -16,10 +15,10 @@ fn coin_stats_persist_load_roundtrips_byte_equal() -> Result<(), Box<dyn std::er
     let mut stats = CoinStats::new();
 
     for index in 0_u32..100 {
-        let outpoint = OutPoint::new(txid(index), index % 64);
+        let outpoint = OutPoint::new(txid(index).into(), index % 64);
         let txout = TxOut {
-            value: Amount::from_sat(1_000 + u64::from(index)),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, index.to_le_bytes()[0]]),
+            value: 1_000 + u64::from(index),
+            script_pubkey: vec![0x51, index.to_le_bytes()[0]],
         };
         stats.insert_utxo(&outpoint, &txout, 42, index == 0);
     }
@@ -54,10 +53,10 @@ fn finish_block_applies_height_and_transaction_delta() {
 #[test]
 fn coin_stats_codec_is_exact_and_preserves_muhash_continuation()
 -> Result<(), Box<dyn std::error::Error>> {
-    let old_op = OutPoint::new(txid(1_000), 3);
+    let old_op = OutPoint::new(txid(1_000).into(), 3);
     let old_txout = TxOut {
-        value: Amount::from_sat(12_345),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x21]),
+        value: 12_345,
+        script_pubkey: vec![0x51, 0x21],
     };
     let mut original = CoinStats::new();
     original.insert_utxo(&old_op, &old_txout, 100, true);
@@ -79,10 +78,10 @@ fn coin_stats_codec_is_exact_and_preserves_muhash_continuation()
         Err(CoinStatsDecodeError::TrailingBytes)
     ));
 
-    let new_op = OutPoint::new(txid(1_001), 4);
+    let new_op = OutPoint::new(txid(1_001).into(), 4);
     let new_txout = TxOut {
-        value: Amount::from_sat(54_321),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x22]),
+        value: 54_321,
+        script_pubkey: vec![0x51, 0x22],
     };
     original.remove_utxo(&old_op, &old_txout, 100, true);
     restored.remove_utxo(&old_op, &old_txout, 100, true);

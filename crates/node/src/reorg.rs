@@ -8,10 +8,8 @@
 
 use alloc::vec::Vec;
 
-use bitcoin::consensus::Decodable as _;
-use bitcoin::hashes::Hash as _;
 use bitcoin_rs_chain::{NodeId, ReorgPlan, plan_reorg};
-use bitcoin_rs_primitives::Hash256;
+use bitcoin_rs_primitives::{Block, DecodeError, Hash256};
 use bitcoin_rs_storage::StorageError;
 
 use crate::apply::ApplyHandles;
@@ -132,7 +130,7 @@ pub enum ReorgError {
         height: u32,
         /// Consensus decoding failure.
         #[source]
-        source: bitcoin::consensus::encode::Error,
+        source: DecodeError,
     },
     /// A loaded body's header names a block other than the planned node.
     ///
@@ -230,7 +228,7 @@ pub fn switch_to_branch<F, G>(
     mut connected_body: G,
 ) -> core::result::Result<(), ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
     G: FnMut(Hash256),
 {
     loop {
@@ -354,7 +352,7 @@ fn current_reorg_plan(
 
 struct LoadedBranchBody {
     hash: Hash256,
-    block: bitcoin::Block,
+    block: Block,
     serialized: bytes::Bytes,
     height: u32,
 }
@@ -368,7 +366,7 @@ fn load_branch_bodies<F>(
     staged_body: &mut F,
 ) -> core::result::Result<Vec<LoadedBranchBody>, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
 {
     branch_nodes(handles, ids)?
         .into_iter()
@@ -383,7 +381,7 @@ fn load_available_branch_prefix<F>(
     staged_body: &mut F,
 ) -> core::result::Result<LoadedBranchPrefix, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
 {
     let nodes = branch_nodes(handles, ids)?;
     let mut loaded = Vec::with_capacity(nodes.len());
@@ -419,7 +417,7 @@ fn load_branch_body<F>(
     staged_body: &mut F,
 ) -> core::result::Result<LoadedBranchBody, ReorgError>
 where
-    F: FnMut(Hash256) -> Option<(bitcoin::Block, bytes::Bytes)>,
+    F: FnMut(Hash256) -> Option<(Block, bytes::Bytes)>,
 {
     if let Some((block, serialized)) = staged_body(hash) {
         return validate_branch_body(hash, height, block, serialized);
@@ -444,9 +442,8 @@ fn decode_branch_body(
     height: u32,
     serialized: bytes::Bytes,
 ) -> core::result::Result<LoadedBranchBody, ReorgError> {
-    let mut cursor = std::io::Cursor::new(serialized.as_ref());
     let block =
-        bitcoin::Block::consensus_decode(&mut cursor).map_err(|source| ReorgError::BodyDecode {
+        Block::consensus_decode(serialized.as_ref()).map_err(|source| ReorgError::BodyDecode {
             hash,
             height,
             source,
@@ -457,10 +454,10 @@ fn decode_branch_body(
 fn validate_branch_body(
     expected: Hash256,
     height: u32,
-    block: bitcoin::Block,
+    block: Block,
     serialized: bytes::Bytes,
 ) -> core::result::Result<LoadedBranchBody, ReorgError> {
-    let actual = Hash256::from_le_bytes(block.block_hash().as_byte_array());
+    let actual = block.block_hash().0;
     if actual != expected {
         return Err(ReorgError::BodyHashMismatch {
             expected,

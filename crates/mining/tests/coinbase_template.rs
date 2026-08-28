@@ -3,29 +3,27 @@
 use std::error::Error;
 use std::sync::Arc;
 
+// rust-bitcoin differential oracle: sha256d engine for witness commitment.
 use bitcoin::hashes::{Hash as _, HashEngine as _, sha256d};
-use bitcoin::opcodes::all::{OP_PUSHBYTES_36, OP_RETURN};
-use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, Wtxid,
-    absolute, transaction,
-};
+// rust-bitcoin differential oracle: witness merkle root.
+use bitcoin::Wtxid as OracleWtxid;
 use bitcoin_rs_consensus::bip34::check_bip34;
 use bitcoin_rs_mempool::{MempoolMiningSnapshot, SnapshotEntry};
 use bitcoin_rs_mining::{
     CandidateContext, MiningError, TemplateId, WITNESS_RESERVED_VALUE, assemble_candidate,
 };
-use bitcoin_rs_primitives::{Hash256, Network};
+use bitcoin_rs_primitives::{Hash256, Network, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid};
 
 #[test]
 fn empty_candidate_encodes_bip34_and_exact_subsidy() -> Result<(), Box<dyn Error>> {
     let context = context(height(800_000), true);
     let snapshot = empty_snapshot(7);
-    let payout = ScriptBuf::from_bytes(vec![0x51]);
+    let payout = vec![0x51];
     let candidate = assemble_candidate(&context, &snapshot, &payout)?;
 
-    check_bip34(800_000, candidate.coinbase.input[0].script_sig.as_script())?;
+    check_bip34(800_000, &candidate.coinbase.inputs[0].script_sig)?;
     assert_eq!(
-        &candidate.coinbase.input[0].script_sig.as_bytes()[..4],
+        &candidate.coinbase.inputs[0].script_sig[..4],
         &[3, 0x00, 0x35, 0x0c]
     );
     assert_eq!(candidate.fees, 0);
@@ -33,10 +31,7 @@ fn empty_candidate_encodes_bip34_and_exact_subsidy() -> Result<(), Box<dyn Error
         candidate.coinbase_value,
         bitcoin_rs_consensus::block_subsidy(800_000, Network::Regtest.subsidy_halving_interval())
     );
-    assert_eq!(
-        candidate.coinbase.output[0].script_pubkey.as_bytes(),
-        payout.as_bytes()
-    );
+    assert_eq!(candidate.coinbase.outputs[0].script_pubkey, payout);
     assert_eq!(
         candidate.template_id,
         TemplateId::new(&context.previous_block_hash, 7)
@@ -47,16 +42,12 @@ fn empty_candidate_encodes_bip34_and_exact_subsidy() -> Result<(), Box<dyn Error
 #[test]
 fn small_heights_use_bip34_opcodes_and_two_byte_script_sig() -> Result<(), Box<dyn Error>> {
     for height in [1_u32, 16] {
-        let candidate = assemble_candidate(
-            &context(height, false),
-            &empty_snapshot(1),
-            &ScriptBuf::new(),
-        )?;
-        check_bip34(height, candidate.coinbase.input[0].script_sig.as_script())?;
-        assert!(candidate.coinbase.input[0].script_sig.len() >= 2);
+        let candidate = assemble_candidate(&context(height, false), &empty_snapshot(1), &[])?;
+        check_bip34(height, &candidate.coinbase.inputs[0].script_sig)?;
+        assert!(candidate.coinbase.inputs[0].script_sig.len() >= 2);
         assert!(candidate.witness_commitment.is_none());
-        assert!(candidate.coinbase.input[0].witness.is_empty());
-        assert_eq!(candidate.coinbase.output.len(), 1);
+        assert!(candidate.coinbase.inputs[0].witness.is_empty());
+        assert_eq!(candidate.coinbase.outputs.len(), 1);
     }
     Ok(())
 }
@@ -64,7 +55,7 @@ fn small_heights_use_bip34_opcodes_and_two_byte_script_sig() -> Result<(), Box<d
 #[test]
 fn segwit_candidate_commits_to_selected_wtxids_and_reserved_value() -> Result<(), Box<dyn Error>> {
     let parent = tx_with_witness(1, 50_000, None);
-    let child = tx_with_witness(2, 40_000, Some(parent.compute_txid()));
+    let child = tx_with_witness(2, 40_000, Some(parent.txid()));
     let snapshot = snapshot_from_chain(
         &[
             (Arc::new(parent), 2_000, 0, vec![]),
@@ -72,11 +63,7 @@ fn segwit_candidate_commits_to_selected_wtxids_and_reserved_value() -> Result<()
         ],
         9,
     );
-    let candidate = assemble_candidate(
-        &context(100, true),
-        &snapshot,
-        &ScriptBuf::from_bytes(vec![0x51]),
-    )?;
+    let candidate = assemble_candidate(&context(100, true), &snapshot, &[0x51])?;
 
     assert_eq!(candidate.transactions.len(), 2);
     assert_eq!(candidate.fees, 5_000);
@@ -91,14 +78,18 @@ fn segwit_candidate_commits_to_selected_wtxids_and_reserved_value() -> Result<()
         .ok_or("missing reserved value")?;
     assert_eq!(reserved, WITNESS_RESERVED_VALUE);
     assert_eq!(
-        candidate.coinbase.input[0].witness.to_vec(),
+        candidate.coinbase.inputs[0].witness,
         vec![WITNESS_RESERVED_VALUE.to_vec()]
     );
 
-    let mut leaves = vec![Wtxid::all_zeros()];
-    for tx in &candidate.transactions {
-        leaves.push(tx.wtxid);
-    }
+    // rust-bitcoin differential oracle for witness merkle and sha256d commitment.
+    let mut leaves = vec![OracleWtxid::all_zeros()];
+    leaves.extend(
+        candidate
+            .transactions
+            .iter()
+            .map(|tx| OracleWtxid::from_byte_array(*tx.wtxid.as_bytes())),
+    );
     let root = bitcoin::merkle_tree::calculate_root(leaves.into_iter()).ok_or("root")?;
     let expected_root = Hash256::from_le_bytes(root.as_byte_array());
     assert_eq!(candidate.witness_merkle_root, Some(expected_root));
@@ -112,15 +103,15 @@ fn segwit_candidate_commits_to_selected_wtxids_and_reserved_value() -> Result<()
 
     let commitment_output = candidate
         .coinbase
-        .output
+        .outputs
         .iter()
         .rev()
-        .find(|output| output.script_pubkey.is_op_return())
+        .find(|output| output.script_pubkey.first() == Some(&0x6a))
         .ok_or("missing commitment output")?;
-    let script = commitment_output.script_pubkey.as_bytes();
+    let script = &commitment_output.script_pubkey;
     assert_eq!(script.len(), 38);
-    assert_eq!(script[0], OP_RETURN.to_u8());
-    assert_eq!(script[1], OP_PUSHBYTES_36.to_u8());
+    assert_eq!(script[0], 0x6a);
+    assert_eq!(script[1], 0x24);
     assert_eq!(&script[2..6], &[0xaa, 0x21, 0xa9, 0xed]);
     assert_eq!(&script[6..], expected_commitment.as_byte_array());
     Ok(())
@@ -139,18 +130,14 @@ fn fee_overflow_is_reported_instead_of_wrapping() {
         sequence: 1,
         entries: vec![entry.clone(), {
             let mut second = entry;
-            second.txid = Txid::from_byte_array([2; 32]);
-            second.wtxid = Wtxid::from_byte_array([2; 32]);
+            second.txid = Txid(Hash256::from_le_bytes(&[2; 32]));
+            second.wtxid = Wtxid(Hash256::from_le_bytes(&[2; 32]));
             second.tx = Arc::new(tx_with_witness(2, 1_000, None));
             second
         }],
     };
-    let err = assemble_candidate(
-        &context(1, false),
-        &snapshot,
-        &ScriptBuf::from_bytes(vec![0x51]),
-    )
-    .expect_err("fee overflow must fail");
+    let err = assemble_candidate(&context(1, false), &snapshot, &[0x51])
+        .expect_err("fee overflow must fail");
     assert_eq!(err, MiningError::FeeOverflow);
 }
 
@@ -184,7 +171,7 @@ fn empty_snapshot(sequence: u64) -> MempoolMiningSnapshot {
 }
 
 fn snapshot_from_chain(
-    entries: &[(Arc<Transaction>, u64, i64, Vec<u32>)],
+    entries: &[(Arc<Tx>, u64, i64, Vec<u32>)],
     sequence: u64,
 ) -> MempoolMiningSnapshot {
     MempoolMiningSnapshot {
@@ -198,23 +185,18 @@ fn snapshot_from_chain(
     }
 }
 
-fn snapshot_entry(
-    tx: Arc<Transaction>,
-    fee: u64,
-    fee_delta: i64,
-    ancestors: Vec<u32>,
-) -> SnapshotEntry {
-    let weight = tx.weight().to_wu();
+fn snapshot_entry(tx: Arc<Tx>, fee: u64, fee_delta: i64, ancestors: Vec<u32>) -> SnapshotEntry {
+    let weight = tx.weight();
     let size = u32::try_from(tx.total_size()).unwrap_or(u32::MAX);
     let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
     SnapshotEntry {
-        txid: tx.compute_txid(),
-        wtxid: tx.compute_wtxid(),
+        txid: tx.txid(),
+        wtxid: tx.wtxid(),
         vsize,
         bip141_vsize: vsize,
         size,
         weight,
-        sigop_cost: u32::try_from(tx.total_sigop_cost(|_| None)).unwrap_or(0),
+        sigop_cost: 0,
         fee,
         fee_delta,
         time: 0,
@@ -227,28 +209,24 @@ fn snapshot_entry(
     }
 }
 
-fn tx_with_witness(label: u8, value: u64, parent: Option<Txid>) -> Transaction {
-    let mut witness = Witness::new();
-    witness.push([label; 32]);
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx_with_witness(label: u8, value: u64, parent: Option<Txid>) -> Tx {
+    let mut bytes = [0_u8; 32];
+    bytes[0] = label;
+    Tx {
+        version: 2,
+        inputs: vec![TxIn {
             previous_output: OutPoint::new(
-                parent.unwrap_or_else(|| {
-                    let mut bytes = [0_u8; 32];
-                    bytes[0] = label;
-                    Txid::from_byte_array(bytes)
-                }),
+                parent.unwrap_or_else(|| Txid(Hash256::from_le_bytes(&bytes))),
                 0,
             ),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness,
+            script_sig: vec![],
+            sequence: u32::MAX,
+            witness: vec![vec![label; 32]],
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, label]),
+        outputs: vec![TxOut {
+            value,
+            script_pubkey: vec![0x51, label],
         }],
+        lock_time: 0,
     }
 }

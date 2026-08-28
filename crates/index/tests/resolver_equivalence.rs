@@ -4,7 +4,7 @@
 //! the same fixture. Equality is over the **full** result — same elements, same
 //! order, same values — not a spot check, because the resolvers' output order is
 //! itself contractual: `combined_history` sorts by `(height, txid)` downstream,
-//! and ScriptIndex clients hash the sequence to derive a status.
+//! and `ScriptIndex` clients hash the sequence to derive a status.
 //!
 //! These tests are deliberately backend-free so they run on a plain
 //! `cargo test --workspace`.
@@ -17,12 +17,10 @@ mod common;
 use std::cell::Cell;
 use std::sync::Arc;
 
-use bitcoin::hashes::Hash as _;
-use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, absolute, block, transaction,
-};
 use bitcoin_rs_index::{BlockSource, Indexer, ScriptHash};
+use bitcoin_rs_primitives::{
+    Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+};
 use bitcoin_rs_storage::{ColumnFamily, KvStore as _, WriteBatch as _};
 use hashbrown::HashMap;
 use proptest::prelude::*;
@@ -69,53 +67,52 @@ impl BlockSource for FixtureSource {
             return None;
         }
         self.range_loads.set(self.range_loads.get() + 1);
-        let bytes = bitcoin::consensus::encode::serialize(self.blocks.get(&height)?);
+        let bytes = consensus_bytes(self.blocks.get(&height)?);
         let start = usize::try_from(offset).ok()?;
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         bytes.get(start..end).map(<[u8]>::to_vec)
     }
 }
 
-fn header() -> block::Header {
-    block::Header {
-        version: block::Version::ONE,
-        prev_blockhash: BlockHash::all_zeros(),
-        merkle_root: TxMerkleNode::all_zeros(),
+fn header() -> Header {
+    Header {
+        version: 1,
+        prev_blockhash: BlockHash::default(),
+        merkle_root: Hash256::default(),
         time: 0,
-        bits: CompactTarget::from_consensus(0),
+        bits: 0,
         nonce: 0,
     }
 }
-
-fn script(tag: u8, len: usize) -> ScriptBuf {
-    ScriptBuf::from_bytes(core::iter::repeat_n(tag, len.max(1)).collect())
+fn script(tag: u8, len: usize) -> Vec<u8> {
+    core::iter::repeat_n(tag, len.max(1)).collect()
 }
 
 /// An `OP_RETURN` script, which ingest skips so no funding row is ever written.
-fn op_return_script(tag: u8) -> ScriptBuf {
-    ScriptBuf::from_bytes(vec![0x6a, tag])
+fn op_return_script(tag: u8) -> Vec<u8> {
+    vec![0x6a, tag]
 }
 
-fn tx_with_outputs(seed: u8, outputs: Vec<TxOut>) -> Transaction {
-    Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
+fn tx_with_outputs(seed: u8, outputs: Vec<TxOut>) -> Tx {
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
             previous_output: OutPoint {
-                txid: Txid::from_byte_array([seed; 32]),
+                txid: Txid(Hash256::from_le_bytes(&[seed; 32])),
                 vout: u32::from(seed),
             },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
+            script_sig: Vec::new(),
+            sequence: u32::MAX,
+            witness: Vec::new(),
         }],
-        output: outputs,
+        outputs,
     }
 }
 
-fn out(script_pubkey: ScriptBuf, sats: u64) -> TxOut {
+fn out(script_pubkey: Vec<u8>, sats: u64) -> TxOut {
     TxOut {
-        value: Amount::from_sat(sats),
+        value: sats,
         script_pubkey,
     }
 }
@@ -125,7 +122,7 @@ fn index_blocks(blocks: Vec<(u32, Block)>) -> (Indexer<MemoryStore>, HashMap<u32
     let mut indexer = Indexer::new(Arc::new(MemoryStore::default()));
     let mut map = HashMap::new();
     for (height, block) in blocks {
-        let bytes = bitcoin::consensus::encode::serialize(&block);
+        let bytes = consensus_bytes(&block);
         indexer
             .ingest_block(&bytes, height)
             .expect("fixture block ingests");
@@ -221,7 +218,7 @@ fn the_position_path_reads_ranges_and_never_whole_blocks() {
             BASE_HEIGHT + offset,
             Block {
                 header: header(),
-                txdata: vec![
+                txs: vec![
                     tx_with_outputs(0x40 + seed, vec![out(script(0x77, 22), 11)]),
                     tx_with_outputs(0x50 + seed, vec![out(target.clone(), 12)]),
                 ],
@@ -229,7 +226,7 @@ fn the_position_path_reads_ranges_and_never_whole_blocks() {
         ));
     }
     let (indexer, blocks) = index_blocks(blocks);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
 
     let positioned = FixtureSource::new(blocks.clone(), true);
     let history = indexer
@@ -274,14 +271,10 @@ fn agrees_on_single_funding_output() {
     let target = script(0x11, 22);
     let block = Block {
         header: header(),
-        txdata: vec![tx_with_outputs(1, vec![out(target.clone(), 5_000)])],
+        txs: vec![tx_with_outputs(1, vec![out(target.clone(), 5_000)])],
     };
     let (indexer, blocks) = index_blocks(vec![(BASE_HEIGHT, block)]);
-    assert_resolvers_agree(
-        &indexer,
-        &blocks,
-        ScriptHash::from_script_bytes(target.as_bytes()),
-    );
+    assert_resolvers_agree(&indexer, &blocks, ScriptHash::from_script_bytes(&target));
 }
 
 #[test]
@@ -291,7 +284,7 @@ fn agrees_when_one_transaction_pays_the_target_twice() {
     let target = script(0x22, 22);
     let block = Block {
         header: header(),
-        txdata: vec![tx_with_outputs(
+        txs: vec![tx_with_outputs(
             2,
             vec![
                 out(target.clone(), 1),
@@ -301,7 +294,7 @@ fn agrees_when_one_transaction_pays_the_target_twice() {
         )],
     };
     let (indexer, blocks) = index_blocks(vec![(BASE_HEIGHT, block)]);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
     assert_resolvers_agree(&indexer, &blocks, scripthash);
 
     let source = FixtureSource::new(blocks, true);
@@ -322,14 +315,14 @@ fn agrees_when_two_transactions_in_one_block_pay_the_target() {
     let target = script(0x33, 22);
     let block = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(3, vec![out(target.clone(), 7)]),
             tx_with_outputs(4, vec![out(script(0x88, 22), 8)]),
             tx_with_outputs(5, vec![out(target.clone(), 9)]),
         ],
     };
     let (indexer, blocks) = index_blocks(vec![(BASE_HEIGHT, block)]);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
     assert_resolvers_agree(&indexer, &blocks, scripthash);
     let source = FixtureSource::new(blocks, true);
     assert_eq!(
@@ -348,7 +341,7 @@ fn agrees_across_multiple_heights() {
         .map(|offset| {
             let block = Block {
                 header: header(),
-                txdata: vec![
+                txs: vec![
                     tx_with_outputs(
                         u8::try_from(offset).unwrap_or(0),
                         vec![out(script(0x77, 22), 1)],
@@ -363,11 +356,7 @@ fn agrees_across_multiple_heights() {
         })
         .collect();
     let (indexer, blocks) = index_blocks(blocks);
-    assert_resolvers_agree(
-        &indexer,
-        &blocks,
-        ScriptHash::from_script_bytes(target.as_bytes()),
-    );
+    assert_resolvers_agree(&indexer, &blocks, ScriptHash::from_script_bytes(&target));
 }
 
 #[test]
@@ -377,15 +366,15 @@ fn agrees_when_the_block_source_cannot_resolve_a_height() {
     let target = script(0x55, 22);
     let block = Block {
         header: header(),
-        txdata: vec![tx_with_outputs(6, vec![out(target.clone(), 4)])],
+        txs: vec![tx_with_outputs(6, vec![out(target.clone(), 4)])],
     };
     let mut indexer = Indexer::new(Arc::new(MemoryStore::default()));
     indexer
-        .ingest_block(&bitcoin::consensus::encode::serialize(&block), BASE_HEIGHT)
+        .ingest_block(&consensus_bytes(&block), BASE_HEIGHT)
         .expect("ingest");
     // Source deliberately holds no blocks at all.
     let blocks: HashMap<u32, Block> = HashMap::new();
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
     assert_resolvers_agree(&indexer, &blocks, scripthash);
     let source = FixtureSource::new(blocks, true);
     assert!(
@@ -403,10 +392,10 @@ fn agrees_when_the_target_is_op_return() {
     let target = op_return_script(0x66);
     let block = Block {
         header: header(),
-        txdata: vec![tx_with_outputs(7, vec![out(target.clone(), 0)])],
+        txs: vec![tx_with_outputs(7, vec![out(target.clone(), 0)])],
     };
     let (indexer, blocks) = index_blocks(vec![(BASE_HEIGHT, block)]);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
     assert_resolvers_agree(&indexer, &blocks, scripthash);
     let source = FixtureSource::new(blocks, true);
     assert!(
@@ -421,13 +410,13 @@ fn agrees_when_the_target_is_op_return() {
 fn agrees_for_a_scripthash_that_was_never_indexed() {
     let block = Block {
         header: header(),
-        txdata: vec![tx_with_outputs(8, vec![out(script(0xaa, 22), 1)])],
+        txs: vec![tx_with_outputs(8, vec![out(script(0xaa, 22), 1)])],
     };
     let (indexer, blocks) = index_blocks(vec![(BASE_HEIGHT, block)]);
     assert_resolvers_agree(
         &indexer,
         &blocks,
-        ScriptHash::from_script_bytes(script(0xbb, 22).as_bytes()),
+        ScriptHash::from_script_bytes(&script(0xbb, 22)),
     );
 }
 
@@ -444,7 +433,7 @@ fn stale_positions_from_a_superseded_block_fall_back_to_scanning() {
     // Block A: the target is funded by the second of three transactions.
     let block_a = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(10, vec![out(script(0xa1, 22), 1)]),
             tx_with_outputs(11, vec![out(target.clone(), 2)]),
             tx_with_outputs(12, vec![out(script(0xa2, 22), 3)]),
@@ -454,7 +443,7 @@ fn stale_positions_from_a_superseded_block_fall_back_to_scanning() {
     // twice — at offsets that do not line up with A's.
     let block_b = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(20, vec![out(target.clone(), 4), out(script(0xb1, 22), 5)]),
             tx_with_outputs(21, vec![out(script(0xb2, 22), 6)]),
             tx_with_outputs(22, vec![out(target.clone(), 7)]),
@@ -464,16 +453,13 @@ fn stale_positions_from_a_superseded_block_fall_back_to_scanning() {
     // Index A, then serve B. The rows describe A; the source serves B.
     let mut indexer = Indexer::new(Arc::new(MemoryStore::default()));
     indexer
-        .ingest_block(
-            &bitcoin::consensus::encode::serialize(&block_a),
-            BASE_HEIGHT,
-        )
+        .ingest_block(&consensus_bytes(&block_a), BASE_HEIGHT)
         .expect("ingest A");
 
     let mut served = HashMap::new();
     served.insert(BASE_HEIGHT, block_b);
     let source = FixtureSource::new(served, true);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
 
     let fast = indexer
         .resolve_script_history(scripthash, &source)
@@ -518,7 +504,7 @@ fn a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan() {
     // two blocks place their transactions at identical offsets.
     let block_a = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(40, vec![out(decoy_a.clone(), 1)]),
             tx_with_outputs(41, vec![out(target.clone(), 2)]),
             tx_with_outputs(42, vec![out(decoy_a, 3)]),
@@ -526,7 +512,7 @@ fn a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan() {
     };
     let block_b = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(50, vec![out(decoy_b.clone(), 4)]),
             // Same slot as A's target transaction, but funds a decoy.
             tx_with_outputs(51, vec![out(decoy_b, 5)]),
@@ -535,8 +521,8 @@ fn a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan() {
         ],
     };
 
-    let a_bytes = bitcoin::consensus::encode::serialize(&block_a);
-    let b_bytes = bitcoin::consensus::encode::serialize(&block_b);
+    let a_bytes = consensus_bytes(&block_a);
+    let b_bytes = consensus_bytes(&block_b);
     assert_eq!(
         a_bytes.len(),
         b_bytes.len(),
@@ -551,7 +537,7 @@ fn a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan() {
     let mut served = HashMap::new();
     served.insert(BASE_HEIGHT, block_b);
     let source = FixtureSource::new(served, true);
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
 
     let history = indexer
         .resolve_script_history(scripthash, &source)
@@ -591,7 +577,7 @@ fn rows_without_positions_fall_back_to_scanning() {
     let target = script(0x88, 22);
     let block = Block {
         header: header(),
-        txdata: vec![
+        txs: vec![
             tx_with_outputs(30, vec![out(target.clone(), 1)]),
             tx_with_outputs(31, vec![out(target.clone(), 2)]),
         ],
@@ -613,7 +599,7 @@ fn rows_without_positions_fall_back_to_scanning() {
         store.write(batch).expect("blank values");
     }
 
-    let scripthash = ScriptHash::from_script_bytes(target.as_bytes());
+    let scripthash = ScriptHash::from_script_bytes(&target);
     assert_resolvers_agree(&indexer, &blocks, scripthash);
 
     let source = FixtureSource::new(blocks, true);
@@ -669,14 +655,14 @@ proptest! {
                 })
                 .collect();
             let height = BASE_HEIGHT + u32::try_from(block_idx).unwrap_or(0);
-            blocks.push((height, Block { header: header(), txdata }));
+            blocks.push((height, Block { header: header(), txs: txdata }));
         }
 
         let (indexer, indexed) = index_blocks(blocks);
         assert_resolvers_agree(
             &indexer,
             &indexed,
-            ScriptHash::from_script_bytes(target.as_bytes()),
+            ScriptHash::from_script_bytes(&target),
         );
     }
 }

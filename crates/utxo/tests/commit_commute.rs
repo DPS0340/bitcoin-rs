@@ -13,7 +13,6 @@
 //! parallel path. Each result is also checked against an independent `HashMap` oracle,
 //! so the paths cannot be *equally* wrong.
 
-use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoError, UtxoSet, hash_serialized_3};
 use hashbrown::HashMap;
@@ -76,8 +75,8 @@ fn txout(seed: u64) -> TxOut {
     script.extend_from_slice(&seed.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes());
     script.extend_from_slice(&seed.wrapping_add(0x9e37_79b9_7f4a_7c15).to_le_bytes());
     TxOut {
-        value: Amount::from_sat(5_000 + (seed % 1_000_000)),
-        script_pubkey: ScriptBuf::from_bytes(script),
+        value: 5_000 + (seed % 1_000_000),
+        script_pubkey: script,
     }
 }
 
@@ -87,7 +86,7 @@ fn workload(shape: ShardShape) -> Vec<Entry> {
     for index in 0..ENTRY_COUNT {
         let seed = next_u64(&mut rng);
         entries.push(Entry {
-            op: OutPoint::new(shaped_txid(seed, index, shape), 0),
+            op: OutPoint::new(shaped_txid(seed, index, shape).into(), 0),
             txout: txout(seed),
             coinbase: false,
             height: 2,
