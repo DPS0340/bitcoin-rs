@@ -379,6 +379,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "parking_lot",
  "proptest",
+ "serde_json",
  "sha2 0.11.0",
  "smallvec",
  "tempfile",
