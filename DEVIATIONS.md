@@ -418,3 +418,28 @@ buys 12 points of the 16 GiB tip-RSS budget. **If G14 tip RSS measures well
 under budget — say below 10 GiB — this complexity is not earning its keep and
 reverting is the right call.** v4 remains in the tree as the equivalence oracle
 and the benchmark's `before` arm, so a revert is a revert, not a rewrite.
+
+## One-session overhaul: filter index re-introduced behind the extension model
+
+The Task 9 removal of `crates/filters` (above) removed a derived index that
+had no in-tree consumer. The one-session overhaul re-introduces the BIP157/158
+basic filter index as the second reconciliation consumer on the chain-event
+boundary (`docs/contracts/chain-events.md`, `docs/contracts/extensions.md`),
+which is the consumer the removal said derived state needs to earn its cost:
+
+- `crates/ext-blockfilterindex` owns the namespace schema; the worker loop
+  lives in `crates/node/src/filterindex_worker.rs`, mirroring the txindex
+  consumer shape (cursor + one atomic batch per block, no inline apply
+  writes).
+- `getblockfilter` ships again, but requires the `--blockfilterindex`
+  runtime toggle and answers the Core "Index is not enabled" error without
+  it; the REST blockfilter routes keep their registered-but-unavailable
+  posture unless the extension runs.
+- `--blockfilterindex` / `BITCOIN_RS_BLOCKFILTERINDEX` / the
+  `bitcoin.conf` `blockfilterindex` key are recognized again. Validation
+  rejects `blockfilterindex requires txindex` and
+  `blockfilterindex requires prune disabled` combinations before
+  `NodeState::open`.
+- The `getcapabilities` pending extension row shipped; `getindexinfo` gains
+  a `basicblockfilterindex` entry only while the extension runs, preserving
+  the absent-filter contract recorded at removal time.

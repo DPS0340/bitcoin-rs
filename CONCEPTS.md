@@ -351,3 +351,20 @@ The rule that one logical record has exactly one byte string. Fixed-width fields
 
 ### Work-count assertion
 Asserting how much of an expensive operation a code path performs, instead of how long it takes. A wall-clock assertion in a test suite is a flake generator, and an assertion that a function merely returns something passes for a stub. `find_output_decompresses_at_most_the_amount_it_returns` counts `decompress_amount` calls behind a `cfg(test)` thread-local and requires one for a hit, none for a miss and none for `max_vout`, at any record size — which is the algorithmic claim the layout rests on, stated deterministically. The counterpart is the case a count cannot make: where the claim really is about elapsed time, the assertion belongs in a paired-arm benchmark, not a test.
+### Chain snapshot
+The coherent, non-torn view of the applied tip the chain-event publisher keeps in one `RwLock`ed cell: `{ epoch, sequence, tip_hash, tip_height }` (`crates/node/src/state.rs`). The single writer replaces the whole cell per commit, so a reader never mixes two commit points. `epoch` is a persisted, strictly monotonic per-data-dir counter that makes an old run's cursors stale; `sequence` advances once per committed connect or disconnect and starts at 1. The snapshot is live state, never persisted per-event; readers take `NodeState::active_chain_snapshot`.
+
+### Chain-event hint
+The bounded-channel wake-up `ChainEventPublisher::record` emits after replacing the snapshot cell: `{ kind, height, hash, epoch, sequence }`, one per committed connect or disconnect. Hints carry no payload to apply and a full channel drops them without blocking the commit path; recovery is always positional re-planning over the chain itself. Hints are not a recovery log.
+
+### Reconciliation consumer
+An index that mirrors the applied chain by re-planning positionally against a fresh chain snapshot instead of receiving inline writes from the apply path. The txindex worker is the reference consumer; the BIP157/158 filter index is the second (`crates/node/src/filterindex_worker.rs`), which is what makes the seam real rather than a naming convention. A consumer owns its rows, its cursor, and its batch atomicity, and a failure or lag in it can never stall block application.
+
+### Consumer cursor
+The durable 52-byte record `{ epoch, sequence, height, hash }` naming the exact chain state a consumer's rows already mirror (`crates/node/src/reconcile.rs`). Position (`height`, `hash`) anchors row truth; `epoch` and `sequence` are advisory identity that a restart or epoch bump invalidates without invalidating rows. It is written only when the publisher snapshot provably names the tip the rows reached, and always in the same atomic batch as the row mutations it describes.
+
+### Extension capability
+The named, compiled-in service unit the extension registry reports and validates: an `ExtensionDescriptor` carries the id, namespace directory, schema version, and required/incompatible capability ids, and exists even when the runtime toggle is off. Enabled instances live or fail independently of core (`docs/contracts/extensions.md`); `getcapabilities` reports the live `CapabilitySnapshot` with compiled/enabled/state per capability.
+
+### Filter-header pointer
+The namespace-owned `(height, hash)` marker for the newest block whose BIP157 filter header the consumer's header chain provably ends at (`crates/ext-blockfilterindex`). Because filter and header rows are hash-addressed, a reorg rewinds only this pointer and the consumer cursor — rows are retained and re-derived rows are idempotent overwrites — which is the disconnect contract that lets the filter consumer share the txindex reconciliation shape without row deletion.
