@@ -36,6 +36,8 @@ pub mod bip66;
 pub mod bip68;
 /// BIP9 versionbits checks.
 pub mod bip9;
+/// Parse-once block state shared by the native apply path.
+pub mod block_view;
 /// Non-terminal CHECKSIG census checkpoint ABI wrapper.
 #[cfg(feature = "checksig-census")]
 pub mod census_checkpoint;
@@ -51,6 +53,7 @@ pub mod verify_block;
 pub mod verify_tx;
 
 pub use bip9::{DeploymentContext, DeploymentParams, DeploymentState, compute_state};
+pub use block_view::BlockView;
 pub use rust_path::{TipState, UtxoView};
 pub use verify_block::{
     BlockRuleContext, verify_block_rules, verify_block_rules_precomputed,

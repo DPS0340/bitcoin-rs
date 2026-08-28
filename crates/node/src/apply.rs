@@ -50,58 +50,9 @@ fn is_coinbase_tx(tx: &Tx) -> bool {
         && tx.inputs[0].previous_output.vout == u32::MAX
 }
 
-/// BIP141 witness-commitment precheck with exact semantics.
-///
-/// Finds the highest matching `OP_RETURN` `PUSH36` {aa 21 a9 ed} output (>=38 bytes),
-/// verifies the coinbase witness first item is exactly 32 bytes (the reserved value),
-/// uses the all-zero coinbase wtxid as the witness merkle leaf, and checks
-/// `SHA256d(witness_merkle_root || reserved) == commitment`.
-fn check_witness_commitment(block: &Block) -> bool {
-    const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-
-    let Some(coinbase) = block.txs.first() else {
-        return false;
-    };
-    // Highest matching output: iterate in reverse to find the last one.
-    let Some(commitment) = coinbase
-        .outputs
-        .iter()
-        .rev()
-        .find(|output| {
-            output.script_pubkey.len() >= 38
-                && output.script_pubkey[..6] == WITNESS_COMMITMENT_PREFIX
-        })
-        .map(|output| &output.script_pubkey[6..38])
-    else {
-        return false;
-    };
-    // Coinbase witness first item must be exactly 32 bytes (the reserved value).
-    let Some(reserved) = coinbase.inputs.first().and_then(|inp| inp.witness.first()) else {
-        return false;
-    };
-    if reserved.len() != 32 {
-        return false;
-    }
-
-    // Build witness merkle leaves: coinbase leaf is all-zero (its wtxid is zero per BIP141).
-    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(block.txs.len());
-    for (index, tx) in block.txs.iter().enumerate() {
-        leaves.push(if index == 0 {
-            [0_u8; 32]
-        } else {
-            *tx.wtxid().as_bytes()
-        });
-    }
-    let Some(root) = merkle_root_bytes(&mut leaves) else {
-        return false;
-    };
-
-    let mut buffer = [0_u8; 64];
-    buffer[..32].copy_from_slice(&root);
-    buffer[32..].copy_from_slice(reserved);
-    sha256d(&buffer) == *commitment
-}
-
+/// Double SHA256, kept next to the witness merkle reduction its only remaining
+/// caller (a test fixture helper) uses.
+#[cfg(test)]
 fn sha256d(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let inner = Sha256::digest(data);
@@ -109,6 +60,10 @@ fn sha256d(data: &[u8]) -> [u8; 32] {
     outer.into()
 }
 
+/// Merkle reduction over 32-byte leaves, duplicating the last leaf on odd
+/// widths; test-fixture helper after the witness-commitment precheck moved to
+/// the consensus crate.
+#[cfg(test)]
 fn merkle_root_bytes(leaves: &mut Vec<[u8; 32]>) -> Option<[u8; 32]> {
     if leaves.is_empty() {
         return None;
@@ -1807,11 +1762,11 @@ impl std::error::Error for WindowApplyError {
 /// predecessor, a prevout that does not resolve, or any failing check all
 /// return nothing.
 #[allow(clippy::too_many_lines)]
-fn prove_window(
+fn prove_window<'a>(
     handles: &ApplyHandles,
-    blocks: &[&Block],
+    blocks: &[&'a Block],
     serialized: &[bytes::Bytes],
-) -> Vec<ProvenApply> {
+) -> Vec<ProvenApply<'a>> {
     if blocks.is_empty() || blocks.len() != serialized.len() {
         return Vec::new();
     }
@@ -1887,14 +1842,16 @@ fn prove_window(
     let mut overlay = crate::window_overlay::WindowOverlay::new(handles.utxo.as_ref());
     let mut prepared = Vec::with_capacity(blocks.len());
     for ((block, parsed), context) in blocks.iter().zip(parsed).zip(&contexts) {
-        let Ok((kernel_block, tx_plan)) = parsed else {
+        let Ok((kernel_block, txids)) = parsed else {
             return Vec::new();
         };
+        let tx_plan = plan_block_transactions(block, &txids);
+        let view = bitcoin_rs_consensus::BlockView::new(&block.txs, txids);
         let resolved = Arc::new(ResolvedUtxoView::resolve(&overlay, block, &tx_plan));
         if overlay
             .advance(
                 block,
-                tx_plan.txids(),
+                view.txids(),
                 context.height,
                 tx_plan.same_block_spent_set(),
             )
@@ -1904,6 +1861,7 @@ fn prove_window(
         }
         prepared.push(PreparedApply {
             kernel_block,
+            view,
             tx_plan,
             resolved,
         });
@@ -1922,27 +1880,30 @@ fn prove_window(
     // script verification for a block that is rejected immediately either way.
     // Both checks below depend on nothing but the block, so running them here
     // costs a hash per block and removes the amplification.
-    let max_txs = blocks.iter().map(|b| b.txs.len()).max().unwrap_or(0);
-    let mut merkle_scratch = Vec::with_capacity(max_txs);
-    for (block, (unit, context)) in blocks.iter().zip(prepared.iter().zip(&contexts)) {
-        merkle_scratch.clear();
-        merkle_scratch.extend_from_slice(unit.tx_plan.txids());
+    for ((block, unit), context) in blocks.iter().zip(prepared.iter_mut()).zip(&contexts) {
         if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
             block,
-            &mut merkle_scratch,
+            unit.view.txids(),
         ) {
             return Vec::new();
         }
         // BIP141: a missing commitment is fatal only when the block carries
         // witness data anyway; a commitment-less block without witness data is
-        // valid under active segwit.
+        // valid under active segwit. The commitment check consumes the view's
+        // cached witness IDs, so a block hashes its transactions as witness
+        // IDs exactly once across the whole window.
         if context
             .flags
             .contains(bitcoin_rs_script::VerifyFlags::WITNESS)
             && bitcoin_rs_consensus::verify_block::block_has_witness(block)
-            && !check_witness_commitment(block)
         {
-            return Vec::new();
+            let commitment_matches = {
+                let wtxids = unit.view.witness_ids();
+                bitcoin_rs_consensus::verify_block::block_witness_commitment_matches(block, wtxids)
+            };
+            if !commitment_matches {
+                return Vec::new();
+            }
         }
     }
 
@@ -1964,8 +1925,11 @@ fn prove_window(
         // split within one.
         let mut units = Vec::with_capacity(prepared.len());
         let mut flags: Vec<bitcoin_rs_script::VerifyFlags> = Vec::with_capacity(prepared.len());
-        for (index, ((block, unit), context)) in
-            blocks.iter().zip(&prepared).zip(&contexts).enumerate()
+        for (index, ((block, unit), context)) in blocks
+            .iter()
+            .zip(prepared.iter_mut())
+            .zip(&contexts)
+            .enumerate()
         {
             // The same predicate the single-block path applies, per block rather
             // than per window, because the anchor height can fall inside a
@@ -1984,12 +1948,13 @@ fn prove_window(
                 block,
                 &unit.tx_plan,
                 context.height,
+                unit.view.txids(),
             ) else {
                 return Vec::new();
             };
+            unit.view.set_resolved(resolved);
             match bitcoin_rs_consensus::verify_tx::prepare_block_script_checks(
-                &block.txs,
-                resolved,
+                &mut unit.view,
                 context.height,
                 context.locktime_cutoff,
                 &unit.kernel_block,
@@ -2052,8 +2017,8 @@ struct BlockValidationContext {
 /// The proof is private, single-use, and owns the prepared state it certifies.
 /// It is constructed only after the whole window verifier succeeds, so callers
 /// cannot pair a block's verdict with foreign resolved prevouts.
-struct BlockValidationProof {
-    prepared: PreparedApply,
+struct BlockValidationProof<'b> {
+    prepared: PreparedApply<'b>,
     context: BlockValidationContext,
 }
 
@@ -2061,9 +2026,9 @@ struct BlockValidationProof {
 ///
 /// Assume-valid is not proof. A skipped block must re-enter the ordinary
 /// transaction path at commit so it reads the trust gate in its current state.
-enum ProvenApply {
-    Proven(BlockValidationProof),
-    AssumeValidSkipped(PreparedApply),
+enum ProvenApply<'b> {
+    Proven(BlockValidationProof<'b>),
+    AssumeValidSkipped(PreparedApply<'b>),
 }
 
 /// Everything a block's application needs that depends only on the block and
@@ -2073,8 +2038,12 @@ enum ProvenApply {
 /// at once, against one ordered overlay, and share a single script dispatch.
 /// The measured duplication that made an earlier batching attempt a wash was
 /// exactly the kernel parse and the prevout resolution below being done twice.
-struct PreparedApply {
+struct PreparedApply<'b> {
     kernel_block: bitcoin_rs_consensus::kernel::KernelBlock,
+    /// Parse-once transaction state: identities computed once in
+    /// [`parse_block_for_apply`], witness IDs on demand, and the prevout
+    /// matrix installed once right before script verification.
+    view: bitcoin_rs_consensus::BlockView<'b>,
     tx_plan: BlockTxPlan,
     resolved: Arc<ResolvedUtxoView>,
 }
@@ -2138,7 +2107,7 @@ pub(crate) fn bytes_are_block(raw: &[u8], block: &Block) -> bool {
 fn parse_block_for_apply(
     block: &Block,
     provided_serialized: Option<bytes::Bytes>,
-) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, BlockTxPlan), ApplyError> {
+) -> core::result::Result<(bitcoin_rs_consensus::kernel::KernelBlock, Vec<Txid>), ApplyError> {
     // Preserved bytes must BE this block, not merely agree with it on
     // transaction count. In kernel builds the txids and the transactions that
     // script verification runs come from these bytes, while the witness
@@ -2155,24 +2124,47 @@ fn parse_block_for_apply(
             ),
         ));
     }
-    let raw_block: bytes::Bytes =
-        provided_serialized.unwrap_or_else(|| bytes::Bytes::from(consensus_bytes(block)));
-    let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
-        .map_err(ApplyError::Consensus)?;
-    if kernel_block.transaction_count() != block.txs.len() {
-        return Err(ApplyError::Consensus(
-            bitcoin_rs_consensus::ConsensusError::Kernel(format!(
-                "kernel parsed {} transactions, decoder produced {}",
-                kernel_block.transaction_count(),
-                block.txs.len()
-            )),
-        ));
-    }
-    let tx_plan = plan_block_transactions_with_txids(
-        block,
-        kernel_block.txids().map_err(ApplyError::Consensus)?,
+    #[cfg(feature = "kernel")]
+    let (kernel_block, txids) = {
+        let raw_block: bytes::Bytes =
+            provided_serialized.unwrap_or_else(|| bytes::Bytes::from(consensus_bytes(block)));
+        let kernel_block = bitcoin_rs_consensus::kernel::KernelBlock::parse(&raw_block)
+            .map_err(ApplyError::Consensus)?;
+        if kernel_block.transaction_count() != block.txs.len() {
+            return Err(ApplyError::Consensus(
+                bitcoin_rs_consensus::ConsensusError::Kernel(format!(
+                    "kernel parsed {} transactions, decoder produced {}",
+                    kernel_block.transaction_count(),
+                    block.txs.len()
+                )),
+            ));
+        }
+        let txids = kernel_block.txids().map_err(ApplyError::Consensus)?;
+        (kernel_block, txids)
+    };
+    // Without the kernel there is no second parse to harvest identities from,
+    // so hash each transaction of the already-decoded block exactly once.
+    // Re-decoding the preserved bytes here would make the native path pay two
+    // full decodes plus one consensus re-serialization per block.
+    #[cfg(not(feature = "kernel"))]
+    let (kernel_block, txids) = (
+        bitcoin_rs_consensus::kernel::KernelBlock,
+        block_txids(block),
     );
-    Ok((kernel_block, tx_plan))
+    Ok((kernel_block, txids))
+}
+
+/// Transaction IDs of an already-decoded block, hashed exactly once.
+///
+/// Blocks beyond the threshold the window verifier uses fan the hashing out;
+/// below it, serial iteration wins because dispatch costs more than the
+/// per-transaction double SHA256.
+fn block_txids(block: &Block) -> Vec<Txid> {
+    if block.txs.len() > 32 {
+        block.txs.par_iter().map(Tx::txid).collect()
+    } else {
+        block.txs.iter().map(Tx::txid).collect()
+    }
 }
 
 /// Parses a block and resolves the outputs it spends.
@@ -2180,15 +2172,18 @@ fn parse_block_for_apply(
 /// `source` is where prevouts come from. Every caller outside a window passes
 /// the committed UTXO set; a window passes an overlay so a block can see
 /// outputs an earlier block in the same window created.
-fn prepare_apply<S: crate::window_overlay::OutputSource + ?Sized>(
-    block: &Block,
+fn prepare_apply<'b, S: crate::window_overlay::OutputSource + ?Sized>(
+    block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
     source: &S,
-) -> core::result::Result<PreparedApply, ApplyError> {
-    let (kernel_block, tx_plan) = parse_block_for_apply(block, provided_serialized)?;
+) -> core::result::Result<PreparedApply<'b>, ApplyError> {
+    let (kernel_block, txids) = parse_block_for_apply(block, provided_serialized)?;
+    let tx_plan = plan_block_transactions(block, &txids);
+    let view = bitcoin_rs_consensus::BlockView::new(&block.txs, txids);
     let resolved = Arc::new(ResolvedUtxoView::resolve(source, block, &tx_plan));
     Ok(PreparedApply {
         kernel_block,
+        view,
         tx_plan,
         resolved,
     })
@@ -2215,11 +2210,11 @@ fn apply_block_inner(
 /// on the write side, and would leave gaps in which another applier could move
 /// the chain out from under prepared state.
 #[allow(clippy::too_many_lines)]
-fn apply_block_admitted(
+fn apply_block_admitted<'b>(
     handles: &ApplyHandles,
-    block: &Block,
+    block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
-    proven: Option<ProvenApply>,
+    proven: Option<ProvenApply<'b>>,
     _transition: &ChainTransition<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let total_started = quanta::Instant::now();
@@ -2296,6 +2291,7 @@ fn apply_block_admitted(
     };
     let PreparedApply {
         kernel_block,
+        mut view,
         tx_plan,
         resolved,
     } = prepared;
@@ -2306,12 +2302,20 @@ fn apply_block_admitted(
     check_unseen_header_timestamp(handles, block, block_hash)?;
 
     let block_rules_started = quanta::Instant::now();
+    // Witness IDs are needed only for a witness-carrying block under active
+    // segwit; the view computes them once and the commitment check consumes
+    // the cache, so witness-free blocks never serialize-and-hash for wtxids.
+    let needs_wtxids = softfork_state.segwit_active && tx_plan.witness_presence.is_present();
+    if needs_wtxids {
+        view.witness_ids();
+    }
     let block_rules_result = bitcoin_rs_consensus::verify_block_rules_precomputed(
         block,
         bitcoin_rs_consensus::BlockRuleContext {
             segwit_active: softfork_state.segwit_active,
         },
-        tx_plan.txids(),
+        view.txids(),
+        view.computed_witness_ids().unwrap_or(&[]),
         tx_plan.witness_presence.is_present(),
     );
     let block_rules_dur = block_rules_started.elapsed();
@@ -2322,7 +2326,7 @@ fn apply_block_admitted(
     let bip30_bip34_started = quanta::Instant::now();
     let previous_tip_id = prior.as_deref().map(|tip| tip.tip_id);
     let bip30_bip34_result =
-        check_bip30_and_bip34(handles, block, height, tx_plan.txids(), previous_tip_id);
+        check_bip30_and_bip34(handles, block, height, view.txids(), previous_tip_id);
     let bip30_bip34_dur = bip30_bip34_started.elapsed();
     metrics::histogram!("node.apply_block.bip30_bip34_seconds")
         .record(bip30_bip34_dur.as_secs_f64());
@@ -2345,6 +2349,7 @@ fn apply_block_admitted(
         verify_block_transactions(
             handles,
             block,
+            &mut view,
             &tx_plan,
             Arc::clone(&resolved),
             height,
@@ -2373,6 +2378,7 @@ fn apply_block_admitted(
         handles,
         block,
         &tx_plan,
+        view.txids(),
         Arc::clone(&resolved),
         height,
     );
@@ -2386,6 +2392,7 @@ fn apply_block_admitted(
         handles,
         block,
         &tx_plan,
+        view.txids(),
         Arc::clone(&resolved),
         height,
         prev_median_time_past,
@@ -2403,7 +2410,7 @@ fn apply_block_admitted(
         .as_ref()
         .is_some_and(|sampler| sampler.wants_height(height));
     let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
-        tx_plan.into_scratch_parts();
+        tx_plan.into_scratch_parts(view.into_txids());
     let scratch = ApplyScratch::from_prepared_parts(
         block,
         wants_rawtx,
@@ -2774,7 +2781,6 @@ fn applied_header_tip(
 }
 
 struct BlockTxPlan {
-    txids: Vec<Txid>,
     only_coinbase: bool,
     needs_local_utxo_overlay: bool,
     overlay_capacity: usize,
@@ -2798,12 +2804,9 @@ impl BlockTxPlan {
         self.same_block_spent.as_ref().unwrap_or(&NONE)
     }
 
-    fn txids(&self) -> &[Txid] {
-        &self.txids
-    }
-
     fn into_scratch_parts(
         self,
+        txids: Vec<Txid>,
     ) -> (
         Vec<Txid>,
         ApplyScratchCapacities,
@@ -2811,7 +2814,7 @@ impl BlockTxPlan {
         usize,
     ) {
         (
-            self.txids,
+            txids,
             ApplyScratchCapacities {
                 created_outputs: self.created_output_count,
                 spent_inputs: self.spent_input_count,
@@ -2842,23 +2845,14 @@ impl WitnessPresence {
     }
 }
 
-#[cfg(test)]
-fn plan_block_transactions(block: &Block) -> BlockTxPlan {
-    let txids: Vec<Txid> = if block.txs.len() > 32 {
-        block.txs.par_iter().map(Tx::txid).collect()
-    } else {
-        block.txs.iter().map(Tx::txid).collect()
-    };
-    plan_block_transactions_with_txids(block, txids)
-}
-
 /// Plans a block whose txids are already known.
 ///
-/// The kernel's one-shot block parse hashes every transaction on the way past,
-/// using the SHA-256 implementation Core picks at runtime, so the apply path
-/// hands those txids straight in rather than re-hashing with a scalar
-/// implementation.
-fn plan_block_transactions_with_txids(block: &Block, txids: Vec<Txid>) -> BlockTxPlan {
+/// Identities come from the parse-once view: the kernel parse hashes every
+/// transaction on the way past using the SHA-256 implementation Core picks at
+/// runtime, and the native build hashes each transaction once in
+/// [`block_txids`]. Either way the plan borrows them instead of re-hashing
+/// with a scalar implementation.
+fn plan_block_transactions(block: &Block, txids: &[Txid]) -> BlockTxPlan {
     let mut only_coinbase = true;
     let mut needs_local_utxo_overlay = false;
     let mut overlay_capacity = 0usize;
@@ -2930,7 +2924,6 @@ fn plan_block_transactions_with_txids(block: &Block, txids: Vec<Txid>) -> BlockT
     }
 
     BlockTxPlan {
-        txids,
         only_coinbase,
         needs_local_utxo_overlay,
         overlay_capacity,
@@ -3023,8 +3016,8 @@ fn resolve_block_prevouts(
     block: &Block,
     tx_plan: &BlockTxPlan,
     height: u32,
+    txids: &[Txid],
 ) -> core::result::Result<Vec<Vec<Option<TxOut>>>, ApplyError> {
-    let txids = tx_plan.txids();
     if tx_plan.needs_local_utxo_overlay {
         let mut view =
             BlockLocalUtxoView::new(resolved, &block.txs, height, tx_plan.overlay_capacity);
@@ -3124,6 +3117,7 @@ fn run_non_script_checks_only(
 fn verify_block_transactions(
     handles: &ApplyHandles,
     block: &Block,
+    view: &mut bitcoin_rs_consensus::BlockView<'_>,
     tx_plan: &BlockTxPlan,
     resolved: Arc<ResolvedUtxoView>,
     height: u32,
@@ -3131,8 +3125,7 @@ fn verify_block_transactions(
     flags: bitcoin_rs_script::VerifyFlags,
     kernel_block: &bitcoin_rs_consensus::kernel::KernelBlock,
 ) -> core::result::Result<(), ApplyError> {
-    let txids = tx_plan.txids();
-    debug_assert_eq!(block.txs.len(), txids.len());
+    debug_assert_eq!(block.txs.len(), view.txids().len());
     if tx_plan.only_coinbase {
         for tx in &block.txs {
             bitcoin_rs_consensus::verify_tx::verify_coinbase_script_sig_size(tx)?;
@@ -3149,7 +3142,7 @@ fn verify_block_transactions(
             block,
             tx_plan,
             resolved,
-            txids,
+            view.txids(),
             height,
             locktime_cutoff,
         );
@@ -3162,18 +3155,19 @@ fn verify_block_transactions(
     // later transaction sees outputs an earlier one created (or spent) in the same
     // block; the non-overlay case reads the committed shared set directly.
     let resolution_started = quanta::Instant::now();
-    let resolution_result = resolve_block_prevouts(resolved, block, tx_plan, height);
+    let resolution_result =
+        resolve_block_prevouts(resolved, block, tx_plan, height, view.txids());
     let resolution_dur = resolution_started.elapsed();
     metrics::histogram!("node.apply_block.script_resolution_seconds")
         .record(resolution_dur.as_secs_f64());
     let resolved = resolution_result?;
+    view.set_resolved(resolved);
     // preparation and parallel input-check fan-out internally and reports both
     // sub-stage durations back; record them here on the success and error paths
     // before propagating the verdict, mirroring the surrounding `*_result` idiom.
     let mut script_timings = bitcoin_rs_consensus::ScriptStageTimings::default();
     let script_input_result = bitcoin_rs_consensus::verify_block_input_scripts(
-        &block.txs,
-        resolved,
+        view,
         height,
         locktime_cutoff,
         flags,
@@ -3268,23 +3262,24 @@ pub(crate) fn check_coinbase_maturity(
     block: &Block,
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
-    let tx_plan = plan_block_transactions(block);
+    let tx_plan = plan_block_transactions(block, &block_txids(block));
     let resolved = Arc::new(ResolvedUtxoView::resolve(
         handles.utxo.as_ref(),
         block,
         &tx_plan,
     ));
-    check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, resolved, height)
+    let txids = block_txids(block);
+    check_coinbase_maturity_with_tx_plan(handles, block, &tx_plan, &txids, resolved, height)
 }
 
 fn check_coinbase_maturity_with_tx_plan(
     _handles: &ApplyHandles,
     block: &Block,
     tx_plan: &BlockTxPlan,
+    txids: &[Txid],
     resolved: Arc<ResolvedUtxoView>,
     height: u32,
 ) -> core::result::Result<(), ApplyError> {
-    let txids = tx_plan.txids();
     debug_assert_eq!(block.txs.len(), txids.len());
     if tx_plan.only_coinbase {
         return Ok(());
@@ -3340,6 +3335,7 @@ fn check_bip68_sequence_locks(
     handles: &ApplyHandles,
     block: &Block,
     tx_plan: &BlockTxPlan,
+    txids: &[Txid],
     resolved: Arc<ResolvedUtxoView>,
     height: u32,
     mtp: u32,
@@ -3356,7 +3352,6 @@ fn check_bip68_sequence_locks(
         return Ok(());
     }
 
-    let txids = tx_plan.txids();
     debug_assert_eq!(block.txs.len(), txids.len());
     let mut view = BlockLocalUtxoView::new(resolved, &block.txs, height, tx_plan.overlay_capacity);
     let mut prevout_mtp_by_height = None;
@@ -3811,7 +3806,7 @@ mod consensus_rule_tests {
     }
 
     fn tx_plan(block: &Block) -> BlockTxPlan {
-        plan_block_transactions(block)
+        plan_block_transactions(block, &block_txids(block))
     }
 
     #[test]
@@ -3929,6 +3924,7 @@ mod consensus_rule_tests {
         verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4056,6 +4052,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4115,6 +4112,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4192,6 +4190,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4233,6 +4232,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4267,6 +4267,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4375,6 +4376,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4408,6 +4410,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4441,6 +4444,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4474,6 +4478,7 @@ mod consensus_rule_tests {
         verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4497,6 +4502,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4531,6 +4537,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4568,6 +4575,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4606,6 +4614,7 @@ mod consensus_rule_tests {
         let error = match verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &tx_plan(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -4744,6 +4753,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -4770,6 +4780,7 @@ mod consensus_rule_tests {
             verify_block_transactions(
                 &handles,
                 &block,
+                &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
                 &tx_plan(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
@@ -4787,6 +4798,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -4817,6 +4829,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -4836,6 +4849,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -4871,6 +4885,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -4890,6 +4905,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -4923,6 +4939,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -4968,6 +4985,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -4999,6 +5017,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -5029,6 +5048,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -5066,6 +5086,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -5102,6 +5123,7 @@ mod consensus_rule_tests {
             &handles,
             &block,
             &tx_plan(&block),
+            &block_txids(&block),
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
                 &block,
@@ -5135,6 +5157,7 @@ mod consensus_rule_tests {
                 &handles,
                 &block,
                 &tx_plan(&block),
+                &block_txids(&block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &block,
@@ -5165,6 +5188,7 @@ mod consensus_rule_tests {
                 &handles,
                 &version_one_block,
                 &tx_plan(&version_one_block),
+                &block_txids(&version_one_block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &version_one_block,
@@ -5188,6 +5212,7 @@ mod consensus_rule_tests {
                 &handles,
                 &disabled_block,
                 &tx_plan(&disabled_block),
+                &block_txids(&disabled_block),
                 Arc::new(ResolvedUtxoView::resolve(
                     handles.utxo.as_ref(),
                     &disabled_block,
@@ -8234,6 +8259,7 @@ mod consensus_rule_tests {
         verify_block_transactions(
             &handles,
             &block,
+            &mut bitcoin_rs_consensus::BlockView::new(&block.txs, block_txids(&block)),
             &plan,
             Arc::new(ResolvedUtxoView::resolve(
                 handles.utxo.as_ref(),
@@ -8252,6 +8278,7 @@ mod consensus_rule_tests {
         let err = match verify_block_transactions(
             &handles2,
             &block2,
+            &mut bitcoin_rs_consensus::BlockView::new(&block2.txs, block_txids(&block2)),
             &plan2,
             Arc::new(ResolvedUtxoView::resolve(
                 handles2.utxo.as_ref(),

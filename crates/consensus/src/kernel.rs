@@ -223,44 +223,22 @@ pub struct KernelContext;
 #[cfg(not(feature = "kernel"))]
 /// Portable-build stand-in for the kernel's one-shot block parse.
 ///
-/// The kernel build gets every txid out of `libbitcoinkernel`'s parse for free.
-/// Without the kernel there is no such parse, so this decodes with the native
-/// primitives and hashes each transaction. That is slower than the kernel path
-/// by design: the portable backend exists for differential testing, not for
-/// throughput.
-pub struct KernelBlock {
-    txids: Vec<bitcoin_rs_primitives::Txid>,
-}
+/// The native apply path computes every transaction ID directly from the
+/// decoded block it already owns, so this marker carries no data. It keeps
+/// the prepared-apply shape identical across backends without taking a
+/// second owned copy of the block's txids.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KernelBlock;
 
 #[cfg(not(feature = "kernel"))]
 impl KernelBlock {
-    /// Decodes `raw_block` and computes its txids.
+    /// Decodes `raw_block` to validate preserved block bytes.
     ///
     /// # Errors
     /// Returns [`ConsensusError::Kernel`] if `raw_block` is not a valid block.
     pub fn parse(raw_block: &[u8]) -> Result<Self, crate::ConsensusError> {
-        let block = bitcoin_rs_primitives::Block::consensus_decode(raw_block)
+        bitcoin_rs_primitives::Block::consensus_decode(raw_block)
             .map_err(|error| crate::ConsensusError::Kernel(error.to_string()))?;
-        Ok(Self {
-            txids: block
-                .txs
-                .iter()
-                .map(bitcoin_rs_primitives::Tx::txid)
-                .collect(),
-        })
-    }
-
-    /// Txids in block order.
-    ///
-    /// # Errors
-    /// Never fails in this build; the signature matches the kernel one.
-    pub fn txids(&self) -> Result<Vec<bitcoin_rs_primitives::Txid>, crate::ConsensusError> {
-        Ok(self.txids.clone())
-    }
-
-    /// Transaction count as parsed.
-    #[must_use]
-    pub fn transaction_count(&self) -> usize {
-        self.txids.len()
+        Ok(Self)
     }
 }

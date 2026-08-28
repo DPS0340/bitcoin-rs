@@ -72,8 +72,7 @@ fn benchmark_block(merkle_root: Hash256) -> Block {
 }
 
 fn validate_benchmark_input(block: &Block, input: &[Txid]) {
-    let mut candidate = input.to_vec();
-    assert!(block_merkle_root_matches_txids(block, &mut candidate));
+    assert!(block_merkle_root_matches_txids(block, input));
 
     let mut scalar = input.to_vec();
     let expected = Txid(block.header.merkle_root);
@@ -90,8 +89,7 @@ fn merkle_tree(c: &mut Criterion) {
         let mut scratch = input.clone();
         group.bench_function(BenchmarkId::new("avx2_dispatch_leaves", leaf_count), |b| {
             b.iter(|| {
-                scratch.clone_from(&input);
-                black_box(block_merkle_root_matches_txids(&block, &mut scratch));
+                black_box(block_merkle_root_matches_txids(&block, &input));
             });
         });
         group.bench_function(BenchmarkId::new("scalar_leaves", leaf_count), |b| {
@@ -112,8 +110,7 @@ fn merkle_tree(c: &mut Criterion) {
             BenchmarkId::new("avx2_dispatch_parents", parent_count),
             |b| {
                 b.iter(|| {
-                    scratch.clone_from(&input);
-                    black_box(block_merkle_root_matches_txids(&block, &mut scratch));
+                    black_box(block_merkle_root_matches_txids(&block, &input));
                 });
             },
         );

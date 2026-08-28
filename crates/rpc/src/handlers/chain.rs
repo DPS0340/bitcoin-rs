@@ -854,9 +854,9 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             if let Some(record) = ctx.block_by_hash(node.hash) {
                 if let Some(bytes) = ctx.block_body_bytes(&record) {
                     if let Ok(block) = deserialize::<Block>(&bytes) {
-                        let mut txids = block.txids();
+                        let txids = block.txids();
                         if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
-                            &block, &mut txids,
+                            &block, &txids,
                         ) {
                             return Ok(json!(false));
                         }
