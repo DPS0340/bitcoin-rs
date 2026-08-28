@@ -1,0 +1,634 @@
+//! Mempool policy compatibility contract: every policy row in
+//! `docs/policies/mempool-policy.md` cites one fixture here (or in
+//! `crates/rpc/tests/policy_contract.rs`). Each fixture asserts the
+//! observable verdict on both admission surfaces — the mutating pool API and
+//! the non-mutating acceptance-preview seam — and that the two agree.
+#![deny(clippy::expect_used)]
+
+extern crate alloc;
+
+use alloc::sync::Arc;
+use std::error::Error;
+
+use bitcoin::hashes::Hash as _;
+use bitcoin::{
+    Amount, FeeRate, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, WPubkeyHash, Witness,
+};
+use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
+use bitcoin_rs_mempool::standardness::{
+    AcceptanceRejectReason, PackageTxContext, StandardnessPolicy, evaluate_package_acceptance,
+    is_standard_tx,
+};
+use bitcoin_rs_mempool::{
+    Mempool, MempoolEntry, MempoolError, MempoolLimits, MutationOutcome, PolicyError, RbfError,
+    RemovalReason, ReplacementCandidate,
+};
+use bitcoin_rs_primitives::Hash256;
+
+/// Node default: Bitcoin Core incremental relay fee, 1000 sat/kvB.
+const INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
+
+fn policy() -> StandardnessPolicy {
+    StandardnessPolicy {
+        dust_relay_fee: FeeRate::DUST,
+        max_datacarrier_bytes: Some(83),
+    }
+}
+
+fn p2wpkh_script() -> ScriptBuf {
+    ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20]))
+}
+
+fn op_true_script() -> ScriptBuf {
+    ScriptBuf::from_bytes(vec![0x51])
+}
+
+fn outpoint(label: u8, vout: u32) -> OutPoint {
+    OutPoint {
+        txid: bitcoin::Txid::from_byte_array([label; 32]),
+        vout,
+    }
+}
+
+/// One-input, one-P2WPKH-output transaction. Distinct `output_value` values
+/// keep txids distinct across fixtures.
+fn tx(prevout: OutPoint, output_value: u64, sequence: Sequence) -> Transaction {
+    tx_multi(&[(prevout, sequence)], output_value, p2wpkh_script())
+}
+
+fn tx_multi(
+    inputs: &[(OutPoint, Sequence)],
+    output_value: u64,
+    script_pubkey: ScriptBuf,
+) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: inputs
+            .iter()
+            .map(|(prevout, sequence)| TxIn {
+                previous_output: *prevout,
+                script_sig: ScriptBuf::new(),
+                sequence: *sequence,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(output_value),
+            script_pubkey,
+        }],
+    }
+}
+
+fn txid(tx: &Transaction) -> Hash256 {
+    Hash256::from_le_bytes(tx.compute_txid().as_byte_array())
+}
+
+fn entry(tx: Transaction, vsize: u32, fee: u64) -> MempoolEntry {
+    MempoolEntry::new(Arc::new(tx), vsize, fee, 0, 1)
+}
+
+fn context(fee: u64, vsize: u32) -> PackageTxContext {
+    PackageTxContext {
+        fee,
+        vsize,
+        sigop_cost: 0,
+        missing_inputs: false,
+    }
+}
+
+fn preview_reason(
+    pool: &Mempool,
+    tx: &Transaction,
+    ctx: PackageTxContext,
+) -> Option<AcceptanceRejectReason> {
+    evaluate_package_acceptance(
+        pool,
+        &policy(),
+        std::slice::from_ref(tx),
+        &[ctx],
+        None,
+        INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+    )
+    .results
+    .into_iter()
+    .next()
+    .and_then(|fact| fact.reject_reason)
+}
+
+fn preview_allowed(pool: &Mempool, tx: &Transaction, ctx: PackageTxContext) -> bool {
+    evaluate_package_acceptance(
+        pool,
+        &policy(),
+        std::slice::from_ref(tx),
+        &[ctx],
+        None,
+        INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+    )
+    .results
+    .first()
+    .is_some_and(|fact| fact.allowed == Some(true))
+}
+
+// ---------------------------------------------------------------------------
+// Min relay fee
+// ---------------------------------------------------------------------------
+
+#[test]
+fn below_min_relay_fee_rejects_on_both_surfaces_at_the_same_floor() -> Result<(), Box<dyn Error>> {
+    let mut pool = Mempool::new(MempoolLimits::default());
+    // rate = fee * 1000 / vsize = 3999 * 1000 / 4000 = 999 sat/kvB.
+    let low = tx(outpoint(1, 0), 1_000, Sequence::MAX);
+    let err = pool
+        .insert_entry(entry(low.clone(), 4_000, 3_999))
+        .err()
+        .ok_or("expected BelowMinRelayFee rejection")?;
+    assert_eq!(
+        err,
+        MempoolError::Policy(PolicyError::BelowMinRelayFee {
+            tx_rate: 999,
+            min_rate: 1_000,
+        })
+    );
+    assert_eq!(
+        preview_reason(&pool, &low, context(3_999, 4_000)),
+        Some(AcceptanceRejectReason::MinRelayFeeNotMet),
+        "acceptance preview must quote the same floor"
+    );
+
+    // Boundary: exactly 1000 sat/kvB is admitted.
+    let boundary = tx(outpoint(2, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(boundary, 4_000, 4_000))?;
+    assert_eq!(pool.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn configured_min_relay_floor_overrides_the_default() -> Result<(), Box<dyn Error>> {
+    let limits = MempoolLimits {
+        min_relay_fee_sat_per_kvb: 5_000,
+        ..MempoolLimits::default()
+    };
+    let mut pool = Mempool::new(limits);
+    let low = tx(outpoint(1, 0), 1_000, Sequence::MAX);
+    let err = pool
+        .insert_entry(entry(low.clone(), 4_000, 8_000))
+        .err()
+        .ok_or("expected BelowMinRelayFee rejection")?;
+    assert_eq!(
+        err,
+        MempoolError::Policy(PolicyError::BelowMinRelayFee {
+            tx_rate: 2_000,
+            min_rate: 5_000,
+        })
+    );
+    assert_eq!(
+        preview_reason(&pool, &low, context(8_000, 4_000)),
+        Some(AcceptanceRejectReason::MinRelayFeeNotMet)
+    );
+
+    let at_floor = tx(outpoint(2, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(at_floor, 4_000, 20_000))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BIP125 replacement policy
+// ---------------------------------------------------------------------------
+
+/// Original (signaling or not) plus a descendant, both at 2000 sat/kvB.
+struct ConflictFixture {
+    pool: Mempool,
+    original: Transaction,
+    child: Transaction,
+}
+
+fn conflict_pool(signaling: bool) -> Result<ConflictFixture, Box<dyn Error>> {
+    let sequence = if signaling {
+        Sequence::ENABLE_RBF_NO_LOCKTIME
+    } else {
+        Sequence::MAX
+    };
+    let mut pool = Mempool::new(MempoolLimits::default());
+    let original = tx(outpoint(1, 0), 1_000, sequence);
+    pool.insert_entry(entry(original.clone(), 4_000, 8_000))?;
+    let child = tx(
+        OutPoint::new(original.compute_txid(), 0),
+        1_000,
+        Sequence::MAX,
+    );
+    pool.insert_entry(entry(child.clone(), 2_000, 4_000))?;
+    Ok(ConflictFixture {
+        pool,
+        original,
+        child,
+    })
+}
+
+#[test]
+fn rbf_opt_in_replacement_sweeps_conflicts_and_descendants() -> Result<(), Box<dyn Error>> {
+    let fixture = conflict_pool(true)?;
+    let mut pool = fixture.pool;
+    // Pays the 12 000 sat evicted package (rule 3), at least its own vsize
+    // more (rule 4: 16 000 - 12 000 >= 4 000), and outranks the originals'
+    // 2000 sat/kvB (rule 6).
+    let replacement = tx(outpoint(1, 0), 2_000, Sequence::MAX);
+
+    let previewed = preview_reason(&pool, &replacement, context(16_000, 4_000));
+    assert_eq!(previewed, None, "legal replacement must preview clean");
+
+    let result = pool.replace_transaction(
+        ReplacementCandidate::new(Arc::new(replacement.clone()), 4_000, 16_000, 1_000),
+        0,
+        1,
+        0,
+    )?;
+    assert_eq!(
+        result
+            .changes
+            .iter()
+            .map(|change| (change.txid, change.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                txid(&fixture.original),
+                MutationOutcome::Removed(RemovalReason::Replaced)
+            ),
+            (
+                txid(&fixture.child),
+                MutationOutcome::Removed(RemovalReason::Descendant)
+            ),
+            (txid(&replacement), MutationOutcome::Accepted),
+        ],
+        "commit order is direct conflicts, swept descendants, then the replacement"
+    );
+    assert_eq!(pool.len(), 1);
+    assert!(pool.contains_txid(&replacement.compute_txid()));
+    Ok(())
+}
+
+#[test]
+fn rbf_rule1_nonsignaling_originals_reject_on_both_surfaces() -> Result<(), Box<dyn Error>> {
+    let fixture = conflict_pool(false)?;
+    let mut pool = fixture.pool;
+    let replacement = tx(outpoint(1, 0), 2_000, Sequence::MAX);
+
+    let err = pool
+        .replace_transaction(
+            ReplacementCandidate::new(Arc::new(replacement.clone()), 4_000, 16_000, 1_000),
+            0,
+            1,
+            0,
+        )
+        .err()
+        .ok_or("expected rule 1 rejection")?;
+    assert_eq!(err, RbfError::Rule1NoOptIn);
+    assert_eq!(
+        preview_reason(&pool, &replacement, context(16_000, 4_000)),
+        Some(AcceptanceRejectReason::Replacement(RbfError::Rule1NoOptIn))
+    );
+    assert_eq!(pool.len(), 2, "rejection must leave the pool untouched");
+    Ok(())
+}
+
+#[test]
+fn rbf_rule3_replacement_must_pay_evicted_fees() -> Result<(), Box<dyn Error>> {
+    let fixture = conflict_pool(true)?;
+    let mut pool = fixture.pool;
+    // 4 000 sat < the 8 000 sat direct conflict alone.
+    let replacement = tx(outpoint(1, 0), 2_000, Sequence::MAX);
+    let err = pool
+        .replace_transaction(
+            ReplacementCandidate::new(Arc::new(replacement.clone()), 4_000, 4_000, 1_000),
+            0,
+            1,
+            0,
+        )
+        .err()
+        .ok_or("expected rule 3 rejection")?;
+    assert_eq!(err, RbfError::Rule3InsufficientAbsoluteFee);
+    assert_eq!(
+        preview_reason(&pool, &replacement, context(4_000, 4_000)),
+        Some(AcceptanceRejectReason::Replacement(
+            RbfError::Rule3InsufficientAbsoluteFee
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn rbf_rule6_replacement_rate_must_exceed_direct_conflicts() -> Result<(), Box<dyn Error>> {
+    let fixture = conflict_pool(true)?;
+    let mut pool = fixture.pool;
+    // Absolute fee 32 000 pays the 12 000 sat evicted package (rule 3) and
+    // its own 16 000 vB of incremental fee (rule 4), but lands at exactly the
+    // originals' 2000 sat/kvB — rule 6 wants strictly higher.
+    let replacement = tx(outpoint(1, 0), 2_000, Sequence::MAX);
+    let err = pool
+        .replace_transaction(
+            ReplacementCandidate::new(Arc::new(replacement.clone()), 16_000, 32_000, 1_000),
+            0,
+            1,
+            0,
+        )
+        .err()
+        .ok_or("expected rule 6 rejection")?;
+    assert_eq!(err, RbfError::Rule6InsufficientFeeRate);
+    assert_eq!(
+        preview_reason(&pool, &replacement, context(32_000, 16_000)),
+        Some(AcceptanceRejectReason::Replacement(
+            RbfError::Rule6InsufficientFeeRate
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn rbf_rule2_replacement_may_not_add_unconfirmed_inputs() -> Result<(), Box<dyn Error>> {
+    let fixture = conflict_pool(true)?;
+    let mut pool = fixture.pool;
+    let unrelated = tx(outpoint(9, 9), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(unrelated.clone(), 4_000, 4_000))?;
+
+    let replacement = tx_multi(
+        &[
+            (outpoint(1, 0), Sequence::MAX),
+            (OutPoint::new(unrelated.compute_txid(), 0), Sequence::MAX),
+        ],
+        2_000,
+        p2wpkh_script(),
+    );
+    let err = pool
+        .replace_transaction(
+            ReplacementCandidate::new(Arc::new(replacement.clone()), 4_000, 16_000, 1_000),
+            0,
+            1,
+            0,
+        )
+        .err()
+        .ok_or("expected rule 2 rejection")?;
+    assert_eq!(err, RbfError::Rule2NewUnconfirmedInput);
+    assert_eq!(
+        preview_reason(&pool, &replacement, context(16_000, 4_000)),
+        Some(AcceptanceRejectReason::Replacement(
+            RbfError::Rule2NewUnconfirmedInput
+        ))
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Ancestor / descendant package limits
+// ---------------------------------------------------------------------------
+
+fn chain_pool(depth: u32) -> Result<(Mempool, Vec<Transaction>), Box<dyn Error>> {
+    let mut pool = Mempool::new(MempoolLimits::default());
+    let mut txs = Vec::new();
+    let mut previous = outpoint(1, 0);
+    for _ in 0..depth {
+        let next = tx(previous, 1_000, Sequence::MAX);
+        previous = OutPoint::new(next.compute_txid(), 0);
+        pool.insert_entry(entry(next.clone(), 4_000, 4_000))?;
+        txs.push(next);
+    }
+    Ok((pool, txs))
+}
+
+#[test]
+fn ancestor_count_limit_rejects_the_26th_unconfirmed_tx() -> Result<(), Box<dyn Error>> {
+    let (mut pool, txs) = chain_pool(25)?;
+    let tip = txs.last().ok_or("empty chain")?;
+    let rejected = tx(OutPoint::new(tip.compute_txid(), 0), 1_000, Sequence::MAX);
+    let err = pool
+        .insert_entry(entry(rejected, 4_000, 4_000))
+        .err()
+        .ok_or("expected TooManyAncestors rejection")?;
+    assert_eq!(err, MempoolError::Policy(PolicyError::TooManyAncestors));
+    Ok(())
+}
+
+#[test]
+fn ancestor_size_limit_rejects_an_oversized_package() -> Result<(), Box<dyn Error>> {
+    let mut pool = Mempool::new(MempoolLimits::default());
+    let mut previous = outpoint(1, 0);
+    // 3 x 26 000 vB = 78 000 vB chained; the 4th would reach 104 000 > 101 000.
+    for _ in 0..3 {
+        let next = tx(previous, 1_000, Sequence::MAX);
+        previous = OutPoint::new(next.compute_txid(), 0);
+        pool.insert_entry(entry(next, 26_000, 26_000))?;
+    }
+    let rejected = tx(previous, 1_000, Sequence::MAX);
+    let err = pool
+        .insert_entry(entry(rejected, 26_000, 26_000))
+        .err()
+        .ok_or("expected AncestorSizeLimit rejection")?;
+    assert_eq!(err, MempoolError::Policy(PolicyError::AncestorSizeLimit));
+    Ok(())
+}
+
+#[test]
+fn descendant_count_limit_rejects_the_26th_child() -> Result<(), Box<dyn Error>> {
+    let mut pool = Mempool::new(MempoolLimits::default());
+    let parent = tx(outpoint(1, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(parent.clone(), 4_000, 4_000))?;
+    let parent_out = OutPoint::new(parent.compute_txid(), 0);
+    for value in 1_000_u64..1_024 {
+        let child = tx(parent_out, value, Sequence::MAX);
+        pool.insert_entry(entry(child, 4_000, 4_000))?;
+    }
+    let rejected = tx(parent_out, 9_999, Sequence::MAX);
+    let err = pool
+        .insert_entry(entry(rejected, 4_000, 4_000))
+        .err()
+        .ok_or("expected TooManyDescendants rejection")?;
+    assert_eq!(err, MempoolError::Policy(PolicyError::TooManyDescendants));
+    Ok(())
+}
+
+#[test]
+fn acceptance_preview_gap_ancestor_limits_surface_only_at_admission() -> Result<(), Box<dyn Error>>
+{
+    // Pins the documented preview gap: the acceptance seam does not carry the
+    // package limits, so testmempoolaccept reports allowed for a tx the
+    // admission gate then rejects. Deviation ledger, row "package limits".
+    let (pool, txs) = chain_pool(25)?;
+    let tip = txs.last().ok_or("empty chain")?;
+    let candidate = tx(OutPoint::new(tip.compute_txid(), 0), 1_000, Sequence::MAX);
+    assert!(
+        preview_allowed(&pool, &candidate, context(4_000, 4_000)),
+        "preview currently misses ancestor limits (documented gap)"
+    );
+    let mut pool = pool;
+    let err = pool
+        .insert_entry(entry(candidate, 4_000, 4_000))
+        .err()
+        .ok_or("expected admission to enforce the limit")?;
+    assert_eq!(err, MempoolError::Policy(PolicyError::TooManyAncestors));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Standardness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn oversized_weight_is_not_standard_on_both_surfaces() {
+    let pool = Mempool::new(MempoolLimits::default());
+    // 3400 P2WPKH outputs ≈ 435 000 weight units > 400 000.
+    let mut oversized = tx(outpoint(1, 0), 1_000, Sequence::MAX);
+    oversized.output = (0..3_400)
+        .map(|_| TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: p2wpkh_script(),
+        })
+        .collect();
+
+    assert_eq!(
+        is_standard_tx(&oversized, &policy()).err(),
+        Some(bitcoin_rs_mempool::standardness::StandardnessError::Weight)
+    );
+    assert_eq!(
+        preview_reason(&pool, &oversized, context(0, 100_000)),
+        Some(AcceptanceRejectReason::NonStandard(
+            bitcoin_rs_mempool::standardness::StandardnessError::Weight
+        ))
+    );
+}
+
+#[test]
+fn nonstandard_output_script_is_not_standard_on_both_surfaces() {
+    let pool = Mempool::new(MempoolLimits::default());
+    let weird = tx_multi(&[(outpoint(1, 0), Sequence::MAX)], 5_000, op_true_script());
+
+    assert_eq!(
+        preview_reason(&pool, &weird, context(1_000, 200)),
+        Some(AcceptanceRejectReason::NonStandard(
+            bitcoin_rs_mempool::standardness::StandardnessError::NonStandardOutput
+        ))
+    );
+}
+
+#[test]
+fn dust_output_is_not_standard_on_both_surfaces() {
+    let pool = Mempool::new(MempoolLimits::default());
+    let dust = tx_multi(&[(outpoint(1, 0), Sequence::MAX)], 100, p2wpkh_script());
+    assert_eq!(
+        preview_reason(&pool, &dust, context(1_000, 200)),
+        Some(AcceptanceRejectReason::NonStandard(
+            bitcoin_rs_mempool::standardness::StandardnessError::DustOutput
+        ))
+    );
+}
+
+#[test]
+fn missing_inputs_fact_is_reported_by_the_preview() -> Result<(), Box<dyn Error>> {
+    let pool = Mempool::new(MempoolLimits::default());
+    let orphan = tx(outpoint(200, 0), 1_000, Sequence::MAX);
+    let missing = PackageTxContext {
+        fee: 0,
+        vsize: 200,
+        sigop_cost: 0,
+        missing_inputs: true,
+    };
+    let facts = evaluate_package_acceptance(
+        &pool,
+        &policy(),
+        std::slice::from_ref(&orphan),
+        &[missing],
+        None,
+        INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+    );
+    let fact = facts.results.first().ok_or("expected one fact row")?;
+    assert_eq!(
+        fact.reject_reason,
+        Some(AcceptanceRejectReason::MissingInputs)
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Size-limit eviction and the pressure mempool-min fee
+// ---------------------------------------------------------------------------
+
+#[test]
+fn size_limit_eviction_removes_the_lowest_fee_package_first() -> Result<(), Box<dyn Error>> {
+    let limits = MempoolLimits {
+        max_total_bytes: 4_000,
+        ..MempoolLimits::default()
+    };
+    let mut pool = Mempool::new(limits);
+    let high = tx(outpoint(1, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(high, 1_000, 3_000))?;
+    let low = tx(outpoint(2, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(low.clone(), 1_000, 1_000))?;
+    let mid = tx(outpoint(3, 0), 1_000, Sequence::MAX);
+    pool.insert_entry(entry(mid, 1_000, 2_000))?;
+
+    let overflow = tx(outpoint(4, 0), 1_000, Sequence::MAX);
+    let result = pool.insert_entry(entry(overflow.clone(), 2_000, 6_000))?;
+    assert_eq!(
+        result
+            .changes
+            .iter()
+            .map(|change| (change.txid, change.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (txid(&overflow), MutationOutcome::Accepted),
+            (
+                txid(&low),
+                MutationOutcome::Removed(RemovalReason::PolicyEviction)
+            ),
+        ],
+        "the 1000 sat/kvB package evicts first, accepted change commits first"
+    );
+    assert_eq!(pool.len(), 3);
+    assert_eq!(pool.total_vsize(), 4_000);
+    Ok(())
+}
+
+#[test]
+fn mempool_min_fee_rises_under_size_pressure_and_the_preview_enforces_it()
+-> Result<(), Box<dyn Error>> {
+    let limits = MempoolLimits {
+        max_total_bytes: 4_000,
+        ..MempoolLimits::default()
+    };
+    let mut pool = Mempool::new(limits);
+    // Fill to exactly half of maxmempool: the pressure threshold.
+    pool.insert_entry(entry(
+        tx(outpoint(1, 0), 1_000, Sequence::MAX),
+        1_000,
+        1_000,
+    ))?;
+    pool.insert_entry(entry(
+        tx(outpoint(2, 0), 1_000, Sequence::MAX),
+        1_000,
+        2_000,
+    ))?;
+
+    // Floor = cheapest evictable (1000) + incremental (1000).
+    assert_eq!(
+        mempool_min_fee_sat_per_kvb(&pool, INCREMENTAL_RELAY_FEE_SAT_PER_KVB),
+        2_000
+    );
+
+    // rate 1200 sat/kvB: above the configured floor, below the pressure floor.
+    let lukewarm = tx(outpoint(3, 0), 1_000, Sequence::MAX);
+    assert_eq!(
+        preview_reason(&pool, &lukewarm, context(1_200, 1_000)),
+        Some(AcceptanceRejectReason::MinRelayFeeNotMet),
+        "the preview must quote the pressure floor"
+    );
+
+    // What IS: the raw insert gate checks only the configured floor, so the
+    // same tx admits through the pool API (deviation ledger, "pressure floor
+    // surface").
+    pool.insert_entry(entry(lukewarm, 1_000, 1_200))?;
+    assert_eq!(pool.len(), 3);
+
+    // Control: on an unloaded default pool the same tx previews clean.
+    let empty = Mempool::new(MempoolLimits::default());
+    let accepted = tx(outpoint(4, 0), 1_000, Sequence::MAX);
+    assert!(preview_allowed(&empty, &accepted, context(1_200, 1_000)));
+    Ok(())
+}

@@ -1253,10 +1253,10 @@ impl Mempool {
         }
     }
 
-    fn check_ancestor_limits(
+    fn check_ancestor_count_and_size(
         &self,
         ancestors: &[EntryId],
-        entry: &MempoolEntry,
+        candidate_vsize: u32,
     ) -> Result<(), PolicyError> {
         let ancestor_count = u32::try_from(ancestors.len())
             .unwrap_or(u32::MAX)
@@ -1264,16 +1264,26 @@ impl Mempool {
         if ancestor_count > self.limits.max_ancestors {
             return Err(PolicyError::TooManyAncestors);
         }
-        let ancestor_size = ancestors.iter().fold(u64::from(entry.vsize), |total, id| {
-            total.saturating_add(
-                self.entry(*id)
-                    .map_or(0, |ancestor| u64::from(ancestor.vsize)),
-            )
-        });
+        let ancestor_size = ancestors
+            .iter()
+            .fold(u64::from(candidate_vsize), |total, id| {
+                total.saturating_add(
+                    self.entry(*id)
+                        .map_or(0, |ancestor| u64::from(ancestor.vsize)),
+                )
+            });
         if ancestor_size > self.limits.max_ancestor_size {
             return Err(PolicyError::AncestorSizeLimit);
         }
         Ok(())
+    }
+
+    fn check_ancestor_limits(
+        &self,
+        ancestors: &[EntryId],
+        entry: &MempoolEntry,
+    ) -> Result<(), PolicyError> {
+        self.check_ancestor_count_and_size(ancestors, entry.vsize)
     }
 
     fn check_descendant_limits_excluding(
@@ -1411,6 +1421,34 @@ impl Mempool {
         u32::try_from(ancestors.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1)
+    }
+
+    /// Checks ancestor and descendant package limits for `tx` without
+    /// inserting it, mirroring the gates `validate_insert` applies.
+    ///
+    /// `excluded` is the set of entry ids that a replacement will evict;
+    /// those entries are skipped in the descendant-count check so a
+    /// replacement that trims an over-large descendant package is not
+    /// falsely rejected by the package it is about to clear. Pass an empty
+    /// set for a plain (non-replacement) admission preview.
+    ///
+    /// `vsize` is the candidate's own virtual size; it is folded into the
+    /// ancestor-size total exactly as `validate_insert` does.
+    ///
+    /// WHY: the acceptance preview (`testmempoolaccept`) and the admission
+    /// gate (`sendrawtransaction` → `replace_transaction`) must quote the
+    /// same verdict; without this check the preview reports `allowed` for a
+    /// transaction the admission gate then rejects on package limits.
+    pub fn check_package_limits(
+        &self,
+        tx: &Transaction,
+        vsize: u32,
+        excluded: &HashSet<EntryId>,
+    ) -> Result<(), PolicyError> {
+        let ancestors = self.ancestor_ids_for_tx(tx);
+        self.check_ancestor_count_and_size(&ancestors, vsize)?;
+        self.check_descendant_limits_excluding(&ancestors, excluded)?;
+        Ok(())
     }
 
     fn entry_mut(&mut self, id: EntryId) -> Option<&mut MempoolEntry> {

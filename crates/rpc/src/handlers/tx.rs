@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use core::str::FromStr as _;
-use std::collections::HashSet;
+use hashbrown::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -12,10 +12,11 @@ use bitcoin::{
     Amount, Denomination, FeeRate, OutPoint as BitcoinOutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxOut, Txid, Witness, absolute, transaction,
 };
-use bitcoin_rs_mempool::MempoolEntry;
+use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
+use bitcoin_rs_mempool::{EntryId, PolicyError, RbfError, ReplacementCandidate};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
-use hashbrown::HashMap;
+
 use miniscript::psbt::PsbtExt as _;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, Value, json};
 
@@ -411,17 +412,24 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         return Err(reject_to_rpc_error(&reason));
     }
 
-    let entry = MempoolEntry::new(
+    // WHY: on a non-conflicting tx replace_transaction commits exactly what
+    // insert_entry would, and on a conflicting spend it applies the BIP125
+    // sweep the acceptance fact above already vetted; insert_entry cannot
+    // admit a conflicting tx at all.
+    let candidate = ReplacementCandidate::new(
         Arc::new(tx.clone()),
         fact.vsize,
         fact.base_fee.unwrap_or(0),
-        unix_time_secs(),
-        ctx.applied_height(),
-    )
-    .with_sigop_cost(fact.sigop_cost);
+        DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+    );
     ctx.mempool
         .write()
-        .insert_entry(entry)
+        .replace_transaction(
+            candidate,
+            unix_time_secs(),
+            ctx.applied_height(),
+            fact.sigop_cost,
+        )
         .map_err(|error| RpcError::Internal(error.to_string()))?;
     let _ = ctx.add_transaction(tx);
     Ok(json!(txid.to_string()))
@@ -685,6 +693,8 @@ enum RejectReason {
     NonStandard(StandardnessError),
     MaxFeeExceeded,
     MinRelayFeeNotMet,
+    Replacement(RbfError),
+    PackageLimit(PolicyError),
 }
 
 impl core::fmt::Display for RejectReason {
@@ -695,6 +705,8 @@ impl core::fmt::Display for RejectReason {
             Self::NonStandard(error) => write!(f, "{error}"),
             Self::MaxFeeExceeded => write!(f, "max-fee-exceeded"),
             Self::MinRelayFeeNotMet => write!(f, "min-relay-fee-not-met"),
+            Self::PackageLimit(error) => write!(f, "{error}"),
+            Self::Replacement(error) => write!(f, "{error}"),
         }
     }
 }
@@ -705,7 +717,9 @@ fn reject_to_rpc_error(reason: &RejectReason) -> RpcError {
         RejectReason::AlreadyInMempool
         | RejectReason::MissingInputs
         | RejectReason::MinRelayFeeNotMet
-        | RejectReason::NonStandard(_) => RpcError::Internal(reason.to_string()),
+        | RejectReason::NonStandard(_)
+        | RejectReason::Replacement(_)
+        | RejectReason::PackageLimit(_) => RpcError::Internal(reason.to_string()),
     }
 }
 
@@ -792,6 +806,10 @@ fn evaluate_package_acceptance(
     max_feerate: Option<u64>,
 ) -> Vec<AcceptanceFact> {
     let policy = standardness_policy();
+    // The floor tracks the pool's live min-relay / mempool-min state so both
+    // admission surfaces quote the same policy verdict.
+    let min_relay_fee =
+        mempool_min_fee_sat_per_kvb(pool, DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
     let mut facts = Vec::with_capacity(txs.len());
 
     for (tx, ctx) in txs.iter().zip(contexts) {
@@ -818,14 +836,30 @@ fn evaluate_package_acceptance(
                     } else {
                         0
                     };
-                    if let Some(max_rate) = max_feerate
+                    if fee_rate < min_relay_fee {
+                        Some(RejectReason::MinRelayFeeNotMet)
+                    } else if let Some(max_rate) = max_feerate
                         && fee_rate > max_rate
                     {
                         Some(RejectReason::MaxFeeExceeded)
-                    } else if fee_rate < DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB {
-                        Some(RejectReason::MinRelayFeeNotMet)
                     } else {
-                        None
+                        let candidate = ReplacementCandidate::new(
+                            Arc::new(tx.clone()),
+                            ctx.vsize,
+                            ctx.fee,
+                            DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+                        );
+                        match pool.check_replacement(&candidate) {
+                            Err(error) => Some(RejectReason::Replacement(error)),
+                            Ok(plan) => {
+                                let excluded: HashSet<EntryId> =
+                                    plan.evicted.iter().copied().collect();
+                                match pool.check_package_limits(tx, ctx.vsize, &excluded) {
+                                    Err(error) => Some(RejectReason::PackageLimit(error)),
+                                    Ok(()) => None,
+                                }
+                            }
+                        }
                     }
                 }
                 Err(error) => Some(RejectReason::NonStandard(error)),
