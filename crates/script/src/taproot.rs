@@ -8,7 +8,7 @@ pub fn verify_taproot_keypath(
     public_key: &XOnlyPublicKey,
 ) -> bool {
     secp256k1::SECP256K1
-        .verify_schnorr(signature, message.as_ref(), public_key)
+        .verify_schnorr(signature, message, public_key)
         .is_ok()
 }
 
@@ -34,14 +34,14 @@ mod tests {
     #[test]
     fn taproot_helpers_accept_valid_schnorr_signature() {
         let secp = Secp256k1::new();
-        let secret = match SecretKey::from_byte_array([1; 32]) {
+        let secret = match SecretKey::from_slice(&[1u8; 32]) {
             Ok(secret) => secret,
             Err(error) => panic!("fixed secret key should be valid: {error}"),
         };
         let keypair = Keypair::from_secret_key(&secp, &secret);
         let (public_key, _) = XOnlyPublicKey::from_keypair(&keypair);
         let message = Message::from_digest([2; 32]);
-        let signature = secp.sign_schnorr(message.as_ref(), &keypair);
+        let signature = secp.sign_schnorr(&message, &keypair);
 
         assert!(verify_taproot_keypath(&signature, &message, &public_key));
         assert!(verify_taproot_scriptpath(&signature, &message, &public_key));

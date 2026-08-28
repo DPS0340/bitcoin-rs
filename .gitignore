@@ -7,6 +7,9 @@ Cargo.lock.bak
 .vscode/
 *.profraw
 *.profdata
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/.tmp*/
 perf.data
 perf.data.old
 flamegraph.svg
