@@ -14,7 +14,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use bitcoin_rs_primitives::{Network, Tx, TxIn, TxOut, consensus_bytes};
-use sonic_rs::Value;
+use sonic_rs::{JsonValueMutTrait as _, JsonValueTrait as _, Value};
 
 use crate::error::RpcError;
 use crate::tx_render;
@@ -118,8 +118,7 @@ pub(crate) fn script_asm(script: &[u8]) -> String {
 /// Re-serializes one typed Core wire value through the serde boundary into
 /// the transport value.
 pub(crate) fn typed_to_sonic<T: serde::Serialize>(typed: &T) -> Result<Value, RpcError> {
-    let text = serde_json::to_string(typed)?;
-    Ok(sonic_rs::from_str(&text)?)
+    sonic_rs::to_value(typed).map_err(RpcError::from)
 }
 
 /// Serializes one typed Core wire value, omitting keys whose value is `null`.
@@ -134,16 +133,15 @@ pub(crate) fn typed_to_sonic<T: serde::Serialize>(typed: &T) -> Result<Value, Rp
 pub(crate) fn typed_to_sonic_omitting_nulls<T: serde::Serialize>(
     typed: &T,
 ) -> Result<Value, RpcError> {
-    let mut value = serde_json::to_value(typed)?;
+    let mut value = sonic_rs::to_value(typed)?;
     omit_json_nulls(&mut value);
-    let text = serde_json::to_string(&value)?;
-    Ok(sonic_rs::from_str(&text)?)
+    Ok(value)
 }
 
 /// Recurses through objects and arrays, dropping object entries whose value
 /// is `null`. Array slots are kept: Core omits optional fields, never array
 /// items.
-fn omit_json_nulls(value: &mut serde_json::Value) {
+fn omit_json_nulls(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.retain(|_, field| {
             omit_json_nulls(field);
@@ -160,8 +158,7 @@ fn omit_json_nulls(value: &mut serde_json::Value) {
 /// pinned strict field set (`deny_unknown_fields` where the upstream type
 /// opts in).
 pub(crate) fn sonic_to_typed<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, RpcError> {
-    let text = sonic_rs::to_string(value)?;
-    serde_json::from_str(&text).map_err(RpcError::from)
+    sonic_rs::from_value(value).map_err(RpcError::from)
 }
 
 /// Projects one output script into the versioned `scriptPubKey` object,
