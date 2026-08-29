@@ -1,110 +1,101 @@
 # Getting started
 
-From a clone to a syncing node. Each step says what you should see, so you can
-tell it worked before moving on.
-
-Before you start: do not run this on mainnet as your only node. Reorganisation
-handling and transaction relay have known limitations documented in
-[README.md](README.md#known-gaps). The filter index is not backfilled across a
-gap.
+From a clone to a syncing node. Each step explains what you should see so you can
+verify progress before moving on.
 
 ## Prerequisites
 
-A Rust toolchain for edition 2024, plus `cmake` and `libboost-dev`. The last
-two are needed because the default build compiles libbitcoinkernel from C++
-sources.
+- A Rust toolchain for edition 2024 (MSRV 1.95.0 or newer).
+- The default build is pure Rust and requires no C++ compiler or system libraries.
 
-On Debian or Ubuntu:
+If you plan to compile with the optional `kernel` feature for differential
+verification against `libbitcoinkernel`, install `cmake` and `libboost-dev`:
 
 ```sh
+# Only required for the optional kernel oracle feature
 sudo apt-get install -y cmake libboost-dev
 ```
 
 ## Step 1: build
 
+Build the node with default features:
+
 ```sh
 cargo build --release -p bitcoin-rs
 ```
 
-This produces `./target/release/bitcoin-rs`. The default features are
-`rocksdb`, `fjall`, `redb`, `mdbx`, and `kernel`, so all four storage backends
-and the kernel verifier are compiled in.
+This produces `./target/release/bitcoin-rs`. The default configuration includes
+the `fjall` storage backend, `redb`, and `zmq` sequence publishing. Consensus
+validation runs natively in pure Rust across all script types (Legacy, SegWit v0,
+and Taproot key-path and script-path spends).
 
-If you cannot install the C++ dependencies, build the portable node instead.
-It must still name a storage backend, because bare `--no-default-features`
-compiles in none and the node then refuses to start:
+To compile with the optional `libbitcoinkernel` verification oracle:
 
 ```sh
-cargo build --release -p bitcoin-rs --no-default-features --features fjall
+cargo build --release -p bitcoin-rs --features kernel
 ```
-
-The portable verifier supports only Taproot key-path spends. It cannot validate
-non-Taproot spends or Taproot script-path spends, so a mainnet sync stops early.
-Use it for development, not for following the chain.
 
 ## Step 2: choose a storage backend
 
-fjall is the default. Pass `--storage-backend` to pick another:
+`fjall` is the default storage engine. `redb` is also compiled in default builds.
+Pass `--storage-backend` to select a backend:
 
 ```sh
-./target/release/bitcoin-rs --storage-backend rocksdb
+./target/release/bitcoin-rs --storage-backend redb
 ```
 
-Valid values are `fjall`, `rocksdb`, `mdbx`, and `redb`. All four hold the same
-chain state; they differ in write amplification and memory profile. If you have
-no reason to change it, keep fjall.
-
-You can also set it in the environment:
+You can also set it via environment variable:
 
 ```sh
 export BITCOIN_RS_STORAGE_BACKEND=fjall
 ```
 
+Alternative C++ storage backends (`rocksdb`, `mdbx`) are available through
+non-default Cargo features:
+
+```sh
+cargo build --release -p bitcoin-rs --features rocksdb
+```
+
 ## Step 3: start the node
+
+Start the node on mainnet:
 
 ```sh
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs
 ```
 
-Defaults worth knowing:
+Configuration defaults:
 
-| flag | default |
+| Flag | Default |
 |---|---|
 | `--data-dir` | `.bitcoin-rs` |
-| `--network` | mainnet (`mainnet`, `testnet3`, `testnet4`, `signet`, `regtest`) |
-| `--rpc-bind` | `127.0.0.1:8332` on mainnet, the network's Core port otherwise |
+| `--network` | `mainnet` (`mainnet`, `testnet3`, `testnet4`, `signet`, `regtest`) |
+| `--storage-backend` | `fjall` |
+| `--rpc-bind` | `127.0.0.1:8332` on mainnet, network Core port otherwise |
 | `--rpc-user` / `--rpc-password` | `bitcoin-rs` / `bitcoin-rs` |
-| `--dbcache-mb` | 450 (clamped to 16–1048576 MiB; split 70/20/10 across chainstate, txindex, and filters, with disabled shares going to chainstate) |
-| `--prune-target-mb` | 0, meaning no pruning |
+| `--dbcache-mb` | 450 (split 70/20/10 across chainstate, txindex, and filters, with disabled shares going to chainstate) |
+| `--prune-target-mb` | 0 (no pruning) |
 | `--txindex` | off |
 | `--scriptindex` | off |
+| `--verify-kernel` | off (requires `--features kernel` build) |
 
-The node logs its startup and the address the RPC listener bound to. If you see
-that line, it is running.
+The node logs its startup banner, effective cache allocation, and the address
+the JSON-RPC listener bound to.
 
-`--txindex` advertises Bitcoin Core-compatible transaction lookup support.
-`--scriptindex` enables current address/scripthash UTXO queries and confirmed
-funding/spending history.
-`--txindex` remains independent and is required for confirmed transaction
-lookups such as `/tx/<txid>` when the transaction is not in the mempool.
-Esplora is served by the node HTTP listener at the standard root (for example
-`/blocks/tip/height`, `/tx/<txid>`, `/address/<address>/utxo`, and `POST /tx`).
-Address and scripthash routes return `503` until `--scriptindex` catches up, or
-when it is disabled. These index modes are incompatible with pruning
-because backfill and reorg repair require durable block bodies.
+`--txindex` enables Bitcoin Core-compatible transaction lookup support.
+`--scriptindex` enables address and scripthash UTXO queries and confirmed
+funding/spending history exposed via Esplora-compatible HTTP endpoints.
+Address and scripthash routes return HTTP 503 until `--scriptindex` catches up,
+or when it is disabled.
 
-The ScriptIndex format does not migrate an existing legacy index. At startup,
-the node deletes incompatible derived index data in bounded batches and rebuilds
-it before exposing `--scriptindex` or `--txindex` queries.
-
-Change the RPC credentials before exposing the port anywhere. The defaults are
-a development convenience, not a secret. `--rpc-cookie` takes a Core-style
+Change the RPC credentials before exposing the port. The defaults are a
+development convenience, not a secret. Pass `--rpc-cookie` to use a Core-style
 cookie file instead.
 
 ## Step 4: check sync progress
 
-The JSON-RPC surface uses Bitcoin Core's method names, so Core's client tools
-work against it.
+The JSON-RPC surface uses Bitcoin Core method names:
 
 ```sh
 curl -s --user bitcoin-rs:bitcoin-rs \
@@ -113,10 +104,10 @@ curl -s --user bitcoin-rs:bitcoin-rs \
   http://127.0.0.1:8332/
 ```
 
-The response carries the current height and best block hash. Call it twice a
-minute apart: if the height moved, the node is syncing.
+The response includes the current validated height, best block hash, and sync
+progress. Call it twice a minute apart to confirm height advances.
 
-For just the tip:
+To query just the tip hash:
 
 ```sh
 curl -s --user bitcoin-rs:bitcoin-rs \
@@ -125,27 +116,26 @@ curl -s --user bitcoin-rs:bitcoin-rs \
   http://127.0.0.1:8332/
 ```
 
-The full list of implemented methods is the dispatch table in
-`crates/rpc/src/handlers.rs`. There is no wallet: private-key and
-wallet-construction methods are not implemented, while the key-free PSBT
-utilities and descriptor helpers remain for external-signer workflows.
+The dispatch table in `crates/rpc/src/handlers.rs` implements supported Core
+methods. There is no internal wallet: private-key and wallet-construction
+methods are absent, while key-free PSBT utilities (`combinepsbt`, `finalizepsbt`)
+and descriptor helpers remain for external signers.
 
 ## Verifying everything yourself
 
-Mainnet skips historical script verification below the pinned assume-valid
-anchor. To verify every script from genesis:
+Mainnet skips historical script checks below the pinned assume-valid anchor.
+To verify every script from genesis:
 
 ```sh
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs --assume-valid-height 0
 ```
 
-This is much slower. It is the right setting for benchmarking and for anyone
-who does not want to trust the anchor.
+This runs full script execution on every transaction from block 0. It is the
+recommended mode for benchmarking and independent consensus audits.
 
 ## Next
 
-- [../README.md](../README.md) for the full default posture and the measured
-  benchmark.
-- [README.md](README.md) for the documentation index.
-- [solutions/](solutions/) before debugging something that smells like it has
-  been hit before.
+- [../README.md](../README.md) for architecture overview and benchmark records
+- [../CONTRIBUTING.md](../CONTRIBUTING.md) for development workflows and testing
+- [README.md](README.md) for the documentation index
+- [contracts/](contracts/) for normative architecture and protocol contracts

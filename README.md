@@ -1,211 +1,154 @@
 # bitcoin-rs
 
-A Bitcoin full node in Rust 2024, built for fast initial block download and a
-small resident set, running script verification through the same library
-Bitcoin Core uses.
+A Bitcoin full node in Rust 2024 with pure-Rust defaults, native consensus
+validation, and an opt-in kernel oracle for differential verification.
 
 [![CI](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/gosuda/bitcoin-rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
-## Why bitcoin-rs
+## Features
 
-[Bitcoin Core](https://github.com/bitcoin/bitcoin) is the most successful
-implementation of Bitcoin. Its conservatism, stability, and compatibility
-discipline are major reasons for
-that success. Over time, however, those safeguards also shape which changes are
-practical: existing boundaries accumulate dependencies, and implementation
-choices harden into assumptions that Bitcoin consensus does not require.
-
-bitcoin-rs asks a simple question:
-
-> **If a Bitcoin full node were designed again today, what would we keep, and
-> what would we change?**
-
-### Why now?
-
-AI is changing how software is built. Work that once required large teams and
-long development cycles can now be attempted by much smaller teams with far
-faster iteration. Bitcoin is unusually well suited to this model because
-implementations can be checked against Bitcoin Core, `libbitcoinkernel`,
-historical chain data, consensus test vectors, fuzzing, and differential tests.
-
-**Bitcoin is well suited to AI-native development; Bitcoin Core's development
-culture is not.** Its review process prioritizes minimizing change risk,
-rewarding incrementalism, entrenching existing boundaries, and making radical
-architectural experimentation prohibitively expensive.
-
-**That is why we built `bitcoin-rs`: to preserve Bitcoin's consensus while
-making bold architectural experimentation practical—build alternatives,
-verify them against reproducible evidence, and keep iterating until better
-designs emerge.**
-
-### What can be improved
-
-- **Performance is a first-class requirement.** `bitcoin-rs` is not aiming for
-  parity with Bitcoin Core simply by changing languages. Synchronization,
-  storage, memory ownership, concurrency, caching, I/O, and indexing can all be
-  reconsidered. Improvements must be demonstrated with matched whole-node
-  benchmarks against Core.
-- **The UTXO set is the node's authoritative coin state.** Much of the Bitcoin
-  application ecosystem grew by rebuilding or duplicating wallet-, Electrum-,
-  and explorer-specific views around the same chain data. `bitcoin-rs`
-  simplifies that boundary: the node owns the canonical UTXO set used for
-  validation and an integrated script index exposed through Esplora-compatible
-  APIs. This eliminates the need for a separate Electrum server with its own
-  duplicate chain state and ingestion pipeline.
-  Wallet-specific keys, policies, and metadata remain outside the node.
-  Consumers build on node state; they do not redefine where Bitcoin's coin
-  state lives.
-- **Modularity keeps the core isolated and components composable.** Clear
-  dependency and failure boundaries keep extensions from destabilizing
-  validation or chainstate while allowing components to be reused independently.
-  Extensions own their state and lifecycle and may build on core capabilities,
-  but they do not become dependencies of the core.
-- **Rust-native integration is a primary path.** Applications and extensions in
-  the Rust Bitcoin ecosystem can attach to the node as typed, in-process
-  components instead of routing through serialized RPC or separate processes.
-  This improves runtime efficiency and simplifies integration and deployment,
-  making the full node a native, composable part of the ecosystem.
-
-Bitcoin is not defined by the continued preservation of one codebase. **The code
-can change; consensus is what must remain.** `bitcoin-rs` aims to challenge
-Bitcoin Core and build a better Bitcoin implementation. That challenge
-strengthens the Bitcoin ecosystem: a separately designed codebase cross-checks
-consensus interpretation, increases implementation diversity, and reduces the
-risk of correlated implementation failures.
+- Native consensus validation: pure-Rust script execution covering Legacy,
+  SegWit v0, and Taproot key-path and script-path spends, with sighash midstate
+  caching and parallel check evaluation.
+- Opt-in verification oracle: compile with `--features kernel` to enable
+  `--verify-kernel` for side-by-side consensus verdict comparison against
+  `libbitcoinkernel`.
+- Pure-Rust storage defaults: LSM-tree storage backed by `fjall` by default,
+  with `redb` compiled in, and `rocksdb`/`mdbx` available through optional Cargo
+  features.
+- Sharded UTXO cache: a 256-shard in-memory UTXO set (`hashbrown::HashTable` of
+  compact records behind `parking_lot::RwLock`) with checkpoint-based crash
+  recovery and effective `--dbcache-mb` budget allocation.
+- Asynchronous index consumers: `txindex` and BIP157/158 block filters reconcile
+  over a monotonic chain snapshot and event hint channel without blocking block
+  validation.
+- Integrated ScriptIndex and Esplora APIs: address and scripthash UTXO indexing
+  and confirmed transaction history served directly over HTTP.
+- Mempool mutation gateway: centralized mutation tracking publishing ordered
+  accept and remove events over ZMQ `pubsequence`.
+- Block template assembly: mining candidate generation via `getblocktemplate`.
+- Core-compatible RPC and typed embedding: synchronous HTTP JSON-RPC using Core
+  method names and wire formats (walletless, no private keys), plus a typed
+  async `Node` embedding API for in-process Rust integrations.
 
 ## Quick start
 
-Building the default configuration links libbitcoinkernel, which needs `cmake`
-and `libboost-dev` on the system.
+Build and run the default node (pure Rust, no C++ toolchain required):
 
 ```sh
 cargo build --release -p bitcoin-rs
 ./target/release/bitcoin-rs --data-dir .bitcoin-rs
 ```
 
-That starts a mainnet node storing state in `.bitcoin-rs` and serving JSON-RPC
-on `127.0.0.1:8332`. See [docs/getting-started.md](docs/getting-started.md) for
-backend selection, RPC authentication, and checking sync progress.
+This starts a mainnet node storing state in `.bitcoin-rs` and listening for
+JSON-RPC on `127.0.0.1:8332`.
 
-### Enforcer integration
+Verify the node is responding and syncing:
 
-Running bitcoin-rs alongside the BIP300/301 enforcer is a separate deployment path with
-its own Compose example: see [tools/bip300301-enforcer](tools/bip300301-enforcer) for
-the stack and [docs/rest-interface.md](docs/rest-interface.md) for the REST surface the
-enforcer consumes. It builds the production `fjall` plus `bitcoinkernel` profile and
-binds RPC to the Docker host's loopback only.
+```sh
+curl -s --user bitcoin-rs:bitcoin-rs \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"1.0","id":"1","method":"getblockchaininfo","params":[]}' \
+  http://127.0.0.1:8332/
+```
+
+### Optional kernel oracle build
+
+To build with the opt-in `libbitcoinkernel` verification oracle, install C++
+dependencies (`cmake` and `libboost-dev` on Debian/Ubuntu), then pass
+`--features kernel`:
+
+```sh
+cargo build --release -p bitcoin-rs --features kernel
+./target/release/bitcoin-rs --data-dir .bitcoin-rs --verify-kernel
+```
 
 ## Measured performance
 
-Full verification replay of mainnet blocks 0 to 150,000 (1,718,407
-transactions) from local block files, with `--assume-valid-height 0` so no
-script verification is skipped. Host: 80-CPU Intel Xeon Gold 6138, pinned to 32
-physical cores with `taskset -c 0-31`. Three interleaved runs per contender,
-medians reported. Bitcoin Core 31.0 was run with `-reindex-chainstate
--assumevalid=0 -connect=0 -dbcache=450`.
+Performance measurements from the bounded disk-backed campaign documented in
+[docs/benchmarks/end-to-end-sync.md](docs/benchmarks/end-to-end-sync.md) (commit
+`de8001e`, mainnet blocks 0 to 150,000, full validation with
+`--assume-valid-height 0`, CPU set 0–31 on Intel Xeon Gold 6138):
 
-| contender | wall | CPU | peak RSS |
-|---|---|---|---|
-| bitcoin-rs | 55.3s | 389.1s | 558 MB |
-| Bitcoin Core 31.0 | 61.1s | 469.9s | 659 MB |
+| Workload | bitcoin-rs median | Bitcoin Core 31.1 median | Ratio |
+|---|---:|---:|---:|
+| Full-validation local replay | 39.25s | 64.92s | 1.654x |
+| Whole benchmark process wall | 42.03s | 67.02s | 1.595x |
+| Bounded single-peer daemon IBD | 89.58s | 73.46s | 0.820x |
 
-Measured at commit `686379a` with the host near idle: 1.10x faster on
-wall-clock, 1.21x less CPU, and a 1.18x smaller resident set. Both nodes reach
-the same tip hash.
-
-Full measurement conditions, session variance, and the comparative data against Bitcoin
-Core and GoCoin are documented in
-[docs/benchmarks/end-to-end-sync.md](docs/benchmarks/end-to-end-sync.md). Read it before
-reusing any number here: only runs interleaved with Core inside one session are
-comparable.
-
-Against [GoCoin](https://github.com/piotrnar/gocoin) on the same harness:
-2.6x faster on replay and 3.03x on peer-to-peer sync.
+These measurements reflect a bounded 0–150,000 historical block range before
+SegWit and Taproot activation. Full-tip live network sync measurements remain
+pending fresh benchmarking runs. See
+[docs/benchmarks/end-to-end-sync.md](docs/benchmarks/end-to-end-sync.md) for full
+methodology, hardware constraints, and artifact custody.
 
 ## Architecture
 
-- Consensus verification via bitcoinkernel (libbitcoinkernel), covering both
-  script-path and key-path spends.
-- A 256-shard UTXO set: each shard is a `hashbrown::HashTable` of compact records
-  (`ThinRecordBuf`, one pointer-sized heap allocation per record) behind a
-  `parking_lot::RwLock`, with a snapshot format and checkpoint-based crash recovery.
-- Block application in windows: consecutive blocks share one script
-  verification dispatch, while each block still commits in order, so every rule
-  that depends on committed state sees the real chain.
-- A native ScriptIndex with an Esplora HTTP surface, coinstats over MuHash, and
-  pruning with Core's 288-block reorg-safety floor.
-- `getblocktemplate` for mining.
-- Synchronous HTTP/1.1 JSON-RPC over sonic-rs using Core's method names. There
-  is no wallet: private-key methods are absent, and the key-free PSBT
-  utilities (`combinepsbt`, `finalizepsbt`) remain for external signers.
-- mimalloc as the global allocator, over a crossbeam-channel event loop.
+```
+Surfaces:      bin/bitcoin-rs, crates/rpc, crates/ext-api, crates/ext-blockfilterindex
+Capabilities:  crates/index, crates/mining, crates/mempool
+Node services: crates/node, crates/p2p, crates/storage
+Core & domain: crates/consensus, crates/script, crates/utxo, crates/chain, crates/primitives
+```
+
+- Validation: native script execution runs in parallel across rayon workers,
+  with sighash midstate reuse per transaction.
+- Oracle boundary: `crates/consensus/src/kernel_oracle.rs` contains all
+  `libbitcoinkernel` types behind `#[cfg(feature = "kernel")]`. Kernel types
+  never leak into node state or apply logic.
+- Storage: `crates/storage` provides backend abstraction. The active engine is
+  configured at startup (`fjall`, `redb`, `rocksdb`, or `mdbx`).
+- Indexing: `txindex` and `ext-blockfilterindex` run as independent consumers
+  advancing their own cursors and rollback metadata atomically.
 
 ## Default posture
 
-The defaults target mainnet initial block download.
-
-| setting | default |
+| Setting | Default |
 |---|---|
-| storage backend | fjall |
-| database cache | 450 MiB, matching Bitcoin Core |
-| multi-peer download | on: 8 outbound peers, 128-block pending budget, 16 blocks in flight per peer |
-| transaction index | off |
-| pruning | off |
+| Storage backend | `fjall` |
+| Validation engine | Native Rust |
+| Kernel verification oracle | Off (opt-in via `--features kernel`) |
+| Database cache | 450 MiB (`--dbcache-mb`, split 70/20/10) |
+| Multi-peer download | On (8 outbound peers, 128-block window) |
+| Transaction index | Off |
+| Block filters | Off |
+| Script index | Off |
+| Pruning | Off |
 
-Mainnet also skips historical script verification up to height 938343, block
-`00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`. Checks are
-skipped only once the node confirms the active header chain contains that exact
-block, so a diverged chain or a tip below the anchor gets full verification.
-Pass `--assume-valid-height 0` to verify everything. Other networks default
-to 0.
+Mainnet defaults to skipping historical script verification up to the pinned
+assume-valid anchor. Pass `--assume-valid-height 0` to verify all scripts from
+genesis.
 
-## Build
+## Build and test
 
 ```sh
+# Build default binary (pure Rust)
 cargo build --release -p bitcoin-rs
+
+# Run workspace unit and integration tests
+cargo test --workspace
+
+# Lint all targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The default features are `rocksdb`, `fjall`, `redb`, `mdbx`, and `kernel`.
+## Contributing
 
-```sh
-cargo build --release -p bitcoin-rs --no-default-features --features fjall
-```
-
-The portable verifier supports only Taproot key-path spends, so a mainnet sync stops
-early; use it for development only. For portable builds without C++ dependencies and
-their verification trade-offs, see
-[docs/getting-started.md](docs/getting-started.md).
-
-## Tests
-
-```sh
-cargo test
-```
-
-Gates that need live infrastructure are `#[ignore]`d. Run them individually
-with `-- --ignored` once the documented environment is in place.
-
-## Status
-
-The node syncs, verifies, serves, and reorganises. The sync loop compares the
-header tip against the applied tip each tick and switches branches when the
-applied chain is outweighed.
-
-It is still not the node to depend on. A disconnected block's transactions do
-not return to the mempool, and the filter index is not backfilled across a gap.
-The ZMQ `pubsequence` stream publishes block connect/disconnect events plus
-mempool `A`/`R` events with per-change sequence assignment. `docs/README.md`
-lists the rest.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for local
+verification commands, CI workflows, and crate architecture conventions.
 
 ## Documentation
 
-- [docs/getting-started.md](docs/getting-started.md) — clone to synced node
-- [docs/](docs/README.md) — the documentation index
-- [CONCEPTS.md](CONCEPTS.md) — project vocabulary
-- [PLAN.md](PLAN.md) — roadmap and the G1-G15 verification gates
+- [docs/getting-started.md](docs/getting-started.md) — Node setup and configuration
+- [docs/README.md](docs/README.md) — Documentation index
+- [docs/contracts/](docs/contracts/) — Normative architecture and protocol contracts
+- [CONCEPTS.md](CONCEPTS.md) — Domain terminology and concepts
+- [PLAN.md](PLAN.md) — Project roadmap and historical milestones (G1–G15 verification gates)
+- [CONTRIBUTING.md](CONTRIBUTING.md) — Development workflow and CI guidelines
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). See
+[LICENSE](LICENSE) for full details.
