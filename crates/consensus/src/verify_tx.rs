@@ -444,12 +444,15 @@ pub struct BatchScriptFailure {
 /// not errors here: they are retained in transaction order and reported by
 /// [`verify_prepared_units`], because reporting them now would let a later
 /// transaction's cheap failure outrank an earlier one.
-pub fn prepare_block_script_checks<'b>(
-    view: &'b mut BlockView<'_>,
+pub fn prepare_block_script_checks<'tx, 'checks>(
+    view: &mut BlockView<'tx>,
     height: u32,
     locktime_cutoff: u32,
-    kernel_block: &'b crate::kernel::KernelBlock,
-) -> Result<BlockScriptChecks<'b>, ConsensusError> {
+    kernel_block: &'checks crate::kernel::KernelBlock,
+) -> Result<BlockScriptChecks<'checks>, ConsensusError>
+where
+    'tx: 'checks,
+{
     let (txs, resolved) = view.parts_mut();
     if txs.len() != resolved.len() {
         return Err(ConsensusError::PrevoutMatrixSize {
