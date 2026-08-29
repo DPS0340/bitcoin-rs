@@ -7,7 +7,9 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
 `crates/ext-blockfilterindex`; the worker and query engine in
 `crates/node/src/filterindex_worker.rs`.
 
-## Descriptors outlive instances
+## Clauses
+
+### `EXT-01`: Descriptors outlive instances
 
 - Every compiled extension contributes its `ExtensionDescriptor`
   unconditionally, in registry order: `txindex`, then `blockfilterindex`.
@@ -18,7 +20,7 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
   the data dir, the schema version, and required / incompatible capability
   ids.
 
-## Validation runs before anything opens
+### `EXT-02`: Pre-open validation and dependency gating
 
 - `validate_extensions(&config)` runs at the top of `run`, before
   `NodeState::open`: no storage is opened and no listener binds for an
@@ -31,7 +33,7 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
   and `blockfilterindex requires prune disabled` (the consumer needs every
   body).
 
-## Extensions never abort core
+### `EXT-03`: Supervised execution and never-abort-core isolation
 
 - Extension lifecycle callbacks are best-effort wake-ups; they never block
   or fail the caller.
@@ -40,9 +42,9 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
   `HealthStatus::Failed` and stops. Block application, sync, and other
   indexes are unaffected: the apply path never touches an extension store.
 - Extension work is positional reconciliation over the chain-event seam
-  (`chain-events.md`). A dropped hint loses latency only.
+  (`docs/contracts/chain-events.md`). A dropped hint loses latency only.
 
-## Namespace ownership
+### `EXT-04`: Namespace ownership and schema refusal
 
 - One extension owns `data_dir/<namespace>` and nothing else. The reference
   namespace is `data_dir/blockfilterindex`.
@@ -53,7 +55,7 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
 - Rows, the active pointer, the consumer cursor, and the lifecycle state
   commit in one atomic store batch.
 
-## Capability report
+### `EXT-05`: Capability snapshot and status reporting
 
 - The registry produces a `CapabilitySnapshot`: one `CapabilityStatus` per
   compiled capability with `id`, `compiled`, `enabled`, and live `state`
@@ -62,7 +64,6 @@ capability report in `crates/node/src/extensions.rs`; the reference adapter in
   RPC crate never sees node internals or storage backends. The report backs
   the `getcapabilities` extension method and the `getindexinfo` index
   entries.
-
 ## Proven by
 
 - `crates/node/src/extensions.rs` tests:

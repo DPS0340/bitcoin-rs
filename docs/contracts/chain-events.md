@@ -6,7 +6,9 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 `crates/node/src/state.rs`; `ConsumerCursor` and the reconciliation plan in
 `crates/node/src/reconcile.rs`.
 
-## Snapshot
+## Clauses
+
+### `EVT-01`: Coherent snapshot cell and process epoch
 
 - `ChainSnapshot { epoch, sequence, tip_hash, tip_height }` is a coherent,
   non-torn view of the applied tip. The single writer replaces the whole cell
@@ -19,7 +21,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 - The snapshot is a live value. It is never persisted per-event.
 - Readers use `NodeState::active_chain_snapshot()`.
 
-## Hints
+### `EVT-02`: Non-blocking hint emission order
 
 - One `ChainEventHint { kind, height, hash, epoch, sequence }` per committed
   event. `kind` is `Connected` or `Disconnected`.
@@ -36,7 +38,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `BlockTree::find_common_ancestor` (`crates/chain`); bodies come from
   `PruneBodyStore::load_block_body`.
 
-## Consumer cursor
+### `EVT-03`: Consumer cursor and positional reconciliation
 
 - `ConsumerCursor { epoch, sequence, height, hash }` names the chain state a
   consumer's rows already mirror. Durable form is `CURSOR_BYTE_LEN` = 52
@@ -47,7 +49,7 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   The txindex worker (`crates/node/src/txindex_worker.rs`) is the reference
   consumer; later index consumers copy this shape.
 
-## Consumers
+### `EVT-04`: Consumer error isolation and row retention
 
 - The transaction index is the first consumer: per-capability watermarks
   select its rollback/forward legs, and its wake is the coalesced revision
@@ -67,7 +69,13 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   it never blocks the apply path, and a restart re-plans from the persisted
   pointer.
 
+## Live gaps
+
+- **Cross-crate lifecycle boundary**: Slimming `crates/node` orchestration and shifting domain-owned mechanics to their respective crates is tracked under #217 (open).
+- **Crash/reorg recovery invariants**: Explicit system-level convergence rules across chainstate checkpoints, block data, and secondary indexes are tracked under #209 (open).
+
 ## Proven by
+
 
 - `crates/node/src/state.rs`: `record_publishes_snapshot_and_hints_in_commit_order`,
   `record_drops_hints_when_channel_full`,

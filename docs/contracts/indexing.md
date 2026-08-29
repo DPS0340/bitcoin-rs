@@ -69,7 +69,7 @@ Owners:
   `ScriptHistory` leaves `TxLookup` online and serving queries as long as its
   own watermark matches the applied tip, and vice versa.
 
-## Restart semantics
+### `IDX-05`: Restart reconciliation and schema version refusal
 
 - Index namespaces (`data_dir/txindex`, `data_dir/blockfilterindex`) maintain
   durable format versions and capability watermarks (`IndexWatermarks`,
@@ -83,7 +83,7 @@ Owners:
   - If the watermark is on an abandoned branch, the worker rolls back to the
     common ancestor and connects forward to the active tip.
 
-## Reorganization semantics
+### `IDX-06`: Reorganization rollback and forward reconciliation
 
 - Reorganizations reconcile asynchronously across the chain-event seam
   (`docs/contracts/chain-events.md`). `ApplyHandles` invokes
@@ -103,7 +103,7 @@ Owners:
   prepared, the atomic commit detects the watermark divergence, discards the
   stale prepared batch, and re-plans from the new active tip on the next pass.
 
-## Rebuild and error isolation semantics
+### `IDX-07`: Error isolation and supervised rebuild
 
 - If a required block body is missing during a rollback (e.g. an abandoned
   branch block pruned before rollback completed), the worker resets the
@@ -114,6 +114,10 @@ Owners:
   stops the worker. Block validation, UTXO commits, and chainstate progress
   continue unimpeded: the apply path never depends on index writes.
 
+## Live gaps
+
+- **Asynchronous recovery decoupling**: Index stores are currently opened synchronously during node initialization; decoupling index recovery from authoritative chain listener readiness is tracked under #208 and #209 (open).
+- **Deep reorg memory bounding**: Disconnect planning preloads branch block bodies into memory; streaming bounded-memory disconnect is tracked under #206 (open).
 ## Proven by
 
 - `crates/node/src/txindex_worker_reconcile_tests.rs`:

@@ -7,7 +7,9 @@ and the ZMQ `sequence` mapping built on them. Owners: `MempoolGateway` in
 in `crates/node/src/mempool_observer.rs`; payload encoding in
 `crates/node/src/zmq_publisher.rs`.
 
-## Gateway invariant
+## Clauses
+
+### `MPL-01`: Single mutation gateway ordering invariant
 
 - Every production mempool mutation routes through `MempoolGateway`. No
   production code outside the gateway takes the mempool write lock; lookups
@@ -32,7 +34,7 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   through the gateway or otherwise take the mempool write lock: re-entrancy
   deadlocks.
 
-## Mutation records
+### `MPL-02`: Atomic mutation records and sequence assignment
 
 - Every mutating `Mempool` method returns `MutationResult`: an ordered
   `Vec<MutationChange>`, one change per affected transaction, in commit
@@ -44,7 +46,7 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   the write lock is held. A failed insert, a no-op removal, and a clear of
   an empty pool assign nothing.
 
-## ZMQ `sequence` mapping
+### `MPL-03`: ZeroMQ sequence event payload mapping
 
 - `SequenceEvent::Added(Txid, seq)` publishes label `A` (`0x41`);
   `SequenceEvent::Removed(Txid, seq)` publishes label `R` (`0x52`).
@@ -54,7 +56,6 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
 - `BlockInclusion` emits no `R`: the block `C` event covers it. Every other
   removal reason emits `R`. Accepted changes emit `A`. One event per change,
   in commit order.
-
 ## Proven by
 
 - `crates/mempool/src/gateway.rs` (inline tests):
