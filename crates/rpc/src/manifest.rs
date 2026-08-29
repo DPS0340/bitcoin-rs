@@ -389,10 +389,10 @@ pub const MANIFEST: &[Entry] = &[
     Entry {
         name: "getmempoolinfo",
         kind: SurfaceKind::Rpc,
-        status: Status::Implemented,
+        status: Status::Deviation,
         feature: "",
         core_version: CORE_VERSION,
-        notes: "Pinned v31 shape; the extra mempool_sequence field Core never had was dropped (crates/rpc/src/handlers/mempool.rs).",
+        notes: "Policy fields project the enforced MempoolPolicySnapshot (crates/mempool/src/policy.rs): fullrbf always reports the enforced BIP125 signaling requirement (false) where Core 31.1 emits the field only under -deprecatedrpc=fullrbf; limitclustercount and limitclustersize project the enforced ancestor-package bounds because cluster tracking is not implemented (see getmempoolcluster); optimal is always true because the fee-rate index is rewritten under the pool write lock (crates/rpc/src/handlers/mempool.rs).",
         since: "0.4.0",
     },
     Entry {

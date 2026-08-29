@@ -31,6 +31,18 @@ pub struct StandardnessPolicy {
     pub max_datacarrier_bytes: Option<usize>,
 }
 
+impl Default for StandardnessPolicy {
+    /// The enforced defaults: Core's dust-relay rate (3 000 sat/kvB) and an
+    /// 83-byte aggregate nulldata budget. Admission consumes these through
+    /// [`crate::Mempool::policy_snapshot`]; `getmempoolinfo` projects them.
+    fn default() -> Self {
+        Self {
+            dust_relay_fee: 3_000,
+            max_datacarrier_bytes: Some(83),
+        }
+    }
+}
+
 /// Minimum transaction version considered standard.
 const TX_VERSION_MIN: i32 = 1;
 

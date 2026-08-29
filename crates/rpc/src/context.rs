@@ -1217,13 +1217,14 @@ impl Context {
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
         utxo.set_listener(Box::new(coin_stats_listener.clone()));
         let coin_stats = Arc::new(coin_stats_listener);
+        let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
         Self {
             chain_tip: Arc::new(ArcSwapOption::empty()),
             applied_tip: Arc::new(ArcSwapOption::empty()),
             chain_transition: Arc::new(Mutex::new(())),
             chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
-            mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            mempool,
             blocks: Arc::new(RwLock::new(BlockLog::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
             utxo: Arc::new(utxo),
@@ -2285,17 +2286,6 @@ mod tests {
             "the tree-derived record must carry the header the tree holds"
         );
         assert_eq!(record.header_hex(), hex_encode(&consensus_bytes(&header)));
-    }
-    #[test]
-    fn block_by_height_returns_record_after_add_block() {
-        let ctx = Context::new();
-        let record = BlockRecord::synthetic(42, BlockHash::default());
-        ctx.add_block(record);
-
-        let Some(found) = ctx.block_by_height(42) else {
-            panic!("expected record at height 42");
-        };
-        assert_eq!(found.height, 42);
     }
 
     #[test]

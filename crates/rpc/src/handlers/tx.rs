@@ -11,8 +11,10 @@ use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
-use bitcoin_rs_mempool::standardness::{StandardnessError, StandardnessPolicy, is_standard_tx};
-use bitcoin_rs_mempool::{EntryId, PolicyError, RbfError, ReplacementCandidate};
+use bitcoin_rs_mempool::standardness::{StandardnessError, is_standard_tx};
+use bitcoin_rs_mempool::{
+    EntryId, MempoolPolicySnapshot, PolicyError, RbfError, ReplacementCandidate,
+};
 use bitcoin_rs_primitives::{
     Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid, consensus_bytes,
     deserialize as native_deserialize,
@@ -28,8 +30,6 @@ use crate::error::RpcError;
 use crate::handlers::{optional_bool, params_array, parse_txid, required_str, required_u64};
 use corepc_types::v31;
 
-/// Bitcoin Core incremental relay fee default: 1000 sat/kvB.
-const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 
 /// Encodes `bytes` as lowercase hexadecimal.
@@ -444,13 +444,24 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
     }
 
-    let fact = {
+    let (fact, policy) = {
         let pool = ctx.mempool.read();
+        // One coherent guard: the same live pool read feeds both the
+        // acceptance facts and the policy record quoted alongside them, so
+        // admission never mixes pre- and post-reconfiguration policy.
+        let policy = pool.policy_snapshot();
         let contexts = package_contexts(ctx, &pool, std::slice::from_ref(&tx));
-        evaluate_package_acceptance(&pool, std::slice::from_ref(&tx), &contexts, max_feerate)
-            .into_iter()
-            .next()
-            .ok_or_else(|| RpcError::Internal("package acceptance returned no rows".to_owned()))?
+        let fact = evaluate_package_acceptance(
+            &pool,
+            std::slice::from_ref(&tx),
+            &contexts,
+            max_feerate,
+            policy,
+        )
+        .into_iter()
+        .next()
+        .ok_or_else(|| RpcError::Internal("package acceptance returned no rows".to_owned()))?;
+        (fact, policy)
     };
 
     if let Some(reason) = fact.reject_reason {
@@ -465,7 +476,7 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         Arc::new(tx.clone()),
         fact.vsize,
         fact.base_fee.unwrap_or(0),
-        DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+        policy.incremental_relay_fee_sat_per_kvb,
     );
     ctx.mempool
         .write()
@@ -497,8 +508,9 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
     }
 
     let pool = ctx.mempool.read();
+    let policy = pool.policy_snapshot();
     let contexts = package_contexts(ctx, &pool, &txs);
-    let facts = evaluate_package_acceptance(&pool, &txs, &contexts, max_feerate);
+    let facts = evaluate_package_acceptance(&pool, &txs, &contexts, max_feerate, policy);
 
     let mut rows = Vec::with_capacity(facts.len());
     for fact in facts {
@@ -638,13 +650,6 @@ pub(crate) fn createrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result
 fn decode_tx(raw: &str) -> Result<Tx, RpcError> {
     let bytes = hex_decode(raw)?;
     native_deserialize(&bytes).map_err(|_| RpcError::InvalidParams("transaction decode failed"))
-}
-
-fn standardness_policy() -> StandardnessPolicy {
-    StandardnessPolicy {
-        dust_relay_fee: 3_000,
-        max_datacarrier_bytes: Some(83),
-    }
 }
 
 fn unix_time_secs() -> u64 {
@@ -920,12 +925,11 @@ fn evaluate_package_acceptance(
     txs: &[Tx],
     contexts: &[PackageTxContext],
     max_feerate: Option<u64>,
+    policy: MempoolPolicySnapshot,
 ) -> Vec<AcceptanceFact> {
-    let policy = standardness_policy();
     // The floor tracks the pool's live min-relay / mempool-min state so both
     // admission surfaces quote the same policy verdict.
-    let min_relay_fee =
-        mempool_min_fee_sat_per_kvb(pool, DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB);
+    let min_relay_fee = mempool_min_fee_sat_per_kvb(pool, policy.incremental_relay_fee_sat_per_kvb);
     let mut facts = Vec::with_capacity(txs.len());
 
     for (tx, ctx) in txs.iter().zip(contexts) {
@@ -943,7 +947,7 @@ fn evaluate_package_acceptance(
         } else if ctx.missing_inputs {
             Some(RejectReason::MissingInputs)
         } else {
-            match is_standard_tx(tx, &policy) {
+            match is_standard_tx(tx, &policy.standardness) {
                 Ok(()) => {
                     // Fee rate checks.
                     let fee_rate = if ctx.vsize > 0 {
@@ -962,7 +966,7 @@ fn evaluate_package_acceptance(
                             Arc::new(tx.clone()),
                             ctx.vsize,
                             ctx.fee,
-                            DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+                            policy.incremental_relay_fee_sat_per_kvb,
                         );
                         match pool.check_replacement(&candidate) {
                             Err(error) => Some(RejectReason::Replacement(error)),

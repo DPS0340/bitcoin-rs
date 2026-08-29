@@ -7,17 +7,22 @@ surface per check with Core's behavior alongside, and keeps a deviation
 ledger. This page adds nothing normative; it places the policy under the
 [contracts precedence rule](README.md).
 
-- **Owner**: `docs/policies/mempool-policy.md`. It covers relay policy only;
-  consensus validation of scripts and sighashes is out of scope there and
-  here.
-- **Scope**: admission outlets `crates/mempool/src/standardness.rs`,
-  `limits.rs`, `rbf.rs`, `eviction.rs`, `policy.rs` and the RPC surface
-  `sendrawtransaction`/`testmempoolaccept` in
-  `crates/rpc/src/handlers/tx.rs`.
-- **Proven by**: `crates/mempool/tests/policy_contract.rs` and
-  `crates/rpc/tests/policy_contract.rs` —
-  `cargo test -p bitcoin-rs-mempool --test policy_contract` for direct-pool
-  semantics, `-p bitcoin-rs-rpc --test policy_contract` for the RPC
-  cross-check; per-rule RBF in `crates/mempool/tests/rbf_bip125.rs`;
-  ancestor/descendant limits in
-  `crates/mempool/tests/ancestor_limits.rs`.
+## Clauses
+
+### `POL-01`: Relay policy specification and Core 31.1 compatibility
+
+- **Owner**: `docs/policies/mempool-policy.md` owns the mempool relay policy
+  surface against Bitcoin Core 31.1. Consensus script and sighash validation
+  are governed by consensus rules.
+- **Scope**: admission checks in `crates/mempool/src/standardness.rs`,
+  `limits.rs`, `rbf.rs`, `eviction.rs`, `policy.rs`, and the RPC surface
+  `sendrawtransaction` / `testmempoolaccept` in `crates/rpc/src/handlers/tx.rs`.
+- Standardness rules, BIP125 RBF rules 1–6, package limits, and eviction
+  ranking follow the policy document.
+
+## Proven by
+
+- `crates/mempool/tests/policy_contract.rs` (`cargo test -p bitcoin-rs-mempool --test policy_contract`)
+- `crates/rpc/tests/policy_contract.rs` (`cargo test -p bitcoin-rs-rpc --test policy_contract`)
+- `crates/mempool/tests/rbf_bip125.rs` (BIP125 RBF rules 1–6)
+- `crates/mempool/tests/ancestor_limits.rs` (ancestor and descendant limits)

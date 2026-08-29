@@ -4,6 +4,8 @@
 //! verdict (accept, or error code + message; per-row `reject-reason` for
 //! `testmempoolaccept`) and that the bare `Mempool` path decides the same
 //! class the same way for the same fixture tx.
+//!
+//! Contract clause: `docs/contracts/mempool-policy.md` `POL-01`.
 #![deny(clippy::expect_used)]
 
 extern crate alloc;

@@ -32,7 +32,7 @@ pub use fee_estimator::{FeeEstimator, FeeRate};
 pub use gateway::{MempoolGateway, MempoolObserver};
 pub use mutation::{MutationChange, MutationOutcome, MutationResult, RemovalReason};
 pub use pareto::{ParetoFront, SortedParetoFront};
-pub use policy::{MempoolLimits, PolicyError};
+pub use policy::{MempoolLimits, MempoolPolicySnapshot, PolicyError};
 pub use pool::{
     Mempool, MempoolError, MempoolMiningSnapshot, MempoolStats, PrioritiseError, ScriptHash,
     SnapshotEntry,

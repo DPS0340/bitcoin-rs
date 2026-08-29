@@ -11,7 +11,9 @@ use thiserror::Error;
 use crate::entry::fee_rate;
 use crate::fee_estimator::{FeeEstimator, FeeRate};
 use crate::mutation::{MutationChange, MutationOutcome, MutationResult, RemovalReason};
-use crate::{EntryId, MempoolEntry, MempoolLimits, ParetoFront, PolicyError};
+use crate::{
+    EntryId, MempoolEntry, MempoolLimits, MempoolPolicySnapshot, ParetoFront, PolicyError,
+};
 
 /// Script-index key for funding index range scans.
 #[derive(
@@ -507,6 +509,20 @@ impl Mempool {
             .filter(|(_id, entry)| entry.is_replaceable())
             .map(|(_id, entry)| entry.txid)
             .collect()
+    }
+
+    /// Returns the relay-policy snapshot this pool enforces, for the RPC
+    /// `getmempoolinfo` projection and the transaction-admission surface.
+    ///
+    /// Standardness reads [`crate::standardness::StandardnessPolicy::default`]:
+    /// the pool holds no separate standardness knob, so the enforced default
+    /// is the single source of those values.
+    #[must_use]
+    pub fn policy_snapshot(&self) -> MempoolPolicySnapshot {
+        MempoolPolicySnapshot::from_enforced(
+            self.limits,
+            crate::standardness::StandardnessPolicy::default(),
+        )
     }
 
     /// Returns the total virtual size of all entries.

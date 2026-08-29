@@ -3,6 +3,8 @@
 //! `crates/rpc/tests/policy_contract.rs`). Each fixture asserts the
 //! observable verdict on both admission surfaces — the mutating pool API and
 //! the non-mutating acceptance-preview seam — and that the two agree.
+//!
+//! Contract clause: `docs/contracts/mempool-policy.md` `POL-01`.
 #![deny(clippy::expect_used)]
 
 extern crate alloc;

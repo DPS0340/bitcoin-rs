@@ -10,14 +10,15 @@ use crate::error::RpcError;
 use crate::handlers::{optional_bool, parse_txid, required_str};
 use corepc_types::v31;
 
-// Bitcoin Core default for incremental relay-fee policy until per-node
-// configuration is wired. Units: sat/kvB (the canonical workspace internal).
-// 1000 sat/kvB = 1 sat/vB = 0.00001 BTC/kvB.
-const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 1_000;
-
 pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     crate::handlers::ensure_no_params(params)?;
+    // One typed policy record derived under this handler's read guard from
+    // the pool's live limits and the enforced standardness settings; the
+    // handler holds no policy literals of its own, so the response cannot
+    // disagree with the pool even when its limits are reconfigured at
+    // runtime.
     let pool = ctx.mempool.read();
+    let policy = pool.policy_snapshot();
     let stats = pool.stats();
     let maxmempool = pool.limits.max_total_bytes;
     let live_min_relay_sat_per_kvb = pool.min_relay_fee_sat_per_kvb();
@@ -30,7 +31,7 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         && let Some(lowest) = pool.lowest_fee_rate()
     {
         live_min_relay_sat_per_kvb
-            .max(lowest.saturating_add(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB))
+            .max(lowest.saturating_add(policy.incremental_relay_fee_sat_per_kvb))
     } else {
         live_min_relay_sat_per_kvb
     };
@@ -43,14 +44,14 @@ pub(crate) fn getmempoolinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value
         max_mempool: i64_saturated(maxmempool),
         mempool_min_fee: sat_to_btc(mempool_min_fee_sat_per_kvb),
         min_relay_tx_fee: sat_to_btc(live_min_relay_sat_per_kvb),
-        incremental_relay_fee: sat_to_btc(DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB),
+        incremental_relay_fee: sat_to_btc(policy.incremental_relay_fee_sat_per_kvb),
         unbroadcast_count: 0,
-        full_rbf: true,
-        permit_bare_multisig: true,
-        max_data_carrier_size: 83,
-        limit_cluster_count: 64,
-        limit_cluster_size: 101_000,
-        optimal: true,
+        full_rbf: policy.full_rbf,
+        permit_bare_multisig: policy.permit_bare_multisig,
+        max_data_carrier_size: policy.max_data_carrier_size(),
+        limit_cluster_count: i64::from(policy.max_ancestor_count),
+        limit_cluster_size: i64_saturated(policy.max_ancestor_size_vbytes),
+        optimal: policy.optimal,
     })
 }
 
@@ -346,6 +347,92 @@ mod tests {
         assert!(
             result.get("mempool_sequence").is_none(),
             "mempool_sequence must stay absent from getmempoolinfo: {result:?}"
+        );
+    }
+
+    #[test]
+    fn getmempoolinfo_policy_fields_project_the_enforced_record() {
+        let ctx = Arc::new(Context::new());
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let result = handler
+            .dispatch("getmempoolinfo", &json!([]))
+            .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
+        // The enforced defaults: bare multisig permitted, the 83-byte
+        // nulldata budget, the ancestor-package bounds under the recorded
+        // cluster deviation, and the eviction-floor increment.
+        assert_eq!(
+            result
+                .get("permitbaremultisig")
+                .and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .get("maxdatacarriersize")
+                .and_then(JsonValueTrait::as_u64),
+            Some(83)
+        );
+        assert_eq!(
+            result
+                .get("limitclustercount")
+                .and_then(JsonValueTrait::as_i64),
+            Some(25)
+        );
+        assert_eq!(
+            result
+                .get("limitclustersize")
+                .and_then(JsonValueTrait::as_i64),
+            Some(101_000)
+        );
+        assert_eq!(
+            result.get("optimal").and_then(JsonValueTrait::as_bool),
+            Some(true)
+        );
+        let Some(incremental) = result
+            .get("incrementalrelayfee")
+            .and_then(JsonValueTrait::as_f64)
+        else {
+            panic!("incrementalrelayfee missing: {result:?}");
+        };
+        assert!((incremental - 0.00001).abs() < 1e-12);
+        // fullrbf is the real replacement policy — BIP125 rule 1 signaling is
+        // enforced — not the unconditional `true` this handler once emitted.
+        assert_eq!(
+            result.get("fullrbf").and_then(JsonValueTrait::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn getmempoolinfo_policy_follows_the_configured_pool_limits() {
+        let ctx = Arc::new(Context::new());
+        // Reconfigure the live pool's limits after composition, the way
+        // `policy_contract.rs` reconfigures floors mid-test: the per-guard
+        // derivation must quote them on the next call, never a stale
+        // composition-time copy.
+        ctx.mempool.write().limits.max_ancestors = 7;
+        ctx.mempool.write().limits.max_ancestor_size = 42_000;
+        let handler = crate::Handler::new(Arc::clone(&ctx));
+        let result = handler
+            .dispatch("getmempoolinfo", &json!([]))
+            .unwrap_or_else(|err| panic!("getmempoolinfo failed: {err}"));
+        // The cluster fields project the configured ancestor-package bounds;
+        // unrelated defaults stay untouched.
+        assert_eq!(
+            result
+                .get("limitclustercount")
+                .and_then(JsonValueTrait::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            result
+                .get("limitclustersize")
+                .and_then(JsonValueTrait::as_i64),
+            Some(42_000)
+        );
+        assert_eq!(
+            result.get("fullrbf").and_then(JsonValueTrait::as_bool),
+            Some(false)
         );
     }
 
