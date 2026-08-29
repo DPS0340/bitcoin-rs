@@ -23,12 +23,30 @@ tags:
 
 # Node-level reorg execution: authoritative chainstate and derived indexes
 
+> **Historical / Non-Normative**: This solution document records the 2026-08 design
+> of node-level reorg execution and state boundaries. Its historical "Still open"
+> remainder has been completed and is superseded by the normative contracts:
+> - [docs/contracts/indexing.md](../../contracts/indexing.md) (indexing runtime, capability gating, reorg/restart reconciliation)
+> - [docs/contracts/chain-events.md](../../contracts/chain-events.md) (chain snapshots, event hints, consumer cursors)
+> - [docs/contracts/mempool-mutations.md](../../contracts/mempool-mutations.md) (mempool gateway, transaction reconsideration, ZMQ sequence events)
+> - [docs/contracts/extensions.md](../../contracts/extensions.md) (filter index consumer and extension isolation)
+> - Live G10 gate in `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs`.
+
 ## Status
 
-**Live branch switching is implemented and called from sync. Crash replay remains
-open.**
+**Branch switching, block disconnect, mempool transaction reconsideration, ZMQ
+sequence notifications, and asynchronous index reconciliation are implemented.**
+The G10 gate is the verification record, and it proves unit and reconciliation
+guarantees only — not end-to-end reorg execution: the chain planner's depth-100
+competing-fork plan calculation (in-memory headers, no block execution),
+unit-level disconnect behavior in `crates/node` (exact prior-state restoration;
+sequence-event ordering captured through an injected recording publisher, not a
+live ZMQ socket; body-load failure safety), and txindex watermark
+rollback/repair on the next reconciliation pass across rival reorgs. The gate
+runs no 100-block full-stack fixture and does not exercise coinstats rewind,
+mempool reconsideration, or live `pubsequence` emission.
 
-Done:
+Historical implementation record:
 
 * `ColumnFamily::UndoData` across all four backends, and a versioned undo codec
   bound to the block hash (`crates/utxo/src/undo_codec.rs`).
@@ -36,8 +54,8 @@ Done:
   is queued before the block body and UTXO commit. A clean checkpoint makes the
   queued record durable.
 * `disconnect_block`, which restores the UTXO set, rewinds block-level
-  coinstats, publishes the parent `applied_tip`, and wakes the derived TxIndex
-  worker. Its authoritative ordering claims are mutation-verified.
+  coinstats, publishes the parent `applied_tip`, and wakes derived index workers.
+  Its authoritative ordering claims are mutation-verified.
 * Node-owned `invalidateblock` control, which invalidates the named header
   subtree and uses the normal branch-switch/disconnect path rather than
   mutating chainstate in the RPC crate. It previews the replacement tip and
@@ -69,15 +87,17 @@ Done:
   `scantxoutset` captures its UTXO view and applied-tip metadata while connects
   and disconnects are excluded, so response height, hash, confirmations, and
   unspents describe one authoritative state.
-
-Still open: transaction reconsideration, filter-index backfill, real crash
-replay, and the ignored live `g10_reorg_deep` gate. ZMQ now publishes block
-disconnect notifications through `pubsequence`, but mempool `A`/`R` events remain
-intentionally open.
-Transaction reconsideration requires one production admission pipeline shared
-by Esplora broadcast, P2P relay, and reorg handling. Raw mempool insertion cannot supply
-the required fee, policy, conflict, and ancestry metadata.
-
+* Disconnected transaction reconsideration is implemented in `crates/node/src/reorg.rs`
+  (`reconsider_disconnected_transactions`) and routes through `MempoolGateway`.
+* ZMQ publishes block disconnect notifications (`D`) and mempool `A`/`R` events
+  with per-change sequence assignment through `pubsequence`.
+* Filter index backfill is implemented via consumer-cursor reconciliation in
+  `crates/node/src/filterindex_worker.rs`.
+* Reorg plan calculation, unit-level disconnect and sequence-event ordering,
+  and txindex watermark reconciliation are gated in
+  `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs` — one `cargo test` filter per
+  required test; full-stack reorg execution and live ZMQ emission are outside
+  its evidence.
 ## Why it matters
 
 A Bitcoin full node that cannot disconnect a block cannot follow the most-work
@@ -188,15 +208,17 @@ Done:
 | RPC invalidation | `invalidateblock` delegates through `ChainControl`; unknown blocks map to Core not-found, genesis is refused, required bodies are preflighted before header mutation, one transition witness spans invalidation and branch switching, and a successful active-tip rollback emits `pubsequence D` |
 | Whole-chainstate RPC reads | `scantxoutset` shares the chain-transition mutex and reads its UTXO scan plus applied-tip identity under that guard; it cannot publish metadata from the opposite side of a connect or disconnect. |
 
-Open:
+### Superseded open items
 
-| Piece | Notes |
+The open items identified during initial design have landed:
+
+| Item | Superseding implementation and normative contract |
 |---|---|
-| Mempool reconsideration | Block transactions need the same production admission pipeline as Esplora broadcast and future P2P relay. Direct insertion is invalid because it fabricates admission metadata |
-| Mempool sequence events | Mempool `A`/`R` notifications remain intentionally absent until event sequencing and removal reasons are redesigned |
-| Filter-index backfill | a gap leaves the index unavailable from that point, by design; nothing repairs it |
-| Real crash replay | the node detects and refuses torn disconnect state, but cannot replay or repair it in place |
-| Un-ignore `g10_reorg_deep` | prove the full path against `bitcoind` regtest |
+| Mempool reconsideration | Implemented in `crates/node/src/reorg.rs` (`reconsider_disconnected_transactions`) using `MempoolGateway::reconsider_disconnected`; see [docs/contracts/mempool-mutations.md](../../contracts/mempool-mutations.md) |
+| Mempool sequence events | Implemented with per-change sequence counters and `0x41`/`0x52` payloads in `crates/node/src/zmq_publisher.rs` and `crates/mempool/src/gateway.rs`; see [docs/contracts/mempool-mutations.md](../../contracts/mempool-mutations.md) |
+| Filter-index backfill | Implemented via `ConsumerCursor` reconciliation in `crates/node/src/filterindex_worker.rs`; see [docs/contracts/chain-events.md](../../contracts/chain-events.md) and [docs/contracts/extensions.md](../../contracts/extensions.md) |
+| Real crash replay / recovery | In-flight marker detection, startup refusal, and clean-tip convergence verified across backends; see [docs/contracts/chain-events.md](../../contracts/chain-events.md) |
+| Live `g10_reorg_deep` gate | Implemented as per-test `cargo test` invocations (single libtest filter each) in `bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs`; proves plan calculation, unit disconnect/sequence ordering, and watermark reconciliation only |
 
 A body-load error occurs before its attempt mutates. A missing suffix body can
 be reported after a coherent target prefix commits. A refused disconnect can

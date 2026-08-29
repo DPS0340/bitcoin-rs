@@ -1283,23 +1283,24 @@ fn plan_disconnect(
 /// Disconnects the applied tip, restoring the consensus state the block
 /// replaced.
 ///
-/// Restores the UTXO set and `applied_tip`. The transaction index runtime is
-/// notified after the tip moves, and the worker reconciles the index
-/// asynchronously. It does NOT yet restore the other state connection touches,
-/// so it has no production caller and must not get one until they are handled:
+/// Restores the consensus UTXO set, coinstats, RPC block cache, and `applied_tip`.
 ///
-/// | Handle | Status |
+/// Production callers: branch switching (`crate::reorg::switch_to_branch`) and
+/// block invalidation (`crate::reorg::invalidate_block`).
+///
+/// State and notification ownership across a disconnect:
+///
+/// | Handle | Responsibility |
 /// |---|---|
 /// | `utxo`, `applied_tip` | restored here |
-/// | `tx_index_runtime` | notified here; the worker reconciles the index asynchronously |
-/// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
-/// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
+/// | `coin_stats` | restored here in two halves: per-coin fields ride the `UtxoSet` change listener; block-level height and transaction count are explicitly rewound |
+/// | `blocks` | rewound here — pops the cached block record so RPC reflects the parent tip |
 /// | `transactions` | nothing owed: connection never populates it |
-/// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
+/// | `chain_event_publisher` / `tx_index_runtime` | sequence counter advanced and hints emitted; index workers reconcile asynchronously |
+/// | `zmq_publisher` | publishes `SequenceEvent::Disconnected` after the tip moves |
+/// | `mempool` | owned at the branch-switch boundary in `crate::reorg::reconsider_disconnected_transactions`, which re-admits disconnected transactions through `MempoolGateway` |
 /// | `block_tree` | retained deliberately — the header stays valid and known |
-/// | `block_body_store` | retained deliberately — the body is still a real block |
-/// | `zmq_publisher` | a notification, not state; a disconnect event belongs here later |
-///
+/// | `block_body_store` | retained deliberately — the body is still a real block available for future reorgs or RPC |
 /// The ordering below is the design: every fallible step that touches nothing
 /// runs first, so the common failures cost nothing.
 ///
@@ -1325,8 +1326,9 @@ fn plan_disconnect(
 ///    so a missing or corrupt record costs nothing.
 /// 2. Restore the UTXO set.
 /// 3. Move `applied_tip` to the parent.
-/// 4. Notify the transaction index runtime. The worker rolls the index back
-///    asynchronously, and the runtime wake is a coalesced, non-blocking signal.
+/// 4. Advance the sequence counter, emit chain-event hints, and publish ZMQ
+///    disconnect notifications. Index workers reconcile asynchronously over
+///    the chain-event seam (`docs/contracts/chain-events.md`).
 ///
 /// Refuses any block that is not the applied tip, because disconnecting from
 /// the middle of a chain restores outputs its descendants have already spent,

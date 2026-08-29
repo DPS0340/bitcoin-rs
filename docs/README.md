@@ -58,22 +58,21 @@ a description of how the node works today.
 
 ## Known gaps
 
-**Do not run this on mainnet as your only node.** Sync now calls
+**Do not run this on mainnet as your only node.** Sync calls
 `switch_to_branch` when a higher-work header branch wins. It preloads the
-divergent bodies, revalidates the plan under one chain-transition guard, and
-retires staged accounting after each committed connect. A fatal partial
-transition stops the process.
+divergent bodies, revalidates the plan under one chain-transition guard,
+restores UTXO state and coinstats, re-admits disconnected non-coinbase
+transactions to the mempool in dependency order, and wakes index consumers to
+reconcile asynchronously. A fatal partial transition stops the process.
 
-Reorg handling still does not return disconnected transactions to the mempool.
-That requires one production admission pipeline shared by Esplora broadcast, P2P relay,
-and reorg handling. Production transaction relay is also incomplete. The ZMQ
-`pubsequence` stream publishes block connect/disconnect events and mempool
-`A`/`R` events with per-change sequence assignment and explicit removal
+The ZMQ `pubsequence` stream publishes block connect/disconnect events and
+mempool `A`/`R` events with per-change sequence assignment and explicit removal
 reasons.
 
-Also incomplete: metrics coverage and parts of the CLI and RPC surface.
+Still incomplete: production P2P transaction relay, broader metrics coverage,
+and parts of the CLI and RPC surface.
 
-On documentation itself: there is no API reference and no tutorial series.
-JSON-RPC uses Bitcoin Core's method names, so Core's API documentation applies
-to the shared surface; the authoritative list of what this node implements is
-the dispatch table in `crates/rpc/src/handlers.rs`.
+On documentation itself: there is no tutorial series. JSON-RPC uses Bitcoin
+Core's method names, so Core's API documentation applies to the shared surface;
+the authoritative list of what this node implements is the manifest and dispatch
+table in `crates/rpc/src/handlers.rs`.

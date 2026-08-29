@@ -1,58 +1,108 @@
-//! G10 — Reorg-deep.
-//! **G10 — Reorg-deep test (INTENDED).** A simulated 100-block reorg replays cleanly: UTXO state,
-//! coinstats, filter index, `ScriptIndex`, wallet, and mempool all converge to the new tip without
-//! panic, deadlock, or stale row; verified against bitcoind's reorg behavior in regtest.
+//! G10 — Reorganization execution and planning gate.
 //!
-//! **STATUS — NOT YET IMPLEMENTED.** Node-level chain reorganization does not exist: the apply path
-//! advances `applied_tip` forward only (it rejects any non-extending block), undo data is never
-//! persisted, and `plan_reorg` has no production caller. The full-stack gate below is therefore
-//! `#[ignore]`d until reorg lands. The running test verifies only the reorg *planner* (disconnect /
-//! connect list computation), not node-level rollback — it must not be read as evidence that reorg
-//! works.
+//! **G10 — Reorganization execution and planning.** Runs one `cargo test`
+//! subprocess per required test — libtest accepts a single positional filter,
+//! so multiple filters in one invocation are invalid — and requires every
+//! named test to execute and pass.
+//!
+//! Proof surface, scoped to what the named tests actually execute:
+//! - `bitcoin-rs-chain` planner test (`plans_deep_reorg_to_common_fork`):
+//!   depth-100 competing-fork disconnect/connect plan calculation over an
+//!   in-memory header tree — no block bodies, no chainstate mutation.
+//! - `bitcoin-rs-node` unit tests: single-block disconnect restores the exact
+//!   prior UTXO set and applied tip; sequence-event ordering (D before C
+//!   across a rival fork; D on invalidateblock) captured through an injected
+//!   recording publisher, not a live ZMQ socket; a disconnect body-load
+//!   failure moves nothing.
+//! - `bitcoin-rs-node` txindex worker tests: watermark rollback and
+//!   stale-prefix repair on the next reconciliation pass across rival branch
+//!   reorganizations.
+//!
+//! Not exercised here: full-stack 100-block reorg execution, coinstats
+//! rewind, mempool reconsideration, and live `pubsequence` emission.
 
-#![allow(clippy::expect_used)]
+use std::process::Command;
 
-/// Verifies the reorg PLANNER computes the depth-100 disconnect/connect node lists for a competing
-/// fork. Does NOT exercise node-level reorg (UTXO rollback, coinstats, indexes, wallet, mempool) —
-/// that behavior is unimplemented; see the ignored full-stack placeholder below.
-#[test]
-fn reorg_deep_test() {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args([
-            "test",
-            "-p",
-            "bitcoin-rs-chain",
-            "plans_deep_reorg_to_common_fork",
-        ])
-        .output()
-        .expect("spawn cargo");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "chain crate depth-100 reorg planner test failed:\n{stdout}\n{stderr}"
-    );
-    // Loud-fail guard: `cargo test <name>` exits 0 even when zero tests match (the planner test gets
-    // renamed, removed, or cfg-gated away). Require the named test to appear as executed-and-passed in
-    // the output so the gate can't pass on zero matches. A substring filter (no `--exact`) plus matching
-    // on the `<name> ... ok` suffix stays robust to module nesting; same anti-theater intent as G7.
-    assert!(
-        stdout.contains("plans_deep_reorg_to_common_fork ... ok"),
-        "reorg planner test did not run (renamed/removed?) — gate would be theater:\n{stdout}\n{stderr}"
-    );
+fn cargo() -> Command {
+    Command::new(env!("CARGO"))
 }
 
-/// INTENDED full-stack reorg gate: a 100-block reorg in which UTXO state, coinstats, filter index, and `ScriptIndex`
-/// indexes, wallet, and mempool all converge to the new tip, cross-checked against bitcoind regtest.
-///
-/// NOT YET IMPLEMENTED — node-level reorg (block disconnect + UTXO undo) does not exist: `applied_tip`
-/// is forward-only, undo data is never persisted, and `plan_reorg` is unwired. Un-ignore and build this
-/// once node-level reorg lands; until then it is a placeholder, not a passing check.
+/// Loud-fail guard: require each named test to appear as executed-and-passed in stdout.
+fn require_ran(stdout: &str, names: &[&str]) {
+    for name in names {
+        assert!(
+            stdout.contains(&format!("{name} ... ok")),
+            "expected test `{name}` did not run or did not pass:\n{stdout}"
+        );
+    }
+}
+
+fn output_or_panic(mut command: Command, context: &str) -> std::process::Output {
+    match command.output() {
+        Ok(output) => output,
+        Err(error) => panic!("{context}: failed to spawn cargo: {error}"),
+    }
+}
+
 #[test]
-#[ignore = "node-level reorg unimplemented (forward-only tip, undo not persisted, plan_reorg unwired)"]
-fn reorg_deep_fullstack() {
-    // Apply a chain, reorg to a competing higher-work branch, and assert UTXO / coinstats / filter /
-    // ScriptIndex / wallet / mempool state converges to the new tip vs bitcoind regtest. Requires
-    // node-level reorg (disconnect + undo) to be implemented first.
+fn reorg_deep_test() {
+    // libtest accepts exactly one positional filter per invocation, so each
+    // required test runs in its own subprocess: (package, test name, failure
+    // context). Success and executed-and-passed checks apply to every
+    // subprocess output.
+    let required: &[(&str, &str, &str)] = &[
+        (
+            "bitcoin-rs-chain",
+            "plans_deep_reorg_to_common_fork",
+            "chain crate depth-100 reorg planner",
+        ),
+        (
+            "bitcoin-rs-node",
+            "disconnecting_the_tip_restores_the_exact_prior_state",
+            "node disconnect state restoration",
+        ),
+        (
+            "bitcoin-rs-node",
+            "reorg_sequence_events_disconnect_old_tip_before_connecting_new_branch",
+            "node reorg sequence-event ordering",
+        ),
+        (
+            "bitcoin-rs-node",
+            "invalidate_block_disconnects_active_tip_and_emits_sequence_event",
+            "node invalidateblock disconnect",
+        ),
+        (
+            "bitcoin-rs-node",
+            "a_disconnect_body_store_failure_moves_nothing",
+            "node disconnect body-load failure safety",
+        ),
+        (
+            "bitcoin-rs-node",
+            "forward_commit_overlapping_rival_reorg_repairs_on_next_pass",
+            "txindex rival-reorg watermark repair",
+        ),
+        (
+            "bitcoin-rs-node",
+            "rollback_of_recanonicalized_watermark_repairs_on_next_pass",
+            "txindex recanonicalized watermark rollback",
+        ),
+    ];
+
+    for &(package, name, context) in required {
+        let output = output_or_panic(
+            {
+                let mut cmd = cargo();
+                cmd.args(["test", "-p", package, name]);
+                cmd
+            },
+            &format!("spawn cargo test for {context}"),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{context} test failed:\n{stdout}\n{stderr}"
+        );
+        require_ran(&stdout, &[name]);
+    }
 }
