@@ -30,7 +30,7 @@ pub mod wire;
 /// BIP339 wtxid-relay state.
 pub mod wtxid;
 
-pub use connection::{ConnectionId, PeerLease, PeerSource, PeerStats};
+pub use connection::{ConnectionId, PeerLease, PeerLifecycle, PeerSource, PeerStats};
 pub use dispatch::{ChainQuery, InventoryResponse};
 pub use inbound::{InboundBlock, InboundHeaders};
 pub use listener::spawn_outbound_connection;

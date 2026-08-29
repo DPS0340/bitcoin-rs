@@ -141,11 +141,7 @@ fn spawn_p2p_listeners(
     inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,
-    peer_registered: Arc<
-        dyn Fn(SocketAddr, bitcoin_rs_p2p::PeerLease, bitcoin_rs_p2p::PeerInfo) -> bool
-            + Send
-            + Sync,
-    >,
+    peer_ready: Arc<dyn Fn(SocketAddr) + Send + Sync>,
 ) -> anyhow::Result<Vec<std::thread::JoinHandle<Result<(), bitcoin_rs_p2p::listener::ListenerError>>>>
 {
     let mut handles = Vec::with_capacity(config.p2p_listen.len());
@@ -161,7 +157,7 @@ fn spawn_p2p_listeners(
         let listener_inbound_blocks_tx = inbound_blocks_tx.clone();
         let listener_sync_wake_tx = sync_wake_tx.clone();
         let listener_chain_query = Arc::clone(&chain_query);
-        let listener_peer_registered = Arc::clone(&peer_registered);
+        let listener_peer_ready = Arc::clone(&peer_ready);
         let handle = std::thread::Builder::new()
             .name(format!("bitcoin-rs-p2p-{listener_addr}"))
             .spawn(move || {
@@ -177,7 +173,7 @@ fn spawn_p2p_listeners(
                     listener_banned,
                     Some(listener_chain_query),
                     Some(listener_sync_wake_tx),
-                    Some(listener_peer_registered),
+                    Some(listener_peer_ready),
                 )
             })?;
         tracing::info!(addr = %listener_addr, "p2p listener bound");
@@ -230,11 +226,7 @@ fn spawn_p2p_outbound_drain(
     shutdown: &Arc<AtomicBool>,
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,
-    peer_registered: Arc<
-        dyn Fn(SocketAddr, bitcoin_rs_p2p::PeerLease, bitcoin_rs_p2p::PeerInfo) -> bool
-            + Send
-            + Sync,
-    >,
+    peer_ready: Arc<dyn Fn(SocketAddr) + Send + Sync>,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     let outbound_rx = state.p2p_outbound_receiver();
     let magic = bitcoin::p2p::Magic::from_bytes(state.config().p2p_magic());
@@ -242,7 +234,7 @@ fn spawn_p2p_outbound_drain(
     let outbound_peer_outbound = state.peer_outbound();
     let outbound_banned = state.banned_subnets();
     let outbound_headers_tx = state.inbound_headers_sender();
-    let outbound_peer_registered = Arc::clone(&peer_registered);
+    let outbound_peer_ready = Arc::clone(&peer_ready);
     let outbound_blocks_tx = state.inbound_blocks_sender();
     let outbound_sync_wake_tx = sync_wake_tx;
     let outbound_shutdown = Arc::clone(shutdown);
@@ -291,7 +283,7 @@ fn spawn_p2p_outbound_drain(
                             Arc::clone(&outbound_network_active),
                             Some(Arc::clone(&outbound_chain_query)),
                             Some(outbound_sync_wake_tx.clone()),
-                            Some(Arc::clone(&outbound_peer_registered)),
+                            Some(Arc::clone(&outbound_peer_ready)),
                         );
                         active.insert(addr);
                         handles.push((addr, handle));
@@ -620,7 +612,7 @@ pub fn run(mut config: Config) -> Result<()> {
     );
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
     let sync = state.sync();
-    let peer_registered = sync.peer_registration_handle();
+    let peer_ready = sync.peer_ready_handle();
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let mining_control: Arc<dyn bitcoin_rs_rpc::context::MiningControl> =
         Arc::new(crate::MiningCoordinator::new(
@@ -696,14 +688,14 @@ pub fn run(mut config: Config) -> Result<()> {
         state.inbound_blocks_sender(),
         sync_wake_tx.clone(),
         Arc::clone(&p2p_chain_query),
-        Arc::clone(&peer_registered),
+        Arc::clone(&peer_ready),
     )?;
     let outbound_worker = spawn_p2p_outbound_drain(
         &state,
         &shutdown,
         sync_wake_tx,
         Arc::clone(&p2p_chain_query),
-        Arc::clone(&peer_registered),
+        Arc::clone(&peer_ready),
     )?;
     let bootstrap_worker = if state.config().connect.is_empty() {
         spawn_dns_peer_maintenance(
