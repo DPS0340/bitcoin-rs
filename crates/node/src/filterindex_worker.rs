@@ -35,7 +35,9 @@ use bitcoin_rs_ext_blockfilterindex::{
     LifecycleState, StoredCursor, basic_filter_for_block, filter_header, zero_filter_header,
 };
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{FilterIndexInfo, FilterIndexQuery, TxIndexQuery, TxQueryError};
+use bitcoin_rs_rpc::context::{
+    FilterIndexInfo, FilterIndexQuery, TxIndexInfo, TxIndexQuery, TxQueryError,
+};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 
@@ -210,6 +212,10 @@ enum FilterWorkerError {
     /// incomplete, so the block is refused rather than mis-indexed.
     #[error("filter index worker: cannot resolve prevout {0} for the basic filter")]
     UnresolvablePrevout(OutPoint),
+    /// The transaction-index lookup failed terminally; the namespace cannot
+    /// prove a complete filter set, so the pass fails.
+    #[error("filter index worker: transaction-index query failed: {0}")]
+    TxQuery(TxQueryError),
     /// The active-chain identity for `height` is not resolvable.
     #[error("filter index worker: target chain node missing at height {height}")]
     MissingTargetChain {
@@ -222,6 +228,9 @@ enum FilterWorkerError {
 enum Action {
     /// At least one namespace batch was committed this pass.
     Progressed,
+    /// A required transaction-index lookup raced index progress; wait for the
+    /// next wake or poll tick before retrying this block.
+    Retry,
     /// The namespace mirrors the applied tip, or there is no applied tip.
     CaughtUp,
 }
@@ -301,7 +310,7 @@ impl Worker {
                 break;
             }
             match self.reconcile_once() {
-                Ok(Action::Progressed | Action::CaughtUp) => {
+                Ok(Action::Progressed | Action::Retry | Action::CaughtUp) => {
                     if self.wait_for_wake().is_none() {
                         break;
                     }
@@ -428,23 +437,38 @@ impl Worker {
                 })?;
             drop(body);
 
-            let filter =
-                basic_filter_for_block(&block, |outpoint| self.resolve_prevout(&block, outpoint))
-                    .map_err(|error| match error {
-                    bitcoin::bip158::Error::UtxoMissing(outpoint) => {
-                        FilterWorkerError::UnresolvablePrevout(outpoint)
+            let mut query_error = None;
+            let filter_result = basic_filter_for_block(&block, |outpoint| {
+                if query_error.is_some() {
+                    return None;
+                }
+                match self.resolve_prevout(&block, outpoint) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        query_error = Some(error);
+                        None
                     }
-                    bitcoin::bip158::Error::Io(io) => {
-                        FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(io))
-                    }
-                    // `bip158::Error` is `#[non_exhaustive]`: route future
-                    // variants through the storage-backed error.
-                    other => {
-                        FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(
-                            other,
-                        ))
-                    }
-                })?;
+                }
+            });
+            if let Some(error) = query_error {
+                return match error {
+                    TxQueryError::Retry => Ok(Action::Retry),
+                    terminal => Err(FilterWorkerError::TxQuery(terminal)),
+                };
+            }
+            let filter = filter_result.map_err(|error| match error {
+                bitcoin::bip158::Error::UtxoMissing(outpoint) => {
+                    FilterWorkerError::UnresolvablePrevout(outpoint)
+                }
+                bitcoin::bip158::Error::Io(io) => {
+                    FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(io))
+                }
+                // `bip158::Error` is `#[non_exhaustive]`: route future
+                // variants through the storage-backed error.
+                other => FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(
+                    other,
+                )),
+            })?;
             for tx in &block.txdata {
                 self.window.remember(tx);
             }
@@ -544,29 +568,36 @@ impl Worker {
         &mut self,
         block: &bitcoin::Block,
         outpoint: &OutPoint,
-    ) -> Option<ScriptBuf> {
+    ) -> Result<Option<ScriptBuf>, TxQueryError> {
         for tx in &block.txdata {
             if tx.compute_txid() == outpoint.txid {
-                return tx
+                let Some(vout) = usize::try_from(outpoint.vout).ok() else {
+                    return Ok(None);
+                };
+                return Ok(tx
                     .output
-                    .get(usize::try_from(outpoint.vout).ok()?)
-                    .map(|output| output.script_pubkey.clone());
+                    .get(vout)
+                    .map(|output| output.script_pubkey.clone()));
             }
         }
         if let Some(script) = self.window.script_for(outpoint) {
-            return Some(script);
+            return Ok(Some(script));
         }
         let native_txid = bitcoin_rs_primitives::Txid::from(Hash256::from_le_bytes(
             outpoint.txid.as_byte_array(),
         ));
-        let tx = self
-            .tx_lookup
-            .as_ref()?
-            .transaction(&native_txid)
-            .ok()??;
-        tx.outputs
-            .get(usize::try_from(outpoint.vout).ok()?)
-            .map(|output| ScriptBuf::from_bytes(output.script_pubkey.clone()))
+        let Some(tx_lookup) = self.tx_lookup.as_ref() else {
+            return Ok(None);
+        };
+        let Some(tx) = tx_lookup.transaction(&native_txid)? else {
+            return Ok(None);
+        };
+        let Some(vout) = usize::try_from(outpoint.vout).ok() else {
+            return Ok(None);
+        };
+        Ok(tx.outputs.get(vout).map(|output| {
+            ScriptBuf::from_bytes(output.script_pubkey.clone())
+        }))
     }
 }
 
@@ -1135,6 +1166,265 @@ mod tests {
             hints: hint_rx,
             window: PrevoutWindow::new(),
         }
+    }
+
+    fn worker_for_lookup(fixture: &Fixture, lookup: Arc<dyn TxIndexQuery>) -> Worker {
+        let mut worker = worker_for(fixture);
+        worker.tx_lookup = Some(lookup);
+        worker
+    }
+
+    /// Worker over genesis plus a child spending an index-only prevout, tip
+    /// advanced to the child, genesis already indexed.
+    fn deep_child_worker(mode: LookupMode) -> (Fixture, Worker) {
+        let genesis = genesis_block(Network::Regtest);
+        let child = deep_child(&genesis, phantom_prevout());
+        let fixture = fixture(&[genesis, child]);
+        let mut worker = worker_for_lookup(&fixture, Arc::new(StubLookup::new(mode)));
+        fixture.advance_tip_to(0);
+        assert_eq!(
+            worker.reconcile_once().expect("genesis pass"),
+            Action::Progressed
+        );
+        fixture.advance_tip_to(1);
+        (fixture, worker)
+    }
+
+    /// A failed pass keeps the last committed position and stays healthy
+    /// until the run loop publishes the failure.
+    fn assert_terminal_pass_kept_committed_rows(fixture: &Fixture, worker: &Worker) {
+        assert!(worker.runtime.failure_message().is_none());
+        let genesis_block_hash = fixture.blocks[0].block_hash();
+        let genesis_hash = genesis_block_hash.as_byte_array();
+        assert!(fixture.store.filter_row(*genesis_hash).expect("row").is_some());
+    }
+
+    /// Stand-in transaction-index query returning per-mode canned answers.
+    struct StubLookup {
+        mode: parking_lot::Mutex<LookupMode>,
+    }
+
+    enum LookupMode {
+        /// The index raced progress: the typed nonterminal answer.
+        Race,
+        Unavailable,
+        Storage,
+        /// Complete absence proven for the queried txid.
+        ProvenMissing,
+        Answer(bitcoin_rs_primitives::Tx),
+    }
+
+    impl StubLookup {
+        fn new(mode: LookupMode) -> Self {
+            Self {
+                mode: parking_lot::Mutex::new(mode),
+            }
+        }
+
+        fn set_mode(&self, mode: LookupMode) {
+            *self.mode.lock() = mode;
+        }
+    }
+
+    impl TxIndexQuery for StubLookup {
+        fn transaction(
+            &self,
+            txid: &bitcoin_rs_primitives::Txid,
+        ) -> Result<Option<bitcoin_rs_primitives::Tx>, TxQueryError> {
+            match &*self.mode.lock() {
+                LookupMode::Race => Err(TxQueryError::Retry),
+                LookupMode::Unavailable => Err(TxQueryError::Unavailable("index offline".into())),
+                LookupMode::Storage => Err(TxQueryError::Storage("index store broke".into())),
+                LookupMode::ProvenMissing => Ok(None),
+                LookupMode::Answer(tx) if tx.txid() == *txid => Ok(Some(tx.clone())),
+                LookupMode::Answer(_) => Ok(None),
+            }
+        }
+
+        fn outpoint_value(
+            &self,
+            _outpoint: &bitcoin_rs_primitives::OutPoint,
+        ) -> Result<Option<u64>, TxQueryError> {
+            Ok(None)
+        }
+
+        fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
+            Ok(TxIndexInfo {
+                synced: true,
+                best_block_height: 1,
+            })
+        }
+    }
+
+    /// Child whose single non-coinbase tx spends an outpoint whose creating
+    /// tx exists only in the transaction index: same block and recency-window
+    /// resolution both miss, so the worker must consult `tx_lookup`.
+    #[expect(
+        clippy::expect_used,
+        reason = "test: hand-built fixtures cannot fail except by a bug"
+    )]
+    fn deep_child(parent: &bitcoin::Block, spent: OutPoint) -> bitcoin::Block {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_hex("51").expect("op_true"),
+            }],
+        };
+        let spender = Transaction {
+            version: Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: spent,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_hex("52").expect("op_2"),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: parent.header,
+            txdata: vec![coinbase, spender],
+        };
+        block.header.prev_blockhash = parent.block_hash();
+        block.header.merkle_root = block.compute_merkle_root().expect("merkle root");
+        while block.header.validate_pow(block.header.target()).is_err() {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
+
+    fn phantom_prevout() -> OutPoint {
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0x42_u8; 32]),
+            vout: 0,
+        }
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test: hand-built fixtures cannot fail except by a bug"
+    )]
+    #[test]
+    fn tx_query_retry_stays_live_until_lookup_recovers() {
+        let genesis = genesis_block(Network::Regtest);
+        let answer = bitcoin_rs_primitives::Tx {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: vec![bitcoin_rs_primitives::TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+        let answer_outpoint = OutPoint {
+            txid: bitcoin::Txid::from_byte_array(answer.txid().0.to_le_bytes()),
+            vout: 0,
+        };
+        let child = deep_child(&genesis, answer_outpoint);
+        let fixture = fixture(&[genesis, child]);
+        let stub = Arc::new(StubLookup::new(LookupMode::Race));
+        let mut worker = worker_for_lookup(&fixture, Arc::clone(&stub) as Arc<dyn TxIndexQuery>);
+        fixture.advance_tip_to(0);
+        assert_eq!(
+            worker.reconcile_once().expect("genesis pass"),
+            Action::Progressed
+        );
+        fixture.advance_tip_to(1);
+
+        assert_eq!(worker.reconcile_once().expect("retry is not an error"), Action::Retry);
+        let genesis_block_hash = fixture.blocks[0].block_hash();
+        let genesis_hash = genesis_block_hash.as_byte_array();
+        assert!(fixture.store.filter_row(*genesis_hash).expect("row").is_some());
+        assert_eq!(
+            fixture.store.pointer().expect("pointer"),
+            Some(ActivePointer {
+                height: 0,
+                hash: *genesis_hash,
+            })
+        );
+        assert!(worker.runtime.failure_message().is_none());
+
+        // A later pass over a recovered index converges: the retry was
+        // transient, not a permanent failure of the worker.
+        stub.set_mode(LookupMode::Answer(answer));
+        assert_eq!(
+            worker.reconcile_once().expect("recovered pass"),
+            Action::Progressed
+        );
+        let child_block_hash = fixture.blocks[1].block_hash();
+        let child_hash = child_block_hash.as_byte_array();
+        assert!(fixture.store.filter_row(*child_hash).expect("row").is_some());
+        assert_eq!(
+            fixture.store.pointer().expect("pointer"),
+            Some(ActivePointer {
+                height: 1,
+                hash: *child_hash,
+            })
+        );
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test: hand-built fixtures cannot fail except by a bug"
+    )]
+    #[test]
+    fn tx_query_unavailable_fails_the_pass() {
+        let (fixture, mut worker) = deep_child_worker(LookupMode::Unavailable);
+
+        let error = worker
+            .reconcile_once()
+            .expect_err("unavailable lookup is terminal");
+        assert!(matches!(
+            error,
+            FilterWorkerError::TxQuery(TxQueryError::Unavailable(_))
+        ));
+        assert_terminal_pass_kept_committed_rows(&fixture, &worker);
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test: hand-built fixtures cannot fail except by a bug"
+    )]
+    #[test]
+    fn tx_query_storage_error_fails_the_pass() {
+        let (fixture, mut worker) = deep_child_worker(LookupMode::Storage);
+
+        let error = worker
+            .reconcile_once()
+            .expect_err("storage-backed lookup error is terminal");
+        assert!(matches!(
+            error,
+            FilterWorkerError::TxQuery(TxQueryError::Storage(_))
+        ));
+        assert_terminal_pass_kept_committed_rows(&fixture, &worker);
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "test: hand-built fixtures cannot fail except by a bug"
+    )]
+    #[test]
+    fn tx_query_proven_missing_prevout_fails_the_pass() {
+        let (fixture, mut worker) = deep_child_worker(LookupMode::ProvenMissing);
+
+        // `Ok(None)` proves complete absence, so the required prevout stays
+        // unresolvable and the pass fails instead of mis-indexing.
+        let error = worker
+            .reconcile_once()
+            .expect_err("proven-missing prevout is terminal");
+        assert!(matches!(error, FilterWorkerError::UnresolvablePrevout(_)));
+        assert_terminal_pass_kept_committed_rows(&fixture, &worker);
     }
 
     #[expect(
