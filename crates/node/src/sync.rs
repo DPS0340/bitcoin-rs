@@ -317,10 +317,14 @@ impl BlockSync {
         Arc::new(move |peer_addr, lease, info| {
             let mut window = window.lock();
             let mut outbound = outbound.write();
-            let replaced = outbound.remove(&peer_addr).is_some_and(|prior| {
-                prior.cancel();
-                true
-            });
+            let replaced = match outbound.remove(&peer_addr) {
+                Some(prior) if prior.same_connection(&lease) => false,
+                Some(prior) => {
+                    prior.cancel();
+                    true
+                }
+                None => false,
+            };
             window.forget_peer(peer_addr);
             outbound.insert(peer_addr, lease);
             let mut peers = peers.write();
@@ -7786,6 +7790,34 @@ mod tests {
             conn_time: 0,
             inbound: true,
         }
+    }
+
+    #[test]
+    fn peer_registration_keeps_the_pre_registered_connection_live()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
+        let (tx, rx) = unbounded::<Message>();
+        let lease = PeerLease::new(tx);
+        peer_outbound.write().insert(addr, lease.clone());
+
+        let registration = sync.peer_registration_handle();
+        assert!(!registration(addr, lease.clone(), synthetic_peer(addr, 1)));
+        assert!(
+            !lease.is_cancelled(),
+            "handshake publication must not cancel its pre-registered connection"
+        );
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|current| current.same_connection(&lease))
+        );
+        lease.send(Message::Ping(7))?;
+        assert_eq!(rx.recv()?, Message::Ping(7));
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 1)]);
+        Ok(())
     }
 
     #[test]
