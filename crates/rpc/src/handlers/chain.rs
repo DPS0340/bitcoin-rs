@@ -293,9 +293,8 @@ pub(crate) fn getchaintips(ctx: &Arc<Context>, params: &Value) -> Result<Value, 
 pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
     const DEFAULT_WINDOW: u64 = 30 * 24 * 6; // ~1 month of 10-min blocks
     let array = params_array(params)?;
-    let tip_hash = match array.get(1) {
+    let tip_hash = match array.get(1).filter(|value| !value.is_null()) {
         None => ctx.applied_hash(),
-        Some(value) if value.is_null() => ctx.applied_hash(),
         Some(value) => {
             let hash = parse_hash(
                 value
@@ -314,11 +313,9 @@ pub(crate) fn getchaintxstats(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let tip_height = ctx
         .height_for_hash(tip_hash)
         .unwrap_or_else(|| ctx.applied_height());
-    let window_block_count = match array.first() {
-        None => DEFAULT_WINDOW.min(u64::from(tip_height.saturating_sub(1))),
-        Some(value) if value.is_null() => {
-            DEFAULT_WINDOW.min(u64::from(tip_height.saturating_sub(1)))
-        }
+    let default_window = DEFAULT_WINDOW.min(u64::from(tip_height.saturating_sub(1)));
+    let window_block_count = match array.first().filter(|value| !value.is_null()) {
+        None => default_window,
         Some(value) => {
             let nblocks = value
                 .as_u64()
@@ -854,9 +851,9 @@ pub(crate) fn verifychain(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             if let Some(record) = ctx.block_by_hash(node.hash) {
                 if let Some(bytes) = ctx.block_body_bytes(&record) {
                     if let Ok(block) = deserialize::<Block>(&bytes) {
-                        let mut txids = block.txids();
+                        let txids = block.txids();
                         if !bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids(
-                            &block, &mut txids,
+                            &block, &txids,
                         ) {
                             return typed_to_sonic(&v31::VerifyChain(false));
                         }

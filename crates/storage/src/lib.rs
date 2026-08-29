@@ -49,3 +49,20 @@ pub use mdbx_impl::MdbxStore;
 pub use redb_impl::{RedbStore, open_redb_tx_index_store, open_redb_tx_index_store_with_cache};
 #[cfg(feature = "rocksdb")]
 pub use rocksdb_impl::RocksDbStore;
+
+/// Converts a `u64` byte count to an `f64` metric value.
+///
+/// Split the value into 32-bit limbs so the conversion uses only exact
+/// `f64::from(u32)` operations and rounds like a direct `u64` conversion.
+pub(crate) fn metric_f64(value: u64) -> f64 {
+    const TWO32: f64 = 4_294_967_296.0;
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = value.to_le_bytes();
+    let low = u32::from_le_bytes([b0, b1, b2, b3]);
+    let high = u32::from_le_bytes([b4, b5, b6, b7]);
+    f64::from(high).mul_add(TWO32, f64::from(low))
+}
+
+/// Converts a `usize` byte count to an `f64` metric value via `u64`.
+pub(crate) fn metric_f64_from_usize(value: usize) -> f64 {
+    metric_f64(u64::try_from(value).unwrap_or(u64::MAX))
+}

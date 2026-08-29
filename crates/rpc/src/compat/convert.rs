@@ -47,10 +47,12 @@ pub(crate) fn i64_saturated_len(value: usize) -> i64 {
 /// Saturating `i64 -> i32` for Core wire counters typed as `i32`.
 #[must_use]
 pub(crate) fn i32_saturated(value: i64) -> i32 {
-    i32::try_from(value).unwrap_or(if value.is_negative() {
-        i32::MIN
-    } else {
-        i32::MAX
+    i32::try_from(value).unwrap_or_else(|_| {
+        if value.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
     })
 }
 
@@ -66,10 +68,12 @@ pub(crate) fn sat_to_btc(sats: u64) -> f64 {
 /// Signed counterpart for fee fields that carry deltas.
 #[must_use]
 pub(crate) fn signed_sat_to_btc(sats: i128) -> f64 {
-    let clamped = i64::try_from(sats).unwrap_or(if sats.is_negative() {
-        i64::MIN
-    } else {
-        i64::MAX
+    let clamped = i64::try_from(sats).unwrap_or_else(|_| {
+        if sats.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
     });
     let magnitude = clamped.unsigned_abs();
     let high = u32::try_from(magnitude >> 32).unwrap_or(u32::MAX);
@@ -224,7 +228,7 @@ pub(crate) fn raw_transaction_verbose(
         .iter()
         .enumerate()
         .map(|(index, input)| raw_input_typed(input, index == 0 && coinbase))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let outputs = tx
         .outputs
         .iter()
@@ -247,7 +251,7 @@ pub(crate) fn raw_transaction_verbose(
         txid: tx.txid().to_string(),
         hash: tx.wtxid().to_string(),
         size: u64::try_from(tx.total_size()).unwrap_or(u64::MAX),
-        vsize: u64::try_from(tx.vsize()).unwrap_or(u64::MAX),
+        vsize: tx.vsize(),
         weight: tx.weight(),
         version: tx.version,
         lock_time: tx.lock_time,
@@ -276,7 +280,7 @@ pub(crate) fn raw_transaction(
         .iter()
         .enumerate()
         .map(|(index, input)| raw_input_typed(input, index == 0 && coinbase))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let outputs = tx
         .outputs
         .iter()
@@ -287,7 +291,7 @@ pub(crate) fn raw_transaction(
         txid: tx.txid().to_string(),
         hash: tx.wtxid().to_string(),
         size: u64::try_from(tx.total_size()).unwrap_or(u64::MAX),
-        vsize: u64::try_from(tx.vsize()).unwrap_or(u64::MAX),
+        vsize: tx.vsize(),
         weight: tx.weight(),
         version: tx.version,
         lock_time: tx.lock_time,
@@ -297,10 +301,7 @@ pub(crate) fn raw_transaction(
 }
 
 /// Projects one transaction input, coinbase-shaped when flagged.
-fn raw_input_typed(
-    input: &TxIn,
-    coinbase: bool,
-) -> Result<corepc_types::v31::RawTransactionInput, RpcError> {
+fn raw_input_typed(input: &TxIn, coinbase: bool) -> corepc_types::v31::RawTransactionInput {
     let txin_witness = (!input.witness.is_empty()).then(|| {
         input
             .witness
@@ -309,27 +310,27 @@ fn raw_input_typed(
             .collect::<Vec<_>>()
     });
     if coinbase {
-        return Ok(corepc_types::v31::RawTransactionInput {
+        return corepc_types::v31::RawTransactionInput {
             coinbase: Some(hex_encode(&input.script_sig)),
             txid: None,
             vout: None,
             script_sig: None,
             txin_witness,
             sequence: input.sequence,
-        });
+        };
     }
     // Field copies come before any `&self` method: `OutPoint` is
     // `#[repr(packed)]` (consensus wire layout), so field references would be
     // unaligned.
     let (prev_txid, prev_vout) = (input.previous_output.txid, input.previous_output.vout);
-    Ok(corepc_types::v31::RawTransactionInput {
+    corepc_types::v31::RawTransactionInput {
         coinbase: None,
         txid: Some(prev_txid.to_string()),
         vout: Some(prev_vout),
         script_sig: Some(script_sig_typed(&input.script_sig)),
         txin_witness,
         sequence: input.sequence,
-    })
+    }
 }
 
 /// Projects one transaction output at its zero-based index.
@@ -391,7 +392,10 @@ mod compact_target_tests {
     #[test]
     fn compact_target_ignores_sign_and_drops_overflow_shifts() {
         // The sign bit negates; the rendered magnitude is unchanged.
-        assert_eq!(compact_target_hex(0x1d80_ffff), compact_target_hex(0x1d00_ffff));
+        assert_eq!(
+            compact_target_hex(0x1d80_ffff),
+            compact_target_hex(0x1d00_ffff)
+        );
 
         // Exponent 35 shifts every mantissa byte past 256 bits: zero target.
         assert_eq!(compact_target_hex(0x2300_ffff), "0".repeat(64));

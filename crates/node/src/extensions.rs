@@ -129,11 +129,11 @@ impl NodeCapabilities {
         }
     }
 
-    fn applied_height(&self, applied_tip: &ArcSwapOption<TipSnapshot>) -> u32 {
+    fn applied_height(applied_tip: &ArcSwapOption<TipSnapshot>) -> u32 {
         applied_tip.load().as_ref().map_or(0, |tip| tip.height)
     }
 
-    fn txindex_status(&self, inputs: &CapabilityInputs) -> CapabilityStatus {
+    fn txindex_status(inputs: &CapabilityInputs) -> CapabilityStatus {
         let state = if !inputs.txindex_enabled {
             HealthStatus::Disabled
         } else if let Some(message) = inputs
@@ -145,7 +145,7 @@ impl NodeCapabilities {
                 reason: message.to_string(),
             }
         } else {
-            let target = self.applied_height(&inputs.applied_tip);
+            let target = Self::applied_height(&inputs.applied_tip);
             match inputs.tx_query.as_ref().map(|query| query.index_info()) {
                 Some(Ok(info)) if info.synced => HealthStatus::Ready,
                 Some(Ok(info)) => HealthStatus::CatchingUp {
@@ -166,7 +166,7 @@ impl NodeCapabilities {
         }
     }
 
-    fn filter_status(&self, inputs: &CapabilityInputs) -> CapabilityStatus {
+    fn filter_status(inputs: &CapabilityInputs) -> CapabilityStatus {
         let enabled = inputs.filter_status.is_some();
         let state = match inputs.filter_status.as_ref() {
             None => HealthStatus::Disabled,
@@ -185,7 +185,7 @@ impl CapabilityProvider for NodeCapabilities {
     fn snapshot(&self) -> CapabilitySnapshot {
         let inputs = self.inputs.lock();
         CapabilitySnapshot {
-            capabilities: vec![self.txindex_status(&inputs), self.filter_status(&inputs)],
+            capabilities: vec![Self::txindex_status(&inputs), Self::filter_status(&inputs)],
         }
     }
 }
@@ -224,7 +224,10 @@ mod tests {
     #[test]
     fn validation_names_the_missing_dependency_literally() {
         let config = config_with(|config| config.blockfilterindex = true);
-        let error = validate_extensions(&config).expect_err("missing txindex");
+        let error = match validate_extensions(&config) {
+            Ok(()) => panic!("missing txindex must be rejected"),
+            Err(error) => error,
+        };
         assert_eq!(error.to_string(), "blockfilterindex requires txindex");
     }
 
@@ -253,7 +256,10 @@ mod tests {
             config.blockfilterindex = true;
             config.prune_target_mb = 10;
         });
-        let error = validate_extensions(&config).expect_err("prune conflict");
+        let error = match validate_extensions(&config) {
+            Ok(()) => panic!("prune conflict must be rejected"),
+            Err(error) => error,
+        };
         assert_eq!(
             error.to_string(),
             "blockfilterindex requires prune disabled"
@@ -266,6 +272,6 @@ mod tests {
             config.txindex = true;
             config.blockfilterindex = true;
         });
-        validate_extensions(&config).expect("valid combination");
+        assert!(validate_extensions(&config).is_ok());
     }
 }

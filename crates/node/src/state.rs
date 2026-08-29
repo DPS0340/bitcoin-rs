@@ -1441,8 +1441,7 @@ impl NodeState {
                         Arc::clone(&applied_tip),
                         Some(body_source),
                     ));
-                    let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> =
-                        query.clone();
+                    let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
                     let worker = crate::txindex_worker::TxIndexWorker::spawn(
                         Arc::clone(&runtime),
                         open.writer,
@@ -1746,8 +1745,7 @@ impl NodeState {
             return None;
         }
         self.filter_index.as_ref().map(|handle| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::context::FilterIndexQuery> =
-                handle.query.clone();
+            let adapter: Arc<dyn bitcoin_rs_rpc::context::FilterIndexQuery> = handle.query.clone();
             adapter
         })
     }

@@ -372,11 +372,7 @@ fn render_mining_info(info: &MiningInfo) -> Result<Value, RpcError> {
             difficulty: info.next_difficulty,
             target: next_target,
         },
-        warnings: info
-            .warnings
-            .iter()
-            .map(|warning| warning.to_string())
-            .collect(),
+        warnings: info.warnings.iter().map(ToString::to_string).collect(),
     })
 }
 

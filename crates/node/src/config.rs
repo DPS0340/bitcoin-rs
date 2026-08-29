@@ -152,8 +152,8 @@ pub struct Config {
     pub prune_target_mb: u64,
     /// Whether the transaction index is enabled.
     pub txindex: bool,
-/// Whether the BIP157/158 basic block filter index extension is enabled.
-pub blockfilterindex: bool,
+    /// Whether the BIP157/158 basic block filter index extension is enabled.
+    pub blockfilterindex: bool,
     /// Database cache budget in MiB, divided across the persistent storage
     /// namespaces (chainstate 70%, txindex 20%, filters 10%; shares of
     /// disabled namespaces redistribute to chainstate).

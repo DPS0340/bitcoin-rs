@@ -175,7 +175,9 @@ fn assert_sparse_invalid(value: &sonic_rs::Value) {
         .unwrap_or_else(|| panic!("validateaddress: not an object: {value:?}"));
     assert_eq!(object.len(), 1, "expected exactly one key: {value:?}");
     assert_eq!(
-        value.get("isvalid").and_then(sonic_rs::JsonValueTrait::as_bool),
+        value
+            .get("isvalid")
+            .and_then(sonic_rs::JsonValueTrait::as_bool),
         Some(false),
         "isvalid must be false: {value:?}"
     );
@@ -213,18 +215,14 @@ fn util_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::err
     // object only, and a well-formed address from another network fails
     // identically; the corepc type cannot model that branch (local_shape).
     assert_sparse_invalid(&handler.dispatch("validateaddress", &json!(["not a real address"]))?);
-    assert_sparse_invalid(
-        &handler.dispatch(
-            "validateaddress",
-            &json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]),
-        )?,
-    );
-    let descriptor: corepc_types::v31::GetDescriptorInfo = typed(
-        &handler.dispatch(
-            "getdescriptorinfo",
-            &json!(["addr(1111111111111111111114oLvT2)"]),
-        )?,
-    )?;
+    assert_sparse_invalid(&handler.dispatch(
+        "validateaddress",
+        &json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]),
+    )?);
+    let descriptor: corepc_types::v31::GetDescriptorInfo = typed(&handler.dispatch(
+        "getdescriptorinfo",
+        &json!(["addr(1111111111111111111114oLvT2)"]),
+    )?)?;
     assert!(!descriptor.is_range);
     assert!(!descriptor.is_solvable);
     assert_eq!(descriptor.checksum.len(), 8);

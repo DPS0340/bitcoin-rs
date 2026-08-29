@@ -332,9 +332,11 @@ fn verify_input_script_portable(
 
 /// Per-transaction state retained across the flat block verify phases.
 struct PreparedTx<'b> {
+    #[cfg(not(feature = "kernel"))]
     /// Borrowed from the parse-once [`BlockView`]; every input check of this
     /// transaction reads the same decoded transaction without re-indexing.
     tx: &'b Tx,
+    #[cfg(feature = "kernel")]
     prevouts: Vec<(OutPoint, TxOut)>,
     /// The prevouts of `prevouts` as a plain slice, cloned once per
     /// transaction instead of once per input check; the portable interpreter
@@ -630,7 +632,9 @@ fn prepare_block_input_checks<'b>(
             Ok(Some(prep)) => prep,
             Ok(None) => {
                 prepared.push(PreparedTx {
+                    #[cfg(not(feature = "kernel"))]
                     tx,
+                    #[cfg(feature = "kernel")]
                     prevouts: Vec::new(),
                     #[cfg(not(feature = "kernel"))]
                     spent_outputs: Vec::new(),
@@ -645,7 +649,9 @@ fn prepare_block_input_checks<'b>(
             }
             Err(pre_error) => {
                 prepared.push(PreparedTx {
+                    #[cfg(not(feature = "kernel"))]
                     tx,
+                    #[cfg(feature = "kernel")]
                     prevouts: Vec::new(),
                     #[cfg(not(feature = "kernel"))]
                     spent_outputs: Vec::new(),
@@ -669,6 +675,7 @@ fn prepare_block_input_checks<'b>(
             Ok(state) => state,
             Err(setup_error) => {
                 prepared.push(PreparedTx {
+                    #[cfg(not(feature = "kernel"))]
                     tx,
                     prevouts: prep.prevouts,
                     pre_error: Some(setup_error),
@@ -704,7 +711,9 @@ fn prepare_block_input_checks<'b>(
         let post_error = finalize_tx_value_and_sigops(tx, &prep).err();
         let stop_after_tx = post_error.is_some();
         prepared.push(PreparedTx {
+            #[cfg(not(feature = "kernel"))]
             tx,
+            #[cfg(feature = "kernel")]
             prevouts: prep.prevouts,
             #[cfg(not(feature = "kernel"))]
             spent_outputs,
@@ -853,9 +862,11 @@ mod tests {
     #[cfg(feature = "kernel")]
     use bitcoin::hashes::Hash as _;
     use bitcoin_rs_primitives::{
-        Block, BlockHash, Hash256, Header, OutPoint, Sighash, SighashCache, Tx, TxIn, TxOut, Txid,
-        consensus_bytes, deserialize,
+        Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
+        deserialize,
     };
+    #[cfg(not(feature = "kernel"))]
+    use bitcoin_rs_primitives::{Sighash, SighashCache};
     #[cfg(feature = "kernel")]
     use bitcoin_rs_script::opcode::{OP_EQUAL, OP_HASH160};
     #[cfg(feature = "kernel")]
@@ -2039,12 +2050,8 @@ mod tests {
     fn parallel_timing_is_captured_before_ordered_error_scan() {
         use std::cell::Cell;
 
-        // A leaked transaction backs the prepared entries; this unit runs no
-        // script, so only the reference must stay valid.
-        let tx: &'static Tx = Box::leak(Box::new(coinbase_transaction_with_script_sig_len(2)));
         let prepared: Vec<super::PreparedTx> = (0..10)
             .map(|_| super::PreparedTx {
-                tx,
                 prevouts: Vec::new(),
                 pre_error: None,
                 post_error: None,

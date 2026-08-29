@@ -8,9 +8,7 @@ use sonic_rs::{JsonValueTrait, Value, json};
 
 use corepc_types::v31;
 
-use crate::compat::convert::{
-    self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls,
-};
+use crate::compat::convert::{self, sat_to_btc, typed_to_sonic, typed_to_sonic_omitting_nulls};
 use crate::context::Context;
 use crate::error::RpcError;
 use crate::handlers::{params_array, required_str, required_u64};
@@ -525,9 +523,8 @@ mod validateaddress_tests {
         // ctx defaults to the Mainnet selector; this testnet address parses
         // but fails require_network, and Core answers it sparsely too.
         let ctx = Arc::new(Context::new());
-        let result =
-            validateaddress(&ctx, &json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]))
-                .unwrap_or_else(|err| panic!("validateaddress failed: {err}"));
+        let result = validateaddress(&ctx, &json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]))
+            .unwrap_or_else(|err| panic!("validateaddress failed: {err}"));
         assert_sparse_invalid(&result);
     }
 

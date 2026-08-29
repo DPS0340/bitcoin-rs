@@ -49,7 +49,7 @@ impl RedbStore {
             cache_bytes
         };
         metrics::gauge!("storage.cache_capacity_bytes", "backend" => "redb")
-            .set(cache_bytes as f64);
+            .set(crate::metric_f64(cache_bytes));
         let db_path = database_path(path.as_ref())?;
         let db = Database::builder()
             .set_cache_size(usize::try_from(cache_bytes).unwrap_or(usize::MAX))
@@ -79,7 +79,7 @@ impl RedbStore {
         metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
             .increment(1);
         metrics::histogram!("storage.write_bytes", "backend" => "redb")
-            .record(batch.encoded_bytes as f64);
+            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(durability)
@@ -250,7 +250,7 @@ impl RedbTxIndexStore {
         metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => durability_label)
             .increment(1);
         metrics::histogram!("storage.write_bytes", "backend" => "redb")
-            .record(batch.encoded_bytes as f64);
+            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
         let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
         write_txn
             .set_durability(durability)
@@ -379,9 +379,10 @@ pub fn open_redb_tx_index_store(path: &Path) -> Result<impl KvStore, StorageErro
 }
 
 /// Opens the fixed-width redb transaction-index store with an explicit
-/// page-cache capacity. Same tables, same layout; only the cache window
-/// differs from [`open_redb_tx_index_store`]. `cache_bytes` is configured
-/// exactly; zero selects the store default.
+/// page-cache capacity.
+///
+/// The tables and layout are unchanged. `cache_bytes` configures only the
+/// cache window; zero selects the store default.
 pub fn open_redb_tx_index_store_with_cache(
     path: &Path,
     cache_bytes: u64,
@@ -392,7 +393,7 @@ pub fn open_redb_tx_index_store_with_cache(
         cache_bytes
     };
     metrics::gauge!("storage.cache_capacity_bytes", "backend" => "redb-txindex")
-        .set(cache_bytes as f64);
+        .set(crate::metric_f64(cache_bytes));
     RedbTxIndexStore::open_with_cache(path, cache_bytes)
 }
 

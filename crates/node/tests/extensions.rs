@@ -89,36 +89,40 @@ fn wait_for_filter_sync(state: &NodeState, target_height: u32) -> TestResult {
 }
 
 #[test]
-fn extension_validation_rejects_incompatible_capabilities() -> TestResult {
+fn extension_validation_rejects_incompatible_capabilities() {
     // Missing dependency: the reference extension requires txindex rows.
     let mut config = Config::default_for_network(Network::Regtest);
     config.blockfilterindex = true;
-    let error = bitcoin_rs_node::extensions::validate_extensions(&config)
-        .expect_err("blockfilterindex without txindex must be rejected");
+    let error = match bitcoin_rs_node::extensions::validate_extensions(&config) {
+        Ok(()) => panic!("blockfilterindex without txindex must be rejected"),
+        Err(error) => error,
+    };
     assert_eq!(error.to_string(), "blockfilterindex requires txindex");
 
     // Conflicting dependency: the filter index needs every block body.
     config.txindex = true;
     config.prune_target_mb = 10;
-    let error = bitcoin_rs_node::extensions::validate_extensions(&config)
-        .expect_err("blockfilterindex with prune must be rejected");
+    let error = match bitcoin_rs_node::extensions::validate_extensions(&config) {
+        Ok(()) => panic!("blockfilterindex with prune must be rejected"),
+        Err(error) => error,
+    };
     assert_eq!(
         error.to_string(),
         "blockfilterindex requires prune disabled"
     );
 
     // The same checks hold as a Config::validate backstop.
-    let error = config
-        .validate()
-        .expect_err("Config::validate repeats the extension checks");
+    let error = match config.validate() {
+        Ok(()) => panic!("Config::validate must repeat the extension checks"),
+        Err(error) => error,
+    };
     assert_eq!(
         error.to_string(),
         "blockfilterindex requires prune disabled"
     );
 
     config.prune_target_mb = 0;
-    bitcoin_rs_node::extensions::validate_extensions(&config).expect("valid combination");
-    Ok(())
+    assert!(bitcoin_rs_node::extensions::validate_extensions(&config).is_ok());
 }
 
 #[expect(
@@ -221,7 +225,10 @@ fn filter_extension_apply_outpaces_a_lagging_consumer() -> TestResult {
 
     let mut blocks = vec![genesis_block(BitcoinNetwork::Regtest)];
     for height in 1_u8..=5 {
-        let parent = blocks.last().expect("parent").clone();
+        let parent = blocks
+            .last()
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("missing parent block"))?;
         blocks.push(coinbase_child(&parent, height)?);
     }
     for block in &blocks {

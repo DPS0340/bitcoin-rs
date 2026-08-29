@@ -20,7 +20,7 @@ it across the persistent namespaces — chainstate 70%, txindex 20%, filters 10%
 namespace's share) to chainstate, so the shares always sum to at most the
 budget. Each backend accepts its namespace's share through `open_with_cache`
 (`open_redb_tx_index_store_with_cache` for the redb transaction index); fjall
-sizes its block cache, redb its page cache, RocksDB its LRU block cache, and
+sizes its block cache, redb its page cache, `RocksDB` its LRU block cache, and
 MDBX its reserved dirty-page pool. Clamping bounds: budgets land in
 `[16 MiB, 1 TiB]`, and the node logs the effective per-namespace capacities at
 startup.

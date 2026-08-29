@@ -57,13 +57,7 @@ fn extension_model_gates() {
     let output = output_or_panic(
         {
             let mut command = cargo();
-            command.args([
-                "test",
-                "-p",
-                "bitcoin-rs-node",
-                "--test",
-                "extensions",
-            ]);
+            command.args(["test", "-p", "bitcoin-rs-node", "--test", "extensions"]);
             command
         },
         "spawn cargo test for node extension tests",

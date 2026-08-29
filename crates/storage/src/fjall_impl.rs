@@ -32,7 +32,7 @@ impl FjallStore {
             cache_bytes
         };
         metrics::gauge!("storage.cache_capacity_bytes", "backend" => "fjall")
-            .set(cache_bytes as f64);
+            .set(crate::metric_f64(cache_bytes));
         let db = Database::builder(path.as_ref())
             .cache_size(cache_bytes)
             .open()
@@ -66,7 +66,7 @@ impl FjallStore {
         metrics::counter!("storage.writes_total", "backend" => "fjall", "durability" => durability_label)
             .increment(1);
         metrics::histogram!("storage.write_bytes", "backend" => "fjall")
-            .record(batch.encoded_bytes as f64);
+            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
         let mut fjall_batch = self.db.batch();
         if let Some(durability) = durability {
             fjall_batch = fjall_batch.durability(Some(durability));

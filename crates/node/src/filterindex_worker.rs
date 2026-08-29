@@ -35,9 +35,7 @@ use bitcoin_rs_ext_blockfilterindex::{
     LifecycleState, StoredCursor, basic_filter_for_block, filter_header, zero_filter_header,
 };
 use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{
-    FilterIndexInfo, FilterIndexQuery, TxIndexInfo, TxIndexQuery, TxQueryError,
-};
+use bitcoin_rs_rpc::context::{FilterIndexInfo, FilterIndexQuery, TxIndexQuery, TxQueryError};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::RwLock;
 
@@ -343,7 +341,7 @@ impl Worker {
         let pointer = self.store.pointer()?;
         let stored_cursor = self.store.cursor()?;
 
-        match {
+        let reconcile_plan = {
             let tree = self.block_tree.read();
             match pointer {
                 None => ReconcilePlan::Forward { from_height: 0 },
@@ -357,7 +355,8 @@ impl Worker {
                     plan(&cursor, &target, &tree)
                 }
             }
-        } {
+        };
+        match reconcile_plan {
             ReconcilePlan::CaughtUp => {
                 if self.commit_caught_up(&target)? {
                     Ok(Action::CaughtUp)
@@ -465,9 +464,9 @@ impl Worker {
                 }
                 // `bip158::Error` is `#[non_exhaustive]`: route future
                 // variants through the storage-backed error.
-                other => FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(
-                    other,
-                )),
+                other => {
+                    FilterWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(other))
+                }
             })?;
             for tx in &block.txdata {
                 self.window.remember(tx);
@@ -565,7 +564,7 @@ impl Worker {
     /// Resolves the script of one spent prevout: same block first, then the
     /// recency window, then the transaction-index query.
     fn resolve_prevout(
-        &mut self,
+        &self,
         block: &bitcoin::Block,
         outpoint: &OutPoint,
     ) -> Result<Option<ScriptBuf>, TxQueryError> {
@@ -595,9 +594,10 @@ impl Worker {
         let Some(vout) = usize::try_from(outpoint.vout).ok() else {
             return Ok(None);
         };
-        Ok(tx.outputs.get(vout).map(|output| {
-            ScriptBuf::from_bytes(output.script_pubkey.clone())
-        }))
+        Ok(tx
+            .outputs
+            .get(vout)
+            .map(|output| ScriptBuf::from_bytes(output.script_pubkey.clone())))
     }
 }
 
@@ -702,13 +702,7 @@ impl FilterIndexStatus {
             .map_err(|error| TxQueryError::Storage(error.to_string().into()))?;
         let applied = self.applied_tip.load_full();
         let snapshot = self.chain_events.snapshot();
-        let synced = metadata_claims_tip(
-            pointer,
-            state,
-            cursor,
-            applied.as_deref(),
-            &snapshot,
-        );
+        let synced = metadata_claims_tip(pointer, state, cursor, applied.as_deref(), &snapshot);
         Ok(FilterIndexInfo {
             synced,
             best_block_height: pointer.map_or(0, |pointer| pointer.height),
@@ -849,6 +843,7 @@ mod tests {
     use bitcoin::{Amount, Network, ScriptBuf, Sequence, TxIn, Witness};
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_ext_blockfilterindex::FilterOp;
+    use bitcoin_rs_rpc::context::TxIndexInfo;
     use bitcoin_rs_storage::StorageError;
     use parking_lot::Mutex;
 
@@ -910,9 +905,10 @@ mod tests {
 
     impl FilterStoreOps for MemStore {
         fn schema_version(&self) -> Result<Option<u32>, FilterStoreError> {
-            Ok(self
-                .row(&[0x00, b'V'])
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes"))))
+            Ok(self.row(&[0x00, b'V']).and_then(|bytes| {
+                let bytes = <[u8; 4]>::try_from(bytes).ok()?;
+                Some(u32::from_le_bytes(bytes))
+            }))
         }
 
         fn is_fresh(&self) -> Result<bool, FilterStoreError> {
@@ -949,15 +945,11 @@ mod tests {
         fn header_row(&self, hash: [u8; 32]) -> Result<Option<[u8; 32]>, FilterStoreError> {
             let mut key = vec![b'h'];
             key.extend_from_slice(&hash);
-            Ok(self
-                .row(&key)
-                .map(|bytes| bytes.try_into().expect("32 bytes")))
+            Ok(self.row(&key).and_then(|bytes| bytes.try_into().ok()))
         }
 
         fn pointer(&self) -> Result<Option<ActivePointer>, FilterStoreError> {
-            Ok(self
-                .read(POINTER_KEY)?
-                .map(|bytes| decode_pointer(&bytes)))
+            Ok(self.read(POINTER_KEY)?.map(|bytes| decode_pointer(&bytes)))
         }
 
         fn cursor(&self) -> Result<Option<StoredCursor>, FilterStoreError> {
@@ -1183,7 +1175,9 @@ mod tests {
         let mut worker = worker_for_lookup(&fixture, Arc::new(StubLookup::new(mode)));
         fixture.advance_tip_to(0);
         assert_eq!(
-            worker.reconcile_once().expect("genesis pass"),
+            worker
+                .reconcile_once()
+                .unwrap_or_else(|error| panic!("genesis pass failed: {error}")),
             Action::Progressed
         );
         fixture.advance_tip_to(1);
@@ -1196,7 +1190,11 @@ mod tests {
         assert!(worker.runtime.failure_message().is_none());
         let genesis_block_hash = fixture.blocks[0].block_hash();
         let genesis_hash = genesis_block_hash.as_byte_array();
-        assert!(fixture.store.filter_row(*genesis_hash).expect("row").is_some());
+        let row = fixture
+            .store
+            .filter_row(*genesis_hash)
+            .unwrap_or_else(|error| panic!("filter-row lookup failed: {error}"));
+        assert!(row.is_some());
     }
 
     /// Stand-in transaction-index query returning per-mode canned answers.
@@ -1235,9 +1233,8 @@ mod tests {
                 LookupMode::Race => Err(TxQueryError::Retry),
                 LookupMode::Unavailable => Err(TxQueryError::Unavailable("index offline".into())),
                 LookupMode::Storage => Err(TxQueryError::Storage("index store broke".into())),
-                LookupMode::ProvenMissing => Ok(None),
                 LookupMode::Answer(tx) if tx.txid() == *txid => Ok(Some(tx.clone())),
-                LookupMode::Answer(_) => Ok(None),
+                LookupMode::ProvenMissing | LookupMode::Answer(_) => Ok(None),
             }
         }
 
@@ -1334,7 +1331,7 @@ mod tests {
         let child = deep_child(&genesis, answer_outpoint);
         let fixture = fixture(&[genesis, child]);
         let stub = Arc::new(StubLookup::new(LookupMode::Race));
-        let mut worker = worker_for_lookup(&fixture, Arc::clone(&stub) as Arc<dyn TxIndexQuery>);
+        let mut worker = worker_for_lookup(&fixture, stub.clone());
         fixture.advance_tip_to(0);
         assert_eq!(
             worker.reconcile_once().expect("genesis pass"),
@@ -1342,10 +1339,19 @@ mod tests {
         );
         fixture.advance_tip_to(1);
 
-        assert_eq!(worker.reconcile_once().expect("retry is not an error"), Action::Retry);
+        assert_eq!(
+            worker.reconcile_once().expect("retry is not an error"),
+            Action::Retry
+        );
         let genesis_block_hash = fixture.blocks[0].block_hash();
         let genesis_hash = genesis_block_hash.as_byte_array();
-        assert!(fixture.store.filter_row(*genesis_hash).expect("row").is_some());
+        assert!(
+            fixture
+                .store
+                .filter_row(*genesis_hash)
+                .expect("row")
+                .is_some()
+        );
         assert_eq!(
             fixture.store.pointer().expect("pointer"),
             Some(ActivePointer {
@@ -1364,7 +1370,13 @@ mod tests {
         );
         let child_block_hash = fixture.blocks[1].block_hash();
         let child_hash = child_block_hash.as_byte_array();
-        assert!(fixture.store.filter_row(*child_hash).expect("row").is_some());
+        assert!(
+            fixture
+                .store
+                .filter_row(*child_hash)
+                .expect("row")
+                .is_some()
+        );
         assert_eq!(
             fixture.store.pointer().expect("pointer"),
             Some(ActivePointer {
@@ -1648,7 +1660,7 @@ mod tests {
         let mut worker = worker_for(&fixture);
         let status = FilterIndexStatus::new(
             Arc::clone(&worker.runtime),
-            Arc::clone(&fixture.store) as Arc<dyn FilterStoreOps>,
+            fixture.store.clone(),
             Arc::clone(&fixture.applied_tip),
             Arc::clone(&fixture.chain_events),
         );
@@ -1792,7 +1804,7 @@ mod tests {
         let mut worker = worker_for(&fixture);
         let status = FilterIndexStatus::new(
             Arc::clone(&worker.runtime),
-            Arc::clone(&fixture.store) as Arc<dyn FilterStoreOps>,
+            fixture.store.clone(),
             Arc::clone(&fixture.applied_tip),
             Arc::clone(&fixture.chain_events),
         );

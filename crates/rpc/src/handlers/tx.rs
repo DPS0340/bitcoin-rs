@@ -733,7 +733,6 @@ struct AcceptanceFact {
     wtxid: Wtxid,
     allowed: bool,
     vsize: u32,
-    weight: u64,
     base_fee: Option<u64>,
     sigop_cost: u32,
     reject_reason: Option<RejectReason>,
@@ -933,7 +932,6 @@ fn evaluate_package_acceptance(
         let txid = tx.txid();
         let wtxid = tx.wtxid();
         let vsize = ctx.vsize;
-        let weight = tx.weight();
         let base_fee = if ctx.missing_inputs {
             None
         } else {
@@ -989,7 +987,6 @@ fn evaluate_package_acceptance(
             wtxid,
             allowed,
             vsize,
-            weight,
             base_fee,
             sigop_cost: ctx.sigop_cost,
             reject_reason,

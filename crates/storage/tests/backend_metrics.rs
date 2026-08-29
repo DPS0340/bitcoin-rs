@@ -191,9 +191,7 @@ fn redb_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Err
     metrics::with_local_recorder(&recorder, || {
         let mut deferred = store.new_batch();
         deferred.put(ColumnFamily::BlockBodies, b"deferred-key", b"value");
-        store
-            .write_deferred(deferred)
-            .expect("deferred write");
+        store.write_deferred(deferred).expect("deferred write");
         let mut durable = store.new_batch();
         durable.put(ColumnFamily::BlockBodies, b"durable-key", b"value");
         store.write_durable(durable).expect("durable write");
@@ -224,8 +222,8 @@ fn redb_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::erro
 
 #[test]
 #[cfg(feature = "redb")]
-fn redb_txindex_wrapper_configures_the_budgeted_share_verbatim(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn redb_txindex_wrapper_configures_the_budgeted_share_verbatim()
+-> Result<(), Box<dyn std::error::Error>> {
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
@@ -233,7 +231,10 @@ fn redb_txindex_wrapper_configures_the_budgeted_share_verbatim(
         bitcoin_rs_storage::open_redb_tx_index_store_with_cache(dir.path(), share)
             .expect("redb txindex open with budgeted share");
     });
-    assert_eq!(recorder.gauge(&cache_capacity("redb-txindex")), share as f64);
+    assert_eq!(
+        recorder.gauge(&cache_capacity("redb-txindex")),
+        share as f64
+    );
     Ok(())
 }
 

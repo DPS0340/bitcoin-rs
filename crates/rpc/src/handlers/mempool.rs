@@ -60,7 +60,7 @@ pub(crate) fn getmempoolentry(ctx: &Arc<Context>, params: &Value) -> Result<Valu
     let entry = pool
         .entry_by_txid(&txid)
         .ok_or(RpcError::NotFound("transaction not in mempool"))?;
-    typed_to_sonic(&v31::GetMempoolEntry(mempool_entry_typed(entry, &pool)?))
+    typed_to_sonic(&v31::GetMempoolEntry(mempool_entry_typed(entry, &pool)))
 }
 
 pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -78,7 +78,7 @@ pub(crate) fn getrawmempool(ctx: &Arc<Context>, params: &Value) -> Result<Value,
         let mut map = BTreeMap::new();
         for txid in pool.iter_txids() {
             if let Some(entry) = pool.entry_by_txid(&txid) {
-                map.insert(txid.to_string(), mempool_entry_typed(entry, &pool)?);
+                map.insert(txid.to_string(), mempool_entry_typed(entry, &pool));
             }
         }
         return typed_to_sonic(&v31::GetRawMempoolVerbose(map));
@@ -123,7 +123,7 @@ pub(crate) fn getmempooldescendants(ctx: &Arc<Context>, params: &Value) -> Resul
 fn mempool_entry_typed(
     entry: &MempoolEntry,
     pool: &bitcoin_rs_mempool::Mempool,
-) -> Result<v31::MempoolEntry, RpcError> {
+) -> v31::MempoolEntry {
     let mut depends = entry
         .tx
         .inputs
@@ -162,7 +162,7 @@ fn mempool_entry_typed(
         ),
         chunk: sat_to_btc(entry.fee),
     };
-    Ok(v31::MempoolEntry {
+    v31::MempoolEntry {
         vsize: i64_saturated(u64::from(entry.vsize)),
         weight: i64_saturated(entry.weight),
         time: i64_saturated(entry.time),
@@ -178,7 +178,7 @@ fn mempool_entry_typed(
         spent_by: spentby,
         bip125_replaceable: entry.is_replaceable(),
         unbroadcast: false,
-    })
+    }
 }
 
 fn render_ancestors(
@@ -190,7 +190,7 @@ fn render_ancestors(
         let mut map = BTreeMap::new();
         for id in ids {
             if let Some(entry) = pool.entry(*id) {
-                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool)?);
+                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool));
             }
         }
         return typed_to_sonic(&v31::GetMempoolAncestorsVerbose(map));
@@ -212,7 +212,7 @@ fn render_descendants(
         let mut map = BTreeMap::new();
         for id in ids {
             if let Some(entry) = pool.entry(*id) {
-                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool)?);
+                map.insert(entry.txid.to_string(), mempool_entry_typed(entry, pool));
             }
         }
         return typed_to_sonic(&v31::GetMempoolDescendantsVerbose(map));
@@ -573,8 +573,7 @@ mod spentby_tests {
     use super::*;
 
     fn entry_to_serde(entry: &MempoolEntry, pool: &Mempool) -> serde_json::Value {
-        let typed = super::mempool_entry_typed(entry, pool)
-            .unwrap_or_else(|err| panic!("typed mempool entry failed: {err}"));
+        let typed = super::mempool_entry_typed(entry, pool);
         let rendered = sonic_rs::to_string(&typed)
             .unwrap_or_else(|err| panic!("re-encoding mempool entry failed: {err}"));
         serde_json::from_str(&rendered)

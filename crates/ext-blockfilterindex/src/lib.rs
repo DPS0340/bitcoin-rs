@@ -328,11 +328,11 @@ impl<S: KvStore + Send + Sync> FilterStoreOps for FilterStore<S> {
         let bytes = self.get(keys::SCHEMA)?;
         Ok(match bytes {
             None => None,
-            Some(bytes) if bytes.len() == 4 => Some(u32::from_le_bytes(
-                bytes
-                    .try_into()
-                    .map_err(|_| FilterStoreError::CorruptMetadata("schema version"))?,
-            )),
+            Some(bytes) if bytes.len() == 4 => {
+                Some(u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    FilterStoreError::CorruptMetadata("schema version")
+                })?))
+            }
             Some(_) => return Err(FilterStoreError::CorruptMetadata("schema version")),
         })
     }
@@ -369,11 +369,11 @@ impl<S: KvStore + Send + Sync> FilterStoreOps for FilterStore<S> {
         let bytes = self.get(&row_key(keys::HEADER_ROW, hash))?;
         match bytes {
             None => Ok(None),
-            Some(bytes) if bytes.len() == 32 => Ok(Some(
-                bytes
-                    .try_into()
-                    .map_err(|_| FilterStoreError::CorruptMetadata("filter header row"))?,
-            )),
+            Some(bytes) if bytes.len() == 32 => {
+                Ok(Some(bytes.try_into().map_err(|_| {
+                    FilterStoreError::CorruptMetadata("filter header row")
+                })?))
+            }
             Some(_) => Err(FilterStoreError::CorruptMetadata("filter header row")),
         }
     }

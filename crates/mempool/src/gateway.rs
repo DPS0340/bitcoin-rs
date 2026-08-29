@@ -780,11 +780,7 @@ mod tests {
         let seen = observer.seen.lock();
         assert_eq!(seen.len(), 2, "one publish per committed candidate");
         assert_eq!(seen[0].0, hash(&parent_txid), "parent commits first");
-        assert_eq!(
-            seen[1].0,
-            hash(&child.txid()),
-            "child commits second"
-        );
+        assert_eq!(seen[1].0, hash(&child.txid()), "child commits second");
     }
 
     #[test]
@@ -829,6 +825,7 @@ mod tests {
         gateway
             .insert_entry(MempoolEntry::new(Arc::new(tx(36)), 100, 9_000, 1, 7))
             .expect("filler in");
+        observer.seen.lock().clear();
 
         let parent = tx(34);
         let parent_txid = parent.txid();

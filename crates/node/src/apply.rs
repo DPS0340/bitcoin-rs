@@ -2013,6 +2013,17 @@ struct BlockValidationContext {
     locktime_cutoff: u32,
 }
 
+/// Chain facts BIP68 evaluates against: the validation context fixing the
+/// block's height, the parent median-time-past, the softfork state at
+/// connect, and the applied tip the prevout ancestry hangs from.
+#[derive(Clone, Copy)]
+struct Bip68Context<'a> {
+    validation: &'a BlockValidationContext,
+    median_time_past: u32,
+    softfork_state: crate::bip9_context::ContextualSoftforkState,
+    previous_tip_id: Option<bitcoin_rs_chain::node::NodeId>,
+}
+
 /// Evidence that every ordered transaction pre-check, input script, and
 /// transaction post-check passed for this exact prepared block state.
 ///
@@ -2161,6 +2172,7 @@ fn parse_block_for_apply(
 /// Blocks beyond the threshold the window verifier uses fan the hashing out;
 /// below it, serial iteration wins because dispatch costs more than the
 /// per-transaction double SHA256.
+#[cfg(any(test, not(feature = "kernel")))]
 fn block_txids(block: &Block) -> Vec<Txid> {
     if block.txs.len() > 32 {
         block.txs.par_iter().map(Tx::txid).collect()
@@ -2354,9 +2366,7 @@ fn apply_block_admitted<'b>(
             &mut view,
             &tx_plan,
             Arc::clone(&resolved),
-            height,
-            locktime_cutoff,
-            verify_flags,
+            &validation_context,
             &kernel_block,
         )
     };
@@ -2396,15 +2406,16 @@ fn apply_block_admitted<'b>(
         &tx_plan,
         view.txids(),
         Arc::clone(&resolved),
-        height,
-        prev_median_time_past,
-        softfork_state,
-        previous_tip_id,
+        Bip68Context {
+            validation: &validation_context,
+            median_time_past: prev_median_time_past,
+            softfork_state,
+            previous_tip_id,
+        },
     );
     let bip68_dur = bip68_started.elapsed();
     metrics::histogram!("node.apply_block.bip68_seconds").record(bip68_dur.as_secs_f64());
     bip68_result?;
-
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
     let wants_rawblock = handles.zmq_publisher.wants_rawblock();
     let needs_g14_sample = handles
@@ -3122,9 +3133,7 @@ fn verify_block_transactions(
     view: &mut bitcoin_rs_consensus::BlockView<'_>,
     tx_plan: &BlockTxPlan,
     resolved: Arc<ResolvedUtxoView>,
-    height: u32,
-    locktime_cutoff: u32,
-    flags: bitcoin_rs_script::VerifyFlags,
+    context: &BlockValidationContext,
     kernel_block: &bitcoin_rs_consensus::kernel::KernelBlock,
 ) -> core::result::Result<(), ApplyError> {
     debug_assert_eq!(block.txs.len(), view.txids().len());
@@ -3137,7 +3146,7 @@ fn verify_block_transactions(
     // Assume-valid: skip kernel / portable script execution only, and only while the
     // hash-pinned trust gate holds (always trusted when no pin is configured).
     let skip_scripts = handles.assume_valid_height > 0
-        && height <= handles.assume_valid_height
+        && context.height <= handles.assume_valid_height
         && handles.assume_valid_gate.trusted();
     if skip_scripts {
         return run_non_script_checks_only(
@@ -3145,8 +3154,8 @@ fn verify_block_transactions(
             tx_plan,
             resolved,
             view.txids(),
-            height,
-            locktime_cutoff,
+            context.height,
+            context.locktime_cutoff,
         );
     }
     // Full-verify: resolve every transaction's prevouts serially in block order
@@ -3158,7 +3167,7 @@ fn verify_block_transactions(
     // block; the non-overlay case reads the committed shared set directly.
     let resolution_started = quanta::Instant::now();
     let resolution_result =
-        resolve_block_prevouts(resolved, block, tx_plan, height, view.txids());
+        resolve_block_prevouts(resolved, block, tx_plan, context.height, view.txids());
     let resolution_dur = resolution_started.elapsed();
     metrics::histogram!("node.apply_block.script_resolution_seconds")
         .record(resolution_dur.as_secs_f64());
@@ -3170,9 +3179,9 @@ fn verify_block_transactions(
     let mut script_timings = bitcoin_rs_consensus::ScriptStageTimings::default();
     let script_input_result = bitcoin_rs_consensus::verify_block_input_scripts(
         view,
-        height,
-        locktime_cutoff,
-        flags,
+        context.height,
+        context.locktime_cutoff,
+        context.flags,
         &mut script_timings,
         kernel_block,
     );
@@ -3182,7 +3191,7 @@ fn verify_block_transactions(
         .record(script_timings.parallel_seconds);
     script_input_result?;
     tracing::debug!(
-        height,
+        height = context.height,
         script_resolution_us = resolution_dur.as_micros(),
         script_prepare_us = (script_timings.prepare_seconds * 1_000_000.0) as u64,
         script_parallel_us = (script_timings.parallel_seconds * 1_000_000.0) as u64,
@@ -3339,12 +3348,9 @@ fn check_bip68_sequence_locks(
     tx_plan: &BlockTxPlan,
     txids: &[Txid],
     resolved: Arc<ResolvedUtxoView>,
-    height: u32,
-    mtp: u32,
-    softfork_state: crate::bip9_context::ContextualSoftforkState,
-    previous_tip_id: Option<bitcoin_rs_chain::node::NodeId>,
+    context: Bip68Context<'_>,
 ) -> core::result::Result<(), ApplyError> {
-    if !softfork_state.csv_active {
+    if !context.softfork_state.csv_active {
         return Ok(());
     }
     if tx_plan.only_coinbase {
@@ -3353,6 +3359,8 @@ fn check_bip68_sequence_locks(
     if !tx_plan.has_bip68_sequence_locks {
         return Ok(());
     }
+    let height = context.validation.height;
+    let mtp = context.median_time_past;
 
     debug_assert_eq!(block.txs.len(), txids.len());
     let mut view = BlockLocalUtxoView::new(resolved, &block.txs, height, tx_plan.overlay_capacity);
@@ -3389,7 +3397,7 @@ fn check_bip68_sequence_locks(
                         *prevout_mtp
                     } else {
                         let prevout_mtp =
-                            bip68_prevout_mtp(handles, previous_tip_id, entry.height)?;
+                            bip68_prevout_mtp(handles, context.previous_tip_id, entry.height)?;
                         cache.insert(entry.height, prevout_mtp);
                         prevout_mtp
                     }
@@ -3811,6 +3819,21 @@ mod consensus_rule_tests {
         plan_block_transactions(block, &block_txids(block))
     }
 
+    fn validation_context(
+        block: &Block,
+        height: u32,
+        locktime_cutoff: u32,
+        flags: bitcoin_rs_script::VerifyFlags,
+    ) -> BlockValidationContext {
+        BlockValidationContext {
+            hash: block.block_hash().0,
+            parent: block.header.prev_blockhash.0,
+            height,
+            flags,
+            locktime_cutoff,
+        }
+    }
+
     #[test]
     fn decode_block_tx_count_reads_the_varint_after_the_header() {
         let block = block_with_transaction(coinbase_transaction(0x42));
@@ -3933,9 +3956,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::NONE,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
             &kernel_block_of(&block),
         )?;
         Ok(())
@@ -4061,9 +4082,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail under the kernel build"),
@@ -4121,9 +4140,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad same-block spend must fail under the kernel build"),
@@ -4199,9 +4216,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("earlier tx bad script must reject the block"),
@@ -4241,9 +4256,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::NONE,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("cross-transaction duplicate spend must fail script verification"),
@@ -4276,9 +4289,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            1,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail transaction verification"),
@@ -4385,9 +4396,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::NONE,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail when assume_valid_height is zero"),
@@ -4419,9 +4428,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::NONE,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::NONE),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail even under assume_valid_height"),
@@ -4453,9 +4460,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            3,
-            0,
-            bitcoin_rs_script::VerifyFlags::NONE,
+            &validation_context(&block, 3, 0, bitcoin_rs_script::VerifyFlags::NONE),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("duplicate spend must fail above assume_valid_height"),
@@ -4487,9 +4492,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         )?;
         Ok(())
@@ -4511,9 +4514,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail when assume_valid_height is zero"),
@@ -4546,9 +4547,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            3,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 3, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad script must fail above assume_valid_height"),
@@ -4584,9 +4583,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            2,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 2, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("outputs exceeding inputs must fail even under assume_valid_height"),
@@ -4623,9 +4620,7 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            1,
-            0,
-            bitcoin_rs_script::VerifyFlags::MANDATORY,
+            &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::MANDATORY),
             &kernel_block_of(&block),
         ) {
             Ok(()) => panic!("bad coinbase scriptSig length must fail under assume_valid_height"),
@@ -4789,9 +4784,7 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                1,
-                0,
-                bitcoin_rs_script::VerifyFlags::NONE,
+                &validation_context(&block, 1, 0, bitcoin_rs_script::VerifyFlags::NONE),
                 &kernel_block_of(&block),
             )
             .is_ok()
@@ -4837,10 +4830,17 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            101,
-            0,
-            active,
-            None,
+            Bip68Context {
+                validation: &validation_context(
+                    &block,
+                    101,
+                    0,
+                    bitcoin_rs_script::VerifyFlags::NONE,
+                ),
+                median_time_past: 0,
+                softfork_state: active,
+                previous_tip_id: None,
+            },
         ) {
             Ok(()) => panic!("BIP68 height lock must reject one block before maturity"),
             Err(error) => error,
@@ -4857,10 +4857,17 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                102,
-                0,
-                active,
-                None
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        102,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: 0,
+                    softfork_state: active,
+                    previous_tip_id: None,
+                },
             )
             .is_ok()
         );
@@ -4893,10 +4900,12 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            0,
-            required_mtp - 1,
-            active,
-            Some(previous_tip_id),
+            Bip68Context {
+                validation: &validation_context(&block, 0, 0, bitcoin_rs_script::VerifyFlags::NONE),
+                median_time_past: required_mtp - 1,
+                softfork_state: active,
+                previous_tip_id: Some(previous_tip_id),
+            },
         ) {
             Ok(()) => panic!("BIP68 time lock must reject one second before maturity"),
             Err(error) => error,
@@ -4913,10 +4922,17 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                0,
-                required_mtp,
-                active,
-                Some(previous_tip_id)
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        0,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: required_mtp,
+                    softfork_state: active,
+                    previous_tip_id: Some(previous_tip_id),
+                },
             )
             .is_ok()
         );
@@ -4947,10 +4963,17 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                prevout_height + 1,
-                200,
-                softfork_state(true),
-                Some(previous_tip_id),
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        prevout_height + 1,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: 200,
+                    softfork_state: softfork_state(true),
+                    previous_tip_id: Some(previous_tip_id),
+                },
             )
             .is_ok()
         );
@@ -4993,12 +5016,86 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                prevout_height + 1,
-                BIP68_TEST_PREVOUT_MTP,
-                softfork_state(true),
-                Some(previous_tip_id),
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        prevout_height + 1,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: BIP68_TEST_PREVOUT_MTP,
+                    softfork_state: softfork_state(true),
+                    previous_tip_id: Some(previous_tip_id),
+                },
             )
             .is_ok()
+        );
+        Ok(())
+    }
+
+    /// Drives the real apply entry into active CSV with a version-2 spend whose
+    /// relative height lock is unmet, pinning two facts about the apply path:
+    /// the BIP68 verdict must propagate out of `apply_block` as
+    /// `ApplyError::Consensus(ConsensusError::Bip)`, and it must do so before
+    /// the first write — a gate deleted or reordered after the UTXO commit
+    /// would leave the tip advanced, the prevout spent, or the header
+    /// installed, and every one of those is asserted against here.
+    #[test]
+    fn apply_block_propagates_unmet_bip68_sequence_lock_before_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // CSV activates on regtest at height 432, so the applied tip sits at
+        // 431 and the block connects at the first BIP68-enforcing height. The
+        // prevout is a tip-block output and the sequence asks for two blocks
+        // of age, making BIP68 the only rule the block violates.
+        let prevout_height = 431;
+        let previous_output = OutPoint::new(fixture_txid(0x6e), 0);
+        let utxo = utxo_with_output(previous_output, prevout_height)?;
+        let handles = apply_handles_for_network(Network::Regtest, Arc::clone(&utxo));
+        let tip_id = seed_block_tree_for_bip68_time_at_height(&handles, prevout_height)?;
+        let seeded_tip = handles
+            .block_tree
+            .read()
+            .tip()
+            .filter(|tip| tip.tip_id == tip_id)
+            .ok_or_else(|| std::io::Error::other("seeded tip missing"))?;
+        handles.applied_tip.store(Some(Arc::clone(&seeded_tip)));
+
+        // Version 2 with a sequence lacking the disable flag is what arms the
+        // relative lock; version 1 or a disabled sequence would bypass it.
+        let spend = spending_transaction_to_script(previous_output, 2, op_true_script());
+        let block = mined_block_with_prev_hash_and_transactions(
+            BlockHash::from(seeded_tip.hash),
+            vec![coinbase_transaction(0x6f), spend],
+        )?;
+
+        let error = match apply_block(&handles, &block) {
+            Ok(_) => panic!("unmet BIP68 sequence lock must reject the block"),
+            Err(error) => error,
+        };
+        assert_bip_error(&error, "BIP68");
+
+        // No mutation: tip, UTXO set, and block tree are exactly as seeded.
+        let tip_after = handles
+            .applied_tip
+            .load_full()
+            .ok_or_else(|| std::io::Error::other("applied tip vanished"))?;
+        assert_eq!(tip_after.height, prevout_height);
+        assert_eq!(tip_after.hash, seeded_tip.hash);
+        assert!(
+            utxo.get(&previous_output).is_some(),
+            "the spent prevout must survive a rejected apply"
+        );
+        assert!(
+            utxo.get(&OutPoint::new(block.txs[1].txid(), 0)).is_none(),
+            "a rejected block must not install its outputs"
+        );
+        assert!(
+            handles
+                .block_tree
+                .read()
+                .lookup(Hash256::from(block.block_hash()))
+                .is_none(),
+            "a rejected block must not enter the block tree"
         );
         Ok(())
     }
@@ -5025,10 +5122,17 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                101,
-                BIP68_TEST_PREVOUT_MTP,
-                softfork_state(true),
-                Some(previous_tip_id),
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        101,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: BIP68_TEST_PREVOUT_MTP,
+                    softfork_state: softfork_state(true),
+                    previous_tip_id: Some(previous_tip_id),
+                },
             )
             .is_ok()
         );
@@ -5056,10 +5160,17 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            101,
-            BIP68_TEST_PREVOUT_MTP,
-            softfork_state(true),
-            Some(previous_tip_id),
+            Bip68Context {
+                validation: &validation_context(
+                    &block,
+                    101,
+                    0,
+                    bitcoin_rs_script::VerifyFlags::NONE,
+                ),
+                median_time_past: BIP68_TEST_PREVOUT_MTP,
+                softfork_state: softfork_state(true),
+                previous_tip_id: Some(previous_tip_id),
+            },
         ) {
             Ok(()) => {
                 panic!("same-block time-based relative lock must not mature in the same block")
@@ -5094,10 +5205,12 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            0,
-            BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
-            active,
-            None,
+            Bip68Context {
+                validation: &validation_context(&block, 0, 0, bitcoin_rs_script::VerifyFlags::NONE),
+                median_time_past: BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
+                softfork_state: active,
+                previous_tip_id: None,
+            },
         ) {
             Ok(()) => panic!("BIP68 time lock must reject missing previous tip context"),
             Err(error) => error,
@@ -5131,10 +5244,12 @@ mod consensus_rule_tests {
                 &block,
                 &tx_plan(&block),
             )),
-            0,
-            BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
-            active,
-            Some(previous_tip_id),
+            Bip68Context {
+                validation: &validation_context(&block, 0, 0, bitcoin_rs_script::VerifyFlags::NONE),
+                median_time_past: BIP68_TEST_PREVOUT_MTP + BIP68_TIME_GRANULARITY_SECONDS,
+                softfork_state: active,
+                previous_tip_id: Some(previous_tip_id),
+            },
         ) {
             Ok(()) => panic!("BIP68 time lock must reject missing prevout ancestry"),
             Err(error) => error,
@@ -5165,10 +5280,17 @@ mod consensus_rule_tests {
                     &block,
                     &tx_plan(&block)
                 )),
-                101,
-                0,
-                softfork_state(false),
-                None
+                Bip68Context {
+                    validation: &validation_context(
+                        &block,
+                        101,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: 0,
+                    softfork_state: softfork_state(false),
+                    previous_tip_id: None,
+                },
             )
             .is_ok()
         );
@@ -5196,10 +5318,17 @@ mod consensus_rule_tests {
                     &version_one_block,
                     &tx_plan(&version_one_block)
                 )),
-                101,
-                0,
-                active,
-                None
+                Bip68Context {
+                    validation: &validation_context(
+                        &version_one_block,
+                        101,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: 0,
+                    softfork_state: active,
+                    previous_tip_id: None,
+                },
             )
             .is_ok()
         );
@@ -5220,10 +5349,17 @@ mod consensus_rule_tests {
                     &disabled_block,
                     &tx_plan(&disabled_block)
                 )),
-                101,
-                0,
-                active,
-                None
+                Bip68Context {
+                    validation: &validation_context(
+                        &disabled_block,
+                        101,
+                        0,
+                        bitcoin_rs_script::VerifyFlags::NONE
+                    ),
+                    median_time_past: 0,
+                    softfork_state: active,
+                    previous_tip_id: None,
+                },
             )
             .is_ok()
         );
@@ -8268,9 +8404,7 @@ mod consensus_rule_tests {
                 &block,
                 &plan,
             )),
-            170_060,
-            0,
-            exc_flags,
+            &validation_context(&block, 170_060, 0, exc_flags),
             &kernel_block_of(&block),
         )?;
 
@@ -8287,9 +8421,7 @@ mod consensus_rule_tests {
                 &block2,
                 &plan2,
             )),
-            170_060,
-            0,
-            normal_flags,
+            &validation_context(&block2, 170_060, 0, normal_flags),
             &kernel_block_of(&block2),
         ) {
             Ok(()) => {

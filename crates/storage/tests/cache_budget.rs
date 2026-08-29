@@ -67,7 +67,10 @@ fn minimum_budget_split_with_all_namespaces_enabled() {
     let total = clamp_dbcache_bytes(16);
     assert_eq!(total, MIN_DBCACHE_BYTES);
     let shares = split_cache_budget(total, true, true);
-    assert_eq!(shares[0].bytes, 11_744_052, "chainstate keeps the remainder");
+    assert_eq!(
+        shares[0].bytes, 11_744_052,
+        "chainstate keeps the remainder"
+    );
     assert_eq!(shares[1].bytes, 3_355_443, "txindex keeps a floored 20%");
     assert_eq!(shares[2].bytes, 1_677_721, "filters keeps a floored 10%");
     assert_eq!(

@@ -41,7 +41,7 @@ impl RocksDbStore {
         };
         let cache_bytes = usize::try_from(cache_bytes).unwrap_or(usize::MAX);
         metrics::gauge!("storage.cache_capacity_bytes", "backend" => "rocksdb")
-            .set(cache_bytes as f64);
+            .set(crate::metric_f64_from_usize(cache_bytes));
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
@@ -193,7 +193,8 @@ impl KvStore for RocksDbStore {
 fn count_write(durability: &'static str, encoded_bytes: usize) {
     metrics::counter!("storage.writes_total", "backend" => "rocksdb", "durability" => durability)
         .increment(1);
-    metrics::histogram!("storage.write_bytes", "backend" => "rocksdb").record(encoded_bytes as f64);
+    metrics::histogram!("storage.write_bytes", "backend" => "rocksdb")
+        .record(crate::metric_f64_from_usize(encoded_bytes));
 }
 
 fn cached_cf_handle<'store>(

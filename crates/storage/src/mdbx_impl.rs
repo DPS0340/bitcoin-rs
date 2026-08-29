@@ -15,11 +15,11 @@ const TIB: usize = 1024 * GIB;
 /// MDBX's default page size, used to turn cache bytes into page counts.
 const MDBX_PAGE_BYTES: u64 = 4 * 1024;
 /// MDBX's default dirty-page reserve for unbudgeted opens.
-const MDBX_DEFAULT_DIRTY_RESERVE_BYTES: u64 = 64 * MIB as u64;
+const MDBX_DEFAULT_DIRTY_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 /// Engine ceiling for the reserved dirty-page pool (MDBX caps at 32-bit).
 const MDBX_MAX_RESERVE_PAGES: u64 = 1 << 20;
 /// Engine ceiling for the loose-page reuse pool.
-const MDBX_MAX_LOOSE_PAGES: u64 = 1 << 16;
+const MDBX_MAX_LOOSE_PAGES: u64 = 255;
 
 /// MDBX-backed key-value store.
 pub struct MdbxStore {
@@ -53,7 +53,7 @@ impl MdbxStore {
         let reserve_pages = (cache_bytes / MDBX_PAGE_BYTES).min(MDBX_MAX_RESERVE_PAGES);
         let loose_pages = (cache_bytes / MDBX_PAGE_BYTES / 4).clamp(16, MDBX_MAX_LOOSE_PAGES);
         metrics::gauge!("storage.cache_capacity_bytes", "backend" => "mdbx")
-            .set(cache_bytes as f64);
+            .set(crate::metric_f64(cache_bytes));
         std::fs::create_dir_all(path.as_ref())?;
         let env = Environment::builder()
             .set_max_dbs(ColumnFamily::ALL.len())
@@ -194,7 +194,8 @@ impl KvStore for MdbxStore {
 fn count_write(durability: &'static str, encoded_bytes: usize) {
     metrics::counter!("storage.writes_total", "backend" => "mdbx", "durability" => durability)
         .increment(1);
-    metrics::histogram!("storage.write_bytes", "backend" => "mdbx").record(encoded_bytes as f64);
+    metrics::histogram!("storage.write_bytes", "backend" => "mdbx")
+        .record(crate::metric_f64_from_usize(encoded_bytes));
 }
 
 fn cached_database(

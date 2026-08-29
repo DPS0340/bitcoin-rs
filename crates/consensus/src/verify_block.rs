@@ -1,8 +1,10 @@
-use bitcoin_rs_primitives::{Block, Hash256, Tx, Txid, Wtxid, encode::double_sha256};
+use bitcoin_rs_primitives::{Block, Tx, Txid, Wtxid, encode::double_sha256};
 
 use crate::ConsensusError;
 #[cfg(test)]
 use crate::sha256d64::{Avx2Sha256d64, detect_avx2};
+#[cfg(test)]
+use bitcoin_rs_primitives::Hash256;
 
 /// BIP141 witness commitment output prefix: `OP_RETURN` `OP_PUSHBYTES_36` `commitment_header`.
 const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
@@ -208,10 +210,12 @@ fn merkle_root_and_mutation_borrowed(txids: &[Txid]) -> Option<(Txid, bool)> {
             }
         });
     }
-    Some((
-        carry.expect("nonempty input leaves one spine node").0,
-        mutated,
-    ))
+    let Some((root, _)) = carry else {
+        // Unreachable: the first leaf of non-empty input parks a node in the
+        // spine, so the fold above ran at least once.
+        return None;
+    };
+    Some((root, mutated))
 }
 
 #[cfg(test)]

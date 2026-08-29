@@ -1267,10 +1267,11 @@ impl Context {
                     chain_network,
                 },
             mempool: MempoolHandles { mempool },
-            indexes: IndexHandles {
-                tx_index,
-                script_index,
-            },
+            indexes:
+                IndexHandles {
+                    tx_index,
+                    script_index,
+                },
             network:
                 NetworkHandles {
                     network,
@@ -1357,7 +1358,6 @@ impl Context {
         self.chain_control = Some(chain_control);
         self
     }
-
 
     /// Shares the node's authoritative connect/disconnect lock with RPC readers.
     #[must_use]

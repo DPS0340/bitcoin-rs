@@ -76,8 +76,14 @@ fn approved_layer(crate_name: &str) -> u8 {
     }
 }
 
-#[test]
-fn workspace_dependency_direction_is_one_way() {
+struct WorkspaceMetadata {
+    normal_deps: BTreeMap<String, Vec<String>>,
+    engine_deps: BTreeMap<String, Vec<String>>,
+    features: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    classified: usize,
+}
+
+fn workspace_metadata() -> WorkspaceMetadata {
     let output = Command::new(env!("CARGO"))
         .args([
             "metadata",
@@ -97,13 +103,13 @@ fn workspace_dependency_direction_is_one_way() {
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
 
-    let mut normal_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut engine_deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut features: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    let mut normal_deps = BTreeMap::new();
+    let mut engine_deps = BTreeMap::new();
+    let mut features = BTreeMap::new();
     let mut classified = 0_usize;
     for package in metadata["packages"].as_array().expect("packages array") {
         let name = package["name"].as_str().expect("package name").to_owned();
-        let _ = approved_layer(&name); // fails loudly on an unclassified crate
+        let _ = approved_layer(&name);
         classified += 1;
 
         let mut edges = Vec::new();
@@ -117,8 +123,7 @@ fn workspace_dependency_direction_is_one_way() {
             if !dep_name.starts_with("bitcoin-rs") {
                 continue;
             }
-            let kind = dependency["kind"].as_str().unwrap_or("normal");
-            if kind == "normal" {
+            if dependency["kind"].as_str().unwrap_or("normal") == "normal" {
                 edges.push(dep_name);
             }
         }
@@ -126,11 +131,7 @@ fn workspace_dependency_direction_is_one_way() {
         engine_deps.insert(name.clone(), engines);
 
         let mut feature_map = BTreeMap::new();
-        for (feature, implies) in package["features"]
-            .as_object()
-            .expect("features object")
-            .iter()
-        {
+        for (feature, implies) in package["features"].as_object().expect("features object") {
             let implies = implies
                 .as_array()
                 .expect("feature implies array")
@@ -141,6 +142,22 @@ fn workspace_dependency_direction_is_one_way() {
         }
         features.insert(name, feature_map);
     }
+    WorkspaceMetadata {
+        normal_deps,
+        engine_deps,
+        features,
+        classified,
+    }
+}
+
+#[test]
+fn workspace_dependency_direction_is_one_way() {
+    let WorkspaceMetadata {
+        normal_deps,
+        engine_deps,
+        features,
+        classified,
+    } = workspace_metadata();
     assert!(
         classified >= 12,
         "workspace crates went missing from metadata: {classified} classified"
