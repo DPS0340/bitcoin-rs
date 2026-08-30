@@ -41,6 +41,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 deny = [
+    # Only the two audited base64 releases may coexist.
+    { crate = "base64:<0.21.7", reason = "only audited base64 versions 0.21.7 and 0.22.1 are allowed" },
+    { crate = "base64:>0.21.7,<0.22.1", reason = "only audited base64 versions 0.21.7 and 0.22.1 are allowed" },
+    { crate = "base64:>0.22.1", reason = "only audited base64 versions 0.21.7 and 0.22.1 are allowed" },
     # Forbid disallowed crates discovered during the 2026-05-19 dependency audit:
     { name = "openssl", reason = "use rustls" },
     { name = "openssl-sys", reason = "use rustls" },
@@ -53,60 +57,42 @@ deny = [
 # any future duplicate in the consensus stack hard-fails this check.
 #
 # Everything below is an audited, third-party-only split with the driver of
-# the older copy named. Both pinned versions are listed individually so a
-# FUTURE third version, or a bump of a skipped copy, still fails the check.
+# each skipped copy named. One current version remains unskipped as the
+# duplicate anchor, so a new version or a change to a skipped copy fails.
 skip = [
+    # bitcoin 0.32 and metrics-exporter-prometheus 0.18 require disjoint base64 lines.
+    { crate = "base64@0.21.7", reason = "bitcoin 0.32.11 via corepc-types 0.15.0" },
     # zmq 0.10 (zmq-sys build chain) pins the bitflags 1.x line.
     { crate = "bitflags@1.3.2", reason = "zmq 0.10" },
-    { crate = "bitflags@2.13.0", reason = "current line" },
     # bitcoin_slices 0.11 pins the digest 0.10/sha2 0.10 stack; workspace pins sha2 0.11.
     { crate = "block-buffer@0.10.4", reason = "digest 0.10 stack via bitcoin_slices" },
-    { crate = "block-buffer@0.12.0", reason = "digest 0.11 stack" },
     { crate = "cpufeatures@0.2.17", reason = "sha2 0.10 via bitcoin_slices" },
-    { crate = "cpufeatures@0.3.0", reason = "sha2 0.11" },
     { crate = "crypto-common@0.1.7", reason = "digest 0.10 stack via bitcoin_slices" },
-    { crate = "crypto-common@0.2.2", reason = "digest 0.11 stack" },
     { crate = "digest@0.10.7", reason = "bitcoin_slices 0.11 pins sha2 0.10" },
-    { crate = "digest@0.11.3", reason = "workspace sha2 0.11" },
     { crate = "sha2@0.10.9", reason = "bitcoin_slices 0.11 pin" },
-    { crate = "sha2@0.11.0", reason = "workspace pin" },
     # rand 0.8 (secp256k1 0.29 rand-std, also via bitcoin rand-std) vs 0.9 ecosystem.
     { crate = "getrandom@0.2.17", reason = "rand_core 0.6 via secp256k1 0.29" },
     { crate = "getrandom@0.3.4", reason = "wasi/fjall chain" },
-    { crate = "getrandom@0.4.2", reason = "current line" },
     { crate = "rand@0.8.6", reason = "secp256k1 0.29 rand-std" },
-    { crate = "rand@0.9.4", reason = "current line" },
     { crate = "rand_chacha@0.3.1", reason = "rand 0.8 chain" },
-    { crate = "rand_chacha@0.9.0", reason = "rand 0.9 chain" },
     { crate = "rand_core@0.6.4", reason = "rand 0.8 chain" },
-    { crate = "rand_core@0.9.5", reason = "rand 0.9 chain" },
     { crate = "r-efi@5.3.0", reason = "getrandom 0.3 UEFI backend" },
-    { crate = "r-efi@6.0.0", reason = "getrandom 0.4 UEFI backend" },
     { crate = "wit-bindgen@0.51.0", reason = "getrandom 0.3 wasm bindings" },
-    { crate = "wit-bindgen@0.57.1", reason = "getrandom 0.4 wasm bindings" },
-    # dashmap 6.2 pins hashbrown 0.14; the rest of the graph uses 0.17.
+    # dashmap 6.2 pins 0.14; metrics-util/quick_cache pin 0.16; the workspace uses 0.17.
     { crate = "hashbrown@0.14.5", reason = "dashmap 6.2 pin" },
-    { crate = "hashbrown@0.17.1", reason = "current line" },
+    { crate = "hashbrown@0.16.1", reason = "metrics-util 0.20 and quick_cache 0.6" },
     # bitcoin 0.32 pins hex-conservative 0.2; bitcoin_slices uses 1.x.
     { crate = "hex-conservative@0.2.2", reason = "bitcoin 0.32 pin" },
-    { crate = "hex-conservative@1.2.0", reason = "bitcoin_slices 0.11" },
     # cap-std 4 stack: fs-set-times 0.20 pins io-lifetimes 2, cap-std uses 3.
     { crate = "io-lifetimes@2.0.4", reason = "fs-set-times 0.20" },
-    { crate = "io-lifetimes@3.0.1", reason = "cap-std 4" },
     # system-deps 6 (zmq/rocksdb build chain) pins the toml 0.8 stack.
     { crate = "serde_spanned@0.6.9", reason = "toml 0.8 via system-deps" },
-    { crate = "serde_spanned@1.1.1", reason = "toml 1.x" },
     { crate = "toml@0.8.23", reason = "system-deps 6 build dep" },
-    { crate = "toml@1.1.2+spec-1.1.0", reason = "current line" },
     { crate = "toml_datetime@0.6.11", reason = "toml 0.8 via system-deps" },
-    { crate = "toml_datetime@1.1.1+spec-1.1.0", reason = "toml 1.x" },
     { crate = "winnow@0.7.15", reason = "toml_edit 0.22 via toml 0.8" },
-    { crate = "winnow@1.0.3", reason = "toml 1.x" },
     { crate = "shlex@1.3.0", reason = "bindgen 0.72 build dep" },
-    { crate = "shlex@2.0.1", reason = "current line" },
     # windows-only metadata targets; 0.52 pinned by older win crates.
     { crate = "windows-sys@0.52.0", reason = "windows-only split" },
-    { crate = "windows-sys@0.61.2", reason = "current line" },
 ]
 
 [sources]
