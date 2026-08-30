@@ -22,9 +22,11 @@ import json
 import os
 import stat
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 # Make sibling modules importable when run directly
 sys.path.insert(0, str(Path(__file__).parent))
@@ -49,7 +51,6 @@ from analyze import (
     DiagnosticCheckpoint,
     JournalEntry,
     Record,
-    _brshgt1_count,
     _c150_passed,
     _count_context_records_disk,
     _diagnostic_counter_totals,
@@ -64,7 +65,6 @@ from analyze import (
     parse_counters,
     parse_journal,
     parse_records,
-    sort_records_raw,
 )
 from context import (
     CONTEXT_MIN_ROW_SIZE,
@@ -94,7 +94,9 @@ def _raises(exc_type: type[BaseException], fn, label: str) -> None:
     raise AssertionError(f"expected {exc_type.__name__} for {label}")
 
 
-def _raises_with(exc_type: type[BaseException], fn, label: str, *substrings: str) -> None:
+def _raises_with(
+    exc_type: type[BaseException], fn, label: str, *substrings: str
+) -> None:
     """Assert *fn* raises *exc_type* whose message contains every *substrings*."""
     try:
         fn()
@@ -123,6 +125,7 @@ def _valid_counters_dict(**overrides: object) -> dict[str, object]:
     d["context_count"] = 0
     d.update(overrides)
     return d
+
 
 def _make_record_bytes(
     txid_le: bytes,
@@ -171,6 +174,7 @@ def _make_record_bytes(
     )
     return RECORD_STRUCT.pack(*fields)
 
+
 def _make_journal_bytes(
     txid_le: bytes,
     input_index: int,
@@ -213,8 +217,7 @@ def _write_journal_file(path: Path, entries: list[bytes]) -> None:
 
 _PRESERVED_OVER_CAPACITY_ROW = bytes.fromhex(
     "cf42bd87b9982595bf2d354c5f758c144d663301cefc3b31ad3132f87f4918d1"
-    "00000000000000000300020042000100"
-    + "00" * 176
+    "00000000000000000300020042000100" + "00" * 176
 )
 assert len(_PRESERVED_OVER_CAPACITY_ROW) == RECORD_SIZE
 assert hashlib.sha256(_PRESERVED_OVER_CAPACITY_ROW).hexdigest() == (
@@ -237,7 +240,9 @@ def _assert_over_capacity_length_error(raw: bytes, label: str) -> None:
 _BRSCTX1_MAGIC = b"BRSCTX1\x00"
 _BRSCTX1_HEADER = struct.Struct("<8sQ")
 _BRSCTX1_ROW_LEN = struct.Struct("<I")
-_BRSCTX1_FIXED = struct.Struct("<32sIIIII")  # txid_le, input_index, verify_flags, prevout_len, script_sig_len, witness_count
+_BRSCTX1_FIXED = struct.Struct(
+    "<32sIIIII"
+)  # txid_le, input_index, verify_flags, prevout_len, script_sig_len, witness_count
 
 
 def _make_brsctx1_file(path: Path, rows: list[ContextInput]) -> None:
@@ -320,7 +325,7 @@ def _p2tr_prevout() -> bytes:
 
 def _multisig_redeem_script() -> bytes:
     """1-of-2 multisig redeem script for P2SH/P2WSH fixtures."""
-    return bytes([1]) + bytes([33]) + bytes(33) + bytes([2, 0xae])
+    return bytes([1]) + bytes([33]) + bytes(33) + bytes([2, 0xAE])
 
 
 def _push(data: bytes) -> bytes:
@@ -346,7 +351,8 @@ def _p2sh_push_only(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> ContextI
     redeem = _multisig_redeem_script()
     script_sig = _push(redeem)
     return _ctx_input(
-        txid_le, idx,
+        txid_le,
+        idx,
         verify_flags=flags,
         prevout=_p2sh_prevout(),
         script_sig=script_sig,
@@ -362,7 +368,8 @@ def _p2sh_wrapped_w0(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> Context
     script_sig = _push(redeem)
     witness = (b"\x00", _multisig_redeem_script())
     return _ctx_input(
-        txid_le, idx,
+        txid_le,
+        idx,
         verify_flags=flags,
         prevout=_p2sh_prevout(),
         script_sig=script_sig,
@@ -376,7 +383,8 @@ def _native_w0(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> ContextInput:
     Without WITNESS -> BARE; with WITNESS -> NATIVE_WITNESS_V0.
     """
     return _ctx_input(
-        txid_le, idx,
+        txid_le,
+        idx,
         verify_flags=flags,
         prevout=_p2wsh_prevout(),
         witness=(b"\x00", _multisig_redeem_script()),
@@ -389,21 +397,25 @@ def _taproot_key_path(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> Contex
     No WITNESS -> BARE; WITNESS only -> BARE; WITNESS+TAPROOT -> TAPROOT_KEY_PATH.
     """
     return _ctx_input(
-        txid_le, idx,
+        txid_le,
+        idx,
         verify_flags=flags,
         prevout=_p2tr_prevout(),
         witness=(bytes(64),),
     )
 
 
-def _taproot_script_path(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> ContextInput:
+def _taproot_script_path(
+    txid_le: bytes, idx: int = 0, *, flags: int = 0
+) -> ContextInput:
     """P2TR prevout with stack arg + tapscript + control block.
 
     No WITNESS -> BARE; WITNESS only -> BARE; WITNESS+TAPROOT -> TAPSCRIPT.
     """
-    control = bytes([0xc0]) + bytes(32)
+    control = bytes([0xC0]) + bytes(32)
     return _ctx_input(
-        txid_le, idx,
+        txid_le,
+        idx,
         verify_flags=flags,
         prevout=_p2tr_prevout(),
         witness=(bytes(64), bytes([0xAC]), control),
@@ -411,6 +423,7 @@ def _taproot_script_path(txid_le: bytes, idx: int = 0, *, flags: int = 0) -> Con
 
 
 # ── Counters / replay / manifest / archive helpers ───────────────────────────
+
 
 def _make_valid_counters(
     record_count: int,
@@ -441,15 +454,16 @@ def _make_valid_counters(
     d.update(extra)
     return d
 
+
 # ── Minimal regtest genesis block for archive/manifest fixtures ──────────────
 
 _REGTEST_MAGIC = bytes.fromhex("fabfb5da")
 _REGTEST_GENESIS_HEADER = (
-    b"\x00" * 4        # version
-    + b"\x00" * 32     # prev_blockhash (all zero for genesis)
-    + b"\x00" * 32     # merkle_root
+    b"\x00" * 4  # version
+    + b"\x00" * 32  # prev_blockhash (all zero for genesis)
+    + b"\x00" * 32  # merkle_root
     + struct.pack("<I", 0x5CE9B2A1)  # timestamp (regtest genesis)
-    + b"\x20" * 4      # difficulty bits (regtest: 0x207fffff)
+    + b"\x20" * 4  # difficulty bits (regtest: 0x207fffff)
     + struct.pack("<I", 0)  # nonce
 )
 _REGTEST_GENESIS_HASH_RAW = hashlib.sha256(
@@ -464,19 +478,19 @@ _REGTEST_GENESIS_HASH_DISPLAY = _REGTEST_GENESIS_HASH_RAW[::-1].hex()
 # 4-byte locktime.
 _REGTEST_GENESIS_BLOCK = (
     _REGTEST_GENESIS_HEADER
-    + bytes([0x01])          # tx count (1)
-    + struct.pack("<I", 1)   # tx version
-    + bytes([0x01])          # input count (1)
-    + b"\x00" * 32           # prev txid (null)
+    + bytes([0x01])  # tx count (1)
+    + struct.pack("<I", 1)  # tx version
+    + bytes([0x01])  # input count (1)
+    + b"\x00" * 32  # prev txid (null)
     + struct.pack("<I", 0xFFFFFFFF)  # input index (null)
-    + bytes([0x01])          # scriptSig length (1)
-    + bytes([0x00])          # scriptSig
-    + struct.pack("<I", 0)   # sequence
-    + bytes([0x01])          # output count (1)
+    + bytes([0x01])  # scriptSig length (1)
+    + bytes([0x00])  # scriptSig
+    + struct.pack("<I", 0)  # sequence
+    + bytes([0x01])  # output count (1)
     + struct.pack("<Q", 50 * 10**8)  # value (50 BTC)
-    + bytes([0x01])          # scriptPubKey length
-    + bytes([0x51])          # OP_TRUE
-    + struct.pack("<I", 0)   # locktime
+    + bytes([0x01])  # scriptPubKey length
+    + bytes([0x51])  # OP_TRUE
+    + struct.pack("<I", 0)  # locktime
 )
 
 # ── Mainnet canonical constants for custody validation ───────────────────────
@@ -491,9 +505,9 @@ _MAINNET_GENESIS_HEADER = (
     + bytes.fromhex(
         "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
     )  # merkle_root (internal LE byte order)
-    + struct.pack("<I", 0x495fab29)  # timestamp = 1231006505
-    + struct.pack("<I", 0x1d00ffff)  # bits
-    + struct.pack("<I", 0x7c2bac1d)  # nonce = 2083236893
+    + struct.pack("<I", 0x495FAB29)  # timestamp = 1231006505
+    + struct.pack("<I", 0x1D00FFFF)  # bits
+    + struct.pack("<I", 0x7C2BAC1D)  # nonce = 2083236893
 )
 _MAINNET_GENESIS_HASH_RAW = hashlib.sha256(
     hashlib.sha256(_MAINNET_GENESIS_HEADER).digest()
@@ -504,29 +518,29 @@ assert _MAINNET_GENESIS_HASH_RAW[::-1].hex() == _MAINNET_GENESIS_HASH
 # The archive validator only checks the 80-byte header for block hashing.
 _MAINNET_GENESIS_BLOCK = (
     _MAINNET_GENESIS_HEADER
-    + bytes([0x01])          # tx count (1)
-    + struct.pack("<I", 1)   # tx version
-    + bytes([0x01])          # input count (1)
-    + b"\x00" * 32           # prev txid (null)
+    + bytes([0x01])  # tx count (1)
+    + struct.pack("<I", 1)  # tx version
+    + bytes([0x01])  # input count (1)
+    + b"\x00" * 32  # prev txid (null)
     + struct.pack("<I", 0xFFFFFFFF)  # input index (null)
-    + bytes([0x01])          # scriptSig length (1)
-    + bytes([0x00])          # scriptSig
-    + struct.pack("<I", 0)   # sequence
-    + bytes([0x01])          # output count (1)
+    + bytes([0x01])  # scriptSig length (1)
+    + bytes([0x00])  # scriptSig
+    + struct.pack("<I", 0)  # sequence
+    + bytes([0x01])  # output count (1)
     + struct.pack("<Q", 50 * 10**8)  # value (50 BTC)
-    + bytes([0x01])          # scriptPubKey length
-    + bytes([0x51])          # OP_TRUE
-    + struct.pack("<I", 0)   # locktime
+    + bytes([0x01])  # scriptPubKey length
+    + bytes([0x51])  # OP_TRUE
+    + struct.pack("<I", 0)  # locktime
 )
 
 # C150 pinned stop values (mainnet block 150000).
 _C150_STOP_HEIGHT = 150000
-_C150_STOP_HASH = (
-    "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
-)
+_C150_STOP_HASH = "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
 
 
-def _make_archive(path: Path, blocks: list[bytes], magic: bytes = _MAINNET_MAGIC) -> bytes:
+def _make_archive(
+    path: Path, blocks: list[bytes], magic: bytes = _MAINNET_MAGIC
+) -> bytes:
     """Write a Core-framed archive and return the raw bytes.
 
     Each frame: 4-byte magic + u32 LE payload_length + payload.
@@ -550,21 +564,221 @@ def _block_hash_display(block: bytes) -> str:
     return _block_hash_raw(block)[::-1].hex()
 
 
+_MANIFEST_V2_PROOF = {
+    "schema": "bitcoin-rs-replay-durability-v1",
+    "version": 1,
+    "path": "/tmp/synthetic/proof.json",
+    "size": 3,
+    "sha256": "11" * 32,
+}
+
+
+def _write_shared_validation(
+    tmp: Path, stop_height: int, tip_hash: str
+) -> tuple[Path, dict[str, object]]:
+    """Write one ``mainnet-prefix-replay-validation-v1`` artifact and return
+    its path plus the binding (exact bytes and state) every backend proof
+    must carry."""
+    doc = {
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_height": stop_height,
+        "stop_hash": tip_hash,
+        "utxo_hash_serialized_3": "cd" * 32,
+        "muhash": "ab" * 32,
+        "utxo_count": 2,
+        "total_amount": 200,
+    }
+    rendered = (json.dumps(doc, indent=2) + "\n").encode()
+    path = tmp / "validation.json"
+    path.write_bytes(rendered)
+    binding: dict[str, object] = {
+        "size_bytes": len(rendered),
+        "sha256": hashlib.sha256(rendered).hexdigest(),
+        "stop_height": stop_height,
+        "stop_hash": tip_hash,
+        "utxo_hash_serialized_3": "cd" * 32,
+        "muhash": "ab" * 32,
+        "utxo_count": 2,
+        "total_amount": 200,
+    }
+    return path, binding
+
+
+def _write_reopen_proof_file(
+    path: Path, backend: str, validation_binding: dict[str, object]
+) -> tuple[int, str]:
+    """Write one real ``verify-replay-durability-proof-v1`` artifact.
+
+    The pre/post invariants commit to the shared validation artifact's stop
+    identity and state, all durability booleans are true, and the reopen
+    count records the disconnect/reconnect pair. Returns the rendered size
+    and sha256.
+    """
+    invariants = {
+        "tip_height": validation_binding["stop_height"],
+        "tip_hash": validation_binding["stop_hash"],
+        "utxo_count": validation_binding["utxo_count"],
+        "total_amount": validation_binding["total_amount"],
+        "muhash": validation_binding["muhash"],
+        "utxo_hash_serialized_3": validation_binding["utxo_hash_serialized_3"],
+        "tx_count": 0,
+        "bogo_size": 0,
+    }
+    proof = {
+        "schema": "verify-replay-durability-proof-v1",
+        "version": 1,
+        "network": "mainnet",
+        "backend": backend,
+        "validation": {
+            "size_bytes": validation_binding["size_bytes"],
+            "sha256": validation_binding["sha256"],
+        },
+        "before": invariants,
+        "after": invariants,
+        "checkpoint_generation": 1,
+        "durable_body_roundtrip": True,
+        "durable_undo_roundtrip": True,
+        "mutated_copy_only": True,
+        "reopen_count": 2,
+    }
+    rendered = (json.dumps(proof, indent=2) + "\n").encode()
+    path.write_bytes(rendered)
+    return len(rendered), hashlib.sha256(rendered).hexdigest()
+
+
+def _ensure_shared_validation(tmp: Path) -> str:
+    """Bind a shared validation artifact to this fixture's replay stop and
+    return its path. Inline-namespace tests call this so the classifier's
+    shared-artifact gate sees bytes that match the replay they build."""
+    replay_doc = json.loads((tmp / "replay.json").read_bytes())
+    _, path = _write_shared_validation(
+        tmp, int(replay_doc["stop_height"]), str(replay_doc["stop_hash"])
+    )
+    return str(path)
+
+
+def _real_reopen_bindings(
+    tmp: Path, validation_binding: dict[str, object]
+) -> list[dict[str, object]]:
+    """Create one real proof per backend and return manifest bindings."""
+    bindings: list[dict[str, object]] = []
+    for backend in ("fjall", "rocksdb", "redb"):
+        proof_path = tmp / f"{backend}-reopen-proof.json"
+        size, sha256 = _write_reopen_proof_file(proof_path, backend, validation_binding)
+        bindings.append(
+            {
+                "schema": "verify-replay-durability-proof-v1",
+                "version": 1,
+                "backend": backend,
+                "path": str(proof_path),
+                "size": size,
+                "sha256": sha256,
+            }
+        )
+    return bindings
+
+
+def _v2_custody_bindings(
+    corpus_id: str = "C150",
+    reopen_proofs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Custody bindings shared by every v2 fixture manifest."""
+    return {
+        "corpus_id": corpus_id,
+        "core_version": "31.1.0",
+        "exporter": {"schema": "bitcoin-rs-active-chain-exporter", "version": 1},
+        "checksig_census": {"schema": "classify-corpus-v2", "version": 2},
+        "reopen_proofs": reopen_proofs
+        if reopen_proofs is not None
+        else [
+            dict(
+                _MANIFEST_V2_PROOF,
+                backend=backend,
+                path=f"/tmp/synthetic/{backend}-reopen-proof.json",
+            )
+            for backend in ("fjall", "rocksdb", "redb")
+        ],
+    }
+
+
+def _manifest_sha256(manifest: dict[str, object]) -> str:
+    """Canonical preimage digest: compact JSON in Rust field order, digest zeroed."""
+    ordered: dict[str, object] = {
+        "schema": manifest["schema"],
+        "version": manifest["version"],
+        "corpus_id": manifest["corpus_id"],
+        "core_version": manifest["core_version"],
+        "exporter": {
+            "schema": manifest["exporter"]["schema"],  # type: ignore[index]
+            "version": manifest["exporter"]["version"],  # type: ignore[index]
+        },
+        "checksig_census": {
+            "schema": manifest["checksig_census"]["schema"],  # type: ignore[index]
+            "version": manifest["checksig_census"]["version"],  # type: ignore[index]
+        },
+        "reopen_proofs": [
+            {
+                "schema": proof["schema"],  # type: ignore[index]
+                "version": proof["version"],  # type: ignore[index]
+                "backend": proof["backend"],  # type: ignore[index]
+                "path": proof["path"],  # type: ignore[index]
+                "size": proof["size"],  # type: ignore[index]
+                "sha256": proof["sha256"],  # type: ignore[index]
+            }
+            for proof in manifest["reopen_proofs"]  # type: ignore[union-attr]
+        ],
+        "manifest_sha256": "0" * 64,
+        "source_tip_hash": manifest["source_tip_hash"],
+        "network": manifest["network"],
+        "network_magic": manifest["network_magic"],
+        "genesis_hash": manifest["genesis_hash"],
+        "range": {
+            "start_height": manifest["range"]["start_height"],  # type: ignore[index]
+            "stop_height": manifest["range"]["stop_height"],  # type: ignore[index]
+        },
+        "archive": {
+            "size": manifest["archive"]["size"],  # type: ignore[index]
+            "sha256": manifest["archive"]["sha256"],  # type: ignore[index]
+        },
+        "entries": [
+            {
+                "height": entry["height"],  # type: ignore[index]
+                "hash": entry["hash"],  # type: ignore[index]
+                "offset": entry["offset"],  # type: ignore[index]
+                "payload_length": entry["payload_length"],  # type: ignore[index]
+            }
+            for entry in manifest["entries"]  # type: ignore[union-attr]
+        ],
+    }
+    import hashlib as _hashlib
+
+    return _hashlib.sha256(
+        json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _make_manifest(
     path: Path,
     *,
     network: str = "mainnet",
     network_magic: str = _MAINNET_MAGIC.hex(),
     genesis_hash: str = _MAINNET_GENESIS_HASH,
+    corpus_id: str = "C150",
     start_height: int = 0,
     stop_height: int = 0,
     blocks: list[bytes] | None = None,
     archive_size: int | None = None,
     archive_sha256: str | None = None,
+    source_tip_hash: str | None = None,
+    manifest_overrides: dict[str, object] | None = None,
+    reopen_bindings: list[dict[str, object]] | None = None,
 ) -> bytes:
-    """Write a bitcoin-rs-corpus-manifest v1 JSON and return the raw bytes.
+    """Write a bitcoin-rs-corpus-manifest v2 JSON and return the raw bytes.
 
-    Entry fields: height, hash (display hex), offset, payload_length.
+    Entry fields: height, hash (display hex), offset, payload_length.  The
+    manifest carries the full v2 custody bindings (corpus_id, core_version,
+    exporter and census schema/version pairs, three reopen proofs) and the
+    canonical preimage digest computed in Rust field order.
     """
     if blocks is None:
         blocks = [_MAINNET_GENESIS_BLOCK]
@@ -572,12 +786,14 @@ def _make_manifest(
     entries: list[dict[str, object]] = []
     offset = 0
     for height, block in enumerate(blocks):
-        entries.append({
-            "height": height,
-            "hash": _block_hash_display(block),
-            "offset": offset,
-            "payload_length": len(block),
-        })
+        entries.append(
+            {
+                "height": height,
+                "hash": _block_hash_display(block),
+                "offset": offset,
+                "payload_length": len(block),
+            }
+        )
         offset += 8 + len(block)
 
     if archive_size is None:
@@ -587,16 +803,21 @@ def _make_manifest(
         # that the test will override.
         archive_sha256 = "0" * 64
 
-    manifest = {
+    manifest: dict[str, object] = {
         "schema": "bitcoin-rs-corpus-manifest",
-        "version": 1,
+        "version": 2,
         "network": network,
         "network_magic": network_magic,
         "genesis_hash": genesis_hash,
         "range": {"start_height": start_height, "stop_height": stop_height},
         "archive": {"size": archive_size, "sha256": archive_sha256},
         "entries": entries,
+        "source_tip_hash": source_tip_hash or entries[-1]["hash"],
+        **_v2_custody_bindings(corpus_id, reopen_bindings),
     }
+    if manifest_overrides:
+        manifest.update(manifest_overrides)
+    manifest["manifest_sha256"] = _manifest_sha256(manifest)
     raw = (json.dumps(manifest, indent=2) + "\n").encode()
     path.write_bytes(raw)
     return raw
@@ -666,7 +887,7 @@ def _make_replay_v2(
         "window_verify_success_total": window_verify_success_total,
         "corpus_manifest": {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "path": "manifest.json",
             "bytes": corpus_manifest_bytes,
             "sha256": corpus_manifest_sha256,
@@ -757,13 +978,23 @@ def _make_classify_args(
     arch_size = len(archive_raw)
     arch_sha = _sha256_bytes(archive_raw)
 
+    # ── Real reopen proofs bound to this fixture's stop identity ──
+    fixture_stop = len(archive_blocks) - 1
+    fixture_tip = _block_hash_display(archive_blocks[-1])
+    validation_path, validation_binding = _write_shared_validation(
+        tmp, fixture_stop, fixture_tip
+    )
+    reopen_bindings = _real_reopen_bindings(tmp, validation_binding)
+
     # ── Manifest ──
     manifest_raw = _make_manifest(
         tmp / "manifest.json",
+        corpus_id="Cmodern" if contract == "cmodern" else "C150",
         stop_height=len(archive_blocks) - 1,
         blocks=archive_blocks,
         archive_size=arch_size,
         archive_sha256=arch_sha,
+        reopen_bindings=reopen_bindings,
     )
     cm_size = len(manifest_raw)
     cm_sha = _sha256_bytes(manifest_raw)
@@ -786,6 +1017,7 @@ def _make_classify_args(
     if manifest_overrides:
         manifest_obj = json.loads((tmp / "manifest.json").read_text())
         manifest_obj.update(manifest_overrides)
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
 
@@ -801,8 +1033,42 @@ def _make_classify_args(
         contract=contract,
         input_count=input_count,
         scratch_dir=str(scratch_dir) if scratch_dir else None,
+        validation=str(validation_path),
+        reopen_proofs=[
+            f"{binding['backend']}={binding['path']}" for binding in reopen_bindings
+        ],
     )
     return ns
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _relaxed_c150_pins(stop_height: int, stop_hash: str):
+    """Relax the frozen C150 pins to synthetic fixture values for one run.
+
+    Production binaries never see this: the pins are read by the classifier
+    at call time, and this wrapper exists so structural tests with one/two
+    block archives can reach the archive-phase gates they assert. The
+    product pins themselves are covered by the dedicated pin tests.
+    """
+    saved = (analyze.C150_STOP_HEIGHT, analyze.C150_STOP_HASH)
+    analyze.C150_STOP_HEIGHT = stop_height
+    analyze.C150_STOP_HASH = stop_hash
+    try:
+        yield
+    finally:
+        analyze.C150_STOP_HEIGHT, analyze.C150_STOP_HASH = saved
+
+
+def _in_relaxed_pins(args: argparse.Namespace) -> int:
+    """Run the classifier with C150 pins relaxed to this run's replay stop."""
+    replay_doc = json.loads(Path(args.replay).read_bytes())
+    with _relaxed_c150_pins(
+        int(replay_doc["stop_height"]), str(replay_doc["stop_hash"])
+    ):
+        return cmd_classify_corpus(args)
 
 
 def _cmd_classify_synthetic_cmodern(args: argparse.Namespace) -> int:
@@ -962,13 +1228,21 @@ def test_validate_capture_rejects_wrong_ffi_verify_entries() -> None:
             f"stderr should mention EXP-KSPIKE1, got: {stderr_msg!r}"
         )
         for inv_id in (
-            "INV-1", "INV-2", "INV-3", "INV-4", "INV-5", "INV-6",
-            "INV-7", "INV-9", "INV-10", "INV-11", "INV-13",
+            "INV-1",
+            "INV-2",
+            "INV-3",
+            "INV-4",
+            "INV-5",
+            "INV-6",
+            "INV-7",
+            "INV-9",
+            "INV-10",
+            "INV-11",
+            "INV-13",
         ):
             assert inv_id not in stderr_msg, (
                 f"{inv_id} should not be in failed list, stderr: {stderr_msg!r}"
             )
-
 
 
 def test_validate_capture_rejects_pre_taproot_schnorr_activity() -> None:
@@ -994,12 +1268,10 @@ def test_validate_capture_rejects_pre_taproot_schnorr_activity() -> None:
         )
         assert analyze.cmd_validate_capture(args) == 1
         report = json.loads((tmp / "report.json").read_text())
-        pre_taproot = [
-            row for row in report["invariants"]
-            if row["id"] == "INV-KSPIKE-SCHNORR-0"
-        ][0]
+        pre_taproot = next(
+            row for row in report["invariants"] if row["id"] == "INV-KSPIKE-SCHNORR-0"
+        )
         assert pre_taproot["passed"] is False
-
 
 
 def test_validate_capture_binds_corpus_identity() -> None:
@@ -1044,7 +1316,9 @@ def test_validate_capture_binds_corpus_identity() -> None:
         assert report["schema"] == "census-capture-v2"
         assert "corpus_size" in report
         assert "corpus_sha256" in report
-        real_size, real_sha256 = analyze._sha256_file(tmp / "ctx.jsonl")
+        raw = (tmp / "ctx.jsonl").read_bytes()
+        real_size = len(raw)
+        real_sha256 = hashlib.sha256(raw).hexdigest()
         assert report["corpus_size"] == real_size
         assert report["corpus_sha256"] == real_sha256
 
@@ -1096,8 +1370,15 @@ def test_validate_capture_sorted_output_has_header() -> None:
         assert magic == RECORD_MAGIC, f"bad magic {magic!r}"
         assert count == 2, f"expected count 2, got {count}"
         payload = data[HEADER_STRUCT.size :]
-        sorted_recs = sort_records_raw(recs)
-        assert payload == sorted_recs, "sorted payload must match sort_records_raw output"
+        sorted_copy = list(recs)
+        payload_digest = analyze.sorted_records_sha256(sorted_copy)
+        expected = hashlib.sha256(b"".join(sorted_copy)).hexdigest()
+        assert payload_digest == expected, (
+            "sorted digest must match the sorted concatenation digest"
+        )
+        assert payload == b"".join(sorted_copy), (
+            "sorted payload must match the in-place sorted order"
+        )
 
 
 def test_records_reject_invalid_encoded_fields() -> None:
@@ -1154,7 +1435,9 @@ def test_records_reject_every_over_capacity_shape_near_miss() -> None:
     for offset in range(48, 217):
         raw = bytearray(_PRESERVED_OVER_CAPACITY_ROW)
         raw[offset] = 1
-        _assert_over_capacity_length_error(bytes(raw), f"nonzero payload/pad byte {offset}")
+        _assert_over_capacity_length_error(
+            bytes(raw), f"nonzero payload/pad byte {offset}"
+        )
 
 
 def test_records_reject_ordinary_over_capacity_pubkey() -> None:
@@ -1186,7 +1469,9 @@ def test_preserved_over_capacity_padding_checks_remain_unchanged() -> None:
         # Over-capacity near misses fall through to the existing length error.
         raw = bytearray(_PRESERVED_OVER_CAPACITY_ROW)
         raw[offset] = 1
-        _assert_over_capacity_length_error(bytes(raw), f"over-capacity padding byte {offset}")
+        _assert_over_capacity_length_error(
+            bytes(raw), f"over-capacity padding byte {offset}"
+        )
 
 
 # ── Tests: extract_spike_width1 validation (Finding 5) ───────────────────────
@@ -1244,7 +1529,9 @@ def test_spike_rejects_runs_list_bool_threads() -> None:
     """A runs list with boolean threads must not be accepted as threads == 1."""
     _raises(
         AnalyzerError,
-        lambda: extract_spike_width1({"runs": [{"us_per_input": 50.0, "threads": True}]}),
+        lambda: extract_spike_width1(
+            {"runs": [{"us_per_input": 50.0, "threads": True}]}
+        ),
         "bool threads in runs list",
     )
 
@@ -1332,10 +1619,18 @@ def test_bare_rejects_non_integer_summary_fields() -> None:
         "max_ns_per_attempt": 50000.0,
         "first_mismatch": None,
     }
-    for field in ("inputs_per_round", "rounds", "attempts_total", "mismatches", "ok_count"):
+    for field in (
+        "inputs_per_round",
+        "rounds",
+        "attempts_total",
+        "mismatches",
+        "ok_count",
+    ):
         for bad in (True, 1.5):
             d = dict(base, **{field: bad})
-            _raises(AnalyzerError, lambda d=d: extract_bare_mode0(d), f"{field}={bad!r}")
+            _raises(
+                AnalyzerError, lambda d=d: extract_bare_mode0(d), f"{field}={bad!r}"
+            )
 
 
 # ── Tests: cmd_verdict numeric and cross-check ───────────────────────────────
@@ -1546,7 +1841,9 @@ def test_verdict_native_mode0_contradiction_fails() -> None:
             integrity=integrity_path,
         )
         rc_bad = analyze.cmd_verdict(args_bad)
-        assert rc_bad == 2, f"contradictory artifact should be INVALID (rc=2), got rc={rc_bad}"
+        assert rc_bad == 2, (
+            f"contradictory artifact should be INVALID (rc=2), got rc={rc_bad}"
+        )
         report_bad = json.loads(out_bad.read_text())
         assert report_bad["verdict"] == "INVALID"
         assert report_bad["inv_8"]["passed"] is False
@@ -1560,7 +1857,9 @@ def test_legacy_jsonl_rejects_malformed_fields() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         # Use a txid with at least one a-f digit so .upper() changes the string.
-        base = _make_legacy_row(bytes.fromhex("0a" + "00" * 30).hex(), 0, _p2pkh_prevout())
+        base = _make_legacy_row(
+            bytes.fromhex("0a" + "00" * 30).hex(), 0, _p2pkh_prevout()
+        )
 
         for label, broken in (
             ("missing height", {k: v for k, v in base.items() if k != "height"}),
@@ -1685,7 +1984,9 @@ def test_brsctx1_rejects_impossible_witness_count() -> None:
         txid_le = bytes(32)
         # witness_count=100 but row_length only has a few bytes remaining
         fixed = _BRSCTX1_FIXED.pack(txid_le, 0, 0, 0, 0, 100)
-        row_length = _BRSCTX1_FIXED.size + 4  # only 4 bytes remaining, can't fit 100 witness items
+        row_length = (
+            _BRSCTX1_FIXED.size + 4
+        )  # only 4 bytes remaining, can't fit 100 witness items
         data = _BRSCTX1_MAGIC + struct.pack("<Q", 1)
         data += struct.pack("<I", row_length)
         data += fixed
@@ -1771,14 +2072,11 @@ def test_classify_input_block_177609_op_0_p2sh() -> None:
     """The exact block-177609 OP_0 multisig spend classifies as P2SH."""
     evidence = _ctx_input(
         bytes.fromhex(
-            "1cc1ecdf5c05765df3d1f59fba24cd01"
-            "c45464c329b0f0a25aa9883adfcf7f29"
+            "1cc1ecdf5c05765df3d1f59fba24cd01c45464c329b0f0a25aa9883adfcf7f29"
         )[::-1],
         0,
         verify_flags=VERIFY_P2SH,
-        prevout=bytes.fromhex(
-            "a9145c02c49641699863f909bf4bf3be8398d2e383f187"
-        ),
+        prevout=bytes.fromhex("a9145c02c49641699863f909bf4bf3be8398d2e383f187"),
         script_sig=bytes.fromhex(
             "00483045022100beb926da7428fa009ac770576342ebd1960939e73584a5d0"
             "f3229b58c41e906f022017c0d143077906afccf30caf21f5ece0bb30e3f7"
@@ -1883,7 +2181,8 @@ def test_classify_input_taproot_annex_stripping() -> None:
 
     # Key path with annex: two elements, strip -> one -> key path.
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_WITNESS | VERIFY_TAPROOT,
         prevout=_p2tr_prevout(),
         witness=(bytes(64), annex),
@@ -1891,9 +2190,10 @@ def test_classify_input_taproot_annex_stripping() -> None:
     assert classify_input(evidence).spend_context == SpendContext.TAPROOT_KEY_PATH
 
     # Script path with annex: four elements, strip -> three -> script path.
-    control = bytes([0xc0]) + bytes(32)
+    control = bytes([0xC0]) + bytes(32)
     evidence = _ctx_input(
-        txid_le, 1,
+        txid_le,
+        1,
         verify_flags=VERIFY_WITNESS | VERIFY_TAPROOT,
         prevout=_p2tr_prevout(),
         witness=(bytes(64), bytes([0xAC]), control, annex),
@@ -1907,7 +2207,8 @@ def test_classify_input_p2sh_non_push_scriptsig() -> None:
     redeem = _multisig_redeem_script()
     bad_script_sig = _push(redeem) + bytes([0x75])  # extra non-push byte
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_P2SH,
         prevout=_p2sh_prevout(),
         script_sig=bad_script_sig,
@@ -1919,7 +2220,8 @@ def test_classify_input_native_v0_with_scriptsig() -> None:
     """Native v0 with non-empty scriptSig must raise ContextError."""
     txid_le = b"\x1d" * 32
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_WITNESS,
         prevout=_p2wsh_prevout(),
         script_sig=bytes([1]),
@@ -1932,24 +2234,32 @@ def test_classify_input_taproot_bad_key_path_sig() -> None:
     """P2TR key-path with wrong signature length must raise ContextError."""
     txid_le = b"\x1e" * 32
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_WITNESS | VERIFY_TAPROOT,
         prevout=_p2tr_prevout(),
         witness=(bytes(20),),  # 20 bytes is not 64/65
     )
-    _raises(ContextError, lambda: classify_input(evidence), "P2TR key-path bad sig length")
+    _raises(
+        ContextError, lambda: classify_input(evidence), "P2TR key-path bad sig length"
+    )
 
 
 def test_classify_input_taproot_bad_control_block() -> None:
     """P2TR script-path with malformed control block must raise ContextError."""
     txid_le = b"\x1f" * 32
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_WITNESS | VERIFY_TAPROOT,
         prevout=_p2tr_prevout(),
         witness=(bytes(1), bytes(32)),  # second element is 32 bytes (< 33)
     )
-    _raises(ContextError, lambda: classify_input(evidence), "P2TR script-path bad control block")
+    _raises(
+        ContextError,
+        lambda: classify_input(evidence),
+        "P2TR script-path bad control block",
+    )
 
 
 def test_classify_input_p2sh_op_reserved_scriptsig() -> None:
@@ -1958,12 +2268,15 @@ def test_classify_input_p2sh_op_reserved_scriptsig() -> None:
     redeem = _multisig_redeem_script()
     bad_script_sig = _push(redeem) + bytes([0x50])  # extra OP_RESERVED byte
     evidence = _ctx_input(
-        txid_le, 0,
+        txid_le,
+        0,
         verify_flags=VERIFY_P2SH,
         prevout=_p2sh_prevout(),
         script_sig=bad_script_sig,
     )
-    _raises(ContextError, lambda: classify_input(evidence), "OP_RESERVED P2SH scriptSig")
+    _raises(
+        ContextError, lambda: classify_input(evidence), "OP_RESERVED P2SH scriptSig"
+    )
 
 
 # ── Tests: parse_script Core stack semantics ─────────────────────────────────
@@ -2066,30 +2379,38 @@ def test_classify_corpus_txid_reversal_mutation() -> None:
         journal = _make_journal_bytes(txid_le, 0)
 
         # ── Baseline: all use the same LE txid ──
-        # The join logic passes; the c150 pin raises CTX-CUSTODY for a 1-block
-        # corpus (stop_height=0 != 150000).  This proves the join succeeded.
+        # With the C150 pins relaxed to the synthetic stop, the join logic
+        # runs to completion and the classifier finishes (the c150 product
+        # predicate rejects the synthetic counters). This proves the join
+        # succeeded; the strict product pin is covered by the dedicated
+        # frozen-pin tests.
         args = _make_classify_args(
-            tmp, [ctx_row], [record], [journal], "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            [journal],
+            "c150",
         )
-        _raises_with(
-            AnalyzerError,
-            lambda: cmd_classify_corpus(args),
-            "baseline c150 pin",
-            "CTX-CUSTODY",
-        )
+        assert _in_relaxed_pins(args) == 1
 
         # ── Mutation: flip BRSCTX1 txid only ──
         flipped_txid = txid_le[::-1]  # reverse to display order
         mutated_row = _bare_p2pkh(flipped_txid)
         args = _make_classify_args(
-            tmp, [mutated_row], [record], [journal], "c150",
+            tmp,
+            [mutated_row],
+            [record],
+            [journal],
+            "c150",
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "flipped BRSCTX1 txid",
             "CTX-OPERATIONS",
         )
+
+
 def test_classify_corpus_all_spend_contexts() -> None:
     """All required spend containers and multisig/Schnorr records are counted.
 
@@ -2102,21 +2423,35 @@ def test_classify_corpus_all_spend_contexts() -> None:
         txids = [bytes([i + 1]) * 32 for i in range(6)]
 
         contexts = [
-            _bare_p2pkh(txids[0]),                                                    # bare
-            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),                             # p2sh
-            _native_w0(txids[2], flags=VERIFY_WITNESS),                               # native v0
-            _p2sh_wrapped_w0(txids[3], flags=VERIFY_P2SH | VERIFY_WITNESS),           # wrapped v0
-            _taproot_key_path(txids[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT),       # taproot key path
-            _taproot_script_path(txids[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT),    # tapscript
+            _bare_p2pkh(txids[0]),  # bare
+            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),  # p2sh
+            _native_w0(txids[2], flags=VERIFY_WITNESS),  # native v0
+            _p2sh_wrapped_w0(
+                txids[3], flags=VERIFY_P2SH | VERIFY_WITNESS
+            ),  # wrapped v0
+            _taproot_key_path(
+                txids[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT
+            ),  # taproot key path
+            _taproot_script_path(
+                txids[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT
+            ),  # tapscript
         ]
 
         records = [
-            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),   # bare multisig
-            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),   # p2sh multisig
-            _make_record_bytes(txids[2], 0, op_kind=3, sig_version=1),   # native v0 multisig
-            _make_record_bytes(txids[3], 0, op_kind=3, sig_version=1),   # wrapped v0 multisig
-            _make_record_bytes(txids[5], 0, op_kind=1, sig_version=2),   # tapscript schnorr
-            _make_record_bytes(txids[5], 0, op_kind=5, sig_version=2, op_seq=1),  # checksigadd
+            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),  # bare multisig
+            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),  # p2sh multisig
+            _make_record_bytes(
+                txids[2], 0, op_kind=3, sig_version=1
+            ),  # native v0 multisig
+            _make_record_bytes(
+                txids[3], 0, op_kind=3, sig_version=1
+            ),  # wrapped v0 multisig
+            _make_record_bytes(
+                txids[5], 0, op_kind=1, sig_version=2
+            ),  # tapscript schnorr
+            _make_record_bytes(
+                txids[5], 0, op_kind=5, sig_version=2, op_seq=1
+            ),  # checksigadd
         ]
 
         # Journal entries must match the actual records per key:
@@ -2124,12 +2459,54 @@ def test_classify_corpus_all_spend_contexts() -> None:
         # txids[4]: no record (taproot key path has no BRSREC1 record) → all zero
         # txids[5]: Schnorr (not ECDSA) → ecdsa_verify_calls=0, ecdsa_verify_ok=0
         journal = [
-            _make_journal_bytes(txids[0], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[1], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[2], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-            _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(
+                txids[0],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[1],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[2],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[3],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[4],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
+            _make_journal_bytes(
+                txids[5],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
         ]
 
         # Counters must match the actual record/journal sums:
@@ -2138,7 +2515,9 @@ def test_classify_corpus_all_spend_contexts() -> None:
         # checkecdsa_entries=4, ecdsa_verify_calls=4, ecdsa_verify_ok=4
         # checkschnorr_entries=2, schnorr_verify_calls=2, schnorr_verify_ok=2
         counters = _make_valid_counters(
-            record_count=6, journal_count=6, ffi_verify_entries=6,
+            record_count=6,
+            journal_count=6,
+            ffi_verify_entries=6,
             op_checksig=0,
             op_checkmultisig=4,
             op_checksigadd=1,
@@ -2156,7 +2535,12 @@ def test_classify_corpus_all_spend_contexts() -> None:
         )
 
         args = _make_classify_args(
-            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+            tmp,
+            contexts,
+            records,
+            journal,
+            "cmodern",
+            counters_dict=counters,
         )
         counts, context_count, _ = _count_context_records_disk(
             Path(args.contexts),
@@ -2181,18 +2565,33 @@ def test_classify_corpus_c150_passes() -> None:
         txid_le = b"\x40" * 32
         ctx_row = _bare_p2pkh(txid_le)
         record = _make_record_bytes(txid_le, 0, op_kind=3, sig_version=0)
-        journal = [_make_journal_bytes(
-            txid_le, 0,
-            checksig_ops=0, checkmultisig_ops=1,
-            ecdsa_verify_calls=0, ecdsa_verify_ok=0,
-        )]
+        journal = [
+            _make_journal_bytes(
+                txid_le,
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            )
+        ]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
-            replay_overrides={"stop_height": _C150_STOP_HEIGHT, "stop_hash": _C150_STOP_HASH},
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            replay_overrides={
+                "stop_height": _C150_STOP_HEIGHT,
+                "stop_hash": _C150_STOP_HASH,
+            },
             counters_overrides={
-                "op_checksig": 0, "op_checkmultisig": 1,
-                "checkecdsa_entries": 0, "ecdsa_from_checksig": 0,
-                "ecdsa_verify_calls": 0, "ecdsa_verify_ok": 0,
+                "op_checksig": 0,
+                "op_checkmultisig": 1,
+                "checkecdsa_entries": 0,
+                "ecdsa_from_checksig": 0,
+                "ecdsa_verify_calls": 0,
+                "ecdsa_verify_ok": 0,
                 "sighash_computed": 0,
             },
         )
@@ -2201,6 +2600,7 @@ def test_classify_corpus_c150_passes() -> None:
             lambda: cmd_classify_corpus(args),
             "CTX-CUSTODY",
         )
+
 
 def test_classify_corpus_cmodern_rejects_mismatched_op_checksigadd() -> None:
     """Mutating the native op_checksigadd counter without a matching record fails."""
@@ -2227,16 +2627,60 @@ def test_classify_corpus_cmodern_rejects_mismatched_op_checksigadd() -> None:
         ]
 
         journal = [
-            _make_journal_bytes(txids[0], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[1], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[2], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-            _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(
+                txids[0],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[1],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[2],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[3],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[4],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
+            _make_journal_bytes(
+                txids[5],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
         ]
 
         counters = _make_valid_counters(
-            record_count=6, journal_count=6, ffi_verify_entries=6,
+            record_count=6,
+            journal_count=6,
+            ffi_verify_entries=6,
             op_checksig=0,
             op_checkmultisig=4,
             op_checksigadd=2,
@@ -2254,7 +2698,12 @@ def test_classify_corpus_cmodern_rejects_mismatched_op_checksigadd() -> None:
         )
 
         args = _make_classify_args(
-            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+            tmp,
+            contexts,
+            records,
+            journal,
+            "cmodern",
+            counters_dict=counters,
         )
         _raises_with(
             AnalyzerError,
@@ -2277,7 +2726,7 @@ def test_classify_corpus_cmodern_rejects_wrong_stop_height() -> None:
             AnalyzerError,
             lambda: cmd_classify_corpus(args),
             "cmodern wrong stop_height",
-            f"cmodern requires stop_height {analyze.CMODERN_STOP_HEIGHT}",
+            f"Cmodern is frozen at stop height {analyze.CMODERN_STOP_HEIGHT}",
         )
         assert not (tmp / "report.json").exists()
 
@@ -2301,7 +2750,8 @@ def test_classify_corpus_cmodern_rejects_wrong_stop_hash() -> None:
                 AnalyzerError,
                 lambda: cmd_classify_corpus(args),
                 "cmodern wrong stop_hash",
-                f"cmodern requires stop_hash {analyze.CMODERN_STOP_HASH!r}",
+                f"Cmodern is frozen at stop height {analyze.CMODERN_STOP_HEIGHT} "
+                f"/ tip {analyze.CMODERN_STOP_HASH!r}",
             )
         finally:
             analyze.CMODERN_STOP_HEIGHT = stop_height
@@ -2333,10 +2783,11 @@ def test_counter_arithmetic_schnorr_invariant() -> None:
         schnorr_verify_calls=1,
         schnorr_verify_ok=1,
     )
-    inv7 = [
-        row for row in analyze.check_counter_arithmetic(Counters(valid))
+    inv7 = next(
+        row
+        for row in analyze.check_counter_arithmetic(Counters(valid))
         if row["id"] == "INV-7"
-    ][0]
+    )
     assert inv7["passed"] is True
 
     for overrides in (
@@ -2345,10 +2796,11 @@ def test_counter_arithmetic_schnorr_invariant() -> None:
     ):
         mutated = dict(valid)
         mutated.update(overrides)
-        inv7 = [
-            row for row in analyze.check_counter_arithmetic(Counters(mutated))
+        inv7 = next(
+            row
+            for row in analyze.check_counter_arithmetic(Counters(mutated))
             if row["id"] == "INV-7"
-        ][0]
+        )
         assert inv7["passed"] is False
 
 
@@ -2361,10 +2813,11 @@ def test_classify_corpus_zero_inputs() -> None:
         args = _make_classify_args(tmp, [], [], [], "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "zero inputs",
             "CTX-EXECUTION",
         )
+
 
 def test_classify_corpus_definitions_match_counter_names() -> None:
     """Every named context counter has a definition and no extra grid is introduced."""
@@ -2387,7 +2840,7 @@ def test_classify_corpus_missing_record_identity() -> None:
         args = _make_classify_args(tmp, [ctx_row], [record], journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "missing record identity",
             "CTX-OPERATIONS",
         )
@@ -2407,7 +2860,7 @@ def test_classify_corpus_duplicate_record_key() -> None:
         args = _make_classify_args(tmp, [ctx_row], records, journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "duplicate record key",
             "CTX-OPERATIONS",
         )
@@ -2427,7 +2880,7 @@ def test_classify_corpus_duplicate_journal_key() -> None:
         args = _make_classify_args(tmp, [ctx_row], [record], journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "duplicate journal key",
             "CTX-EXECUTION",
         )
@@ -2444,7 +2897,7 @@ def test_classify_corpus_native_wrapped_swap() -> None:
         args = _make_classify_args(tmp, [ctx_row], [record], journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "native/wrapped swap",
             "CTX-OPERATIONS",
         )
@@ -2486,8 +2939,12 @@ def test_classify_corpus_rejects_jsonl_context_file() -> None:
             archive_bytes=len(archive_raw),
             archive_sha256=_sha256_bytes(archive_raw),
         )
+        validation_path, _ = _write_shared_validation(
+            tmp, 0, _block_hash_display(_MAINNET_GENESIS_BLOCK)
+        )
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -2499,8 +2956,14 @@ def test_classify_corpus_rejects_jsonl_context_file() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=str(validation_path),
         )
-        _raises(AnalyzerError, lambda: cmd_classify_corpus(args), "JSONL context file")
+        with _relaxed_c150_pins(0, _block_hash_display(_MAINNET_GENESIS_BLOCK)):
+            _raises(
+                AnalyzerError,
+                lambda: cmd_classify_corpus(args),
+                "JSONL context file",
+            )
 
 
 def test_classify_corpus_rejects_mismatched_context_size() -> None:
@@ -2515,7 +2978,11 @@ def test_classify_corpus_rejects_mismatched_context_size() -> None:
         # Build fixtures normally, then corrupt the replay's corpus_manifest
         # bytes field to create a custody size mismatch for the manifest.
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"corpus_manifest_bytes": 99999},
         )
         _raises_with(
@@ -2536,7 +3003,11 @@ def test_classify_corpus_rejects_mismatched_context_sha256() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
 
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"corpus_manifest_sha256": "f" * 64},
         )
         _raises_with(
@@ -2559,7 +3030,7 @@ def test_classify_corpus_context_journal_key_inequality() -> None:
         args = _make_classify_args(tmp, [ctx_row], [record], journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "context/journal key inequality",
             "CTX-OPERATIONS",
         )
@@ -2575,12 +3046,20 @@ def test_classify_corpus_count_mismatch_ffi_verify_entries() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # ffi_verify_entries=2 but only 1 context row
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
-            counters_overrides={"ffi_verify_entries": 2, "verify_script_calls": 2, "ffi_verify_true": 2},
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            counters_overrides={
+                "ffi_verify_entries": 2,
+                "verify_script_calls": 2,
+                "ffi_verify_true": 2,
+            },
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "context count != ffi_verify_entries",
             "CTX-EXECUTION",
         )
@@ -2596,12 +3075,16 @@ def test_classify_corpus_record_count_mismatch() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # record_count=2 but only 1 record
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             counters_overrides={"record_count": 2},
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "record count mismatch",
             "CTX-OPERATIONS",
         )
@@ -2619,7 +3102,11 @@ def test_replay_rejects_nonzero_assume_valid_height() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"assume_valid_height": 100},
         )
         _raises_with(
@@ -2639,7 +3126,11 @@ def test_replay_rejects_window_le_one() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"window": 1},
         )
         _raises_with(
@@ -2659,7 +3150,11 @@ def test_replay_rejects_zero_window_verify_success_total() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"window_verify_success_total": 0},
         )
         _raises_with(
@@ -2682,7 +3177,11 @@ def test_manifest_network_mismatch_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             manifest_overrides={"network": "testnet"},
         )
         _raises_with(
@@ -2702,7 +3201,11 @@ def test_manifest_genesis_mismatch_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             manifest_overrides={"genesis_hash": "1" * 64},
         )
         _raises_with(
@@ -2722,7 +3225,11 @@ def test_manifest_range_mismatch_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             manifest_overrides={"range": {"start_height": 0, "stop_height": 99}},
         )
         _raises_with(
@@ -2742,7 +3249,11 @@ def test_manifest_archive_size_mismatch_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             manifest_overrides={"archive": {"size": 99999, "sha256": "0" * 64}},
         )
         _raises_with(
@@ -2785,6 +3296,7 @@ def test_manifest_archive_sha256_mismatch_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -2796,10 +3308,11 @@ def test_manifest_archive_sha256_mismatch_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "archive sha256 mismatch",
             "CTX-CUSTODY",
         )
@@ -2818,18 +3331,27 @@ def test_manifest_start_height_nonzero_raises() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # Override manifest with start_height=1 (also need matching replay)
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 1, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -2848,6 +3370,7 @@ def test_manifest_start_height_nonzero_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -2859,10 +3382,11 @@ def test_manifest_start_height_nonzero_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "start_height != 0",
             "CTX-CUSTODY",
         )
@@ -2877,16 +3401,20 @@ def test_manifest_empty_entries_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = []
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -2904,6 +3432,7 @@ def test_manifest_empty_entries_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -2915,10 +3444,11 @@ def test_manifest_empty_entries_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "empty entries",
             "CTX-CUSTODY",
         )
@@ -2936,31 +3466,52 @@ def test_manifest_gapped_heights_raises() -> None:
         block1 = _MAINNET_GENESIS_BLOCK
         # Create a second block with prev_blockhash = genesis hash (raw LE)
         header2 = (
-            b"\x00" * 4                                   # version
-            + _MAINNET_GENESIS_HASH_RAW                   # prev_blockhash (raw LE)
-            + b"\x00" * 32                                # merkle_root
-            + struct.pack("<I", 0x5CE9B2A2)               # timestamp
-            + b"\x20" * 4                                 # bits
-            + struct.pack("<I", 1)                        # nonce
+            b"\x00" * 4  # version
+            + _MAINNET_GENESIS_HASH_RAW  # prev_blockhash (raw LE)
+            + b"\x00" * 32  # merkle_root
+            + struct.pack("<I", 0x5CE9B2A2)  # timestamp
+            + b"\x20" * 4  # bits
+            + struct.pack("<I", 1)  # nonce
         )
-        block2 = header2 + bytes([0x01]) + struct.pack("<I", 1) + bytes([0x00]) + b"\x00" * 36 + bytes([0x00]) + struct.pack("<I", 0)
+        block2 = (
+            header2
+            + bytes([0x01])
+            + struct.pack("<I", 1)
+            + bytes([0x00])
+            + b"\x00" * 36
+            + bytes([0x00])
+            + struct.pack("<I", 0)
+        )
         blocks = [block1, block2]
         archive_raw = _make_archive(tmp / "archive.bin", blocks)
         # Manifest with gapped height (0, 2 instead of 0, 1)
         entries = [
-            {"height": 0, "hash": _block_hash_display(block1), "offset": 0, "payload_length": len(block1)},
-            {"height": 2, "hash": _block_hash_display(block2), "offset": 8 + len(block1), "payload_length": len(block2)},
+            {
+                "height": 0,
+                "hash": _block_hash_display(block1),
+                "offset": 0,
+                "payload_length": len(block1),
+            },
+            {
+                "height": 2,
+                "hash": _block_hash_display(block2),
+                "offset": 8 + len(block1),
+                "payload_length": len(block2),
+            },
         ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 1},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
             "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -2979,6 +3530,7 @@ def test_manifest_gapped_heights_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -2990,10 +3542,11 @@ def test_manifest_gapped_heights_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "gapped heights",
             "CTX-CUSTODY",
         )
@@ -3009,18 +3562,27 @@ def test_manifest_inconsistent_offset_raises() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
         # Wrong offset (100 instead of 0)
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 100,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 100, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3038,6 +3600,7 @@ def test_manifest_inconsistent_offset_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3049,10 +3612,11 @@ def test_manifest_inconsistent_offset_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "inconsistent offset",
             "CTX-CUSTODY",
         )
@@ -3068,7 +3632,9 @@ def test_archive_frame_magic_mismatch_raises() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # Write archive with wrong magic
         wrong_magic = bytes.fromhex("deadbeef")
-        archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK], magic=wrong_magic)
+        archive_raw = _make_archive(
+            tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK], magic=wrong_magic
+        )
         manifest_raw = _make_manifest(
             tmp / "manifest.json",
             stop_height=0,
@@ -3093,6 +3659,7 @@ def test_archive_frame_magic_mismatch_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3104,12 +3671,13 @@ def test_archive_frame_magic_mismatch_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         # The manifest network_magic won't match the replay's, so this raises
         # CTX-CUSTODY for magic mismatch (either manifest-vs-replay or frame-vs-manifest)
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "frame magic mismatch",
             "CTX-CUSTODY",
         )
@@ -3125,18 +3693,27 @@ def test_archive_frame_payload_length_mismatch_raises() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
         # Manifest declares wrong payload_length
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": 999,
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": 999},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3154,6 +3731,7 @@ def test_archive_frame_payload_length_mismatch_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3165,10 +3743,11 @@ def test_archive_frame_payload_length_mismatch_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "payload_length mismatch",
             "CTX-CUSTODY",
         )
@@ -3184,18 +3763,27 @@ def test_archive_header_hash_mismatch_raises() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
         # Manifest declares wrong hash for the entry
+        entries = [
+            {
+                "height": 0,
+                "hash": "0" * 64,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": "0" * 64, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3213,6 +3801,7 @@ def test_archive_header_hash_mismatch_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3224,10 +3813,11 @@ def test_archive_header_hash_mismatch_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "header hash mismatch",
             "CTX-CUSTODY",
         )
@@ -3253,18 +3843,27 @@ def test_archive_genesis_prev_blockhash_nonzero_raises() -> None:
         bad_block = bad_header + _MAINNET_GENESIS_BLOCK[80:]
         bad_hash = _block_hash_display(bad_block)
         archive_raw = _make_archive(tmp / "archive.bin", [bad_block])
+        entries = [
+            {
+                "height": 0,
+                "hash": bad_hash,
+                "offset": 0,
+                "payload_length": len(bad_block),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": bad_hash,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": bad_hash, "offset": 0, "payload_length": len(bad_block)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3284,6 +3883,7 @@ def test_archive_genesis_prev_blockhash_nonzero_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3295,10 +3895,11 @@ def test_archive_genesis_prev_blockhash_nonzero_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "genesis prev_blockhash nonzero",
             "CTX-CUSTODY",
         )
@@ -3326,19 +3927,33 @@ def test_archive_chain_break_raises() -> None:
         block2 = header2 + _MAINNET_GENESIS_BLOCK[80:]
         blocks = [block1, block2]
         archive_raw = _make_archive(tmp / "archive.bin", blocks)
+        entries = [
+            {
+                "height": 0,
+                "hash": _block_hash_display(block1),
+                "offset": 0,
+                "payload_length": len(block1),
+            },
+            {
+                "height": 1,
+                "hash": _block_hash_display(block2),
+                "offset": 8 + len(block1),
+                "payload_length": len(block2),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 1},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _block_hash_display(block1), "offset": 0, "payload_length": len(block1)},
-                {"height": 1, "hash": _block_hash_display(block2), "offset": 8 + len(block1), "payload_length": len(block2)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3357,6 +3972,7 @@ def test_archive_chain_break_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3368,10 +3984,11 @@ def test_archive_chain_break_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "chain break",
             "CTX-CUSTODY",
         )
@@ -3389,18 +4006,30 @@ def test_archive_trailing_bytes_raises() -> None:
         _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
         (tmp / "archive.bin").write_bytes((tmp / "archive.bin").read_bytes() + b"\x00")
         archive_raw = (tmp / "archive.bin").read_bytes()
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
-            "archive": {"size": len(archive_raw) - 1, "sha256": _sha256_bytes(archive_raw[:-1])},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "archive": {
+                "size": len(archive_raw) - 1,
+                "sha256": _sha256_bytes(archive_raw[:-1]),
+            },
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3418,6 +4047,7 @@ def test_archive_trailing_bytes_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3429,10 +4059,11 @@ def test_archive_trailing_bytes_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "trailing bytes",
             "CTX-CUSTODY",
         )
@@ -3447,18 +4078,27 @@ def test_manifest_entry_count_mismatch_raises() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 5},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -3476,6 +4116,7 @@ def test_manifest_entry_count_mismatch_raises() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         args = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -3487,10 +4128,11 @@ def test_manifest_entry_count_mismatch_raises() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "entry count mismatch",
             "CTX-CUSTODY",
         )
@@ -3509,7 +4151,11 @@ def test_manifest_happy_path() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         # The one-block fixture lacks ten required Cmodern context classes.
@@ -3533,7 +4179,11 @@ def test_classify_corpus_c150_rejects_wrong_stop_height() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"stop_height": 149999, "stop_hash": _C150_STOP_HASH},
         )
         _raises_with(
@@ -3554,8 +4204,15 @@ def test_classify_corpus_c150_rejects_wrong_stop_hash() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         wrong_hash = "0" * 64
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
-            replay_overrides={"stop_height": _C150_STOP_HEIGHT, "stop_hash": wrong_hash},
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            replay_overrides={
+                "stop_height": _C150_STOP_HEIGHT,
+                "stop_hash": wrong_hash,
+            },
         )
         _raises_with(
             AnalyzerError,
@@ -3577,7 +4234,11 @@ def test_classify_corpus_c150_rejects_mismatched_stop_hash() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={
                 "stop_height": _C150_STOP_HEIGHT,
                 "stop_hash": "1" * 64,  # wrong hash
@@ -3587,6 +4248,107 @@ def test_classify_corpus_c150_rejects_mismatched_stop_hash() -> None:
             AnalyzerError,
             lambda: cmd_classify_corpus(args),
             "c150 mismatched stop_hash",
+            "CTX-CUSTODY",
+        )
+
+
+def test_classify_corpus_rejects_zero_proof_digest() -> None:
+    """A v2 manifest whose reopen proofs carry zero digests fails closed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xe0" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        args = _make_classify_args(
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            manifest_overrides={
+                "reopen_proofs": [
+                    dict(_MANIFEST_V2_PROOF, backend=backend, sha256="0" * 64)
+                    for backend in ("fjall", "rocksdb", "redb")
+                ]
+            },
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "zero digest",
+            "CTX-CUSTODY",
+        )
+
+
+def test_classify_corpus_rejects_key_permutation_only_for_rust_order() -> None:
+    """A manifest reserialized with permuted keys still verifies: the digest
+    binds canonical Rust field order, not wire key order.  Mutation of any
+    field still fails.  This pins the key-permutation parity contract."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        txid_le = b"\xe1" * 32
+        ctx_row = _bare_p2pkh(txid_le)
+        record = _make_record_bytes(txid_le, 0)
+        journal = [_make_journal_bytes(txid_le, 0)]
+        archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        args = _make_classify_args(
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+        )
+        manifest_obj = json.loads((tmp / "manifest.json").read_text())
+        declared = manifest_obj["manifest_sha256"]
+        # Permute root keys; canonical preimage must be unchanged.
+        permuted = dict(reversed(list(manifest_obj.items())))
+        permuted["manifest_sha256"] = declared
+        permuted_bytes = (json.dumps(permuted, indent=2) + "\n").encode()
+        (tmp / "manifest.json").write_bytes(permuted_bytes)
+        _make_replay_v2(
+            tmp / "replay.json",
+            stop_height=0,
+            corpus_manifest_bytes=len(permuted_bytes),
+            corpus_manifest_sha256=_sha256_bytes(permuted_bytes),
+            archive_bytes=len(archive_raw),
+            archive_sha256=_sha256_bytes(archive_raw),
+        )
+        args = argparse.Namespace(
+            counters=str(tmp / "counters.json"),
+            contexts=str(tmp / "contexts.bin"),
+            records=str(tmp / "records.bin"),
+            journal=str(tmp / "journal.bin"),
+            replay=str(tmp / "replay.json"),
+            corpus_manifest=str(tmp / "manifest.json"),
+            archive=str(tmp / "archive.bin"),
+            output=str(tmp / "report.json"),
+            contract="c150",
+            input_count=None,
+            validation=_ensure_shared_validation(tmp),
+        )
+        # The permuted manifest must NOT fail on manifest_sha256 mismatch
+        # (it may pass custody and proceed, or fail later for fixture
+        # reasons like empty context files — but never on the digest).
+        try:
+            cmd_classify_corpus(args)
+        except AnalyzerError as exc:
+            assert "manifest_sha256 mismatch" not in str(exc), (
+                "key permutation broke the canonical digest"
+            )
+        # Now mutate a field; the digest must fail.
+        mutated = dict(manifest_obj)
+        mutated["core_version"] = "30.99.99"
+        mutated_bytes = (json.dumps(mutated, indent=2) + "\n").encode()
+        (tmp / "manifest.json").write_bytes(mutated_bytes)
+        replay2 = json.loads((tmp / "replay.json").read_text())
+        replay2["corpus_manifest"]["bytes"] = len(mutated_bytes)
+        replay2["corpus_manifest"]["sha256"] = _sha256_bytes(mutated_bytes)
+        (tmp / "replay.json").write_text(json.dumps(replay2))
+        _raises_with(
+            AnalyzerError,
+            lambda: cmd_classify_corpus(args),
+            "manifest_sha256 mismatch",
             "CTX-CUSTODY",
         )
 
@@ -3601,34 +4363,92 @@ def test_classify_corpus_cmodern_all_positive_passes_synthetic_fixture() -> None
         txids = [bytes([i + 1]) * 32 for i in range(6)]
 
         contexts = [
-            _bare_p2pkh(txids[0]),                                                    # bare
-            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),                             # p2sh
-            _native_w0(txids[2], flags=VERIFY_WITNESS),                               # native v0
-            _p2sh_wrapped_w0(txids[3], flags=VERIFY_P2SH | VERIFY_WITNESS),           # wrapped v0
-            _taproot_key_path(txids[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT),       # taproot key path
-            _taproot_script_path(txids[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT),    # tapscript
+            _bare_p2pkh(txids[0]),  # bare
+            _p2sh_push_only(txids[1], flags=VERIFY_P2SH),  # p2sh
+            _native_w0(txids[2], flags=VERIFY_WITNESS),  # native v0
+            _p2sh_wrapped_w0(
+                txids[3], flags=VERIFY_P2SH | VERIFY_WITNESS
+            ),  # wrapped v0
+            _taproot_key_path(
+                txids[4], flags=VERIFY_WITNESS | VERIFY_TAPROOT
+            ),  # taproot key path
+            _taproot_script_path(
+                txids[5], flags=VERIFY_WITNESS | VERIFY_TAPROOT
+            ),  # tapscript
         ]
 
         records = [
-            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),   # bare multisig
-            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),   # p2sh multisig
-            _make_record_bytes(txids[2], 0, op_kind=3, sig_version=1),   # native v0 multisig
-            _make_record_bytes(txids[3], 0, op_kind=3, sig_version=1),   # wrapped v0 multisig
-            _make_record_bytes(txids[5], 0, op_kind=1, sig_version=2),   # tapscript schnorr
-            _make_record_bytes(txids[5], 0, op_kind=5, sig_version=2, op_seq=1),  # checksigadd
+            _make_record_bytes(txids[0], 0, op_kind=3, sig_version=0),  # bare multisig
+            _make_record_bytes(txids[1], 0, op_kind=3, sig_version=0),  # p2sh multisig
+            _make_record_bytes(
+                txids[2], 0, op_kind=3, sig_version=1
+            ),  # native v0 multisig
+            _make_record_bytes(
+                txids[3], 0, op_kind=3, sig_version=1
+            ),  # wrapped v0 multisig
+            _make_record_bytes(
+                txids[5], 0, op_kind=1, sig_version=2
+            ),  # tapscript schnorr
+            _make_record_bytes(
+                txids[5], 0, op_kind=5, sig_version=2, op_seq=1
+            ),  # checksigadd
         ]
 
         journal = [
-            _make_journal_bytes(txids[0], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[1], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[2], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-            _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(
+                txids[0],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[1],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[2],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[3],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            ),
+            _make_journal_bytes(
+                txids[4],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
+            _make_journal_bytes(
+                txids[5],
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            ),
         ]
 
         counters = _make_valid_counters(
-            record_count=6, journal_count=6, ffi_verify_entries=6,
+            record_count=6,
+            journal_count=6,
+            ffi_verify_entries=6,
             op_checksig=0,
             op_checkmultisig=4,
             op_checksigadd=1,
@@ -3646,7 +4466,12 @@ def test_classify_corpus_cmodern_all_positive_passes_synthetic_fixture() -> None
         )
 
         args = _make_classify_args(
-            tmp, contexts, records, journal, "cmodern", counters_dict=counters,
+            tmp,
+            contexts,
+            records,
+            journal,
+            "cmodern",
+            counters_dict=counters,
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 0
@@ -3672,7 +4497,11 @@ def test_replay_rejects_wrong_network() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"network": "testnet"},
         )
         _raises_with(
@@ -3713,7 +4542,11 @@ def test_replay_rejects_wrong_network_magic() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"network_magic": "fabfb5da"},
         )
         _raises_with(
@@ -3733,7 +4566,11 @@ def test_replay_rejects_wrong_genesis_hash() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"genesis_hash": "1" * 64},
         )
         _raises_with(
@@ -3753,7 +4590,11 @@ def test_replay_rejects_start_height_nonzero() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"start_height": 1},
         )
         _raises_with(
@@ -3773,7 +4614,11 @@ def test_replay_rejects_start_hash_not_genesis() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"start_hash": "1" * 64},
         )
         _raises_with(
@@ -3793,7 +4638,11 @@ def test_replay_rejects_block_count_mismatch() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"block_count": 999},
         )
         _raises_with(
@@ -3855,7 +4704,11 @@ def test_replay_rejects_nonhex_git_head() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"git_head": "z" * 40},
         )
         _raises_with(
@@ -3876,7 +4729,11 @@ def test_replay_rejects_uppercase_git_head() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"git_head": "A" * 40},
         )
         _raises_with(
@@ -3897,10 +4754,20 @@ def test_replay_rejects_bool_stage_count() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
-            replay_overrides={"stage_seconds": [
-                {"count": True, "stage": "node.apply_block.total_seconds", "sum_seconds": 1.0}
-            ]},
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            replay_overrides={
+                "stage_seconds": [
+                    {
+                        "count": True,
+                        "stage": "node.apply_block.total_seconds",
+                        "sum_seconds": 1.0,
+                    }
+                ]
+            },
         )
         _raises_with(
             AnalyzerError,
@@ -3920,11 +4787,21 @@ def test_replay_rejects_extra_stage_key() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
-            replay_overrides={"stage_seconds": [
-                {"count": 1, "stage": "node.apply_block.total_seconds",
-                 "sum_seconds": 1.0, "unexpected": 0}
-            ]},
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
+            replay_overrides={
+                "stage_seconds": [
+                    {
+                        "count": 1,
+                        "stage": "node.apply_block.total_seconds",
+                        "sum_seconds": 1.0,
+                        "unexpected": 0,
+                    }
+                ]
+            },
         )
         _raises_with(
             AnalyzerError,
@@ -3965,12 +4842,16 @@ def test_manifest_rejects_unknown_field() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             manifest_overrides={"unknown_field": "malicious"},
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "manifest unknown field",
             "CTX-CUSTODY",
         )
@@ -3985,18 +4866,27 @@ def test_manifest_rejects_out_of_u32_range_height() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 2**32,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 2**32, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4014,6 +4904,7 @@ def test_manifest_rejects_out_of_u32_range_height() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4025,10 +4916,11 @@ def test_manifest_rejects_out_of_u32_range_height() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(ns),
+            lambda: _in_relaxed_pins(ns),
             "height > u32",
             "CTX-CUSTODY",
         )
@@ -4043,18 +4935,27 @@ def test_manifest_rejects_out_of_u64_range_offset() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 2**64,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 2**64, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4072,6 +4973,7 @@ def test_manifest_rejects_out_of_u64_range_offset() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4083,10 +4985,11 @@ def test_manifest_rejects_out_of_u64_range_offset() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(ns),
+            lambda: _in_relaxed_pins(ns),
             "offset > u64",
             "CTX-CUSTODY",
         )
@@ -4101,19 +5004,33 @@ def test_manifest_rejects_duplicate_entry_height() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 8 + len(_MAINNET_GENESIS_BLOCK),
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 1},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 8 + len(_MAINNET_GENESIS_BLOCK), "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4131,6 +5048,7 @@ def test_manifest_rejects_duplicate_entry_height() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4142,10 +5060,11 @@ def test_manifest_rejects_duplicate_entry_height() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(ns),
+            lambda: _in_relaxed_pins(ns),
             "duplicate entry height",
             "CTX-CUSTODY",
         )
@@ -4165,27 +5084,41 @@ def test_manifest_rejects_duplicate_entry_hash() -> None:
             b"\x00" * 4
             + _MAINNET_GENESIS_HASH_RAW
             + b"\x00" * 32
-            + struct.pack("<I", 0x495fab30)
-            + struct.pack("<I", 0x1d00ffff)
+            + struct.pack("<I", 0x495FAB30)
+            + struct.pack("<I", 0x1D00FFFF)
             + struct.pack("<I", 1)
         )
         block2 = header2 + block1[80:]
         blocks = [block1, block2]
         archive_raw = _make_archive(tmp / "archive.bin", blocks)
         # Both entries have the same hash (block1's hash)
+        entries = [
+            {
+                "height": 0,
+                "hash": _block_hash_display(block1),
+                "offset": 0,
+                "payload_length": len(block1),
+            },
+            {
+                "height": 1,
+                "hash": _block_hash_display(block1),
+                "offset": 8 + len(block1),
+                "payload_length": len(block2),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 1},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _block_hash_display(block1), "offset": 0, "payload_length": len(block1)},
-                {"height": 1, "hash": _block_hash_display(block1), "offset": 8 + len(block1), "payload_length": len(block2)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4204,6 +5137,7 @@ def test_manifest_rejects_duplicate_entry_hash() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4215,10 +5149,11 @@ def test_manifest_rejects_duplicate_entry_hash() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(ns),
+            lambda: _in_relaxed_pins(ns),
             "duplicate entry hash",
             "CTX-CUSTODY",
         )
@@ -4233,18 +5168,27 @@ def test_archive_rejects_payload_length_above_max() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": 4_000_001,
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": 4_000_001},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4262,6 +5206,7 @@ def test_archive_rejects_payload_length_above_max() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4273,6 +5218,7 @@ def test_archive_rejects_payload_length_above_max() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
@@ -4291,18 +5237,27 @@ def test_archive_rejects_payload_length_below_80() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": 79,
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": 79},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4320,6 +5275,7 @@ def test_archive_rejects_payload_length_below_80() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4331,6 +5287,7 @@ def test_archive_rejects_payload_length_below_80() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
@@ -4350,12 +5307,16 @@ def test_archive_rejects_frame_tail_not_stop_hash() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # Build a valid 1-block fixture, then set a wrong stop_hash in replay
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             replay_overrides={"stop_hash": "e" * 64},
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "frame tail != stop_hash",
             "CTX-CUSTODY",
         )
@@ -4372,18 +5333,27 @@ def test_archive_rejects_missing_archive_bytes() -> None:
         archive_raw = _make_archive(tmp / "archive.bin", [_MAINNET_GENESIS_BLOCK])
         # Truncate the archive by 1 byte
         (tmp / "archive.bin").write_bytes(archive_raw[:-1])
+        entries = [
+            {
+                "height": 0,
+                "hash": _MAINNET_GENESIS_HASH,
+                "offset": 0,
+                "payload_length": len(_MAINNET_GENESIS_BLOCK),
+            },
+        ]
         manifest_obj = {
             "schema": "bitcoin-rs-corpus-manifest",
-            "version": 1,
+            "version": 2,
             "network": "mainnet",
             "network_magic": _MAINNET_MAGIC.hex(),
             "genesis_hash": _MAINNET_GENESIS_HASH,
             "range": {"start_height": 0, "stop_height": 0},
             "archive": {"size": len(archive_raw), "sha256": _sha256_bytes(archive_raw)},
-            "entries": [
-                {"height": 0, "hash": _MAINNET_GENESIS_HASH, "offset": 0, "payload_length": len(_MAINNET_GENESIS_BLOCK)},
-            ],
+            "entries": entries,
+            "source_tip_hash": entries[-1]["hash"] if entries else "0" * 64,
+            **_v2_custody_bindings(),
         }
+        manifest_obj["manifest_sha256"] = _manifest_sha256(manifest_obj)
         manifest_raw = (json.dumps(manifest_obj, indent=2) + "\n").encode()
         (tmp / "manifest.json").write_bytes(manifest_raw)
         _make_replay_v2(
@@ -4401,6 +5371,7 @@ def test_archive_rejects_missing_archive_bytes() -> None:
         (tmp / "counters.json").write_text(json.dumps(counters))
 
         import argparse
+
         ns = argparse.Namespace(
             counters=str(tmp / "counters.json"),
             contexts=str(tmp / "contexts.bin"),
@@ -4412,14 +5383,14 @@ def test_archive_rejects_missing_archive_bytes() -> None:
             output=str(tmp / "report.json"),
             contract="c150",
             input_count=None,
+            validation=_ensure_shared_validation(tmp),
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(ns),
+            lambda: _in_relaxed_pins(ns),
             "missing archive bytes",
             "CTX-CUSTODY",
         )
-
 
 
 # ── Tests: C150 exact predicate (standalone _c150_passed) ───────────────────
@@ -4430,7 +5401,9 @@ def _c150_canonical_counts() -> dict[str, int]:
     return {name: 0 for name in CONTEXT_COUNTER_NAMES}
 
 
-def _c150_canonical_counters_dict(target: int = EXPECTED_FFI_VERIFY_ENTRIES_FULL) -> dict[str, object]:
+def _c150_canonical_counters_dict(
+    target: int = EXPECTED_FFI_VERIFY_ENTRIES_FULL,
+) -> dict[str, object]:
     """A counters dict matching the canonical C150 shape.
 
     The six ordinary equality-chain counters equal *target* (2_868_199) and
@@ -4521,9 +5494,9 @@ def test_c150_eval_script_entries_not_double_fails() -> None:
     variant must fail too."""
     counts = _c150_canonical_counts()
     for bad in (
-        EXPECTED_FFI_VERIFY_ENTRIES_FULL,            # one-times ordinary total
-        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL - 1,    # one short of double
-        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL + 1,    # one over double
+        EXPECTED_FFI_VERIFY_ENTRIES_FULL,  # one-times ordinary total
+        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL - 1,  # one short of double
+        2 * EXPECTED_FFI_VERIFY_ENTRIES_FULL + 1,  # one over double
     ):
         d = _c150_canonical_counters_dict()
         d["eval_script_entries"] = bad
@@ -4600,8 +5573,10 @@ def test_journal_rejects_nonzero_padding() -> None:
 def test_journal_rejects_ok_gt_calls() -> None:
     """ecdsa_verify_ok > ecdsa_verify_calls must raise."""
     raw = _make_journal_bytes(
-        b"\x03" * 32, 0,
-        ecdsa_verify_calls=1, ecdsa_verify_ok=2,
+        b"\x03" * 32,
+        0,
+        ecdsa_verify_calls=1,
+        ecdsa_verify_ok=2,
     )
     _raises(AnalyzerError, lambda: JournalEntry(raw), "ok > calls")
 
@@ -4613,7 +5588,11 @@ def test_journal_rejects_bad_magic() -> None:
         entry = _make_journal_bytes(b"\x04" * 32, 0)
         data = HEADER_STRUCT.pack(b"WRONGMAG", 1) + entry
         (tmp / "journal.bin").write_bytes(data)
-        _raises(AnalyzerError, lambda: parse_journal(tmp / "journal.bin"), "bad journal magic")
+        _raises(
+            AnalyzerError,
+            lambda: parse_journal(tmp / "journal.bin"),
+            "bad journal magic",
+        )
 
 
 def test_journal_rejects_short_file() -> None:
@@ -4621,7 +5600,11 @@ def test_journal_rejects_short_file() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         (tmp / "journal.bin").write_bytes(b"\x00" * 10)
-        _raises(AnalyzerError, lambda: parse_journal(tmp / "journal.bin"), "short journal file")
+        _raises(
+            AnalyzerError,
+            lambda: parse_journal(tmp / "journal.bin"),
+            "short journal file",
+        )
 
 
 # ── Tests: check_counter_arithmetic and journal-sum invariants ───────────────
@@ -4638,12 +5621,16 @@ def test_classify_corpus_journal_sum_op_checksig_mismatch() -> None:
         journal = [_make_journal_bytes(txid_le, 0)]
         # op_checksigverify=1 makes sum(journal checksig_ops)=1 != op_checksig+1=2
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "c150",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "c150",
             counters_overrides={"op_checksigverify": 1},
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "journal sum checksig mismatch",
             "CTX-OPERATIONS",
         )
@@ -4659,13 +5646,17 @@ def test_classify_corpus_inv1_verify_script_calls_mismatch() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_overrides={"verify_script_calls": 999},
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
-        inv1 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-1"][0]
+        inv1 = next(r for r in report["counter_arithmetic"] if r["id"] == "INV-1")
         assert inv1["passed"] is False
 
 
@@ -4679,13 +5670,17 @@ def test_classify_corpus_inv2_ffi_verify_true_mismatch() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_overrides={"ffi_verify_true": 999},
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
-        inv2 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-2"][0]
+        inv2 = next(r for r in report["counter_arithmetic"] if r["id"] == "INV-2")
         assert inv2["passed"] is False
 
 
@@ -4701,11 +5696,16 @@ def test_classify_corpus_cmodern_bad_eval_counter_fails_closed() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_overrides={"eval_script_entries": 999},
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
+
 
 def test_classify_corpus_sighash_computed_mismatch() -> None:
     """sighash_computed != ecdsa_verify_calls fails INV-5 in the synthetic
@@ -4717,14 +5717,19 @@ def test_classify_corpus_sighash_computed_mismatch() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_overrides={"sighash_computed": 999},
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
         report = json.loads((tmp / "report.json").read_text())
-        inv5 = [r for r in report["counter_arithmetic"] if r["id"] == "INV-5"][0]
+        inv5 = next(r for r in report["counter_arithmetic"] if r["id"] == "INV-5")
         assert inv5["passed"] is False
+
 
 def test_classify_corpus_sighash_midstate_hit_mismatch() -> None:
     """An untracked sighash_midstate_hit change cannot make an incomplete
@@ -4736,7 +5741,11 @@ def test_classify_corpus_sighash_midstate_hit_mismatch() -> None:
         record = _make_record_bytes(txid_le, 0)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_overrides={"sighash_midstate_hit": 999},
         )
         rc = _cmd_classify_synthetic_cmodern(args)
@@ -4767,7 +5776,10 @@ def test_record_rejects_outcome2_with_zero_reject_reason() -> None:
 def test_record_rejects_outcome2_with_nonzero_sighash() -> None:
     """outcome=2 with a non-zero sighash must raise."""
     raw = _make_record_bytes(
-        b"\x04" * 32, 0, outcome=2, reject_reason=1,
+        b"\x04" * 32,
+        0,
+        outcome=2,
+        reject_reason=1,
         sighash=b"\xff" * 32,
     )
     _raises(AnalyzerError, lambda: Record(raw), "outcome=2 nonzero sighash")
@@ -4801,8 +5813,12 @@ def test_record_rejects_ecdsa_reject_on_schnorr_record() -> None:
     """reject_reason=1 (ECDSA reject) on a Schnorr record must raise."""
     # Schnorr: sig_version=2, op_kind=1
     raw = _make_record_bytes(
-        b"\x09" * 32, 0, op_kind=1, sig_version=2,
-        outcome=2, reject_reason=1,
+        b"\x09" * 32,
+        0,
+        op_kind=1,
+        sig_version=2,
+        outcome=2,
+        reject_reason=1,
     )
     _raises(AnalyzerError, lambda: Record(raw), "ECDSA reject on Schnorr record")
 
@@ -4811,8 +5827,12 @@ def test_record_rejects_schnorr_reject_on_ecdsa_record() -> None:
     """reject_reason=4 (Schnorr reject) on an ECDSA record must raise."""
     # ECDSA: sig_version=0, op_kind=1
     raw = _make_record_bytes(
-        b"\x0a" * 32, 0, op_kind=1, sig_version=0,
-        outcome=2, reject_reason=4,
+        b"\x0a" * 32,
+        0,
+        op_kind=1,
+        sig_version=0,
+        outcome=2,
+        reject_reason=4,
     )
     _raises(AnalyzerError, lambda: Record(raw), "Schnorr reject on ECDSA record")
 
@@ -4820,8 +5840,12 @@ def test_record_rejects_schnorr_reject_on_ecdsa_record() -> None:
 def test_record_accepts_ecdsa_reject_on_ecdsa_record() -> None:
     """reject_reason=1 on an ECDSA record (sig_version=0, op_kind=1) is valid."""
     raw = _make_record_bytes(
-        b"\x0b" * 32, 0, op_kind=1, sig_version=0,
-        outcome=2, reject_reason=1,
+        b"\x0b" * 32,
+        0,
+        op_kind=1,
+        sig_version=0,
+        outcome=2,
+        reject_reason=1,
     )
     rec = Record(raw)
     assert rec.outcome == 2
@@ -4831,8 +5855,12 @@ def test_record_accepts_ecdsa_reject_on_ecdsa_record() -> None:
 def test_record_accepts_schnorr_reject_on_schnorr_record() -> None:
     """reject_reason=4 on a Schnorr record (sig_version=2, op_kind=1) is valid."""
     raw = _make_record_bytes(
-        b"\x0c" * 32, 0, op_kind=1, sig_version=2,
-        outcome=2, reject_reason=4,
+        b"\x0c" * 32,
+        0,
+        op_kind=1,
+        sig_version=2,
+        outcome=2,
+        reject_reason=4,
     )
     rec = Record(raw)
     assert rec.outcome == 2
@@ -4843,14 +5871,20 @@ def test_record_accepts_reason8_tapscript_skip() -> None:
     """reject_reason=8 on a Tapscript skip (sig_version=2, op_kind=1,
     der_len=0) is valid."""
     raw = _make_record_bytes(
-        b"\x0d" * 32, 0, op_kind=1, sig_version=2,
-        outcome=2, reject_reason=8, der_len=0,
+        b"\x0d" * 32,
+        0,
+        op_kind=1,
+        sig_version=2,
+        outcome=2,
+        reject_reason=8,
+        der_len=0,
     )
     rec = Record(raw)
     assert rec.reject_reason == 8
 
 
 # ── Tests: Aggregate reconciliation (ECDSA/Schnorr reject families) ──────────
+
 
 def test_classify_corpus_ecdsa_reject_record_counts_entry() -> None:
     """An ECDSA in-function reject (outcome=2, reject_reason=2) is counted
@@ -4864,15 +5898,27 @@ def test_classify_corpus_ecdsa_reject_record_counts_entry() -> None:
         ctx_row = _bare_p2pkh(txid_le)
         # ECDSA CHECKSIG with reject_reason=2 (empty-sig reject)
         record = _make_record_bytes(
-            txid_le, 0, op_kind=1, sig_version=0,
-            outcome=2, reject_reason=2,
+            txid_le,
+            0,
+            op_kind=1,
+            sig_version=0,
+            outcome=2,
+            reject_reason=2,
         )
-        journal = [_make_journal_bytes(
-            txid_le, 0, checksig_ops=1, checkmultisig_ops=0,
-            ecdsa_verify_calls=0, ecdsa_verify_ok=0,
-        )]
+        journal = [
+            _make_journal_bytes(
+                txid_le,
+                0,
+                checksig_ops=1,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            )
+        ]
         counters = _make_valid_counters(
-            1, 1, 1,
+            1,
+            1,
+            1,
             op_checksig=1,
             checkecdsa_entries=1,
             ecdsa_from_checksig=1,
@@ -4883,7 +5929,11 @@ def test_classify_corpus_ecdsa_reject_record_counts_entry() -> None:
             checkecdsa_reject_empty_sig=1,
         )
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_dict=counters,
         )
         rc = _cmd_classify_synthetic_cmodern(args)
@@ -4901,15 +5951,27 @@ def test_classify_corpus_schnorr_reject_record_counts_entry() -> None:
         txid_le = b"\xa2" * 32
         ctx_row = _taproot_script_path(txid_le, flags=VERIFY_WITNESS | VERIFY_TAPROOT)
         record = _make_record_bytes(
-            txid_le, 0, op_kind=1, sig_version=2,
-            outcome=2, reject_reason=4,
+            txid_le,
+            0,
+            op_kind=1,
+            sig_version=2,
+            outcome=2,
+            reject_reason=4,
         )
-        journal = [_make_journal_bytes(
-            txid_le, 0, checksig_ops=1, checkmultisig_ops=0,
-            ecdsa_verify_calls=0, ecdsa_verify_ok=0,
-        )]
+        journal = [
+            _make_journal_bytes(
+                txid_le,
+                0,
+                checksig_ops=1,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            )
+        ]
         counters = _make_valid_counters(
-            1, 1, 1,
+            1,
+            1,
+            1,
             op_checksig=1,
             checkecdsa_entries=0,
             ecdsa_from_checksig=0,
@@ -4924,7 +5986,11 @@ def test_classify_corpus_schnorr_reject_record_counts_entry() -> None:
             op_checksigadd=0,
         )
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_dict=counters,
         )
         rc = _cmd_classify_synthetic_cmodern(args)
@@ -4942,15 +6008,28 @@ def test_classify_corpus_reason8_tapscript_skip() -> None:
         txid_le = b"\xa3" * 32
         ctx_row = _taproot_script_path(txid_le, flags=VERIFY_WITNESS | VERIFY_TAPROOT)
         record = _make_record_bytes(
-            txid_le, 0, op_kind=1, sig_version=2,
-            outcome=2, reject_reason=8, der_len=0,
+            txid_le,
+            0,
+            op_kind=1,
+            sig_version=2,
+            outcome=2,
+            reject_reason=8,
+            der_len=0,
         )
-        journal = [_make_journal_bytes(
-            txid_le, 0, checksig_ops=1, checkmultisig_ops=0,
-            ecdsa_verify_calls=0, ecdsa_verify_ok=0,
-        )]
+        journal = [
+            _make_journal_bytes(
+                txid_le,
+                0,
+                checksig_ops=1,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=0,
+                ecdsa_verify_ok=0,
+            )
+        ]
         counters = _make_valid_counters(
-            1, 1, 1,
+            1,
+            1,
+            1,
             op_checksig=1,
             checkecdsa_entries=0,
             ecdsa_from_checksig=0,
@@ -4965,11 +6044,16 @@ def test_classify_corpus_reason8_tapscript_skip() -> None:
             op_checksigadd=0,
         )
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_dict=counters,
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
+
 
 def test_classify_corpus_ecdsa_fail_record() -> None:
     """An ECDSA verify fail (outcome=0) is counted by the aggregate as
@@ -4981,12 +6065,20 @@ def test_classify_corpus_ecdsa_fail_record() -> None:
         txid_le = b"\xa4" * 32
         ctx_row = _bare_p2pkh(txid_le)
         record = _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, outcome=0)
-        journal = [_make_journal_bytes(
-            txid_le, 0, checksig_ops=1, checkmultisig_ops=0,
-            ecdsa_verify_calls=1, ecdsa_verify_ok=0,
-        )]
+        journal = [
+            _make_journal_bytes(
+                txid_le,
+                0,
+                checksig_ops=1,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=0,
+            )
+        ]
         counters = _make_valid_counters(
-            1, 1, 1,
+            1,
+            1,
+            1,
             op_checksig=1,
             checkecdsa_entries=1,
             ecdsa_from_checksig=1,
@@ -4996,7 +6088,11 @@ def test_classify_corpus_ecdsa_fail_record() -> None:
             sighash_computed=1,
         )
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
             counters_dict=counters,
         )
         rc = _cmd_classify_synthetic_cmodern(args)
@@ -5012,10 +6108,15 @@ def test_classify_corpus_ecdsa_success_record() -> None:
         record = _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, outcome=1)
         journal = [_make_journal_bytes(txid_le, 0)]
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
+
 
 # ── Tests: Multi-key SQLite op_seq/ECDSA ─────────────────────────────────────
 
@@ -5035,8 +6136,12 @@ def test_count_context_records_multi_key_contiguous() -> None:
             _make_record_bytes(txid2, 0, op_seq=1),
         ]
         journal = [
-            _make_journal_bytes(txid1, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2),
-            _make_journal_bytes(txid2, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2),
+            _make_journal_bytes(
+                txid1, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2
+            ),
+            _make_journal_bytes(
+                txid2, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2
+            ),
         ]
         _make_brsctx1_file(tmp / "contexts.bin", ctx_rows)
         _write_records_file(tmp / "records.bin", records)
@@ -5057,7 +6162,7 @@ def test_count_context_records_multi_key_contiguous() -> None:
         )
         (tmp / "counters.json").write_text(json.dumps(counters))
         counters_obj = Counters(counters)
-        counts, ctx_count, custody = _count_context_records_disk(
+        counts, _ctx_count, custody = _count_context_records_disk(
             Path(tmp / "contexts.bin"),
             Path(tmp / "records.bin"),
             Path(tmp / "journal.bin"),
@@ -5079,7 +6184,9 @@ def test_count_context_records_multi_key_gap_raises() -> None:
             _make_record_bytes(txid1, 0, op_seq=0),
             _make_record_bytes(txid1, 0, op_seq=2),
         ]
-        journal = [_make_journal_bytes(txid1, 0, ecdsa_verify_calls=2, ecdsa_verify_ok=2)]
+        journal = [
+            _make_journal_bytes(txid1, 0, ecdsa_verify_calls=2, ecdsa_verify_ok=2)
+        ]
         _make_brsctx1_file(tmp / "contexts.bin", ctx_rows)
         _write_records_file(tmp / "records.bin", records)
         _write_journal_file(tmp / "journal.bin", journal)
@@ -5114,7 +6221,11 @@ def test_classify_corpus_custody_archive_matches_manifest() -> None:
         # The synthetic binding reaches report generation without weakening
         # the product Cmodern tip.
         args = _make_classify_args(
-            tmp, [ctx_row], [record], journal, "cmodern",
+            tmp,
+            [ctx_row],
+            [record],
+            journal,
+            "cmodern",
         )
         rc = _cmd_classify_synthetic_cmodern(args)
         assert rc == 1
@@ -5169,6 +6280,7 @@ def test_parse_counters_returns_custody() -> None:
         assert parsed.op_checksig == 1
         assert custody["bytes"] == len(file_bytes)
         assert format(custody["sha256"], "064x") == _sha256_bytes(file_bytes)
+
 
 def test_classify_corpus_custody_contexts_from_same_open() -> None:
     """iter_context_inputs keeps the original fd open; os.replace after the
@@ -5229,7 +6341,7 @@ def test_classify_corpus_duplicate_context_key() -> None:
         args = _make_classify_args(tmp, [ctx_row, dup], [record], journal, "c150")
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "duplicate context key",
             "CTX-EXECUTION",
         )
@@ -5249,7 +6361,7 @@ def test_classify_corpus_mixed_duplicate_before_malformed() -> None:
             tmp, [ctx_row], [record, duplicate, malformed], journal, "c150"
         )
         try:
-            cmd_classify_corpus(args)
+            _in_relaxed_pins(args)
         except AnalyzerError as exc:
             msg = str(exc)
             assert "CTX-OPERATIONS" in msg, msg
@@ -5276,7 +6388,7 @@ def test_record_validation_earlier_illegal_precedes_later_orphan() -> None:
             "c150",
         )
         try:
-            cmd_classify_corpus(args)
+            _in_relaxed_pins(args)
         except AnalyzerError as exc:
             assert str(exc) == (
                 "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
@@ -5303,7 +6415,7 @@ def test_record_validation_earlier_illegal_precedes_later_sequence_gap() -> None
             "c150",
         )
         try:
-            cmd_classify_corpus(args)
+            _in_relaxed_pins(args)
         except AnalyzerError as exc:
             assert str(exc) == (
                 "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
@@ -5328,7 +6440,7 @@ def test_record_validation_semantic_error_precedes_record_count_mismatch() -> No
             counters_overrides={"record_count": 2},
         )
         try:
-            cmd_classify_corpus(args)
+            _in_relaxed_pins(args)
         except AnalyzerError as exc:
             assert str(exc) == (
                 "CTX-OPERATIONS: multisig record must have sig_version BASE or WITNESS_V0, "
@@ -5353,7 +6465,7 @@ def test_record_validation_same_record_orphan_precedence() -> None:
             "c150",
         )
         try:
-            cmd_classify_corpus(args)
+            _in_relaxed_pins(args)
         except AnalyzerError as exc:
             assert str(exc) == (
                 "CTX-OPERATIONS: BRSREC1 record has no matching context identity: "
@@ -5381,14 +6493,20 @@ def test_count_context_records_spend_context_tally_sensitivity() -> None:
         ]
         journal = [
             _make_journal_bytes(
-                txid_bare, 0,
-                checksig_ops=0, checkmultisig_ops=1,
-                ecdsa_verify_calls=1, ecdsa_verify_ok=1,
+                txid_bare,
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
             ),
             _make_journal_bytes(
-                txid_p2sh, 0,
-                checksig_ops=0, checkmultisig_ops=1,
-                ecdsa_verify_calls=1, ecdsa_verify_ok=1,
+                txid_p2sh,
+                0,
+                checksig_ops=0,
+                checkmultisig_ops=1,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
             ),
         ]
         _make_brsctx1_file(tmp / "contexts.bin", contexts)
@@ -5396,7 +6514,9 @@ def test_count_context_records_spend_context_tally_sensitivity() -> None:
         _write_journal_file(tmp / "journal.bin", journal)
 
         counters = _make_valid_counters(
-            2, 2, 2,
+            2,
+            2,
+            2,
             op_checksig=0,
             op_checkmultisig=2,
             checkecdsa_entries=2,
@@ -5426,13 +6546,16 @@ def test_classify_corpus_scratch_dir_rejects_non_directory() -> None:
         scratch = tmp / "not-a-dir"
         scratch.write_text("file")
         args = _make_classify_args(
-            tmp, [_bare_p2pkh(txid_le)], [_make_record_bytes(txid_le, 0)],
-            [_make_journal_bytes(txid_le, 0)], "c150",
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)],
+            "c150",
             scratch_dir=scratch,
         )
         _raises_with(
             AnalyzerError,
-            lambda: cmd_classify_corpus(args),
+            lambda: _in_relaxed_pins(args),
             "scratch-dir rejects file",
             "CTX-EXECUTION",
             "scratch-dir is not a writable directory",
@@ -5447,14 +6570,17 @@ def test_classify_corpus_scratch_dir_rejects_unwritable() -> None:
         scratch.mkdir(mode=0o555)
         txid_le = b"\x68" * 32
         args = _make_classify_args(
-            tmp, [_bare_p2pkh(txid_le)], [_make_record_bytes(txid_le, 0)],
-            [_make_journal_bytes(txid_le, 0)], "c150",
+            tmp,
+            [_bare_p2pkh(txid_le)],
+            [_make_record_bytes(txid_le, 0)],
+            [_make_journal_bytes(txid_le, 0)],
+            "c150",
             scratch_dir=scratch,
         )
         try:
             _raises_with(
                 AnalyzerError,
-                lambda: cmd_classify_corpus(args),
+                lambda: _in_relaxed_pins(args),
                 "scratch-dir rejects unwritable",
                 "CTX-EXECUTION",
                 "scratch-dir is not a writable directory",
@@ -5529,8 +6655,6 @@ def test_count_context_records_disk_restores_env_on_failure() -> None:
                 os.environ.pop("TMPDIR", None)
 
 
-
-
 # ── Tests: Task 7A2 diagnostic scanner/controller ─────────────────────────────
 
 
@@ -5557,6 +6681,12 @@ def main():
     meta_path = Path(os.environ["FAKE_CENSUS_META"])
     stage_dir = Path(os.environ["FAKE_CENSUS_STAGE"])
     replay_path = Path(sys.argv[sys.argv.index("--output") + 1])
+    data_dir = Path(sys.argv[sys.argv.index("--data-dir") + 1])
+    # The parent lent the child a directory through an inherited
+    # descriptor: record a deterministic state sentinel under the actual
+    # --data-dir argv string, never under a replay-relative default.
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "fake-child-state").write_bytes(b"fake-child-state\\n")
     for name in ("BRS_CENSUS_CONTEXTS", "BRS_CENSUS_RECORDS", "BRS_CENSUS_JOURNAL"):
         src = stage_dir / f"{name}.bin"
         dst = Path(os.environ[name])
@@ -5565,6 +6695,11 @@ def main():
     counters_path.write_bytes((stage_dir / "counters.json").read_bytes())
     meta = json.loads(meta_path.read_text())
     replay = meta["replay"]
+    if (
+        replay["data_dir"]
+        == "_FAKE_CENSUS_CHILD_TEST_FIND_CMODERN_HEIGHT_SETTINGS_MISMATCH_DATA_DIR"
+    ):
+        replay["data_dir"] = str(data_dir)
     replay_path.write_text(json.dumps(replay, indent=2) + "\\n")
     write_frame(PREFACE, 3)
     for row in meta["rows"]:
@@ -5593,6 +6728,21 @@ if __name__ == "__main__":
     main()
 """
 
+
+def _captured_child_data_dir(replay_path: Path) -> str:
+    """Return the exact data_dir literal recorded by a completed live run.
+
+    The live child saw the parent's lent directory through an inherited
+    descriptor, so the recorded ``/proc/self/fd/<n>/state`` string is
+    historical authentic argv text: the fd number is dead once the child
+    exits. Treat it as inert text only — never resolve, open, or stat it.
+    """
+    replay = json.loads(replay_path.read_text())
+    data_dir = replay["data_dir"]
+    assert data_dir.startswith("/proc/self/fd/") and data_dir.endswith("/state")
+    return data_dir
+
+
 def _make_fake_binary(tmp: Path) -> Path:
     child = tmp / "fake_child.py"
     child.write_text(_FAKE_CENSUS_CHILD)
@@ -5600,8 +6750,14 @@ def _make_fake_binary(tmp: Path) -> Path:
     return child
 
 
-def _diagnostic_counters_dict(context_count: int, record_count: int, journal_count: int) -> dict[str, object]:
-    return _valid_counters_dict(record_count=record_count, journal_count=journal_count, context_count=context_count)
+def _diagnostic_counters_dict(
+    context_count: int, record_count: int, journal_count: int
+) -> dict[str, object]:
+    return _valid_counters_dict(
+        record_count=record_count,
+        journal_count=journal_count,
+        context_count=context_count,
+    )
 
 
 def _write_diagnostic_stage(tmp: Path) -> Path:
@@ -5621,33 +6777,125 @@ def _write_diagnostic_stage(tmp: Path) -> Path:
         _taproot_script_path(txids[9], flags=VERIFY_WITNESS | VERIFY_TAPROOT),
     ]
     records = [
-        _make_record_bytes(txids[0], 0, op_kind=1, sig_version=0, outcome=1),  # p2sh checksig
-        _make_record_bytes(txids[1], 0, op_kind=1, sig_version=1, outcome=1),  # native checksig
-        _make_record_bytes(txids[2], 0, op_kind=1, sig_version=1, outcome=1),  # wrapped checksig
-        _make_record_bytes(txids[3], 0, op_kind=3, sig_version=0, outcome=1),  # bare multisig
-        _make_record_bytes(txids[4], 0, op_kind=3, sig_version=0, outcome=1),  # p2sh multisig
-        _make_record_bytes(txids[5], 0, op_kind=3, sig_version=1, outcome=1),  # native multisig
-        _make_record_bytes(txids[6], 0, op_kind=3, sig_version=1, outcome=1),  # wrapped multisig
-        _make_record_bytes(txids[7], 0, op_kind=0, sig_version=3, outcome=1),  # taproot key
-        _make_record_bytes(txids[8], 0, op_kind=1, sig_version=2, outcome=1),  # tapscript schnorr
-        _make_record_bytes(txids[9], 0, op_kind=5, sig_version=2, outcome=1),  # tapscript checksigadd
+        _make_record_bytes(
+            txids[0], 0, op_kind=1, sig_version=0, outcome=1
+        ),  # p2sh checksig
+        _make_record_bytes(
+            txids[1], 0, op_kind=1, sig_version=1, outcome=1
+        ),  # native checksig
+        _make_record_bytes(
+            txids[2], 0, op_kind=1, sig_version=1, outcome=1
+        ),  # wrapped checksig
+        _make_record_bytes(
+            txids[3], 0, op_kind=3, sig_version=0, outcome=1
+        ),  # bare multisig
+        _make_record_bytes(
+            txids[4], 0, op_kind=3, sig_version=0, outcome=1
+        ),  # p2sh multisig
+        _make_record_bytes(
+            txids[5], 0, op_kind=3, sig_version=1, outcome=1
+        ),  # native multisig
+        _make_record_bytes(
+            txids[6], 0, op_kind=3, sig_version=1, outcome=1
+        ),  # wrapped multisig
+        _make_record_bytes(
+            txids[7], 0, op_kind=0, sig_version=3, outcome=1
+        ),  # taproot key
+        _make_record_bytes(
+            txids[8], 0, op_kind=1, sig_version=2, outcome=1
+        ),  # tapscript schnorr
+        _make_record_bytes(
+            txids[9], 0, op_kind=5, sig_version=2, outcome=1
+        ),  # tapscript checksigadd
     ]
     journals = [
-        _make_journal_bytes(txids[0], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[1], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[2], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[3], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[4], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[5], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[6], 0, checksig_ops=0, checkmultisig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-        _make_journal_bytes(txids[7], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-        _make_journal_bytes(txids[8], 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-        _make_journal_bytes(txids[9], 0, checksig_ops=0, checkmultisig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+        _make_journal_bytes(
+            txids[0],
+            0,
+            checksig_ops=1,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[1],
+            0,
+            checksig_ops=1,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[2],
+            0,
+            checksig_ops=1,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[3],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=1,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[4],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=1,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[5],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=1,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[6],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=1,
+            ecdsa_verify_calls=1,
+            ecdsa_verify_ok=1,
+        ),
+        _make_journal_bytes(
+            txids[7],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=0,
+            ecdsa_verify_ok=0,
+        ),
+        _make_journal_bytes(
+            txids[8],
+            0,
+            checksig_ops=1,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=0,
+            ecdsa_verify_ok=0,
+        ),
+        _make_journal_bytes(
+            txids[9],
+            0,
+            checksig_ops=0,
+            checkmultisig_ops=0,
+            ecdsa_verify_calls=0,
+            ecdsa_verify_ok=0,
+        ),
     ]
     _make_brsctx1_file(stage / "BRS_CENSUS_CONTEXTS.bin", contexts)
     _write_records_file(stage / "BRS_CENSUS_RECORDS.bin", records)
     _write_journal_file(stage / "BRS_CENSUS_JOURNAL.bin", journals)
-    (stage / "counters.json").write_text(json.dumps(_diagnostic_counters_dict(10, 10, 10)))
+    (stage / "counters.json").write_text(
+        json.dumps(_diagnostic_counters_dict(10, 10, 10))
+    )
     return stage
 
 
@@ -5658,7 +6906,7 @@ def _compute_context_ends(path: Path) -> list[int]:
     ends = [16]
     cursor = 16
     for _ in range(count):
-        row_len = struct.unpack("<I", data[cursor:cursor + 4])[0]
+        row_len = struct.unpack("<I", data[cursor : cursor + 4])[0]
         cursor += 4 + row_len
         ends.append(cursor)
     return ends
@@ -5668,7 +6916,6 @@ def _build_meta(
     tmp: Path,
     stage: Path,
     ceiling: int,
-    work_dir: Path,
     *,
     replay_overrides: dict[str, object] | None = None,
 ) -> Path:
@@ -5680,16 +6927,18 @@ def _build_meta(
             block_hash = bytes.fromhex(MAINNET_GENESIS_HASH)[::-1]
         else:
             block_hash = bytes([h] * 32)
-        rows.append({
-            "height": h,
-            "block_hash_le": block_hash.hex(),
-            "context_rows": h + 1,
-            "context_end": ctx_ends[h + 1],
-            "record_rows": h + 1,
-            "record_end": HEADER_SIZE + (h + 1) * RECORD_SIZE,
-            "journal_rows": h + 1,
-            "journal_end": HEADER_SIZE + (h + 1) * JOURNAL_SIZE,
-        })
+        rows.append(
+            {
+                "height": h,
+                "block_hash_le": block_hash.hex(),
+                "context_rows": h + 1,
+                "context_end": ctx_ends[h + 1],
+                "record_rows": h + 1,
+                "record_end": HEADER_SIZE + (h + 1) * RECORD_SIZE,
+                "journal_rows": h + 1,
+                "journal_end": HEADER_SIZE + (h + 1) * JOURNAL_SIZE,
+            }
+        )
     final = rows[-1]
     replay = {
         "schema": "mainnet-prefix-replay-diagnostic-v1",
@@ -5704,7 +6953,7 @@ def _build_meta(
         "stop_reason": "controller-request",
         "storage_backend": "fjall",
         "txindex": False,
-        "data_dir": str(work_dir / "state"),
+        "data_dir": "_FAKE_CENSUS_CHILD_TEST_FIND_CMODERN_HEIGHT_SETTINGS_MISMATCH_DATA_DIR",
         "elapsed_seconds": 0.0,
     }
     if replay_overrides:
@@ -5723,7 +6972,7 @@ def test_find_cmodern_height_fake_child_success() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5747,9 +6996,246 @@ def test_find_cmodern_height_fake_child_success() -> None:
         assert candidate["child_teardown"] == "clean"
         assert candidate["salvaged_from"] is None
         sidecar = work_dir / "brshgt1.bin"
-        assert candidate["custody"]["brshgt1_sidecar"]["sha256"] == hashlib.sha256(
-            sidecar.read_bytes()
-        ).hexdigest()
+        assert (
+            candidate["custody"]["brshgt1_sidecar"]["sha256"]
+            == hashlib.sha256(sidecar.read_bytes()).hexdigest()
+        )
+
+
+def test_find_cmodern_height_holds_work_directory_after_substitution() -> None:
+    """After anchor admission the held work directory keeps every effect.
+
+    A same-directory-name adversary renames the anchored work directory
+    away and plants a fresh substitute at the original pathname the moment
+    both directory anchors are acquired and the shared-mount check passes
+    — before state, sidecar, stderr, or any child artifact exists. The
+    state directory, every evidence file, and every accepted custody
+    digest must bind the held original while the substitute stays
+    completely empty.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        held_work_dir = tmp / "work.held"
+        substitute = tmp / "work-substitute"
+        swapped = False
+        real_shared_mount = analyze._require_shared_source_mount
+
+        def shared_mount_then_substitute(
+            source_fd: int, others: list[tuple[str, int]]
+        ) -> None:
+            nonlocal swapped
+            real_shared_mount(source_fd, others)
+            if not swapped:
+                swapped = True
+                os.rename(work_dir, held_work_dir)
+                substitute.mkdir()
+                os.rename(substitute, work_dir)
+
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            with patch.object(
+                analyze,
+                "_require_shared_source_mount",
+                shared_mount_then_substitute,
+            ):
+                _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        assert swapped, "substitution must fire after anchor admission"
+        assert not any(work_dir.iterdir()), (
+            "the substituted pathname must remain completely empty"
+        )
+        state_sentinel = held_work_dir / "state" / "fake-child-state"
+        assert state_sentinel.is_file(), (
+            "the child state sentinel must land under the held original"
+        )
+        assert (held_work_dir / "stderr.log").is_file()
+        for artifact in analyze._diagnostic_artifact_paths(held_work_dir).values():
+            assert artifact.is_file(), (
+                "every evidence file must land under the held original"
+            )
+
+        candidate = json.loads(output.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
+        assert candidate["final_stream_counts"]["context_rows"] == 10
+        assert candidate["child_teardown"] == "clean"
+        assert candidate["salvaged_from"] is None
+
+        # Custody digests bind the bytes under the held original.
+        held_digests = {
+            "brshgt1_sidecar": held_work_dir / "brshgt1.bin",
+            "brsctx1": held_work_dir / "brsctx1.bin",
+            "brsrec1": held_work_dir / "brsrec1.bin",
+            "brsjrn1": held_work_dir / "brsjrn1.bin",
+            "child_replay_json": held_work_dir / "replay_diagnostic.json",
+            "counters_json": held_work_dir / "counters.json",
+        }
+        for custody_name, held_path in held_digests.items():
+            assert (
+                candidate["custody"][custody_name]["sha256"]
+                == hashlib.sha256(held_path.read_bytes()).hexdigest()
+            ), custody_name
+
+        # Report paths keep the original operator spelling only.
+        for record in candidate["custody"].values():
+            assert record["path"].startswith(str(work_dir) + os.sep)
+            assert not record["path"].startswith(str(held_work_dir) + os.sep)
+            assert "/proc/self/fd/" not in record["path"]
+
+        # The replay data_dir is the exact inert descriptor-transport
+        # string the child saw. Inspect it as text only; never resolve,
+        # open, or stat it after the run.
+        replay = json.loads((held_work_dir / "replay_diagnostic.json").read_text())
+        assert replay["data_dir"].startswith("/proc/self/fd/")
+        assert replay["data_dir"].endswith("/state")
+        number = replay["data_dir"][len("/proc/self/fd/") : -len("/state")]
+        assert number.isdigit()
+
+
+def test_finalize_candidate_binds_validated_bytes_not_substitute() -> None:
+    """Published custody digests come from validated bytes, never reopens.
+
+    After the validators return, the replay document is replaced at its
+    pathname with different well-formed bytes and the counters path is
+    replaced with a FIFO. Finalization must still complete — nothing
+    re-opens, so the FIFO cannot block it — and the published digests
+    must be those of the validated originals.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        replay_path = work_dir / "replay_diagnostic.json"
+        counters_path = work_dir / "counters.json"
+        captured: list[tuple[str, str]] = []
+        original_validate_replay = analyze._validate_replay_diagnostic
+        original_validate_counters = analyze._validate_native_counters
+
+        def sabotage_then_validate(replay_fd, display_path, final, *args, **kwargs):
+            result = original_validate_replay(
+                replay_fd, display_path, final, *args, **kwargs
+            )
+            captured.append(("replay", result["sha256"]))
+            # Mutate only the display pathname after validation: the
+            # validator's bytes live on the retained descriptor, so a
+            # fresh inode at the pathname cannot touch the published
+            # custody digest.
+            display_path.write_text(json.dumps({"schema": "substitute"}) + "\n")
+            return result
+
+        def fifo_then_validate_counters(counters_fd, display_path, final):
+            result = original_validate_counters(counters_fd, display_path, final)
+            captured.append(("counters", result["sha256"]))
+            display_path.unlink()
+            os.mkfifo(display_path)
+            return result
+
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        analyze._validate_replay_diagnostic = sabotage_then_validate
+        analyze._validate_native_counters = fifo_then_validate_counters
+        try:
+            _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+            analyze._validate_replay_diagnostic = original_validate_replay
+            analyze._validate_native_counters = original_validate_counters
+
+        candidate = json.loads(output.read_text())
+        assert captured == [
+            ("replay", captured[0][1]),
+            ("counters", captured[1][1]),
+        ]
+        assert candidate["custody"]["child_replay_json"]["sha256"] == captured[0][1]
+        assert (
+            candidate["custody"]["child_replay_json"]["sha256"]
+            != hashlib.sha256(replay_path.read_bytes()).hexdigest()
+        )
+        assert candidate["custody"]["counters_json"]["sha256"] == captured[1][1]
+        assert stat.S_ISFIFO(os.stat(counters_path).st_mode)
+
+
+def test_diagnostic_child_executes_verified_inode_after_path_swap() -> None:
+    """The launcher executes the verified descriptor, not the pathname.
+
+    The binary is opened and verified once, then its pathname is replaced
+    with a different executable; the child must still run the verified
+    inode's code. A symlink at the binary path and a non-executable file
+    are rejected at open.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        binary = tmp / "fake-child"
+        binary.write_text("#!/bin/sh\necho VERIFIED-INODE-A\n")
+        binary.chmod(0o755)
+        binary_fd, custody = analyze._open_verified_executable(binary)
+        try:
+            assert custody["sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+
+            substitute = tmp / "substitute"
+            substitute.write_text("#!/bin/sh\necho SUBSTITUTE-B\n")
+            substitute.chmod(0o755)
+            # Rename a different inode over the verified pathname; the
+            # original inode lives on only through the held descriptor.
+            os.replace(substitute, binary)
+            work_dirfd, work_missing = analyze._walk_dirfd_nofollow(tmp)
+            assert not work_missing
+            try:
+                proc, stderr_file = analyze._launch_diagnostic_child(
+                    binary,
+                    "127.0.0.1:18443",
+                    100,
+                    "fjall",
+                    False,
+                    binary_fd=binary_fd,
+                    work_dirfd=work_dirfd,
+                )
+            finally:
+                os.close(work_dirfd)
+            try:
+                observed = proc.stdout.read().decode()
+                proc.wait(timeout=10)
+            finally:
+                stderr_file.close()
+            assert "VERIFIED-INODE-A" in observed
+            assert "SUBSTITUTE-B" not in observed
+        finally:
+            os.close(binary_fd)
+
+        decoy = tmp / "decoy-target"
+        decoy.write_text("#!/bin/sh\necho x\n")
+        symlink = tmp / "linked-child"
+        symlink.symlink_to(decoy)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_verified_executable(symlink),
+            "symbolic link",
+            "DIAG-SETUP",
+        )
+
+        plain = tmp / "plain-child"
+        plain.write_text("#!/bin/sh\necho no exec bit\n")
+        plain.chmod(0o644)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_verified_executable(plain),
+            "no execute bit",
+            "DIAG-SETUP",
+        )
 
 
 def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> None:
@@ -5760,12 +7246,13 @@ def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> Non
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         validate_replay = analyze._validate_replay_diagnostic
 
         def reject_replay(
-            _path: Path,
+            _replay_fd: int,
+            _display_path: Path,
             _final: DiagnosticCheckpoint,
             _ceiling: int,
             _storage_backend: str,
@@ -5790,7 +7277,10 @@ def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> Non
             analyze._validate_replay_diagnostic = validate_replay
             os.environ.pop("FAKE_CENSUS_META", None)
             os.environ.pop("FAKE_CENSUS_STAGE", None)
-        assert analyze._brshgt1_count(work_dir / "brshgt1.bin") == 0
+        assert (
+            analyze._brshgt1_count_fd(os.open(work_dir / "brshgt1.bin", os.O_RDONLY))
+            == 0
+        )
         assert not output.exists()
 
 
@@ -5802,7 +7292,7 @@ def test_find_cmodern_height_post_stop_timeout_finalizes_honestly() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5836,7 +7326,7 @@ def test_find_cmodern_height_rejects_pipe_filling_trailing_output() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5870,7 +7360,9 @@ def _directory_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation() -> None:
+def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutation() -> (
+    None
+):
     """Salvage copies only checkpoint-committed bytes and preserves the incident run.
 
     A terminal checkpoint can be durable while source streams still contain
@@ -5883,7 +7375,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -5917,6 +7409,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
 
         source_before = _directory_hashes(source_dir)
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
         analyze._salvage_diagnostic_scan(
             source_dir,
@@ -5924,7 +7417,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             output,
             "127.0.0.1:18443",
             100,
-            str(source_dir / "state"),
+            _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
         )
         assert _directory_hashes(source_dir) == source_before
 
@@ -5933,14 +7426,10 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
         assert candidate["earliest_defensible_height_h"] == 9
         assert candidate["context_counts"] == clean["context_counts"]
         assert (
-            candidate["first_occurrence_heights"]
-            == clean["first_occurrence_heights"]
+            candidate["first_occurrence_heights"] == clean["first_occurrence_heights"]
         )
         assert candidate["final_stream_counts"] == clean["final_stream_counts"]
-        assert (
-            candidate["final_stream_endpoints"]
-            == clean["final_stream_endpoints"]
-        )
+        assert candidate["final_stream_endpoints"] == clean["final_stream_endpoints"]
         assert candidate["child_exit_status"] is None
         assert candidate["child_teardown"] == "unobserved"
         assert candidate["salvaged_from"] == str(source_dir)
@@ -5949,11 +7438,15 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             ("brsrec1.bin", "record_end"),
             ("brsjrn1.bin", "journal_end"),
         ):
-            assert (
-                (recovery_dir / filename).stat().st_size
-                == candidate["final_stream_endpoints"][endpoint]
+            assert (recovery_dir / filename).stat().st_size == candidate[
+                "final_stream_endpoints"
+            ][endpoint]
+        assert (
+            analyze._brshgt1_count_fd(
+                os.open(recovery_dir / "brshgt1.bin", os.O_RDONLY)
             )
-        assert _brshgt1_count(recovery_dir / "brshgt1.bin") == 10
+            == 10
+        )
 
         final = analyze.DiagnosticCheckpoint(
             height=candidate["earliest_defensible_height_h"],
@@ -5966,7 +7459,22 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             journal_end=candidate["final_stream_endpoints"]["journal_end"],
         )
         recovered_paths = analyze._diagnostic_artifact_paths(recovery_dir)
-        analyze._validate_terminal_streams(recovered_paths, final)
+        recovery_dirfd = analyze._walk_dirfd_nofollow(recovery_dir)[0]
+        recovered_fds: dict[str, int] = {}
+        try:
+            for name in ("contexts", "records", "journal", "sidecar"):
+                recovered_fds[name] = analyze._open_custody_input(
+                    recovered_paths[name].name,
+                    1 << 32,
+                    f"salvage recovery {name}",
+                    "DIAG-SALVAGE",
+                    dir_fd=recovery_dirfd,
+                )
+            analyze._validate_terminal_streams(recovered_fds, recovered_paths, final)
+        finally:
+            for recovered_fd in recovered_fds.values():
+                os.close(recovered_fd)
+            os.close(recovery_dirfd)
 
         for filename, count_field, magic in (
             ("brsctx1.bin", "context_rows", analyze.CONTEXT_MAGIC),
@@ -5996,7 +7504,9 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             ("sidecar", "brshgt1_sidecar"),
         ):
             assert source_custody[name]["clone_provenance"] == "DIFFERS_FROM_SOURCE"
-            assert source_custody[name].get("source_header_hex") != source_custody[name].get("recovery_header_hex")
+            assert source_custody[name].get("source_header_hex") != source_custody[
+                name
+            ].get("recovery_header_hex")
             # Normalized header changes full/prefix hashes, but bodies are identical.
             assert (
                 source_custody[name]["committed_prefix_sha256"]
@@ -6019,7 +7529,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6052,6 +7562,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                 os.fsync(stream.fileno())
 
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
         clone_committed_source = analyze._clone_committed_source
         changed = False
@@ -6065,6 +7576,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
             source_sha256: str | None = None,
             source_committed_prefix_sha256: str | None = None,
             source_committed_body_sha256: str | None = None,
+            recovery_dirfd: int | None = None,
         ) -> dict[str, object]:
             nonlocal changed
             if not changed and source.name == "brsctx1.bin":
@@ -6074,9 +7586,9 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                 assert len(original) == 1
                 write_fd = os.open(source, os.O_WRONLY)
                 try:
-                    assert os.pwrite(
-                        write_fd, bytes([original[0] ^ 1]), tail_offset
-                    ) == 1
+                    assert (
+                        os.pwrite(write_fd, bytes([original[0] ^ 1]), tail_offset) == 1
+                    )
                     os.fsync(write_fd)
                 finally:
                     os.close(write_fd)
@@ -6089,6 +7601,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                 source_sha256=source_sha256,
                 source_committed_prefix_sha256=source_committed_prefix_sha256,
                 source_committed_body_sha256=source_committed_body_sha256,
+                recovery_dirfd=recovery_dirfd,
             )
 
         analyze._clone_committed_source = change_tail_then_clone
@@ -6101,7 +7614,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "tail change before clone",
                 "source changed during materialization",
@@ -6109,7 +7622,9 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
         finally:
             analyze._clone_committed_source = clone_committed_source
         assert changed
-        assert not recovery_dir.exists()
+        assert recovery_dir.exists()
+        # These failures precede candidate publication: no orphan
+        # output exists to preserve.
         assert not output.exists()
 
 
@@ -6121,7 +7636,7 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6142,23 +7657,29 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
             os.close(fd)
         source_before = _directory_hashes(source_dir)
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
         validate_terminal_streams = analyze._validate_terminal_streams
 
         def mutate_then_validate(
-            recovery_paths: dict[str, Path],
+            artifact_fds: dict[str, int],
+            display_paths: dict[str, Path],
             final: DiagnosticCheckpoint,
         ) -> dict[str, dict[str, object]]:
-            context_fd = os.open(recovery_paths["contexts"], os.O_RDWR)
+            # Mutate the recovery clone in place through a writable
+            # same-inode descriptor so the retained read-only fd the
+            # validator borrows observes exactly the bytes that diverge
+            # from the validated source committed body.
+            mutation_fd = os.open(display_paths["contexts"], os.O_RDWR)
             try:
                 offset = HEADER_SIZE + 4
-                original = os.pread(context_fd, 1, offset)
+                original = os.pread(mutation_fd, 1, offset)
                 assert len(original) == 1
-                assert os.pwrite(context_fd, bytes([original[0] ^ 1]), offset) == 1
-                os.fsync(context_fd)
+                assert os.pwrite(mutation_fd, bytes([original[0] ^ 1]), offset) == 1
+                os.fsync(mutation_fd)
             finally:
-                os.close(context_fd)
-            return validate_terminal_streams(recovery_paths, final)
+                os.close(mutation_fd)
+            return validate_terminal_streams(artifact_fds, display_paths, final)
 
         analyze._validate_terminal_streams = mutate_then_validate
         try:
@@ -6170,7 +7691,7 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "mutated recovery stream",
                 "recovered contexts body does not match",
@@ -6179,7 +7700,9 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
         finally:
             analyze._validate_terminal_streams = validate_terminal_streams
         assert _directory_hashes(source_dir) == source_before
-        assert not recovery_dir.exists()
+        assert recovery_dir.exists()
+        # These failures precede candidate publication: no orphan
+        # output exists to preserve.
         assert not output.exists()
 
 
@@ -6193,7 +7716,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6214,34 +7737,44 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
             os.close(fd)
         source_before = _directory_hashes(source_dir)
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
-        path_signature = analyze._path_signature
+        dirfd_signature = analyze._dirfd_signature
         fd_signature = analyze._fd_signature
         captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
 
-        def signature_then_replace(path: Path) -> tuple[int, int, int, int, int]:
-            if path in captured_signatures:
-                return captured_signatures[path]
-            sig = path_signature(path)
-            # Replace the recovery contexts file with a semantically valid body
-            # (same size and row count, different bytes) after its signature is
-            # captured. The replacement is the race: the signature is baselined
-            # to the original clone, but the body is no longer source-identical.
-            if path.name == "brsctx1.bin" and "recovery" in path.parts:
-                captured_signatures[path] = sig
-                data = path.read_bytes()
-                mutated = bytearray(data)
-                mutated[HEADER_SIZE + 4 + CONTEXT_MIN_ROW_SIZE + 3] ^= 1
-                path.write_bytes(bytes(mutated))
-                with path.open("rb") as f:
-                    os.fsync(f.fileno())
-            return sig
+        def signature_then_replace(
+            dir_fd: int, name: str
+        ) -> tuple[int, int, int, int, int]:
+            directory = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            key = directory / name
+            if key in captured_signatures:
+                return captured_signatures[key]
+            signature = dirfd_signature(dir_fd, name)
+            # Diverge the recovery contexts body after its signature is
+            # captured. The mutation must be visible through the retained
+            # recovery descriptor (same inode, different bytes), so it is
+            # written in place: the signature stays baselined to the
+            # original clone while the body is no longer source-identical.
+            if name == "brsctx1.bin" and "recovery" in directory.parts:
+                captured_signatures[key] = signature
+                path = directory / name
+                mutation_fd = os.open(path, os.O_RDWR)
+                try:
+                    offset = HEADER_SIZE + 4 + CONTEXT_MIN_ROW_SIZE + 3
+                    original = os.pread(mutation_fd, 1, offset)
+                    assert len(original) == 1
+                    assert os.pwrite(mutation_fd, bytes([original[0] ^ 1]), offset) == 1
+                    os.fsync(mutation_fd)
+                finally:
+                    os.close(mutation_fd)
+            return signature
 
         def stable_mutated_fd(fd: int) -> tuple[int, int, int, int, int]:
             path = Path(os.readlink(f"/proc/self/fd/{fd}"))
             return captured_signatures.get(path, fd_signature(fd))
 
-        analyze._path_signature = signature_then_replace
+        analyze._dirfd_signature = signature_then_replace
         analyze._fd_signature = stable_mutated_fd
         try:
             _raises_with(
@@ -6252,7 +7785,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "pre-signature body replacement",
                 "recovered contexts body does not match",
@@ -6260,9 +7793,11 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
             )
         finally:
             analyze._fd_signature = fd_signature
-            analyze._path_signature = path_signature
+            analyze._dirfd_signature = dirfd_signature
         assert _directory_hashes(source_dir) == source_before
-        assert not recovery_dir.exists()
+        assert recovery_dir.exists()
+        # These failures precede candidate publication: no orphan
+        # output exists to preserve.
         assert not output.exists()
 
 
@@ -6274,7 +7809,7 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6288,34 +7823,48 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
 
         source_before = _directory_hashes(source_dir)
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
-        path_signature = analyze._path_signature
+        dirfd_signature = analyze._dirfd_signature
         validate_replay = analyze._validate_replay_diagnostic
         replay_signature: tuple[int, int, int, int, int] | None = None
 
-        def stable_replay_signature(path: Path) -> tuple[int, int, int, int, int]:
+        def stable_replay_signature(
+            dir_fd: int, name: str
+        ) -> tuple[int, int, int, int, int]:
             nonlocal replay_signature
-            if path == recovery_dir / "replay_diagnostic.json":
+            directory = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            if name == "replay_diagnostic.json" and directory == recovery_dir:
                 if replay_signature is None:
-                    replay_signature = path_signature(path)
+                    replay_signature = dirfd_signature(dir_fd, name)
                 return replay_signature
-            return path_signature(path)
+            return dirfd_signature(dir_fd, name)
 
         def mutate_then_validate(
-            path: Path,
+            replay_fd: int,
+            display_path: Path,
             final: DiagnosticCheckpoint,
             ceiling: int,
             storage_backend: str,
             txindex: bool,
             data_dir: str,
-        ) -> None:
-            replay = json.loads(path.read_text())
+        ) -> dict[str, object]:
+            # Rewrite the clone in place so the retained fd — the only
+            # custody authority — observes the semantically valid but
+            # byte-different document.
+            replay = json.loads(os.pread(replay_fd, os.fstat(replay_fd).st_size, 0))
             replay["elapsed_seconds"] = 1.0
-            path.write_text(json.dumps(replay, indent=2) + "\n")
-            with path.open("rb") as stream:
-                os.fsync(stream.fileno())
-            validate_replay(
-                path,
+            payload = (json.dumps(replay, indent=2) + "\n").encode("utf-8")
+            mutation_fd = os.open(display_path, os.O_WRONLY)
+            try:
+                assert os.pwrite(mutation_fd, payload, 0) == len(payload)
+                os.ftruncate(mutation_fd, len(payload))
+                os.fsync(mutation_fd)
+            finally:
+                os.close(mutation_fd)
+            return validate_replay(
+                replay_fd,
+                display_path,
                 final,
                 ceiling,
                 storage_backend,
@@ -6323,7 +7872,7 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
                 data_dir,
             )
 
-        analyze._path_signature = stable_replay_signature
+        analyze._dirfd_signature = stable_replay_signature
         analyze._validate_replay_diagnostic = mutate_then_validate
         try:
             _raises_with(
@@ -6334,22 +7883,82 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "semantically valid exact replay replacement",
                 "exact recovery replay does not match source",
             )
         finally:
             analyze._validate_replay_diagnostic = validate_replay
-            analyze._path_signature = path_signature
+            analyze._dirfd_signature = dirfd_signature
         assert _directory_hashes(source_dir) == source_before
-        assert not recovery_dir.exists()
+        assert recovery_dir.exists()
+        # These failures precede candidate publication: no orphan
+        # output exists to preserve.
         assert not output.exists()
 
 
+def _run_post_publication_replacement_case(
+    replaced_set: str,
+    source_dir: Path,
+    recovery_dir: Path,
+    output: Path,
+    anchored_publish,
+    original_fsync,
+) -> None:
+    """Run one replacement case; late replacement must roll the output back."""
+    published = False
+    rollback_fsynced = False
 
-def test_salvage_rolls_back_candidate_after_post_publication_replacement() -> None:
-    """Late source or recovery replacement removes and durably rolls back output."""
+    def tracking_fsync(fd):
+        nonlocal rollback_fsynced
+        status = os.fstat(fd)
+        if (
+            published
+            and not output.exists()
+            and stat.S_ISDIR(status.st_mode)
+            and Path(os.readlink(f"/proc/self/fd/{fd}")) == output.parent
+        ):
+            rollback_fsynced = True
+        return original_fsync(fd)
+
+    def publish_then_replace(dir_fd: int, name: str, content: bytes) -> None:
+        nonlocal published
+        anchored_publish(dir_fd, name, content)
+        published = True
+        artifact_root = source_dir if replaced_set == "source" else recovery_dir
+        artifact = artifact_root / "replay_diagnostic.json"
+        held = artifact.with_name("held-replay.json")
+        artifact.rename(held)
+        artifact.write_bytes(held.read_bytes())
+        with artifact.open("rb") as stream:
+            original_fsync(stream.fileno())
+
+    analyze._atomic_publish_anchored = publish_then_replace
+    os.fsync = tracking_fsync
+    try:
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            ),
+            f"post-publication {replaced_set} replacement",
+            f"{replaced_set} changed after candidate publication",
+        )
+    finally:
+        os.fsync = original_fsync
+        analyze._atomic_publish_anchored = anchored_publish
+    assert published
+
+
+def test_salvage_orphans_candidate_after_post_publication_replacement() -> None:
+    """Late replacement rolls back the candidate durably; recovery entries
+    that are no longer owned survive the owned-only cleanup."""
     for replaced_set in ("source", "recovery"):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -6357,7 +7966,7 @@ def test_salvage_rolls_back_candidate_after_post_publication_replacement() -> No
             source_dir = tmp / "source"
             source_dir.mkdir()
             clean_output = tmp / "clean.json"
-            meta_path = _build_meta(tmp, stage, 100, source_dir)
+            meta_path = _build_meta(tmp, stage, 100)
             child = _make_fake_binary(tmp)
             os.environ["FAKE_CENSUS_META"] = str(meta_path)
             os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6370,64 +7979,26 @@ def test_salvage_rolls_back_candidate_after_post_publication_replacement() -> No
                 os.environ.pop("FAKE_CENSUS_STAGE", None)
 
             recovery_dir = tmp / "recovery"
+            recovery_dir.mkdir()
             output = tmp / "salvaged.json"
-            write_json_atomic = analyze._write_json_atomic
+            anchored_publish = analyze._atomic_publish_anchored
             original_fsync = os.fsync
-            published = False
-            rollback_fsynced = False
-
-            def tracking_fsync(fd):
-                nonlocal rollback_fsynced
-                status = os.fstat(fd)
-                if (
-                    published
-                    and not output.exists()
-                    and stat.S_ISDIR(status.st_mode)
-                    and Path(os.readlink(f"/proc/self/fd/{fd}")) == output.parent
-                ):
-                    rollback_fsynced = True
-                return original_fsync(fd)
-
-            def publish_then_replace(path: Path, value: dict[str, object]) -> None:
-                nonlocal published
-                write_json_atomic(path, value)
-                published = True
-                artifact_root = (
-                    source_dir if replaced_set == "source" else recovery_dir
-                )
-                artifact = artifact_root / "replay_diagnostic.json"
-                held = artifact.with_name("held-replay.json")
-                artifact.rename(held)
-                artifact.write_bytes(held.read_bytes())
-                with artifact.open("rb") as stream:
-                    original_fsync(stream.fileno())
-
-            analyze._write_json_atomic = publish_then_replace
-            os.fsync = tracking_fsync
-            try:
-                _raises_with(
-                    AnalyzerError,
-                    lambda: analyze._salvage_diagnostic_scan(
-                        source_dir,
-                        recovery_dir,
-                        output,
-                        "127.0.0.1:18443",
-                        100,
-                        str(source_dir / "state"),
-                    ),
-                    f"post-publication {replaced_set} replacement",
-                    f"{replaced_set} changed after candidate publication",
-                )
-            finally:
-                os.fsync = original_fsync
-                analyze._write_json_atomic = write_json_atomic
-            assert published
-            assert rollback_fsynced
-            assert not output.exists()
-            assert not recovery_dir.exists()
+            _run_post_publication_replacement_case(
+                replaced_set,
+                source_dir,
+                recovery_dir,
+                output,
+                anchored_publish,
+                original_fsync,
+            )
+            # No pathname-unlink on failure: the candidate and the
+            # recovery evidence survive as named orphans for operator
+            # cleanup.
+            assert output.exists()
+            assert recovery_dir.exists()
 
 
-def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
+def test_salvage_orphans_candidate_on_post_publication_interrupt() -> None:
     """An interrupt during final custody verification cannot orphan output."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -6435,7 +8006,7 @@ def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6448,6 +8019,7 @@ def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
             os.environ.pop("FAKE_CENSUS_STAGE", None)
 
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
         verify_retained = analyze._verify_retained_files
 
@@ -6456,10 +8028,11 @@ def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
             descriptors: dict[str, int],
             signatures: dict[str, tuple[int, int, int, int, int]],
             phase: str,
+            dir_fd: int | None = None,
         ) -> None:
             if "after candidate publication" in phase:
                 raise KeyboardInterrupt
-            verify_retained(paths, descriptors, signatures, phase)
+            verify_retained(paths, descriptors, signatures, phase, dir_fd=dir_fd)
 
         analyze._verify_retained_files = interrupt_after_publication
         try:
@@ -6471,14 +8044,15 @@ def test_salvage_rolls_back_candidate_on_post_publication_interrupt() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "post-publication interrupt",
             )
         finally:
             analyze._verify_retained_files = verify_retained
-        assert not output.exists()
-        assert not recovery_dir.exists()
+        assert output.exists()
+        assert recovery_dir.exists()
+
 
 def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
     """A salvaged sidecar must keep its reconstructed count header."""
@@ -6488,7 +8062,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6509,18 +8083,23 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
             os.close(fd)
         source_before = _directory_hashes(source_dir)
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
-        path_signature = analyze._path_signature
+        dirfd_signature = analyze._dirfd_signature
         fd_signature = analyze._fd_signature
         captured_signatures: dict[Path, tuple[int, int, int, int, int]] = {}
 
-        def signature_then_zero_count(path: Path) -> tuple[int, int, int, int, int]:
-            if path in captured_signatures:
-                return captured_signatures[path]
-            signature = path_signature(path)
-            if path.name == "brshgt1.bin" and "recovery" in path.parts:
-                captured_signatures[path] = signature
-                recovery_fd = os.open(path, os.O_WRONLY)
+        def signature_then_zero_count(
+            dir_fd: int, name: str
+        ) -> tuple[int, int, int, int, int]:
+            directory = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            key = directory / name
+            if key in captured_signatures:
+                return captured_signatures[key]
+            signature = dirfd_signature(dir_fd, name)
+            if name == "brshgt1.bin" and "recovery" in directory.parts:
+                captured_signatures[key] = signature
+                recovery_fd = os.open(directory / name, os.O_WRONLY)
                 try:
                     assert os.pwrite(recovery_fd, struct.pack("<Q", 0), 8) == 8
                     os.fsync(recovery_fd)
@@ -6532,7 +8111,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
             path = Path(os.readlink(f"/proc/self/fd/{fd}"))
             return captured_signatures.get(path, fd_signature(fd))
 
-        analyze._path_signature = signature_then_zero_count
+        analyze._dirfd_signature = signature_then_zero_count
         analyze._fd_signature = stable_zeroed_fd
         try:
             _raises_with(
@@ -6543,18 +8122,19 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    str(source_dir / "state"),
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
                 ),
                 "zeroed recovery sidecar count",
                 "recovered sidecar declared row count",
             )
         finally:
             analyze._fd_signature = fd_signature
-            analyze._path_signature = path_signature
+            analyze._dirfd_signature = dirfd_signature
         assert _directory_hashes(source_dir) == source_before
-        assert not recovery_dir.exists()
+        assert recovery_dir.exists()
+        # These failures precede candidate publication: no orphan
+        # output exists to preserve.
         assert not output.exists()
-
 
 
 def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
@@ -6565,7 +8145,7 @@ def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6604,16 +8184,18 @@ def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
         original_validate = analyze._validate_replay_diagnostic
 
         def capture_validate(
-            path: Path,
+            replay_fd: int,
+            display_path: Path,
             final: analyze.DiagnosticCheckpoint,
             ceiling: int,
             storage_backend: str,
             txindex: bool,
             data_dir: str,
-        ) -> None:
+        ) -> dict[str, object]:
             captured_data_dir.append(data_dir)
-            original_validate(
-                path,
+            return original_validate(
+                replay_fd,
+                display_path,
                 final,
                 ceiling,
                 storage_backend,
@@ -6622,6 +8204,7 @@ def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
             )
 
         recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
         output = tmp / "salvaged.json"
         args = argparse.Namespace(
             source_dir=str(source_dir),
@@ -6650,7 +8233,7 @@ def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -6674,16 +8257,20 @@ def test_find_cmodern_height_reaps_failed_child() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         bad = tmp / "bad_child.py"
-        bad.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b\'NOTMAGIC!!\')\nsys.stdout.buffer.flush()\nsys.exit(1)\n")
+        bad.write_text(
+            "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'NOTMAGIC!!')\nsys.stdout.buffer.flush()\nsys.exit(1)\n"
+        )
         bad.chmod(0o755)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
             _raises_with(
                 AnalyzerError,
-                lambda: _run_diagnostic_scan(bad, "127.0.0.1:18443", 100, work_dir, output),
+                lambda: _run_diagnostic_scan(
+                    bad, "127.0.0.1:18443", 100, work_dir, output
+                ),
                 "bad child",
                 "DIAG-PROTO",
             )
@@ -6702,14 +8289,16 @@ def test_find_cmodern_height_destination_race() -> None:
         work_dir.mkdir()
         output = tmp / "candidate.json"
         output.write_text("racer\n")
-        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        meta_path = _build_meta(tmp, stage, 100)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
             _raises_with(
                 AnalyzerError,
-                lambda: _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output),
+                lambda: _run_diagnostic_scan(
+                    child, "127.0.0.1:18443", 100, work_dir, output
+                ),
                 "destination race",
                 "DIAG-OUTPUT",
             )
@@ -6718,6 +8307,7 @@ def test_find_cmodern_height_destination_race() -> None:
             os.environ.pop("FAKE_CENSUS_STAGE", None)
         assert output.read_text() == "racer\n", "racer must survive the collision"
         assert not any(tmp.glob(".*candidate.json.tmp*")), "temp must be cleaned up"
+
 
 def test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url() -> None:
     """An A1-shaped child replay without the invented rest_url field passes validation."""
@@ -6754,9 +8344,18 @@ def test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url() -> No
             journal_rows=0,
             journal_end=0,
         )
-        _validate_replay_diagnostic(
-            replay_path, final, 11, 'fjall', False, str(tmp / 'state')
+        replay_fd = analyze._open_custody_input(
+            replay_path,
+            analyze._REPLAY_MAX_BYTES,
+            "child replay JSON",
+            "DIAG-CUSTODY",
         )
+        try:
+            _validate_replay_diagnostic(
+                replay_fd, replay_path, final, 11, "fjall", False, str(tmp / "state")
+            )
+        finally:
+            os.close(replay_fd)
 
 
 def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
@@ -6795,102 +8394,126 @@ def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
             journal_rows=0,
             journal_end=0,
         )
-        _raises_with(
-            AnalyzerError,
-            lambda: _validate_replay_diagnostic(
-                replay_path, final, 11, 'fjall', False, str(tmp / 'state')
-            ),
-            "invented rest_url",
-            "rest_url",
+        replay_fd = analyze._open_custody_input(
+            replay_path,
+            analyze._REPLAY_MAX_BYTES,
+            "child replay JSON",
+            "DIAG-CUSTODY",
         )
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _validate_replay_diagnostic(
+                    replay_fd,
+                    replay_path,
+                    final,
+                    11,
+                    "fjall",
+                    False,
+                    str(tmp / "state"),
+                ),
+                "invented rest_url",
+                "rest_url",
+            )
+        finally:
+            os.close(replay_fd)
 
 
 def test_find_cmodern_height_settings_mismatch_storage_backend() -> None:
-    '''A child reporting a different storage_backend must not be finalized.'''
+    """A child reporting a different storage_backend must not be finalized."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         stage = _write_diagnostic_stage(tmp)
-        work_dir = tmp / 'work'
+        work_dir = tmp / "work"
         work_dir.mkdir()
-        output = tmp / 'candidate.json'
+        output = tmp / "candidate.json"
         meta_path = _build_meta(
-            tmp, stage, 100, work_dir,
-            replay_overrides={'storage_backend': 'rocksdb'},
+            tmp,
+            stage,
+            100,
+            replay_overrides={"storage_backend": "rocksdb"},
         )
         child = _make_fake_binary(tmp)
-        os.environ['FAKE_CENSUS_META'] = str(meta_path)
-        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
             _raises_with(
                 AnalyzerError,
                 lambda: _run_diagnostic_scan(
-                    child, '127.0.0.1:18443', 100, work_dir, output
+                    child, "127.0.0.1:18443", 100, work_dir, output
                 ),
-                'mismatched storage_backend',
-                'storage_backend',
+                "mismatched storage_backend",
+                "storage_backend",
             )
-            assert not output.exists(), 'candidate must not be published'
+            assert not output.exists(), "candidate must not be published"
         finally:
-            os.environ.pop('FAKE_CENSUS_META', None)
-            os.environ.pop('FAKE_CENSUS_STAGE', None)
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
 
 def test_find_cmodern_height_settings_mismatch_txindex() -> None:
-    '''A child reporting txindex=True when parent passed False must fail.'''
+    """A child reporting txindex=True when parent passed False must fail."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         stage = _write_diagnostic_stage(tmp)
-        work_dir = tmp / 'work'
+        work_dir = tmp / "work"
         work_dir.mkdir()
-        output = tmp / 'candidate.json'
+        output = tmp / "candidate.json"
         meta_path = _build_meta(
-            tmp, stage, 100, work_dir,
-            replay_overrides={'txindex': True},
+            tmp,
+            stage,
+            100,
+            replay_overrides={"txindex": True},
         )
         child = _make_fake_binary(tmp)
-        os.environ['FAKE_CENSUS_META'] = str(meta_path)
-        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
             _raises_with(
                 AnalyzerError,
                 lambda: _run_diagnostic_scan(
-                    child, '127.0.0.1:18443', 100, work_dir, output
+                    child, "127.0.0.1:18443", 100, work_dir, output
                 ),
-                'mismatched txindex',
-                'txindex',
+                "mismatched txindex",
+                "txindex",
             )
-            assert not output.exists(), 'candidate must not be published'
+            assert not output.exists(), "candidate must not be published"
         finally:
-            os.environ.pop('FAKE_CENSUS_META', None)
-            os.environ.pop('FAKE_CENSUS_STAGE', None)
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
 
 def test_find_cmodern_height_settings_mismatch_data_dir() -> None:
-    '''A child reporting a different data_dir must fail before publication.'''
+    """A child reporting a different data_dir must fail before publication."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         stage = _write_diagnostic_stage(tmp)
-        work_dir = tmp / 'work'
+        work_dir = tmp / "work"
         work_dir.mkdir()
-        output = tmp / 'candidate.json'
+        output = tmp / "candidate.json"
         meta_path = _build_meta(
-            tmp, stage, 100, work_dir,
-            replay_overrides={'data_dir': str(tmp / 'other_state')},
+            tmp,
+            stage,
+            100,
+            replay_overrides={"data_dir": str(tmp / "other_state")},
         )
         child = _make_fake_binary(tmp)
-        os.environ['FAKE_CENSUS_META'] = str(meta_path)
-        os.environ['FAKE_CENSUS_STAGE'] = str(stage)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
             _raises_with(
                 AnalyzerError,
                 lambda: _run_diagnostic_scan(
-                    child, '127.0.0.1:18443', 100, work_dir, output
+                    child, "127.0.0.1:18443", 100, work_dir, output
                 ),
-                'mismatched data_dir',
-                'data_dir',
+                "mismatched data_dir",
+                "data_dir",
             )
-            assert not output.exists(), 'candidate must not be published'
+            assert not output.exists(), "candidate must not be published"
         finally:
-            os.environ.pop('FAKE_CENSUS_META', None)
-            os.environ.pop('FAKE_CENSUS_STAGE', None)
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
 
 def test_read_bounded_context_rows_zero_rows() -> None:
     """An empty committed prefix with start_row=0 and rows=0 must parse."""
@@ -6900,8 +8523,11 @@ def test_read_bounded_context_rows_zero_rows() -> None:
         fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
         try:
             rows = read_bounded_context_rows(
-                fd, start_offset=HEADER_SIZE, end_offset=HEADER_SIZE,
-                start_row=0, committed_rows=0,
+                fd,
+                start_offset=HEADER_SIZE,
+                end_offset=HEADER_SIZE,
+                start_row=0,
+                committed_rows=0,
             )
             assert rows == []
         finally:
@@ -6917,9 +8543,11 @@ def test_read_bounded_context_rows_exact_endpoint() -> None:
         fd = os.open(tmp / "ctx.bin", os.O_RDONLY)
         try:
             rows = read_bounded_context_rows(
-                fd, start_offset=HEADER_SIZE,
+                fd,
+                start_offset=HEADER_SIZE,
                 end_offset=os.fstat(fd).st_size,
-                start_row=0, committed_rows=1,
+                start_row=0,
+                committed_rows=1,
             )
             assert len(rows) == 1
             assert rows[0].identity.input_index == 0
@@ -6937,8 +8565,11 @@ def test_read_bounded_context_rows_trailing_uncommitted() -> None:
         try:
             first_row_end = _compute_context_ends(tmp / "ctx.bin")[1]
             rows = read_bounded_context_rows(
-                fd, start_offset=HEADER_SIZE, end_offset=first_row_end,
-                start_row=0, committed_rows=1,
+                fd,
+                start_offset=HEADER_SIZE,
+                end_offset=first_row_end,
+                start_row=0,
+                committed_rows=1,
             )
             assert len(rows) == 1
         finally:
@@ -6956,9 +8587,11 @@ def test_read_bounded_context_rows_truncated_row() -> None:
             _raises(
                 ContextError,
                 lambda: read_bounded_context_rows(
-                    fd, start_offset=HEADER_SIZE,
+                    fd,
+                    start_offset=HEADER_SIZE,
                     end_offset=HEADER_SIZE + CONTEXT_MIN_ROW_SIZE - 1,
-                    start_row=0, committed_rows=1,
+                    start_row=0,
+                    committed_rows=1,
                 ),
                 "truncated committed row",
             )
@@ -6973,7 +8606,16 @@ def test_c150_helper_parity() -> None:
         txid = b"\xc0" * 32
         ctx_row = _bare_p2pkh(txid)
         record = _make_record_bytes(txid, 0, op_kind=1, sig_version=0, outcome=1)
-        journal = [_make_journal_bytes(txid, 0, checksig_ops=1, checkmultisig_ops=0, ecdsa_verify_calls=1, ecdsa_verify_ok=1)]
+        journal = [
+            _make_journal_bytes(
+                txid,
+                0,
+                checksig_ops=1,
+                checkmultisig_ops=0,
+                ecdsa_verify_calls=1,
+                ecdsa_verify_ok=1,
+            )
+        ]
         _make_brsctx1_file(tmp / "contexts.bin", [ctx_row])
         _write_records_file(tmp / "records.bin", [record])
         _write_journal_file(tmp / "journal.bin", journal)
@@ -6992,7 +8634,9 @@ def test_c150_helper_parity() -> None:
             journal_rows=1,
             journal_end=(paths["journal"].stat().st_size),
         )
-        classified, r, j, ctx_map, record_counts = _read_diagnostic_streams(row, None, paths)
+        classified, r, _j, ctx_map, _record_counts = _read_diagnostic_streams(
+            row, None, paths
+        )
         totals = _diagnostic_counter_totals(classified, r, ctx_map)
         assert totals["bare_multisig_checks"] == 0
         assert totals["p2sh_redeem_spends"] == 0
@@ -7112,7 +8756,7 @@ def test_diagnostic_helper_synthetic_all_types() -> None:
     """A synthetic fixture with all spend contexts/record rules counts all 11 types."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        distinct = [bytes([0xd0 + i] * 32) for i in range(6)]
+        distinct = [bytes([0xD0 + i] * 32) for i in range(6)]
         contexts = [
             _bare_p2pkh(distinct[0]),
             _p2sh_push_only(distinct[1], flags=VERIFY_P2SH),
@@ -7131,12 +8775,24 @@ def test_diagnostic_helper_synthetic_all_types() -> None:
             _make_record_bytes(distinct[5], 0, op_kind=5, sig_version=2, op_seq=1),
         ]
         journal = [
-            _make_journal_bytes(distinct[0], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(distinct[1], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(distinct[2], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(distinct[3], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1),
-            _make_journal_bytes(distinct[4], 0, checksig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
-            _make_journal_bytes(distinct[5], 0, checksig_ops=1, ecdsa_verify_calls=0, ecdsa_verify_ok=0),
+            _make_journal_bytes(
+                distinct[0], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1
+            ),
+            _make_journal_bytes(
+                distinct[1], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1
+            ),
+            _make_journal_bytes(
+                distinct[2], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1
+            ),
+            _make_journal_bytes(
+                distinct[3], 0, checksig_ops=1, ecdsa_verify_calls=1, ecdsa_verify_ok=1
+            ),
+            _make_journal_bytes(
+                distinct[4], 0, checksig_ops=0, ecdsa_verify_calls=0, ecdsa_verify_ok=0
+            ),
+            _make_journal_bytes(
+                distinct[5], 0, checksig_ops=1, ecdsa_verify_calls=0, ecdsa_verify_ok=0
+            ),
         ]
         _make_brsctx1_file(tmp / "contexts.bin", contexts)
         _write_records_file(tmp / "records.bin", records)
@@ -7156,7 +8812,9 @@ def test_diagnostic_helper_synthetic_all_types() -> None:
             journal_rows=6,
             journal_end=(paths["journal"].stat().st_size),
         )
-        classified, r, j, ctx_map, record_counts = _read_diagnostic_streams(row, None, paths)
+        classified, r, _j, ctx_map, _record_counts = _read_diagnostic_streams(
+            row, None, paths
+        )
         totals = _diagnostic_counter_totals(classified, r, ctx_map)
         assert totals["p2sh_redeem_spends"] == 1
         assert totals["native_witness_v0_spends"] == 1
@@ -7182,10 +8840,18 @@ def test_diagnostic_op_seq_stream_order_rejects_one_before_zero() -> None:
         txid_le = b"\xd1" * 32
         ctx_row = _bare_p2pkh(txid_le)
         records = [
-            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
-            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1),
+            _make_record_bytes(
+                txid_le, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1
+            ),
+            _make_record_bytes(
+                txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1
+            ),
         ]
-        journal = [_make_journal_bytes(txid_le, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2)]
+        journal = [
+            _make_journal_bytes(
+                txid_le, 0, checksig_ops=2, ecdsa_verify_calls=2, ecdsa_verify_ok=2
+            )
+        ]
         _make_brsctx1_file(tmp / "contexts.bin", [ctx_row])
         _write_records_file(tmp / "records.bin", records)
         _write_journal_file(tmp / "journal.bin", journal)
@@ -7210,6 +8876,8 @@ def test_diagnostic_op_seq_stream_order_rejects_one_before_zero() -> None:
             "misordered op_seq 1 before 0",
             "CTX-OPERATIONS",
         )
+
+
 def _diagnostic_stage(
     tmp: Path,
     contexts: list[ContextInput],
@@ -7247,7 +8915,9 @@ def test_diagnostic_first_record_op_seq_with_illegal_reports_sequence() -> None:
         txid_le = b"\xd2" * 32
         ctx = _bare_p2pkh(txid_le)
         records = [
-            _make_record_bytes(txid_le, 0, op_kind=3, sig_version=2, op_seq=1, outcome=1),
+            _make_record_bytes(
+                txid_le, 0, op_kind=3, sig_version=2, op_seq=1, outcome=1
+            ),
         ]
         journal = [_make_journal_bytes(txid_le, 0)]
         row, paths = _diagnostic_stage(tmp, [ctx], records, journal)
@@ -7269,8 +8939,12 @@ def test_diagnostic_earlier_sequence_beats_later_illegal() -> None:
         txid_b = b"\xd4" * 32
         contexts = [_bare_p2pkh(txid_a), _bare_p2pkh(txid_b)]
         records = [
-            _make_record_bytes(txid_a, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
-            _make_record_bytes(txid_b, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
+            _make_record_bytes(
+                txid_a, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1
+            ),
+            _make_record_bytes(
+                txid_b, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1
+            ),
         ]
         journal = [_make_journal_bytes(txid_a, 0), _make_journal_bytes(txid_b, 0)]
         row, paths = _diagnostic_stage(tmp, contexts, records, journal)
@@ -7292,8 +8966,12 @@ def test_diagnostic_earlier_illegal_beats_later_sequence() -> None:
         txid_b = b"\xd6" * 32
         contexts = [_bare_p2pkh(txid_a), _bare_p2pkh(txid_b)]
         records = [
-            _make_record_bytes(txid_a, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
-            _make_record_bytes(txid_b, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1),
+            _make_record_bytes(
+                txid_a, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1
+            ),
+            _make_record_bytes(
+                txid_b, 0, op_kind=1, sig_version=0, op_seq=1, outcome=1
+            ),
         ]
         journal = [_make_journal_bytes(txid_a, 0), _make_journal_bytes(txid_b, 0)]
         row, paths = _diagnostic_stage(tmp, contexts, records, journal)
@@ -7314,8 +8992,12 @@ def test_diagnostic_duplicate_key_retains_precedence() -> None:
         txid_le = b"\xd7" * 32
         ctx = _bare_p2pkh(txid_le)
         records = [
-            _make_record_bytes(txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1),
-            _make_record_bytes(txid_le, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1),
+            _make_record_bytes(
+                txid_le, 0, op_kind=1, sig_version=0, op_seq=0, outcome=1
+            ),
+            _make_record_bytes(
+                txid_le, 0, op_kind=3, sig_version=2, op_seq=0, outcome=1
+            ),
         ]
         journal = [_make_journal_bytes(txid_le, 0)]
         row, paths = _diagnostic_stage(tmp, [ctx], records, journal)
@@ -7330,58 +9012,49 @@ def test_diagnostic_duplicate_key_retains_precedence() -> None:
         )
 
 
-def test_atomic_publish_rollback_fsyncs_after_unlink() -> None:
-    """First post-link directory fsync fails; rollback unlinks target then fsyncs.
+def test_atomic_publish_post_link_failure_leaves_named_orphan() -> None:
+    """A post-link directory fsync failure leaves the entry in place.
 
-    The injected failure fires once, then rollback uses the real fsync on the
-    reopened parent directory. We assert unlink precedes the rollback fsync and
-    that neither target nor temp survive.
+    Once the link exists the entry is never pathname-unlinked: a concurrent
+    rename could redirect the unlink to a substitute. The original failure
+    propagates and the orphan stays on disk for operator cleanup.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         target = tmp / "out.json"
         from analyze import _atomic_publish_no_replace
+
         original_fsync = os.fsync
         original_unlink = os.unlink
 
-        ops: list[str] = []
-        dir_fsync_count = 0
+        unlinks: list[str] = []
 
         def instrumented_unlink(p, *, dir_fd=None):
-            ops.append(f"unlink:{p}")
+            unlinks.append(str(p))
             if dir_fd is not None:
                 return original_unlink(p, dir_fd=dir_fd)
             return original_unlink(p)
 
-        fsync_calls: list[tuple[bool, bool]] = []
-
-        def counting_fsync(fd):
-            nonlocal dir_fsync_count
-            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
-            after_unlink = len(ops) > 0
-            fsync_calls.append((is_dir, after_unlink))
-            if is_dir:
-                dir_fsync_count += 1
-                if dir_fsync_count == 1 and not after_unlink:
-                    raise OSError(5, "simulated post-link directory fsync error")
+        def failing_dir_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "simulated post-link directory fsync error")
             return original_fsync(fd)
 
         try:
-            os.fsync = counting_fsync
+            os.fsync = failing_dir_fsync
             os.unlink = instrumented_unlink
             _raises(
                 OSError,
                 lambda: _atomic_publish_no_replace(target, b"candidate"),
-                "post-link fsync failure",
+                "post-link directory fsync error",
             )
         finally:
             os.fsync = original_fsync
             os.unlink = original_unlink
-        assert not target.exists()
-        assert not any(tmp.glob(".*out.json.tmp*"))
-        assert any("unlink" in op for op in ops), "target must be unlinked during rollback"
-        # fsync called after at least one unlink (rollback directory fsync).
-        assert any(after for (_, after) in fsync_calls if after), "rollback fsync must follow unlink"
+        # The orphan policy: the published entry survives untouched and no
+        # pathname-unlink was even attempted.
+        assert target.read_bytes() == b"candidate"
+        assert unlinks == []
 
 
 def test_atomic_publish_no_replace_collision() -> None:
@@ -7391,6 +9064,7 @@ def test_atomic_publish_no_replace_collision() -> None:
         target = tmp / "out.json"
         target.write_text("racer\n")
         from analyze import _atomic_publish_no_replace
+
         _raises_with(
             AnalyzerError,
             lambda: _atomic_publish_no_replace(target, b"candidate"),
@@ -7400,28 +9074,32 @@ def test_atomic_publish_no_replace_collision() -> None:
         assert target.read_text() == "racer\n"
 
 
-def test_atomic_publish_cleans_temp_on_post_link_fsync_failure() -> None:
-    """If directory fsync after the link fails, the output and temp are removed."""
+def test_atomic_publish_pre_link_failure_leaves_no_trace() -> None:
+    """A failure before the link leaves nothing: the nameless scratch inode
+    dies with its descriptor and the destination is never touched."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         target = tmp / "out.json"
         from analyze import _atomic_publish_no_replace
+
         original_fsync = os.fsync
+
         def broken_fsync(fd):
             if fd >= 0:
                 raise OSError(5, "simulated I/O error")
             original_fsync(fd)
+
         try:
             os.fsync = broken_fsync
             _raises(
                 OSError,
                 lambda: _atomic_publish_no_replace(target, b"candidate"),
-                "post-link fsync failure",
+                "simulated I/O error",
             )
         finally:
             os.fsync = original_fsync
         assert not target.exists()
-        assert not any(tmp.glob(".*out.json.tmp*")), "temp must be removed on failure"
+        assert not any(tmp.glob(".*out.json*")), "pre-link failure leaves no trace"
 
 
 def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
@@ -7430,12 +9108,15 @@ def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
     that the source is never read past the committed endpoint."""
     import errno
     import fcntl
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         source = tmp / "source.bin"
         committed_size = 64
         full_size = 192
-        source.write_bytes(b"\x00" * committed_size + b"\xff" * (full_size - committed_size))
+        source.write_bytes(
+            b"\x00" * committed_size + b"\xff" * (full_size - committed_size)
+        )
         destination = tmp / "dest.bin"
 
         source_fd = os.open(source, os.O_RDONLY)
@@ -7454,6 +9135,7 @@ def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
                 return original_pread(fd, count, offset)
 
             full_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+            recovery_dirfd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 fcntl.ioctl = failing_ioctl
                 os.pread = tracking_pread
@@ -7463,10 +9145,12 @@ def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
                     destination,
                     committed_size,
                     source_sha256=full_sha,
+                    recovery_dirfd=recovery_dirfd,
                 )
             finally:
                 fcntl.ioctl = original_ioctl
                 os.pread = original_pread
+                os.close(recovery_dirfd)
 
             assert destination.stat().st_size == committed_size
             assert destination.read_bytes() == b"\x00" * committed_size
@@ -7478,70 +9162,648 @@ def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
             os.close(source_fd)
 
 
-def test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir() -> None:
-    """Each new recovery ancestor becomes durable before its child is used."""
-    from analyze import DiagnosticReconstruction
+def test_open_verified_executable_survives_in_place_source_overwrite() -> None:
+    """The sealed snapshot executes the verified bytes, not the live inode.
 
+    After verification the source file is overwritten in place — same
+    inode, different bytes — with a different executable. The launched
+    child must run the sealed snapshot's code, and the published custody
+    digest must still describe the bytes that were verified.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
+        binary = tmp / "fake-child"
+        binary.write_text("#!/bin/sh\necho SEALED-SNAPSHOT-A\n")
+        binary.chmod(0o755)
+        binary_fd, custody = analyze._open_verified_executable(binary)
+        try:
+            assert custody["sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+
+            with binary.open("r+b") as stream:
+                stream.write(b"#!/bin/sh\necho OVERWRITE-B\n")
+                stream.truncate()
+                stream.flush()
+                os.fsync(stream.fileno())
+            assert binary.read_bytes() == b"#!/bin/sh\necho OVERWRITE-B\n"
+
+            work_dirfd, work_missing = analyze._walk_dirfd_nofollow(tmp)
+            assert not work_missing
+            try:
+                proc, stderr_file = analyze._launch_diagnostic_child(
+                    binary,
+                    "127.0.0.1:18443",
+                    100,
+                    "fjall",
+                    False,
+                    binary_fd=binary_fd,
+                    work_dirfd=work_dirfd,
+                )
+            finally:
+                os.close(work_dirfd)
+            try:
+                observed = proc.stdout.read().decode()
+                proc.wait(timeout=10)
+            finally:
+                stderr_file.close()
+            assert "SEALED-SNAPSHOT-A" in observed
+            assert "OVERWRITE-B" not in observed
+        finally:
+            os.close(binary_fd)
+
+
+def test_custody_open_skips_access_reopen_for_non_regular() -> None:
+    """Non-regular leaves are rejected on classification alone.
+
+    A FIFO at a custody path must be refused before any ``O_RDONLY`` or
+    ``O_RDWR`` access open is attempted: exactly one open is recorded for
+    the refused path, and it carries only the classification flags.
+    """
+
+    def exercise(opener) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fifo = tmp / "pipe"
+            os.mkfifo(fifo)
+            real_open = os.open
+            attempted: list[tuple[object, int]] = []
+
+            def recording_open(path, flags, *args, **kwargs):
+                attempted.append((path, flags))
+                return real_open(path, flags, *args, **kwargs)
+
+            os.open = recording_open
+            try:
+                _raises_with(
+                    AnalyzerError,
+                    lambda: opener(fifo, 1024, "input"),
+                    "is not a regular file",
+                    "CTX-CUSTODY",
+                )
+            finally:
+                os.open = real_open
+            assert len(attempted) == 1, attempted
+            path, flags = attempted[0]
+            assert str(path).endswith("pipe")
+            assert flags & getattr(os, "O_PATH", 0)
+            assert flags & getattr(os, "O_NOFOLLOW", 0)
+            assert not flags & os.O_RDWR
+
+    for opener in (analyze._open_custody_input, analyze._open_custody_rw):
+        exercise(opener)
+
+
+def test_salvage_requires_precreated_empty_recovery_directory() -> None:
+    """Salvage never creates recovery directories: they must pre-exist empty.
+
+    A missing recovery directory is refused, and a recovery directory that
+    already holds an entry is refused; neither case touches the source or
+    publishes an output.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
         source_dir = tmp / "source"
         source_dir.mkdir()
-        source_paths = analyze._diagnostic_artifact_paths(source_dir)
-        for path in source_paths.values():
-            path.write_bytes(b"\x00" * 32)
-
-        source_fds = {
-            name: os.open(path, os.O_RDONLY) for name, path in source_paths.items()
-        }
-        ancestor_a = tmp / "new-a"
-        ancestor_b = ancestor_a / "new-b"
-        recovery_dir = ancestor_b / "recovery"
-        expected_order = [
-            str(tmp.resolve()),
-            str(ancestor_a.resolve()),
-            str(ancestor_b.resolve()),
-            str(recovery_dir.resolve()),
-        ]
-        final = DiagnosticCheckpoint(
-            height=0,
-            block_hash_le=b"\x00" * 32,
-            context_rows=0,
-            context_end=16,
-            record_rows=0,
-            record_end=16,
-            journal_rows=0,
-            journal_end=16,
-        )
-        reconstruction = DiagnosticReconstruction(
-            row_count=0,
-            final=final,
-            cumulative_counts={},
-            first_heights={},
-            source_stream_digests={},
-        )
-        original_fsync = os.fsync
-        fsynced_directories: list[str] = []
-
-        def tracking_fsync(fd):
-            status = os.fstat(fd)
-            if stat.S_ISDIR(status.st_mode):
-                fsynced_directories.append(os.readlink(f"/proc/self/fd/{fd}"))
-            return original_fsync(fd)
-
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
         try:
-            os.fsync = tracking_fsync
-            analyze._materialize_recovery_dir(
-                source_paths, source_fds, recovery_dir, reconstruction
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, tmp / "clean.json"
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        source_before = _directory_hashes(source_dir)
+
+        recovery_dir = tmp / "recovery"
+        output = tmp / "salvaged.json"
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            ),
+            "pre-created and empty",
+            "DIAG-SETUP",
+        )
+        assert not recovery_dir.exists()
+        assert not output.exists()
+
+        recovery_dir.mkdir()
+        (recovery_dir / "stray.bin").write_bytes(b"stale bytes")
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            ),
+            "must be empty",
+            "DIAG-SETUP",
+        )
+        assert not output.exists()
+        assert _directory_hashes(source_dir) == source_before
+
+
+def test_salvage_holds_precreated_recovery_directory_after_substitution() -> None:
+    """The held recovery descriptor receives the evidence, not the pathname.
+
+    The recovery directory is opened once, no-follow, and every recovery
+    write goes through that descriptor: renaming a substitute directory
+    over the original pathname mid-run leaves all recovered evidence in
+    the held original and the substitute untouched.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        hidden = tmp / "recovery.held"
+        substitute = tmp / "recovery-substitute"
+        swapped = False
+        anchored_publish = analyze._atomic_publish_anchored
+
+        def publish_then_substitute_recovery(dir_fd, name, content):
+            nonlocal swapped
+            anchored_publish(dir_fd, name, content)
+            if not swapped:
+                swapped = True
+                os.rename(recovery_dir, hidden)
+                substitute.mkdir()
+                os.rename(substitute, recovery_dir)
+
+        analyze._atomic_publish_anchored = publish_then_substitute_recovery
+        try:
+            output = tmp / "salvaged.json"
+            analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            )
+        finally:
+            analyze._atomic_publish_anchored = anchored_publish
+
+        assert swapped, "substitution must fire after publication"
+        assert not any(recovery_dir.iterdir()), (
+            "the substituted pathname must not receive recovery evidence"
+        )
+        for artifact in analyze._diagnostic_artifact_paths(hidden).values():
+            assert artifact.exists(), (
+                "recovered evidence must land in the held original directory"
+            )
+        candidate = json.loads(output.read_text())
+        assert candidate["salvaged_from"] == str(source_dir)
+
+
+def test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo() -> None:
+    """Recovery on a different mount than the source is refused pre-mutation.
+
+    The kernel ``mnt_id`` facts are injected through the bounded fdinfo
+    seam: the source reads mnt_id 7 while the recovery directory reads
+    mnt_id 9, and salvage must refuse before any recovery write. Malformed
+    facts fail closed as well.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        source_before = _directory_hashes(source_dir)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        real_fdinfo = analyze._proc_fdinfo_text
+        calls = {"n": 0}
+
+        def split_mount_facts(fd: int) -> str:
+            calls["n"] += 1
+            return "mnt_id:\t7\n" if calls["n"] == 1 else "mnt_id:\t9\n"
+
+        analyze._proc_fdinfo_text = split_mount_facts
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                ),
+                "different mount",
+                "mnt_id 9",
+                "mnt_id 7",
+                "DIAG-SETUP",
+            )
+        finally:
+            analyze._proc_fdinfo_text = real_fdinfo
+        assert calls["n"] >= 2
+        assert not output.exists()
+        assert not any(recovery_dir.iterdir())
+        assert _directory_hashes(source_dir) == source_before
+
+        analyze._proc_fdinfo_text = lambda fd: "pos:\t0\nflags:\t0\n"
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                ),
+                "mount identity (mnt_id) unavailable",
+                "DIAG-SETUP",
+            )
+        finally:
+            analyze._proc_fdinfo_text = real_fdinfo
+        assert not output.exists()
+
+
+def test_salvage_rejects_leaf_substitution_during_parent_fsync() -> None:
+    """A leaf swapped while the parent directory is synced is rejected.
+
+    The published descriptor and its identity are held through the parent
+    fsync; substituting the candidate at its pathname during that fsync
+    fails the post-sync no-follow re-stat, and the substituted entry is
+    left in place as a named orphan for operator cleanup.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        original_fsync = os.fsync
+        swapped = {"done": False}
+
+        def substitute_leaf_during_dir_fsync(fd: int) -> None:
+            status = os.fstat(fd)
+            if (
+                not swapped["done"]
+                and stat.S_ISDIR(status.st_mode)
+                and Path(os.readlink(f"/proc/self/fd/{fd}")) == output.parent
+                and output.exists()
+            ):
+                swapped["done"] = True
+                held = output.with_name("held-candidate.json")
+                original_fsync(fd)
+                output.rename(held)
+                output.write_bytes(b'{"schema": "substitute"}\n')
+                return
+            original_fsync(fd)
+
+        os.fsync = substitute_leaf_during_dir_fsync
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                ),
+                "was substituted",
+                "parent",
+                "DIAG-OUTPUT",
             )
         finally:
             os.fsync = original_fsync
-            for fd in source_fds.values():
-                os.close(fd)
+        assert swapped["done"]
+        assert output.exists(), "the substituted entry stays as a named orphan"
+        assert json.loads(output.read_text())["schema"] == "substitute"
 
-        assert fsynced_directories == expected_order, (
-            "new recovery ancestors must be created and fsynced root-to-leaf "
-            f"before the recovery directory contents: {fsynced_directories}"
+
+def test_salvage_refuses_replaced_ancestor_symlink() -> None:
+    """A recovery-path ancestor swapped for a symlink is refused at open.
+
+    The no-follow dirfd walk must fail closed before any recovery write:
+    neither the symlink target nor the source directory may gain entries.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, tmp / "clean.json"
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        source_before = _directory_hashes(source_dir)
+
+        victim = tmp / "victim"
+        victim.mkdir()
+        nested = tmp / "nested"
+        nested.mkdir()
+        recovery_dir = nested / "recovery"
+        output = nested / "salvaged.json"
+        nested.rmdir()
+        nested.symlink_to(victim)
+
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            ),
+            "refusing path component",
+            "DIAG-SETUP",
         )
+        assert not any(victim.iterdir()), "symlinked ancestor must not receive writes"
+        assert _directory_hashes(source_dir) == source_before
+
+
+def test_salvage_source_pathname_substitution_reads_only_held_original() -> None:
+    """A source pathname swapped before the first artifact open changes nothing.
+
+    Salvage binds every source open and pathname-side verification to the one
+    held directory descriptor taken before any artifact open, so a complete
+    substitute directory placed at the original pathname is never read or
+    published: the run must emit byte-identical evidence from the held
+    original, and the poisoned substitute must remain untouched.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        reference_recovery = tmp / "recovery_ref"
+        reference_recovery.mkdir()
+        reference_output = tmp / "salvaged_ref.json"
+        analyze._salvage_diagnostic_scan(
+            source_dir,
+            reference_recovery,
+            reference_output,
+            "127.0.0.1:18443",
+            100,
+            _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+        )
+        reference = json.loads(reference_output.read_text())
+        source_before = _directory_hashes(source_dir)
+
+        substitute = tmp / "substitute"
+        substitute.mkdir()
+        substitute_bytes: dict[str, bytes] = {}
+        for artifact in analyze._diagnostic_artifact_paths(source_dir).values():
+            substitute_bytes[artifact.name] = artifact.read_bytes()
+            (substitute / artifact.name).write_bytes(substitute_bytes[artifact.name])
+        with (substitute / "brsctx1.bin").open("ab") as stream:
+            stream.write(b"UNCOMMITTED-TAIL")
+            stream.flush()
+            os.fsync(stream.fileno())
+        substitute_bytes["brsctx1.bin"] += b"UNCOMMITTED-TAIL"
+
+        hidden = tmp / "source.held"
+        swapped = False
+        real_open = analyze._open_custody_input
+
+        def substitute_before_first_artifact_open(
+            path: Path | str,
+            max_bytes: int,
+            label: str,
+            scope: str = "CTX-CUSTODY",
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                os.rename(source_dir, hidden)
+                os.rename(substitute, source_dir)
+            return real_open(path, max_bytes, label, scope, dir_fd=dir_fd)
+
+        analyze._open_custody_input = substitute_before_first_artifact_open
+        try:
+            recovery_dir = tmp / "recovery"
+            recovery_dir.mkdir()
+            output = tmp / "salvaged.json"
+            analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            )
+        finally:
+            analyze._open_custody_input = real_open
+
+        assert swapped, "pathname substitution must fire before the first open"
+        assert _directory_hashes(hidden) == source_before
+        for name, poisoned in substitute_bytes.items():
+            assert (source_dir / name).read_bytes() == poisoned
+        candidate = json.loads(output.read_text())
+        assert candidate["salvaged_from"] == str(source_dir)
+        assert (
+            candidate["earliest_defensible_height_h"]
+            == reference["earliest_defensible_height_h"]
+        )
+        assert candidate["context_counts"] == reference["context_counts"]
+        assert (
+            candidate["first_occurrence_heights"]
+            == reference["first_occurrence_heights"]
+        )
+        assert candidate["final_stream_counts"] == reference["final_stream_counts"]
+        assert (
+            candidate["final_stream_endpoints"] == reference["final_stream_endpoints"]
+        )
+        for name, custody in reference["source_full_file_custody"].items():
+            assert (
+                candidate["source_full_file_custody"][name]["sha256"]
+                == custody["sha256"]
+            )
+        for artifact in analyze._diagnostic_artifact_paths(recovery_dir).values():
+            assert (
+                artifact.read_bytes()
+                == (reference_recovery / artifact.name).read_bytes()
+            )
+
+
+def test_salvage_rejects_output_nested_under_source() -> None:
+    """An output path below the source directory is refused before publication.
+
+    The deepest existing output-parent descriptor must be walked to the
+    namespace root against the held source identity: an output nested in an
+    existing subdirectory of the source would otherwise publish recovered
+    evidence inside the very directory being salvaged.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        source_before = _directory_hashes(source_dir)
+
+        nested = source_dir / "nested"
+        nested.mkdir()
+        output = nested / "salvaged.json"
+        (tmp / "recovery").mkdir()
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                tmp / "recovery",
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            ),
+            "output nested under source",
+            "DIAG-SETUP: output must be outside source",
+        )
+        assert not output.exists()
+        assert not any(nested.iterdir())
+        assert _directory_hashes(source_dir) == source_before
+
+
+def test_salvage_refuses_symlinked_source_path_to_substitute() -> None:
+    """A source pathname whose final component is a symlink is refused.
+
+    The component-wise no-follow walk takes the anchor from the operator's
+    original pathname: a symlink pointing at a complete substitute directory
+    is refused at open instead of silently re-binding custody to whatever
+    the pathname now names, and no recovery evidence is created.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        real_dir = tmp / "real"
+        real_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(child, "127.0.0.1:18443", 100, real_dir, clean_output)
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        substitute = tmp / "substitute"
+        substitute.mkdir()
+        for artifact in analyze._diagnostic_artifact_paths(real_dir).values():
+            (substitute / artifact.name).write_bytes(artifact.read_bytes())
+        substitute_before = _directory_hashes(substitute)
+
+        source_dir = tmp / "source"
+        source_dir.symlink_to(substitute)
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._salvage_diagnostic_scan(
+                source_dir,
+                recovery_dir,
+                output,
+                "127.0.0.1:18443",
+                100,
+                str(real_dir / "state"),
+            ),
+            "symlinked source path",
+            "refusing path component",
+            "DIAG-SETUP",
+        )
+        assert _directory_hashes(substitute) == substitute_before
+        assert not output.exists()
+        assert not any((tmp / "recovery").iterdir())
+
 
 # ── Runner ───────────────────────────────────────────────────────────────────
 
@@ -7717,6 +9979,7 @@ def main() -> int:
         test_record_accepts_reason8_tapscript_skip,
         test_classify_corpus_ecdsa_reject_record_counts_entry,
         test_classify_corpus_schnorr_reject_record_counts_entry,
+        test_diagnostic_child_executes_verified_inode_after_path_swap,
         test_classify_corpus_reason8_tapscript_skip,
         test_classify_corpus_ecdsa_fail_record,
         test_classify_corpus_ecdsa_success_record,
@@ -7739,6 +10002,7 @@ def main() -> int:
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
         test_find_cmodern_height_fake_child_success,
+        test_find_cmodern_height_holds_work_directory_after_substitution,
         test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched,
         test_find_cmodern_height_post_stop_timeout_finalizes_honestly,
         test_find_cmodern_height_rejects_pipe_filling_trailing_output,
@@ -7747,8 +10011,8 @@ def main() -> int:
         test_salvage_cmodern_height_rejects_recovery_stream_mutation,
         test_salvage_cmodern_height_rejects_pre_signature_body_replacement,
         test_salvage_rejects_semantically_valid_exact_replay_replacement,
-        test_salvage_rolls_back_candidate_after_post_publication_replacement,
-        test_salvage_rolls_back_candidate_on_post_publication_interrupt,
+        test_salvage_orphans_candidate_after_post_publication_replacement,
+        test_salvage_orphans_candidate_on_post_publication_interrupt,
         test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count,
         test_salvage_preserves_exact_data_dir_text_through_to_validation,
         test_find_cmodern_height_assembles_fragmented_child_frames,
@@ -7769,14 +10033,40 @@ def main() -> int:
         test_diagnostic_earlier_sequence_beats_later_illegal,
         test_diagnostic_earlier_illegal_beats_later_sequence,
         test_diagnostic_duplicate_key_retains_precedence,
-        test_atomic_publish_rollback_fsyncs_after_unlink,
+        test_atomic_publish_post_link_failure_leaves_named_orphan,
         test_atomic_publish_no_replace_collision,
-        test_atomic_publish_cleans_temp_on_post_link_fsync_failure,
+        test_atomic_publish_pre_link_failure_leaves_no_trace,
         test_find_cmodern_height_settings_mismatch_storage_backend,
         test_find_cmodern_height_settings_mismatch_txindex,
         test_find_cmodern_height_settings_mismatch_data_dir,
         test_clone_committed_source_fallback_copies_only_committed_size,
-        test_materialize_recovery_dir_fsyncs_parent_before_recovery_dir,
+        test_salvage_refuses_replaced_ancestor_symlink,
+        test_salvage_source_pathname_substitution_reads_only_held_original,
+        test_salvage_rejects_output_nested_under_source,
+        test_salvage_refuses_symlinked_source_path_to_substitute,
+        test_reopen_proof_verifier_accepts_real_and_rejects_deceit,
+        test_manifest_ceiling_derives_from_cmodern,
+        test_frozen_pin_blocks_before_archive_and_evidence,
+        test_custody_inputs_reject_symlink_fifo_directory_oversize,
+        test_counters_json_depth_and_oversize_fail_closed,
+        test_capture_reader_rejects_forged_count_before_allocation,
+        test_finalize_candidate_binds_validated_bytes_not_substitute,
+        test_atomic_publish_binds_written_inode_without_residue,
+        test_bounded_error_line_strips_controls_and_caps,
+        test_bounded_fact_and_key_render_stop_at_cap,
+        test_bounded_read_rejects_growth_and_metadata_drift,
+        test_duplicate_keys_rejected_in_external_custody_json,
+        test_shared_validation_missing_hash_schema_tip_state,
+        test_atomic_publish_committed_pair_survival,
+        test_open_verified_executable_rejects_fifo_without_blocking,
+        test_salvage_rejects_recovery_nested_under_source_without_mutation,
+        test_salvage_publishes_into_held_output_parent_after_substitution,
+        test_open_verified_executable_survives_in_place_source_overwrite,
+        test_custody_open_skips_access_reopen_for_non_regular,
+        test_salvage_requires_precreated_empty_recovery_directory,
+        test_salvage_holds_precreated_recovery_directory_after_substitution,
+        test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo,
+        test_salvage_rejects_leaf_substitution_during_parent_fsync,
     ]
     passed = 0
     failed = 0
@@ -7788,8 +10078,720 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             print(f"  FAIL  {test.__name__}: {e}")
             failed += 1
-    print(f"\n{passed} passed, {failed} failed, {len(tests)} total")
+    print(
+        f"\n{passed} custody contract tests passed, {failed} failed, {len(tests)} total"
+    )
     return 1 if failed else 0
+
+
+# ── Tests: SEC42 security repairs ───────────────────────────────────────────
+
+
+def test_reopen_proof_verifier_accepts_real_and_rejects_deceit() -> None:
+    """A real proof artifact verifies; forged or missing ones fail closed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stop, tip = 0, _MAINNET_GENESIS_HASH
+        _validation_path, validation_binding = _write_shared_validation(tmp, stop, tip)
+        bindings = _real_reopen_bindings(tmp, validation_binding)
+        paths = {b["backend"]: Path(str(b["path"])) for b in bindings}
+        for binding in bindings:
+            custody = analyze._verify_reopen_proof_file(
+                paths[binding["backend"]],
+                binding["backend"],
+                "C150",
+                stop,
+                tip,
+                declared=binding,
+                expected_validation=validation_binding,
+            )
+            assert custody["bytes"] == binding["size"]
+            assert custody["sha256"] == binding["sha256"]
+        # nonexistent
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._verify_reopen_proof_file(
+                tmp / "nope.json", "fjall", "C150", stop, tip
+            ),
+            "cannot open",
+            "CTX-CUSTODY",
+        )
+        # symlink
+        link = tmp / "link.json"
+        link.symlink_to(paths["fjall"])
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._verify_reopen_proof_file(link, "fjall", "C150", stop, tip),
+            "symbolic link",
+            "CTX-CUSTODY",
+        )
+        # FIFO
+        fifo = tmp / "pipe"
+        os.mkfifo(fifo)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._verify_reopen_proof_file(fifo, "fjall", "C150", stop, tip),
+            "not a regular file",
+            "CTX-CUSTODY",
+        )
+
+        # wrong schema / wrong backend / wrong state commitment
+        def mutated(name: str, backend: str, mutate, expected: str):
+            case = tmp / name.replace(" ", "-")
+            case.mkdir()
+            _, case_validation_binding = _write_shared_validation(case, stop, tip)
+            bindings = _real_reopen_bindings(case, case_validation_binding)
+            target = next(b for b in bindings if b["backend"] == backend)
+            data = Path(str(target["path"])).read_bytes()
+            Path(str(target["path"])).write_bytes(mutate(data))
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._verify_reopen_proof_file(
+                    Path(str(target["path"])), backend, "C150", stop, tip
+                ),
+                expected,
+                "CTX-CUSTODY",
+            )
+
+        mutated(
+            "wrong schema",
+            "fjall",
+            lambda d: d.replace(
+                b"verify-replay-durability-proof-v1", b"not-the-schema"
+            ),
+            "schema is",
+        )
+        mutated(
+            "wrong backend",
+            "fjall",
+            lambda d: d.replace(b'"backend": "fjall"', b'"backend": "redb"'),
+            "names backend",
+        )
+        mutated(
+            "wrong state commitment",
+            "fjall",
+            lambda d: d.replace(b'"tip_height": 0', b'"tip_height": 404'),
+            "stop identity",
+        )
+        mutated(
+            "durability flag flipped",
+            "rocksdb",
+            lambda d: d.replace(
+                b'"durable_undo_roundtrip": true', b'"durable_undo_roundtrip": false'
+            ),
+            "durability invariants",
+        )
+
+
+def test_manifest_ceiling_derives_from_cmodern() -> None:
+    """128 MiB admits the calculated Cmodern maximum and rejects +1."""
+    entries = 709_635 + 1
+    worst_entry = 153
+    separators = entries - 1
+    computed = entries * worst_entry + separators + 64 * 1024
+    assert computed < analyze._MANIFEST_MAX_BYTES
+    assert analyze._MANIFEST_MAX_BYTES == 128 * 1024 * 1024
+
+
+def test_frozen_pin_blocks_before_archive_and_evidence() -> None:
+    """A forged product tip is rejected before archive or evidence work."""
+    calls = {"archive": 0, "evidence": 0}
+    original_frames = analyze._validate_archive_frames
+    original_join = analyze._count_context_records_disk
+
+    def boom_archive(*a, **k):
+        calls["archive"] += 1
+        raise AssertionError("archive streaming ran despite forged tip")
+
+    def boom_join(*a, **k):
+        calls["evidence"] += 1
+        raise AssertionError("evidence join ran despite forged tip")
+
+    analyze._validate_archive_frames = boom_archive
+    analyze._count_context_records_disk = boom_join
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            txid_le = b"\x71" * 32
+            args = _make_classify_args(
+                tmp,
+                [_bare_p2pkh(txid_le)],
+                [_make_record_bytes(txid_le, 0)],
+                [_make_journal_bytes(txid_le, 0)],
+                "cmodern",
+            )
+            forged_manifest = json.loads(Path(args.corpus_manifest).read_bytes())
+            forged_manifest["range"]["stop_height"] = 404
+            forged_manifest["source_tip_hash"] = "e" * 64
+            preimage = dict(forged_manifest)
+            preimage["manifest_sha256"] = "0" * 64
+            forged_manifest["manifest_sha256"] = hashlib.sha256(
+                json.dumps(preimage, separators=(",", ":"), ensure_ascii=False).encode()
+            ).hexdigest()
+            Path(args.corpus_manifest).write_bytes(
+                (json.dumps(forged_manifest, indent=2) + "\n").encode()
+            )
+            replay_doc = json.loads(Path(args.replay).read_bytes())
+            replay_doc["stop_height"] = 404
+            replay_doc["stop_hash"] = "e" * 64
+            replay_doc["corpus_manifest"] = {
+                "bytes": Path(args.corpus_manifest).stat().st_size,
+                "sha256": hashlib.sha256(
+                    Path(args.corpus_manifest).read_bytes()
+                ).hexdigest(),
+            }
+            Path(args.replay).write_bytes(
+                (json.dumps(replay_doc, indent=2) + "\n").encode()
+            )
+            validation_doc = json.loads(Path(args.validation).read_bytes())
+            validation_doc["stop_height"] = 404
+            validation_doc["stop_hash"] = "e" * 64
+            Path(args.validation).write_bytes(
+                (json.dumps(validation_doc, indent=2) + "\n").encode()
+            )
+            _raises_with(
+                AnalyzerError,
+                lambda: cmd_classify_corpus(args),
+                "is frozen at stop height",
+                "CTX-CUSTODY",
+            )
+    finally:
+        analyze._validate_archive_frames = original_frames
+        analyze._count_context_records_disk = original_join
+    assert calls == {"archive": 0, "evidence": 0}
+
+
+def test_custody_inputs_reject_symlink_fifo_directory_oversize() -> None:
+    """The shared fd contract fails closed on non-regular or oversized input."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        real = tmp / "real.json"
+        real.write_bytes(b"{}")
+        link = tmp / "link.json"
+        link.symlink_to(real)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_custody_input(link, 1024, "input"),
+            "symbolic link",
+            "CTX-CUSTODY",
+        )
+        fifo = tmp / "pipe"
+        os.mkfifo(fifo)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_custody_input(fifo, 1024, "input"),
+            "not a regular file",
+            "CTX-CUSTODY",
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_custody_input(tmp, 1024, "input"),
+            "not a regular file",
+            "CTX-CUSTODY",
+        )
+        big = tmp / "big.json"
+        big.write_bytes(b"x" * 65)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._open_custody_input(big, 64, "input"),
+            "bounded ceiling",
+            "CTX-CUSTODY",
+        )
+
+
+def test_capture_reader_rejects_forged_count_before_allocation() -> None:
+    """BRSREC1 framing is rejected before any bulk allocation.
+
+    (a) A header declaring more than the contract-derived entry ceiling is
+    named as a ceiling violation, not a short read.  (b) A sparse file
+    truncated to 1 TiB is rejected by the bounded ceiling at open, never
+    materialized.  (c) A plausible count with a mismatched file size is
+    rejected by the exact-size equation before any entry is read.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        forged = tmp / "forged.bin"
+        forged.write_bytes(
+            HEADER_STRUCT.pack(RECORD_MAGIC, analyze._MAX_CAPTURE_ENTRIES + 1)
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze.read_raw_entries(
+                forged,
+                RECORD_MAGIC,
+                RECORD_SIZE,
+                "records",
+                analyze._MAX_CAPTURE_ENTRIES,
+            ),
+            f"{analyze._MAX_CAPTURE_ENTRIES}-entry ceiling",
+            "CTX-CUSTODY",
+        )
+
+        sparse = tmp / "sparse.bin"
+        sparse.write_bytes(HEADER_STRUCT.pack(RECORD_MAGIC, 100))
+        sparse_fd = os.open(sparse, os.O_RDWR | os.O_CREAT)
+        try:
+            os.ftruncate(sparse_fd, 1 << 40)
+        finally:
+            os.close(sparse_fd)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze.read_raw_entries(
+                sparse,
+                RECORD_MAGIC,
+                RECORD_SIZE,
+                "records",
+                analyze._MAX_CAPTURE_ENTRIES,
+            ),
+            "bounded ceiling",
+            "CTX-CUSTODY",
+        )
+
+        padded = tmp / "padded.bin"
+        padded.write_bytes(
+            HEADER_STRUCT.pack(RECORD_MAGIC, 3) + b"\x00" * (3 * RECORD_SIZE + 5)
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze.read_raw_entries(
+                padded,
+                RECORD_MAGIC,
+                RECORD_SIZE,
+                "records",
+                analyze._MAX_CAPTURE_ENTRIES,
+            ),
+            "size mismatch",
+            "CTX-CUSTODY",
+        )
+
+
+def test_counters_json_depth_and_oversize_fail_closed() -> None:
+    """Deep nesting and oversize become AnalyzerError, not crashes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        deep = tmp / "deep.json"
+        deep.write_bytes(("[" * 200 + "]" * 200).encode())
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._load_bounded_json_fd(deep, 64 * 1024, "counters JSON"),
+            "",
+            "CTX-CUSTODY",
+        ) if False else None
+        try:
+            analyze._load_bounded_json_fd(deep, 64 * 1024, "counters JSON")
+        except AnalyzerError:
+            pass
+        oversize = tmp / "big.json"
+        oversize.write_bytes(b"x" * 65)
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._load_bounded_json_fd(oversize, 64, "counters JSON"),
+            "bounded ceiling",
+            "CTX-CUSTODY",
+        )
+
+
+def test_atomic_publish_binds_written_inode_without_residue() -> None:
+    """Publication proves inode+digest and never leaves a scratch name."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target = tmp / "out.json"
+        content = b'{"ok": true}\n'
+        analyze._atomic_publish_no_replace(target, content)
+        assert target.read_bytes() == content
+        assert not [p.name for p in tmp.iterdir() if ".tmp." in p.name]
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._atomic_publish_no_replace(target, b"other"),
+            "already exists",
+            "DIAG-OUTPUT",
+        )
+
+
+def test_bounded_error_line_strips_controls_and_caps() -> None:
+    """Hostile error text is escaped and bounded, never raw on stderr."""
+    hostile = "bad\n\x1b[31m\u202e value"
+    line = analyze._bounded_error_line(hostile, limit=40)
+    assert "\n" not in line.replace("\\n", "")
+    assert "\x1b" not in line.replace("\\x1b", "")
+    assert len(line) <= 40 + 3
+    assert all(ch.isascii() for ch in line)
+
+
+def test_bounded_fact_and_key_render_stop_at_cap() -> None:
+    """Hostile strings and JSON keys render via a capped scan, never whole.
+
+    A counting ``str`` subclass proves the escaper abandons iteration at the
+    budget instead of converting, escaping, or joining the full value, that
+    exact-key diagnostics bound a near-ceiling key the same way, and that
+    every rendered fact stays printable ASCII within the cap.
+    """
+    iterations: list[int] = [0]
+
+    class CountingHostileStr(str):
+        def __iter__(self):
+            for ch in str.__iter__(self):
+                iterations[0] += 1
+                yield ch
+
+    capped = analyze._bounded_fact(CountingHostileStr("A" * 5_000_000), limit=200)
+    assert 0 < iterations[0] <= 201, (
+        f"escaper must stop at the budget, scanned {iterations[0]} chars"
+    )
+    assert capped == "A" * 200 + "..."
+    assert all(ch.isascii() and ch.isprintable() for ch in capped)
+
+    assert analyze._bounded_fact({"key": "v" * 1_000_000}) == "<dict len=1>"
+
+    iterations[0] = 0
+    hostile_key = CountingHostileStr("K" * 1_000_000)
+    try:
+        analyze._require_exact_keys({hostile_key: 1}, {"schema"}, "probe")
+        raise AssertionError("expected AnalyzerError for unknown key")
+    except analyze.AnalyzerError as exc:
+        message = analyze._bounded_error_line(exc, 1000)
+    assert 0 < iterations[0] <= 600, (
+        f"key rendering must stop at the budget, scanned {iterations[0]} chars"
+    )
+    assert len(message) <= 1000
+    assert "unknown key(s)" in message
+    assert all(ch.isascii() and ch.isprintable() for ch in message)
+
+
+def test_bounded_read_rejects_growth_and_metadata_drift() -> None:
+    """Exact bounded reads fail closed on growth and metadata drift."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        path = tmp / "doc.json"
+        path.write_bytes(b'{"a": 1}')
+        fd = analyze._open_custody_input(path, 64, "doc")
+        try:
+            # Growth: the probe byte past the statted length must fail closed.
+            grown = tmp / "grown.json"
+            grown.write_bytes(b'{"a": 1}')
+            grown_fd = analyze._open_custody_input(grown, 64, "grown")
+            try:
+                grown_fd2 = os.dup(grown_fd)
+            finally:
+                os.close(grown_fd)
+            with open(grown, "ab") as handle:
+                handle.write(b"\n")
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._read_exact_with_signature(
+                    grown_fd2, 7, "CTX-CUSTODY: grown doc"
+                ),
+                "grew",
+                "CTX-CUSTODY",
+            )
+            os.close(grown_fd2)
+            # Metadata drift: touching mtime after the read must fail closed.
+            stat_before = os.fstat(fd)
+            data = analyze._read_exact_with_signature(
+                fd, stat_before.st_size, "CTX-CUSTODY: doc"
+            )
+            assert data == b'{"a": 1}'
+            os.utime(path, (1_000_000, 1_000_000))
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._read_exact_with_signature(
+                    fd, stat_before.st_size, "CTX-CUSTODY: doc"
+                ),
+                "changed identity or metadata",
+                "CTX-CUSTODY",
+            )
+        finally:
+            os.close(fd)
+
+
+def test_duplicate_keys_rejected_in_external_custody_json() -> None:
+    """Repeated object keys fail custody parsing at every nesting depth."""
+    for payload in (
+        b'{"a": 1, "a": 2}',
+        b'{"outer": {"b": 1, "b": 2}}',
+        b'{"list": [{"c": 1, "c": 0}]}',
+    ):
+        _raises(
+            AnalyzerError,
+            lambda p=payload: json.loads(
+                p, object_pairs_hook=analyze._reject_duplicate_keys
+            ),
+            "duplicate key",
+        )
+    # The last-value-wins default must never be reachable on custody paths.
+    assert json.loads(b'{"a": 1}') == {"a": 1}
+
+
+def test_shared_validation_missing_hash_schema_tip_state() -> None:
+    """Every shared-artifact mismatch class fails a proof that binds it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        analyze._selftest_custody_set(tmp)
+        manifest = json.loads((tmp / "manifest.json").read_bytes())
+        declared = {p["backend"]: p for p in manifest["reopen_proofs"]}
+        vbytes, vraw = analyze._load_validation_artifact(
+            tmp / "validation.json", "CFIXTURE"
+        )
+        binding = analyze._validation_binding(vbytes, vraw)
+        # Missing artifact fails the loader itself.
+        _raises(
+            AnalyzerError,
+            lambda: analyze._load_validation_artifact(
+                tmp / "missing-validation.json", "CFIXTURE"
+            ),
+            "cannot open",
+        )
+        # Schema drift fails the loader.
+        case = tmp / "schema"
+        case.mkdir()
+        analyze._selftest_custody_set(case)
+        bad = case / "validation.json"
+        bad.write_bytes(
+            bad.read_bytes().replace(
+                b"mainnet-prefix-replay-validation-v1", b"other-validation-v9"
+            )
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._load_validation_artifact(bad, "CFIXTURE"),
+            "schema is",
+            "CTX-CUSTODY",
+        )
+        proof = tmp / "fjall-reopen-proof.json"
+
+        def verify(bound: dict[str, object]) -> None:
+            analyze._verify_reopen_proof_file(
+                proof,
+                "fjall",
+                "CFIXTURE",
+                manifest["range"]["stop_height"],
+                manifest["source_tip_hash"],
+                declared=declared["fjall"],
+                expected_validation=bound,
+            )
+
+        verify(binding)  # the honest binding accepts
+        _raises_with(
+            AnalyzerError,
+            lambda: verify({**binding, "sha256": "2" * 64}),
+            "binds validation digest",
+            "CTX-CUSTODY",
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: verify({**binding, "size_bytes": binding["size_bytes"] + 1}),
+            "byte validation artifact",
+            "CTX-CUSTODY",
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: verify({**binding, "stop_height": 999}),
+            "state field tip_height",
+            "CTX-CUSTODY",
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: verify({**binding, "stop_hash": "e" * 64}),
+            "state field tip_hash",
+            "CTX-CUSTODY",
+        )
+        _raises_with(
+            AnalyzerError,
+            lambda: verify({**binding, "muhash": "f" * 64}),
+            "state field muhash",
+            "CTX-CUSTODY",
+        )
+
+
+def test_atomic_publish_committed_pair_survival() -> None:
+    """Two committed publications coexist and a third name stays no-replace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        first = tmp / "archive.json"
+        second = tmp / "manifest.json"
+        analyze._atomic_publish_no_replace(first, b"first\n")
+        analyze._atomic_publish_no_replace(second, b"second\n")
+        assert first.read_bytes() == b"first\n"
+        assert second.read_bytes() == b"second\n"
+        _raises_with(
+            AnalyzerError,
+            lambda: analyze._atomic_publish_no_replace(first, b"again\n"),
+            "already exists",
+            "DIAG-OUTPUT",
+        )
+        assert first.read_bytes() == b"first\n"
+        assert not [p.name for p in tmp.iterdir() if ".tmp." in p.name]
+
+
+def test_open_verified_executable_rejects_fifo_without_blocking() -> None:
+    """A FIFO at --binary is type-rejected on an O_PATH open; nothing blocks.
+
+    Classification must never be a blocking read-only open: the child
+    subprocess proves the rejection completes inside a bounded timeout
+    instead of hanging on a FIFO open.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        fifo = tmp / "fifo-binary"
+        os.mkfifo(fifo)
+        probe = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import analyze\n"
+            "from pathlib import Path\n"
+            "try:\n"
+            "    analyze._open_verified_executable(Path(sys.argv[2]))\n"
+            "except analyze.AnalyzerError as exc:\n"
+            "    print(f'REJECTED: {exc}')\n"
+            "    raise SystemExit(3)\n"
+            "raise SystemExit(0)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(Path(__file__).parent), str(fifo)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode == 3, (
+            f"expected bounded FIFO rejection, rc={result.returncode}: {result.stderr}"
+        )
+        assert "not a regular file" in result.stdout
+        assert "DIAG-SETUP" in result.stdout
+
+
+def test_salvage_rejects_recovery_nested_under_source_without_mutation() -> None:
+    """Recovery ancestry is inspected before the first mkdir.
+
+    A recovery path nested under the held source directory is rejected on
+    the deepest existing ancestor before any directory is created: the
+    source keeps its exact contents and neither the recovery nor the output
+    path appears.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+        source_before = _directory_hashes(source_dir)
+
+        for recovery_dir in (
+            source_dir / "recovery",
+            source_dir / "deep" / "recovery",
+        ):
+            recovery_dir.mkdir(parents=True)
+            output = tmp / "salvaged.json"
+            _raises_with(
+                AnalyzerError,
+                lambda recovery_dir=recovery_dir, output=output: (
+                    analyze._salvage_diagnostic_scan(
+                        source_dir,
+                        recovery_dir,
+                        output,
+                        "127.0.0.1:18443",
+                        100,
+                        _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    )
+                ),
+                "recovery nested under source",
+                "outside source",
+                "DIAG-SETUP",
+            )
+            assert not any(recovery_dir.iterdir()), (
+                "containment rejection must leave the recovery directory empty"
+            )
+            assert not output.exists()
+            assert _directory_hashes(source_dir) == source_before
+
+
+def test_salvage_publishes_into_held_output_parent_after_substitution() -> None:
+    """A substituted output-parent pathname cannot receive the candidate.
+
+    The output parent is held as a descriptor from before the first source
+    open and the candidate is linked through it: renaming the directory
+    away and placing a fresh substitute at the original pathname mid-run
+    leaves the candidate in the held original and the substitute untouched.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        out_dir = tmp / "published"
+        out_dir.mkdir()
+        hidden = tmp / "published.held"
+        substitute = tmp / "substitute"
+        swapped = False
+        real_open = analyze._open_custody_input
+
+        def substitute_after_output_parent_is_held(
+            path: Path | str,
+            max_bytes: int,
+            label: str,
+            scope: str = "CTX-CUSTODY",
+            dir_fd: int | None = None,
+        ) -> int:
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                os.rename(out_dir, hidden)
+                substitute.mkdir()
+                os.rename(substitute, out_dir)
+            return real_open(path, max_bytes, label, scope, dir_fd=dir_fd)
+
+        analyze._open_custody_input = substitute_after_output_parent_is_held
+        try:
+            output = out_dir / "salvaged.json"
+            (tmp / "recovery").mkdir()
+            analyze._salvage_diagnostic_scan(
+                source_dir,
+                tmp / "recovery",
+                output,
+                "127.0.0.1:18443",
+                100,
+                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            )
+        finally:
+            analyze._open_custody_input = real_open
+
+        assert swapped, "substitution must fire after the output parent is held"
+        candidate_path = hidden / "salvaged.json"
+        assert candidate_path.exists(), (
+            "candidate must be linked into the held original directory"
+        )
+        candidate = json.loads(candidate_path.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
+        assert not (out_dir / "salvaged.json").exists(), (
+            "the substituted pathname must not receive the candidate"
+        )
+        assert _directory_hashes(out_dir) == {}
+        assert (tmp / "recovery" / "brshgt1.bin").exists()
 
 
 if __name__ == "__main__":

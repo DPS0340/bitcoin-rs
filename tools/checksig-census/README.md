@@ -116,6 +116,37 @@ python3 analyze.py find-cmodern-height \
 
 The candidate is diagnostic evidence, not a certifying corpus. A terminal checkpoint binds the selected height and hash to the committed stream row counts and byte endpoints. The child can finish those writes before its process teardown completes. Schema `cmodern-candidate-diagnostic-v2` therefore records `child_exit_status`, `child_teardown`, and `salvaged_from` separately instead of reporting a forced kill as a clean exit.
 
+`--binary` is classified on an `O_PATH|O_NOFOLLOW` descriptor — an open
+that can neither block on a FIFO nor side-effect a device — and only a
+regular executable file of at most 1 GiB is reopened read-only
+(`O_NONBLOCK`) through that descriptor's pinned `/proc/self/fd` path, which
+must still carry the classified inode's identity. The verified bytes are
+then copied into a `memfd_create(MFD_ALLOW_SEALING)` snapshot, made
+executable, and locked with `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`
+before the seals are read back and the snapshot — not the source inode —
+is hashed. Every child launch executes that held sealed descriptor through
+`/proc/self/fd`, so a binary overwritten in place or swapped at its
+pathname after verification is never run.
+
+After the controller anchors the work directory, every live diagnostic
+filesystem effect is relative to that one held descriptor: the `state`
+directory and sidecar are created through it, the child inherits it and
+receives only `/proc/self/fd/<work-fd>/...` paths for its state and
+evidence files, and the streams, replay document, and counters are
+acquired, validated, hashed, patched, and fsynced through descriptors
+anchored there. The original operator pathname text remains display and
+provenance only — it is never resolved again for live I/O. A principal
+able to rename the anchored directory and plant a substitute can no
+longer move any effect or any accepted byte: a deterministic regression
+(`test_find_cmodern_height_holds_work_directory_after_substitution`)
+renames and substitutes the pathname right after anchor admission and
+proves the substitute stays empty while the held original receives the
+state, evidence, and custody digests. What is outside the threat model:
+same-authority mutation of entries inside the protected directory after
+anchoring (a principal already permitted to mutate the held directory
+can create or replace entries directly), and no pathname-namespace
+atomicity is claimed for the protected directory itself.
+
 If the child wrote the terminal checkpoint but did not exit before the controller deadline, preserve the failed work directory and recover into new paths:
 
 ```bash
@@ -124,14 +155,38 @@ python3 analyze.py salvage-cmodern-height \
   --recovery-dir "$EXP/out/cmodern-recovery" \
   --rest-url 127.0.0.1:18443 \
   --stop-height 961741 \
-  --data-dir "$EXP/out/cmodern-diagnostic/state" \
+  --data-dir '/proc/self/fd/<work-fd>/state' \
   --storage-backend fjall \
   --output "$EXP/out/cmodern-candidate.json"
 ```
 
-Salvage opens every source artifact once and keeps those descriptors open through publication. It validates each checkpoint-committed slice and hashes the source streams during that same pass. It reflink-clones or copies the files into the new recovery directory, truncates each stream at its committed endpoint, and resets only the recovery sidecar header. `source_full_file_custody` records a direct full-file SHA-256 and `clone_provenance` (`EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`) for every source. Stream entries also record the committed-prefix SHA-256. Final validation hashes the recovery streams and requires those hashes to equal the source committed-prefix hashes. The source paths, bytes, and metadata must remain unchanged until the candidate is published.
+Salvage opens every source artifact once and keeps those descriptors open through publication. It validates each checkpoint-committed slice and hashes the source streams during that same pass. It reflink-clones or copies the files into the pre-created recovery directory, truncates each stream at its committed endpoint, and resets only the recovery sidecar header. `source_full_file_custody` records a direct full-file SHA-256 and `clone_provenance` (`EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`) for every source. Stream entries also record the committed-prefix SHA-256. Final validation hashes the recovery streams and requires those hashes to equal the source committed-prefix hashes. The source paths, bytes, and metadata must remain unchanged until the candidate is published.
+The sidecar descriptor is retained through count patch, validation, hash,
+and publication, so no salvage step re-opens a custody path.
 
-`--rest-url` comes from the original controller command. The child replay JSON does not contain that value, so salvaged candidates label it `operator_supplied_original_argv`. `--data-dir` must match the exact string in `replay_diagnostic.json`. Do not resolve or rewrite it.
+Recovery writes are anchored, not pathname-addressed, and salvage never
+creates recovery directories: `--recovery-dir` must already exist, be
+empty, and live on the same filesystem mount as the source. The directory
+is opened through a component-wise no-follow held descriptor (symlinked
+ancestors and a symlinked final component are refused at open), the held
+descriptor is re-proved against a no-follow re-stat of the leaf pathname,
+emptiness is required, containment against the held source identity is
+rejected before any write, and ancestors are never re-followed after the
+anchor is taken. The output parent is taken and containment-checked the
+same way, and the source, output-parent, and recovery directories must
+share the source's mount (`mnt_id` from `/proc/self/fdinfo`) before the
+first mutation; cross-mount custody fails closed. The output parent is
+held through publication: immediately before the candidate is linked, its
+ancestry is rechecked against the held source identity and the link is
+made through that descriptor; the published descriptor stays live through
+the parent-directory fsync and a final no-follow re-stat of the leaf
+rejects any substitution racing that sync. Failed runs leave the
+candidate and recovery evidence in place as named orphans reported on
+stderr for operator cleanup. Recovery and output paths must therefore be
+fully resolved real directories; missing, non-empty, substituted, or
+cross-mount recovery directories and missing output parents fail closed.
+
+`--rest-url` comes from the original controller command. The child replay JSON does not contain that value, so salvaged candidates label it `operator_supplied_original_argv`. `--data-dir` must match the exact descriptor-backed child argv string recorded in `replay_diagnostic.json`; salvage preserves that authenticated literal verbatim and never resolves, rewrites, or reopens it. That value is historical text — the inherited `/proc/self/fd/<work-fd>/state` transport path of the live child is dead once the child exits — so salvage treats it as inert authenticated provenance text only.
 
 ### Run A — authoritative C150 cumulative evidence
 
@@ -163,6 +218,7 @@ python3 analyze.py classify-corpus \
   --records out/c150.records.bin \
   --journal out/c150.journal.bin \
   --replay out/c150.replay.json \
+  --validation out/c150.validation.json \
   --corpus-manifest "$C150/manifest.json" \
   --archive "$C150/blocks.dat" \
   --output out/c150.classification.json \
@@ -228,6 +284,167 @@ classes. A certifying result has `all_passed: true`, `cmodern_frozen: true`, and
 `cmodern_passed: true`. Here, `cmodern_frozen` means the product tip is fixed;
 only `cmodern_passed` records successful corpus certification.
 
+
+## Corpus custody contract (manifest v2)
+
+Every product corpus export is bound by a `bitcoin-rs-corpus-manifest` v2
+JSON published by `export_active_chain_corpus` (crates/node). The manifest is
+only valid when every custody binding is present and consistent; consumers
+fail closed on any missing or mismatched field.
+
+### Required bindings
+
+| Field | Meaning |
+|---|---|
+| `schema` / `version` | `bitcoin-rs-corpus-manifest` / `2` |
+| `corpus_id` | `C150` or `Cmodern`; the census classifier binds it to `--contract` |
+| `core_version` | Bitcoin Core version the source chain was exported from (e.g. `31.1.0`) |
+| `exporter` | `bitcoin-rs-active-chain-exporter` / `1` |
+| `checksig_census` | `classify-corpus-v2` / `2`; the consumer schema the manifest is bound to |
+| `reopen_proofs` | exactly one real `verify-replay-durability-proof-v1` artifact per backend (`fjall`, `rocksdb`, `redb`), each bound by `path` plus the measured `size` and `sha256` of that file |
+| `manifest_sha256` | SHA-256 of the canonical preimage: the same compact JSON with `manifest_sha256` zeroed |
+| `source_tip_hash` | displayed hash of the final entry; must equal the replay `stop_hash` |
+| `network` / `network_magic` / `genesis_hash` / `range` / `archive` / `entries` | unchanged from v1 |
+
+Publication order is crash-safe and inode-bound: each output is written to
+an anonymous `O_TMPFILE` scratch inode (no intermediate directory entry),
+fsynced, and installed with `linkat(AT_EMPTY_PATH)` against a retained
+parent-directory descriptor — archive first, manifest second, no-replace.
+After each link the final path is reopened `O_NOFOLLOW` and its device,
+inode, and content digest are proven equal to the written object before the
+directory fsync. A substituted scratch name cannot exist and a substituted
+final file cannot pass the proof. A manifest therefore can never exist
+without the archive bytes it binds. The converse is possible by design: a
+crash or manifest-publish failure after the archive publish leaves a final
+orphan `blocks.dat` with no manifest. That orphan is uncertifiable (no
+manifest = no corpus), and no-clobber publication deliberately blocks a
+blind rerun from overwriting it. Recovery is a manual, operator-verified
+step: confirm no `manifest.json` exists, confirm the file belongs to the
+failed run, confirm no certification or replay record references it, then
+delete the orphan before re-exporting. There are no scratch `.tmp.` names
+to clean up: failed publications leave nothing on disk.
+
+Every custody input is opened under one descriptor contract —
+`O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`, proven a regular file via
+`fstat`, bounded per format, then read, hashed, and parsed from that same
+descriptor — so a path swapped between stat and open cannot split what is
+recorded from what is parsed. Manifests are additionally bounded by a
+shared 128 MiB ceiling derived from the Cmodern entry count (709,636
+entries at a worst-case 153-byte rendering), enforced by the exporter
+before publication and by both loaders before allocation.
+
+Finalization inherits that same one-descriptor rule: the digest a published
+candidate records for the child replay and counters documents is computed
+from the exact bytes their validators approved — the custody paths are
+never re-opened after validation — and the BRSHGT1 sidecar descriptor is
+retained through count patch, terminal validation, hashing, and
+publication.
+
+### Guarded export
+
+Disk discipline — declare before exporting, verify on a fixed cadence:
+
+- Worst-case footprint: archive bytes plus manifest plus one sibling temp copy
+  of each during publication. C150 is exactly 688,584,209 archive bytes plus
+  a ~18 MB manifest; declare 1.5 GiB. Cmodern has no measured size yet;
+  declare 750 GiB as the working ceiling until an export records its true
+  size in the manifest.
+- Reserve threshold: free space must exceed the declared footprint plus
+  a fixed 32 GiB reserve before starting.
+- Free-space cadence: check `df` before the run, at every 50 GiB written
+  (every 10% for C150), before the manifest publish, and after completion.
+  If free space falls under the reserve, abort and delete only this run's
+  `.tmp.` siblings.
+
+Export from a quiesced, synchronized node (the exporter refuses to overwrite
+existing outputs and requires the full custody binding set):
+
+```bash
+export_active_chain_corpus \
+  --data-dir /path/to/node \
+  --storage-backend fjall \
+  --network mainnet \
+  --stop-height 150000 \
+  --corpus-id C150 \
+  --core-version 31.1.0 \
+  --validation /abs/validation.json \
+  --reopen-proof fjall=/abs/proof-fjall.json \
+  --reopen-proof rocksdb=/abs/proof-rocksdb.json \
+  --reopen-proof redb=/abs/proof-redb.json \
+  --archive /abs/blocks.dat \
+  --manifest /abs/manifest.json
+```
+
+`--rest-url` may replace `--data-dir`/`--storage-backend` when exporting
+through Bitcoin Core's REST interface instead of node storage.
+
+### Guarded reopen
+
+A manifest cannot be accepted without real reopen proof custody. The proofs
+are the actual `verify-replay-durability-proof-v1` artifacts produced by
+`verify_replay_durability` (`proof-fjall.json`, `proof-rocksdb.json`,
+`proof-redb.json`); the exporter opens each one, verifies its backend,
+successful durable reorg, product identity, and state commitment, and binds
+its measured size and SHA-256. Every proof must bind one shared
+`mainnet-prefix-replay-validation-v1` artifact (`--validation PATH`, one
+per export): the exporter loads it once under the bounded-read contract and
+each proof is checked against its exact size, SHA-256, and committed state
+(stop height/hash, muhash, UTXO hash, UTXO count, total amount), so three
+proofs can never each bind a different state. The census classifier takes
+the same shared artifact (`--validation PATH`), re-derives size and digest
+from its own descriptors, and rejects any proof whose binding or state
+disagrees with it.
+
+Publication uses one crash-safe path: bytes are written to a scratch inode
+with no directory entry, fsynced, linked into a retained parent-directory
+descriptor without replacing any existing entry, re-proven through a
+dirfd-relative no-follow reopen (device, inode, streamed digest over a
+fixed 1 MiB buffer), and made durable by a directory fsync. Multi-entry
+publications run under a guard that never pathname-unlinks a published
+entry: an inode verified through a descriptor can be redirected by a
+concurrent rename before an unlink lands, which would delete a
+substitute. A publication that does not complete therefore leaves its
+linked entries in place as named orphans — reported for operator cleanup —
+and the manifest, the durable integrity contract, is always published
+last. SIGKILL and power loss cannot run that guard either, so a complete
+orphan archive can survive them for the same reason.
+
+The census classifier requires the same
+three artifacts by path (`--reopen-proof backend=path`), re-derives size
+and digest from its own descriptors, and rejects any mismatch with the
+manifest. Re-verify the artifacts before and after any campaign step:
+
+```bash
+sha256sum /abs/proof-fjall.json /abs/proof-rocksdb.json /abs/proof-redb.json
+```
+
+The census classifier independently rejects custody drift in one invocation:
+wrong `corpus_id` for `--contract`, non-mainnet manifests, frozen
+stop-height/tip drift (enforced immediately after manifest structure
+validation, before any archive streaming, scratch creation, or evidence
+parsing), v1 manifests, missing/duplicate/unknown backend proofs, proofs
+that are missing, symlinks, FIFOs, wrong-schema, wrong-backend, wrong-state,
+wrong-size, or wrong-hash artifacts, artifacts whose shared validation
+binding (exact bytes or committed state) disagrees with the one
+`--validation` artifact, missing, symlinked, wrong-schema, or zero-hash
+validation artifacts, zero digests (proof, archive, or manifest), out-of-range
+payload lengths, duplicate entry hashes, duplicate
+JSON keys, and archive or manifest digest mismatches all fail with a
+`CTX-CUSTODY` error before any counting runs. The synthetic
+acceptance/rejection matrix is exercised by:
+
+```bash
+python3 analyze.py custody-selftest
+```
+
+### Product corpus status
+
+No C150 or Cmodern product export exists under this contract. The manifest
+v2 custody machinery, the guarded export command, and the fail-closed census
+validation are delivered; generating and certifying the two product corpora
+(archive bytes, manifests, reopen proofs, and census runs bound to them)
+remains pending external execution.
+
 ### Run B — KSPIKE1 capture (counters + journal + records, run twice)
 
 ```bash
@@ -274,6 +491,14 @@ python3 analyze.py validate-capture \
 
 Checks INV-1 through INV-11 and INV-13 (count-repeat equivalence).
 Writes `kspike1.records.sorted.bin` (sorted by spend_txid, input_index, op_seq).
+
+Capture readers are bounded before they allocate: each BRSREC1/BRSJRN1 file
+is opened no-follow under the custody fd contract, the 16-byte header is
+validated alone (magic, then declared count ≤ 2,868,199 — the frozen C150
+full-capture entry ceiling), and the file size must equal
+`16 + count × 224` (records) or `16 + count × 56` (journal) exactly —
+byte ceilings of ≈613 MiB and ≈153 MiB. A forged count, a sparse-file size
+lie, or trailing bytes is rejected before any bulk read or list allocation.
 
 ### Run C — bare-secp per-attempt timing (native mode 0)
 
@@ -377,6 +602,7 @@ python3 analyze.py classify-corpus \
   --records out/c150.records.bin \
   --journal out/c150.journal.bin \
   --replay out/c150.replay.json \
+  --validation out/c150.validation.json \
   --corpus-manifest "$C150/manifest.json" \
   --archive "$C150/blocks.dat" \
   --output out/c150.classification.json \
@@ -523,6 +749,22 @@ Untimed durability verification (`crates/node/examples/verify_replay_durability.
   - `proof-redb.json`: size 1,223 B, SHA256 `40a585ff8f1c146b7899f5d62a91d7ce487b9c43ac307d1a1f11e792519b917d`
 
 Every backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, checkpoint generation 2, two reopens, and exact invariant equality (`before == after`).
+
+The verifier anchors `--data-dir` once with a no-follow directory
+descriptor, records its device and inode, and resolves all three state
+opens through that held descriptor via `/proc/self/fd` — so a pathname
+swapped in mid-run cannot substitute a store, and a pathname re-open that
+resolves elsewhere is rejected on device/inode identity. The held anchor
+is re-verified across the destructive reorg. Prove the property on any
+host without a store:
+
+```bash
+cargo run -p bitcoin-rs-node --example verify_replay_durability -- --self-test-anchor
+```
+
+It prints `ANCHOR-SELF-TEST-OK` after swapping the pathname for a
+substitute and proving the held anchor still reads and writes the
+original directory while the substitute is rejected.
 
 ## Binary formats
 

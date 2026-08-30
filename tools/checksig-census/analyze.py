@@ -19,8 +19,8 @@ import json
 import math
 import os
 import re
-import shutil
 import sqlite3
+import stat as stat_module
 import statistics
 import struct
 import subprocess
@@ -52,6 +52,18 @@ HEADER_SIZE = 16
 
 EXPECTED_FFI_VERIFY_ENTRIES_FULL = 2_868_199
 EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1 = 159_259
+
+# The largest recognized capture is the frozen C150 full run; KSPIKE1's
+# 159,259 entries are a strict subset of it. Every BRSREC1/BRSJRN1 reader
+# refuses a declared count above this ceiling before allocating anything,
+# which bounds a records file to HEADER_SIZE + 2,868,199 × 224 bytes and a
+# journal to HEADER_SIZE + 2,868,199 × 56.
+_MAX_CAPTURE_ENTRIES = EXPECTED_FFI_VERIFY_ENTRIES_FULL
+_BINARY_MAX_BYTES = 1 << 30
+"""Child-executable custody ceiling: the same 1 GiB bound the benchmark
+custody docs pin for binary artifacts."""
+_DIAGNOSTIC_ARTIFACT_MAX_BYTES = 1 << 32
+"""Bound for every retained diagnostic stream and sidecar artifact."""
 
 COUNTER_NAMES: list[str] = [
     "verify_script_calls",
@@ -111,12 +123,14 @@ CONTEXT_COUNTER_DEFINITIONS: dict[str, str] = {
     "tapscript_checksigadd_checks": "BRSREC1 executed-operation records with sig_version TAPSCRIPT and op_kind CHECKSIGADD",
 }
 
-MULTISIG_ELIGIBLE_CONTEXTS: frozenset[SpendContext] = frozenset((
-    SpendContext.BARE,
-    SpendContext.P2SH,
-    SpendContext.NATIVE_WITNESS_V0,
-    SpendContext.P2SH_WRAPPED_WITNESS_V0,
-))
+MULTISIG_ELIGIBLE_CONTEXTS: frozenset[SpendContext] = frozenset(
+    (
+        SpendContext.BARE,
+        SpendContext.P2SH,
+        SpendContext.NATIVE_WITNESS_V0,
+        SpendContext.P2SH_WRAPPED_WITNESS_V0,
+    )
+)
 HEADER_STRUCT = struct.Struct("<8sQ")
 RECORD_STRUCT = struct.Struct("<32sIIBBBBBBBB32s72s65s7s")
 JOURNAL_STRUCT = struct.Struct("<32sIIIIIB3s")
@@ -132,15 +146,11 @@ MAINNET_GENESIS_HASH = (
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 )
 C150_STOP_HEIGHT = 150_000
-C150_STOP_HASH = (
-    "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
-)
+C150_STOP_HASH = "0000000000000a3290f20e75860d505ce0e948a1d1d846bec7e39015d242884b"
 # The recovered diagnostic candidate selects this product tip. It does not
 # certify a corpus. Certification still requires a fresh file-bound replay.
 CMODERN_STOP_HEIGHT = 709_635
-CMODERN_STOP_HASH = (
-    "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
-)
+CMODERN_STOP_HASH = "00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f"
 
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
@@ -174,16 +184,16 @@ def _require_non_bool_int(value: object, field: str) -> int:
     return value
 
 
-def _require_exact_keys(
-    d: dict[str, object], expected: set[str], label: str
-) -> None:
+def _require_exact_keys(d: dict[str, object], expected: set[str], label: str) -> None:
     """Reject unknown or missing keys in *d* against *expected*."""
     actual = set(d.keys())
     unknown = actual - expected
     if unknown:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: {label} has unknown key(s): {sorted(unknown)}"
-        )
+        listed = sorted(unknown)
+        shown = ", ".join(_bounded_fact(key) for key in listed[:4])
+        if len(listed) > 4:
+            shown += f", +{len(listed) - 4} more"
+        raise AnalyzerError(f"CTX-CUSTODY: {label} has unknown key(s): [{shown}]")
     missing = expected - actual
     if missing:
         raise AnalyzerError(
@@ -205,13 +215,13 @@ def _require_u64(value: object, field: str) -> int:
     """Validate a u64 (0 ..= 2**64-1)."""
     v = _require_non_bool_int(value, field)
     if v < 0 or v > 0xFFFFFFFFFFFFFFFF:
-        raise AnalyzerError(
-            f"CTX-CUSTODY: {field} must be u64, got {v}"
-        )
+        raise AnalyzerError(f"CTX-CUSTODY: {field} must be u64, got {v}")
     return v
 
 
-def _require_custody_ref(value: object, label: str, *, with_schema: bool = False) -> dict[str, object]:
+def _require_custody_ref(
+    value: object, label: str, *, with_schema: bool = False
+) -> dict[str, object]:
     """Validate a custody reference object (path/bytes/sha256, optionally schema/version)."""
     if not isinstance(value, dict):
         raise AnalyzerError(f"CTX-CUSTODY: {label} must be an object")
@@ -235,8 +245,10 @@ def _require_custody_ref(value: object, label: str, *, with_schema: bool = False
                 f"expected 'bitcoin-rs-corpus-manifest'"
             )
         version = _require_int_field(value["version"], f"{label}.version")
-        if version != 1:
-            raise AnalyzerError(f"CTX-CUSTODY: {label}.version must be 1, got {version}")
+        if version != 2:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: {label}.version must be 2, got {version}"
+            )
         result["schema"] = schema
         result["version"] = version
     return result
@@ -311,6 +323,7 @@ class Counters:
         self.journal_count: int = raw["journal_count"]
         self.context_count: int = raw["context_count"]
 
+
 class Record:
     """Parsed 224-byte record."""
 
@@ -366,16 +379,26 @@ class Record:
             and self.pubkey == b"\x00" * 65
         )
         if self.pubkey_len > 65 and not _is_exact_over_capacity_reject:
-            raise AnalyzerError(f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65")
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record pubkey_len {self.pubkey_len} exceeds 65"
+            )
         # ── Canonical field-range validation ──
         if self.op_kind > 5:
-            raise AnalyzerError(f"CTX-OPERATIONS: record op_kind {self.op_kind} exceeds 5")
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record op_kind {self.op_kind} exceeds 5"
+            )
         if self.sig_version > 3:
-            raise AnalyzerError(f"CTX-OPERATIONS: record sig_version {self.sig_version} exceeds 3")
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record sig_version {self.sig_version} exceeds 3"
+            )
         if self.outcome > 2:
-            raise AnalyzerError(f"CTX-OPERATIONS: record outcome {self.outcome} exceeds 2")
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record outcome {self.outcome} exceeds 2"
+            )
         if self.reject_reason > 8:
-            raise AnalyzerError(f"CTX-OPERATIONS: record reject_reason {self.reject_reason} exceeds 8")
+            raise AnalyzerError(
+                f"CTX-OPERATIONS: record reject_reason {self.reject_reason} exceeds 8"
+            )
         # Canonical outcome/reject combinations:
         # outcome 0/1 (post-verification) must not carry a reject reason.
         # outcome 2 (pre-verification reject) must have a valid reason and no sighash.
@@ -395,12 +418,12 @@ class Record:
                 )
             # ── Reject-family compatibility: exact native emission ──
             _is_ecdsa_rec = self.sig_version in (0, 1) and self.op_kind in (1, 2, 3, 4)
-            _is_schnorr_rec = (
-                (self.sig_version == 2 and self.op_kind in (1, 2, 5))
-                or (self.sig_version == 3 and self.op_kind == 0)
+            _is_schnorr_rec = (self.sig_version == 2 and self.op_kind in (1, 2, 5)) or (
+                self.sig_version == 3 and self.op_kind == 0
             )
             _is_tapscript_skip = (
-                self.sig_version == 2 and self.op_kind in (1, 2, 5)
+                self.sig_version == 2
+                and self.op_kind in (1, 2, 5)
                 and self.der_len == 0
             )
             if self.reject_reason in (1, 2, 3):
@@ -418,15 +441,14 @@ class Record:
                         f"or sig_version 3 op 0), got sig_version "
                         f"{self.sig_version}, op_kind {self.op_kind}"
                     )
-            elif self.reject_reason == 8:
-                if not _is_tapscript_skip:
-                    raise AnalyzerError(
-                        f"CTX-OPERATIONS: reject_reason 8 requires Tapscript "
-                        f"skipped call (sig_version 2, op_kind 1/2/5, "
-                        f"empty signature), got sig_version "
-                        f"{self.sig_version}, op_kind {self.op_kind}, "
-                        f"der_len {self.der_len}"
-                    )
+            elif self.reject_reason == 8 and not _is_tapscript_skip:
+                raise AnalyzerError(
+                    f"CTX-OPERATIONS: reject_reason 8 requires Tapscript "
+                    f"skipped call (sig_version 2, op_kind 1/2/5, "
+                    f"empty signature), got sig_version "
+                    f"{self.sig_version}, op_kind {self.op_kind}, "
+                    f"der_len {self.der_len}"
+                )
         if self.der_len > 72:
             # The native instrumented kernel stores the original vchSig length in
             # der_len but only copies up to 72 bytes into the fixed-size der_sig
@@ -446,7 +468,7 @@ class Record:
             raise AnalyzerError(
                 f"CTX-OPERATIONS: record der_sig has non-zero padding beyond der_len={self.der_len}"
             )
-        if self.pubkey[self.pubkey_len:] != b"\x00" * (65 - self.pubkey_len):
+        if self.pubkey[self.pubkey_len :] != b"\x00" * (65 - self.pubkey_len):
             raise AnalyzerError(
                 f"CTX-OPERATIONS: record pubkey has non-zero padding beyond pubkey_len={self.pubkey_len}"
             )
@@ -499,7 +521,6 @@ class JournalEntry:
         return (self.spend_txid, self.input_index)
 
 
-
 # ── Canonical BRSREC1 interpretation (shared by disk classifier and diagnostic scanner)
 
 
@@ -508,9 +529,18 @@ class JournalEntry:
 _RECORD_COUNTER_RULES: list[tuple[str, list[tuple[int, int, str]]]] = [
     ("bare_multisig_checks", [(3, 0, "bare"), (4, 0, "bare")]),
     ("p2sh_multisig_checks", [(3, 0, "p2sh"), (4, 0, "p2sh")]),
-    ("native_witness_v0_multisig_checks", [(3, 1, "native_witness_v0"), (4, 1, "native_witness_v0")]),
-    ("p2sh_wrapped_witness_v0_multisig_checks", [(3, 1, "p2sh_wrapped_witness_v0"), (4, 1, "p2sh_wrapped_witness_v0")]),
-    ("tapscript_schnorr_checks", [(5, 2, "tapscript"), (1, 2, "tapscript"), (2, 2, "tapscript")]),
+    (
+        "native_witness_v0_multisig_checks",
+        [(3, 1, "native_witness_v0"), (4, 1, "native_witness_v0")],
+    ),
+    (
+        "p2sh_wrapped_witness_v0_multisig_checks",
+        [(3, 1, "p2sh_wrapped_witness_v0"), (4, 1, "p2sh_wrapped_witness_v0")],
+    ),
+    (
+        "tapscript_schnorr_checks",
+        [(5, 2, "tapscript"), (1, 2, "tapscript"), (2, 2, "tapscript")],
+    ),
     ("tapscript_checksigadd_checks", [(5, 2, "tapscript")]),
 ]
 
@@ -671,7 +701,9 @@ def _diagnostic_record_counts(
     return counts, op_seq_by_identity
 
 
-def _record_legality_message(error: str, op_name: str, sig_name: str, identity: str) -> str:
+def _record_legality_message(
+    error: str, op_name: str, sig_name: str, identity: str
+) -> str:
     """Human-readable message for a BRSREC1 legality error code."""
     if error == "multisig_sig":
         return f"multisig record must have sig_version BASE or WITNESS_V0, got {sig_name} for {identity}"
@@ -715,6 +747,8 @@ def _diagnostic_counter_totals(
     spend_counts = _diagnostic_spend_counts(classified)
     record_counts, _ = _diagnostic_record_counts(records, context_map)
     return {**spend_counts, **record_counts}
+
+
 def _accumulate_block_counts(
     block_counts: dict[str, int],
     height: int,
@@ -726,9 +760,6 @@ def _accumulate_block_counts(
         cumulative_counts[name] += block_counts[name]
         if block_counts[name] > 0 and name not in first_heights:
             first_heights[name] = height
-
-
-
 
 
 # ── Cmodern diagnostic checkpoint protocol
@@ -781,8 +812,6 @@ class DiagnosticReconstruction(NamedTuple):
     source_stream_digests: dict[str, DiagnosticStreamDigests]
 
 
-
-
 def _read_exact_stream(stream: BinaryIO, length: int, field: str) -> bytes:
     """Read exactly *length* bytes from the child protocol stream.
 
@@ -822,7 +851,9 @@ def _read_diagnostic_preface(stream: BinaryIO) -> None:
     if version != DIAGNOSTIC_VERSION:
         raise AnalyzerError(f"DIAG-PROTO: unsupported protocol version {version}")
     if row_size != DIAGNOSTIC_ROW_SIZE:
-        raise AnalyzerError(f"DIAG-PROTO: unsupported row size {row_size}, expected {DIAGNOSTIC_ROW_SIZE}")
+        raise AnalyzerError(
+            f"DIAG-PROTO: unsupported row size {row_size}, expected {DIAGNOSTIC_ROW_SIZE}"
+        )
 
 
 def _read_checkpoint_row(stream: BinaryIO) -> DiagnosticCheckpoint:
@@ -868,65 +899,28 @@ def _write_brshgt1_row(fd: int, row: DiagnosticCheckpoint) -> None:
     os.fsync(fd)
 
 
-def _patch_brshgt1_count(sidecar_path: Path, count: int) -> None:
-    """Patch the row count in the sidecar header, fsync, then sync parent dir."""
-    fd = os.open(sidecar_path, os.O_RDWR)
-    try:
-        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
-        if len(header) != BRSHGT1_HEADER_STRUCT.size:
-            raise AnalyzerError("DIAG-SIDECAR: cannot read header for count patch")
-        magic, _old = BRSHGT1_HEADER_STRUCT.unpack(header)
-        if magic != DIAGNOSTIC_MAGIC:
-            raise AnalyzerError("DIAG-SIDECAR: wrong magic while patching count")
-        os.pwrite(fd, struct.pack("<Q", count), 8)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    dir_fd = os.open(sidecar_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+def _patch_brshgt1_count(sidecar_fd: int, count: int, parent_dirfd: int) -> None:
+    """Patch the row count through retained sidecar and parent descriptors."""
+    header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: cannot read header for count patch")
+    magic, _old = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError("DIAG-SIDECAR: wrong magic while patching count")
+    os.pwrite(sidecar_fd, struct.pack("<Q", count), 8)
+    os.fsync(sidecar_fd)
+    os.fsync(parent_dirfd)
 
 
-def _brshgt1_count(sidecar_path: Path) -> int:
-    """Return the declared row count from a finalized BRSHGT1 sidecar."""
-    fd = os.open(sidecar_path, os.O_RDONLY)
-    try:
-        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
-        if len(header) != BRSHGT1_HEADER_STRUCT.size:
-            raise AnalyzerError("DIAG-SIDECAR: short header")
-        magic, count = BRSHGT1_HEADER_STRUCT.unpack(header)
-        if magic != DIAGNOSTIC_MAGIC:
-            raise AnalyzerError("DIAG-SIDECAR: wrong magic")
-        return count
-    finally:
-        os.close(fd)
-
-
-def _open_brshgt1_read_fd(sidecar_path: Path) -> int:
-    """Open a BRSHGT1 sidecar and validate its preface/header."""
-    fd = os.open(sidecar_path, os.O_RDONLY)
-    valid = False
-    try:
-        header = os.pread(fd, BRSHGT1_HEADER_STRUCT.size, 0)
-        if len(header) != BRSHGT1_HEADER_STRUCT.size:
-            raise AnalyzerError("DIAG-SIDECAR: short header")
-        magic, count = BRSHGT1_HEADER_STRUCT.unpack(header)
-        if magic != DIAGNOSTIC_MAGIC:
-            raise AnalyzerError(f"DIAG-SIDECAR: wrong magic {magic!r}")
-        file_size = os.fstat(fd).st_size
-        expected = BRSHGT1_HEADER_STRUCT.size + count * DIAGNOSTIC_ROW_SIZE
-        if file_size != expected:
-            raise AnalyzerError(
-                f"DIAG-SIDECAR: size {file_size} != header {BRSHGT1_HEADER_STRUCT.size} + "
-                f"{count} x {DIAGNOSTIC_ROW_SIZE} = {expected}"
-            )
-        valid = True
-        return fd
-    finally:
-        if not valid:
-            os.close(fd)
+def _brshgt1_count_fd(sidecar_fd: int) -> int:
+    """Return the declared row count from one retained sidecar descriptor."""
+    header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    if len(header) != BRSHGT1_HEADER_STRUCT.size:
+        raise AnalyzerError("DIAG-SIDECAR: short header")
+    magic, count = BRSHGT1_HEADER_STRUCT.unpack(header)
+    if magic != DIAGNOSTIC_MAGIC:
+        raise AnalyzerError("DIAG-SIDECAR: wrong magic")
+    return count
 
 
 def _read_brshgt1_row(fd: int, row_number: int) -> DiagnosticCheckpoint:
@@ -957,8 +951,6 @@ def _read_brshgt1_row(fd: int, row_number: int) -> DiagnosticCheckpoint:
     )
 
 
-
-
 def _read_fixed_entries_slice(
     fd: int,
     start_offset: int,
@@ -971,9 +963,13 @@ def _read_fixed_entries_slice(
 ) -> list[bytes]:
     """Read a committed slice of fixed-size entries using pread."""
     if start_row < 0 or committed_rows < start_row:
-        raise AnalyzerError(f"DIAG-PROTO: invalid {name} row range {start_row}..{committed_rows}")
+        raise AnalyzerError(
+            f"DIAG-PROTO: invalid {name} row range {start_row}..{committed_rows}"
+        )
     if start_offset < HEADER_SIZE or end_offset < start_offset:
-        raise AnalyzerError(f"DIAG-PROTO: invalid {name} byte range {start_offset}..{end_offset}")
+        raise AnalyzerError(
+            f"DIAG-PROTO: invalid {name} byte range {start_offset}..{end_offset}"
+        )
     expected_start = HEADER_SIZE + start_row * entry_size
     expected_end = HEADER_SIZE + committed_rows * entry_size
     if start_offset != expected_start or end_offset != expected_end:
@@ -988,7 +984,9 @@ def _read_fixed_entries_slice(
         )
     slice_size = end_offset - start_offset
     if slice_size != (committed_rows - start_row) * entry_size:
-        raise AnalyzerError(f"DIAG-PROTO: {name} slice size {slice_size} does not match row delta")
+        raise AnalyzerError(
+            f"DIAG-PROTO: {name} slice size {slice_size} does not match row delta"
+        )
     raw = os.pread(fd, slice_size, start_offset)
     if len(raw) != slice_size:
         raise AnalyzerError(f"DIAG-PROTO: short pread for {name}")
@@ -1136,9 +1134,7 @@ def _read_diagnostic_streams(
     rec_fd = os.open(paths["records"], os.O_RDONLY)
     jrn_fd = os.open(paths["journal"], os.O_RDONLY)
     try:
-        return _read_diagnostic_streams_from_fds(
-            row, prev, ctx_fd, rec_fd, jrn_fd
-        )
+        return _read_diagnostic_streams_from_fds(row, prev, ctx_fd, rec_fd, jrn_fd)
     finally:
         os.close(ctx_fd)
         os.close(rec_fd)
@@ -1156,7 +1152,9 @@ def _validate_checkpoint_bounds(
             raise AnalyzerError("DIAG-PROTO: first checkpoint row must have height 0")
         genesis_le = bytes.fromhex(MAINNET_GENESIS_HASH)[::-1]
         if row.block_hash_le != genesis_le:
-            raise AnalyzerError("DIAG-PROTO: height 0 checkpoint hash is not mainnet genesis")
+            raise AnalyzerError(
+                "DIAG-PROTO: height 0 checkpoint hash is not mainnet genesis"
+            )
     else:
         if row.height != prev.height + 1:
             raise AnalyzerError(
@@ -1173,7 +1171,9 @@ def _validate_checkpoint_bounds(
     for name in ("context", "record", "journal"):
         end = getattr(row, f"{name}_end")
         count = getattr(row, f"{name}_rows")
-        previous_end = getattr(prev, f"{name}_end", HEADER_SIZE) if prev else HEADER_SIZE
+        previous_end = (
+            getattr(prev, f"{name}_end", HEADER_SIZE) if prev else HEADER_SIZE
+        )
         previous_count = getattr(prev, f"{name}_rows", 0) if prev else 0
         if count < previous_count:
             raise AnalyzerError(
@@ -1208,73 +1208,187 @@ def _validate_checkpoint_bounds(
 _ATOMIC_PUBLISH_COUNTER = 0
 
 
-def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
-    """Fsync an exclusive sibling temp and hard-link it without replacement."""
-    parent = path.parent if str(path.parent) else Path(".")
-    parent.mkdir(parents=True, exist_ok=True)
-    global _ATOMIC_PUBLISH_COUNTER
-    _ATOMIC_PUBLISH_COUNTER += 1
-    temp = parent / f".{path.name}.tmp.{os.getpid()}.{_ATOMIC_PUBLISH_COUNTER}"
+import ctypes
+
+
+def _linkat_empty_path(fd: int, dir_fd: int, name: str) -> None:
+    """Link an anonymous O_TMPFILE descriptor into ``dir_fd`` at ``name``.
+
+    ``AT_EMPTY_PATH`` is 0x1000 on Linux; the call is made directly through
+    libc so no intermediate directory entry for the scratch inode ever
+    exists and no pathname fallback can publish substituted bytes.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    AT_EMPTY_PATH = 0x1000
+    result = libc.linkat(
+        ctypes.c_int(fd),
+        ctypes.c_char_p(b""),
+        ctypes.c_int(dir_fd),
+        ctypes.c_char_p(os.fsencode(name)),
+        ctypes.c_uint(AT_EMPTY_PATH),
+    )
+    if result != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _atomic_publish_anchored(dir_fd: int, name: str, content: bytes) -> None:
+    """Publish ``content`` as ``name`` inside the held directory ``dir_fd``.
+
+    The bytes are written into an ``O_TMPFILE`` scratch inode that has no
+    directory entry, fsynced, linked into the held directory with
+    ``linkat(AT_EMPTY_PATH)``, and then proven: the entry is reopened
+    ``O_NOFOLLOW`` relative to the same descriptor and its device, inode,
+    and content digest must equal the written object. An existing
+    destination is never replaced. Once the link exists the entry is never
+    pathname-unlinked: an inode verified through a descriptor can be
+    redirected by a concurrent rename before an unlink lands, so a failure
+    after the link leaves the entry in place as a named orphan and reports
+    it on stderr for operator cleanup. Pre-link failures leave nothing
+    behind because the anonymous inode dies with its descriptor. The
+    caller retains ownership of ``dir_fd``.
+    """
     link_created = False
-    dir_fd: int | None = None
-
-    def _unlink_temp() -> None:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
-
+    completed = False
     try:
-        fd = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = os.open(".", os.O_TMPFILE | os.O_WRONLY, 0o644, dir_fd=dir_fd)
         try:
             view = memoryview(content)
             while view:
                 written = os.write(fd, view)
                 if written == 0:
-                    raise AnalyzerError("DIAG-OUTPUT: zero-byte write to temporary file")
+                    raise AnalyzerError(
+                        "DIAG-OUTPUT: zero-byte write to temporary file"
+                    )
                 view = view[written:]
             os.fsync(fd)
+            written_stat = os.fstat(fd)
+            written_inode = (written_stat.st_dev, written_stat.st_ino)
+            try:
+                # The anonymous inode is linked while its descriptor is open.
+                _linkat_empty_path(fd, dir_fd, name)
+                link_created = True
+            except FileExistsError as exc:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: output already exists: {name}"
+                ) from exc
+            except OSError as exc:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
+                ) from exc
         finally:
             os.close(fd)
+        written_digest = hashlib.sha256(content).hexdigest()
 
-        dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        # Prove the published object: same inode as the written one and the
+        # same content, re-opened without following a final symlink.
+        published = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=dir_fd,
+        )
         try:
-            os.link(temp, path)
-        except FileExistsError as exc:
-            raise AnalyzerError(f"DIAG-OUTPUT: output already exists: {path}") from exc
-        except OSError as exc:
-            raise AnalyzerError(
-                f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
-            ) from exc
-        link_created = True
-        os.fsync(dir_fd)
-        _unlink_temp()
-        os.fsync(dir_fd)
-    except BaseException as publish_error:
-        rollback_error: BaseException | None = None
-        if link_created:
+            published_stat = os.fstat(published)
+            if (
+                published_stat.st_dev,
+                published_stat.st_ino,
+            ) != written_inode:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: published output {name} is not the written inode"
+                )
+            published_digest = hashlib.sha256()
+            while True:
+                chunk = os.read(published, 1 << 20)
+                if not chunk:
+                    break
+                published_digest.update(chunk)
+            if published_digest.hexdigest() != written_digest:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: published output {name} content differs "
+                    "from the written object"
+                )
+            # The published descriptor and its captured identity stay live
+            # through the parent directory fsync; a no-follow re-stat of the
+            # leaf afterwards rejects a substitution racing the sync.
+            os.fsync(dir_fd)
             try:
-                path.unlink()
-                if dir_fd is None:
-                    dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-                os.fsync(dir_fd)
-            except BaseException as exc:
-                rollback_error = exc
-        try:
-            _unlink_temp()
-        except BaseException as exc:
-            if rollback_error is None:
-                rollback_error = exc
-        if rollback_error is not None:
-            raise rollback_error from publish_error
-        raise
+                published_leaf = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise AnalyzerError(
+                    "DIAG-OUTPUT: published output "
+                    f"{_bounded_fact(name)} disappeared while the parent "
+                    f"directory was synced: {_bounded_error_line(exc)}"
+                ) from exc
+            if (published_leaf.st_dev, published_leaf.st_ino) != (
+                published_stat.st_dev,
+                published_stat.st_ino,
+            ):
+                raise AnalyzerError(
+                    "DIAG-OUTPUT: published output "
+                    f"{_bounded_fact(name)} was substituted while the parent "
+                    "directory was synced; refusing the publication"
+                )
+        finally:
+            os.close(published)
+        completed = True
     finally:
-        if dir_fd is not None:
-            os.close(dir_fd)
-        _unlink_temp()
-
+        if link_created and not completed:
+            # Never pathname-unlink a linked entry: a concurrent rename could
+            # redirect the unlink to a substitute. Leave the entry in place
+            # as a named orphan and report it for operator cleanup.
+            print(
+                "DIAG-OUTPUT: failed publication left orphan entry "
+                f"{_bounded_fact(name)} (dev {written_inode[0]}, "
+                f"ino {written_inode[1]}) for operator cleanup",
+                file=sys.stderr,
+            )
     if not link_created:
         raise AnalyzerError("DIAG-OUTPUT: publication did not create a link")
+
+
+def _atomic_publish_no_replace(path: Path, content: bytes) -> None:
+    """Publish ``content`` at ``path`` from one anonymous inode.
+
+    The parent directory is acquired through a no-follow component walk,
+    creating any missing ancestors relative to the held descriptor; a
+    symlinked ancestor is refused at open instead of being traversed. The
+    publication itself runs through :func:`_atomic_publish_anchored`
+    against that held descriptor, so the destination entry is never
+    addressed by rewalking the pathname.
+    """
+    parent = path.parent if str(path.parent) else Path(".")
+    if not hasattr(os, "O_TMPFILE"):
+        raise AnalyzerError(
+            "DIAG-OUTPUT: this platform has no anonymous-tempfile support; "
+            "publication requires O_TMPFILE"
+        )
+    parent_fd, missing = _walk_dirfd_nofollow(parent)
+    try:
+        for component in missing:
+            try:
+                os.mkdir(component, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                # exist_ok semantics for publication parents; a non-directory
+                # component is refused by the no-follow open below, which raises
+                # with the component name.
+                pass
+            try:
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise AnalyzerError(
+                    f"DIAG-OUTPUT: publication parent component {component!r} of "
+                    f"{path} is not a usable directory: {exc}"
+                ) from exc
+            os.fsync(parent_fd)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        _atomic_publish_anchored(parent_fd, path.name, content)
+    finally:
+        os.close(parent_fd)
 
 
 def _write_json_atomic(path: Path, content: dict[str, object]) -> None:
@@ -1310,45 +1424,235 @@ def _reap_child(
         _close_stream(stderr_file)
 
 
+def _open_verified_executable(path: Path) -> tuple[int, dict[str, object]]:
+    """Copy one classified executable into a sealed, immutable snapshot.
+
+    The source is classified through ``O_PATH|O_NOFOLLOW`` before any readable
+    open.  A regular, executable, size-bounded inode is reopened through its
+    pinned descriptor and copied into ``memfd_create(MFD_ALLOW_SEALING)``.  The
+    snapshot is made executable, write/grow/shrink/seal locked, verified, then
+    hashed.  Only that sealed descriptor escapes this function.
+    """
+    o_path = getattr(os, "O_PATH", None)
+    memfd_create = getattr(os, "memfd_create", None)
+    allow_sealing = getattr(os, "MFD_ALLOW_SEALING", None)
+    if o_path is None:
+        raise AnalyzerError(
+            "DIAG-SETUP: O_PATH is unavailable; classifying the executable "
+            "without a blocking open is not possible"
+        )
+    if memfd_create is None or allow_sealing is None:
+        raise AnalyzerError(
+            "DIAG-SETUP: memfd sealing is unavailable; immutable executable "
+            "custody is not possible"
+        )
+
+    add_seals = getattr(fcntl, "F_ADD_SEALS", 1034)
+    get_seals = getattr(fcntl, "F_GET_SEALS", 1035)
+    seal_write = getattr(fcntl, "F_SEAL_WRITE", 0x8)
+    seal_grow = getattr(fcntl, "F_SEAL_GROW", 0x4)
+    seal_shrink = getattr(fcntl, "F_SEAL_SHRINK", 0x2)
+    seal_seal = getattr(fcntl, "F_SEAL_SEAL", 0x1)
+    mfd_cloexec = getattr(os, "MFD_CLOEXEC", 0x8)
+    classify_fd: int | None = None
+    source_fd: int | None = None
+    snapshot_fd: int | None = None
+    try:
+        try:
+            classify_fd = os.open(path, o_path | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            raise AnalyzerError(
+                f"DIAG-SETUP: cannot open binary {_bounded_fact(str(path))}: "
+                f"{_bounded_error_line(exc)}"
+            ) from exc
+        binary_stat = os.fstat(classify_fd)
+        if stat_module.S_ISLNK(binary_stat.st_mode):
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} is a symbolic link"
+            )
+        if not stat_module.S_ISREG(binary_stat.st_mode):
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} is not a regular file"
+            )
+        if not binary_stat.st_mode & 0o111:
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} has no execute bit"
+            )
+        if binary_stat.st_size > _BINARY_MAX_BYTES:
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} is "
+                f"{binary_stat.st_size} bytes; the bounded ceiling is {_BINARY_MAX_BYTES}"
+            )
+        classified_signature = _fd_signature(classify_fd)
+        try:
+            source_fd = os.open(
+                f"/proc/self/fd/{classify_fd}",
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as exc:
+            raise AnalyzerError(
+                "DIAG-SETUP: cannot reopen the classified binary "
+                f"{_bounded_fact(str(path))} through /proc/self/fd: "
+                f"{_bounded_error_line(exc)}"
+            ) from exc
+        if _fd_signature(source_fd) != classified_signature:
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} changed identity "
+                "between classification and reopen"
+            )
+
+        try:
+            snapshot_fd = memfd_create(
+                "bitcoin-rs-checksig-child", allow_sealing | mfd_cloexec
+            )
+        except OSError as exc:
+            raise AnalyzerError(
+                f"DIAG-SETUP: cannot create sealed executable snapshot: "
+                f"{_bounded_error_line(exc)}"
+            ) from exc
+        offset = 0
+        while offset < binary_stat.st_size:
+            chunk = os.pread(
+                source_fd, min(1 << 20, binary_stat.st_size - offset), offset
+            )
+            if not chunk:
+                raise AnalyzerError(
+                    "DIAG-SETUP: binary shrank while copying sealed snapshot"
+                )
+            view = memoryview(chunk)
+            while view:
+                written = os.write(snapshot_fd, view)
+                if written <= 0:
+                    raise AnalyzerError(
+                        "DIAG-SETUP: zero-byte write to sealed executable snapshot"
+                    )
+                view = view[written:]
+            offset += len(chunk)
+        if os.pread(source_fd, 1, binary_stat.st_size):
+            raise AnalyzerError("DIAG-SETUP: binary grew while copying sealed snapshot")
+        if _fd_signature(source_fd) != classified_signature:
+            raise AnalyzerError(
+                f"DIAG-SETUP: binary {_bounded_fact(str(path))} changed while "
+                "copying sealed snapshot"
+            )
+
+        os.fchmod(snapshot_fd, 0o500)
+        required_seals = seal_write | seal_grow | seal_shrink | seal_seal
+        fcntl.fcntl(snapshot_fd, add_seals, required_seals)
+        applied_seals = fcntl.fcntl(snapshot_fd, get_seals)
+        if applied_seals & required_seals != required_seals:
+            raise AnalyzerError(
+                "DIAG-SETUP: executable snapshot seal verification failed"
+            )
+        custody = {
+            "path": str(path),
+            "bytes": binary_stat.st_size,
+            "sha256": _sha256_fd(snapshot_fd),
+        }
+        retained_fd = snapshot_fd
+        snapshot_fd = None
+    except OSError as exc:
+        raise AnalyzerError(
+            f"DIAG-SETUP: executable snapshot custody failed: "
+            f"{_bounded_error_line(exc)}"
+        ) from exc
+    finally:
+        for owned_fd in (source_fd, classify_fd, snapshot_fd):
+            if owned_fd is not None:
+                os.close(owned_fd)
+
+    print(
+        f"DIAG-SETUP: verified sealed binary snapshot "
+        f"{_bounded_fact(custody['path'])} ({custody['bytes']} bytes, "
+        f"sha256 {custody['sha256']})",
+        file=sys.stderr,
+    )
+    return retained_fd, custody
+
+
+def _diagnostic_child_path(work_dirfd: int, leaf: str) -> str:
+    """Return one fixed diagnostic leaf under the inherited work anchor.
+
+    The numeric ``/proc/self/fd/<work-dirfd>/...`` string is process-local
+    child transport: it is valid only while this process holds
+    ``work_dirfd`` and is never treated as durable path provenance.
+    """
+    if not leaf or leaf in (".", "..") or os.sep in leaf:
+        raise AnalyzerError(f"DIAG-SETUP: invalid diagnostic child leaf {leaf!r}")
+    if os.altsep and os.altsep in leaf:
+        raise AnalyzerError(f"DIAG-SETUP: invalid diagnostic child leaf {leaf!r}")
+    return f"/proc/self/fd/{work_dirfd}/{leaf}"
+
+
 def _launch_diagnostic_child(
     binary: Path,
     rest_url: str,
     ceiling: int,
-    work_dir: Path,
-    replay_json: Path,
-    data_dir: Path,
-    stderr_path: Path,
-    counters_path: Path,
     storage_backend: str,
     txindex: bool,
+    *,
+    binary_fd: int,
+    work_dirfd: int,
 ) -> tuple[subprocess.Popen, BinaryIO]:
+    """Launch the sealed child with the work descriptor as its namespace."""
+    proc_fd_dir = Path("/proc/self/fd")
+    if not proc_fd_dir.is_dir():
+        raise AnalyzerError(
+            "DIAG-SETUP: /proc/self/fd is unavailable; cannot execute the "
+            "verified descriptor without a pathname fallback"
+        )
     env = os.environ.copy()
-    env.update({
-        "BRS_CENSUS_COUNTERS": str(counters_path),
-        "BRS_CENSUS_CONTEXTS": str(work_dir / "brsctx1.bin"),
-        "BRS_CENSUS_RECORDS": str(work_dir / "brsrec1.bin"),
-        "BRS_CENSUS_JOURNAL": str(work_dir / "brsjrn1.bin"),
-        "BRS_CENSUS_LABEL": "cmodern-diagnostic",
-    })
+    env.update(
+        {
+            "BRS_CENSUS_COUNTERS": _diagnostic_child_path(work_dirfd, "counters.json"),
+            "BRS_CENSUS_CONTEXTS": _diagnostic_child_path(work_dirfd, "brsctx1.bin"),
+            "BRS_CENSUS_RECORDS": _diagnostic_child_path(work_dirfd, "brsrec1.bin"),
+            "BRS_CENSUS_JOURNAL": _diagnostic_child_path(work_dirfd, "brsjrn1.bin"),
+            "BRS_CENSUS_LABEL": "cmodern-diagnostic",
+        }
+    )
     command = [
         str(binary),
         "--cmodern-diagnostic-protocol",
-        "--rest-url", rest_url,
-        "--start-height", "0",
-        "--assume-valid-height", "0",
-        "--window", "1",
-        "--stop-height", str(ceiling),
-        "--data-dir", str(data_dir),
-        "--output", str(replay_json),
-        "--storage-backend", storage_backend,
+        "--rest-url",
+        rest_url,
+        "--start-height",
+        "0",
+        "--assume-valid-height",
+        "0",
+        "--window",
+        "1",
+        "--stop-height",
+        str(ceiling),
+        "--data-dir",
+        _diagnostic_child_path(work_dirfd, "state"),
+        "--output",
+        _diagnostic_child_path(work_dirfd, "replay_diagnostic.json"),
+        "--storage-backend",
+        storage_backend,
     ]
     if txindex:
         command.append("--txindex")
 
-    stderr_file = stderr_path.open("xb")
+    stderr_fd = os.open(
+        "stderr.log",
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC
+        | os.O_NONBLOCK,
+        0o666,
+        dir_fd=work_dirfd,
+    )
+    stderr_file = os.fdopen(stderr_fd, "wb", closefd=True)
     try:
         proc = subprocess.Popen(
             command,
+            executable=f"/proc/self/fd/{binary_fd}",
+            pass_fds=(binary_fd, work_dirfd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_file,
@@ -1363,20 +1667,20 @@ def _launch_diagnostic_child(
 
 
 def _validate_replay_diagnostic(
-    path: Path,
+    replay_fd: int,
+    display_path: Path,
     final: DiagnosticCheckpoint,
     ceiling: int,
     storage_backend: str,
     txindex: bool,
     data_dir: str,
-) -> None:
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AnalyzerError(f"DIAG-CUSTODY: invalid child replay JSON: {exc}") from exc
+) -> dict[str, object]:
+    """Validate replay bytes borrowed from one retained descriptor."""
+    _child_replay_bytes, raw = _load_bounded_json_from_fd(
+        replay_fd, display_path, _REPLAY_MAX_BYTES, "child replay JSON", "DIAG-CUSTODY"
+    )
     if not isinstance(raw, dict):
         raise AnalyzerError("DIAG-CUSTODY: child replay JSON root is not an object")
-
     expected_keys = {
         "schema",
         "non_certifying",
@@ -1397,22 +1701,20 @@ def _validate_replay_diagnostic(
 
     if raw["schema"] != "mainnet-prefix-replay-diagnostic-v1":
         raise AnalyzerError(
-            f"DIAG-CUSTODY: child replay schema {raw['schema']!r} "
+            f"DIAG-CUSTODY: child replay schema {_bounded_fact(raw['schema'])} "
             "!= 'mainnet-prefix-replay-diagnostic-v1'"
         )
     if raw["non_certifying"] is not True:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: child replay non_certifying {raw['non_certifying']!r} != True"
+            f"DIAG-CUSTODY: child replay non_certifying {_bounded_fact(raw['non_certifying'])} != True"
         )
     if raw["block_source"] != "rest":
         raise AnalyzerError(
-            f"DIAG-CUSTODY: child replay block_source {raw['block_source']!r} != 'rest'"
+            f"DIAG-CUSTODY: child replay block_source {_bounded_fact(raw['block_source'])} != 'rest'"
         )
     start_height = _require_u32(raw["start_height"], "start_height")
     if start_height != 0:
-        raise AnalyzerError(
-            f"DIAG-CUSTODY: start_height {start_height} != 0"
-        )
+        raise AnalyzerError(f"DIAG-CUSTODY: start_height {start_height} != 0")
     requested = _require_u32(
         raw["requested_stop_height_ceiling"], "requested_stop_height_ceiling"
     )
@@ -1436,26 +1738,24 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(f"DIAG-CUSTODY: child replay window {window} != 1")
     assume = _require_u32(raw["assume_valid_height"], "assume_valid_height")
     if assume != 0:
-        raise AnalyzerError(
-            f"DIAG-CUSTODY: assume_valid_height {assume} != 0"
-        )
+        raise AnalyzerError(f"DIAG-CUSTODY: assume_valid_height {assume} != 0")
     if raw["stop_reason"] != "controller-request":
         raise AnalyzerError(
-            f"DIAG-CUSTODY: stop_reason {raw['stop_reason']!r} != 'controller-request'"
+            f"DIAG-CUSTODY: stop_reason {_bounded_fact(raw['stop_reason'])} != 'controller-request'"
         )
 
     if raw["storage_backend"] != storage_backend:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: storage_backend {raw['storage_backend']!r} "
+            f"DIAG-CUSTODY: storage_backend {_bounded_fact(raw['storage_backend'])} "
             f"!= {storage_backend!r}"
         )
     if raw["txindex"] is not txindex:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: txindex {raw['txindex']!r} != {txindex!r}"
+            f"DIAG-CUSTODY: txindex {_bounded_fact(raw['txindex'])} != {txindex!r}"
         )
     if raw["data_dir"] != data_dir:
         raise AnalyzerError(
-            f"DIAG-CUSTODY: data_dir {raw['data_dir']!r} != {data_dir!r}"
+            f"DIAG-CUSTODY: data_dir {_bounded_fact(raw['data_dir'])} != {data_dir!r}"
         )
 
     elapsed = raw["elapsed_seconds"]
@@ -1472,12 +1772,20 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(
             f"DIAG-CUSTODY: elapsed_seconds must be non-negative, got {elapsed_f}"
         )
+    return {
+        "path": str(display_path),
+        "bytes": len(_child_replay_bytes),
+        "sha256": hashlib.sha256(_child_replay_bytes).hexdigest(),
+    }
 
-def _validate_native_counters(path: Path, final: DiagnosticCheckpoint) -> None:
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AnalyzerError(f"DIAG-CUSTODY: invalid counters JSON: {exc}") from exc
+
+def _validate_native_counters(
+    counters_fd: int, display_path: Path, final: DiagnosticCheckpoint
+) -> dict[str, object]:
+    """Validate counters bytes borrowed from one retained descriptor."""
+    _diag_counters_bytes, raw = _load_bounded_json_from_fd(
+        counters_fd, display_path, _COUNTERS_MAX_BYTES, "counters JSON", "DIAG-CUSTODY"
+    )
     if not isinstance(raw, dict):
         raise AnalyzerError("DIAG-CUSTODY: counters JSON root is not an object")
     counters = Counters(raw)
@@ -1491,87 +1799,93 @@ def _validate_native_counters(path: Path, final: DiagnosticCheckpoint) -> None:
             raise AnalyzerError(
                 f"DIAG-CUSTODY: counters {field} {getattr(counters, field)} != {value}"
             )
+    return {
+        "path": str(display_path),
+        "bytes": len(_diag_counters_bytes),
+        "sha256": hashlib.sha256(_diag_counters_bytes).hexdigest(),
+    }
 
 
 def _validate_terminal_streams(
-    paths: dict[str, Path], final: DiagnosticCheckpoint
+    artifact_fds: dict[str, int],
+    display_paths: dict[str, Path],
+    final: DiagnosticCheckpoint,
 ) -> dict[str, dict[str, object]]:
+    """Bind terminal framing and digests to the retained artifact fds."""
     custody: dict[str, dict[str, object]] = {}
-    context_iter = iter_context_inputs(paths["contexts"])
-    for _ in context_iter:
-        continue
-    context_custody = context_iter.custody()
-    if context_custody["count"] != final.context_rows or context_custody["bytes"] != final.context_end:
-        raise AnalyzerError("DIAG-CUSTODY: terminal context header/checkpoint mismatch")
-    custody["contexts"] = {
-        "path": str(paths["contexts"]),
-        "bytes": context_custody["bytes"],
-        "sha256": format(context_custody["sha256"], "064x"),
-        "body_sha256": format(context_custody["body_sha256"], "064x"),
+    stream_specs = {
+        "contexts": (CONTEXT_MAGIC, final.context_rows, final.context_end),
+        "records": (RECORD_MAGIC, final.record_rows, final.record_end),
+        "journal": (JOURNAL_MAGIC, final.journal_rows, final.journal_end),
     }
-
-    record_iter, record_custody = iter_records_with_custody(paths["records"])
-    for _ in record_iter:
-        continue
-    record_count = (record_custody["bytes"] - HEADER_SIZE) // RECORD_SIZE
-    if record_count != final.record_rows or record_custody["bytes"] != final.record_end:
-        raise AnalyzerError("DIAG-CUSTODY: terminal record header/checkpoint mismatch")
-    custody["records"] = {
-        "path": str(paths["records"]),
-        "bytes": record_custody["bytes"],
-        "sha256": format(record_custody["sha256"], "064x"),
-        "body_sha256": format(record_custody["body_sha256"], "064x"),
-    }
-
-    journal_iter, journal_custody = iter_journal_with_custody(paths["journal"])
-    for _ in journal_iter:
-        continue
-    journal_count = (journal_custody["bytes"] - HEADER_SIZE) // JOURNAL_SIZE
-    if journal_count != final.journal_rows or journal_custody["bytes"] != final.journal_end:
-        raise AnalyzerError("DIAG-CUSTODY: terminal journal header/checkpoint mismatch")
-    custody["journal"] = {
-        "path": str(paths["journal"]),
-        "bytes": journal_custody["bytes"],
-        "sha256": format(journal_custody["sha256"], "064x"),
-        "body_sha256": format(journal_custody["body_sha256"], "064x"),
-    }
-
-    sidecar_size = paths["sidecar"].stat().st_size
-    # _validate_sidecar_terminal already validated framing; derive row count from size.
-    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
-    sidecar_fd = os.open(paths["sidecar"], os.O_RDONLY)
-    try:
-        sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
-        if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
-            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar short header")
-        magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
-        if magic != DIAGNOSTIC_MAGIC:
-            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar wrong magic")
-        expected_size = BRSHGT1_HEADER_STRUCT.size + sidecar_count * DIAGNOSTIC_ROW_SIZE
-        if sidecar_size != expected_size:
+    for name, (expected_magic, expected_count, expected_end) in stream_specs.items():
+        fd = artifact_fds[name]
+        file_size = os.fstat(fd).st_size
+        if file_size > _DIAGNOSTIC_ARTIFACT_MAX_BYTES:
             raise AnalyzerError(
-                f"DIAG-CUSTODY: terminal sidecar size {sidecar_size} != {expected_size}"
+                f"DIAG-CUSTODY: terminal {name} size {file_size} exceeds "
+                f"{_DIAGNOSTIC_ARTIFACT_MAX_BYTES}"
             )
-        full_hasher = hashlib.sha256()
+        if file_size != expected_end:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: terminal {name} size {file_size} != {expected_end}"
+            )
+        before = _fd_signature(fd)
+        header = os.pread(fd, HEADER_SIZE, 0)
+        if len(header) != HEADER_SIZE:
+            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} short header")
+        magic, declared_count = HEADER_STRUCT.unpack(header)
+        if magic != expected_magic:
+            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} wrong magic {magic!r}")
+        if declared_count != expected_count:
+            raise AnalyzerError(
+                f"DIAG-CUSTODY: terminal {name} count {declared_count} != {expected_count}"
+            )
+        full_hasher = hashlib.sha256(header)
         body_hasher = hashlib.sha256()
-        full_hasher.update(sidecar_header)
-        offset = BRSHGT1_HEADER_STRUCT.size
-        body_end = expected_size
-        while offset < body_end:
-            chunk = os.pread(sidecar_fd, min(8 * 1024 * 1024, body_end - offset), offset)
+        offset = HEADER_SIZE
+        while offset < file_size:
+            chunk = os.pread(fd, min(8 * 1024 * 1024, file_size - offset), offset)
             if not chunk:
-                raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
+                raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} ended at {offset}")
             full_hasher.update(chunk)
             body_hasher.update(chunk)
             offset += len(chunk)
-        custody["sidecar"] = {
-            "path": str(paths["sidecar"]),
-            "bytes": sidecar_size,
+        if os.pread(fd, 1, file_size) or _fd_signature(fd) != before:
+            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} changed while hashing")
+        custody[name] = {
+            "path": str(display_paths[name]),
+            "bytes": file_size,
             "sha256": full_hasher.hexdigest(),
             "body_sha256": body_hasher.hexdigest(),
         }
-    finally:
-        os.close(sidecar_fd)
+
+    sidecar_fd = artifact_fds["sidecar"]
+    sidecar_size = os.fstat(sidecar_fd).st_size
+    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
+    _validate_sidecar_terminal_fd(sidecar_fd, sidecar_count, final)
+    before = _fd_signature(sidecar_fd)
+    sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+    full_hasher = hashlib.sha256(sidecar_header)
+    body_hasher = hashlib.sha256()
+    offset = BRSHGT1_HEADER_STRUCT.size
+    while offset < sidecar_size:
+        chunk = os.pread(
+            sidecar_fd, min(8 * 1024 * 1024, sidecar_size - offset), offset
+        )
+        if not chunk:
+            raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
+        full_hasher.update(chunk)
+        body_hasher.update(chunk)
+        offset += len(chunk)
+    if os.pread(sidecar_fd, 1, sidecar_size) or _fd_signature(sidecar_fd) != before:
+        raise AnalyzerError("DIAG-CUSTODY: terminal sidecar changed while hashing")
+    custody["sidecar"] = {
+        "path": str(display_paths["sidecar"]),
+        "bytes": sidecar_size,
+        "sha256": full_hasher.hexdigest(),
+        "body_sha256": body_hasher.hexdigest(),
+    }
     return custody
 
 
@@ -1592,9 +1906,7 @@ def _validate_sidecar_terminal_fd(
     expected_size = BRSHGT1_HEADER_STRUCT.size + row_count * DIAGNOSTIC_ROW_SIZE
     actual_size = os.fstat(fd).st_size
     if actual_size != expected_size:
-        raise AnalyzerError(
-            f"DIAG-SIDECAR: size {actual_size} != {expected_size}"
-        )
+        raise AnalyzerError(f"DIAG-SIDECAR: size {actual_size} != {expected_size}")
     if declared_count not in (0, row_count):
         raise AnalyzerError(
             f"DIAG-SIDECAR: declared row count {declared_count} "
@@ -1605,21 +1917,9 @@ def _validate_sidecar_terminal_fd(
     return declared_count
 
 
-def _validate_sidecar_terminal(
-    path: Path,
-    row_count: int,
-    final: DiagnosticCheckpoint,
-) -> int:
-    """Validate a complete sidecar without changing its declared row count."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        return _validate_sidecar_terminal_fd(fd, row_count, final)
-    finally:
-        os.close(fd)
-
-
 def _finalize_candidate(
-    paths: dict[str, Path],
+    display_paths: dict[str, Path],
+    artifact_fds: dict[str, int],
     sidecar_row_count: int,
     final: DiagnosticCheckpoint,
     cumulative_counts: dict[str, int],
@@ -1631,33 +1931,51 @@ def _finalize_candidate(
     txindex: bool,
     data_dir: str,
     teardown: DiagnosticTeardown,
+    recovery_dirfd: int,
+    output_parent_fd: int,
     recovery_signatures: dict[str, tuple[int, int, int, int, int]] | None = None,
+    source_dirfd: int | None = None,
 ) -> None:
-    """Validate terminal proof, finalize custody, then publish one candidate."""
+    """Validate terminal proof, finalize custody, then publish one candidate.
+
+    Every custody digest is computed from bytes already validated through a
+    retained descriptor: the replay/counters records come from their
+    validators, and the sidecar is validated, patched, and hashed on the
+    caller's held descriptor. No custody path is re-opened here. Recovery
+    signatures are captured and rechecked relative to the caller's held
+    ``recovery_dirfd`` — validated pathnames are never re-resolved. When
+    salvaged ``source_custody`` is present, its pathname-side recheck is
+    taken relative to the caller's held ``source_dirfd``, and the output
+    parent's containment against the held source identity is rechecked
+    immediately before the candidate is linked through the retained
+    ``output_parent_fd``.
+    """
     if recovery_signatures is not None:
         for name, signature in recovery_signatures.items():
-            if _path_signature(paths[name]) != signature:
+            if _dirfd_signature(recovery_dirfd, display_paths[name].name) != signature:
                 raise AnalyzerError(
                     f"DIAG-SALVAGE: recovery {name} changed before validation"
                 )
-    declared_count = _validate_sidecar_terminal(
-        paths["sidecar"], sidecar_row_count, final
-    )
+    sidecar_fd = artifact_fds["sidecar"]
+    declared_count = _validate_sidecar_terminal_fd(sidecar_fd, sidecar_row_count, final)
     if recovery_signatures is not None and declared_count != sidecar_row_count:
         raise AnalyzerError(
             f"DIAG-SALVAGE: recovered sidecar declared row count "
             f"{declared_count} != {sidecar_row_count}"
         )
-    stream_custody = _validate_terminal_streams(paths, final)
-    _validate_replay_diagnostic(
-        paths["replay"],
+    stream_custody = _validate_terminal_streams(artifact_fds, display_paths, final)
+    replay_custody = _validate_replay_diagnostic(
+        artifact_fds["replay"],
+        display_paths["replay"],
         final,
         ceiling,
         storage_backend,
         txindex,
         data_dir,
     )
-    _validate_native_counters(paths["counters"], final)
+    counters_custody = _validate_native_counters(
+        artifact_fds["counters"], display_paths["counters"], final
+    )
     if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
         raise AnalyzerError("DIAG-CUSTODY: terminal proof lacks all 11 contexts")
     if max(first_heights.values()) != final.height:
@@ -1666,24 +1984,20 @@ def _finalize_candidate(
         )
 
     if declared_count == 0:
-        _patch_brshgt1_count(paths["sidecar"], sidecar_row_count)
-        sidecar_size, sidecar_sha256 = _sha256_file(paths["sidecar"])
-        stream_custody["sidecar"]["bytes"] = sidecar_size
-        stream_custody["sidecar"]["sha256"] = sidecar_sha256
-    if _brshgt1_count(paths["sidecar"]) != sidecar_row_count:
+        _patch_brshgt1_count(sidecar_fd, sidecar_row_count, recovery_dirfd)
+        stream_custody["sidecar"]["bytes"] = os.fstat(sidecar_fd).st_size
+        stream_custody["sidecar"]["sha256"] = _sha256_fd(sidecar_fd)
+    if _brshgt1_count_fd(sidecar_fd) != sidecar_row_count:
         raise AnalyzerError("DIAG-SIDECAR: finalized row count mismatch")
 
     custody: dict[str, dict[str, object]] = {}
     custody["sidecar"] = stream_custody["sidecar"]
-    for name in ("replay", "counters"):
-        size, digest = _sha256_file(paths[name])
-        custody[name] = {
-            "path": str(paths[name]),
-            "bytes": size,
-            "sha256": digest,
-        }
+    custody["replay"] = replay_custody
+    custody["counters"] = counters_custody
     finalized_recovery_signatures = {
-        name: _path_signature(path) for name, path in paths.items()
+        name: _dirfd_signature(recovery_dirfd, path.name)
+        for name, path in display_paths.items()
+        if name != "stderr"
     }
     source_custody = teardown.source_custody
     if source_custody is not None:
@@ -1783,9 +2097,14 @@ def _finalize_candidate(
         },
     }
     if source_custody is not None:
+        if source_dirfd is None:
+            raise AnalyzerError(
+                "DIAG-SALVAGE: source custody recheck requires the held "
+                "source directory descriptor"
+            )
         for identity in source_custody.values():
             source_path = Path(str(identity["path"]))
-            if _path_signature(source_path) != (
+            if _dirfd_signature(source_dirfd, source_path.name) != (
                 identity["device"],
                 identity["inode"],
                 identity["bytes"],
@@ -1801,12 +2120,23 @@ def _finalize_candidate(
         if teardown.salvaged_from is None
         else "operator_supplied_original_argv"
     )
+    rendered = json.dumps(candidate, indent=2).encode("utf-8") + b"\n"
     for name, signature in finalized_recovery_signatures.items():
-        if _path_signature(paths[name]) != signature:
+        if _dirfd_signature(recovery_dirfd, display_paths[name].name) != signature:
             raise AnalyzerError(
                 f"DIAG-CUSTODY: {name} changed before candidate publication"
             )
-    _write_json_atomic(output_path, candidate)
+    if source_custody is not None and source_dirfd is not None:
+        # Immediately before publication: recheck the held output parent
+        # against the held source identity, then link the candidate through
+        # that descriptor. The checked pathname is never rewalked.
+        source_anchor_stat = os.fstat(source_dirfd)
+        if _dirfd_contains_identity(
+            output_parent_fd,
+            (source_anchor_stat.st_dev, source_anchor_stat.st_ino),
+        ):
+            raise AnalyzerError("DIAG-SALVAGE: output must be outside source")
+    _atomic_publish_anchored(output_parent_fd, output_path.name, rendered)
 
 
 def _send_control(proc: subprocess.Popen, control: bytes) -> None:
@@ -1817,6 +2147,8 @@ def _send_control(proc: subprocess.Popen, control: bytes) -> None:
         proc.stdin.flush()
     except (BrokenPipeError, OSError) as exc:
         raise AnalyzerError(f"DIAG-PROTO: failed to send control byte: {exc}") from exc
+
+
 class _TrailingDrain:
     """Bounded state for draining child stdout concurrently with teardown."""
 
@@ -1876,14 +2208,10 @@ def _await_child_after_terminal(
             f"DIAG-PROTO: {drain.bytes_read} trailing bytes after terminal checkpoint"
         )
     if not timed_out and exit_status != 0:
-        raise AnalyzerError(
-            f"DIAG-PROTO: child exited with status {exit_status}"
-        )
+        raise AnalyzerError(f"DIAG-PROTO: child exited with status {exit_status}")
 
     state = "timeout_after_terminal_proof" if timed_out else "clean"
     return DiagnosticTeardown(exit_status, state, None, None)
-
-
 
 
 def _run_diagnostic_scan(
@@ -1897,29 +2225,64 @@ def _run_diagnostic_scan(
     *,
     stop_deadline_seconds: float = 10.0,
     reap_deadline_seconds: float = 5.0,
+    binary_fd: int | None = None,
 ) -> None:
-    paths = {
-        "contexts": work_dir / "brsctx1.bin",
-        "records": work_dir / "brsrec1.bin",
-        "journal": work_dir / "brsjrn1.bin",
-        "sidecar": work_dir / "brshgt1.bin",
-        "replay": work_dir / "replay_diagnostic.json",
-        "stderr": work_dir / "stderr.log",
-        "counters": work_dir / "counters.json",
-    }
-    data_dir = work_dir / "state"
-    data_dir.mkdir(exist_ok=False)
-    sidecar_fd: int | None = os.open(
-        paths["sidecar"], os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
-    )
-    _write_brshgt1_preface(sidecar_fd)
+    owned_binary_fd = False
+    output_parent_fd: int | None = None
+    work_dirfd: int | None = None
+    artifact_fds: dict[str, int] = {}
     proc: subprocess.Popen | None = None
     stderr_file: BinaryIO | None = None
     child_closed = False
     try:
+        if binary_fd is None:
+            binary_fd, _binary_custody = _open_verified_executable(binary)
+            owned_binary_fd = True
+        output_parent = output_path.parent if str(output_path.parent) else Path(".")
+        output_parent_fd, output_missing = _walk_dirfd_nofollow(output_parent)
+        if output_missing:
+            raise AnalyzerError(
+                f"DIAG-SETUP: output parent directory does not exist: {output_parent}"
+            )
+        work_dirfd, work_missing = _walk_dirfd_nofollow(work_dir)
+        if work_missing:
+            raise AnalyzerError(
+                f"DIAG-SETUP: work directory component missing: {work_dir}"
+            )
+        _require_shared_source_mount(
+            work_dirfd,
+            (("output parent", output_parent_fd),),
+        )
+        display_paths = {
+            "contexts": work_dir / "brsctx1.bin",
+            "records": work_dir / "brsrec1.bin",
+            "journal": work_dir / "brsjrn1.bin",
+            "sidecar": work_dir / "brshgt1.bin",
+            "replay": work_dir / "replay_diagnostic.json",
+            "stderr": work_dir / "stderr.log",
+            "counters": work_dir / "counters.json",
+        }
+        os.mkdir("state", 0o777, dir_fd=work_dirfd)
+        artifact_fds["sidecar"] = os.open(
+            "brshgt1.bin",
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK,
+            0o644,
+            dir_fd=work_dirfd,
+        )
+        _write_brshgt1_preface(artifact_fds["sidecar"])
         proc, stderr_file = _launch_diagnostic_child(
-            binary, rest_url, ceiling, work_dir, paths["replay"], data_dir,
-            paths["stderr"], paths["counters"], storage_backend, txindex,
+            binary,
+            rest_url,
+            ceiling,
+            storage_backend,
+            txindex,
+            binary_fd=binary_fd,
+            work_dirfd=work_dirfd,
         )
         if proc.stdout is None:
             raise AnalyzerError("DIAG-SETUP: child stdout is not piped")
@@ -1931,14 +2294,29 @@ def _run_diagnostic_scan(
 
         while True:
             row = _read_checkpoint_row(proc.stdout)
+            if "contexts" not in artifact_fds:
+                for name in ("contexts", "records", "journal"):
+                    artifact_fds[name] = _open_custody_input(
+                        display_paths[name].name,
+                        _DIAGNOSTIC_ARTIFACT_MAX_BYTES,
+                        f"diagnostic {name}",
+                        "DIAG-CUSTODY",
+                        dir_fd=work_dirfd,
+                    )
             file_sizes = {
-                "context": paths["contexts"].stat().st_size,
-                "record": paths["records"].stat().st_size,
-                "journal": paths["journal"].stat().st_size,
+                "context": os.fstat(artifact_fds["contexts"]).st_size,
+                "record": os.fstat(artifact_fds["records"]).st_size,
+                "journal": os.fstat(artifact_fds["journal"]).st_size,
             }
             _validate_checkpoint_bounds(row, previous, file_sizes)
             classified, _records, _journal, _context_map, record_counts = (
-                _read_diagnostic_streams(row, previous, paths)
+                _read_diagnostic_streams_from_fds(
+                    row,
+                    previous,
+                    artifact_fds["contexts"],
+                    artifact_fds["records"],
+                    artifact_fds["journal"],
+                )
             )
             block_counts = {
                 **_diagnostic_spend_counts(classified),
@@ -1951,7 +2329,7 @@ def _run_diagnostic_scan(
                 first_heights,
             )
 
-            _write_brshgt1_row(sidecar_fd, row)
+            _write_brshgt1_row(artifact_fds["sidecar"], row)
             row_count += 1
             if len(first_heights) == len(CONTEXT_COUNTER_NAMES):
                 expected_h = max(first_heights.values())
@@ -1979,11 +2357,21 @@ def _run_diagnostic_scan(
         _close_stream(stderr_file)
         child_closed = True
 
-        os.fsync(sidecar_fd)
-        os.close(sidecar_fd)
-        sidecar_fd = None
+        os.fsync(artifact_fds["sidecar"])
+        for name, max_bytes in (
+            ("replay", _REPLAY_MAX_BYTES),
+            ("counters", _COUNTERS_MAX_BYTES),
+        ):
+            artifact_fds[name] = _open_custody_input(
+                display_paths[name].name,
+                max_bytes,
+                f"diagnostic {name}",
+                "DIAG-CUSTODY",
+                dir_fd=work_dirfd,
+            )
         _finalize_candidate(
-            paths,
+            display_paths,
+            artifact_fds,
             row_count,
             row,
             cumulative_counts,
@@ -1993,14 +2381,24 @@ def _run_diagnostic_scan(
             output_path,
             storage_backend,
             txindex,
-            str(data_dir),
+            _diagnostic_child_path(work_dirfd, "state"),
             teardown,
+            recovery_dirfd=work_dirfd,
+            output_parent_fd=output_parent_fd,
         )
     finally:
-        if proc is not None and stderr_file is not None and not child_closed:
-            _reap_child(proc, stderr_file)
-        if sidecar_fd is not None:
-            os.close(sidecar_fd)
+        try:
+            if proc is not None and stderr_file is not None and not child_closed:
+                _reap_child(proc, stderr_file)
+        finally:
+            for fd in artifact_fds.values():
+                os.close(fd)
+            if owned_binary_fd and binary_fd is not None:
+                os.close(binary_fd)
+            if output_parent_fd is not None:
+                os.close(output_parent_fd)
+            if work_dirfd is not None:
+                os.close(work_dirfd)
 
 
 def _diagnostic_artifact_paths(root: Path) -> dict[str, Path]:
@@ -2101,7 +2499,9 @@ def _reconstruct_diagnostic_from_fds(
         raise AnalyzerError("DIAG-SALVAGE: short source sidecar header")
     sidecar_magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
     if sidecar_magic != DIAGNOSTIC_MAGIC:
-        raise AnalyzerError(f"DIAG-SALVAGE: wrong source sidecar magic {sidecar_magic!r}")
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: wrong source sidecar magic {sidecar_magic!r}"
+        )
     sidecar_full_hasher.update(sidecar_header)
 
     for row_number in range(1, row_count + 1):
@@ -2114,7 +2514,7 @@ def _reconstruct_diagnostic_from_fds(
         row = BRSHGT1_ROW_STRUCT.unpack(row_raw)
         row = DiagnosticCheckpoint(*row)
         _validate_checkpoint_bounds(row, previous, checkpoint_file_sizes)
-        classified, records, journal, context_map, record_counts = (
+        classified, _records, _journal, _context_map, record_counts = (
             _read_diagnostic_streams_from_fds(
                 row,
                 previous,
@@ -2227,8 +2627,6 @@ def _reconstruct_diagnostic_from_fds(
     )
 
 
-
-
 def _write_all(fd: int, data: bytes | memoryview) -> None:
     view = memoryview(data)
     while view:
@@ -2252,6 +2650,8 @@ def _fd_signature(fd: int) -> tuple[int, int, int, int, int]:
         stat_result.st_mtime_ns,
         stat_result.st_ctime_ns,
     )
+
+
 def _sha256_fd(fd: int) -> str:
     """Hash one retained descriptor without changing its file position."""
     digest = hashlib.sha256()
@@ -2266,8 +2666,6 @@ def _sha256_fd(fd: int) -> str:
         digest.update(chunk)
         offset += len(chunk)
     return digest.hexdigest()
-
-
 
 
 def _path_signature(path: Path) -> tuple[int, int, int, int, int]:
@@ -2300,6 +2698,7 @@ def _clone_committed_source(
     destination: Path,
     committed_size: int,
     *,
+    recovery_dirfd: int,
     replacement_header: bytes | None = None,
     source_sha256: str | None = None,
     source_committed_prefix_sha256: str | None = None,
@@ -2325,11 +2724,14 @@ def _clone_committed_source(
     source_digest = (
         source_sha256 if source_sha256 is not None else _sha256_fd(source_fd)
     )
-    if committed_size == before.st_size and source_committed_prefix_sha256 is not None:
-        if source_committed_prefix_sha256 != source_digest:
-            raise AnalyzerError(
-                f"DIAG-SALVAGE: source committed-prefix digest mismatch: {source}"
-            )
+    if (
+        committed_size == before.st_size
+        and source_committed_prefix_sha256 is not None
+        and source_committed_prefix_sha256 != source_digest
+    ):
+        raise AnalyzerError(
+            f"DIAG-SALVAGE: source committed-prefix digest mismatch: {source}"
+        )
     if _fd_signature(source_fd) != (
         before.st_dev,
         before.st_ino,
@@ -2364,9 +2766,10 @@ def _clone_committed_source(
         identity["recovery_header_hex"] = replacement_header.hex()
 
     destination_fd = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o644,
+        destination.name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=recovery_dirfd,
     )
     try:
         try:
@@ -2381,11 +2784,10 @@ def _clone_committed_source(
                 raise
             _copy_fd_fallback(source_fd, destination_fd, committed_size)
         os.ftruncate(destination_fd, committed_size)
-        if replacement_header is not None:
-            if os.pwrite(destination_fd, replacement_header, 0) != len(
-                replacement_header
-            ):
-                raise AnalyzerError("DIAG-SALVAGE: short recovery header write")
+        if replacement_header is not None and os.pwrite(
+            destination_fd, replacement_header, 0
+        ) != len(replacement_header):
+            raise AnalyzerError("DIAG-SALVAGE: short recovery header write")
         os.fsync(destination_fd)
         if _fd_signature(source_fd) != (
             before.st_dev,
@@ -2394,9 +2796,7 @@ def _clone_committed_source(
             before.st_mtime_ns,
             before.st_ctime_ns,
         ):
-            raise AnalyzerError(
-                f"DIAG-SALVAGE: source changed while cloning: {source}"
-            )
+            raise AnalyzerError(f"DIAG-SALVAGE: source changed while cloning: {source}")
         return identity
     finally:
         os.close(destination_fd)
@@ -2407,32 +2807,220 @@ def _verify_retained_files(
     descriptors: dict[str, int],
     signatures: dict[str, tuple[int, int, int, int, int]],
     phase: str,
+    dir_fd: int | None = None,
 ) -> None:
+    """Prove retained files did not move, via a held directory descriptor.
+
+    When ``dir_fd`` is supplied, each pathname identity check is relative to
+    that descriptor. Otherwise the full pathname is checked.
+    """
     for name, descriptor in descriptors.items():
-        if (
-            _fd_signature(descriptor) != signatures[name]
-            or _path_signature(paths[name]) != signatures[name]
-        ):
+        signature = signatures[name]
+        path_stat = (
+            _dirfd_signature(dir_fd, paths[name].name)
+            if dir_fd is not None
+            else _path_signature(paths[name])
+        )
+        if _fd_signature(descriptor) != signature or path_stat != signature:
             raise AnalyzerError(f"DIAG-SALVAGE: {phase}: {paths[name]}")
 
 
-def _mkdir_exclusive_durable(path: Path) -> None:
-    missing: list[Path] = []
-    cursor = path
-    while not cursor.exists():
-        missing.append(cursor)
-        cursor = cursor.parent
-    if not cursor.is_dir():
-        raise AnalyzerError(
-            f"DIAG-SETUP: recovery ancestor is not a directory: {cursor}"
-        )
-    for directory in reversed(missing):
-        directory.mkdir()
-        parent_fd = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+def _walk_dirfd_nofollow(path: Path) -> tuple[int, list[str]]:
+    """Open the deepest existing ancestor of *path* without symlinks.
+
+    Returns the held descriptor (the caller owns it) plus the names of the
+    missing components below it, in order. Absolute paths anchor at ``/``
+    and relative paths at the current directory. A symlinked component is
+    refused at open (ELOOP) with the component named.
+    """
+    parts = list(path.parts)
+    if path.is_absolute():
+        anchor = "/"
+        parts = parts[1:]
+    else:
+        anchor = "."
+    try:
+        current = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        raise AnalyzerError(f"DIAG-SETUP: cannot open anchor {anchor}: {exc}") from exc
+    missing: list[str] = []
+    for part in parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            os.close(current)
+            raise AnalyzerError(
+                f"DIAG-SETUP: '..' is not allowed in custody paths: {path}"
+            )
+        if missing:
+            missing.append(part)
+            continue
         try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            missing.append(part)
+            continue
+        except OSError as exc:
+            os.close(current)
+            raise AnalyzerError(
+                f"DIAG-SETUP: refusing path component {part!r} of {path}: {exc}"
+            ) from exc
+        os.close(current)
+        current = child
+    return current, missing
+
+
+def _dirfd_contains_identity(directory_fd: int, identity: tuple[int, int]) -> bool:
+    """Return whether a held directory or any namespace ancestor is *identity*."""
+    cursor = os.dup(directory_fd)
+    try:
+        while True:
+            cursor_stat = os.fstat(cursor)
+            cursor_id = (cursor_stat.st_dev, cursor_stat.st_ino)
+            if cursor_id == identity:
+                return True
+            try:
+                parent = os.open(
+                    "..",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=cursor,
+                )
+            except OSError as exc:
+                raise AnalyzerError(
+                    f"DIAG-SETUP: cannot walk to namespace root: {exc}"
+                ) from exc
+            parent_stat = os.fstat(parent)
+            parent_id = (parent_stat.st_dev, parent_stat.st_ino)
+            if parent_id == cursor_id:
+                os.close(parent)
+                return False
+            os.close(cursor)
+            cursor = parent
+    finally:
+        os.close(cursor)
+
+
+def _proc_fdinfo_text(fd: int) -> str:
+    """Bounded raw text of ``/proc/self/fdinfo/<fd>``.
+
+    This is the injectable seam for mount-identity tests: production reads
+    the kernel file, tests substitute facts. The read is capped well below
+    any real fdinfo size.
+    """
+    try:
+        with open(f"/proc/self/fdinfo/{fd}", "r", encoding="ascii") as stream:
+            return stream.read(4096)
+    except OSError as exc:
+        raise AnalyzerError(
+            "DIAG-SETUP: cannot read fdinfo for a held descriptor: "
+            f"{_bounded_error_line(exc)}"
+        ) from exc
+
+
+def _fdinfo_mnt_id(fd: int) -> int:
+    """Parse the kernel ``mnt_id`` fact for one held descriptor.
+
+    A missing or malformed ``mnt_id`` fails closed: custody without a
+    mount identity is refused rather than assumed.
+    """
+    for line in _proc_fdinfo_text(fd).splitlines():
+        if line.split(":", 1)[0].strip() != "mnt_id":
+            continue
+        try:
+            return int(line.split(":", 1)[1].strip(), 10)
+        except ValueError:
+            break
+    raise AnalyzerError(
+        "DIAG-SETUP: mount identity (mnt_id) unavailable for a held "
+        "descriptor; refusing cross-mount custody"
+    )
+
+
+def _require_shared_source_mount(source_fd: int, others: list[tuple[str, int]]) -> None:
+    """Require custody directories to share the source mount before mutation.
+
+    Ordinary descriptors do not freeze mount topology, so this admission
+    check defines the supported custody contract together with the
+    descriptor-relative identity checks that follow: same mount up front,
+    held-descriptor identity throughout.
+    """
+    source_mnt = _fdinfo_mnt_id(source_fd)
+    for label, fd in others:
+        other_mnt = _fdinfo_mnt_id(fd)
+        if other_mnt != source_mnt:
+            raise AnalyzerError(
+                f"DIAG-SETUP: {label} is on a different mount (mnt_id "
+                f"{other_mnt}) than the source (mnt_id {source_mnt}); "
+                "refusing cross-mount custody mutation"
+            )
+
+
+def _open_held_recovery_directory(path: Path) -> int:
+    """Hold a pre-existing, empty recovery directory without following links.
+
+    Salvage never creates or empties recovery directories. The component-
+    wise no-follow walk refuses symlinked ancestors and a symlinked final
+    component; the held descriptor is re-proved against a no-follow re-stat
+    of the leaf pathname; and the directory must be empty. The caller owns
+    the returned descriptor.
+    """
+    dirfd, missing = _walk_dirfd_nofollow(path)
+    try:
+        if missing:
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery directory must be pre-created and "
+                f"empty: {_bounded_fact(str(path))} (missing component "
+                f"{_bounded_fact(missing[0])})"
+            )
+        held_stat = os.fstat(dirfd)
+        if not stat_module.S_ISDIR(held_stat.st_mode):
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery path is not a directory: "
+                f"{_bounded_fact(str(path))}"
+            )
+        try:
+            leaf_stat = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery directory vanished during open: "
+                f"{_bounded_fact(str(path))}: {_bounded_error_line(exc)}"
+            ) from exc
+        if (leaf_stat.st_dev, leaf_stat.st_ino) != (
+            held_stat.st_dev,
+            held_stat.st_ino,
+        ):
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery directory was substituted during "
+                f"open: {_bounded_fact(str(path))}"
+            )
+        entries = os.listdir(f"/proc/self/fd/{dirfd}")
+        if entries:
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery directory must be empty: "
+                f"{_bounded_fact(str(path))} already contains "
+                f"{len(entries)} entries (first: "
+                f"{_bounded_fact(min(entries))})"
+            )
+    except BaseException:
+        os.close(dirfd)
+        raise
+    return dirfd
+
+
+def _dirfd_signature(dir_fd: int, name: str) -> tuple[int, int, int, int, int]:
+    """Identity of one directory entry, stat'ed relative to a held dirfd."""
+    stat_result = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
 
 
 def _materialize_recovery_dir(
@@ -2440,24 +3028,40 @@ def _materialize_recovery_dir(
     source_fds: dict[str, int],
     recovery_dir: Path,
     reconstruction: DiagnosticReconstruction,
+    recovery_dirfd: int,
 ) -> tuple[
     dict[str, Path],
     dict[str, dict[str, object]],
     dict[str, tuple[int, int, int, int, int]],
 ]:
-    """Clone only checkpoint-committed evidence into a new directory."""
-    _mkdir_exclusive_durable(recovery_dir)
+    """Clone only checkpoint-committed evidence into the held directory.
+
+    The caller owns ``recovery_dirfd``; every clone destination is created
+    relative to it and every recovery signature is taken relative to it,
+    so recovery entries are never addressed by pathname.
+    """
     recovery_paths = _diagnostic_artifact_paths(recovery_dir)
     final = reconstruction.final
     source_custody: dict[str, dict[str, object]] = {}
     copy_specs = (
-        ("contexts", final.context_end, HEADER_STRUCT.pack(CONTEXT_MAGIC, final.context_rows)),
-        ("records", final.record_end, HEADER_STRUCT.pack(RECORD_MAGIC, final.record_rows)),
-        ("journal", final.journal_end, HEADER_STRUCT.pack(JOURNAL_MAGIC, final.journal_rows)),
+        (
+            "contexts",
+            final.context_end,
+            HEADER_STRUCT.pack(CONTEXT_MAGIC, final.context_rows),
+        ),
+        (
+            "records",
+            final.record_end,
+            HEADER_STRUCT.pack(RECORD_MAGIC, final.record_rows),
+        ),
+        (
+            "journal",
+            final.journal_end,
+            HEADER_STRUCT.pack(JOURNAL_MAGIC, final.journal_rows),
+        ),
         (
             "sidecar",
-            BRSHGT1_HEADER_STRUCT.size
-            + reconstruction.row_count * DIAGNOSTIC_ROW_SIZE,
+            BRSHGT1_HEADER_STRUCT.size + reconstruction.row_count * DIAGNOSTIC_ROW_SIZE,
             BRSHGT1_HEADER_STRUCT.pack(DIAGNOSTIC_MAGIC, reconstruction.row_count),
         ),
     )
@@ -2469,11 +3073,10 @@ def _materialize_recovery_dir(
             source_paths[name],
             recovery_paths[name],
             committed_size,
+            recovery_dirfd=recovery_dirfd,
             replacement_header=replacement_header,
             source_sha256=(
-                stream_digests.full_file_sha256
-                if stream_digests is not None
-                else None
+                stream_digests.full_file_sha256 if stream_digests is not None else None
             ),
             source_committed_prefix_sha256=(
                 stream_digests.committed_prefix_sha256
@@ -2487,20 +3090,21 @@ def _materialize_recovery_dir(
             ),
         )
         source_custody[name] = identity
-        recovery_signatures[name] = _path_signature(recovery_paths[name])
+        recovery_signatures[name] = _dirfd_signature(
+            recovery_dirfd, recovery_paths[name].name
+        )
     for name in ("replay", "counters"):
         source_custody[name] = _clone_committed_source(
             source_fds[name],
             source_paths[name],
             recovery_paths[name],
             os.fstat(source_fds[name]).st_size,
+            recovery_dirfd=recovery_dirfd,
         )
-        recovery_signatures[name] = _path_signature(recovery_paths[name])
-    dir_fd = os.open(recovery_dir, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        recovery_signatures[name] = _dirfd_signature(
+            recovery_dirfd, recovery_paths[name].name
+        )
+    os.fsync(recovery_dirfd)
     return recovery_paths, source_custody, recovery_signatures
 
 
@@ -2515,32 +3119,78 @@ def _salvage_diagnostic_scan(
     txindex: bool = False,
 ) -> None:
     """Recover terminal proof without changing the failed source directory."""
-    source_dir = source_dir.resolve()
-    recovery_dir = recovery_dir.resolve()
-    output_path = output_path.resolve()
-    # Preserve the operator's exact provenance string for replay comparison.
-    if not source_dir.is_dir():
-        raise AnalyzerError(f"DIAG-SETUP: source directory not found: {source_dir}")
-    if recovery_dir.exists():
+    # Provenance display only: the held anchor is taken by a component-wise
+    # no-follow walk of the operator's original pathname below, so a swapped
+    # intermediate symlink can never redirect custody to a substitute.
+    provenance_dir = source_dir.resolve()
+    if not provenance_dir.is_dir():
+        raise AnalyzerError(f"DIAG-SETUP: source directory not found: {provenance_dir}")
+    if not recovery_dir.is_dir():
         raise AnalyzerError(
-            f"DIAG-SETUP: recovery directory already exists: {recovery_dir}"
+            "DIAG-SETUP: recovery directory must be pre-created and empty: "
+            f"{_bounded_fact(str(recovery_dir))}"
         )
     if output_path.exists():
         raise AnalyzerError(f"DIAG-SETUP: output already exists: {output_path}")
-    if source_dir == recovery_dir or source_dir in recovery_dir.parents:
-        raise AnalyzerError("DIAG-SETUP: recovery directory must be outside source")
-    if source_dir == output_path.parent or source_dir in output_path.parents:
-        raise AnalyzerError("DIAG-SETUP: output must be outside source")
 
-    source_paths = _diagnostic_artifact_paths(source_dir)
+    source_paths = _diagnostic_artifact_paths(provenance_dir)
     source_fds: dict[str, int] = {}
     source_signatures: dict[str, tuple[int, int, int, int, int]] = {}
     recovery_fds: dict[str, int] = {}
+    recovery_dirfd: int | None = None
+    output_parent_fd: int | None = None
+    source_anchor: int | None = None
     succeeded = False
     try:
+        held_anchor, missing_components = _walk_dirfd_nofollow(source_dir)
+        if missing_components:
+            os.close(held_anchor)
+            raise AnalyzerError(
+                f"DIAG-SETUP: source directory component missing: {provenance_dir}"
+            )
+        source_anchor = held_anchor
+        source_anchor_stat = os.fstat(source_anchor)
+        source_anchor_id = (source_anchor_stat.st_dev, source_anchor_stat.st_ino)
+        # The output parent is taken, containment-checked against the held
+        # source identity, and retained for publication before any recovery
+        # or output state exists: no rejection can leave directories behind
+        # and publication never rewalks the checked pathname.
+        output_parent_fd, output_missing = _walk_dirfd_nofollow(
+            output_path.parent if str(output_path.parent) else Path(".")
+        )
+        if output_missing:
+            os.close(output_parent_fd)
+            output_parent_fd = None
+            raise AnalyzerError(
+                "DIAG-SETUP: output parent directory does not exist: "
+                f"{output_path.parent}"
+            )
+        if _dirfd_contains_identity(output_parent_fd, source_anchor_id):
+            os.close(output_parent_fd)
+            output_parent_fd = None
+            raise AnalyzerError("DIAG-SETUP: output must be outside source")
         for name, path in source_paths.items():
-            source_fds[name] = os.open(path, os.O_RDONLY)
+            source_fds[name] = _open_custody_input(
+                path.name,
+                1 << 32,
+                f"salvage source {name}",
+                "DIAG-SALVAGE",
+                dir_fd=source_anchor,
+            )
             source_signatures[name] = _fd_signature(source_fds[name])
+        recovery_dirfd = _open_held_recovery_directory(recovery_dir)
+        if _dirfd_contains_identity(recovery_dirfd, source_anchor_id):
+            raise AnalyzerError(
+                "DIAG-SETUP: recovery directory must be outside source: "
+                "recovery nested under source"
+            )
+        _require_shared_source_mount(
+            source_anchor,
+            (
+                ("recovery directory", recovery_dirfd),
+                ("output parent", output_parent_fd),
+            ),
+        )
         row_count = _source_sidecar_row_count(source_fds["sidecar"])
         source_reconstruction = _reconstruct_diagnostic_from_fds(
             row_count,
@@ -2551,37 +3201,55 @@ def _salvage_diagnostic_scan(
             source_fds,
             source_signatures,
             "source changed during reconstruction",
+            dir_fd=source_anchor,
         )
-        recovery_paths, source_custody, recovery_signatures = (
-            _materialize_recovery_dir(
-                source_paths,
-                source_fds,
-                recovery_dir,
-                source_reconstruction,
-            )
+        recovery_paths, source_custody, recovery_signatures = _materialize_recovery_dir(
+            source_paths,
+            source_fds,
+            recovery_dir,
+            source_reconstruction,
+            recovery_dirfd,
         )
         _verify_retained_files(
             source_paths,
             source_fds,
             source_signatures,
             "source changed during materialization",
+            dir_fd=source_anchor,
         )
         for name, path in recovery_paths.items():
-            recovery_fds[name] = os.open(path, os.O_RDONLY)
+            if name == "sidecar":
+                recovery_fds[name] = _open_custody_rw(
+                    path.name,
+                    1 << 32,
+                    f"salvage recovery {name}",
+                    "DIAG-SALVAGE",
+                    dir_fd=recovery_dirfd,
+                )
+            else:
+                recovery_fds[name] = _open_custody_input(
+                    path.name,
+                    1 << 32,
+                    f"salvage recovery {name}",
+                    "DIAG-SALVAGE",
+                    dir_fd=recovery_dirfd,
+                )
         _verify_retained_files(
             recovery_paths,
             recovery_fds,
             recovery_signatures,
             "recovery changed during materialization",
+            dir_fd=recovery_dirfd,
         )
         teardown = DiagnosticTeardown(
             None,
             "unobserved",
-            str(source_dir),
+            str(provenance_dir),
             source_custody,
         )
         _finalize_candidate(
             recovery_paths,
+            recovery_fds,
             source_reconstruction.row_count,
             source_reconstruction.final,
             source_reconstruction.cumulative_counts,
@@ -2593,7 +3261,10 @@ def _salvage_diagnostic_scan(
             txindex,
             data_dir,
             teardown,
-            recovery_signatures,
+            recovery_dirfd=recovery_dirfd,
+            output_parent_fd=output_parent_fd,
+            recovery_signatures=recovery_signatures,
+            source_dirfd=source_anchor,
         )
         try:
             _verify_retained_files(
@@ -2601,29 +3272,25 @@ def _salvage_diagnostic_scan(
                 source_fds,
                 source_signatures,
                 "source changed after candidate publication",
+                dir_fd=source_anchor,
             )
             _verify_retained_files(
                 recovery_paths,
                 recovery_fds,
                 recovery_signatures,
                 "recovery changed after candidate publication",
+                dir_fd=recovery_dirfd,
             )
-        except BaseException as custody_error:
-            try:
-                try:
-                    output_path.unlink()
-                except FileNotFoundError:
-                    # The candidate is already absent; fsync its parent below.
-                    pass
-                parent_fd = os.open(
-                    output_path.parent, os.O_RDONLY | os.O_DIRECTORY
-                )
-                try:
-                    os.fsync(parent_fd)
-                finally:
-                    os.close(parent_fd)
-            except OSError as rollback_error:
-                raise rollback_error from custody_error
+        except BaseException:
+            # Never pathname-unlink a published candidate: an inode verified
+            # through a descriptor can be redirected by a concurrent rename
+            # before the unlink lands. Leave the candidate as a named orphan
+            # and report it for operator cleanup.
+            print(
+                "DIAG-SALVAGE: failed publication left candidate orphan "
+                f"{_bounded_fact(str(output_path))} for operator cleanup",
+                file=sys.stderr,
+            )
             raise
         succeeded = True
     finally:
@@ -2631,8 +3298,21 @@ def _salvage_diagnostic_scan(
             os.close(fd)
         for fd in source_fds.values():
             os.close(fd)
-        if recovery_dir.exists() and not succeeded:
-            shutil.rmtree(recovery_dir)
+        if source_anchor is not None:
+            os.close(source_anchor)
+        if output_parent_fd is not None:
+            os.close(output_parent_fd)
+        if recovery_dirfd is not None:
+            os.close(recovery_dirfd)
+        if recovery_dirfd is not None and not succeeded:
+            # The recovery evidence is never pathname-unlinked on failure:
+            # deleting by name could delete a concurrent substitute. Leave
+            # the directory in place and report it for operator cleanup.
+            print(
+                "DIAG-SALVAGE: failed run left recovery evidence at "
+                f"{_bounded_fact(str(recovery_dir))} for operator cleanup",
+                file=sys.stderr,
+            )
 
 
 def cmd_salvage_cmodern_height(args: argparse.Namespace) -> int:
@@ -2653,53 +3333,87 @@ def cmd_find_cmodern_height(args: argparse.Namespace) -> int:
     binary = Path(args.binary)
     work_dir = Path(args.work_dir)
     output = Path(args.output)
-    if not binary.is_file():
-        raise AnalyzerError(f"DIAG-SETUP: binary not found: {binary}")
-    if not args.rest_url or ":" not in args.rest_url:
-        raise AnalyzerError(
-            f"DIAG-SETUP: invalid rest_url {args.rest_url!r}; expected host:port"
+    # The child executable is verified and hashed once, no-follow; every
+    # launch in the height search executes that held descriptor.
+    binary_fd, _binary_custody = _open_verified_executable(binary)
+    try:
+        if not args.rest_url or ":" not in args.rest_url:
+            raise AnalyzerError(
+                f"DIAG-SETUP: invalid rest_url {args.rest_url!r}; expected host:port"
+            )
+        if not (0 <= args.stop_height <= 0xFFFFFFFF):
+            raise AnalyzerError(
+                f"DIAG-SETUP: stop-height must be a u32, got {args.stop_height}"
+            )
+        if work_dir.exists():
+            raise AnalyzerError(
+                f"DIAG-SETUP: work directory already exists: {work_dir}"
+            )
+        if output.exists():
+            raise AnalyzerError(f"DIAG-SETUP: output already exists: {output}")
+        work_dir.mkdir(parents=True, exist_ok=False)
+        _run_diagnostic_scan(
+            binary,
+            args.rest_url,
+            args.stop_height,
+            work_dir,
+            output,
+            storage_backend=args.storage_backend,
+            txindex=args.txindex,
+            binary_fd=binary_fd,
         )
-    if not (0 <= args.stop_height <= 0xFFFFFFFF):
-        raise AnalyzerError(
-            f"DIAG-SETUP: stop-height must be a u32, got {args.stop_height}"
-        )
-    if work_dir.exists():
-        raise AnalyzerError(f"DIAG-SETUP: work directory already exists: {work_dir}")
-    if output.exists():
-        raise AnalyzerError(f"DIAG-SETUP: output already exists: {output}")
-    work_dir.mkdir(parents=True, exist_ok=False)
-    _run_diagnostic_scan(
-        binary,
-        args.rest_url,
-        args.stop_height,
-        work_dir,
-        output,
-        storage_backend=args.storage_backend,
-        txindex=args.txindex,
-    )
+    finally:
+        os.close(binary_fd)
     return 0
+
 
 # ── Binary parsing ──────────────────────────────────────────────────────────
 
 
 def read_raw_entries(
-    path: Path, magic: bytes, entry_size: int, name: str
+    path: Path, magic: bytes, entry_size: int, name: str, max_entries: int
 ) -> list[bytes]:
-    """Read a binary file with magic + u64 count header, return raw entry bytes."""
-    data = path.read_bytes()
-    if len(data) < HEADER_SIZE:
-        raise AnalyzerError(
-            f"{path}: file too short ({len(data)} bytes < {HEADER_SIZE} header)"
-        )
-    file_magic, count = HEADER_STRUCT.unpack_from(data, 0)
-    if file_magic != magic:
-        raise AnalyzerError(f"{path}: bad magic {file_magic!r}, expected {magic!r}")
-    expected = HEADER_SIZE + count * entry_size
-    if len(data) != expected:
-        raise AnalyzerError(
-            f"{path}: size mismatch (got {len(data)}, expected {expected} "
-            f"= {HEADER_SIZE} + {count} × {entry_size} {name})"
-        )
+    """Read a magic + u64-count capture file from one bounded descriptor.
+
+    Framing is validated before anything large is allocated: the 16-byte
+    header is read alone, the declared count must be at most
+    ``max_entries``, and the file size must equal
+    ``HEADER_SIZE + count × entry_size`` exactly. Only then are the
+    entries read, so a forged count or a sparse-file size lie is rejected
+    before any bulk allocation.
+    """
+    byte_ceiling = HEADER_SIZE + max_entries * entry_size
+    fd = _open_custody_input(path, byte_ceiling, f"{path}: binary file", "CTX-CUSTODY")
+    try:
+        header = b""
+        while len(header) < HEADER_SIZE:
+            chunk = os.read(fd, HEADER_SIZE - len(header))
+            if not chunk:
+                break
+            header += chunk
+        if len(header) < HEADER_SIZE:
+            raise AnalyzerError(
+                f"{path}: file too short ({len(header)} bytes < {HEADER_SIZE} header)"
+            )
+        file_magic, count = HEADER_STRUCT.unpack_from(header, 0)
+        if file_magic != magic:
+            raise AnalyzerError(f"{path}: bad magic {file_magic!r}, expected {magic!r}")
+        if count > max_entries:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: {path}: declared {count} {name} exceeds the "
+                f"{max_entries}-entry ceiling"
+            )
+        expected = HEADER_SIZE + count * entry_size
+        file_size = os.fstat(fd).st_size
+        if file_size != expected:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: {path}: size mismatch (got {file_size}, expected "
+                f"{expected} = {HEADER_SIZE} + {count} × {entry_size} {name})"
+            )
+        body = _read_fd_exact(fd, expected - HEADER_SIZE, f"{path}: binary file")
+        data = header + body
+    finally:
+        os.close(fd)
     return [
         data[HEADER_SIZE + i * entry_size : HEADER_SIZE + (i + 1) * entry_size]
         for i in range(count)
@@ -2707,12 +3421,16 @@ def read_raw_entries(
 
 
 def parse_records(path: Path) -> list[Record]:
-    raws = read_raw_entries(path, RECORD_MAGIC, RECORD_SIZE, "records")
+    raws = read_raw_entries(
+        path, RECORD_MAGIC, RECORD_SIZE, "records", _MAX_CAPTURE_ENTRIES
+    )
     return [Record(r) for r in raws]
 
 
 def parse_journal(path: Path) -> list[JournalEntry]:
-    raws = read_raw_entries(path, JOURNAL_MAGIC, JOURNAL_SIZE, "journal entries")
+    raws = read_raw_entries(
+        path, JOURNAL_MAGIC, JOURNAL_SIZE, "journal entries", _MAX_CAPTURE_ENTRIES
+    )
     return [JournalEntry(r) for r in raws]
 
 
@@ -2724,17 +3442,27 @@ def _iter_binary_entries(
     Yields ``(index, raw_bytes)`` pairs without loading the whole file.
     Raises ``AnalyzerError`` on short reads, bad magic, or size mismatch.
     """
-    file_size = path.stat().st_size
+    fd = _open_custody_input(
+        path,
+        HEADER_SIZE + _MAX_CAPTURE_ENTRIES * entry_size,
+        name,
+        "CTX-CUSTODY",
+    )
+    file_size = os.fstat(fd).st_size
     if file_size < HEADER_SIZE:
+        os.close(fd)
         raise AnalyzerError(
             f"{name}: file too short ({file_size} bytes < {HEADER_SIZE} header)"
         )
-    with path.open("rb") as stream:
+    with os.fdopen(fd, "rb", closefd=True) as stream:
         header = _read_exact_bytes(stream, HEADER_SIZE, f"{name} header")
         file_magic, count = HEADER_STRUCT.unpack(header)
         if file_magic != magic:
+            raise AnalyzerError(f"{name}: bad magic {file_magic!r}, expected {magic!r}")
+        if count > _MAX_CAPTURE_ENTRIES:
             raise AnalyzerError(
-                f"{name}: bad magic {file_magic!r}, expected {magic!r}"
+                f"CTX-CUSTODY: {name}: declared {count} entries exceeds the "
+                f"{_MAX_CAPTURE_ENTRIES}-entry ceiling"
             )
         expected_payload = count * entry_size
         available = file_size - HEADER_SIZE
@@ -2753,7 +3481,9 @@ def _iter_binary_entries(
             )
 
 
-def _read_exact_bytes(stream: BinaryIO, length: int, field: str, scope: str = "") -> bytes:
+def _read_exact_bytes(
+    stream: BinaryIO, length: int, field: str, scope: str = ""
+) -> bytes:
     """Read exactly *length* bytes from *stream* or raise AnalyzerError."""
     data = stream.read(length)
     if data is None or len(data) < length:
@@ -2764,9 +3494,7 @@ def _read_exact_bytes(stream: BinaryIO, length: int, field: str, scope: str = ""
 
 def iter_records(path: Path) -> Iterator[Record]:
     """Stream BRSREC1 records one at a time without materializing the file."""
-    for _index, raw in _iter_binary_entries(
-        path, RECORD_MAGIC, RECORD_SIZE, "records"
-    ):
+    for _index, raw in _iter_binary_entries(path, RECORD_MAGIC, RECORD_SIZE, "records"):
         yield Record(raw)
 
 
@@ -2777,13 +3505,20 @@ def _iter_binary_entries_with_custody(
     exact single open used for parsing.  Returns ``(iterator, custody)``
     where *custody* is populated once the iterator is fully consumed.
     """
-    file_size = path.stat().st_size
+    fd = _open_custody_input(
+        path,
+        HEADER_SIZE + _MAX_CAPTURE_ENTRIES * entry_size,
+        name,
+        "CTX-CUSTODY",
+    )
+    file_size = os.fstat(fd).st_size
     if file_size < HEADER_SIZE:
+        os.close(fd)
         raise AnalyzerError(
             f"{name}: file too short ({file_size} bytes < {HEADER_SIZE} header)"
         )
     custody: dict[str, int] = {"bytes": 0, "sha256": 0, "body_sha256": 0}
-    stream = path.open("rb")
+    stream = os.fdopen(fd, "rb", closefd=True)
     running_hash = hashlib.sha256()
     body_hash = hashlib.sha256()
     try:
@@ -2791,8 +3526,11 @@ def _iter_binary_entries_with_custody(
         running_hash.update(header)
         file_magic, count = HEADER_STRUCT.unpack(header)
         if file_magic != magic:
+            raise AnalyzerError(f"{name}: bad magic {file_magic!r}, expected {magic!r}")
+        if count > _MAX_CAPTURE_ENTRIES:
             raise AnalyzerError(
-                f"{name}: bad magic {file_magic!r}, expected {magic!r}"
+                f"CTX-CUSTODY: {name}: declared {count} entries exceeds the "
+                f"{_MAX_CAPTURE_ENTRIES}-entry ceiling"
             )
         expected_payload = count * entry_size
         available = file_size - HEADER_SIZE
@@ -2826,9 +3564,7 @@ def _iter_binary_entries_with_custody(
         raise
 
 
-def iter_records_with_custody(
-    path: Path
-) -> tuple[Iterator[Record], dict[str, int]]:
+def iter_records_with_custody(path: Path) -> tuple[Iterator[Record], dict[str, int]]:
     """Stream BRSREC1 records and compute custody on the single open."""
     gen, custody = _iter_binary_entries_with_custody(
         path, RECORD_MAGIC, RECORD_SIZE, "records"
@@ -2837,7 +3573,7 @@ def iter_records_with_custody(
 
 
 def iter_journal_with_custody(
-    path: Path
+    path: Path,
 ) -> tuple[Iterator[JournalEntry], dict[str, int]]:
     """Stream BRSJRN1 journal entries and compute custody on the single open."""
     gen, custody = _iter_binary_entries_with_custody(
@@ -2845,16 +3581,72 @@ def iter_journal_with_custody(
     )
     return ((JournalEntry(raw) for _idx, raw in gen), custody)
 
+
+def sorted_records_sha256(raw_entries: list[bytes]) -> str:
+    """Sort raw record bytes by (spend_txid, input_index, op_seq) in place,
+    then hash the entries in that order without building a concatenation.
+
+    The digest is byte-identical to hashing the sorted concatenation: the
+    hash sees the same entries in the same order, so INV-13 values and the
+    published ``sorted.bin`` payload are unchanged.
+    """
+
+    def key(raw: bytes) -> tuple[bytes, int, int]:
+        txid = raw[0:32]
+        input_index = struct.unpack_from("<I", raw, 32)[0]
+        op_seq = struct.unpack_from("<I", raw, 36)[0]
+        return (txid, input_index, op_seq)
+
+    raw_entries.sort(key=key)
+    digest = hashlib.sha256()
+    for raw in raw_entries:
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _digest_custody_stream(path: Path) -> tuple[int, str]:
+    """Size and sha256 of a non-materialized custody input, streamed from
+    one bounded descriptor.
+
+    This is the digest-only analogue of the capture readers: the file is
+    opened under the custody contract (no symlink, no FIFO block, regular
+    file), never loaded whole, and hashed 8 MiB at a time.
+    """
+    fd = _open_custody_input(path, 1 << 40, f"{path}: file", "CTX-CUSTODY")
+    try:
+        size = os.fstat(fd).st_size
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < size:
+            chunk = os.pread(fd, min(8 * 1024 * 1024, size - offset), offset)
+            if not chunk:
+                raise AnalyzerError(
+                    f"CTX-CUSTODY: {path} ended at {offset}, expected {size}"
+                )
+            digest.update(chunk)
+            offset += len(chunk)
+        return size, digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def iter_journal(path: Path) -> Iterator[JournalEntry]:
     """Stream BRSJRN1 journal entries one at a time without materializing the file."""
     for _index, raw in _iter_binary_entries(
         path, JOURNAL_MAGIC, JOURNAL_SIZE, "journal entries"
     ):
         yield JournalEntry(raw)
+
+
 def parse_counters(path: Path) -> tuple[Counters, dict[str, int]]:
     """Parse counters JSON and return (Counters, custody) from the single read."""
-    counters_bytes = path.read_bytes()
-    raw = json.loads(counters_bytes)
+    counters_bytes, raw = _load_bounded_json_fd(
+        path, _COUNTERS_MAX_BYTES, "counters JSON"
+    )
     if not isinstance(raw, dict):
         raise AnalyzerError(f"{path}: JSON root is not an object")
     if raw.get("schema") != 1:
@@ -2866,39 +3658,6 @@ def parse_counters(path: Path) -> tuple[Counters, dict[str, int]]:
     return Counters(raw), custody
 
 
-# ── Sorting and hashing ─────────────────────────────────────────────────────
-
-
-def sort_records_raw(raw_entries: list[bytes]) -> bytes:
-    """Sort raw record bytes by (spend_txid, input_index, op_seq), concatenate."""
-
-    def key(raw: bytes) -> tuple[bytes, int, int]:
-        txid = raw[0:32]
-        input_index = struct.unpack_from("<I", raw, 32)[0]
-        op_seq = struct.unpack_from("<I", raw, 36)[0]
-        return (txid, input_index, op_seq)
-
-    return b"".join(sorted(raw_entries, key=key))
-
-
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _sha256_file(path: Path) -> tuple[int, str]:
-    """Return (size in bytes, lowercase hex sha256) for a file."""
-    h = hashlib.sha256()
-    size = 0
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(64 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-            size += len(chunk)
-    return size, h.hexdigest()
-
-
 # ── Invariant checks ────────────────────────────────────────────────────────
 
 
@@ -2907,7 +3666,11 @@ def check_counter_arithmetic(c: Counters) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
 
     def inv(inv_id: str, passed: bool, statement: str, **extra: object) -> None:
-        entry: dict[str, object] = {"id": inv_id, "passed": passed, "statement": statement}
+        entry: dict[str, object] = {
+            "id": inv_id,
+            "passed": passed,
+            "statement": statement,
+        }
         entry.update(extra)
         results.append(entry)
 
@@ -3363,27 +4126,41 @@ def extract_spike_width1(spike: dict[str, object]) -> float:
 
 def cmd_validate_capture(args: argparse.Namespace) -> int:
     counters, _ = parse_counters(Path(args.counters))
-    records = parse_records(Path(args.records))
+    # Parse each capture exactly once; the same lists feed the invariant
+    # checks, the digest, and the optional sorted publication.
+    raw1 = read_raw_entries(
+        Path(args.records), RECORD_MAGIC, RECORD_SIZE, "records", _MAX_CAPTURE_ENTRIES
+    )
+    raw2 = read_raw_entries(
+        Path(args.repeat_records),
+        RECORD_MAGIC,
+        RECORD_SIZE,
+        "records",
+        _MAX_CAPTURE_ENTRIES,
+    )
+    records = [Record(raw) for raw in raw1]
     journal = parse_journal(Path(args.journal))
 
     repeat_counters, _ = parse_counters(Path(args.repeat_counters))
-    parse_records(Path(args.repeat_records))
-    parse_journal(Path(args.repeat_journal))
-
-    # Sort records and compute SHA256 for both runs
-    raw1 = read_raw_entries(Path(args.records), RECORD_MAGIC, RECORD_SIZE, "records")
-    raw2 = read_raw_entries(
-        Path(args.repeat_records), RECORD_MAGIC, RECORD_SIZE, "records"
+    # The repeat journal is re-validated for framing only; the repeat
+    # records are fully parsed like the primary run.
+    read_raw_entries(
+        Path(args.repeat_journal),
+        JOURNAL_MAGIC,
+        JOURNAL_SIZE,
+        "journal entries",
+        _MAX_CAPTURE_ENTRIES,
     )
-    sorted1 = sort_records_raw(raw1)
-    sorted2 = sort_records_raw(raw2)
-    sha1 = sha256_hex(sorted1)
-    sha2 = sha256_hex(sorted2)
+    _ = [Record(raw) for raw in raw2]
+
+    # Sort in place and digest without materializing a second full copy.
+    sha1 = sorted_records_sha256(raw1)
+    sha2 = sorted_records_sha256(raw2)
 
     if args.sorted_records_output:
         out = Path(args.sorted_records_output)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(HEADER_STRUCT.pack(RECORD_MAGIC, len(raw1)) + sorted1)
+        out.write_bytes(HEADER_STRUCT.pack(RECORD_MAGIC, len(raw1)) + b"".join(raw1))
 
     inv_results: list[dict[str, object]] = []
     inv_results.extend(check_counter_arithmetic(counters))
@@ -3411,13 +4188,13 @@ def cmd_validate_capture(args: argparse.Namespace) -> int:
 
     context_inputs = getattr(args, "context_inputs", None)
     if context_inputs:
-        corpus_size, corpus_sha256 = _sha256_file(Path(context_inputs))
+        corpus_size, corpus_sha256 = _digest_custody_stream(Path(context_inputs))
         report["corpus_size"] = corpus_size
         report["corpus_sha256"] = corpus_sha256
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n")
+    _write_json_atomic(out_path, report)
 
     failed = [r["id"] for r in inv_results if not r["passed"]]
     if counters.ffi_verify_entries != EXPECTED_FFI_VERIFY_ENTRIES_KSPIKE1:
@@ -3501,7 +4278,7 @@ def cmd_validate_census(args: argparse.Namespace) -> int:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n")
+    _write_json_atomic(out_path, report)
 
     failed = [r["id"] for r in inv_results if not r["passed"]]
     if not exp1["passed"]:
@@ -3843,11 +4620,10 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n")
+    _write_json_atomic(out_path, report)
 
     print(f"verdict: {verdict} — {rationale}")
     return 0 if verdict != "INVALID" else 2
-
 
 
 # ── Subcommand: classify-corpus ──────────────────────────────────────────────
@@ -3903,35 +4679,57 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     Raises ``AnalyzerError`` with CTX-CUSTODY or CTX-WINDOW prefix on any
     schema, field, or invariant violation.
     """
-    replay_bytes = path.read_bytes()
-    raw = json.loads(replay_bytes)
+    replay_bytes, raw = _load_bounded_json_fd(
+        path, _REPLAY_MAX_BYTES, "replay artifact"
+    )
     if not isinstance(raw, dict):
         raise AnalyzerError("CTX-CUSTODY: replay artifact root is not an object")
 
     _REPLAY_KEYS = {
-        "schema", "network", "network_magic", "genesis_hash",
-        "start_height", "start_hash", "stop_height", "stop_hash",
-        "block_count", "window", "assume_valid_height",
-        "window_verify_success_total", "corpus_manifest", "archive",
-        "block_bytes", "block_source",
-        "blocks_per_second", "checkpoint_generation", "data_dir",
-        "decode_seconds", "elapsed_seconds", "fetch_seconds",
-        "git_head", "measurement_target", "rss_high_water_bytes",
-        "stage_seconds", "storage_backend", "tx_count", "txindex",
-        "txindex_worker_catchup_seconds", "txindex_total_elapsed_seconds",
+        "schema",
+        "network",
+        "network_magic",
+        "genesis_hash",
+        "start_height",
+        "start_hash",
+        "stop_height",
+        "stop_hash",
+        "block_count",
+        "window",
+        "assume_valid_height",
+        "window_verify_success_total",
+        "corpus_manifest",
+        "archive",
+        "block_bytes",
+        "block_source",
+        "blocks_per_second",
+        "checkpoint_generation",
+        "data_dir",
+        "decode_seconds",
+        "elapsed_seconds",
+        "fetch_seconds",
+        "git_head",
+        "measurement_target",
+        "rss_high_water_bytes",
+        "stage_seconds",
+        "storage_backend",
+        "tx_count",
+        "txindex",
+        "txindex_worker_catchup_seconds",
+        "txindex_total_elapsed_seconds",
     }
     _require_exact_keys(raw, _REPLAY_KEYS, "replay artifact root")
 
     if raw["schema"] != "mainnet-prefix-replay-v3":
         raise AnalyzerError(
-            f"CTX-CUSTODY: replay schema is {raw['schema']!r}, "
-            f"expected 'mainnet-prefix-replay-v3'"
+            "CTX-CUSTODY: replay schema is "
+            f"{_bounded_fact(raw['schema'])}, expected 'mainnet-prefix-replay-v3'"
         )
 
     network = raw["network"]
     if network != "mainnet":
         raise AnalyzerError(
-            f"CTX-CUSTODY: replay.network must be 'mainnet', got {network!r}"
+            f"CTX-CUSTODY: replay.network must be 'mainnet', got {_bounded_fact(network)}"
         )
 
     network_magic = _require_hex_str(raw["network_magic"], "replay.network_magic", 8)
@@ -3971,9 +4769,7 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     window = _require_int_field(raw["window"], "replay.window")
     if window <= 1:
-        raise AnalyzerError(
-            f"CTX-WINDOW: replay.window must be > 1, got {window}"
-        )
+        raise AnalyzerError(f"CTX-WINDOW: replay.window must be > 1, got {window}")
 
     assume_valid_height = _require_int_field(
         raw["assume_valid_height"], "replay.assume_valid_height"
@@ -3996,9 +4792,7 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     corpus_manifest = _require_custody_ref(
         raw["corpus_manifest"], "replay.corpus_manifest", with_schema=True
     )
-    archive = _require_custody_ref(
-        raw["archive"], "replay.archive", with_schema=False
-    )
+    archive = _require_custody_ref(raw["archive"], "replay.archive", with_schema=False)
 
     # ── Optional timing/metadata fields emitted by the Rust replay binary.
     # These are not load-bearing for the contract, but the schema is frozen,
@@ -4012,31 +4806,40 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     block_bytes = _require_non_bool_int(raw["block_bytes"], "replay.block_bytes")
     if block_bytes < 0:
-        raise AnalyzerError(f"CTX-CUSTODY: replay.block_bytes must be >= 0, got {block_bytes}")
+        raise AnalyzerError(
+            f"CTX-CUSTODY: replay.block_bytes must be >= 0, got {block_bytes}"
+        )
 
     block_source = raw["block_source"]
     if block_source != "file":
         raise AnalyzerError(
-            "CTX-CUSTODY: replay.block_source must be 'file', "
-            f"got {block_source!r}"
+            f"CTX-CUSTODY: replay.block_source must be 'file', got {_bounded_fact(block_source)}"
         )
 
     if not isinstance(raw["txindex"], bool):
         raise AnalyzerError("CTX-CUSTODY: replay.txindex must be a boolean")
 
-    blocks_per_second = _require_float(raw["blocks_per_second"], "replay.blocks_per_second", ge=0.0)
+    blocks_per_second = _require_float(
+        raw["blocks_per_second"], "replay.blocks_per_second", ge=0.0
+    )
     checkpoint_generation = _require_non_bool_int(
         raw["checkpoint_generation"], "replay.checkpoint_generation"
     )
     if checkpoint_generation < 1:
-        raise AnalyzerError(f"CTX-CUSTODY: replay.checkpoint_generation must be >= 1, got {checkpoint_generation}")
+        raise AnalyzerError(
+            f"CTX-CUSTODY: replay.checkpoint_generation must be >= 1, got {checkpoint_generation}"
+        )
 
     data_dir = raw["data_dir"]
     if not isinstance(data_dir, str) or len(data_dir) == 0:
         raise AnalyzerError("CTX-CUSTODY: replay.data_dir must be a nonempty string")
 
-    decode_seconds = _require_float(raw["decode_seconds"], "replay.decode_seconds", ge=0.0)
-    elapsed_seconds = _require_float(raw["elapsed_seconds"], "replay.elapsed_seconds", ge=0.0)
+    decode_seconds = _require_float(
+        raw["decode_seconds"], "replay.decode_seconds", ge=0.0
+    )
+    elapsed_seconds = _require_float(
+        raw["elapsed_seconds"], "replay.elapsed_seconds", ge=0.0
+    )
     fetch_seconds = _require_float(raw["fetch_seconds"], "replay.fetch_seconds", ge=0.0)
 
     def _require_optional_float(value: object, field: str) -> None:
@@ -4056,13 +4859,17 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     measurement_target = raw["measurement_target"]
     if not isinstance(measurement_target, str) or len(measurement_target) == 0:
-        raise AnalyzerError("CTX-CUSTODY: replay.measurement_target must be a nonempty string")
+        raise AnalyzerError(
+            "CTX-CUSTODY: replay.measurement_target must be a nonempty string"
+        )
 
     rss_high_water_bytes = _require_non_bool_int(
         raw["rss_high_water_bytes"], "replay.rss_high_water_bytes"
     )
     if rss_high_water_bytes < 0:
-        raise AnalyzerError(f"CTX-CUSTODY: replay.rss_high_water_bytes must be >= 0, got {rss_high_water_bytes}")
+        raise AnalyzerError(
+            f"CTX-CUSTODY: replay.rss_high_water_bytes must be >= 0, got {rss_high_water_bytes}"
+        )
 
     stage_seconds = raw["stage_seconds"]
     if not isinstance(stage_seconds, list):
@@ -4074,7 +4881,9 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
                 "CTX-CUSTODY: replay.stage_seconds entries must be objects with "
                 "count, stage, and sum_seconds"
             )
-        _require_exact_keys(_stage_entry, _STAGE_ENTRY_KEYS, "replay.stage_seconds entry")
+        _require_exact_keys(
+            _stage_entry, _STAGE_ENTRY_KEYS, "replay.stage_seconds entry"
+        )
         _stage_count = _stage_entry["count"]
         if isinstance(_stage_count, bool) or not isinstance(_stage_count, int):
             raise AnalyzerError(
@@ -4086,7 +4895,9 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
             )
         _stage_name = _stage_entry["stage"]
         if not isinstance(_stage_name, str):
-            raise AnalyzerError("CTX-CUSTODY: replay.stage_seconds stage must be a string")
+            raise AnalyzerError(
+                "CTX-CUSTODY: replay.stage_seconds stage must be a string"
+            )
         _stage_sum = _stage_entry["sum_seconds"]
         if isinstance(_stage_sum, bool) or not isinstance(_stage_sum, float):
             raise AnalyzerError(
@@ -4100,11 +4911,15 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
 
     storage_backend = raw["storage_backend"]
     if not isinstance(storage_backend, str) or len(storage_backend) == 0:
-        raise AnalyzerError("CTX-CUSTODY: replay.storage_backend must be a nonempty string")
+        raise AnalyzerError(
+            "CTX-CUSTODY: replay.storage_backend must be a nonempty string"
+        )
 
     tx_count = _require_non_bool_int(raw["tx_count"], "replay.tx_count")
     if tx_count < 0:
-        raise AnalyzerError(f"CTX-CUSTODY: replay.tx_count must be >= 0, got {tx_count}")
+        raise AnalyzerError(
+            f"CTX-CUSTODY: replay.tx_count must be >= 0, got {tx_count}"
+        )
 
     return {
         "schema": "mainnet-prefix-replay-v3",
@@ -4145,47 +4960,585 @@ def _validate_replay_artifact(path: Path) -> dict[str, object]:
     }
 
 
+def _require_reopen_proofs(proofs: object) -> None:
+    """Require exactly one well-formed reopen proof per supported backend."""
+    if not isinstance(proofs, list):
+        raise AnalyzerError("CTX-CUSTODY: manifest.reopen_proofs must be an array")
+    expected_backends = ("fjall", "rocksdb", "redb")
+    seen: set[str] = set()
+    for index, proof in enumerate(proofs):
+        if not isinstance(proof, dict):
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}] is not an object"
+            )
+        _require_exact_keys(
+            proof,
+            {"schema", "version", "backend", "path", "size", "sha256"},
+            f"manifest.reopen_proofs[{index}]",
+        )
+        if proof["schema"] != "verify-replay-durability-proof-v1":
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].schema is "
+                f"{_bounded_fact(proof['schema'])}, expected 'verify-replay-durability-proof-v1'"
+            )
+        version = _require_int_field(
+            proof["version"], f"manifest.reopen_proofs[{index}].version"
+        )
+        if version != 1:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].version must be 1, "
+                f"got {version}"
+            )
+        backend = proof["backend"]
+        if not isinstance(backend, str) or backend not in expected_backends:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].backend "
+                f"{_bounded_fact(backend)} must be one of {expected_backends}"
+            )
+        if backend in seen:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: duplicate {backend} reopen proof in manifest.reopen_proofs"
+            )
+        seen.add(backend)
+        path = proof["path"]
+        if not isinstance(path, str) or not path.strip():
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].path must be a nonempty string"
+            )
+        size = _require_u64(proof["size"], f"manifest.reopen_proofs[{index}].size")
+        if size == 0:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].size must be nonzero"
+            )
+        proof_sha = _require_hex_str(
+            proof["sha256"], f"manifest.reopen_proofs[{index}].sha256", 64
+        )
+        if set(proof_sha) == {"0"}:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: manifest.reopen_proofs[{index}].sha256 must not be "
+                "the zero digest"
+            )
+    missing = [backend for backend in expected_backends if backend not in seen]
+    if missing:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: manifest.reopen_proofs missing backends: {missing}"
+        )
+
+
+_MANIFEST_MAX_BYTES = 128 * 1024 * 1024
+"""Shared single-read ceiling for corpus manifests (mirrors Rust's
+``MAX_MANIFEST_BYTES``).
+
+Derived from the schema and the largest recognized product: Cmodern is
+frozen at stop height 709,635, so its manifest carries 709,636 entries;
+at the worst-case v2 entry rendering (153 bytes) the entries array plus
+separators and a bounded top-level allowance stay under 128 MiB."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """``object_pairs_hook`` that fails on duplicate JSON keys."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: duplicate JSON key {_bounded_fact(key)} in corpus manifest"
+            )
+        result[key] = value
+    return result
+
+
+_REPLAY_MAX_BYTES = 1 * 1024 * 1024
+"""Bounded ceiling for the replay JSON artifact."""
+
+_COUNTERS_MAX_BYTES = 64 * 1024
+"""Bounded ceiling for the counters JSON artifact."""
+
+_CUSTODY_CLASSIFY_FLAGS = (
+    getattr(os, "O_PATH", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+"""Classification contract for every custody path: an ``O_PATH`` open
+can neither block on a FIFO nor side-effect a device, and ``O_NOFOLLOW``
+refuses a symlinked leaf before any access-direction open is attempted."""
+
+_CUSTODY_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+)
+"""Access flags for the pinned reopen of a classified custody input."""
+
+
+def _open_custody_fd(
+    path: Path | str,
+    max_bytes: int,
+    label: str,
+    access_flags: int,
+    scope: str,
+    dir_fd: int | None,
+) -> int:
+    """Classify, then reopen one custody file through its pinned identity.
+
+    The leaf is classified under :data:`_CUSTODY_CLASSIFY_FLAGS`, required
+    to be a regular file within ``max_bytes``, and only then reopened with
+    ``access_flags`` through the pinned ``/proc/self/fd`` path of the
+    classification descriptor. The access descriptor must still carry the
+    classified inode's identity; that descriptor is returned, and every
+    later read/hash/parse must use it.
+    """
+    classify_fd: int | None = None
+    fd: int | None = None
+    try:
+        try:
+            classify_fd = os.open(path, _CUSTODY_CLASSIFY_FLAGS, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno == getattr(errno, "ELOOP", None):
+                raise AnalyzerError(
+                    f"{scope}: {label} {path} is a symbolic link"
+                ) from exc
+            raise AnalyzerError(f"{scope}: cannot open {label} {path}: {exc}") from exc
+        classify_stat = os.fstat(classify_fd)
+        if not stat_module.S_ISREG(classify_stat.st_mode):
+            raise AnalyzerError(f"{scope}: {label} {path} is not a regular file")
+        if classify_stat.st_size > max_bytes:
+            raise AnalyzerError(
+                f"{scope}: {label} {path} is {classify_stat.st_size} bytes; "
+                f"the bounded ceiling is {max_bytes}"
+            )
+        classified_signature = _fd_signature(classify_fd)
+        try:
+            fd = os.open(f"/proc/self/fd/{classify_fd}", access_flags)
+        except OSError as exc:
+            raise AnalyzerError(
+                f"{scope}: cannot reopen {label} {path} through /proc/self/fd: {exc}"
+            ) from exc
+        if _fd_signature(fd) != classified_signature:
+            raise AnalyzerError(
+                f"{scope}: {label} {path} changed identity between "
+                "classification and reopen"
+            )
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        if classify_fd is not None:
+            os.close(classify_fd)
+        raise
+    os.close(classify_fd)
+    return fd
+
+
+def _open_custody_input(
+    path: Path | str,
+    max_bytes: int,
+    label: str,
+    scope: str = "CTX-CUSTODY",
+    dir_fd: int | None = None,
+) -> int:
+    """Open one custody input under the shared classify-then-reopen contract.
+
+    A symlink is rejected at the classification open (ELOOP) and a FIFO or
+    directory can never reach an access open, let alone block one. The
+    caller owns the returned descriptor.
+    """
+    return _open_custody_fd(path, max_bytes, label, _CUSTODY_OPEN_FLAGS, scope, dir_fd)
+
+
+def _open_custody_rw(
+    path: Path | str,
+    max_bytes: int,
+    label: str,
+    scope: str = "CTX-CUSTODY",
+    dir_fd: int | None = None,
+) -> int:
+    """Open one custody file read-write under the shared fd contract.
+
+    Same classification and pinned-reopen identity checks as
+    :func:`_open_custody_input` but with ``O_RDWR``, for the sidecar
+    descriptors that finalization patches in place. The caller owns the
+    returned descriptor.
+    """
+    return _open_custody_fd(
+        path,
+        max_bytes,
+        label,
+        os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+        scope,
+        dir_fd,
+    )
+
+
+def _read_fd_exact(fd: int, size: int, label: str) -> bytes:
+    """Read exactly ``size`` bytes from ``fd`` or fail closed."""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 20))
+        if not chunk:
+            raise AnalyzerError(f"{label} shrank while being read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise AnalyzerError(f"{label} grew while being read")
+    return b"".join(chunks)
+
+
+def _fd_signature(fd: int) -> tuple[int, int, int, int, int]:
+    """Identity of one open file: dev, ino, size, mtime, ctime.
+
+    ``dev`` and ``ino`` cannot change under a retained descriptor; they are
+    captured anyway so a single predicate serves both the retained case and
+    a dirfd-relative reopen, where they are the whole question.
+    """
+    stat_result = os.fstat(fd)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _read_exact_with_signature(fd: int, size: int, label: str) -> bytes:
+    """Read exactly ``size`` bytes, then prove the file did not move.
+
+    The statted length is consumed exactly, one extra byte is probed, and
+    dev, ino, size, mtime, and ctime are compared after the last read. A
+    short read, a grown file, or drifted metadata is a rejected custody
+    input, never a truncated parse.
+    """
+    before = _fd_signature(fd)
+    data = _read_fd_exact(fd, size, label)
+    if _fd_signature(fd) != before:
+        raise AnalyzerError(f"{label} changed identity or metadata while being read")
+    return data
+
+
+def _load_bounded_json_from_fd(
+    fd: int,
+    display_path: Path,
+    max_bytes: int,
+    label: str,
+    scope: str = "CTX-CUSTODY",
+) -> tuple[bytes, object]:
+    """Read and parse bounded JSON while borrowing one retained fd."""
+    input_stat = os.fstat(fd)
+    if not stat_module.S_ISREG(input_stat.st_mode):
+        raise AnalyzerError(f"{scope}: {label} {display_path} is not a regular file")
+    if input_stat.st_size > max_bytes:
+        raise AnalyzerError(
+            f"{scope}: {label} {display_path} is {input_stat.st_size} bytes; "
+            f"the bounded ceiling is {max_bytes}"
+        )
+    before = _fd_signature(fd)
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < input_stat.st_size:
+        chunk = os.pread(fd, min(1 << 20, input_stat.st_size - offset), offset)
+        if not chunk:
+            raise AnalyzerError(
+                f"{scope}: {label} {display_path} shrank while being read"
+            )
+        chunks.append(chunk)
+        offset += len(chunk)
+    if os.pread(fd, 1, input_stat.st_size):
+        raise AnalyzerError(f"{scope}: {label} {display_path} grew while being read")
+    if _fd_signature(fd) != before:
+        raise AnalyzerError(
+            f"{scope}: {label} {display_path} changed identity or metadata while being read"
+        )
+    data = b"".join(chunks)
+    try:
+        return data, json.loads(data, object_pairs_hook=_reject_duplicate_keys)
+    except RecursionError as exc:
+        raise AnalyzerError(
+            f"{scope}: {label} {display_path} nests JSON too deeply"
+        ) from exc
+
+
+def _load_bounded_json_fd(
+    path: Path, max_bytes: int, label: str, scope: str = "CTX-CUSTODY"
+) -> tuple[bytes, object]:
+    """Open one bounded JSON input and delegate parsing to its retained fd."""
+    fd = _open_custody_input(path, max_bytes, label, scope)
+    try:
+        return _load_bounded_json_from_fd(fd, path, max_bytes, label, scope)
+    finally:
+        os.close(fd)
+
+
+def _read_manifest_bounded(path: Path) -> bytes:
+    """Open the manifest once, no-follow, size it via fstat against
+    ``_MANIFEST_MAX_BYTES``, and read exactly that many bytes from the same
+    descriptor so the parsed bytes cannot diverge from the sized file."""
+    fd = _open_custody_input(path, _MANIFEST_MAX_BYTES, "corpus manifest")
+    try:
+        size = os.fstat(fd).st_size
+        return _read_exact_with_signature(
+            fd, size, f"CTX-CUSTODY: corpus manifest {path}"
+        )
+    finally:
+        os.close(fd)
+
+
+def _verify_manifest_sha256(manifest_bytes: bytes, declared: str) -> None:
+    """Recompute the exporter's canonical manifest digest and require equality.
+
+    The Rust exporter hashes its typed serialization in fixed struct
+    declaration order with ``manifest_sha256`` zeroed.  This mirrors that
+    preimage by rebuilding a canonical ordered object in exactly the Rust
+    field order (including nested objects and per-entry objects), then
+    compact-serializing it.  Input key order therefore cannot change the
+    computed digest, so a key-permuted but otherwise identical manifest
+    still validates; any field change fails closed.
+    """
+    raw = json.loads(manifest_bytes)
+
+    def versioned(obj: object, label: str) -> dict[str, object]:
+        if not isinstance(obj, dict):
+            raise AnalyzerError(f"CTX-CUSTODY: {label} must be an object")
+        return {"schema": obj["schema"], "version": obj["version"]}
+
+    def proof(obj: object, index: int) -> dict[str, object]:
+        if not isinstance(obj, dict):
+            raise AnalyzerError(
+                f"CTX-CUSTODY: reopen_proofs[{index}] must be an object"
+            )
+        return {
+            "schema": obj["schema"],
+            "version": obj["version"],
+            "backend": obj["backend"],
+            "path": obj["path"],
+            "size": obj["size"],
+            "sha256": obj["sha256"],
+        }
+
+    preimage: dict[str, object] = {
+        "schema": raw["schema"],
+        "version": raw["version"],
+        "corpus_id": raw["corpus_id"],
+        "core_version": raw["core_version"],
+        "exporter": versioned(raw["exporter"], "manifest.exporter"),
+        "checksig_census": versioned(
+            raw["checksig_census"], "manifest.checksig_census"
+        ),
+        "reopen_proofs": [
+            proof(item, index) for index, item in enumerate(raw["reopen_proofs"])
+        ],
+        "manifest_sha256": "0" * 64,
+        "source_tip_hash": raw["source_tip_hash"],
+        "network": raw["network"],
+        "network_magic": raw["network_magic"],
+        "genesis_hash": raw["genesis_hash"],
+        "range": {
+            "start_height": raw["range"]["start_height"],
+            "stop_height": raw["range"]["stop_height"],
+        },
+        "archive": {
+            "size": raw["archive"]["size"],
+            "sha256": raw["archive"]["sha256"],
+        },
+        "entries": [
+            {
+                "height": entry["height"],
+                "hash": entry["hash"],
+                "offset": entry["offset"],
+                "payload_length": entry["payload_length"],
+            }
+            for entry in raw["entries"]
+        ],
+    }
+    rendered = json.dumps(preimage, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    computed = hashlib.sha256(rendered).hexdigest()
+    if computed != declared:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: manifest_sha256 mismatch: declared {declared}, "
+            f"computed {computed}"
+        )
+
+
 def _validate_corpus_manifest(
-    manifest_path: Path, archive_path: Path, replay: dict[str, object]
+    manifest_path: Path,
+    archive_path: Path,
+    replay: dict[str, object],
+    expected_corpus_id: str,
+    *,
+    fixture: bool = False,
 ) -> dict[str, object]:
-    """Validate corpus manifest JSON, cross-check against replay, and
-    stream-validate every Core-frame in the archive in a single open pass.
+    """Validate manifest structure, enforce the frozen product pin, then
+    stream-validate the archive in one no-follow open pass.
+
+    Phase order is the security boundary: full structural custody (including
+    entry iteration, bounded by the shared manifest ceiling) runs first, the
+    compiled frozen stop is enforced before any archive byte, scratch
+    directory, or evidence stream is touched, and only then is the archive
+    streamed against the validated entries.
+    """
+    structure = _validate_manifest_structure(
+        manifest_path, replay, expected_corpus_id, fixture=fixture
+    )
+    if not fixture:
+        _enforce_frozen_product_pin(expected_corpus_id, structure, replay)
+    _validate_archive_frames(archive_path, structure)
+    _verify_manifest_sha256(structure["manifest_bytes"], structure["declared_sha256"])
+    return {
+        "schema": "bitcoin-rs-corpus-manifest",
+        "version": structure["version"],
+        "network": structure["network"],
+        "network_magic": structure["network_magic"],
+        "genesis_hash": structure["genesis_hash"],
+        "range": structure["range"],
+        "archive": structure["archive"],
+        "source_tip_hash": structure["source_tip_hash"],
+        "declared_reopen_proofs": structure["declared_reopen_proofs"],
+        "custody": {
+            "bytes": len(structure["manifest_bytes"]),
+            "sha256": hashlib.sha256(structure["manifest_bytes"]).hexdigest(),
+        },
+    }
+
+
+def _validate_manifest_structure(
+    manifest_path: Path,
+    replay: dict[str, object],
+    expected_corpus_id: str,
+    *,
+    fixture: bool = False,
+) -> dict[str, object]:
+    """Phase A: validate manifest JSON, custody bindings, entries, and
+    replay cross-checks without reading a single archive byte.
 
     The archive is opened exactly once.  A running SHA-256 is updated
-    incrementally with every byte read (magic + length + payload), replacing
-    the separate ``_sha256_file`` call.  The computed hash and byte count
+    incrementally with every byte read (magic + length + payload); the
+    computed hash and byte count
     must match the manifest's declared archive size and sha256.
 
     Returns the manifest summary **without** ``entries``.  Raises
     ``AnalyzerError`` with CTX-CUSTODY prefix on any mismatch.
     """
     # ── Load and validate manifest JSON ──
-    manifest_bytes = manifest_path.read_bytes()
-    raw = json.loads(manifest_bytes)
+    #
+    # The read is bounded and duplicate-safe: the manifest is opened once
+    # (no-follow), sized via fstat against the shared 32 MiB ceiling, and
+    # read exactly from that descriptor.  Duplicate JSON keys are rejected
+    # during parsing instead of silently keeping the last value.
+    manifest_bytes, raw = _load_bounded_json_fd(
+        manifest_path, _MANIFEST_MAX_BYTES, "corpus manifest JSON"
+    )
     if not isinstance(raw, dict):
         raise AnalyzerError("CTX-CUSTODY: corpus manifest root is not an object")
 
     _MANIFEST_KEYS = {
-        "schema", "version", "network", "network_magic", "genesis_hash",
-        "range", "archive", "entries",
+        "schema",
+        "version",
+        "corpus_id",
+        "core_version",
+        "exporter",
+        "checksig_census",
+        "reopen_proofs",
+        "manifest_sha256",
+        "source_tip_hash",
+        "network",
+        "network_magic",
+        "genesis_hash",
+        "range",
+        "archive",
+        "entries",
     }
     _require_exact_keys(raw, _MANIFEST_KEYS, "corpus manifest root")
 
     if raw["schema"] != "bitcoin-rs-corpus-manifest":
         raise AnalyzerError(
-            f"CTX-CUSTODY: corpus manifest schema is {raw['schema']!r}, "
-            f"expected 'bitcoin-rs-corpus-manifest'"
+            "CTX-CUSTODY: corpus manifest schema is "
+            f"{_bounded_fact(raw['schema'])}, expected 'bitcoin-rs-corpus-manifest'"
         )
     version = _require_int_field(raw["version"], "manifest.version")
-    if version != 1:
+    if version != 2:
         raise AnalyzerError(
-            f"CTX-CUSTODY: corpus manifest version must be 1, got {version}"
+            f"CTX-CUSTODY: corpus manifest version must be 2, got {version}"
         )
+
+    corpus_id = raw["corpus_id"]
+    if corpus_id != expected_corpus_id:
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.corpus_id is "
+            f"{_bounded_fact(corpus_id)}, expected {expected_corpus_id!r}"
+        )
+    if fixture:
+        # Selftest-only path: the synthetic fixture identity exercises every
+        # structural, proof, digest, and streaming gate without a
+        # 150,001-block product chain. Production callers never pass this
+        # flag, so CFIXTURE can never ride the production loader.
+        if corpus_id != "CFIXTURE":
+            raise AnalyzerError(
+                "CTX-CUSTODY: fixture validation requires corpus_id 'CFIXTURE', "
+                f"got {_bounded_fact(corpus_id)}"
+            )
+    else:
+        if corpus_id not in ("C150", "Cmodern"):
+            raise AnalyzerError(
+                "CTX-CUSTODY: manifest.corpus_id must be C150 or Cmodern, "
+                f"got {_bounded_fact(corpus_id)}"
+            )
+        if raw["network"] != "mainnet":
+            raise AnalyzerError(
+                f"CTX-CUSTODY: {corpus_id} is a mainnet product corpus; "
+                "manifest.network must be 'mainnet', got "
+                f"{_bounded_fact(raw['network'])}"
+            )
+        # Frozen product tips are enforced against the replay at the
+        # classifier contract layer (c150/cmodern stop height/hash pins),
+        # which runs before any counting.
+    core_version = raw["core_version"]
+    if not isinstance(core_version, str) or not core_version.strip():
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.core_version must be a nonempty string"
+        )
+    exporter = raw["exporter"]
+    if not isinstance(exporter, dict):
+        raise AnalyzerError("CTX-CUSTODY: manifest.exporter must be an object")
+    _require_exact_keys(exporter, {"schema", "version"}, "manifest.exporter")
+    if exporter["schema"] != "bitcoin-rs-active-chain-exporter":
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.exporter.schema is "
+            f"{_bounded_fact(exporter['schema'])}, expected 'bitcoin-rs-active-chain-exporter'"
+        )
+    if _require_int_field(exporter["version"], "manifest.exporter.version") != 1:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: manifest.exporter.version must be 1, "
+            f"got {exporter['version']!r}"
+        )
+    census = raw["checksig_census"]
+    if not isinstance(census, dict):
+        raise AnalyzerError("CTX-CUSTODY: manifest.checksig_census must be an object")
+    _require_exact_keys(census, {"schema", "version"}, "manifest.checksig_census")
+    if census["schema"] != "classify-corpus-v2":
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.checksig_census.schema is "
+            f"{_bounded_fact(census['schema'])}, expected 'classify-corpus-v2'"
+        )
+    if _require_int_field(census["version"], "manifest.checksig_census.version") != 2:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: manifest.checksig_census.version must be 2, "
+            f"got {census['version']!r}"
+        )
+    _require_reopen_proofs(raw["reopen_proofs"])
+    declared_reopen_proofs = raw["reopen_proofs"]
+    _require_hex_str(raw["manifest_sha256"], "manifest.manifest_sha256", 64)
+    if set(raw["manifest_sha256"]) == {"0"}:
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.manifest_sha256 must not be the zero digest"
+        )
+    source_tip_hash = _require_hex_str(
+        raw["source_tip_hash"], "manifest.source_tip_hash", 64
+    )
 
     network = raw["network"]
     if network != "mainnet":
         raise AnalyzerError(
-            f"CTX-CUSTODY: manifest.network must be 'mainnet', got {network!r}"
+            f"CTX-CUSTODY: manifest.network must be 'mainnet', got {_bounded_fact(network)}"
         )
     network_magic = _require_hex_str(raw["network_magic"], "manifest.network_magic", 8)
     if network_magic != MAINNET_MAGIC:
@@ -4221,13 +5574,15 @@ def _validate_corpus_manifest(
     archive_sha256 = _require_hex_str(
         archive_obj["sha256"], "manifest.archive.sha256", 64
     )
+    if set(archive_sha256) == {"0"}:
+        raise AnalyzerError(
+            "CTX-CUSTODY: manifest.archive.sha256 must not be the zero digest"
+        )
 
     # ── entries ──
     entries = raw["entries"]
     if not isinstance(entries, list) or len(entries) == 0:
-        raise AnalyzerError(
-            "CTX-CUSTODY: manifest.entries must be a non-empty array"
-        )
+        raise AnalyzerError("CTX-CUSTODY: manifest.entries must be a non-empty array")
 
     # ── Cross-check manifest file bytes/SHA-256 against replay ──
     replay_cm = replay["corpus_manifest"]
@@ -4260,6 +5615,11 @@ def _validate_corpus_manifest(
         raise AnalyzerError(
             f"CTX-CUSTODY: network mismatch: manifest={network!r}, "
             f"replay={replay_network!r}"
+        )
+    if source_tip_hash != replay_stop_hash:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: manifest.source_tip_hash {source_tip_hash} != "
+            f"replay stop_hash {replay_stop_hash}"
         )
     if network_magic != replay_magic:
         raise AnalyzerError(
@@ -4359,12 +5719,337 @@ def _validate_corpus_manifest(
                 f"archive.size {archive_size}"
             )
 
+    return {
+        "corpus_id": corpus_id,
+        "version": version,
+        "network": network,
+        "network_magic": network_magic,
+        "genesis_hash": genesis_hash,
+        "range": {"start_height": range_start, "stop_height": range_stop},
+        "archive": {"size": archive_size, "sha256": archive_sha256},
+        "source_tip_hash": source_tip_hash,
+        "replay_stop_hash": replay_stop_hash,
+        "entries": entries,
+        "magic_bytes": magic_bytes,
+        "last_index": last_index,
+        "manifest_bytes": manifest_bytes,
+        "declared_sha256": raw["manifest_sha256"],
+        "declared_reopen_proofs": declared_reopen_proofs,
+    }
+
+
+_PROOF_MAX_BYTES = 64 * 1024
+"""Bounded ceiling for one reopen-proof artifact."""
+
+_VALIDATION_MAX_BYTES = 64 * 1024
+"""Bounded ceiling for the shared validation artifact."""
+
+_VALIDATION_KEYS = {
+    "schema",
+    "stop_height",
+    "stop_hash",
+    "utxo_hash_serialized_3",
+    "muhash",
+    "utxo_count",
+    "total_amount",
+}
+"""Exact key set of ``mainnet-prefix-replay-validation-v1``."""
+
+
+def _load_validation_artifact(
+    path: Path, expected_corpus_id: str
+) -> tuple[bytes, dict[str, object]]:
+    """Load the one shared validation artifact every backend proof must bind.
+
+    The exact bytes are measured once under the bounded-read contract, so
+    their size and digest become the binding each reopen proof is checked
+    against: three proofs cannot each name a different artifact and still
+    pass. The parsed fields are strict (exact key set, lowercase 64-hex hash
+    fields, positive counts), and production corpus identities pin the
+    artifact to the frozen stop; the CFIXTURE selftest identity skips that
+    pin exactly like the manifest path does.
+    """
+    validation_bytes, raw = _load_bounded_json_fd(
+        path, _VALIDATION_MAX_BYTES, "validation artifact"
+    )
+    if not isinstance(raw, dict):
+        raise AnalyzerError("CTX-CUSTODY: validation artifact root is not an object")
+    _require_exact_keys(raw, _VALIDATION_KEYS, "validation artifact")
+    if raw["schema"] != "mainnet-prefix-replay-validation-v1":
+        raise AnalyzerError(
+            "CTX-CUSTODY: validation artifact schema is "
+            f"{_bounded_fact(raw['schema'])}, expected 'mainnet-prefix-replay-validation-v1'"
+        )
+    for field in ("stop_hash", "utxo_hash_serialized_3", "muhash"):
+        value = raw[field]
+        if (
+            not isinstance(value, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value)
+            or set(value) == {"0"}
+        ):
+            raise AnalyzerError(
+                f"CTX-CUSTODY: validation artifact {field} is not 64 lowercase "
+                "hex characters or is the zero digest"
+            )
+    for field in ("utxo_count", "total_amount"):
+        if (
+            not isinstance(raw[field], int)
+            or isinstance(raw[field], bool)
+            or raw[field] <= 0
+        ):
+            raise AnalyzerError(
+                f"CTX-CUSTODY: validation artifact {field} must be a positive int"
+            )
+    # The frozen product tip itself is enforced by the classifier's existing
+    # pin layer, which reads the compiled constants at call time; the
+    # validation artifact is additionally bound to the replay stop in
+    # cmd_classify_corpus. The loader only proves the artifact is sane and
+    # measures the exact bytes every proof must bind.
+    del expected_corpus_id
+    return validation_bytes, raw
+
+
+_VALIDATION_STATE_KEYS = (
+    "stop_height",
+    "stop_hash",
+    "utxo_hash_serialized_3",
+    "muhash",
+    "utxo_count",
+    "total_amount",
+)
+"""State fields every reopen proof must share with the validation artifact."""
+
+
+def _validation_binding(
+    validation_bytes: bytes, raw: dict[str, object]
+) -> dict[str, object]:
+    """Build the binding one shared validation artifact imposes on proofs.
+
+    Carries both halves of the contract in one object: the exact bytes
+    (size and digest) and the state the bytes commit to.
+    """
+    binding: dict[str, object] = {
+        "size_bytes": len(validation_bytes),
+        "sha256": hashlib.sha256(validation_bytes).hexdigest(),
+    }
+    binding.update({key: raw[key] for key in _VALIDATION_STATE_KEYS})
+    return binding
+
+
+_REOPEN_PROOF_KEYS = {
+    "schema",
+    "version",
+    "network",
+    "backend",
+    "validation",
+    "before",
+    "after",
+    "checkpoint_generation",
+    "durable_body_roundtrip",
+    "durable_undo_roundtrip",
+    "mutated_copy_only",
+    "reopen_count",
+}
+
+
+def _verify_reopen_proof_file(
+    path: Path,
+    backend: str,
+    expected_corpus_id: str,
+    expected_stop_height: int,
+    expected_tip_hash: str,
+    declared: dict[str, object] | None = None,
+    expected_validation: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Independently verify one backend reopen-proof artifact.
+
+    The proof is opened under the shared fd contract, bounded, read and
+    hashed from that single descriptor, parsed against the exact
+    ``verify-replay-durability-proof-v1`` key set, and every semantic claim
+    is checked against this custody run: backend, mainnet, successful
+    durable reorg (pre/post invariants equal, durability booleans true,
+    at least two reopens), tip height/hash equal to the manifest stop
+    identity, a sane validation digest, and the one shared validation
+    artifact — bound both by exact bytes and by state. Returns report
+    custody.
+    """
+    scope = "CTX-CUSTODY"
+    fd = _open_custody_input(path, _PROOF_MAX_BYTES, f"{backend} reopen proof", scope)
+    try:
+        size = os.fstat(fd).st_size
+        proof_bytes = _read_exact_with_signature(
+            fd, size, f"{scope}: {backend} reopen proof {path}"
+        )
+    finally:
+        os.close(fd)
+    sha256 = hashlib.sha256(proof_bytes).hexdigest()
+    if declared is not None:
+        if size != declared["size"]:
+            raise AnalyzerError(
+                f"{scope}: {backend} reopen proof {path} is {size} bytes; the "
+                f"manifest binds {declared['size']}"
+            )
+        if sha256 != declared["sha256"]:
+            raise AnalyzerError(
+                f"{scope}: {backend} reopen proof {path} sha256 does not match "
+                "the manifest binding"
+            )
+    try:
+        raw = json.loads(proof_bytes, object_pairs_hook=_reject_duplicate_keys)
+    except RecursionError as exc:
+        raise AnalyzerError(
+            f"{scope}: {backend} reopen proof {path} nests JSON too deeply"
+        ) from exc
+
+    def bad(message: str) -> AnalyzerError:
+        return AnalyzerError(f"{scope}: {backend} reopen proof {message}")
+
+    if not isinstance(raw, dict):
+        raise bad(f"{path} root is not an object")
+    _require_exact_keys(raw, _REOPEN_PROOF_KEYS, f"{backend} reopen proof")
+    if raw["schema"] != "verify-replay-durability-proof-v1":
+        raise bad(
+            f"schema is {_bounded_fact(raw['schema'])}, "
+            "expected 'verify-replay-durability-proof-v1'"
+        )
+    if _require_int_field(raw["version"], f"{backend} reopen proof version") != 1:
+        raise bad("version must be 1")
+    if raw["network"] != "mainnet":
+        raise bad(f"network is {_bounded_fact(raw['network'])}, expected 'mainnet'")
+    if raw["backend"] != backend:
+        raise bad(f"names backend {_bounded_fact(raw['backend'])}")
+    if raw["before"] != raw["after"]:
+        raise bad("pre/post reorg invariants differ")
+    if not (
+        raw["durable_body_roundtrip"] is True
+        and raw["durable_undo_roundtrip"] is True
+        and raw["mutated_copy_only"] is True
+    ):
+        raise bad("durability invariants are not all true")
+    reopen_count = raw["reopen_count"]
+    if (
+        not isinstance(reopen_count, int)
+        or isinstance(reopen_count, bool)
+        or reopen_count < 2
+    ):
+        raise bad(f"records {reopen_count!r} reopens; at least 2 are required")
+    if (
+        not isinstance(raw["checkpoint_generation"], int)
+        or raw["checkpoint_generation"] <= 0
+    ):
+        raise bad("has no checkpoint generation")
+    before = raw["before"]
+    if not isinstance(before, dict):
+        raise bad("before invariants are not an object")
+    if (
+        before.get("tip_height") != expected_stop_height
+        or before.get("tip_hash") != expected_tip_hash
+    ):
+        raise bad(
+            f"tip {before.get('tip_height')}/{before.get('tip_hash')} does not "
+            f"match the {expected_corpus_id} stop identity "
+            f"{expected_stop_height}/{expected_tip_hash}"
+        )
+    validation = raw["validation"]
+    if not isinstance(validation, dict):
+        raise bad("validation digest is not an object")
+    if (
+        not isinstance(validation.get("size_bytes"), int)
+        or validation["size_bytes"] <= 0
+    ):
+        raise bad("validation size_bytes is not positive")
+    validation_sha = validation.get("sha256")
+    if (
+        not isinstance(validation_sha, str)
+        or len(validation_sha) != 64
+        or not re.fullmatch(r"[0-9a-f]{64}", validation_sha)
+        or set(validation_sha) == {"0"}
+    ):
+        raise bad("validation sha256 is not sane")
+    if expected_validation is None:
+        raise bad("does not name the shared validation artifact binding")
+    if validation["size_bytes"] != expected_validation["size_bytes"]:
+        raise bad(
+            f"binds a {validation['size_bytes']}-byte validation artifact; "
+            f"this custody binds {expected_validation['size_bytes']}"
+        )
+    if validation_sha != expected_validation["sha256"]:
+        raise bad(
+            f"binds validation digest {validation_sha}; this custody binds "
+            f"{expected_validation['sha256']}"
+        )
+    for field, key in (
+        ("tip_height", "stop_height"),
+        ("tip_hash", "stop_hash"),
+        ("muhash", "muhash"),
+        ("utxo_hash_serialized_3", "utxo_hash_serialized_3"),
+        ("utxo_count", "utxo_count"),
+        ("total_amount", "total_amount"),
+    ):
+        if before.get(field) != expected_validation.get(key):
+            raise bad(
+                f"state field {field} does not match the shared validation artifact"
+            )
+    return {"path": str(path), "bytes": size, "sha256": sha256}
+
+
+def _enforce_frozen_product_pin(
+    corpus_id: str,
+    structure: dict[str, object],
+    replay: dict[str, object],
+) -> None:
+    """Reject a forged product stop before any archive/evidence work.
+
+    The compiled identity is read from the module constants at call time, so
+    a caller that legitimately relaxes them (the synthetic-fixture helper)
+    keeps working while production always compares against the real pins.
+    Runs immediately after manifest structure validation and before archive
+    streaming, scratch creation, or evidence parsing.
+    """
+    compiled_height, compiled_hash = {
+        "C150": (C150_STOP_HEIGHT, C150_STOP_HASH),
+        "Cmodern": (CMODERN_STOP_HEIGHT, CMODERN_STOP_HASH),
+    }[corpus_id]
+    stop_height = structure["range"]["stop_height"]  # type: ignore[index]
+    tip_hash = structure["source_tip_hash"]  # type: ignore[index]
+    if (
+        stop_height != compiled_height
+        or tip_hash != compiled_hash
+        or replay["stop_height"] != compiled_height
+        or replay["stop_hash"] != compiled_hash
+    ):
+        raise AnalyzerError(
+            f"CTX-CUSTODY: {corpus_id} is frozen at stop height "
+            f"{compiled_height} / tip {compiled_hash!r}; manifest/replay claim "
+            f"{stop_height} / {tip_hash!r}"
+        )
+
+
+def _validate_archive_frames(archive_path: Path, structure: dict[str, object]) -> None:
+    """Stream-validate every Core-frame against the validated structure."""
+    entries = structure["entries"]  # type: ignore[index]
+    magic_bytes = structure["magic_bytes"]  # type: ignore[index]
+    archive_size = structure["archive"]["size"]  # type: ignore[index]
+    archive_sha256 = structure["archive"]["sha256"]  # type: ignore[index]
+    genesis_hash = structure["genesis_hash"]  # type: ignore[index]
+    replay_stop_hash = structure["replay_stop_hash"]  # type: ignore[index]
+    source_tip_hash = structure["source_tip_hash"]  # type: ignore[index]
+    last_index = structure["last_index"]  # type: ignore[index]
+
     # ── Single-open archive pass: stream frames, hash incrementally ──
     prev_block_hash_raw: bytes | None = None
     running_hash = hashlib.sha256()
     bytes_consumed = 0
 
-    with archive_path.open("rb") as stream:
+    archive_fd = _open_custody_input(archive_path, 1 << 40, "corpus archive")
+    archive_file_size = os.fstat(archive_fd).st_size
+    if archive_file_size != archive_size:
+        os.close(archive_fd)
+        raise AnalyzerError(
+            f"CTX-CUSTODY: archive file size {archive_file_size} "
+            f"!= manifest archive.size {archive_size}"
+        )
+    with os.fdopen(archive_fd, "rb", closefd=True) as stream:
         for index, entry in enumerate(entries):
             assert isinstance(entry, dict)
             entry_payload_length = int(entry["payload_length"])
@@ -4400,9 +6085,7 @@ def _validate_corpus_manifest(
             bytes_consumed += 80
 
             # Double-SHA256 of the 80-byte header → internal LE hash.
-            hash_raw = hashlib.sha256(
-                hashlib.sha256(header_bytes).digest()
-            ).digest()
+            hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
             hash_display = hash_raw[::-1].hex()
 
             if hash_display != entry_hash:
@@ -4439,12 +6122,16 @@ def _validate_corpus_manifest(
                         f"{prev_block_hash_raw[::-1].hex()} (chain break)"
                     )
 
-            # Last block hash must equal replay stop_hash.
             if index == last_index:
                 if entry_hash != replay_stop_hash:
                     raise AnalyzerError(
                         f"CTX-CUSTODY: last block hash {entry_hash} != "
                         f"replay stop_hash {replay_stop_hash}"
+                    )
+                if entry_hash != source_tip_hash:
+                    raise AnalyzerError(
+                        f"CTX-CUSTODY: last block hash {entry_hash} != "
+                        f"manifest.source_tip_hash {source_tip_hash}"
                     )
 
             prev_block_hash_raw = hash_raw
@@ -4455,7 +6142,10 @@ def _validate_corpus_manifest(
             while remaining > 0:
                 to_read = min(remaining, chunk_size)
                 chunk = _read_exact_bytes(
-                    stream, to_read, f"archive frame {index} payload chunk", scope="CTX-CUSTODY"
+                    stream,
+                    to_read,
+                    f"archive frame {index} payload chunk",
+                    scope="CTX-CUSTODY",
                 )
                 running_hash.update(chunk)
                 bytes_consumed += to_read
@@ -4480,20 +6170,6 @@ def _validate_corpus_manifest(
             f"CTX-CUSTODY: archive streaming sha256 {computed_sha256} != "
             f"manifest archive sha256 {archive_sha256}"
         )
-
-    return {
-        "schema": "bitcoin-rs-corpus-manifest",
-        "version": version,
-        "network": network,
-        "network_magic": network_magic,
-        "genesis_hash": genesis_hash,
-        "range": {"start_height": range_start, "stop_height": range_stop},
-        "archive": {"size": archive_size, "sha256": archive_sha256},
-        "custody": {
-            "bytes": len(manifest_bytes),
-            "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        },
-    }
 
 
 def _count_context_records_disk(
@@ -4538,12 +6214,11 @@ def _count_context_records_disk(
 
     conn: sqlite3.Connection | None = None
 
-    def insert_bounded(
-        sql: str, rows: Iterator[tuple[object, ...]]
-    ) -> int:
+    def insert_bounded(sql: str, rows: Iterator[tuple[object, ...]]) -> int:
         inserted = 0
         exhausted = False
         while not exhausted:
+
             def next_chunk() -> Iterator[tuple[object, ...]]:
                 nonlocal exhausted, inserted
                 for _ in range(chunk_size):
@@ -4610,7 +6285,9 @@ def _count_context_records_disk(
                     )
                     contexts_custody = context_iter.custody()
                 except ContextError as exc:
-                    raise AnalyzerError(f"CTX-RAW: BRSCTX1 stream failed: {exc}") from exc
+                    raise AnalyzerError(
+                        f"CTX-RAW: BRSCTX1 stream failed: {exc}"
+                    ) from exc
                 except sqlite3.IntegrityError as exc:
                     raise AnalyzerError(
                         f"CTX-EXECUTION: duplicate context execution identity in BRSCTX1: {exc}"
@@ -4696,7 +6373,9 @@ def _count_context_records_disk(
                         "SELECT spend_context, COUNT(*) FROM contexts GROUP BY spend_context"
                     ).fetchall()
                 )
-                counts["p2sh_redeem_spends"] = spend_counts.get(SpendContext.P2SH.value, 0)
+                counts["p2sh_redeem_spends"] = spend_counts.get(
+                    SpendContext.P2SH.value, 0
+                )
                 counts["native_witness_v0_spends"] = spend_counts.get(
                     SpendContext.NATIVE_WITNESS_V0.value, 0
                 )
@@ -4760,7 +6439,9 @@ def _count_context_records_disk(
                     " WHERE op_seq != expected ORDER BY stream_pos LIMIT 1"
                 ).fetchone()
                 if sequence_error is not None:
-                    record_failures.append((sequence_error[4], 1, sequence_error[:4], "sequence"))
+                    record_failures.append(
+                        (sequence_error[4], 1, sequence_error[:4], "sequence")
+                    )
 
                 invalid = conn.execute(
                     "WITH classified AS ("
@@ -4807,7 +6488,7 @@ def _count_context_records_disk(
                             f"expected {expected}, got {actual}"
                         )
                     # kind == "invalid"
-                    txid_le, input_index, op, sig, ctx_name, error_code = row
+                    txid_le, input_index, op, sig, _ctx_name, error_code = row
                     identity = f"txid={txid_le[::-1].hex()}, input_index={input_index}"
                     sig_name = _sig_version_name(sig)
                     if error_code == "multisig_sig":
@@ -4821,7 +6502,9 @@ def _count_context_records_disk(
                     elif error_code == "wrapped_multisig":
                         message = f"P2SH-wrapped witness-v0 multisig record has sig_version {sig_name}, expected WITNESS_V0 for {identity}"
                     elif error_code == "taproot_multisig":
-                        message = f"multisig record joined to a Taproot input {identity}"
+                        message = (
+                            f"multisig record joined to a Taproot input {identity}"
+                        )
                     elif error_code == "checksigadd_sig":
                         message = f"CHECKSIGADD record must have sig_version TAPSCRIPT, got {sig_name} for {identity}"
                     elif error_code == "checksigadd_context":
@@ -4829,7 +6512,9 @@ def _count_context_records_disk(
                     elif error_code == "keypath_sig":
                         message = f"key-path record must have sig_version TAPROOT, got {sig_name} for {identity}"
                     elif error_code == "keypath_context":
-                        message = f"key-path record joined to a non-key-path input {identity}"
+                        message = (
+                            f"key-path record joined to a non-key-path input {identity}"
+                        )
                     elif error_code == "tapscript_checksig":
                         message = f"Tapscript CHECKSIG record joined to a non-Tapscript input {identity}"
                     elif error_code == "witness_checksig":
@@ -4873,10 +6558,12 @@ def _count_context_records_disk(
                 ).fetchone()
                 for name, value in zip(
                     (
-                        "bare_multisig_checks", "p2sh_multisig_checks",
+                        "bare_multisig_checks",
+                        "p2sh_multisig_checks",
                         "native_witness_v0_multisig_checks",
                         "p2sh_wrapped_witness_v0_multisig_checks",
-                        "tapscript_schnorr_checks", "tapscript_checksigadd_checks",
+                        "tapscript_schnorr_checks",
+                        "tapscript_checksigadd_checks",
                     ),
                     record_tallies,
                 ):
@@ -4896,10 +6583,17 @@ def _count_context_records_disk(
                     " FROM records"
                 ).fetchone()
                 (
-                    agg_ecdsa_calls, agg_ecdsa_ok, agg_ecdsa_fail,
-                    agg_schnorr_calls, agg_schnorr_ok, agg_schnorr_fail,
-                    agg_checkecdsa_entries, agg_checkschnorr_entries,
-                    reject_pubkey, reject_empty_sig, reject_missing_data,
+                    agg_ecdsa_calls,
+                    agg_ecdsa_ok,
+                    agg_ecdsa_fail,
+                    agg_schnorr_calls,
+                    agg_schnorr_ok,
+                    agg_schnorr_fail,
+                    agg_checkecdsa_entries,
+                    agg_checkschnorr_entries,
+                    reject_pubkey,
+                    reject_empty_sig,
+                    reject_missing_data,
                 ) = (value or 0 for value in aggregate)
 
                 ecdsa_mismatch = conn.execute(
@@ -4947,7 +6641,10 @@ def _count_context_records_disk(
                         f"op_checksig + op_checksigverify "
                         f"{counters.op_checksig + counters.op_checksigverify}"
                     )
-                if sum_checkmultisig != counters.op_checkmultisig + counters.op_checkmultisigverify:
+                if (
+                    sum_checkmultisig
+                    != counters.op_checkmultisig + counters.op_checkmultisigverify
+                ):
                     raise AnalyzerError(
                         f"CTX-OPERATIONS: SUM(checkmultisig_ops) {sum_checkmultisig} != "
                         f"op_checkmultisig + op_checkmultisigverify "
@@ -4955,15 +6652,39 @@ def _count_context_records_disk(
                     )
 
                 reconciliations = (
-                    ("ecdsa_verify_calls", agg_ecdsa_calls, counters.ecdsa_verify_calls),
+                    (
+                        "ecdsa_verify_calls",
+                        agg_ecdsa_calls,
+                        counters.ecdsa_verify_calls,
+                    ),
                     ("ecdsa_verify_ok", agg_ecdsa_ok, counters.ecdsa_verify_ok),
                     ("ecdsa_verify_fail", agg_ecdsa_fail, counters.ecdsa_verify_fail),
-                    ("schnorr_verify_calls", agg_schnorr_calls, counters.schnorr_verify_calls),
+                    (
+                        "schnorr_verify_calls",
+                        agg_schnorr_calls,
+                        counters.schnorr_verify_calls,
+                    ),
                     ("schnorr_verify_ok", agg_schnorr_ok, counters.schnorr_verify_ok),
-                    ("schnorr_verify_fail", agg_schnorr_fail, counters.schnorr_verify_fail),
-                    ("checkecdsa_entries", agg_checkecdsa_entries, counters.checkecdsa_entries),
-                    ("checkschnorr_entries", agg_checkschnorr_entries, counters.checkschnorr_entries),
-                    ("op_checksigadd", counts["tapscript_checksigadd_checks"], counters.op_checksigadd),
+                    (
+                        "schnorr_verify_fail",
+                        agg_schnorr_fail,
+                        counters.schnorr_verify_fail,
+                    ),
+                    (
+                        "checkecdsa_entries",
+                        agg_checkecdsa_entries,
+                        counters.checkecdsa_entries,
+                    ),
+                    (
+                        "checkschnorr_entries",
+                        agg_checkschnorr_entries,
+                        counters.checkschnorr_entries,
+                    ),
+                    (
+                        "op_checksigadd",
+                        counts["tapscript_checksigadd_checks"],
+                        counters.op_checksigadd,
+                    ),
                 )
                 for name, actual, expected in reconciliations:
                     if actual != expected:
@@ -4998,11 +6719,15 @@ def _count_context_records_disk(
         else:
             os.environ.pop("TMPDIR", None)
 
-    return counts, context_count, {
-        "contexts": contexts_custody,
-        "records": record_custody,
-        "journal": journal_custody,
-    }
+    return (
+        counts,
+        context_count,
+        {
+            "contexts": contexts_custody,
+            "records": record_custody,
+            "journal": journal_custody,
+        },
+    )
 
 
 def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
@@ -5055,9 +6780,7 @@ def _c150_passed(counts: dict[str, int], counters: Counters) -> bool:
         counters.schnorr_verify_ok,
         counters.schnorr_verify_fail,
     )
-    if any(v != 0 for v in complementary_zero):
-        return False
-    return True
+    return not any(v != 0 for v in complementary_zero)
 
 
 def _cmodern_passed(counts: dict[str, int]) -> bool:
@@ -5082,11 +6805,72 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
     # Each parser computes custody (size + sha256) from the exact buffer it
     # parses, eliminating TOCTOU from a separate prehash pass.
     replay = _validate_replay_artifact(replay_path)
-    manifest = _validate_corpus_manifest(manifest_path, archive_path, replay)
+    expected_corpus_id = {"c150": "C150", "cmodern": "Cmodern"}[args.contract]
+    validation_path = Path(args.validation)
+    validation_bytes, expected_validation = _load_validation_artifact(
+        validation_path, expected_corpus_id
+    )
+    if (
+        expected_validation["stop_height"] != replay["stop_height"]
+        or expected_validation["stop_hash"] != replay["stop_hash"]
+    ):
+        raise AnalyzerError(
+            "CTX-CUSTODY: validation artifact tip "
+            f"{expected_validation['stop_height']}/{expected_validation['stop_hash']} "
+            f"does not match the replay stop "
+            f"{replay['stop_height']}/{replay['stop_hash']}"
+        )
+    validation_binding = _validation_binding(validation_bytes, expected_validation)
+    manifest = _validate_corpus_manifest(
+        manifest_path, archive_path, replay, expected_corpus_id
+    )
+
+    # ── Verify the backend reopen proofs against real artifacts ──
+    supplied: dict[str, Path] = {}
+    for spec in getattr(args, "reopen_proofs", None) or []:
+        backend, separator, proof_path = spec.partition("=")
+        if (
+            not separator
+            or backend not in ("fjall", "rocksdb", "redb")
+            or not proof_path
+        ):
+            raise AnalyzerError(
+                f"CTX-CUSTODY: --reopen-proof must be backend=fjall|rocksdb|redb=path, "
+                f"got {spec!r}"
+            )
+        if backend in supplied:
+            raise AnalyzerError(
+                f"CTX-CUSTODY: duplicate reopen proof for backend {_bounded_fact(backend)}"
+            )
+        supplied[backend] = Path(proof_path)
+    missing = [b for b in ("fjall", "rocksdb", "redb") if b not in supplied]
+    if missing:
+        raise AnalyzerError(
+            f"CTX-CUSTODY: reopen proofs required for backends: {missing}"
+        )
+    declared_proofs = {
+        proof["backend"]: proof for proof in manifest["declared_reopen_proofs"]
+    }
+    proof_custody: dict[str, dict[str, object]] = {}
+    for backend in ("fjall", "rocksdb", "redb"):
+        declared = declared_proofs[backend]
+        verified = _verify_reopen_proof_file(
+            supplied[backend],
+            backend,
+            expected_corpus_id,
+            manifest["range"]["stop_height"],
+            manifest["source_tip_hash"],
+            declared=declared,
+            expected_validation=validation_binding,
+        )
+        proof_custody[backend] = verified
 
     # ── Run disk-backed counter computation (returns custody for ctx/rec/jrn) ──
     counts, context_count, bin_custody = _count_context_records_disk(
-        contexts_path, records_path, journal_path, counters,
+        contexts_path,
+        records_path,
+        journal_path,
+        counters,
         Path(args.scratch_dir) if getattr(args, "scratch_dir", None) else None,
     )
 
@@ -5127,6 +6911,12 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
             "bytes": manifest["archive"]["size"],
             "sha256": manifest["archive"]["sha256"],
         },
+        "validation": {
+            "path": str(validation_path),
+            "bytes": validation_binding["size_bytes"],
+            "sha256": validation_binding["sha256"],
+        },
+        "reopen_proofs": proof_custody,
     }
 
     # ── Counter arithmetic invariants (INV-1 through INV-7) ──
@@ -5134,7 +6924,11 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
     inv_all_passed = all(r["passed"] for r in inv_results)
 
     # ── Zero-input evidence precedence: validate counts > 0 before contract logic ──
-    if counters.context_count == 0 or counters.journal_count == 0 or counters.record_count == 0:
+    if (
+        counters.context_count == 0
+        or counters.journal_count == 0
+        or counters.record_count == 0
+    ):
         raise AnalyzerError(
             "CTX-EXECUTION: zero-input evidence rejected: "
             f"context_count={counters.context_count}, "
@@ -5195,21 +6989,628 @@ def cmd_classify_corpus(args: argparse.Namespace) -> int:
 
     # Optional cross-check: --input-count if provided.
     input_count_opt = getattr(args, "input_count", None)
-    if input_count_opt is not None:
-        if input_count_opt != context_count:
-            raise AnalyzerError(
-                f"CTX-SOURCE: --input-count {input_count_opt} != "
-                f"BRSCTX1 context count {context_count}"
-            )
+    if input_count_opt is not None and input_count_opt != context_count:
+        raise AnalyzerError(
+            f"CTX-SOURCE: --input-count {input_count_opt} != "
+            f"BRSCTX1 context count {context_count}"
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(report, indent=2) + "\n")
+    _write_json_atomic(output_path, report)
 
     if all_passed:
         print(f"classify-corpus: PASSED — {args.contract}")
         return 0
     print(f"classify-corpus: FAILED — {args.contract}", file=sys.stderr)
     return 1
+
+
+def _selftest_header(prev_raw: bytes | None, nonce: int) -> tuple[bytes, str, bytes]:
+    """Build one 80-byte mainnet header: the real genesis, else synthetic.
+
+    Custody validation pins the first archive entry to the manifest genesis
+    hash and the genesis hash to the canonical mainnet constant, so block 0
+    must be the real genesis header. Later blocks stay synthetic and chain
+    on the previous raw digest.
+
+    Returns ``(header_bytes, display_hash, raw_digest)`` where display_hash
+    is the canonical shown form and raw_digest the internal LE digest.
+    """
+    if prev_raw is None:
+        payload = bytes.fromhex(
+            "01000000"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+            "29ab5f49"
+            "ffff001d"
+            "1dac2b7c"
+        )
+    else:
+        version = (1).to_bytes(4, "little")
+        merkle = bytes(range(32))
+        time_bytes = (1_700_000_000).to_bytes(4, "little")
+        bits = bytes.fromhex("ffff7f20")
+        payload = (
+            version
+            + prev_raw
+            + merkle
+            + time_bytes
+            + bits
+            + nonce.to_bytes(4, "little")
+        )
+    raw = hashlib.sha256(hashlib.sha256(payload).digest()).digest()
+    return payload, raw[::-1].hex(), raw
+
+
+def _selftest_custody_set(
+    tmp: Path, mutations: dict[str, object] | None = None
+) -> tuple[Path, Path, dict[str, object]]:
+    """Write a synthetic two-block custody set; return manifest, archive, replay.
+
+    Also writes the shared ``mainnet-prefix-replay-validation-v1`` artifact
+    every fixture proof binds, at ``tmp / "validation.json"``.
+    """
+    header0, hash0, raw0 = _selftest_header(None, 0)
+    header1, hash1, _ = _selftest_header(raw0, 1)
+    archive = b"".join(
+        bytes.fromhex(MAINNET_MAGIC) + len(payload).to_bytes(4, "little") + payload
+        for payload in (header0, header1)
+    )
+    archive_path = tmp / "blocks.dat"
+    archive_path.write_bytes(archive)
+
+    validation_doc = {
+        "schema": "mainnet-prefix-replay-validation-v1",
+        "stop_height": 1,
+        "stop_hash": hash1,
+        "utxo_hash_serialized_3": "cd" * 32,
+        "muhash": "ab" * 32,
+        "utxo_count": 2,
+        "total_amount": 200,
+    }
+    validation_bytes = (json.dumps(validation_doc, indent=2) + "\n").encode()
+    (tmp / "validation.json").write_bytes(validation_bytes)
+    validation_binding = _validation_binding(validation_bytes, validation_doc)
+
+    reopen_proof_paths: dict[str, Path] = {}
+    reopen_bindings: list[dict[str, object]] = []
+    for backend in ("fjall", "rocksdb", "redb"):
+        invariants = {
+            "tip_height": 1,
+            "tip_hash": hash1,
+            "utxo_count": 2,
+            "total_amount": 200,
+            "muhash": "ab" * 32,
+            "utxo_hash_serialized_3": "cd" * 32,
+            "tx_count": 0,
+            "bogo_size": 0,
+        }
+        proof_doc = {
+            "schema": "verify-replay-durability-proof-v1",
+            "version": 1,
+            "network": "mainnet",
+            "backend": backend,
+            "validation": validation_binding,
+            "before": invariants,
+            "after": invariants,
+            "checkpoint_generation": 1,
+            "durable_body_roundtrip": True,
+            "durable_undo_roundtrip": True,
+            "mutated_copy_only": True,
+            "reopen_count": 2,
+        }
+        rendered = (json.dumps(proof_doc, indent=2) + "\n").encode()
+        proof_path = tmp / f"{backend}-reopen-proof.json"
+        proof_path.write_bytes(rendered)
+        reopen_proof_paths[backend] = proof_path
+        reopen_bindings.append(
+            {
+                "schema": "verify-replay-durability-proof-v1",
+                "version": 1,
+                "backend": backend,
+                "path": str(proof_path),
+                "size": len(rendered),
+                "sha256": hashlib.sha256(rendered).hexdigest(),
+            }
+        )
+
+    manifest: dict[str, object] = {
+        "schema": "bitcoin-rs-corpus-manifest",
+        "version": 2,
+        "corpus_id": "CFIXTURE",
+        "core_version": "31.1.0",
+        "exporter": {"schema": "bitcoin-rs-active-chain-exporter", "version": 1},
+        "checksig_census": {"schema": "classify-corpus-v2", "version": 2},
+        "reopen_proofs": reopen_bindings,
+        "manifest_sha256": "0" * 64,
+        "source_tip_hash": hash1,
+        "network": "mainnet",
+        "network_magic": MAINNET_MAGIC,
+        "genesis_hash": hash0,
+        "range": {"start_height": 0, "stop_height": 1},
+        "archive": {
+            "size": len(archive),
+            "sha256": hashlib.sha256(archive).hexdigest(),
+        },
+        "entries": [
+            {"height": 0, "hash": hash0, "offset": 0, "payload_length": 80},
+            {"height": 1, "hash": hash1, "offset": 88, "payload_length": 80},
+        ],
+    }
+    if mutations:
+        manifest.update(mutations)
+    if "manifest_sha256" not in (mutations or {}):
+        preimage = dict(manifest)
+        preimage["manifest_sha256"] = "0" * 64
+        manifest["manifest_sha256"] = hashlib.sha256(
+            json.dumps(preimage, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+    rendered = json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    manifest_path = tmp / "manifest.json"
+    manifest_path.write_bytes(rendered)
+
+    replay: dict[str, object] = {
+        "network": manifest["network"],
+        "network_magic": manifest["network_magic"],
+        "genesis_hash": manifest["genesis_hash"],
+        "start_height": manifest["range"]["start_height"],
+        "stop_height": manifest["range"]["stop_height"],
+        "stop_hash": manifest["source_tip_hash"],
+        "archive": {
+            "bytes": manifest["archive"]["size"],
+            "sha256": manifest["archive"]["sha256"],
+        },
+        "corpus_manifest": {
+            "bytes": len(rendered),
+            "sha256": hashlib.sha256(rendered).hexdigest(),
+        },
+    }
+    return manifest_path, archive_path, replay, reopen_proof_paths
+
+
+def cmd_custody_selftest(args: argparse.Namespace) -> int:
+    """Accept one synthetic custody set and reject the broken variants."""
+    del args
+    rejected: list[str] = []
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        manifest_path, archive_path, replay, proof_paths = _selftest_custody_set(tmp)
+        _validate_corpus_manifest(
+            manifest_path, archive_path, replay, "CFIXTURE", fixture=True
+        )
+        fixture_stop = 1
+        fixture_tip = replay["stop_hash"]
+        (
+            fixture_validation_bytes,
+            _fixture_validation,
+        ) = _load_validation_artifact(tmp / "validation.json", "CFIXTURE")
+        fixture_validation_binding = _validation_binding(
+            fixture_validation_bytes, _fixture_validation
+        )
+        manifest_binding = {
+            proof["backend"]: proof
+            for proof in json.loads(manifest_path.read_bytes())["reopen_proofs"]
+        }
+        for backend, proof_path in proof_paths.items():
+            _verify_reopen_proof_file(
+                proof_path,
+                backend,
+                "CFIXTURE",
+                fixture_stop,
+                fixture_tip,
+                declared=manifest_binding[backend],
+                expected_validation=fixture_validation_binding,
+            )
+
+        def _expect_proof_reject(label: str, backend: str, path: Path) -> None:
+            try:
+                _verify_reopen_proof_file(
+                    path,
+                    backend,
+                    "CFIXTURE",
+                    fixture_stop,
+                    fixture_tip,
+                    expected_validation=fixture_validation_binding,
+                )
+            except AnalyzerError:
+                rejected.append(label)
+            else:
+                raise AnalyzerError(
+                    f"custody-selftest: reopen-proof case {label!r} was not rejected"
+                )
+
+        _expect_proof_reject(
+            "nonexistent reopen proof", "fjall", tmp / "does-not-exist.json"
+        )
+
+        symlink_proof = tmp / "symlink-proof.json"
+        symlink_proof.symlink_to(proof_paths["fjall"])
+        _expect_proof_reject("symlink reopen proof", "fjall", symlink_proof)
+        fifo_proof = tmp / "fifo-proof"
+        os.mkfifo(fifo_proof)
+        _expect_proof_reject("fifo reopen proof", "fjall", fifo_proof)
+
+        def _mutated_proof(name: str, backend: str, mutate) -> None:
+            case_dir = tmp / name.replace(" ", "-")
+            case_dir.mkdir()
+            case_manifest, _, _case_replay, case_proofs = _selftest_custody_set(
+                case_dir
+            )
+            target = case_proofs[backend]
+            original = target.read_bytes()
+            target.write_bytes(mutate(original))
+            case_rendered = json.loads(case_manifest.read_bytes())
+            case_binding = {
+                proof["backend"]: proof for proof in case_rendered["reopen_proofs"]
+            }
+            case_validation_bytes, case_validation_raw = _load_validation_artifact(
+                case_dir / "validation.json", "CFIXTURE"
+            )
+            case_validation_binding = _validation_binding(
+                case_validation_bytes, case_validation_raw
+            )
+            try:
+                _verify_reopen_proof_file(
+                    target,
+                    backend,
+                    "CFIXTURE",
+                    case_rendered["range"]["stop_height"],
+                    case_rendered["source_tip_hash"],
+                    declared=case_binding[backend],
+                    expected_validation=case_validation_binding,
+                )
+            except AnalyzerError:
+                rejected.append(name)
+            else:
+                raise AnalyzerError(
+                    f"custody-selftest: reopen-proof case {name!r} was not rejected"
+                )
+
+        _mutated_proof(
+            "wrong schema reopen proof",
+            "fjall",
+            lambda data: data.replace(
+                b"verify-replay-durability-proof-v1", b"other-schema-v9"
+            ),
+        )
+        _mutated_proof(
+            "wrong backend reopen proof",
+            "fjall",
+            lambda data: data.replace(b'"backend": "fjall"', b'"backend": "rocksdb"'),
+        )
+        _mutated_proof(
+            "wrong state reopen proof",
+            "fjall",
+            lambda data: data.replace(b'"tip_height": 1', b'"tip_height": 999'),
+        )
+        _mutated_proof(
+            "wrong size reopen proof",
+            "fjall",
+            lambda data: data.replace(b'"reopen_count": 2', b'"reopen_count": 23'),
+        )
+        _mutated_proof(
+            "wrong hash reopen proof",
+            "fjall",
+            lambda data: data.replace(
+                b'"durable_body_roundtrip": true', b'"durable_body_roundtrip": false'
+            ),
+        )
+        _mutated_proof(
+            "validation size drift reopen proof",
+            "fjall",
+            lambda data: re.sub(
+                rb'"size_bytes": \d+', b'"size_bytes": 999999', data, count=1
+            ),
+        )
+        _mutated_proof(
+            "validation hash drift reopen proof",
+            "fjall",
+            lambda data: re.sub(
+                rb'"sha256": "[0-9a-f]{64}"',
+                b'"sha256": "' + b"2" * 64 + b'"',
+                data,
+                count=1,
+            ),
+        )
+
+        dup_key_proof = tmp / "dup-key-proof.json"
+        dup_key_proof.write_bytes(
+            proof_paths["fjall"].read_bytes().rstrip()[:-1] + b',"version":1}'
+        )
+        _expect_proof_reject("duplicate key reopen proof", "fjall", dup_key_proof)
+
+        def _expect_validation_reject(label: str, path: Path) -> None:
+            try:
+                _load_validation_artifact(path, "CFIXTURE")
+            except AnalyzerError:
+                rejected.append(label)
+            else:
+                raise AnalyzerError(
+                    f"custody-selftest: validation case {label!r} was not rejected"
+                )
+
+        def _mutated_validation(name: str, mutate) -> None:
+            case_dir = tmp / name.replace(" ", "-")
+            case_dir.mkdir()
+            case_manifest, _, _, case_proofs = _selftest_custody_set(case_dir)
+            target = case_dir / "validation.json"
+            target.write_bytes(mutate(target.read_bytes()))
+            case_rendered = json.loads(case_manifest.read_bytes())
+            case_manifest_binding = {
+                proof["backend"]: proof for proof in case_rendered["reopen_proofs"]
+            }
+            try:
+                case_validation_bytes, case_validation_raw = _load_validation_artifact(
+                    target, "CFIXTURE"
+                )
+            except AnalyzerError:
+                rejected.append(name)
+                return
+            try:
+                _verify_reopen_proof_file(
+                    case_proofs["fjall"],
+                    "fjall",
+                    "CFIXTURE",
+                    case_rendered["range"]["stop_height"],
+                    case_rendered["source_tip_hash"],
+                    declared=case_manifest_binding["fjall"],
+                    expected_validation=_validation_binding(
+                        case_validation_bytes, case_validation_raw
+                    ),
+                )
+            except AnalyzerError:
+                rejected.append(name)
+            else:
+                raise AnalyzerError(
+                    f"custody-selftest: validation case {name!r} was not rejected"
+                )
+
+        _expect_validation_reject(
+            "missing validation artifact", tmp / "no-validation.json"
+        )
+        symlink_validation = tmp / "symlink-validation.json"
+        symlink_validation.symlink_to(tmp / "validation.json")
+        _expect_validation_reject("symlink validation artifact", symlink_validation)
+        _mutated_validation(
+            "wrong schema validation",
+            lambda data: data.replace(
+                b"mainnet-prefix-replay-validation-v1", b"other-validation-v9"
+            ),
+        )
+        _mutated_validation(
+            "zero hash validation",
+            lambda data: data.replace(
+                b'"muhash": "' + b"ab" * 32 + b'"',
+                b'"muhash": "' + b"0" * 64 + b'"',
+            ),
+        )
+        _mutated_validation(
+            "tip drift validation",
+            lambda data: data.replace(
+                b'"stop_hash": "' + str(fixture_tip).encode() + b'"',
+                b'"stop_hash": "' + b"e" * 64 + b'"',
+            ),
+        )
+        _mutated_validation(
+            "state drift validation",
+            lambda data: data.replace(b'"utxo_count": 2', b'"utxo_count": 3'),
+        )
+
+        cases: list[tuple[str, dict[str, object] | None, str]] = [
+            ("wrong corpus id", {"corpus_id": "C999"}, "CFIXTURE"),
+            ("product id on fixture path", {"corpus_id": "C150"}, "CFIXTURE"),
+            ("blank core version", {"core_version": "  "}, "CFIXTURE"),
+            ("manifest v1", {"version": 1}, "CFIXTURE"),
+            (
+                "unknown exporter",
+                {"exporter": {"schema": "other", "version": 1}},
+                "CFIXTURE",
+            ),
+            (
+                "census version drift",
+                {"checksig_census": {"schema": "classify-corpus-v2", "version": 3}},
+                "CFIXTURE",
+            ),
+            ("zero digest", {"manifest_sha256": "0" * 64}, "CFIXTURE"),
+            ("source tip drift", {"source_tip_hash": "f" * 64}, "CFIXTURE"),
+            (
+                "archive digest drift",
+                {"archive": {"size": 184, "sha256": "f" * 64}},
+                "CFIXTURE",
+            ),
+            ("wrong contract id", {}, "C150"),
+            (
+                "zero proof digest",
+                {
+                    "reopen_proofs": [
+                        {
+                            "schema": "verify-replay-durability-proof-v1",
+                            "version": 1,
+                            "backend": backend,
+                            "path": f"/tmp/synthetic/{backend}-reopen-proof.json",
+                            "size": 3,
+                            "sha256": "0" * 64,
+                        }
+                        for backend in ("fjall", "rocksdb", "redb")
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            (
+                "duplicate backend proof",
+                {
+                    "reopen_proofs": [
+                        {
+                            "schema": "verify-replay-durability-proof-v1",
+                            "version": 1,
+                            "backend": backend,
+                            "path": f"/tmp/synthetic/{backend}-reopen-proof.json",
+                            "size": 3,
+                            "sha256": "11" * 32,
+                        }
+                        for backend in ("fjall", "fjall", "redb")
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            (
+                "unknown backend proof",
+                {
+                    "reopen_proofs": [
+                        {
+                            "schema": "verify-replay-durability-proof-v1",
+                            "version": 1,
+                            "backend": backend,
+                            "path": f"/tmp/synthetic/{backend}-reopen-proof.json",
+                            "size": 3,
+                            "sha256": "11" * 32,
+                        }
+                        for backend in ("fjall", "rocksdb", "redb", "lmdb")
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            (
+                "oversized payload",
+                {
+                    "entries": [
+                        {
+                            "height": 0,
+                            "hash": "aa" * 32,
+                            "offset": 0,
+                            "payload_length": 4_000_001,
+                        },
+                        {
+                            "height": 1,
+                            "hash": "bb" * 32,
+                            "offset": 88,
+                            "payload_length": 80,
+                        },
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            (
+                "short payload",
+                {
+                    "entries": [
+                        {
+                            "height": 0,
+                            "hash": "aa" * 32,
+                            "offset": 0,
+                            "payload_length": 79,
+                        },
+                        {
+                            "height": 1,
+                            "hash": "bb" * 32,
+                            "offset": 87,
+                            "payload_length": 79,
+                        },
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            (
+                "duplicate entry hash",
+                {
+                    "entries": [
+                        {
+                            "height": 0,
+                            "hash": "aa" * 32,
+                            "offset": 0,
+                            "payload_length": 80,
+                        },
+                        {
+                            "height": 1,
+                            "hash": "aa" * 32,
+                            "offset": 88,
+                            "payload_length": 80,
+                        },
+                    ]
+                },
+                "CFIXTURE",
+            ),
+            ("duplicate json key", None, "CFIXTURE"),
+            ("production rejects fixture id", None, "C150"),
+        ]
+        for name, mutations, contract in cases:
+            production_rejects_fixture = name == "production rejects fixture id"
+            case_tmp = tmp / name.replace(" ", "-")
+            case_tmp.mkdir()
+            if name == "duplicate json key":
+                # Duplicate keys cannot be produced via the mutation path;
+                # write a manifest with a repeated root key by hand and pair
+                # it with a consistent replay for the rendered bytes.
+                manifest_path, archive_path, replay, _ = _selftest_custody_set(case_tmp)
+                good = json.loads(manifest_path.read_bytes())
+                rendered = manifest_path.read_bytes()
+                injected = rendered[:-1] + b',"version":%d}' % good["version"]
+                manifest_path.write_bytes(injected)
+                replay["corpus_manifest"] = {
+                    "bytes": len(injected),
+                    "sha256": hashlib.sha256(injected).hexdigest(),
+                }
+                case_manifest, case_archive, case_replay = (
+                    manifest_path,
+                    archive_path,
+                    replay,
+                )
+            else:
+                case_manifest, case_archive, case_replay, _ = _selftest_custody_set(
+                    case_tmp, mutations
+                )
+            try:
+                _validate_corpus_manifest(
+                    case_manifest,
+                    case_archive,
+                    case_replay,
+                    contract,
+                    fixture=not production_rejects_fixture,
+                )
+            except AnalyzerError:
+                rejected.append(name)
+            else:
+                raise AnalyzerError(f"custody-selftest: {name!r} was not rejected")
+
+        proofs_tmp = tmp / "missing-proof"
+        proofs_tmp.mkdir()
+        proof_manifest, proof_archive, proof_replay, _proof_files = (
+            _selftest_custody_set(proofs_tmp)
+        )
+        raw_bytes = proof_manifest.read_bytes()
+        raw = json.loads(raw_bytes)
+        raw["reopen_proofs"] = raw["reopen_proofs"][:2]
+        preimage = dict(raw)
+        preimage["manifest_sha256"] = "0" * 64
+        raw["manifest_sha256"] = hashlib.sha256(
+            json.dumps(preimage, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        proof_manifest.write_bytes(
+            json.dumps(raw, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        proof_replay["corpus_manifest"] = {
+            "bytes": proof_manifest.stat().st_size,
+            "sha256": hashlib.sha256(proof_manifest.read_bytes()).hexdigest(),
+        }
+        try:
+            _validate_corpus_manifest(
+                proof_manifest, proof_archive, proof_replay, "CFIXTURE", fixture=True
+            )
+        except AnalyzerError:
+            rejected.append("missing reopen proof")
+        else:
+            raise AnalyzerError(
+                "custody-selftest: 'missing reopen proof' was not rejected"
+            )
+
+    print(f"custody-selftest: PASSED — 1 accepted, {len(rejected)} rejected")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5324,7 +7725,7 @@ def build_parser() -> argparse.ArgumentParser:
     cc.add_argument(
         "--corpus-manifest",
         required=True,
-        help="bitcoin-rs-corpus-manifest v1 JSON",
+        help="bitcoin-rs-corpus-manifest v2 custody JSON",
     )
     cc.add_argument(
         "--archive",
@@ -5353,39 +7754,149 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional writable directory for the classifier database and SQLite temporary files",
     )
+    cc.add_argument(
+        "--reopen-proof",
+        action="append",
+        default=[],
+        metavar="BACKEND=PATH",
+        help="verified backend durability proof: --reopen-proof fjall=/path/proof.json "
+        "(exactly one per backend: fjall, rocksdb, redb; each file must be a real "
+        "verify-replay-durability-proof-v1 artifact bound by the manifest)",
+    )
+    cc.add_argument(
+        "--validation",
+        required=True,
+        help="shared mainnet-prefix-replay-validation-v1 artifact that every "
+        "backend reopen proof must bind by exact bytes and by state",
+    )
     cc.set_defaults(func=cmd_classify_corpus)
 
     fc = sub.add_parser(
         "find-cmodern-height",
         help="launch a diagnostic replay to find the first mainnet height with all 11 special contexts",
     )
-    fc.add_argument("--binary", required=True, help="feature-built mainnet_prefix_replay binary")
+    fc.add_argument(
+        "--binary", required=True, help="feature-built mainnet_prefix_replay binary"
+    )
     fc.add_argument("--rest-url", required=True, help="frozen REST URL (host:port)")
-    fc.add_argument("--stop-height", required=True, type=int, help="safety ceiling (inclusive u32)")
-    fc.add_argument("--work-dir", required=True, help="new work directory for BRS streams and scratch state")
+    fc.add_argument(
+        "--stop-height", required=True, type=int, help="safety ceiling (inclusive u32)"
+    )
+    fc.add_argument(
+        "--work-dir",
+        required=True,
+        help="new work directory for BRS streams and scratch state",
+    )
     fc.add_argument("--output", required=True, help="candidate output JSON path")
-    fc.add_argument("--storage-backend", default="fjall", help="storage backend for replay state")
-    fc.add_argument("--txindex", action="store_true", default=False, help="enable txindex")
+    fc.add_argument(
+        "--storage-backend", default="fjall", help="storage backend for replay state"
+    )
+    fc.add_argument(
+        "--txindex", action="store_true", default=False, help="enable txindex"
+    )
     fc.set_defaults(func=cmd_find_cmodern_height)
     sc = sub.add_parser(
         "salvage-cmodern-height",
         help="recover terminal Cmodern evidence without changing the failed run",
     )
-    sc.add_argument("--source-dir", required=True, help="read-only failed work directory")
-    sc.add_argument("--recovery-dir", required=True, help="new directory for committed evidence")
-    sc.add_argument("--rest-url", required=True, help="original frozen REST URL (host:port)")
-    sc.add_argument("--stop-height", required=True, type=int, help="original safety ceiling")
+    sc.add_argument(
+        "--source-dir", required=True, help="read-only failed work directory"
+    )
+    sc.add_argument(
+        "--recovery-dir",
+        required=True,
+        help="pre-created empty directory for committed evidence "
+        "(same filesystem as the source; never created or emptied by salvage)",
+    )
+    sc.add_argument(
+        "--rest-url", required=True, help="original frozen REST URL (host:port)"
+    )
+    sc.add_argument(
+        "--stop-height", required=True, type=int, help="original safety ceiling"
+    )
     sc.add_argument(
         "--data-dir",
         required=True,
         help="exact original data_dir recorded by replay_diagnostic.json",
     )
     sc.add_argument("--output", required=True, help="new candidate output JSON path")
-    sc.add_argument("--storage-backend", default="fjall", help="original storage backend")
-    sc.add_argument("--txindex", action="store_true", default=False, help="original txindex setting")
+    sc.add_argument(
+        "--storage-backend", default="fjall", help="original storage backend"
+    )
+    sc.add_argument(
+        "--txindex", action="store_true", default=False, help="original txindex setting"
+    )
     sc.set_defaults(func=cmd_salvage_cmodern_height)
+    st = sub.add_parser(
+        "custody-selftest",
+        help="validate the corpus custody contract against synthetic fixtures",
+    )
+    st.set_defaults(func=cmd_custody_selftest)
 
     return parser
+
+
+def _escape_bounded(text: str, limit: int) -> str:
+    """Escape *text* one character at a time, stopping at the budget.
+
+    The scan is abandoned as soon as *limit* columns are spent, so rendering
+    a hostile string never converts, escapes, or joins the whole value
+    before the cap. Output is printable ASCII only.
+    """
+    parts: list[str] = []
+    used = 0
+    for ch in text:
+        code = ord(ch)
+        if ch.isascii() and ch.isprintable():
+            piece = ch
+        elif code <= 0xFF:
+            piece = f"\\x{code:02x}"
+        elif code <= 0xFFFF:
+            piece = f"\\u{code:04x}"
+        else:
+            piece = f"\\U{code:08x}"
+        if used + len(piece) > limit:
+            parts.append("...")
+            break
+        parts.append(piece)
+        used += len(piece)
+    return "".join(parts)
+
+
+def _bounded_fact(value: object, limit: int = 200) -> str:
+    """Render one attacker-controlled fact for message interpolation.
+
+    Strings are escaped with a hard scan budget (``_escape_bounded``);
+    non-scalar containers render as a bounded type/length summary instead of
+    a full ``repr``, so a hostile JSON key or value can never inflate the
+    exception that reports it.
+    """
+    if isinstance(value, str):
+        return _escape_bounded(value, limit)
+    if value is None or isinstance(value, (bool, int, float)):
+        return _escape_bounded(str(value), limit)
+    try:
+        length = len(value)
+    except TypeError:
+        return f"<{type(value).__name__}>"
+    return f"<{type(value).__name__} len={length}>"
+
+
+def _bounded_error_line(text: object, limit: int = 200) -> str:
+    """Render one attacker-influenced error fact as a bounded ASCII line.
+
+    Control characters (newlines, ESC, bidi controls) are escaped, non-ASCII
+    is escape-encoded, and the result is capped at ``limit`` characters so a
+    hostile manifest value or oversized response cannot inject terminal
+    output or amplify one rejected field into a large stderr write. The
+    budget stops the scan; the full value is never rendered first.
+    """
+    if isinstance(text, BaseException):
+        args = text.args
+        if len(args) == 1 and isinstance(args[0], str):
+            return f"{type(text).__name__}: {_bounded_fact(args[0], limit)}"
+        return f"{type(text).__name__}({', '.join(_bounded_fact(a, 50) for a in args)})"
+    return _bounded_fact(text, limit)
 
 
 def main() -> int:
@@ -5394,10 +7905,10 @@ def main() -> int:
     try:
         return args.func(args)
     except AnalyzerError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_bounded_error_line(exc)}", file=sys.stderr)
         return 1
     except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_bounded_error_line(exc)}", file=sys.stderr)
         return 1
 
 
