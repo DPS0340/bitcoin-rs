@@ -18,3 +18,7 @@
   `.agent-tasks/<task-id>/GOALS.md` and place task-local proof in its sibling
   `tests/` directory; delete the task directory after the change merges so
   temporary acceptance evidence does not become permanent project policy.
+- For every TLS path, use Rustls with default features disabled and a reviewed
+  non-C crypto provider, and keep the native-TLS/C-provider family in `deny.toml`
+  complete, because Rustls and adapter feature defaults can reintroduce AWS-LC,
+  ring, OpenSSL, or platform TLS transitively.

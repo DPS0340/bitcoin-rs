@@ -46,8 +46,40 @@ deny = [
     { crate = "base64:>0.21.7,<0.22.1", reason = "only audited base64 versions 0.21.7 and 0.22.1 are allowed" },
     { crate = "base64:>0.22.1", reason = "only audited base64 versions 0.21.7 and 0.22.1 are allowed" },
     # Forbid disallowed crates discovered during the 2026-05-19 dependency audit:
-    { name = "openssl", reason = "use rustls" },
-    { name = "openssl-sys", reason = "use rustls" },
+    { crate = "openssl", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "openssl-sys", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "openssl-src", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "tokio-openssl", reason = "use tokio-rustls with default-features = false and a reviewed non-C provider", use-instead = "tokio-rustls" },
+    { crate = "hyper-openssl", reason = "use hyper-rustls with default-features = false and a reviewed non-C provider", use-instead = "hyper-rustls" },
+    { crate = "native-tls", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "tokio-native-tls", reason = "use tokio-rustls with default-features = false and a reviewed non-C provider", use-instead = "tokio-rustls" },
+    { crate = "hyper-tls", reason = "use hyper-rustls with default-features = false and a reviewed non-C provider", use-instead = "hyper-rustls" },
+    { crate = "async-native-tls", reason = "use tokio-rustls with default-features = false and a reviewed non-C provider", use-instead = "tokio-rustls" },
+    { crate = "schannel", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "security-framework", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "security-framework-sys", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "boring", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "boring-sys", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "tokio-boring", reason = "use tokio-rustls with default-features = false and a reviewed non-C provider", use-instead = "tokio-rustls" },
+    { crate = "hyper-boring", reason = "use hyper-rustls with default-features = false and a reviewed non-C provider", use-instead = "hyper-rustls" },
+    { crate = "s2n-tls", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "s2n-tls-sys", reason = "use rustls with default-features = false and a reviewed non-C provider", use-instead = "rustls" },
+    { crate = "s2n-tls-tokio", reason = "use tokio-rustls with default-features = false and a reviewed non-C provider", use-instead = "tokio-rustls" },
+    { crate = "s2n-tls-hyper", reason = "use hyper-rustls with default-features = false and a reviewed non-C provider", use-instead = "hyper-rustls" },
+    # Rustls defaults/adapters can pull C-backed crypto providers transitively;
+    # ban the providers and rustls-* adapter crates so only a non-C provider
+    # can satisfy the rustls dependency.
+    { crate = "aws-lc-rs", reason = "Rustls must use a non-C provider" },
+    { crate = "aws-lc-sys", reason = "Rustls must use a non-C provider" },
+    { crate = "aws-lc-fips-sys", reason = "Rustls must use a non-C provider" },
+    { crate = "ring", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-aws-lc-rs", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-ring", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-openssl", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-mbedtls-provider", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-symcrypt", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-wolfcrypt-provider", reason = "Rustls must use a non-C provider" },
+    { crate = "rustls-cng", reason = "Rustls must use a non-C provider" },
 ]
 # Duplicate-version guard (issue #174).
 #

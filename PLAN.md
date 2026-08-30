@@ -136,8 +136,8 @@ Stored once in `bitcoin-rs/Cargo.toml` under `[workspace.dependencies]`. Per-cra
 | `toml` | `>=1, <2` | `["parse", "display", "serde"]` | config (read-only) |
 | `clap` | `>=4.6` | `["derive", "env", "wrap_help"]` | CLI; MSRV 1.95 matches |
 | `signal-hook` | `>=0.4` | `[]` | sigterm/sigint; 0.4 latest |
-| `rustls` | `>=0.23.40, <0.24` | `["std", "ring", "tls12", "logging"]` | TLS for Electrum listener; 0.23.40 latest; `ring` provider keeps one TLS stack |
-| `rustls-pki-types` | `>=1.14` | `[]` | mandatory companion to `rustls` |
+| `rustls` | `>=0.23.43, <0.24` | `["std", "tls12", "logging", "custom-provider"]` | TLS for future Electrum listener; default features disabled; requires an explicit reviewed non-C `CryptoProvider`; no rustls dependency is added before a TLS path exists |
+| `rustls-pki-types` | `>=1.15` | `[]` | mandatory companion to `rustls` when a TLS path exists |
 | `thiserror` | `>=2.0` | `[]` | every library crate's error type; 2.0.18 latest |
 | `anyhow` | `>=1.0.100` | `[]` | `bin/bitcoin-rs` only (top-level `main()` error surfacing) |
 | `portable-atomic` | `>=1.13` | `[]` | optional — 128-bit atomics for future lock-free counters; behind `feature = "portable-atomic"` |
@@ -747,7 +747,7 @@ git commit -am "feat(rpc): Bitcoin Core-compat JSON-RPC subset (no signing)" -m 
 - Create: `crates/electrum/src/{lib,server,session,methods,subscription}.rs`
 - Test: `crates/electrum/tests/parity_against_electrs.rs`
 
-- [ ] **Step 1: TCP/TLS server** — port shape from `electrs/src/electrum.rs`. Per-session line-delimited JSON-RPC parsed with `sonic-rs`. TLS via `rustls >=0.23` + `rustls-pki-types >=1.14` (modern pure-Rust TLS stack; tokio-free).
+- [ ] **Step 1: TCP/TLS server** — port shape from `electrs/src/electrum.rs`. Per-session line-delimited JSON-RPC parsed with `sonic-rs`. TLS via `rustls >=0.23.43` (`default-features = false`, features `std`, `tls12`, `logging`, `custom-provider`, configured with an explicit reviewed non-C `CryptoProvider`) + `rustls-pki-types >=1.15` (tokio-free); no rustls dependency is added before a TLS path exists.
 
 - [ ] **Step 2: Methods** — `server.{version,banner,donation_address,peers.subscribe,ping}`, `blockchain.scripthash.{get_history,get_balance,subscribe,listunspent}`, `blockchain.transaction.{get,broadcast}`, `blockchain.estimatefee`, `mempool.get_fee_histogram`, `blockchain.block.headers`, `blockchain.headers.subscribe`.
 
