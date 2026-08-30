@@ -150,7 +150,7 @@ fn sendrawtransaction_idempotent_for_already_in_mempool() -> Result<(), Box<dyn 
 
     // Pre-insert into mempool.
     let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 1);
-    ctx.mempool.write().insert_entry(entry)?;
+    ctx.mempool.pool().write().insert_entry(entry)?;
 
     let raw = hex_encode(&consensus_bytes(&tx));
     let handler = Handler::new(Arc::clone(&ctx));
@@ -195,7 +195,7 @@ fn testmempoolaccept_reports_reject_for_already_in_mempool()
     let txid = tx.txid();
 
     let entry = MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 1);
-    ctx.mempool.write().insert_entry(entry)?;
+    ctx.mempool.pool().write().insert_entry(entry)?;
 
     let raw = hex_encode(&consensus_bytes(&tx));
     let handler = Handler::new(Arc::clone(&ctx));
@@ -268,7 +268,7 @@ fn gettxout_returns_unconfirmed_output_from_mempool() -> Result<(), Box<dyn std:
     };
     let txid = tx.txid();
     let entry = MempoolEntry::new(Arc::new(tx), 100, 500, 1, 1);
-    ctx.mempool.write().insert_entry(entry)?;
+    ctx.mempool.pool().write().insert_entry(entry)?;
 
     let handler = Handler::new(Arc::clone(&ctx));
     let result = handler.dispatch("gettxout", &json!([txid.to_string(), 0_u64]))?;
@@ -300,7 +300,7 @@ fn gettxout_include_mempool_false_skips_mempool() -> Result<(), Box<dyn std::err
     };
     let txid = tx.txid();
     let entry = MempoolEntry::new(Arc::new(tx), 100, 500, 1, 1);
-    ctx.mempool.write().insert_entry(entry)?;
+    ctx.mempool.pool().write().insert_entry(entry)?;
 
     let handler = Handler::new(Arc::clone(&ctx));
     // include_mempool=false → skip mempool, output not in UTXO → null.
@@ -320,7 +320,7 @@ fn gettxout_returns_null_for_outpoint_spent_in_mempool() -> Result<(), Box<dyn s
     // Create a spending tx that spends the UTXO but is only in mempool.
     let spending_tx = make_tx(prevout, 9_000, script);
     let entry = MempoolEntry::new(Arc::new(spending_tx), 100, 1_000, 1, 1);
-    ctx.mempool.write().insert_entry(entry)?;
+    ctx.mempool.pool().write().insert_entry(entry)?;
 
     // The original outpoint is now spent in mempool.
     let spent_txid = prevout.txid;

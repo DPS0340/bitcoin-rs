@@ -8,7 +8,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_ext_api::CapabilityProvider;
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::{Mempool, MempoolLimits};
+use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
@@ -1059,8 +1059,8 @@ pub struct ChainHandles {
 /// Mempool capability handles.
 #[derive(Clone)]
 pub struct MempoolHandles {
-    /// In-memory mempool.
-    pub mempool: Arc<RwLock<Mempool>>,
+    /// The process-wide mutation gateway in front of the in-memory pool.
+    pub mempool: Arc<MempoolGateway>,
 }
 
 /// Index capability handles.
@@ -1123,8 +1123,9 @@ pub struct Context {
     /// longer than the tip-age window would announce that it is back in initial
     /// sync, and callers treat that as "do not trust this node's data yet".
     left_initial_block_download: Arc<core::sync::atomic::AtomicBool>,
-    /// In-memory mempool handle.
-    pub mempool: Arc<RwLock<Mempool>>,
+    /// Mempool mutation gateway: the only production route that takes the
+    /// pool write lock, publishing ordered mutation events to observers.
+    pub mempool: Arc<MempoolGateway>,
     /// Block records already available without blocking storage readers.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Raw transactions indexed by txid for Core transaction RPCs.
@@ -1217,7 +1218,9 @@ impl Context {
         let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
         utxo.set_listener(Box::new(coin_stats_listener.clone()));
         let coin_stats = Arc::new(coin_stats_listener);
-        let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let mempool = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
         Self {
             chain_tip: Arc::new(ArcSwapOption::empty()),
             applied_tip: Arc::new(ArcSwapOption::empty()),
@@ -1981,7 +1984,9 @@ mod tests {
                 chain_network: Network::Mainnet,
             },
             mempool: MempoolHandles {
-                mempool: Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+                mempool: MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+                    MempoolLimits::default(),
+                )))),
             },
             indexes: IndexHandles {
                 tx_index: None,

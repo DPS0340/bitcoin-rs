@@ -107,11 +107,9 @@ pub(crate) fn prioritisetransaction(ctx: &Arc<Context>, params: &Value) -> Resul
         .and_then(JsonValueTrait::as_i64)
         .or_else(|| array.get(1).and_then(JsonValueTrait::as_i64))
         .ok_or(RpcError::InvalidParams("fee_delta is required"))?;
-    {
-        let mut pool = ctx.mempool.write();
-        pool.prioritise(txid, fee_delta)
-            .map_err(|_| RpcError::InvalidParams("fee delta would overflow"))?;
-    }
+    ctx.mempool
+        .prioritise(txid, fee_delta)
+        .map_err(|_| RpcError::InvalidParams("fee delta would overflow"))?;
     if let Some(control) = ctx.mining_control.as_ref() {
         control.publish_generation();
     }
@@ -834,7 +832,7 @@ mod tests {
         };
         let txid = tx.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(tx), 100, 1_000, 1, 7))
                 .unwrap_or_else(|err| panic!("insert failed: {err}"));
         }

@@ -15,8 +15,8 @@ use std::error::Error;
 
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
-    AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits, PolicyError, RbfError,
-    ReplacementCandidate,
+    AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver,
+    MutationEnvelope, MutationOutcome, PolicyError, RbfError, RemovalReason, ReplacementCandidate,
 };
 use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
 use bitcoin_rs_node::{Config, Network, state::NodeState};
@@ -183,7 +183,12 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
     // outlets — the order Core 31.1 uses (admission failure first, then the
     // fee cap).
     let strict = Arc::new(Context::new());
-    strict.mempool.write().limits.min_relay_fee_sat_per_kvb = 20_000_000;
+    strict
+        .mempool
+        .pool()
+        .write()
+        .limits
+        .min_relay_fee_sat_per_kvb = 20_000_000;
     let both = funded_fee_tx(&strict, 0x81, 1_230);
     let handler = Handler::new(Arc::clone(&strict));
     let message = internal_message(
@@ -279,7 +284,7 @@ fn sendrawtransaction_and_testmempoolaccept_quote_the_floor_before_maxfeerate()
 #[test]
 fn rpc_outlets_enforce_the_configured_floor() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
-    ctx.mempool.write().limits.min_relay_fee_sat_per_kvb = 5_000;
+    ctx.mempool.pool().write().limits.min_relay_fee_sat_per_kvb = 5_000;
     let handler = Handler::new(Arc::clone(&ctx));
 
     // 164 sat over 82 vB is exactly 2 000 sat/kvB: below the configured floor.
@@ -339,7 +344,7 @@ fn rpc_outlets_enforce_the_configured_floor() -> Result<(), Box<dyn Error>> {
 fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
     let ctx = Arc::new(Context::new());
     {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         pool.limits.max_total_bytes = 400;
         // Fill to exactly half of -maxmempool, the pressure threshold, with
         // packages at 1 000 and 2 000 sat/kvB.
@@ -402,6 +407,7 @@ fn rpc_outlets_enforce_the_pressure_floor() -> Result<(), Box<dyn Error>> {
     // The raw insert gate checks only the configured floor, so the same tx
     // admits there (deviation ledger, pressure-floor surface).
     ctx.mempool
+        .pool()
         .write()
         .insert_entry(MempoolEntry::new(Arc::new(lukewarm), 82, 82, 0, 1))?;
     assert_eq!(ctx.mempool.read().len(), 3);
@@ -565,7 +571,7 @@ fn insert_original(
     fee: u64,
 ) -> Result<Tx, Box<dyn Error>> {
     let original = tx(fund_utxo(ctx, label, 100_000), 92_000, sequence);
-    ctx.mempool.write().insert_entry(MempoolEntry::new(
+    ctx.mempool.pool().write().insert_entry(MempoolEntry::new(
         Arc::new(original.clone()),
         vsize,
         fee,
@@ -613,6 +619,104 @@ fn sendrawtransaction_applies_an_rbf_replacement_and_sweeps_the_conflicts()
         0,
     )?;
     assert!(pool.contains_txid(&rpc_txid(&replacement)));
+    Ok(())
+}
+
+/// Records every published change as `(origin, sequence, txid, outcome)`.
+#[derive(Default)]
+struct RecordingGatewayObserver {
+    changes: parking_lot::Mutex<Vec<(AdmissionOrigin, u64, Hash256, MutationOutcome)>>,
+}
+
+impl MempoolObserver for RecordingGatewayObserver {
+    fn on_mutation(&self, envelope: &MutationEnvelope) {
+        let mut changes = self.changes.lock();
+        for (offset, change) in envelope.result.changes.iter().enumerate() {
+            let sequence = envelope.result.sequence_of(offset).unwrap_or(u64::MAX);
+            changes.push((envelope.origin, sequence, change.txid, change.outcome));
+        }
+    }
+}
+
+/// `sendrawtransaction` publishes through the process-wide gateway: a
+/// plain submit emits one Accepted change with origin `Rpc`, and an RBF
+/// replacement emits one envelope in commit order — R(Replaced), then
+/// R(Descendant), then A. Staged inserts move the pool sequence without
+/// publishing, exactly like the apply path's raw sweep.
+#[test]
+fn sendrawtransaction_publishes_admission_through_gateway() -> Result<(), Box<dyn Error>> {
+    let ctx = Arc::new(Context::new());
+    let observer = Arc::new(RecordingGatewayObserver::default());
+    assert!(
+        ctx.mempool.install_observer(observer.clone()).is_ok(),
+        "fresh harness gateway has no observer yet"
+    );
+
+    // Plain admission: exactly one Accepted change for the txid.
+    let plain = tx(fund_utxo(&ctx, 0x51, 100_000), 90_000, 0xffff_ffff);
+    let plain_txid = rpc_txid(&plain);
+    let handler = Handler::new(Arc::clone(&ctx));
+    handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&plain)]))?;
+    {
+        let changes = observer.changes.lock();
+        assert_eq!(
+            *changes,
+            vec![(
+                AdmissionOrigin::Rpc,
+                1,
+                Hash256::from(plain_txid),
+                MutationOutcome::Accepted,
+            )],
+            "the first production A event: one Accepted change, origin Rpc"
+        );
+    }
+
+    // RBF replacement over the existing fixture: original plus its
+    // signaling child staged the way an earlier relay round would have.
+    let original = insert_original(&ctx, 0x52, 0xffff_fffd, 4_000, 8_000)?;
+    let original_txid = rpc_txid(&original);
+    let child = tx(OutPoint::new(original_txid, 0), 91_000, 0xffff_fffd);
+    let child_txid = rpc_txid(&child);
+    ctx.mempool.pool().write().insert_entry(MempoolEntry::new(
+        Arc::new(child.clone()),
+        u32::try_from(child.vsize()).unwrap_or(u32::MAX),
+        1_000,
+        0,
+        1,
+    ))?;
+    observer.changes.lock().clear();
+
+    // Its 12 000 sat fee pays both evicted fees (9 000) plus the
+    // incremental relay charge, so rules 3, 4, and 6 all clear.
+    let replacement = tx(confirmed_outpoint(0x52), 88_000, 0xffff_ffff);
+    let replacement_txid = rpc_txid(&replacement);
+    handler.dispatch("sendrawtransaction", &json!([raw_tx_hex(&replacement)]))?;
+
+    let changes = observer.changes.lock();
+    assert_eq!(
+        *changes,
+        vec![
+            (
+                AdmissionOrigin::Rpc,
+                4,
+                Hash256::from(original_txid),
+                MutationOutcome::Removed(RemovalReason::Replaced),
+            ),
+            (
+                AdmissionOrigin::Rpc,
+                5,
+                Hash256::from(child_txid),
+                MutationOutcome::Removed(RemovalReason::Descendant),
+            ),
+            (
+                AdmissionOrigin::Rpc,
+                6,
+                Hash256::from(replacement_txid),
+                MutationOutcome::Accepted,
+            ),
+        ],
+        "one envelope, commit order: conflicts first (parent before descendant), then the replacement"
+    );
     Ok(())
 }
 
@@ -750,7 +854,7 @@ fn sendrawtransaction_rejects_rule6_replacements_that_do_not_improve_the_rate()
     // Original at 4 000 vsize / 8 000 sat fee = 2 000 sat/kvB stored rate,
     // funded at 200 000 so the replacement has fee headroom to tune.
     let original = tx(fund_utxo(&ctx, 0x9b, 200_000), 192_000, 0xffff_fffd);
-    ctx.mempool.write().insert_entry(MempoolEntry::new(
+    ctx.mempool.pool().write().insert_entry(MempoolEntry::new(
         Arc::new(original.clone()),
         4_000,
         8_000,
@@ -936,7 +1040,7 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
     // Raise package limits so 100 descendants can be inserted; the
     // replacement evicts 101 (original + 100 descendants) > 100.
     {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         pool.limits.max_ancestors = 200;
         pool.limits.max_descendants = 200;
     }
@@ -944,7 +1048,7 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
     let original_txid = rpc_txid(&original);
     // Chain 100 descendants from the original, each at 50 vB / 100 sat fee.
     {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         let mut prev = OutPoint::new(original_txid, 0);
         for i in 0..100_u32 {
             let child = tx(prev, 400, 0xffff_ffff);
@@ -976,7 +1080,7 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
 /// Builds a 25-tx unconfirmed chain in the pool starting from a fictional
 /// confirmed root, all entries at the 1000 sat/kvB boundary.
 fn chain_pool(ctx: &Context) -> Result<Vec<Tx>, Box<dyn Error>> {
-    let mut pool = ctx.mempool.write();
+    let mut pool = ctx.mempool.pool().write();
     let mut txs = Vec::new();
     let mut previous = OutPoint {
         txid: Txid(Hash256::from_le_bytes(&[0x62; 32])),
@@ -1215,9 +1319,9 @@ fn sendrawtransaction_enforces_ancestor_size_limits_at_admission() -> Result<(),
     let ctx = Arc::new(Context::new());
     // Shrink -limitancestorsize so a 3 x 4 000 vB chain leaves the follower's
     // real 82 vB as the only gate that can fail: 12 000 + 82 > 12 000.
-    ctx.mempool.write().limits.max_ancestor_size = 12_000;
+    ctx.mempool.pool().write().limits.max_ancestor_size = 12_000;
     let tip = {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         let mut previous = OutPoint {
             txid: Txid(Hash256::from_le_bytes(&[0x94; 32])),
             vout: 0,
@@ -1315,7 +1419,7 @@ fn sendrawtransaction_enforces_descendant_count_limits_at_admission() -> Result<
     // that fill the parent's descendant budget, out 1 is the RPC child's
     // non-conflicting entry point.
     let parent_txid = {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         let parent = tx_outputs(
             OutPoint {
                 txid: Txid(Hash256::from_le_bytes(&[0x96; 32])),
@@ -1417,7 +1521,7 @@ fn sendrawtransaction_admission_evicts_the_lowest_fee_packages_under_size_pressu
         vout: 0,
     };
     let (high_txid, low_txid, mid_txid) = {
-        let mut pool = ctx.mempool.write();
+        let mut pool = ctx.mempool.pool().write();
         // Three independent packages at 3 000 / 1 000 / 2 000 sat/kvB.
         let high = tx(root(0x90), 1_000, 0xffff_ffff);
         let high_txid = high.txid();
@@ -1755,7 +1859,7 @@ fn invalidation_handler(state: &NodeState) -> Handler {
                 chain_network: Network::Regtest,
             },
             mempool: MempoolHandles {
-                mempool: state.mempool(),
+                mempool: MempoolGateway::shared(state.mempool()),
             },
             indexes: IndexHandles {
                 tx_index: None,
@@ -1839,12 +1943,9 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
 
     // Pool-path agreement: the same structural filter over a bare gateway
     // admits the spend once and keeps the coinbase out.
-    let gateway = MempoolGateway::new(
-        Arc::new(parking_lot::RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))),
-        None,
-    );
+    let gateway = MempoolGateway::shared(Arc::new(parking_lot::RwLock::new(Mempool::new(
+        MempoolLimits::default(),
+    ))));
     let committed = gateway.reconsider_disconnected(
         AdmissionOrigin::Reorg,
         mined_block

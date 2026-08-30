@@ -285,7 +285,7 @@ mod tests {
     fn getmempoolinfo_minrelaytxfee_reflects_custom_mempool_floor() {
         let ctx = Arc::new(Context::new());
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             *pool = bitcoin_rs_mempool::Mempool::new(bitcoin_rs_mempool::MempoolLimits {
                 min_relay_fee_sat_per_kvb: 5_000,
                 ..bitcoin_rs_mempool::MempoolLimits::default()
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn getmempoolinfo_maxmempool_reflects_custom_limit() {
         let ctx = Context::new();
-        *ctx.mempool.write() =
+        *ctx.mempool.pool().write() =
             bitcoin_rs_mempool::Mempool::new(bitcoin_rs_mempool::MempoolLimits {
                 max_total_bytes: 50_000_000,
                 ..bitcoin_rs_mempool::MempoolLimits::default()
@@ -410,8 +410,8 @@ mod tests {
         // `policy_contract.rs` reconfigures floors mid-test: the per-guard
         // derivation must quote them on the next call, never a stale
         // composition-time copy.
-        ctx.mempool.write().limits.max_ancestors = 7;
-        ctx.mempool.write().limits.max_ancestor_size = 42_000;
+        ctx.mempool.pool().write().limits.max_ancestors = 7;
+        ctx.mempool.pool().write().limits.max_ancestor_size = 42_000;
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("getmempoolinfo", &json!([]))
@@ -490,7 +490,7 @@ mod tests {
         let child = tx(2, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid().to_string();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
             pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0))?;
         }
@@ -517,7 +517,7 @@ mod tests {
         let child = tx(4, vec![OutPoint::new(parent_txid, 0)]);
         let child_txid = child.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             pool.insert_entry(MempoolEntry::new(Arc::new(parent), 100, 1_000, 0, 0))?;
             pool.insert_entry(MempoolEntry::new(Arc::new(child), 100, 1_000, 0, 0))?;
         }
@@ -565,7 +565,7 @@ mod tests {
         };
         let child_txid = child.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let parent_entry =
                 bitcoin_rs_mempool::MempoolEntry::new(Arc::new(parent), 100, 1_000, 1, 7);
             let Ok(_) = pool.insert_entry(parent_entry) else {
@@ -608,7 +608,7 @@ mod tests {
         };
         let rbf_txid = rbf_tx.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let Ok(_) = pool.insert_entry(MempoolEntry::new(Arc::new(rbf_tx), 100, 10_000, 1, 7))
             else {
                 panic!("mempool insert failed");
@@ -756,7 +756,7 @@ mod spentby_tests {
 
         let ctx = Arc::new(Context::new());
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             for tx in [root, first_spender, second_spender, child_c, loner] {
                 let entry = MempoolEntry::new(Arc::new(tx), 100, 10_000, 1, 7);
                 let Ok(_id) = pool.insert_entry(entry) else {

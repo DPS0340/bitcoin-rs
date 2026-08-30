@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use bitcoin_rs_mempool::{CompositeObserver, MempoolGateway};
 use crossbeam_channel::{Receiver, TrySendError, bounded};
 
 use crate::config::Config;
@@ -569,6 +570,19 @@ fn spawn_fixed_peer_bootstrap(
     ))
 }
 
+fn install_mempool_observer(gateway: &MempoolGateway, zmq: Arc<dyn crate::ZmqPublisher>) {
+    let mut legs = CompositeObserver::new();
+    if zmq.wants_notifications() {
+        legs.add_leg(
+            "zmq-sequence",
+            Arc::new(crate::mempool_observer::MempoolSequenceObserver::new(zmq)),
+        );
+    }
+    gateway
+        .install_observer(Arc::new(legs))
+        .unwrap_or_else(|_| unreachable!("observer composed once before any worker spawns"));
+}
+
 /// Boots the node from a resolved [`Config`] and runs until shutdown.
 ///
 /// Flow:
@@ -622,6 +636,10 @@ pub fn run(mut config: Config) -> Result<()> {
     let (sync_wake_tx, sync_wake_rx) = bounded(1);
     let sync = state.sync();
     let peer_registered = sync.peer_registration_handle();
+    // One process-wide gateway per pool: compose the observer legs once,
+    // before any worker, miner, RPC route, or peer thread can mutate.
+    let mempool_gateway = MempoolGateway::shared(state.mempool());
+    install_mempool_observer(&mempool_gateway, state.zmq_publisher());
     let loop_handle = EventLoop::with_sync_wake(shutdown_rx, sync, sync_wake_rx);
     let mining_control: Arc<dyn bitcoin_rs_rpc::context::MiningControl> =
         Arc::new(crate::MiningCoordinator::new(
@@ -647,7 +665,7 @@ pub fn run(mut config: Config) -> Result<()> {
                 chain_network: state.config().network,
             },
             mempool: bitcoin_rs_rpc::context::MempoolHandles {
-                mempool: state.mempool(),
+                mempool: Arc::clone(&mempool_gateway),
             },
             indexes: bitcoin_rs_rpc::context::IndexHandles {
                 tx_index: state.tx_index_query(),
@@ -892,6 +910,22 @@ mod tests {
 
     fn signet_seeds() -> Vec<&'static str> {
         bitcoin_rs_primitives::Network::Signet.dns_seeds().to_vec()
+    }
+
+    #[test]
+    fn disabled_zmq_still_seals_the_observer_slot() {
+        let gateway = MempoolGateway::shared(Arc::new(parking_lot::RwLock::new(
+            bitcoin_rs_mempool::Mempool::new(bitcoin_rs_mempool::MempoolLimits::default()),
+        )));
+
+        install_mempool_observer(&gateway, Arc::new(crate::NoOpZmqPublisher));
+
+        assert!(
+            gateway
+                .install_observer(Arc::new(CompositeObserver::new()))
+                .is_err(),
+            "startup must seal the observer slot even without a ZMQ endpoint"
+        );
     }
 
     #[test]

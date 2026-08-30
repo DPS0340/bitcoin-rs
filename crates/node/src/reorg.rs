@@ -11,7 +11,7 @@ use std::sync::Arc;
 use alloc::vec::Vec;
 
 use bitcoin_rs_chain::{NodeId, ReorgPlan, current_unix_seconds, plan_reorg};
-use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry, MempoolGateway, MempoolObserver};
+use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry, MempoolGateway};
 use bitcoin_rs_primitives::{Block, DecodeError, Hash256, Tx, Txid};
 use bitcoin_rs_storage::StorageError;
 use hashbrown::HashMap;
@@ -384,22 +384,15 @@ fn reconsider_disconnected_transactions(handles: &ApplyHandles, disconnect: &[Lo
     if entries.is_empty() {
         return;
     }
-    // The sequence observer rides along only when a `--zmq-pub-sequence`
-    // endpoint is configured, exactly as elsewhere on the gateway boundary.
-    let observer: Option<Arc<dyn MempoolObserver>> = if handles.zmq_publisher.wants_notifications()
-    {
-        Some(Arc::new(
-            crate::mempool_observer::MempoolSequenceObserver::new(Arc::clone(
-                &handles.zmq_publisher,
-            )),
-        ))
-    } else {
-        None
-    };
-    let gateway = MempoolGateway::new(Arc::clone(&handles.mempool), observer);
-    // The committed results belong to the observer; re-admission itself is
+    // run() composed and installed the gateway's observer legs once, so
+    // this path reaches that same process-wide gateway through the pool
+    // Arc the handles already carry. Direct-NodeState tests intern an
+    // observer-less gateway and publish nothing — exactly the no-op
+    // publisher behavior of the private instance this replaces. The
+    // committed results belong to the observer; re-admission itself is
     // best-effort and drops whatever the pool refuses.
-    let _ = gateway.reconsider_disconnected(AdmissionOrigin::Reorg, entries);
+    let _ = MempoolGateway::shared(Arc::clone(&handles.mempool))
+        .reconsider_disconnected(AdmissionOrigin::Reorg, entries);
 }
 
 /// Core's `IsCoinBase`: a single input spending the null prevout (zero txid,

@@ -13,7 +13,7 @@ use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::standardness::{StandardnessError, is_standard_tx};
 use bitcoin_rs_mempool::{
-    EntryId, MempoolPolicySnapshot, PolicyError, RbfError, ReplacementCandidate,
+    AdmissionOrigin, EntryId, MempoolPolicySnapshot, PolicyError, RbfError, ReplacementCandidate,
 };
 use bitcoin_rs_primitives::{
     Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid, consensus_bytes,
@@ -479,8 +479,8 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
         policy.incremental_relay_fee_sat_per_kvb,
     );
     ctx.mempool
-        .write()
         .replace_transaction(
+            AdmissionOrigin::Rpc,
             candidate,
             unix_time_secs(),
             ctx.applied_height(),
@@ -1247,7 +1247,7 @@ mod tests {
             .clone();
         let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -1294,7 +1294,7 @@ mod tests {
             .clone();
         let txid = coinbase.txid();
         {
-            let mut pool = ctx.mempool.write();
+            let mut pool = ctx.mempool.pool().write();
             let vsize = u32::try_from(coinbase.vsize())?;
             let entry =
                 MempoolEntry::new(Arc::new(coinbase.clone()), vsize, u64::from(vsize), 0, 0);
@@ -2268,7 +2268,7 @@ mod finalizepsbt_tests {
             panic!("complete missing: {result:?}");
         };
         assert!(!complete);
-        assert!(result.get("hex").map_or(true, Value::is_null));
+        assert!(result.get("hex").is_none_or(Value::is_null));
         assert!(result.get("psbt").and_then(Value::as_str).is_some());
     }
 
@@ -2334,7 +2334,7 @@ mod finalizepsbt_tests {
         let result = finalizepsbt(&ctx, &json!([combined, false]))
             .unwrap_or_else(|err| panic!("finalizepsbt failed: {err}"));
         assert_eq!(result.get("complete").and_then(Value::as_bool), Some(true));
-        assert!(result.get("hex").map_or(true, Value::is_null));
+        assert!(result.get("hex").is_none_or(Value::is_null));
         assert!(result.get("psbt").and_then(Value::as_str).is_some());
     }
 
@@ -2350,7 +2350,7 @@ mod finalizepsbt_tests {
         let result = finalizepsbt(&ctx, &json!([combined]))
             .unwrap_or_else(|err| panic!("finalizepsbt failed: {err}"));
         assert_eq!(result.get("complete").and_then(Value::as_bool), Some(true));
-        assert!(result.get("psbt").map_or(true, Value::is_null));
+        assert!(result.get("psbt").is_none_or(Value::is_null));
         assert!(result.get("hex").and_then(Value::as_str).is_some());
     }
 }

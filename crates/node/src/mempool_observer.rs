@@ -14,9 +14,9 @@ use crate::zmq_publisher::{SequenceEvent, ZmqPublisher};
 
 /// Publishes every committed mempool mutation as `A`/`R` sequence events.
 ///
-/// Install behind the [`MempoolGateway`] observer slot only when a
-/// `--zmq-pub-sequence` endpoint is configured; otherwise the gateway runs
-/// observer-less and publishes nothing.
+/// Install the composed observer during node startup. When no
+/// `--zmq-pub-sequence` endpoint is configured, the composite has no legs and
+/// publishes nothing; sealing that empty slot prevents a later replacement.
 pub struct MempoolSequenceObserver {
     publisher: Arc<dyn ZmqPublisher>,
 }
@@ -137,14 +137,17 @@ mod tests {
         expected
     }
 
-    fn wired_gateway() -> (MempoolGateway, Arc<RecordingPublisher>) {
+    fn wired_gateway() -> (Arc<MempoolGateway>, Arc<RecordingPublisher>) {
         let publisher = Arc::new(RecordingPublisher::default());
         let publisher_dyn = Arc::clone(&publisher);
         let observer: Arc<dyn MempoolObserver> =
             Arc::new(MempoolSequenceObserver::new(publisher_dyn));
-        let gateway = MempoolGateway::new(
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            Some(observer),
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
+        assert!(
+            gateway.install_observer(observer).is_ok(),
+            "fresh test gateway accepts one observer"
         );
         (gateway, publisher)
     }
@@ -219,13 +222,14 @@ mod tests {
         let publisher_dyn = Arc::clone(&publisher);
         let observer: Arc<dyn MempoolObserver> =
             Arc::new(MempoolSequenceObserver::new(publisher_dyn));
-        let gateway = MempoolGateway::new(
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-                min_relay_fee_sat_per_kvb: 0,
-                max_total_bytes: 150,
-                ..MempoolLimits::default()
-            }))),
-            Some(observer),
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            max_total_bytes: 150,
+            ..MempoolLimits::default()
+        }))));
+        assert!(
+            gateway.install_observer(observer).is_ok(),
+            "fresh test gateway accepts one observer"
         );
         let low = MempoolEntry::new(Arc::new(tx(5)), 100, 100, 1, 7);
         let high = MempoolEntry::new(Arc::new(tx(6)), 100, 900, 1, 7);

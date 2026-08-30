@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use bitcoin_rs_mempool::{
+    AdmissionOrigin, MempoolGateway, MempoolObserver, MutationEnvelope, MutationOutcome,
+};
 use bitcoin_rs_node::{Config, MiningCoordinator, Network, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
@@ -20,6 +23,7 @@ use bitcoin_rs_rpc::context::{
     MiningHandles, NetworkHandles,
 };
 use bitcoin_rs_utxo::UtxoSet;
+use parking_lot::Mutex;
 use sonic_rs::{JsonContainerTrait as _, JsonValueTrait, json};
 
 const SEED_BLOCKS: u32 = 100;
@@ -392,7 +396,7 @@ fn mining_handler(state: &NodeState) -> Handler {
             chain_network: state.config().network,
         },
         mempool: MempoolHandles {
-            mempool: state.mempool(),
+            mempool: MempoolGateway::shared(state.mempool()),
         },
         indexes: IndexHandles {
             tx_index: None,
@@ -647,6 +651,88 @@ fn invalidateblock_readmits_parent_before_child_in_dependency_order() -> Result<
             "connect removes two, reconsideration admits parent then child"
         );
     }
+    Ok(())
+}
+
+/// Records every published change as `(origin, sequence, txid, outcome)`.
+#[derive(Default)]
+struct RecordingMempoolObserver {
+    changes: Mutex<Vec<(AdmissionOrigin, u64, Hash256, MutationOutcome)>>,
+}
+
+impl MempoolObserver for RecordingMempoolObserver {
+    fn on_mutation(&self, envelope: &MutationEnvelope) {
+        let mut changes = self.changes.lock();
+        for (offset, change) in envelope.result.changes.iter().enumerate() {
+            let sequence = envelope.result.sequence_of(offset).unwrap_or(u64::MAX);
+            changes.push((envelope.origin, sequence, change.txid, change.outcome));
+        }
+    }
+}
+
+/// Reorg re-admission publishes through the run-composed shared gateway:
+/// two Accepted changes, parent before child, origin `Reorg`, contiguous
+/// sequences. The apply path's raw sweep bypasses observers by design, so
+/// these two changes are the only publications the gateway emits here.
+#[test]
+fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Result<()> {
+    let (state, _guard) = open_regtest()?;
+    apply_genesis(&state)?;
+    let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
+
+    // Interning returns the one gateway every production route reaches
+    // through this pool Arc; the observer installs before the invalidate.
+    let gateway = MempoolGateway::shared(state.mempool());
+    let observer = Arc::new(RecordingMempoolObserver::default());
+    assert!(
+        gateway.install_observer(observer.clone()).is_ok(),
+        "fresh regtest gateway has no observer yet"
+    );
+
+    let parent = seed_coinbase_spend();
+    let parent_txid = parent.txid();
+    let child = Tx {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(parent_txid, 0),
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut {
+            value: REGTEST_SUBSIDY_SATS - 2 * MEMPOOL_TX_FEE_SATS,
+            script_pubkey: vec![0x51],
+        }],
+        lock_time: 0,
+    };
+    let child_txid = child.txid();
+
+    let block = mine_regtest_block(&state, seed_tip_hash, SEED_BLOCKS + 1, vec![parent, child])?;
+    let mined_hash = Hash256::from(block.block_hash());
+    bitcoin_rs_node::reorg::invalidate_block(&state.apply_handles(), mined_hash)
+        .map_err(|error| anyhow::anyhow!("invalidateblock failed: {error}"))?;
+
+    let tip = current_tip(&state)?;
+    assert_eq!(tip.height, SEED_BLOCKS, "the mined block must roll back");
+    let changes = observer.changes.lock();
+    assert_eq!(
+        *changes,
+        vec![
+            (
+                AdmissionOrigin::Reorg,
+                1,
+                Hash256::from(parent_txid),
+                MutationOutcome::Accepted,
+            ),
+            (
+                AdmissionOrigin::Reorg,
+                2,
+                Hash256::from(child_txid),
+                MutationOutcome::Accepted,
+            ),
+        ],
+        "parent before child, origin Reorg, contiguous sequences"
+    );
     Ok(())
 }
 

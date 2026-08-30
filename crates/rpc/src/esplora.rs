@@ -1658,6 +1658,7 @@ mod tests {
         let txid = transaction.txid();
         let ctx = Arc::new(Context::new());
         ctx.mempool
+            .pool()
             .write()
             .insert_entry(MempoolEntry::new(Arc::new(transaction), 100, 1_000, 0, 0))
             .expect("mempool entry accepted");
@@ -1871,6 +1872,7 @@ mod tests {
             unspent: vec![confirmed],
         }));
         ctx.mempool
+            .pool()
             .write()
             .insert_entry(MempoolEntry::new(
                 Arc::new(spending.clone()),

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use bitcoin_rs_mempool::MempoolGateway;
 use bitcoin_rs_node::{Config, state::NodeState};
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_utxo::UtxoSet;
@@ -31,6 +32,7 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let chain_tip = state.chain_tip();
     let applied_tip = state.applied_tip();
     let mempool = state.mempool();
+    let mempool_gateway = MempoolGateway::shared(Arc::clone(&mempool));
     let blocks = state.blocks();
     let transactions = state.transactions();
     let utxo = Arc::new(UtxoSet::new());
@@ -59,7 +61,7 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
             chain_network,
         },
         mempool: bitcoin_rs_rpc::context::MempoolHandles {
-            mempool: Arc::clone(&mempool),
+            mempool: Arc::clone(&mempool_gateway),
         },
         indexes: bitcoin_rs_rpc::context::IndexHandles {
             tx_index: Some(tx_index),
@@ -91,8 +93,8 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
         "applied_tip must share identity"
     );
     assert!(
-        Arc::ptr_eq(&ctx.mempool, &mempool),
-        "mempool must share identity"
+        Arc::ptr_eq(&ctx.mempool, &mempool_gateway),
+        "mempool gateway must share identity"
     );
     assert!(
         ctx.zmq_notifications()

@@ -5,20 +5,37 @@
 //! ordered [`MutationResult`] to the optional [`MempoolObserver`] — always in
 //! commit order, by construction. After this, no production code outside the
 //! gateway takes the mempool write lock — lookups go through the
-//! [`MempoolGateway::read`] passthrough.
+//! [`MempoolGateway::read`] passthrough. One pool, one gateway:
+//! [`MempoolGateway::shared`] interns a single [`MempoolGateway`] per pool
+//! `Arc` identity, so every route to a pool shares one publish mutex and
+//! one observer slot.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use bitcoin_rs_primitives::{Tx, Txid};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::sync::{LazyLock, OnceLock};
 
+/// Interns one [`MempoolGateway`] per pool `Arc` identity.
+///
+/// This is the crate's one piece of process-global state, and it exists
+/// because the apply path (`ApplyHandles`) is frozen in this batch and
+/// cannot carry a gateway handle: reorg and run-time composition reach the
+/// run-composed instance through the pool `Arc` they already hold. The
+/// registry holds weak references only, so it never keeps a gateway or a
+/// pool alive. Handoff note for ING-R34: once `ApplyHandles` gains a
+/// `mempool_gateway` field, the reorg caller can read the handle instead
+/// and `shared` shrinks to run-time composition plus tests.
 use crate::EntryId;
 use crate::entry::MempoolEntry;
 use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationResult};
 use crate::pool::{Mempool, MempoolError, PrioritiseError};
 use crate::rbf::{RbfError, ReplacementCandidate};
+
+static REGISTRY: LazyLock<Mutex<Vec<Weak<MempoolGateway>>>> =
+    LazyLock::new(|| Mutex::new(alloc::vec::Vec::new()));
 
 /// Receives every committed mempool mutation, in commit order.
 ///
@@ -118,7 +135,7 @@ impl MempoolObserver for CompositeObserver {
 /// 1. take the pool write lock,
 /// 2. mutate and assign per-change mempool sequences,
 /// 3. construct the publication envelope,
-/// 4. acquire the publish mutex while still holding the pool lock,
+/// 4. acquire the process-wide publish mutex while still holding the pool lock,
 /// 5. drop the pool write lock,
 /// 6. call the observer under the publish mutex,
 /// 7. release the publish mutex.
@@ -130,7 +147,7 @@ impl MempoolObserver for CompositeObserver {
 /// complete envelope; failures and panics never affect the committed mutation.
 pub struct MempoolGateway {
     pool: Arc<RwLock<Mempool>>,
-    observer: Option<Arc<dyn MempoolObserver>>,
+    observer: OnceLock<Arc<dyn MempoolObserver>>,
     publish: Mutex<()>,
 }
 
@@ -138,22 +155,58 @@ impl core::fmt::Debug for MempoolGateway {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MempoolGateway")
             .field("pool", &self.pool)
-            .field("observer", &self.observer.as_ref().map(|_| "installed"))
+            .field("observer", &self.observer.get().map(|_| "installed"))
             .finish_non_exhaustive()
     }
 }
 
 impl MempoolGateway {
-    /// Wraps `pool` and optionally installs `observer`.
+    /// Returns the one gateway interned for `pool`.
     ///
-    /// Pass `None` when no observer is configured.
-    #[must_use]
-    pub fn new(pool: Arc<RwLock<Mempool>>, observer: Option<Arc<dyn MempoolObserver>>) -> Self {
-        Self {
-            pool,
-            observer,
-            publish: Mutex::new(()),
+    /// Two callers holding clones of the same pool `Arc` get the same
+    /// gateway — one publish mutex, one observer slot. Distinct pools get
+    /// distinct gateways. Dead entries are pruned on every call. Lookup
+    /// upgrades the weak reference FIRST and only then compares pool
+    /// pointers: a live gateway pins its pool alive, so two live `Arc`s
+    /// comparing pointer-equal are the same allocation, which makes ABA
+    /// (a freed pool's address reused by a new allocation) impossible.
+    pub fn shared(pool: Arc<RwLock<Mempool>>) -> Arc<Self> {
+        let mut gateways = REGISTRY.lock();
+        gateways.retain(|weak| weak.upgrade().is_some());
+        for weak in &*gateways {
+            if let Some(candidate) = weak.upgrade() {
+                if Arc::ptr_eq(&candidate.pool, &pool) {
+                    return candidate;
+                }
+            }
         }
+        let gateway = Arc::new(Self {
+            pool,
+            observer: OnceLock::new(),
+            publish: Mutex::new(()),
+        });
+        gateways.push(Arc::downgrade(&gateway));
+        gateway
+    }
+
+    /// Installs the process-wide observer, set-once.
+    ///
+    /// `run` composes the observer legs once, before any worker spawns;
+    /// a second install is a composition bug and returns `Err` with the
+    /// rejected observer.
+    pub fn install_observer(
+        &self,
+        observer: Arc<dyn MempoolObserver>,
+    ) -> Result<(), Arc<dyn MempoolObserver>> {
+        self.observer.set(observer)
+    }
+
+    /// Raw pool access for test fixture staging and read-side composition
+    /// only. The raw-site audit's production pattern matches
+    /// `.pool().write()` too; production mutations must go through the
+    /// gateway so observers stay in the loop.
+    pub fn pool(&self) -> &Arc<RwLock<Mempool>> {
+        &self.pool
     }
 
     /// Read passthrough for lookup callers. Never mutate through this guard:
@@ -305,15 +358,22 @@ impl MempoolGateway {
         // Move-through: the result becomes the envelope, the envelope is
         // published by reference, and only `envelope.result` is handed back
         // — no clone, no allocation beyond the envelope itself.
-        let (envelope, publish) = {
-            let mut pool = self.pool.write();
-            let result = mutate(&mut pool)?;
-            let envelope = MutationEnvelope { origin, result };
-            let publish = self.publish.lock();
-            (envelope, publish)
-        };
+        let mut pool = self.pool.write();
+        let result = mutate(&mut pool)?;
+        let envelope = MutationEnvelope { origin, result };
+        let publish = self.acquire_publish_lock();
+        drop(pool);
         self.publish(&envelope, publish);
         Ok(envelope.result)
+    }
+
+    /// The sole publish-mutex acquisition seam. The test-only causal hook
+    /// lives inside this operation immediately before locking, so moving
+    /// acquisition under the pool guard necessarily moves the hook with it.
+    fn acquire_publish_lock(&self) -> MutexGuard<'_, ()> {
+        #[cfg(test)]
+        ordering_gate::park_if_armed(std::ptr::from_ref(self).expose_provenance());
+        self.publish.lock()
     }
 
     /// The same path for pool methods that cannot fail.
@@ -329,7 +389,7 @@ impl MempoolGateway {
     }
 
     /// Invokes the observer for a committed, non-empty envelope while the
-    /// `publish` guard is held. Empty results publish nothing.
+    /// process-wide `publish` guard is held. Empty results publish nothing.
     /// A panicking observer is contained: the mutation already committed,
     /// and the panic must not take the caller down with it. The default
     /// panic hook still prints the panic before it is caught here.
@@ -337,7 +397,7 @@ impl MempoolGateway {
         if envelope.result.changes.is_empty() {
             return;
         }
-        let Some(observer) = &self.observer else {
+        let Some(observer) = self.observer.get() else {
             return;
         };
         let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
@@ -354,9 +414,64 @@ impl MempoolGateway {
     }
 }
 
+/// Test-only causal gate for the publication ordering proof.
+///
+/// Disarmed, [`park_if_armed`] is a no-op and every mutator passes. Armed,
+/// the next mutator parks inside the exact publish-lock acquisition helper
+/// after sequencing, while it still holds the pool write guard. It signals
+/// the test on `parked` and blocks on `release`. One shot: the park consumes
+/// the arm.
+#[cfg(test)]
+mod ordering_gate {
+    use parking_lot::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    struct Gate {
+        armed: Option<(usize, Sender<()>, Receiver<()>)>,
+    }
+
+    static GATE: Mutex<Gate> = Mutex::new(Gate { armed: None });
+
+    /// Arms the gate with the test's signaling channels.
+    pub(super) fn arm(target: usize, parked_tx: Sender<()>, release_rx: Receiver<()>) {
+        let mut gate = GATE.lock();
+        assert!(gate.armed.is_none(), "ordering gate armed twice");
+        gate.armed = Some((target, parked_tx, release_rx));
+    }
+
+    /// Restores the disarmed state; called by tests that may have failed
+    /// between arming and the one-shot park.
+    pub(super) fn reset() {
+        GATE.lock().armed = None;
+    }
+
+    pub(super) fn park_if_armed(target: usize) {
+        let Some((parked_tx, release_rx)) = ({
+            let mut gate = GATE.lock();
+            match gate.armed.take() {
+                Some((armed_target, parked_tx, release_rx)) if armed_target == target => {
+                    Some((parked_tx, release_rx))
+                }
+                Some(armed) => {
+                    gate.armed = Some(armed);
+                    None
+                }
+                None => None,
+            }
+        }) else {
+            return;
+        };
+        let _ = parked_tx.send(());
+        // The parked mutator holds the pool write guard here; a dead test
+        // thread drops the sender and the park dissolves instead of hanging.
+        let _ = release_rx.recv();
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use super::ordering_gate;
     use super::{CompositeObserver, MempoolGateway, MempoolObserver};
     use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationOutcome, RemovalReason};
     use crate::{Mempool, MempoolEntry, MempoolLimits};
@@ -364,6 +479,44 @@ mod tests {
     use alloc::vec::Vec;
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use parking_lot::{Mutex, RwLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    struct GatedRecorder {
+        stream: Arc<Mutex<Vec<(u64, Hash256, MutationOutcome)>>>,
+        gated: AtomicBool,
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl MempoolObserver for GatedRecorder {
+        fn on_mutation(&self, envelope: &MutationEnvelope) {
+            {
+                let mut stream = self.stream.lock();
+                for (offset, change) in envelope.result.changes.iter().enumerate() {
+                    let sequence = envelope
+                        .result
+                        .sequence_of(offset)
+                        .expect("in-bounds sequence");
+                    stream.push((sequence, change.txid, change.outcome));
+                }
+            }
+            if !self.gated.swap(true, Ordering::SeqCst) {
+                self.entered
+                    .lock()
+                    .take()
+                    .expect("entered armed once")
+                    .send(())
+                    .expect("test waits for the first publication");
+                self.release
+                    .lock()
+                    .take()
+                    .expect("release armed once")
+                    .recv()
+                    .expect("test thread alive to release the observer");
+            }
+        }
+    }
 
     fn tx(label: u8) -> Tx {
         Tx {
@@ -424,11 +577,17 @@ mod tests {
         }
     }
 
-    fn gateway_with(observer: Option<Arc<dyn MempoolObserver>>) -> MempoolGateway {
-        MempoolGateway::new(
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-            observer,
-        )
+    fn gateway_with(observer: Option<Arc<dyn MempoolObserver>>) -> Arc<MempoolGateway> {
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
+        if let Some(observer) = observer {
+            assert!(
+                gateway.install_observer(observer).is_ok(),
+                "fresh test gateway accepts one observer"
+            );
+        }
+        gateway
     }
 
     /// Clones a concrete observer as its trait object without an `as` cast.
@@ -631,13 +790,14 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         // 150-byte budget, 100 vbyte entries at 0 min-relay: the second
         // insert overflows and evicts the lowest-fee package.
-        let gateway = MempoolGateway::new(
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-                min_relay_fee_sat_per_kvb: 0,
-                max_total_bytes: 150,
-                ..MempoolLimits::default()
-            }))),
-            Some(dyn_observer(&observer)),
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            max_total_bytes: 150,
+            ..MempoolLimits::default()
+        }))));
+        assert!(
+            gateway.install_observer(dyn_observer(&observer)).is_ok(),
+            "fresh test gateway accepts one observer"
         );
 
         let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
@@ -761,10 +921,11 @@ mod tests {
             release: Mutex::new(Some(release_rx)),
             stream: Mutex::new(Vec::new()),
         });
-        let gateway = Arc::new(MempoolGateway::new(
-            Arc::clone(&pool),
-            Some(dyn_observer(&observer)),
-        ));
+        let gateway = MempoolGateway::shared(Arc::clone(&pool));
+        assert!(
+            gateway.install_observer(dyn_observer(&observer)).is_ok(),
+            "fresh test gateway accepts one observer"
+        );
 
         let first_txid = tx(20).txid();
         let first = Arc::clone(&gateway);
@@ -947,14 +1108,14 @@ mod tests {
         // as the lowest-fee package. The child pays far more than everything
         // else, so once admitted it fits and survives — only the parent's
         // eviction inside the parent's own MutationResult can keep it out.
-        let observer_dyn: Arc<dyn MempoolObserver> = observer.clone();
-        let gateway = MempoolGateway::new(
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-                min_relay_fee_sat_per_kvb: 0,
-                max_total_bytes: 150,
-                ..MempoolLimits::default()
-            }))),
-            Some(observer_dyn),
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+            min_relay_fee_sat_per_kvb: 0,
+            max_total_bytes: 150,
+            ..MempoolLimits::default()
+        }))));
+        assert!(
+            gateway.install_observer(dyn_observer(&observer)).is_ok(),
+            "fresh test gateway accepts one observer"
         );
         let filler_txid = tx(36).txid();
         let filler = MempoolEntry::new(Arc::new(tx(36)), 100, 9_000, 1, 7);
@@ -1091,5 +1252,163 @@ mod tests {
             ],
             "each published envelope carries the origin the mutator passed"
         );
+    }
+
+    /// Same pool `Arc`, same gateway; distinct pools, distinct gateways.
+    #[test]
+    fn shared_interns_one_gateway_per_pool() {
+        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let first = MempoolGateway::shared(Arc::clone(&pool));
+        let second = MempoolGateway::shared(Arc::clone(&pool));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one pool must intern exactly one gateway"
+        );
+
+        let other = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "distinct pools must get distinct gateways"
+        );
+    }
+
+    /// The observer slot is set-once: the first install wins, a second
+    /// install returns the rejected observer.
+    #[test]
+    fn install_observer_is_set_once() {
+        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
+            MempoolLimits::default(),
+        ))));
+        let first = Arc::new(RecordingObserver::default());
+        assert!(
+            gateway.install_observer(dyn_observer(&first)).is_ok(),
+            "fresh gateway accepts the first observer"
+        );
+
+        let second = Arc::new(RecordingObserver::default());
+        let rejected = gateway
+            .install_observer(dyn_observer(&second))
+            .expect_err("second install must be rejected");
+        let second_dyn = dyn_observer(&second);
+        assert!(
+            Arc::ptr_eq(&rejected, &second_dyn),
+            "the rejected observer is returned to the caller"
+        );
+
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(43)))
+            .expect("in");
+        assert_eq!(
+            first.seen.lock().len(),
+            1,
+            "the first observer stays installed"
+        );
+        assert!(
+            second.seen.lock().is_empty(),
+            "the rejected observer never ran"
+        );
+    }
+
+    /// Two mutators race through one shared gateway. Batch 1 blocks inside
+    /// its observer while holding the publish mutex. Batch 2 sequences under
+    /// the pool write lock and parks immediately before acquiring that mutex.
+    /// While parked it must still hold the pool write guard and must not have
+    /// published. This pins the lock handoff that makes commit order equal
+    /// publication order. Releasing batch 1's observer and then batch 2's
+    /// barrier yields the exact contiguous stream [1, 2].
+    /// No sleeps, polling, or blocking pool reads occur before release.
+    #[test]
+    fn concurrent_mutators_publish_in_commit_order() {
+        ordering_gate::reset();
+
+        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let gateway = MempoolGateway::shared(Arc::clone(&pool));
+        let stream = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (observer_release_tx, observer_release_rx) = mpsc::channel();
+        assert!(
+            gateway
+                .install_observer(Arc::new(GatedRecorder {
+                    stream: Arc::clone(&stream),
+                    gated: AtomicBool::new(false),
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(observer_release_rx)),
+                }))
+                .is_ok(),
+            "fresh shared gateway accepts one observer"
+        );
+
+        // Mutator A: commits batch 1, publishes, and parks inside the
+        // observer while holding the publish mutex.
+        let first_txid = tx(50).txid();
+        let mutator_a = Arc::clone(&gateway);
+        let a_handle = std::thread::spawn(move || {
+            mutator_a
+                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(50)))
+                .expect("first in")
+        });
+        entered_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("first publication reached the observer");
+
+        // Arm the gate, then race mutator B: it must sequence under the
+        // write lock and park before the publish mutex.
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (gate_release_tx, gate_release_rx) = mpsc::channel();
+        ordering_gate::arm(
+            Arc::as_ptr(&gateway).expose_provenance(),
+            parked_tx,
+            gate_release_rx,
+        );
+
+        let second_txid = tx(51).txid();
+        let mutator_b = Arc::clone(&gateway);
+        let b_handle = std::thread::spawn(move || {
+            mutator_b
+                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(51)))
+                .expect("second in")
+        });
+        parked_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("second mutator parked at the publish-lock seam");
+
+        // Batch 2 must retain the pool write guard until it owns the publish
+        // mutex. Releasing the guard here would let batch 3 commit and race
+        // batch 2 to publication.
+        assert!(
+            pool.try_write().is_none(),
+            "parked mutator must retain the pool write guard"
+        );
+        assert_eq!(
+            stream.lock().len(),
+            1,
+            "only batch 1 is published while batch 2 is parked"
+        );
+
+        // Release the observer, then release B's barrier.
+        observer_release_tx.send(()).expect("observer thread alive");
+        gate_release_tx
+            .send(())
+            .expect("parked mutator thread alive");
+        a_handle.join().expect("first publisher");
+        b_handle.join().expect("second publisher");
+
+        let stream_lock = stream.lock();
+        assert_eq!(
+            *stream_lock,
+            vec![
+                (1, hash(&first_txid), MutationOutcome::Accepted),
+                (2, hash(&second_txid), MutationOutcome::Accepted),
+            ],
+            "publish order is commit order: batch 1 then batch 2, contiguous sequences"
+        );
+        drop(stream_lock);
+        let pool_read = gateway.read();
+        assert!(pool_read.contains_txid(&first_txid));
+        assert!(pool_read.contains_txid(&second_txid));
+        drop(pool_read);
+        ordering_gate::reset();
     }
 }
