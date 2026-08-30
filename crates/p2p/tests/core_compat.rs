@@ -22,7 +22,7 @@ use bitcoin::p2p::{Magic, ServiceFlags};
 use bitcoin::{BlockHash, Txid};
 use bitcoin_rs_p2p::Message;
 use bitcoin_rs_p2p::dispatch::{
-    ChainQuery, InventoryResponse, MAX_HEADERS_RESPONSE, dispatch_inbound,
+    ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, dispatch_inbound,
     dispatch_inbound_with_chain,
 };
 use bitcoin_rs_p2p::handshake::{feature_messages, start, version_message};
@@ -197,11 +197,16 @@ impl ChainQuery for FakeChain {
         headers
     }
 
-    fn blocks_for_inventory(&self, items: &[Inventory]) -> InventoryResponse {
-        let mut response = InventoryResponse::default();
+    fn serve_inventory_blocks(
+        &self,
+        items: &[Inventory],
+        headroom: &dyn Fn() -> bool,
+        serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+    ) -> Result<InventoryServing, PeerError> {
+        let mut outcome = InventoryServing::default();
         for item in items {
             let Some(hash) = inventory_hash(item) else {
-                response.not_found.push(*item);
+                outcome.not_found.push(*item);
                 continue;
             };
             let native = native_bh(&hash);
@@ -211,12 +216,16 @@ impl ChainQuery for FakeChain {
                 .get(&native)
                 .is_some_and(|block| block.block_hash() == native);
             if active && known {
-                response.blocks.push(self.bodies[&native].clone());
+                if !headroom() {
+                    outcome.halted = true;
+                    return Ok(outcome);
+                }
+                serve(self.bodies[&native].clone())?;
             } else {
-                response.not_found.push(*item);
+                outcome.not_found.push(*item);
             }
         }
-        response
+        Ok(outcome)
     }
 }
 
@@ -227,6 +236,33 @@ fn inventory_hash(item: &Inventory) -> Option<BlockHash> {
     }
 }
 
+/// Collecting-sink wrapper around the streamed dispatch: responses arrive in
+/// the exact order the streaming send emits them.
+fn dispatch_collect(
+    peer: &mut Peer<Cursor<Vec<u8>>>,
+    message: &Message,
+    chain: Option<&dyn ChainQuery>,
+) -> Result<Vec<Message>, PeerError> {
+    let collected = std::cell::RefCell::new(Vec::new());
+    dispatch_inbound_with_chain(peer, message, chain, &|| true, &mut |response| {
+        collected.borrow_mut().push(response);
+        Ok(())
+    })?;
+    Ok(collected.into_inner())
+}
+
+/// Collecting form of the streaming serve for expected/actual comparisons.
+fn serve_collect(
+    chain: &FakeChain,
+    items: &[Inventory],
+) -> Result<(Vec<Block>, Vec<Inventory>), PeerError> {
+    let blocks = std::cell::RefCell::new(Vec::new());
+    let outcome = chain.serve_inventory_blocks(items, &|| true, &mut |block| {
+        blocks.borrow_mut().push(block);
+        Ok(())
+    })?;
+    Ok((blocks.into_inner(), outcome.not_found))
+}
 /// Drives an outbound handshake as if the remote peer sent `version`.
 fn ready_peer(magic: Magic) -> Result<Peer<Cursor<Vec<u8>>>, PeerError> {
     let mut peer = Peer::new(Cursor::new(Vec::new()), magic);
@@ -420,7 +456,7 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     let mut peer = ready_peer(Magic::REGTEST)?;
 
     // A locator hit at height 1 serves heights 2..=tip.
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(vec![headers[0].compute_hash()], NativeBlockHash::default()),
         Some(&chain),
@@ -433,7 +469,7 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     assert_eq!(served[2].compute_hash(), headers[3].compute_hash());
 
     // Stop hash truncates the walk inclusive, like Core's getheaders.
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(locator_hashes(&headers), headers[2].compute_hash()),
         Some(&chain),
@@ -452,7 +488,7 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     );
 
     // Empty locator + known stop answers exactly the stop header (node contract).
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(Vec::new(), headers[3].compute_hash()),
         Some(&chain),
@@ -464,7 +500,7 @@ fn getheaders_serves_active_chain_with_stop_hash_and_limit() -> Result<(), Box<d
     assert_eq!(served[0].compute_hash(), headers[3].compute_hash());
 
     // Empty locator + zero stop answers nothing.
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(Vec::new(), NativeBlockHash::default()),
         Some(&chain),
@@ -484,7 +520,7 @@ fn headers_responses_truncate_at_the_core_2000_limit() -> Result<(), Box<dyn Err
     let mut peer = ready_peer(Magic::REGTEST)?;
 
     // Core clients send at most 101 locator hashes even on long chains.
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(locator_hashes(&headers[..101]), NativeBlockHash::default()),
         Some(&chain),
@@ -506,7 +542,7 @@ fn oversized_getheaders_locator_disconnects_before_state_mutation() -> Result<()
     let locator = vec![headers[0].compute_hash(); MAX_LOCATOR_HASHES + 1];
 
     let error = expect_protocol_error(
-        dispatch_inbound_with_chain(
+        dispatch_collect(
             &mut peer,
             &get_headers(locator, NativeBlockHash::default()),
             Some(&chain),
@@ -540,8 +576,7 @@ fn inv_getdata_relay_round_trip_serves_blocks_and_notfounds_misses() -> Result<(
     // Inbound inv announcements are answered with getdata echoing the items
     // verbatim (a wtxid-relay peer announces MSG_WTX and is asked for MSG_WTX).
     let tx_inv = Inventory::Transaction(Txid::from_byte_array([9u8; 32]));
-    let response =
-        dispatch_inbound_with_chain(&mut peer, &Message::Inv(vec![tx_inv]), Some(&chain))?;
+    let response = dispatch_collect(&mut peer, &Message::Inv(vec![tx_inv]), Some(&chain))?;
     assert_eq!(response, vec![Message::GetData(vec![tx_inv])]);
 
     // getdata over known + missing inventory serves blocks and notfounds the rest.
@@ -550,7 +585,7 @@ fn inv_getdata_relay_round_trip_serves_blocks_and_notfounds_misses() -> Result<(
     let mut missing_hash = *genesis_hash.as_bytes();
     missing_hash[0] ^= 0xff;
     let missing = Inventory::Block(BlockHash::from_byte_array(missing_hash));
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &Message::GetData(vec![known, missing]),
         Some(&chain),
@@ -590,7 +625,7 @@ fn getdata_bound_of_50k_vectors_matches_core_max_inv() -> Result<(), Box<dyn Err
     let items = vec![Inventory::Transaction(Txid::from_byte_array([1u8; 32])); MAX_INV_PER_MSG + 1];
 
     let error = expect_protocol_error(
-        dispatch_inbound_with_chain(&mut peer, &Message::GetData(items), Some(&chain)),
+        dispatch_collect(&mut peer, &Message::GetData(items), Some(&chain)),
         "Core disconnects oversized getdata",
     )?;
     assert!(matches!(
@@ -734,7 +769,7 @@ fn decode_only_messages_are_accepted_silently_per_policy() -> Result<(), Box<dyn
     let mut peer = ready_peer(Magic::REGTEST)?;
 
     // getblocks: legacy locator request; Core answers with inv, we stay silent.
-    let responses = dispatch_inbound_with_chain(
+    let responses = dispatch_collect(
         &mut peer,
         &Message::GetBlocks(GetBlocksMessage::new(
             vec![btc_bh(genesis.block_hash())],
@@ -803,7 +838,7 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
     let stale_tip = branch_a.last().ok_or("branch A tip")?.compute_hash();
     let fork_point = shared.last().ok_or("shared prefix")?.compute_hash();
     let locator = vec![stale_tip, fork_point];
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(locator.clone(), NativeBlockHash::default()),
         Some(&state),
@@ -823,7 +858,7 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
 
     // The stale-fork locator misses; the shared-prefix entry anchors the walk,
     // so the peer now receives branch B's headers from the fork point.
-    let response = dispatch_inbound_with_chain(
+    let response = dispatch_collect(
         &mut peer,
         &get_headers(locator, NativeBlockHash::default()),
         Some(&state),
@@ -837,8 +872,8 @@ fn reorg_switches_which_chain_a_peer_sees() -> Result<(), Box<dyn Error>> {
 
     // Stale-fork bodies become notfound; new-chain bodies are served.
     // Responses emit served blocks first, then one notfound for the misses —
-    // the same shape `dispatch::data_responses` produces for any getdata.
-    let response = dispatch_inbound_with_chain(
+    // the same shape streamed serving produces for any getdata.
+    let response = dispatch_collect(
         &mut peer,
         &Message::GetData(vec![
             Inventory::Block(btc_bh(branch_a[0].compute_hash())),
@@ -894,9 +929,7 @@ fn restart_rebuild_serves_identical_answers_to_peers() -> Result<(), Box<dyn Err
         Inventory::Block(btc_bh(headers[1].compute_hash())),
         Inventory::Transaction(Txid::from_byte_array([3u8; 32])),
     ];
-    let expected_response = before.blocks_for_inventory(&inventory);
-    let (expected_blocks, expected_missing) =
-        (expected_response.blocks, expected_response.not_found);
+    let (expected_blocks, expected_missing) = serve_collect(&before, &inventory)?;
 
     // Restart: a fresh query rebuilt from the same persisted records must
     // answer identically — a peer cannot see the restart.
@@ -908,9 +941,9 @@ fn restart_rebuild_serves_identical_answers_to_peers() -> Result<(), Box<dyn Err
         );
         assert_eq!(after.headers_after(locator, *stop, 1), *narrow);
     }
-    let actual = after.blocks_for_inventory(&inventory);
-    assert_eq!(actual.blocks, expected_blocks);
-    assert_eq!(actual.not_found, expected_missing);
+    let (actual_blocks, actual_missing) = serve_collect(&after, &inventory)?;
+    assert_eq!(actual_blocks, expected_blocks);
+    assert_eq!(actual_missing, expected_missing);
     Ok(())
 }
 

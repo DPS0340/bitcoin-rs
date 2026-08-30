@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin_rs_chain::BlockTree;
-use bitcoin_rs_p2p::{ChainQuery, InventoryResponse};
+use bitcoin_rs_p2p::{ChainQuery, InventoryServing, PeerError};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
 use bitcoin_rs_rpc::context::BlockBodySource;
 use parking_lot::RwLock;
@@ -93,29 +93,45 @@ impl ChainQuery for NodeP2pChainQuery {
         headers
     }
 
-    fn blocks_for_inventory(&self, items: &[Inventory]) -> InventoryResponse {
-        let mut response = InventoryResponse::default();
+    fn serve_inventory_blocks(
+        &self,
+        items: &[Inventory],
+        headroom: &dyn Fn() -> bool,
+        serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+    ) -> Result<InventoryServing, PeerError> {
+        let mut outcome = InventoryServing::default();
         for item in items {
             let Some(hash) = inventory_block_hash(item) else {
-                response.not_found.push(*item);
+                outcome.not_found.push(*item);
                 continue;
             };
-            if let Some(block) = self.block_by_active_hash(hash) {
-                response.blocks.push(block);
+            let current_height = {
+                let tree = self.block_tree.read();
+                tree.tip()
+                    .and_then(|tip| active_height(&tree, tip.tip_id, hash))
+            };
+            let Some(current_height) = current_height else {
+                outcome.not_found.push(*item);
+                continue;
+            };
+            // I7: the gate is consulted exactly once, immediately before a
+            // body load that the active-chain metadata says can exist.
+            if !headroom() {
+                outcome.halted = true;
+                return Ok(outcome);
+            }
+            if let Some(block) = self.load_active_block_at_height(current_height, hash) {
+                serve(block)?;
             } else {
-                response.not_found.push(*item);
+                outcome.not_found.push(*item);
             }
         }
-        response
+        Ok(outcome)
     }
 }
 
 impl NodeP2pChainQuery {
-    fn block_by_active_hash(&self, hash: BlockHash) -> Option<Block> {
-        let current_height = {
-            let tree = self.block_tree.read();
-            active_height(&tree, tree.tip()?.tip_id, hash)?
-        };
+    fn load_active_block_at_height(&self, current_height: u32, hash: BlockHash) -> Option<Block> {
         let bytes = self
             .block_body_source
             .as_ref()?
@@ -180,6 +196,8 @@ mod tests {
     use bitcoin_rs_chain::NodeStatus;
     use bitcoin_rs_primitives::consensus_bytes;
     use bitcoin_rs_rpc::context::BlockBodySource;
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct SingleBlockSource {
         height: u32,
@@ -191,6 +209,45 @@ mod tests {
         fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
             (height == self.height && hash == self.hash).then(|| self.body.clone())
         }
+    }
+
+    /// Body source serving several recorded bodies, counting loads, and
+    /// tripping an assertion when a load would exceed the derived bound.
+    struct CountingBodySource {
+        bodies: Vec<(u32, BlockHash, Vec<u8>)>,
+        loads: AtomicUsize,
+        tripwire: Option<usize>,
+    }
+
+    impl BlockBodySource for CountingBodySource {
+        fn block_body(&self, height: u32, hash: BlockHash) -> Option<Vec<u8>> {
+            if let Some(limit) = self.tripwire {
+                assert!(
+                    self.loads.load(Ordering::Relaxed) < limit,
+                    "body loaded beyond the production-gate bound"
+                );
+            }
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            self.bodies
+                .iter()
+                .find(|(entry_height, entry_hash, _)| {
+                    *entry_height == height && *entry_hash == hash
+                })
+                .map(|(_, _, body)| body.clone())
+        }
+    }
+
+    /// Collecting form of the streaming serve for assertion convenience.
+    fn serve_collect(
+        query: &NodeP2pChainQuery,
+        items: &[Inventory],
+    ) -> Result<(InventoryServing, Vec<Block>), bitcoin_rs_p2p::PeerError> {
+        let blocks = RefCell::new(Vec::new());
+        let outcome = query.serve_inventory_blocks(items, &|| true, &mut |block| {
+            blocks.borrow_mut().push(block);
+            Ok(())
+        })?;
+        Ok((outcome, blocks.into_inner()))
     }
 
     /// Converts a native [`BlockHash`] to a `bitcoin::BlockHash` for P2P inventory.
@@ -300,18 +357,22 @@ mod tests {
         let missing = Inventory::WitnessBlock(WireBlockHash::from_byte_array([8; 32]));
         let query = query_with(headers)?.with_block_body_source(body_source);
 
-        let response = query.blocks_for_inventory(&[
-            Inventory::Block(wire_hash(block.block_hash())),
-            Inventory::Transaction(txid),
-            missing,
-        ]);
+        let (outcome, blocks) = serve_collect(
+            &query,
+            &[
+                Inventory::Block(wire_hash(block.block_hash())),
+                Inventory::Transaction(txid),
+                missing,
+            ],
+        )?;
 
-        assert_eq!(response.blocks.len(), 1);
-        assert_eq!(response.blocks[0].block_hash(), block.block_hash());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_hash(), block.block_hash());
         assert_eq!(
-            response.not_found,
+            outcome.not_found,
             vec![Inventory::Transaction(txid), missing]
         );
+        assert!(!outcome.halted);
         Ok(())
     }
 
@@ -321,10 +382,10 @@ mod tests {
         let hash = headers[1].compute_hash();
         let query = query_with(headers)?;
 
-        let response = query.blocks_for_inventory(&[Inventory::Block(wire_hash(hash))]);
+        let (outcome, blocks) = serve_collect(&query, &[Inventory::Block(wire_hash(hash))])?;
 
-        assert!(response.blocks.is_empty());
-        assert_eq!(response.not_found, vec![Inventory::Block(wire_hash(hash))]);
+        assert!(blocks.is_empty());
+        assert_eq!(outcome.not_found, vec![Inventory::Block(wire_hash(hash))]);
         Ok(())
     }
 
@@ -342,12 +403,141 @@ mod tests {
         });
         let query = query_with(headers)?.with_block_body_source(body_source);
 
-        let response =
-            query.blocks_for_inventory(&[Inventory::Block(wire_hash(block.block_hash()))]);
+        let (outcome, blocks) =
+            serve_collect(&query, &[Inventory::Block(wire_hash(block.block_hash()))])?;
 
-        assert_eq!(response.blocks.len(), 1);
-        assert_eq!(response.blocks[0].block_hash(), block.block_hash());
-        assert!(response.not_found.is_empty());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].block_hash(), block.block_hash());
+        assert!(outcome.not_found.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn p2p_chain_streams_each_body_once_in_order() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(4);
+        let blocks: Vec<Block> = headers[1..]
+            .iter()
+            .map(|header| Block {
+                header: *header,
+                txs: Vec::new(),
+            })
+            .collect();
+        let bodies: Vec<(u32, BlockHash, Vec<u8>)> = (1_u32..)
+            .zip(&blocks)
+            .map(|(height, block)| (height, block.block_hash(), consensus_bytes(block)))
+            .collect();
+        let body_source = Arc::new(CountingBodySource {
+            bodies,
+            loads: AtomicUsize::new(0),
+            tripwire: None,
+        });
+        let unknown_a = Inventory::WitnessBlock(WireBlockHash::from_byte_array([21; 32]));
+        let unknown_b = Inventory::WitnessBlock(WireBlockHash::from_byte_array([22; 32]));
+        let query = query_with(headers)?.with_block_body_source(body_source.clone());
+        let items = vec![
+            unknown_a,
+            Inventory::WitnessBlock(wire_hash(blocks[0].block_hash())),
+            unknown_b,
+            Inventory::WitnessBlock(wire_hash(blocks[1].block_hash())),
+            Inventory::WitnessBlock(wire_hash(blocks[2].block_hash())),
+        ];
+
+        let (outcome, served) = serve_collect(&query, &items)?;
+
+        let served_hashes: Vec<BlockHash> = served.iter().map(Block::block_hash).collect();
+        assert_eq!(
+            served_hashes,
+            vec![
+                blocks[0].block_hash(),
+                blocks[1].block_hash(),
+                blocks[2].block_hash(),
+            ],
+            "bodies stream in request order"
+        );
+        assert_eq!(body_source.loads.load(Ordering::Relaxed), 3);
+        assert_eq!(outcome.not_found, vec![unknown_a, unknown_b]);
+        assert!(!outcome.halted);
+        Ok(())
+    }
+
+    #[test]
+    fn p2p_chain_does_not_gate_unknown_blocks() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(2);
+        let body_source = Arc::new(CountingBodySource {
+            bodies: Vec::new(),
+            loads: AtomicUsize::new(0),
+            tripwire: Some(0),
+        });
+        let query = query_with(headers)?.with_block_body_source(body_source.clone());
+        let unknown = Inventory::WitnessBlock(WireBlockHash::from_byte_array([23; 32]));
+        let headroom_calls = AtomicUsize::new(0);
+        let served = RefCell::new(Vec::new());
+
+        let outcome = query.serve_inventory_blocks(
+            &[unknown],
+            &|| {
+                headroom_calls.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            &mut |block| {
+                served.borrow_mut().push(block);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(outcome.not_found, vec![unknown]);
+        assert!(!outcome.halted);
+        assert!(served.borrow().is_empty());
+        assert_eq!(body_source.loads.load(Ordering::Relaxed), 0);
+        assert_eq!(headroom_calls.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn p2p_chain_halts_at_gate_without_loading() -> Result<(), Box<dyn std::error::Error>> {
+        let headers = seed_headers(4);
+        let blocks: Vec<Block> = headers[1..]
+            .iter()
+            .map(|header| Block {
+                header: *header,
+                txs: Vec::new(),
+            })
+            .collect();
+        let bodies: Vec<(u32, BlockHash, Vec<u8>)> = (1_u32..)
+            .zip(&blocks)
+            .map(|(height, block)| (height, block.block_hash(), consensus_bytes(block)))
+            .collect();
+        // Tripwire: a third body load panics, so deleting the gate
+        // consultation (mutation M6) turns this test red.
+        let body_source = Arc::new(CountingBodySource {
+            bodies,
+            loads: AtomicUsize::new(0),
+            tripwire: Some(2),
+        });
+        let query = query_with(headers)?.with_block_body_source(body_source.clone());
+        let items: Vec<Inventory> = blocks
+            .iter()
+            .map(|block| Inventory::WitnessBlock(wire_hash(block.block_hash())))
+            .collect();
+        let headroom_calls = AtomicUsize::new(0);
+        let served = RefCell::new(Vec::new());
+
+        let outcome = query.serve_inventory_blocks(
+            &items,
+            &|| {
+                let calls = headroom_calls.fetch_add(1, Ordering::Relaxed);
+                calls < 2
+            },
+            &mut |block| {
+                served.borrow_mut().push(block);
+                Ok(())
+            },
+        )?;
+
+        assert!(outcome.halted);
+        assert_eq!(served.borrow().len(), 2);
+        assert_eq!(body_source.loads.load(Ordering::Relaxed), 2);
+        assert_eq!(headroom_calls.load(Ordering::Relaxed), 3);
         Ok(())
     }
 

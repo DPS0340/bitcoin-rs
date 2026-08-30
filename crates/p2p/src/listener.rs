@@ -850,6 +850,7 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
     const IDLE_DISCONNECT: Duration = Duration::from_mins(1);
 
     let mut last_inbound = Instant::now();
+    let budget = lease.budget_handle();
 
     loop {
         if peer.state == PeerState::Disconnecting {
@@ -887,8 +888,17 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     command = ?std::mem::discriminant(&message),
                     "p2p message received",
                 );
-                let responses =
-                    crate::dispatch::dispatch_inbound_with_chain(peer, &message, chain_query)?;
+                crate::dispatch::dispatch_inbound_with_chain(
+                    peer,
+                    &message,
+                    chain_query,
+                    &|| budget.has_block_production_headroom(),
+                    &mut |response| {
+                        lease.send(response).map_err(|_| {
+                            crate::wire::PeerError::Protocol("outbound queue closed or saturated")
+                        })
+                    },
+                )?;
                 match message {
                     crate::Message::Headers(headers) => {
                         inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
@@ -900,13 +910,6 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                         lease.stats().complete_ping(nonce, unix_micros());
                     }
                     _ => {}
-                }
-                for response in responses {
-                    if lease.send(response).is_err() {
-                        return Err(crate::wire::PeerError::Protocol(
-                            "outbound queue closed or saturated",
-                        ));
-                    }
                 }
             }
             Err(crate::wire::PeerError::Io(error))

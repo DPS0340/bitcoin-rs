@@ -31,7 +31,7 @@ pub mod wire;
 pub mod wtxid;
 
 pub use connection::{ConnectionId, PeerLease, PeerSource, PeerStats};
-pub use dispatch::{ChainQuery, InventoryResponse};
+pub use dispatch::{ChainQuery, InventoryServing};
 pub use inbound::{InboundBlock, InboundHeaders};
 pub use listener::spawn_outbound_connection;
 pub use peer::{

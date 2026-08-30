@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
@@ -13,13 +15,17 @@ pub const MAX_HEADERS_RESPONSE: usize = 2_000;
 /// Maximum block locator hashes accepted in one locator-based request.
 pub use crate::wire::MAX_LOCATOR_HASHES;
 
-/// Blocks and missing inventory resolved for one `getdata` request.
+/// Outcome of streamed inventory serving. Bodies pass through the serving
+/// sink as they load and are never materialized as a whole.
 #[derive(Debug, Default)]
-pub struct InventoryResponse {
-    /// Locally available active-chain blocks, sent as `block` messages.
-    pub blocks: Vec<Block>,
-    /// Inventory that cannot be served by this node.
+pub struct InventoryServing {
+    /// Inventory this node cannot serve (unknown type, stale, pruned, no
+    /// body).
     pub not_found: Vec<Inventory>,
+    /// True when production stopped at the headroom gate with items
+    /// unexamined. The caller applies the saturation policy; remaining
+    /// items are never served (I9: no silent half-serve).
+    pub halted: bool,
 }
 
 /// Read-only active-chain view used by server-side P2P responders.
@@ -32,40 +38,66 @@ pub trait ChainQuery: Send + Sync {
         limit: usize,
     ) -> Vec<Header>;
 
-    /// Resolves a bounded inventory request into available blocks and misses.
-    fn blocks_for_inventory(&self, items: &[Inventory]) -> InventoryResponse;
+    /// Serves block inventory one body at a time, in `items` order. For each
+    /// block-typed item `headroom` is consulted EXACTLY ONCE, immediately
+    /// BEFORE its body load; `false` halts production and sets `halted`
+    /// (I7, I9). Each loaded body is delivered through `serve`; a `serve`
+    /// error aborts production and propagates. Non-block / unservable items
+    /// are collected into `not_found` and never loaded.
+    fn serve_inventory_blocks(
+        &self,
+        items: &[Inventory],
+        headroom: &dyn Fn() -> bool,
+        serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+    ) -> Result<InventoryServing, PeerError>;
 }
 
-/// Dispatch one inbound message and return protocol responses to send.
+/// Chainless dispatch: collects the protocol responses and returns them.
+///
+/// With `chain: None` responses can never contain a block body, so the batch
+/// is protocol-bounded (at most [`MAX_HEADERS_RESPONSE`] headers, or one
+/// inventory-bound notfound/getdata echo) and safe to materialize whole.
 pub fn dispatch_inbound<S>(
     peer: &mut Peer<S>,
     message: &Message,
 ) -> Result<Vec<Message>, PeerError> {
-    dispatch_inbound_with_chain(peer, message, None)
+    let responses = RefCell::new(Vec::new());
+    dispatch_inbound_with_chain(peer, message, None, &|| true, &mut |response| {
+        responses.borrow_mut().push(response);
+        Ok(())
+    })?;
+    Ok(responses.into_inner())
 }
 
-/// Dispatch one inbound message with an optional active-chain query view.
+/// Dispatch with an active-chain view.
+///
+/// Every response is emitted through `send` in the identical order the
+/// former batch form produced (I8); `send` errors abort emission and
+/// propagate. `headroom` gates block-body materialization (I7) and is
+/// evaluated before each load.
 pub fn dispatch_inbound_with_chain<S>(
     peer: &mut Peer<S>,
     message: &Message,
     chain: Option<&dyn ChainQuery>,
-) -> Result<Vec<Message>, PeerError> {
-    let mut responses = Vec::new();
-
+    headroom: &dyn Fn() -> bool,
+    send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+) -> Result<(), PeerError> {
     match message {
         Message::Version(_) => {
             step(peer, message)?;
-            responses.extend(feature_messages());
-            responses.push(Message::Verack);
+            for response in feature_messages() {
+                send(response)?;
+            }
+            send(Message::Verack)?;
         }
         Message::Ping(nonce) => {
             step(peer, message)?;
-            responses.push(Message::Pong(*nonce));
+            send(Message::Pong(*nonce))?;
         }
         Message::Inv(items) => {
             step(peer, message)?;
             if let Some(response) = request_inventory(items) {
-                responses.push(response);
+                send(response)?;
             }
         }
         Message::GetHeaders(request) => {
@@ -74,7 +106,7 @@ pub fn dispatch_inbound_with_chain<S>(
                 "getheaders locator too large",
             )?;
             step(peer, message)?;
-            responses.push(headers_response(chain, request));
+            send(headers_response(chain, request))?;
         }
         Message::GetBlocks(request) => {
             ensure_block_locator_within_bounds(
@@ -86,7 +118,7 @@ pub fn dispatch_inbound_with_chain<S>(
         Message::GetData(items) => {
             ensure_inventory_request_within_bounds(items)?;
             step(peer, message)?;
-            responses.extend(data_responses(chain, items));
+            serve_getdata(chain, items, headroom, send)?;
         }
         _ => step(peer, message)?,
     }
@@ -95,7 +127,7 @@ pub fn dispatch_inbound_with_chain<S>(
         tracing::trace!("peer handshake ready");
     }
 
-    Ok(responses)
+    Ok(())
 }
 
 fn headers_response(chain: Option<&dyn ChainQuery>, request: &GetHeadersMessage) -> Message {
@@ -112,24 +144,36 @@ fn headers_response(chain: Option<&dyn ChainQuery>, request: &GetHeadersMessage)
     Message::Headers(headers)
 }
 
-fn data_responses(chain: Option<&dyn ChainQuery>, items: &[Inventory]) -> Vec<Message> {
+/// Serves one `getdata` through the sink. With no chain view the whole
+/// request is reported missing; otherwise blocks stream through the chain
+/// query behind the headroom gate, followed by at most one trailing
+/// notfound — the exact order the former batch form produced (I8).
+fn serve_getdata(
+    chain: Option<&dyn ChainQuery>,
+    items: &[Inventory],
+    headroom: &dyn Fn() -> bool,
+    send: &mut dyn FnMut(Message) -> Result<(), PeerError>,
+) -> Result<(), PeerError> {
     if items.is_empty() {
-        return Vec::new();
+        return Ok(());
     }
-
-    let response = chain.map_or_else(
-        || InventoryResponse {
-            blocks: Vec::new(),
-            not_found: items.to_vec(),
-        },
-        |chain| chain.blocks_for_inventory(items),
-    );
-
-    let mut messages: Vec<_> = response.blocks.into_iter().map(Message::Block).collect();
-    if !response.not_found.is_empty() {
-        messages.push(Message::NotFound(response.not_found));
+    match chain {
+        None => send(Message::NotFound(items.to_vec()))?,
+        Some(chain) => {
+            let outcome = chain.serve_inventory_blocks(items, headroom, &mut |block| {
+                send(Message::Block(block))
+            })?;
+            if outcome.halted {
+                return Err(PeerError::Protocol(
+                    "getdata serving halted: outbound production gate",
+                ));
+            }
+            if !outcome.not_found.is_empty() {
+                send(Message::NotFound(outcome.not_found))?;
+            }
+        }
     }
-    messages
+    Ok(())
 }
 
 fn ensure_block_locator_within_bounds(
@@ -151,7 +195,9 @@ fn ensure_inventory_request_within_bounds(items: &[Inventory]) -> Result<(), Pee
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::Magic;
@@ -159,9 +205,10 @@ mod tests {
     use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header};
 
     use super::{
-        ChainQuery, InventoryResponse, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, dispatch_inbound,
+        ChainQuery, InventoryServing, MAX_HEADERS_RESPONSE, MAX_LOCATOR_HASHES, dispatch_inbound,
         dispatch_inbound_with_chain,
     };
+    use crate::connection::{OutboundBudget, PeerLease};
     use crate::inv::MAX_INV_PER_MSG;
     use crate::peer::{Peer, PeerState};
     use crate::wire::{Message, PeerError};
@@ -170,7 +217,6 @@ mod tests {
     struct FakeChain {
         headers: Vec<Header>,
         blocks: Vec<Block>,
-        not_found: Vec<Inventory>,
     }
 
     impl FakeChain {
@@ -185,8 +231,12 @@ mod tests {
             Self {
                 headers,
                 blocks: Vec::new(),
-                not_found: Vec::new(),
             }
+        }
+
+        fn with_block(mut self, block: Block) -> Self {
+            self.blocks.push(block);
+            self
         }
     }
 
@@ -200,12 +250,44 @@ mod tests {
             self.headers.iter().take(limit).copied().collect()
         }
 
-        fn blocks_for_inventory(&self, _items: &[Inventory]) -> InventoryResponse {
-            InventoryResponse {
-                blocks: self.blocks.clone(),
-                not_found: self.not_found.clone(),
+        fn serve_inventory_blocks(
+            &self,
+            items: &[Inventory],
+            headroom: &dyn Fn() -> bool,
+            serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+        ) -> Result<InventoryServing, PeerError> {
+            let mut outcome = InventoryServing::default();
+            for item in items {
+                let Some(found) = self
+                    .blocks
+                    .iter()
+                    .find(|block| inv_hash(item) == Some(wire_hash(block)))
+                else {
+                    outcome.not_found.push(*item);
+                    continue;
+                };
+                if !headroom() {
+                    outcome.halted = true;
+                    return Ok(outcome);
+                }
+                serve(found.clone())?;
             }
+            Ok(outcome)
         }
+    }
+
+    /// Streaming fake mirroring `NodeP2pChainQuery`: block-typed items that
+    /// resolve to a stored body are served behind `headroom`; everything
+    /// else lands in `not_found` without a load.
+    fn inv_hash(item: &Inventory) -> Option<[u8; 32]> {
+        match item {
+            Inventory::Block(hash) | Inventory::WitnessBlock(hash) => Some(hash.to_byte_array()),
+            _ => None,
+        }
+    }
+
+    fn wire_hash(block: &Block) -> [u8; 32] {
+        *block.block_hash().as_bytes()
     }
 
     struct GreedyHeaders {
@@ -222,9 +304,28 @@ mod tests {
             self.headers.clone()
         }
 
-        fn blocks_for_inventory(&self, _items: &[Inventory]) -> InventoryResponse {
-            InventoryResponse::default()
+        fn serve_inventory_blocks(
+            &self,
+            _items: &[Inventory],
+            _headroom: &dyn Fn() -> bool,
+            _serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+        ) -> Result<InventoryServing, PeerError> {
+            Ok(InventoryServing::default())
         }
+    }
+
+    /// Collecting-sink wrapper mirroring the listener's streaming send.
+    fn dispatch_collect<S>(
+        peer: &mut Peer<S>,
+        message: &Message,
+        chain: Option<&dyn ChainQuery>,
+    ) -> Result<Vec<Message>, PeerError> {
+        let collected = RefCell::new(Vec::new());
+        dispatch_inbound_with_chain(peer, message, chain, &|| true, &mut |response| {
+            collected.borrow_mut().push(response);
+            Ok(())
+        })?;
+        Ok(collected.into_inner())
     }
 
     #[test]
@@ -236,7 +337,7 @@ mod tests {
         ));
         let mut peer = ready_peer();
 
-        let responses = dispatch_inbound_with_chain(&mut peer, &message, Some(&chain))?;
+        let responses = dispatch_collect(&mut peer, &message, Some(&chain))?;
 
         let [Message::Headers(headers)] = responses.as_slice() else {
             panic!("expected one headers response, got {responses:?}");
@@ -258,7 +359,7 @@ mod tests {
         ));
         let mut peer = ready_peer();
 
-        let responses = dispatch_inbound_with_chain(&mut peer, &message, Some(&chain))?;
+        let responses = dispatch_collect(&mut peer, &message, Some(&chain))?;
 
         let [Message::Headers(headers)] = responses.as_slice() else {
             panic!("expected one headers response, got {responses:?}");
@@ -323,14 +424,13 @@ mod tests {
 
     #[test]
     fn getdata_serves_available_blocks_and_reports_missing_inventory() -> Result<(), PeerError> {
-        let mut chain = FakeChain::with_headers(1);
+        let chain = FakeChain::with_headers(1);
         let block = Block {
             header: chain.headers[0],
             txs: Vec::new(),
         };
         let missing = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array([7; 32]));
-        chain.blocks.push(block);
-        chain.not_found.push(missing);
+        let chain = chain.with_block(block);
         let message = Message::GetData(vec![
             Inventory::Block(bitcoin::BlockHash::from_byte_array(
                 *chain.headers[0].compute_hash().as_bytes(),
@@ -339,7 +439,7 @@ mod tests {
         ]);
         let mut peer = ready_peer();
 
-        let responses = dispatch_inbound_with_chain(&mut peer, &message, Some(&chain))?;
+        let responses = dispatch_collect(&mut peer, &message, Some(&chain))?;
 
         let [Message::Block(found), Message::NotFound(not_found)] = responses.as_slice() else {
             panic!("expected block plus notfound, got {responses:?}");
@@ -362,6 +462,256 @@ mod tests {
         };
         assert_eq!(not_found, &vec![Inventory::Block(hash)]);
         Ok(())
+    }
+
+    /// Streaming chain fake mirroring `NodeP2pChainQuery`: block-typed items
+    /// that resolve to a stored body are served behind `headroom`; all other
+    /// items land in `not_found` without a load. Counters and the tripwire
+    /// back the hostile-preload gates.
+    struct StreamingChain {
+        blocks: Vec<Block>,
+        loads: AtomicUsize,
+        headroom_calls: AtomicUsize,
+        /// Panics when a load would reach this count (mutation-gate tripwire).
+        load_tripwire: Option<usize>,
+    }
+
+    impl ChainQuery for StreamingChain {
+        fn headers_after(
+            &self,
+            _locator_hashes: &[BlockHash],
+            _stop_hash: BlockHash,
+            _limit: usize,
+        ) -> Vec<Header> {
+            Vec::new()
+        }
+
+        fn serve_inventory_blocks(
+            &self,
+            items: &[Inventory],
+            headroom: &dyn Fn() -> bool,
+            serve: &mut dyn FnMut(Block) -> Result<(), PeerError>,
+        ) -> Result<InventoryServing, PeerError> {
+            let mut outcome = InventoryServing::default();
+            for item in items {
+                let Some(hash) = inv_hash(item) else {
+                    outcome.not_found.push(*item);
+                    continue;
+                };
+                let Some(found) = self.blocks.iter().find(|block| wire_hash(block) == hash) else {
+                    outcome.not_found.push(*item);
+                    continue;
+                };
+                self.headroom_calls.fetch_add(1, Ordering::Relaxed);
+                if !headroom() {
+                    outcome.halted = true;
+                    return Ok(outcome);
+                }
+                if let Some(limit) = self.load_tripwire {
+                    assert!(
+                        self.loads.load(Ordering::Relaxed) < limit,
+                        "hostile getdata materialized beyond the derived bound"
+                    );
+                }
+                self.loads.fetch_add(1, Ordering::Relaxed);
+                serve(found.clone())?;
+            }
+            Ok(outcome)
+        }
+    }
+
+    #[test]
+    fn streamed_getdata_preserves_batch_wire_order() -> Result<(), PeerError> {
+        let headers = FakeChain::with_headers(2).headers;
+        let block_a = Block {
+            header: headers[0],
+            txs: Vec::new(),
+        };
+        let block_b = Block {
+            header: headers[1],
+            txs: Vec::new(),
+        };
+        let inv_a = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+            *headers[0].compute_hash().as_bytes(),
+        ));
+        let inv_b = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+            *headers[1].compute_hash().as_bytes(),
+        ));
+        let tx_inv = Inventory::Transaction(bitcoin::Txid::from_byte_array([1; 32]));
+        let unknown = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array([9; 32]));
+        let chain = StreamingChain {
+            blocks: vec![block_a.clone(), block_b.clone()],
+            loads: AtomicUsize::new(0),
+            headroom_calls: AtomicUsize::new(0),
+            load_tripwire: None,
+        };
+        let mut peer = ready_peer();
+
+        let emitted = dispatch_collect(
+            &mut peer,
+            &Message::GetData(vec![tx_inv, inv_a, inv_b, unknown]),
+            Some(&chain),
+        )?;
+
+        assert_eq!(
+            emitted,
+            vec![
+                Message::Block(block_a),
+                Message::Block(block_b),
+                Message::NotFound(vec![tx_inv, unknown]),
+            ],
+            "streamed emission must equal the pre-change batch shape (I8)"
+        );
+        assert_eq!(chain.loads.load(Ordering::Relaxed), 2);
+        assert_eq!(chain.headroom_calls.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn headroom_false_before_first_load_halts_without_loading() {
+        let headers = FakeChain::with_headers(1).headers;
+        let block = Block {
+            header: headers[0],
+            txs: Vec::new(),
+        };
+        let known = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+            *headers[0].compute_hash().as_bytes(),
+        ));
+        let chain = StreamingChain {
+            blocks: vec![block],
+            loads: AtomicUsize::new(0),
+            headroom_calls: AtomicUsize::new(0),
+            load_tripwire: None,
+        };
+        let mut peer = ready_peer();
+        let emitted = RefCell::new(Vec::new());
+
+        let result = dispatch_inbound_with_chain(
+            &mut peer,
+            &Message::GetData(vec![known]),
+            Some(&chain),
+            &|| false,
+            &mut |response| {
+                emitted.borrow_mut().push(response);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(PeerError::Protocol(
+                "getdata serving halted: outbound production gate",
+            ))
+        ));
+        assert_eq!(chain.headroom_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(chain.loads.load(Ordering::Relaxed), 0);
+        assert!(
+            emitted.into_inner().is_empty(),
+            "halt never emits a trailing notfound (I9)"
+        );
+    }
+
+    fn wire_len_of(message: &Message) -> usize {
+        crate::wire::wire_len(message).unwrap_or_else(|_| panic!("test message must encode"))
+    }
+
+    #[test]
+    fn hostile_50000_item_getdata_cannot_materialize_unbounded_blocks() {
+        let block = Block::default();
+        let block_wire_len = wire_len_of(&Message::Block(block.clone()));
+        // Zero-drain attacker: the outbound channel is never drained, so
+        // every admitted message stays charged to the budget.
+        let (outbound_tx, _undrained_rx) = crossbeam_channel::unbounded();
+        let lease = PeerLease::new_with_budget(
+            outbound_tx,
+            false,
+            OutboundBudget::with_block_reserve(100_000, 4 * 2 * block_wire_len, 2 * block_wire_len),
+        );
+        let budget = lease.budget_handle();
+        let known = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+            *block.block_hash().as_bytes(),
+        ));
+        let chain = StreamingChain {
+            blocks: vec![block],
+            loads: AtomicUsize::new(0),
+            headroom_calls: AtomicUsize::new(0),
+            // B = 7 serves: the gate allows a load while
+            // pending_bytes + reserve <= 4 * reserve with each served block
+            // charging block_wire_len = reserve / 2. The tripwire fires on
+            // the first bound-breaking load.
+            load_tripwire: Some(8),
+        };
+        let mut peer = ready_peer();
+
+        let result = dispatch_inbound_with_chain(
+            &mut peer,
+            &Message::GetData(vec![known; MAX_INV_PER_MSG]),
+            Some(&chain),
+            &|| budget.has_block_production_headroom(),
+            &mut |message| {
+                lease
+                    .send(message)
+                    .map_err(|_| PeerError::Protocol("outbound queue closed or saturated"))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(PeerError::Protocol(
+                "getdata serving halted: outbound production gate",
+            ))
+        ));
+        assert_eq!(chain.loads.load(Ordering::Relaxed), 7);
+        assert_eq!(chain.headroom_calls.load(Ordering::Relaxed), 8);
+        assert_eq!(budget.pending(), (7, 7 * block_wire_len));
+    }
+
+    #[test]
+    fn send_refusal_mid_stream_aborts_production() {
+        let block = Block::default();
+        let block_wire_len = wire_len_of(&Message::Block(block.clone()));
+        let (outbound_tx, _undrained_rx) = crossbeam_channel::unbounded();
+        let lease = PeerLease::new_with_budget(
+            outbound_tx,
+            false,
+            OutboundBudget::with_block_reserve(100_000, 3 * block_wire_len, 0),
+        );
+        let budget = lease.budget_handle();
+        let known = Inventory::WitnessBlock(bitcoin::BlockHash::from_byte_array(
+            *block.block_hash().as_bytes(),
+        ));
+        let chain = StreamingChain {
+            blocks: vec![block.clone(), block.clone(), block.clone(), block],
+            loads: AtomicUsize::new(0),
+            headroom_calls: AtomicUsize::new(0),
+            load_tripwire: None,
+        };
+        let mut peer = ready_peer();
+
+        let result = dispatch_inbound_with_chain(
+            &mut peer,
+            &Message::GetData(vec![known; 4]),
+            Some(&chain),
+            &|| true,
+            &mut |message| {
+                lease
+                    .send(message)
+                    .map_err(|_| PeerError::Protocol("outbound queue closed or saturated"))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(PeerError::Protocol("outbound queue closed or saturated"))
+        ));
+        assert_eq!(
+            chain.loads.load(Ordering::Relaxed),
+            4,
+            "three admitted plus one refused load"
+        );
+        assert!(lease.is_cancelled());
+        // The refused fourth block is dropped with the error, never queued.
+        assert_eq!(budget.pending(), (3, 3 * block_wire_len));
     }
 
     #[test]
