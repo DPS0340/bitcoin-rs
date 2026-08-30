@@ -261,7 +261,7 @@ pub enum PeerError {
 ///
 /// Returns the number of bytes written to the wire (header plus payload) so
 /// callers can account per-connection and aggregate traffic.
-pub fn write_message<W: Write>(
+pub fn write_message<W: Write + ?Sized>(
     writer: &mut W,
     magic: Magic,
     message: &Message,
@@ -318,6 +318,15 @@ pub fn read_message<R: Read>(
 
     let message = decode_payload(&command, &payload)?;
     Ok((message, bytes::Bytes::from(payload)))
+}
+
+/// Returns the full encoded wire size of `message`: the 24-byte framing
+/// header plus the encoded payload length.
+///
+/// Admission accounts this exact count and `write_message` returns it for
+/// release, so budget accounting and wire emission charge identical bytes.
+pub fn wire_len(message: &Message) -> Result<usize, PeerError> {
+    Ok(HEADER_LEN + encode_payload(message)?.len())
 }
 
 /// Encode only a message payload.
@@ -528,7 +537,10 @@ fn empty_payload(payload: &[u8], message: Message) -> Result<Message, PeerError>
     }
 }
 
-fn write_command<W: Write>(writer: &mut W, command: &CommandString) -> Result<(), PeerError> {
+fn write_command<W: Write + ?Sized>(
+    writer: &mut W,
+    command: &CommandString,
+) -> Result<(), PeerError> {
     let command = command.as_ref().as_bytes();
     if command.len() > COMMAND_LEN || command.contains(&0) {
         return Err(PeerError::InvalidCommand(
@@ -574,7 +586,8 @@ mod tests {
     use bitcoin::p2p::Magic;
 
     use super::{
-        HEADER_LEN, MAX_MESSAGE_PAYLOAD, PeerError, encode_payload, read_message, write_message,
+        HEADER_LEN, MAX_MESSAGE_PAYLOAD, PeerError, encode_payload, read_message, wire_len,
+        write_message,
     };
 
     /// Serves exactly one v1 wire header and fails on any read beyond it.
@@ -706,5 +719,27 @@ mod tests {
                 "expected PayloadTooLarge from encode path",
             )),
         }
+    }
+
+    #[test]
+    fn wire_len_matches_write_message_for_representative_messages() -> Result<(), PeerError> {
+        let messages = vec![
+            super::Message::Ping(0x1234_5678_9abc_def0),
+            super::Message::Verack,
+            super::Message::Headers(vec![bitcoin_rs_primitives::Header::default(); 2_000]),
+            super::Message::Block(bitcoin_rs_primitives::Block::default()),
+            super::Message::Unknown {
+                command: super::command_string("unknown")?,
+                payload: vec![7; 61],
+            },
+        ];
+
+        for message in &messages {
+            let mut buffer = Vec::new();
+            let written = write_message(&mut buffer, Magic::BITCOIN, message)?;
+            assert_eq!(wire_len(message)?, written);
+            assert_eq!(written, buffer.len());
+        }
+        Ok(())
     }
 }
