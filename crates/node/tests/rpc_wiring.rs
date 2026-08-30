@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bitcoin_rs_node::{Config, state::NodeState};
+use bitcoin_rs_node::{Config, ZmqEndpointConfig, ZmqTopic, state::NodeState};
 use bitcoin_rs_rpc::context::Context;
 use bitcoin_rs_utxo::UtxoSet;
 use tempfile::tempdir;
@@ -22,10 +22,18 @@ fn rpc_context_shares_arc_identity_with_node_state() -> Result<()> {
     let mut config = Config::default();
     config.data_dir = dir.path().join("node");
     config.txindex = true;
-    config.zmqpubhashblock = vec!["inproc://rpc-wiring-zmq-pubhashblock".to_owned()];
-    config.zmqpubhashblockhwm = Some(21);
-    config.zmqpubsequence = vec!["inproc://rpc-wiring-zmq-pubsequence".to_owned()];
-    config.zmqpubsequencehwm = Some(22);
+    config.notifications.zmq = vec![
+        ZmqEndpointConfig {
+            endpoint: "inproc://rpc-wiring-zmq-pubhashblock".to_owned(),
+            topics: vec![ZmqTopic::HashBlock],
+            hwm: Some(21),
+        },
+        ZmqEndpointConfig {
+            endpoint: "inproc://rpc-wiring-zmq-pubsequence".to_owned(),
+            topics: vec![ZmqTopic::Sequence],
+            hwm: Some(22),
+        },
+    ];
     let state = NodeState::open(config)?;
 
     let chain_tip = state.chain_tip();

@@ -231,6 +231,21 @@ disconnects are emitted tip-first before connects on the replacement branch.
 This implementation deliberately omits mempool `A`/`R` events until the
 mempool has per-transaction sequence assignment and explicit removal reasons.
 
+### Notification configuration
+
+Node configuration groups external notification adapters below
+`NotificationConfig`. ZMQ configuration follows the socket ownership boundary:
+one endpoint group contains its endpoint, all topics published by that socket,
+and an optional socket HWM override. Topics that share an endpoint therefore
+cannot claim different HWM values. The ZMQ publisher owns the default HWM of
+1,000; configuration mentions HWM only when an endpoint needs an operational
+override.
+
+The supported file form is `[[notifications.zmq]]` with `endpoint`, `topics`,
+and optional `hwm`. The former topic-specific `zmqpub*` endpoint and HWM fields
+are not part of node configuration, including CLI, environment, TOML, and
+`bitcoin.conf` adapters.
+
 ### Chain control
 
 Consensus-affecting RPCs do not mutate the RPC context's block-tree handle
