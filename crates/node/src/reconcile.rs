@@ -162,6 +162,21 @@ pub fn common_ancestor_height(
     let position_id = tree.lookup(position)?;
     common_ancestor_height_by_id(tree, position_id, active_tip)
 }
+/// Canonical stale-branch depth used to choose rollback versus rebuild.
+///
+/// The depth is measured from the persisted position back to its newest
+/// ancestor shared with the active chain. `None` means the position is no
+/// longer resolvable in the tree.
+#[must_use]
+pub fn rollback_depth(
+    tree: &BlockTree,
+    position: Hash256,
+    position_height: u32,
+    active_tip: NodeId,
+) -> Option<u32> {
+    common_ancestor_height(tree, position, active_tip)
+        .map(|ancestor_height| position_height.saturating_sub(ancestor_height))
+}
 /// Returns whether the block `position` at `height` lies on the active chain
 /// ending at `active_tip`.
 ///

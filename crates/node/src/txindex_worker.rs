@@ -3,14 +3,17 @@
 //! The node creates and owns exactly one `TxIndexRuntime` when Core txindex or
 //! `ScriptIndex` enables an index capability. The runtime holds a process-local revision counter and a bounded
 //! nonblocking wake channel; `ApplyHandles` clones it and wakes the worker
-//! after every committed `applied_tip.store`. The single writer may atomically
-//! publish a complete formerly authoritative prefix while the applied chain
-//! advances or reorganizes; exact query gating refuses that temporary lag and
-//! the next worker pass repairs it. Independent durable capability watermarks
-//! let aligned row families share one parse and commit while divergent families
-//! backfill separately. A snapshot-gated query engine serves
-//! `bitcoin_rs_rpc::context::TxIndexQuery` and the generic [`ScriptIndexQuery`]
-//! without raw index mutex paths.
+//! after every committed `applied_tip.store`. The worker is a process-local
+//! reconciliation loop; storage-level CAS conditions on exact reset state,
+//! optional revision, and both watermarks linearize every ordinary mutation
+//! across coexisting current-process and cross-process writers. A lost CAS
+//! with an unchanged reset is transient (`StaleIndexState`): the worker
+//! discards pending derived work and re-derives from durable state. Exact
+//! query gating refuses that temporary lag and the next worker pass repairs
+//! it. Independent durable capability watermarks let aligned row families
+//! share one parse and commit while divergent families backfill separately.
+//! A snapshot-gated query engine serves `bitcoin_rs_rpc::context::TxIndexQuery`
+//! and the generic [`ScriptIndexQuery`] without raw index mutex paths.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_index::{
-    HashPrefixRow, IndexCapabilities, IndexCapability, IndexError, IndexReader, IndexWatermark,
-    IndexWatermarks, IndexWriter, PreparedBatch, PreparedBatchLimits, PreparedBlock, ScriptHash,
-    TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    ConsumerCursorUpdate, HashPrefixRow, IndexCapabilities, IndexCapability, IndexError,
+    IndexReader, IndexWatermark, IndexWatermarks, IndexWriteFence, IndexWriter, PreparedBatch,
+    PreparedBatchLimits, PreparedBlock, ScriptHash, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
     types::{TxPosition, TxPositionValue},
 };
 use bitcoin_rs_primitives::Hash256;
@@ -167,6 +170,7 @@ impl TxIndexWorker {
         batch_limits: PreparedBatchLimits,
         enabled: IndexCapabilities,
         chain_events: Arc<crate::state::ChainEventPublisher>,
+        rollback_rebuild_cutover: u32,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
         let worker = Worker {
@@ -177,6 +181,7 @@ impl TxIndexWorker {
             body_store,
             batch_limits,
             enabled,
+            rollback_rebuild_cutover,
             wake_rx,
             quiet_period: REVISION_QUIET_PERIOD,
             chain_events,
@@ -231,14 +236,7 @@ impl Drop for TxIndexWorker {
 
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
-    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
-    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
-        let watermark = self.watermark()?;
-        Ok(IndexWatermarks {
-            tx_lookup: watermark,
-            script_history: watermark,
-        })
-    }
+    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError>;
     fn prepare_block(
         &self,
         height: u32,
@@ -255,63 +253,38 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let _ = capabilities;
         self.prepare_block(height, hash, body)
     }
-    fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError>;
     fn commit_forward_with_cursor(
         &self,
+        fence: IndexWriteFence,
         batch: PreparedBatch,
-        cursor: Option<&[u8]>,
-    ) -> Result<IndexWatermark, IndexError> {
-        let watermark = self.commit_forward(batch)?;
-        if let Some(cursor) = cursor {
-            self.commit_consumer_cursor(cursor)?;
-        }
-        Ok(watermark)
-    }
-    fn commit_rollback_one(
-        &self,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError>;
-    fn commit_rollback_one_for(
-        &self,
-        capabilities: IndexCapabilities,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError> {
-        let _ = capabilities;
-        self.commit_rollback_one(prev, body)
-    }
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<IndexWatermark, IndexError>;
     fn commit_rollback_one_for_with_cursor(
         &self,
+        fence: IndexWriteFence,
         capabilities: IndexCapabilities,
         prev: Option<IndexWatermark>,
         body: &[u8],
-        cursor: Option<&[u8]>,
-    ) -> Result<(), IndexError> {
-        self.commit_rollback_one_for(capabilities, prev, body)?;
-        if let Some(cursor) = cursor {
-            self.commit_consumer_cursor(cursor)?;
-        }
-        Ok(())
-    }
+        cursor: ConsumerCursorUpdate<'_>,
+    ) -> Result<(), IndexError>;
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
         let _ = capabilities;
         Err(IndexError::UnsupportedRollback)
     }
     fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, IndexError>;
-    fn commit_consumer_cursor(&self, cursor: &[u8]) -> Result<(), IndexError>;
+    fn commit_consumer_cursor(
+        &self,
+        fence: IndexWriteFence,
+        cursor: &[u8],
+    ) -> Result<(), IndexError>;
 }
 
 impl<S> TxIndexWriter for Mutex<IndexWriter<S>>
 where
     S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
 {
-    fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError> {
-        self.lock().watermark()
-    }
-
-    fn watermarks(&self) -> Result<IndexWatermarks, IndexError> {
-        self.lock().watermarks()
+    fn fenced_watermarks(&self) -> Result<(IndexWriteFence, IndexWatermarks), IndexError> {
+        self.lock().fenced_watermarks()
     }
 
     fn prepare_block(
@@ -334,43 +307,25 @@ where
             .prepare_block_for(capabilities, height, hash, body)
     }
 
-    fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
-        self.lock().commit_forward(batch)
-    }
     fn commit_forward_with_cursor(
         &self,
+        fence: IndexWriteFence,
         batch: PreparedBatch,
-        cursor: Option<&[u8]>,
+        cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<IndexWatermark, IndexError> {
-        self.lock().commit_forward_with_cursor(batch, cursor)
+        self.lock().commit_forward_with_cursor(fence, batch, cursor)
     }
 
-    fn commit_rollback_one(
-        &self,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError> {
-        self.lock().commit_rollback_one(prev, body)
-    }
-
-    fn commit_rollback_one_for(
-        &self,
-        capabilities: IndexCapabilities,
-        prev: Option<IndexWatermark>,
-        body: &[u8],
-    ) -> Result<(), IndexError> {
-        self.lock()
-            .commit_rollback_one_for(capabilities, prev, body)
-    }
     fn commit_rollback_one_for_with_cursor(
         &self,
+        fence: IndexWriteFence,
         capabilities: IndexCapabilities,
         prev: Option<IndexWatermark>,
         body: &[u8],
-        cursor: Option<&[u8]>,
+        cursor: ConsumerCursorUpdate<'_>,
     ) -> Result<(), IndexError> {
         self.lock()
-            .commit_rollback_one_for_with_cursor(capabilities, prev, body, cursor)
+            .commit_rollback_one_for_with_cursor(fence, capabilities, prev, body, cursor)
     }
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
@@ -381,8 +336,12 @@ where
         self.lock().consumer_cursor()
     }
 
-    fn commit_consumer_cursor(&self, cursor: &[u8]) -> Result<(), IndexError> {
-        self.lock().commit_consumer_cursor(cursor)
+    fn commit_consumer_cursor(
+        &self,
+        fence: IndexWriteFence,
+        cursor: &[u8],
+    ) -> Result<(), IndexError> {
+        self.lock().commit_consumer_cursor(fence, cursor)
     }
 }
 
@@ -404,10 +363,16 @@ struct Worker {
     wake_rx: Receiver<()>,
     quiet_period: Duration,
     batch_delay: Duration,
+    /// Fork depth at which a stale watermark routes to a selective reset
+    /// and rebuild instead of a per-block rewind. `u32::MAX` means rewind
+    /// at any depth (pre-cutover behavior).
+    rollback_rebuild_cutover: u32,
 }
 
 /// Uncommitted contiguous rows based on one unchanged durable watermark.
 struct PendingForward {
+    fence: IndexWriteFence,
+    watermarks: IndexWatermarks,
     capabilities: IndexCapabilities,
     durable: Option<IndexWatermark>,
     batch: PreparedBatch,
@@ -533,6 +498,12 @@ impl Worker {
             let action = match self.reconcile_once(&mut pending) {
                 Ok(action) => action,
                 Err(TxIndexWorkerError::Stopped) => break,
+                Err(TxIndexWorkerError::Index(
+                    IndexError::ResetInProgress | IndexError::StaleIndexState,
+                )) => {
+                    pending = None;
+                    ReconcileAction::Stalled
+                }
                 Err(error) => return Err(error),
             };
             if self.runtime.should_stop() {
@@ -547,7 +518,13 @@ impl Worker {
                     if self.runtime.revision() != revision_before {
                         continue;
                     }
-                    self.persist_chain_cursor()?;
+                    match self.persist_chain_cursor()? {
+                        CursorCommit::Settled => {}
+                        CursorCommit::ResetRejected | CursorCommit::NotAligned => {
+                            quiet_armed = true;
+                            continue;
+                        }
+                    }
                     match self.wake_rx.recv_timeout(Duration::from_secs(1)) {
                         Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -561,7 +538,16 @@ impl Worker {
                         BatchWait::Woken => continue,
                         BatchWait::Deadline => {
                             if !self.commit_pending(&mut pending)? {
-                                break;
+                                // `commit_pending` already took the pending
+                                // forward; `Ok(false)` means a retryable
+                                // reset rejection, not a permanent failure.
+                                // Exit only on shutdown; otherwise let the
+                                // quiet wait throttle the retry.
+                                if self.runtime.should_stop() {
+                                    break;
+                                }
+                                quiet_armed = true;
+                                continue;
                             }
                         }
                         BatchWait::Stopped => break,
@@ -586,18 +572,63 @@ impl Worker {
         &self,
         pending: &mut Option<PendingForward>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
-        let (target, watermarks) = self.capture_target_watermarks()?;
+        let (target, fence, watermarks) = self.capture_target_watermarks()?;
 
         if pending.is_some() {
-            return self.reconcile_pending(pending, watermarks, target.as_deref());
+            return self.reconcile_pending(pending, fence, watermarks, target.as_deref());
         }
 
+        let mut fence = fence;
         let mut watermarks = watermarks;
+        let mut warned_ahead = false;
         while let Some((capabilities, watermark)) =
             self.rollback_selection(watermarks, target.as_deref())
         {
-            let previous = match self.rollback_one(capabilities, watermark) {
-                Ok(previous) => previous,
+            // Warn once per pass: an 834k-block stale branch would otherwise
+            // warn once per rolled-back block.
+            if let Some(target) = target.as_deref()
+                && !warned_ahead
+                && watermark.height > target.height
+            {
+                warned_ahead = true;
+                tracing::warn!(
+                    watermark_height = watermark.height,
+                    watermark_hash = %Hash256::from_le_bytes(&watermark.hash),
+                    tip_height = target.height,
+                    tip_hash = %target.hash,
+                    gap = watermark.height.saturating_sub(target.height),
+                    "index watermark is ahead of the applied tip; rolling back"
+                );
+            }
+            let depth = self.rollback_depth_for(watermark, target.as_deref());
+            if depth.is_some_and(|depth| depth > self.rollback_rebuild_cutover) {
+                tracing::warn!(
+                    depth,
+                    cutover = self.rollback_rebuild_cutover,
+                    tx_lookup = capabilities.tx_lookup,
+                    script_history = capabilities.script_history,
+                    "stale index watermark exceeds the rollback cutover; rebuilding selected capabilities"
+                );
+                self.writer
+                    .reset_capabilities(capabilities)
+                    .map_err(TxIndexWorkerError::Index)?;
+                let (next_fence, next_watermarks) = self
+                    .writer
+                    .fenced_watermarks()
+                    .map_err(TxIndexWorkerError::Index)?;
+                fence = next_fence;
+                watermarks = next_watermarks;
+                continue;
+            }
+            match self.rollback_one(fence, watermarks, capabilities, watermark) {
+                Ok(_) => {
+                    let (next_fence, next_watermarks) = self
+                        .writer
+                        .fenced_watermarks()
+                        .map_err(TxIndexWorkerError::Index)?;
+                    fence = next_fence;
+                    watermarks = next_watermarks;
+                }
                 Err(error) if error.requires_capability_rebuild() => {
                     tracing::warn!(
                         error = %error,
@@ -608,15 +639,20 @@ impl Worker {
                     self.writer
                         .reset_capabilities(capabilities)
                         .map_err(TxIndexWorkerError::Index)?;
-                    None
+                    let (next_fence, next_watermarks) = self
+                        .writer
+                        .fenced_watermarks()
+                        .map_err(TxIndexWorkerError::Index)?;
+                    fence = next_fence;
+                    watermarks = next_watermarks;
+                    continue;
+                }
+                Err(TxIndexWorkerError::Index(
+                    IndexError::ResetInProgress | IndexError::StaleIndexState,
+                )) => {
+                    return Ok(ReconcileAction::Stalled);
                 }
                 Err(error) => return Err(error),
-            };
-            if capabilities.tx_lookup {
-                watermarks.tx_lookup = previous;
-            }
-            if capabilities.script_history {
-                watermarks.script_history = previous;
             }
         }
 
@@ -626,18 +662,27 @@ impl Worker {
         let Some((capabilities, watermark)) = self.forward_selection(watermarks, &target) else {
             return Ok(ReconcileAction::CaughtUp);
         };
-        self.catch_up_to(&target, watermark, capabilities, pending)
+        self.catch_up_to(&target, fence, watermarks, watermark, capabilities, pending)
     }
 
     fn reconcile_pending(
         &self,
         pending: &mut Option<PendingForward>,
+        fence: IndexWriteFence,
         watermarks: IndexWatermarks,
         target: Option<&TipSnapshot>,
     ) -> Result<ReconcileAction, TxIndexWorkerError> {
         let Some(state) = pending.as_ref() else {
             return Err(TxIndexWorkerError::PendingDurableChanged);
         };
+        // Any fence change invalidates the retained rows. Discard them and
+        // re-derive from the new reset, revision, and watermark state.
+        if fence != state.fence {
+            *pending = None;
+            return Ok(ReconcileAction::Stalled);
+        }
+        // A different watermark under the same fence is an incoherent writer
+        // response, not a concurrent commit. Treat it as corruption.
         if selected_watermark(watermarks, state.capabilities)
             != SelectedWatermark::Valid(state.durable)
         {
@@ -670,7 +715,14 @@ impl Worker {
                     Ok(ReconcileAction::Stalled)
                 };
             }
-            return self.catch_up_to(target, state.durable, state.capabilities, pending);
+            return self.catch_up_to(
+                target,
+                state.fence,
+                state.watermarks,
+                state.durable,
+                state.capabilities,
+                pending,
+            );
         }
 
         if self.commit_pending(pending)? {
@@ -682,13 +734,14 @@ impl Worker {
 
     fn capture_target_watermarks(
         &self,
-    ) -> Result<(Option<Arc<TipSnapshot>>, IndexWatermarks), TxIndexWorkerError> {
-        let target = self.applied_tip.load_full();
-        let watermarks = self
+    ) -> Result<(Option<Arc<TipSnapshot>>, IndexWriteFence, IndexWatermarks), TxIndexWorkerError>
+    {
+        let (fence, watermarks) = self
             .writer
-            .watermarks()
+            .fenced_watermarks()
             .map_err(TxIndexWorkerError::Index)?;
-        Ok((target, watermarks))
+        let target = self.applied_tip.load_full();
+        Ok((target, fence, watermarks))
     }
 
     fn rollback_selection(
@@ -781,6 +834,24 @@ impl Worker {
             target.tip_id,
         )
     }
+    /// Canonical rollback-versus-rebuild depth for one watermark, captured
+    /// under a short tree lock. `None` leaves the per-block rollback route:
+    /// an unresolvable watermark hash or an absent target fails inside
+    /// `rollback_one` into the error-driven reset arm.
+    fn rollback_depth_for(
+        &self,
+        watermark: IndexWatermark,
+        target: Option<&TipSnapshot>,
+    ) -> Option<u32> {
+        let target = target?;
+        let tree = self.block_tree.read();
+        crate::reconcile::rollback_depth(
+            &tree,
+            Hash256::from_le_bytes(&watermark.hash),
+            watermark.height,
+            target.tip_id,
+        )
+    }
 
     /// Persists the consumer cursor once the rows provably mirror the live
     /// snapshot.
@@ -791,14 +862,28 @@ impl Worker {
     /// reached, so it can never describe rows the store does not hold. The
     /// publisher briefly lags `applied_tip` inside one commit, so a disagreeing
     /// snapshot simply skips the write; the next caught-up pass retries.
-    fn persist_chain_cursor(&self) -> Result<(), TxIndexWorkerError> {
+    fn persist_chain_cursor(&self) -> Result<CursorCommit, TxIndexWorkerError> {
+        let (fence, watermarks) = match self.writer.fenced_watermarks() {
+            Ok(snapshot) => snapshot,
+            Err(IndexError::ResetInProgress) => return Ok(CursorCommit::ResetRejected),
+            Err(error) => return Err(TxIndexWorkerError::Index(error)),
+        };
         let loaded_tip = self.applied_tip.load_full();
         let Some(target) = loaded_tip.as_deref() else {
-            return Ok(());
+            return Ok(CursorCommit::Settled);
         };
         let snapshot = self.chain_events.snapshot();
         if snapshot.tip_hash != target.hash || snapshot.tip_height != target.height {
-            return Ok(());
+            return Ok(CursorCommit::Settled);
+        }
+        let expected = IndexWatermark {
+            height: snapshot.tip_height,
+            hash: snapshot.tip_hash.to_le_bytes(),
+        };
+        if (self.enabled.tx_lookup && watermarks.tx_lookup != Some(expected))
+            || (self.enabled.script_history && watermarks.script_history != Some(expected))
+        {
+            return Ok(CursorCommit::NotAligned);
         }
         let bytes = crate::reconcile::ConsumerCursor::from_snapshot(&snapshot).to_bytes();
         if self
@@ -807,13 +892,15 @@ impl Worker {
             .map_err(TxIndexWorkerError::Index)?
             .is_some_and(|stored| stored == bytes)
         {
-            return Ok(());
+            return Ok(CursorCommit::Settled);
         }
-        self.writer
-            .commit_consumer_cursor(&bytes)
-            .map_err(TxIndexWorkerError::Index)
+        match self.writer.commit_consumer_cursor(fence, &bytes) {
+            Ok(()) => Ok(CursorCommit::Settled),
+            Err(IndexError::ResetInProgress) => Ok(CursorCommit::ResetRejected),
+            Err(IndexError::StaleIndexState) => Ok(CursorCommit::NotAligned),
+            Err(error) => Err(TxIndexWorkerError::Index(error)),
+        }
     }
-
     /// Copies one bounded chunk of active-chain identities under one short
     /// read lock.
     fn collect_target_chain(
@@ -857,6 +944,8 @@ impl Worker {
     fn catch_up_to(
         &self,
         target: &TipSnapshot,
+        fence: IndexWriteFence,
+        watermarks: IndexWatermarks,
         watermark: Option<IndexWatermark>,
         capabilities: IndexCapabilities,
         pending: &mut Option<PendingForward>,
@@ -866,6 +955,8 @@ impl Worker {
         }
 
         let mut state = pending.take().unwrap_or_else(|| PendingForward {
+            fence,
+            watermarks,
             capabilities,
             durable: watermark,
             batch: PreparedBatch::new(self.batch_limits),
@@ -879,7 +970,7 @@ impl Worker {
             |endpoint| endpoint.height.saturating_add(1),
         );
         if start_height > target.height {
-            return if self.sync_and_commit(state.batch)?.is_some() {
+            return if self.sync_and_commit(state)?.is_some() {
                 Ok(ReconcileAction::CaughtUp)
             } else {
                 Ok(ReconcileAction::Stalled)
@@ -943,14 +1034,14 @@ impl Worker {
                 }
 
                 if state.batch.try_push(prepared).is_err() {
-                    return if self.sync_and_commit(state.batch)?.is_some() {
+                    return if self.sync_and_commit(state)?.is_some() {
                         Ok(ReconcileAction::Progressed)
                     } else {
                         Ok(ReconcileAction::Stalled)
                     };
                 }
                 if state.batch.is_full() {
-                    return if self.sync_and_commit(state.batch)?.is_some() {
+                    return if self.sync_and_commit(state)?.is_some() {
                         Ok(ReconcileAction::Progressed)
                     } else {
                         Ok(ReconcileAction::Stalled)
@@ -990,7 +1081,7 @@ impl Worker {
             return Ok(ReconcileAction::Buffered);
         }
 
-        if self.sync_and_commit(state.batch)?.is_some() {
+        if self.sync_and_commit(state)?.is_some() {
             Ok(ReconcileAction::Progressed)
         } else {
             Ok(ReconcileAction::Stalled)
@@ -999,6 +1090,8 @@ impl Worker {
     /// Rolls back one complete block for every selected capability.
     fn rollback_one(
         &self,
+        fence: IndexWriteFence,
+        watermarks: IndexWatermarks,
         capabilities: IndexCapabilities,
         watermark: IndexWatermark,
     ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
@@ -1021,15 +1114,18 @@ impl Worker {
         if self.runtime.should_stop() {
             return Err(TxIndexWorkerError::Stopped);
         }
-        let cursor = self.cursor_for_result(capabilities, prev)?;
+        let cursor = self.cursor_for_result(capabilities, prev, watermarks);
         self.writer
             .commit_rollback_one_for_with_cursor(
+                fence,
                 capabilities,
                 prev,
                 &body,
                 cursor
                     .as_ref()
-                    .map(<[u8; crate::reconcile::CURSOR_BYTE_LEN]>::as_slice),
+                    .map_or(ConsumerCursorUpdate::Clear, |bytes| {
+                        ConsumerCursorUpdate::Set(bytes.as_slice())
+                    }),
             )
             .map_err(TxIndexWorkerError::Index)?;
         Ok(prev)
@@ -1047,8 +1143,14 @@ impl Worker {
 
     fn sync_and_commit(
         &self,
-        batch: PreparedBatch,
+        state: PendingForward,
     ) -> Result<Option<IndexWatermark>, TxIndexWorkerError> {
+        let PendingForward {
+            fence,
+            watermarks,
+            batch,
+            ..
+        } = state;
         if batch.is_empty() {
             return Ok(None);
         }
@@ -1065,16 +1167,25 @@ impl Worker {
         let capabilities = batch
             .capabilities()
             .ok_or(TxIndexWorkerError::PendingDurableChanged)?;
-        let cursor = self.cursor_for_result(capabilities, Some(endpoint))?;
-        let watermark = self
-            .writer
-            .commit_forward_with_cursor(
-                batch,
-                cursor
-                    .as_ref()
-                    .map(<[u8; crate::reconcile::CURSOR_BYTE_LEN]>::as_slice),
-            )
-            .map_err(TxIndexWorkerError::Index)?;
+        let cursor = self.cursor_for_result(capabilities, Some(endpoint), watermarks);
+        let watermark = match self.writer.commit_forward_with_cursor(
+            fence,
+            batch,
+            cursor.as_ref().map_or(ConsumerCursorUpdate::Keep, |bytes| {
+                ConsumerCursorUpdate::Set(bytes.as_slice())
+            }),
+        ) {
+            Ok(watermark) => watermark,
+            Err(IndexError::ResetInProgress) => {
+                tracing::debug!("index reset rejected a stale forward batch");
+                return Ok(None);
+            }
+            Err(IndexError::StaleIndexState) => {
+                tracing::debug!("index CAS lost with unchanged reset; re-deriving");
+                return Ok(None);
+            }
+            Err(error) => return Err(TxIndexWorkerError::Index(error)),
+        };
         Ok(Some(watermark))
     }
 
@@ -1082,18 +1193,13 @@ impl Worker {
         &self,
         capabilities: IndexCapabilities,
         result: Option<IndexWatermark>,
-    ) -> Result<Option<[u8; crate::reconcile::CURSOR_BYTE_LEN]>, TxIndexWorkerError> {
+        mut watermarks: IndexWatermarks,
+    ) -> Option<[u8; crate::reconcile::CURSOR_BYTE_LEN]> {
         let snapshot = self.chain_events.snapshot();
-        let Some(result) = result else {
-            return Ok(None);
-        };
+        let result = result?;
         if result.height != snapshot.tip_height || result.hash != snapshot.tip_hash.to_le_bytes() {
-            return Ok(None);
+            return None;
         }
-        let mut watermarks = self
-            .writer
-            .watermarks()
-            .map_err(TxIndexWorkerError::Index)?;
         if capabilities.tx_lookup {
             watermarks.tx_lookup = Some(result);
         }
@@ -1102,7 +1208,7 @@ impl Worker {
         }
         let aligned = (!self.enabled.tx_lookup || watermarks.tx_lookup == Some(result))
             && (!self.enabled.script_history || watermarks.script_history == Some(result));
-        Ok(aligned.then(|| crate::reconcile::ConsumerCursor::from_snapshot(&snapshot).to_bytes()))
+        aligned.then(|| crate::reconcile::ConsumerCursor::from_snapshot(&snapshot).to_bytes())
     }
 
     fn commit_pending(
@@ -1112,8 +1218,14 @@ impl Worker {
         let Some(state) = pending.take() else {
             unreachable!("commit_pending has a pending batch");
         };
-        Ok(self.sync_and_commit(state.batch)?.is_some())
+        Ok(self.sync_and_commit(state)?.is_some())
     }
+}
+
+enum CursorCommit {
+    Settled,
+    ResetRejected,
+    NotAligned,
 }
 
 enum ReconcileAction {
@@ -1980,7 +2092,7 @@ mod body_reader_tests {
         let data_dir = tempfile::tempdir()?;
         let index_store = Arc::new(bitcoin_rs_storage::FjallStore::open(data_dir.path())?);
         let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::Mutex::new(
-            bitcoin_rs_index::IndexWriter::open(index_store)?,
+            bitcoin_rs_index::IndexWriter::open(index_store, 1)?,
         ));
         let body_store = Arc::new(SessionBodyStore {
             height: tip.height,
@@ -1991,6 +2103,7 @@ mod body_reader_tests {
             session_loads: AtomicUsize::new(0),
             direct_loads: AtomicUsize::new(0),
         });
+        let (fence, watermarks) = writer.fenced_watermarks()?;
         let worker = Worker {
             runtime,
             writer,
@@ -2003,11 +2116,21 @@ mod body_reader_tests {
             chain_events: detached_chain_publisher(),
             quiet_period: Duration::ZERO,
             batch_delay: Duration::ZERO,
+            // The body-reader session test never exercises reset routing;
+            // `u32::MAX` keeps every stale watermark on the per-block rewind.
+            rollback_rebuild_cutover: u32::MAX,
         };
         let mut pending = None;
 
         assert!(matches!(
-            worker.catch_up_to(&tip, None, IndexCapabilities::ALL, &mut pending)?,
+            worker.catch_up_to(
+                &tip,
+                fence,
+                watermarks,
+                None,
+                IndexCapabilities::ALL,
+                &mut pending
+            )?,
             ReconcileAction::Buffered
         ));
         assert_eq!(body_store.readers.load(Ordering::Acquire), 1);

@@ -3,7 +3,7 @@ use std::path::Path;
 use bytes::Bytes;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
 /// Fjall's default block-cache capacity for unbudgeted opens.
 const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
@@ -12,6 +12,8 @@ const FJALL_DEFAULT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 pub struct FjallStore {
     db: Database,
     keyspaces: Vec<Keyspace>,
+    // Non-reentrant: public mutators hold this lock while calling the lock-free batch helper.
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl FjallStore {
@@ -44,7 +46,11 @@ impl FjallStore {
                     .map_err(StorageError::backend)?,
             );
         }
-        Ok(Self { db, keyspaces })
+        Ok(Self {
+            db,
+            keyspaces,
+            write_lock: parking_lot::Mutex::new(()),
+        })
     }
 
     fn keyspace(&self, cf: ColumnFamily) -> Result<&Keyspace, StorageError> {
@@ -134,17 +140,39 @@ impl KvStore for FjallStore {
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.keyspace(cf)?
             .insert(key, value)
             .map_err(StorageError::backend)
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.write_with_durability(batch, None)
     }
 
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.write_with_durability(batch, Some(PersistMode::SyncAll))
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: FjallWriteBatch,
+    ) -> Result<bool, StorageError> {
+        let _guard = self.write_lock.lock();
+        let mut keyspaces = [None; ColumnFamily::ALL.len()];
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let keyspace = cached_keyspace(self, &mut keyspaces, cf)?;
+            let current = keyspace.get(key).map_err(StorageError::backend)?;
+            if !condition.matches(current.as_ref().map(std::convert::AsRef::as_ref)) {
+                return Ok(false);
+            }
+        }
+        self.write_with_durability(batch, Some(PersistMode::SyncAll))?;
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {

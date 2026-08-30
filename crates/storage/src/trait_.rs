@@ -10,9 +10,12 @@ pub type KvIter<'a> = Box<dyn Iterator<Item = Result<KvPair, StorageError>> + 'a
 /// Resource limits for one bounded prefix scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrefixScanLimit {
-    /// Maximum number of rows to return.
+    /// Maximum number of rows to return. Hard: scanning stops once this many
+    /// rows have been collected. `0` produces an empty, incomplete scan.
     pub max_rows: usize,
-    /// Maximum sum of returned key and value lengths.
+    /// Maximum sum of returned key and value lengths. Soft for the first row:
+    /// when `max_rows > 0` the first matching row is always admitted even if it
+    /// alone exceeds `max_bytes`. The limit is hard for every subsequent row.
     pub max_bytes: usize,
 }
 
@@ -22,7 +25,49 @@ pub struct PrefixScan {
     /// Matching rows in key order.
     pub rows: Vec<KvPair>,
     /// Whether every matching row fit within the limits.
+    ///
+    /// `false` when the scan stopped early because a row or byte limit was
+    /// reached. Because the first row is always admitted when `max_rows > 0`
+    /// (see [`PrefixScanLimit`]), an incomplete scan contains at least one row
+    /// whenever any matching rows exist.
     pub complete: bool,
+}
+/// Precondition evaluated against a store's state before a conditional batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteCondition<'a> {
+    /// The key must not exist.
+    Absent {
+        /// Logical column family containing the key.
+        cf: ColumnFamily,
+        /// Key whose absence is required.
+        key: &'a [u8],
+    },
+    /// The key's value must equal `expected` byte for byte.
+    Equals {
+        /// Logical column family containing the key.
+        cf: ColumnFamily,
+        /// Key whose value is compared.
+        key: &'a [u8],
+        /// Required pre-batch value.
+        expected: &'a [u8],
+    },
+}
+
+impl WriteCondition<'_> {
+    /// Returns the condition's logical column family and key.
+    pub const fn location(&self) -> (ColumnFamily, &[u8]) {
+        match self {
+            Self::Absent { cf, key } | Self::Equals { cf, key, .. } => (*cf, key),
+        }
+    }
+
+    /// Tests a logical pre-batch value.
+    pub fn matches(&self, current: Option<&[u8]>) -> bool {
+        match self {
+            Self::Absent { .. } => current.is_none(),
+            Self::Equals { expected, .. } => current == Some(*expected),
+        }
+    }
 }
 
 /// Backend-neutral key-value store over named column families.
@@ -40,7 +85,11 @@ pub trait KvStore: Send + Sync + 'static {
         prefix: &[u8],
     ) -> Result<KvIter<'a>, StorageError>;
 
-    /// Collects matching rows until the next row would exceed `limit`.
+    /// Collects matching rows until a limit is reached.
+    ///
+    /// The first matching row is always admitted when `max_rows > 0`, even if
+    /// it exceeds `max_bytes`; `max_bytes` is enforced only for subsequent rows.
+    /// See [`PrefixScanLimit`].
     fn scan_prefix_bounded(
         &self,
         cf: ColumnFamily,
@@ -87,6 +136,25 @@ pub trait KvStore: Send + Sync + 'static {
         self.write_deferred(batch)?;
         self.flush()
     }
+
+    /// Durably applies the entire ordered `batch` only when every condition in
+    /// `conditions` matches the pre-batch state.
+    ///
+    /// Every supplied condition observes the pre-batch state, even when the batch puts or
+    /// deletes a condition key; conditions never observe batch effects, including from
+    /// earlier conditions on the same key. The empty slice is an all-true conjunction:
+    /// the batch commits unconditionally. `Ok(true)` means the whole batch committed
+    /// atomically and is durable before return. `Ok(false)` means at least one condition
+    /// did not match and no batch operation was applied. An unknown family, failed
+    /// lookup, or backend error while evaluating any condition propagates as `Err` and
+    /// is never reported as a mismatch. Evaluation and commit are atomic with respect
+    /// to every writer the backend permits to coexist on the same database: the backend
+    /// holds one write boundary across all condition reads and the commit.
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: Self::WriteBatch,
+    ) -> Result<bool, StorageError>;
 
     /// Makes every earlier completed write durable before returning.
     fn flush(&self) -> Result<(), StorageError>;
@@ -141,7 +209,11 @@ pub trait KvSnapshot: Send + Sync {
         prefix: &[u8],
     ) -> Result<KvIter<'a>, StorageError>;
 
-    /// Collects matching snapshot rows until the next row would exceed `limit`.
+    /// Collects matching snapshot rows until a limit is reached.
+    ///
+    /// The first matching row is always admitted when `max_rows > 0`, even if
+    /// it exceeds `max_bytes`; `max_bytes` is enforced only for subsequent rows.
+    /// See [`PrefixScanLimit`].
     fn scan_prefix_bounded(
         &self,
         cf: ColumnFamily,
@@ -165,7 +237,13 @@ pub(crate) fn push_bounded_row(
     let Some(next_bytes) = bytes.checked_add(row_bytes) else {
         return false;
     };
-    if rows.len() >= limit.max_rows || next_bytes > limit.max_bytes {
+    if rows.len() >= limit.max_rows {
+        return false;
+    }
+    // The first row is admitted regardless of max_bytes when at least one row
+    // is requested, so a single oversized row never produces an empty scan.
+    // max_bytes is honored as a hard limit for every subsequent row.
+    if !rows.is_empty() && next_bytes > limit.max_bytes {
         return false;
     }
     rows.push((key.to_vec(), value.to_vec()));

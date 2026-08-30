@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use bytes::Bytes;
@@ -6,7 +7,7 @@ use signet_libmdbx::{
     tx::aliases::{RoTxSync, RwTxSync},
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
 const MIB: usize = 1024 * 1024;
 const GIB: usize = 1024 * MIB;
@@ -94,32 +95,7 @@ impl MdbxStore {
     ) -> Result<(), StorageError> {
         count_write(durability, batch.encoded_bytes);
         let txn = self.env.begin_rw_sync().map_err(StorageError::backend)?;
-        let mut databases = [None; ColumnFamily::ALL.len()];
-        for op in batch.ops {
-            match op {
-                BatchOp::Put { cf, key, value } => {
-                    txn.put(
-                        cached_database(self, &mut databases, cf)?,
-                        key,
-                        value,
-                        WriteFlags::empty(),
-                    )
-                    .map_err(StorageError::backend)?;
-                }
-                BatchOp::Delete { cf, key } => {
-                    txn.del(cached_database(self, &mut databases, cf)?, key, None)
-                        .map_err(StorageError::backend)?;
-                }
-                BatchOp::DeleteRange { cf, start, end } => {
-                    let database = cached_database(self, &mut databases, cf)?;
-                    let keys = collect_range_keys(&txn, database, &start, &end)?;
-                    for key in keys {
-                        txn.del(database, key, None)
-                            .map_err(StorageError::backend)?;
-                    }
-                }
-            }
-        }
+        apply_mdbx_ops(self, &txn, batch)?;
         txn.commit().map_err(StorageError::backend)
     }
 }
@@ -174,6 +150,29 @@ impl KvStore for MdbxStore {
         self.write_with_durability(batch, "durable")
     }
 
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: MdbxWriteBatch,
+    ) -> Result<bool, StorageError> {
+        let encoded_bytes = batch.encoded_bytes;
+        let txn = self.env.begin_rw_sync().map_err(StorageError::backend)?;
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let current: Option<Cow<'_, [u8]>> = txn
+                .get(self.database(cf)?.dbi(), key)
+                .map_err(StorageError::backend)?;
+            if !condition.matches(current.as_deref()) {
+                // Dropping the transaction aborts it, so no batch operation is applied.
+                return Ok(false);
+            }
+        }
+        apply_mdbx_ops(self, &txn, batch)?;
+        txn.commit().map_err(StorageError::backend)?;
+        count_write("durable", encoded_bytes);
+        Ok(true)
+    }
+
     fn flush(&self) -> Result<(), StorageError> {
         metrics::counter!("storage.flushes_total", "backend" => "mdbx").increment(1);
         self.env
@@ -196,6 +195,40 @@ fn count_write(durability: &'static str, encoded_bytes: usize) {
         .increment(1);
     metrics::histogram!("storage.write_bytes", "backend" => "mdbx")
         .record(crate::metric_f64_from_usize(encoded_bytes));
+}
+
+/// Applies every ordered batch operation inside one open write transaction.
+fn apply_mdbx_ops(
+    store: &MdbxStore,
+    txn: &RwTxSync,
+    batch: MdbxWriteBatch,
+) -> Result<(), StorageError> {
+    let mut databases = [None; ColumnFamily::ALL.len()];
+    for op in batch.ops {
+        match op {
+            BatchOp::Put { cf, key, value } => {
+                txn.put(
+                    cached_database(store, &mut databases, cf)?,
+                    &key,
+                    &value,
+                    WriteFlags::empty(),
+                )
+                .map_err(StorageError::backend)?;
+            }
+            BatchOp::Delete { cf, key } => {
+                txn.del(cached_database(store, &mut databases, cf)?, &key, None)
+                    .map_err(StorageError::backend)?;
+            }
+            BatchOp::DeleteRange { cf, start, end } => {
+                let database = cached_database(store, &mut databases, cf)?;
+                for key in collect_range_keys(txn, database, &start, &end)? {
+                    txn.del(database, &key, None)
+                        .map_err(StorageError::backend)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cached_database(

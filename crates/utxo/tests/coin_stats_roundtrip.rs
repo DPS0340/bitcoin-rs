@@ -1,7 +1,9 @@
 //! Coinstats persistence round-trip tests.
 
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
-use bitcoin_rs_storage::{ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch};
+use bitcoin_rs_storage::{
+    ColumnFamily, KvIter, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition,
+};
 use bitcoin_rs_utxo::stats::coin_stats::COIN_STATS_ENCODED_LEN;
 use bitcoin_rs_utxo::stats::{
     CoinStats, CoinStatsDecodeError, CoinStatsListener, load_coin_stats, store_coin_stats,
@@ -141,31 +143,31 @@ impl KvStore for MemoryStore {
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         let mut rows = self.rows.write();
-        for op in batch.ops {
-            match op {
-                MemoryOp::Put(cf, key, value) => {
-                    if let Some((_row, existing_value)) = rows
-                        .iter_mut()
-                        .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == &key)
-                    {
-                        *existing_value = value;
-                    } else {
-                        rows.push(((cf, key), value));
-                    }
-                }
-                MemoryOp::Delete(cf, key) => {
-                    rows.retain(|((row_cf, row_key), _value)| *row_cf != cf || row_key != &key);
-                }
-                MemoryOp::DeleteRange(cf, start, end) => {
-                    rows.retain(|((row_cf, key), _value)| {
-                        *row_cf != cf
-                            || key.as_slice() < start.as_slice()
-                            || key.as_slice() >= end.as_slice()
-                    });
-                }
-            }
-        }
+        apply_ops(&mut rows, batch.ops.into_iter());
         Ok(())
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: Self::WriteBatch,
+    ) -> Result<bool, StorageError> {
+        let mut rows = self.rows.write();
+        // Every condition observes pre-batch state; the batch may mutate a
+        // condition key itself.
+        let matched = conditions.iter().all(|condition| {
+            let (cf, key) = condition.location();
+            condition.matches(
+                rows.iter()
+                    .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == key)
+                    .map(|(_row, value)| value.as_slice()),
+            )
+        });
+        if !matched {
+            return Ok(false);
+        }
+        apply_ops(&mut rows, batch.ops.into_iter());
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -203,5 +205,33 @@ impl WriteBatch for MemoryBatch {
     fn delete_range(&mut self, cf: ColumnFamily, start: &[u8], end: &[u8]) {
         self.ops
             .push(MemoryOp::DeleteRange(cf, start.to_vec(), end.to_vec()));
+    }
+}
+
+/// Folds one batch's operations into the row list, in order.
+fn apply_ops(rows: &mut Vec<Row>, ops: std::vec::IntoIter<MemoryOp>) {
+    for op in ops {
+        match op {
+            MemoryOp::Put(cf, key, value) => {
+                if let Some((_row, existing_value)) = rows
+                    .iter_mut()
+                    .find(|((row_cf, row_key), _value)| *row_cf == cf && row_key == &key)
+                {
+                    *existing_value = value;
+                } else {
+                    rows.push(((cf, key), value));
+                }
+            }
+            MemoryOp::Delete(cf, key) => {
+                rows.retain(|((row_cf, row_key), _value)| *row_cf != cf || row_key != &key);
+            }
+            MemoryOp::DeleteRange(cf, start, end) => {
+                rows.retain(|((row_cf, key), _value)| {
+                    *row_cf != cf
+                        || key.as_slice() < start.as_slice()
+                        || key.as_slice() >= end.as_slice()
+                });
+            }
+        }
     }
 }

@@ -4,6 +4,20 @@ The backend-neutral storage layer every persisted index and chain-state store si
 
 `KvStore` is the central trait: `get`, ordered `iter_prefix` iteration, bounded `scan_prefix_bounded` scans under a `PrefixScanLimit`, and point-in-time `snapshot` reads, with all mutations going through backend-specific `WriteBatch` types applied by `write`, by `write_deferred` (visible immediately, crash durability deferred to `flush`), or by `write_durable`. `ColumnFamily` names the logical column families shared by every backend and `StorageError` is the common error type. Concrete backends are feature-gated and exported from the crate root: `FjallStore` (the default), `RocksDbStore`, `RedbStore`, and `MdbxStore`; the implementation modules themselves are private. The specialized redb transaction index has no public concrete type: it is constructed only through the redb-gated `open_redb_tx_index_store` factory, which hides the store behind an opaque `impl KvStore`. Immutable block bodies bypass key-value storage entirely: `FlatFileBlockStore` and `FlatFileBlockReader` manage the append-only flat files with `BlockFilePosition` addressing, and the `corpus` module streams length-prefixed Core frames through `CoreFrameReader` and `CoreFrameWriter`.
 
+All backends also implement `write_durable_if`: given a conjunction of
+`WriteCondition`s — each key `Absent`, or its value `Equals` an `expected` byte
+string — it durably applies the entire ordered batch only when every condition
+matches the pre-batch state (the batch itself may put or delete condition
+keys). The empty slice is an all-true conjunction and commits
+unconditionally. Every condition is read and compared before any batch
+operation applies: the first mismatch returns `false` with no mutation, while
+an unknown family, failed lookup, or backend error on any condition propagates
+as `Err` and is never treated as a miss. `true` is returned only after the
+commit is durable. The condition reads and the batch commit share one backend
+write boundary, so competing writers cannot both observe the same pre-image
+and no backend releases its lock or transaction between condition evaluation
+and commit.
+
 ## Pruning
 
 `pruning` deletes historical block bodies and undo records once the active chain no longer needs them. It is here rather than in a crate of its own (issue #164) because it is a retention policy over rows this crate already owns -- the former `bitcoin-rs-pruning` declared `bitcoin-rs-utxo`, `bitcoin-rs-chain` and `bitcoin` and referenced none of them.

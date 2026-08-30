@@ -5,7 +5,7 @@ use redb::{
     Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
 type ByteTable = TableDefinition<'static, &'static [u8], &'static [u8]>;
 type FixedTable<const N: usize> = TableDefinition<'static, &'static [u8; N], ()>;
@@ -84,18 +84,7 @@ impl RedbStore {
         write_txn
             .set_durability(durability)
             .map_err(StorageError::backend)?;
-        let mut ops = batch.ops.into_iter().peekable();
-        while let Some(op) = ops.next() {
-            let cf = op.cf();
-            let mut table = write_txn
-                .open_table(table_for(cf))
-                .map_err(StorageError::backend)?;
-            apply_redb_batch_op(&mut table, op)?;
-            while ops.peek().is_some_and(|next| next.cf() == cf) {
-                let Some(op) = ops.next() else { break };
-                apply_redb_batch_op(&mut table, op)?;
-            }
-        }
+        apply_redb_ops(&write_txn, batch.ops.into_iter())?;
         write_txn.commit().map_err(StorageError::backend)
     }
 }
@@ -159,6 +148,42 @@ impl KvStore for RedbStore {
 
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         self.write_with_durability(batch, Durability::Immediate)
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: RedbWriteBatch,
+    ) -> Result<bool, StorageError> {
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(StorageError::backend)?;
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let table = write_txn
+                .open_table(table_for(cf))
+                .map_err(StorageError::backend)?;
+            let guard = table.get(key).map_err(StorageError::backend)?;
+            let matched = match condition {
+                WriteCondition::Absent { .. } => guard.is_none(),
+                WriteCondition::Equals { expected, .. } => match &guard {
+                    Some(g) => g.value() == *expected,
+                    None => false,
+                },
+            };
+            if !matched {
+                // Dropping the transaction aborts it, so no batch operation is applied.
+                return Ok(false);
+            }
+        }
+        apply_redb_ops(&write_txn, batch.ops.into_iter())?;
+        write_txn.commit().map_err(StorageError::backend)?;
+        metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => "durable")
+            .increment(1);
+        metrics::histogram!("storage.write_bytes", "backend" => "redb")
+            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -255,39 +280,7 @@ impl RedbTxIndexStore {
         write_txn
             .set_durability(durability)
             .map_err(StorageError::backend)?;
-        let mut ops = batch.ops.into_iter().peekable();
-        while let Some(op) = ops.next() {
-            match op.cf() {
-                ColumnFamily::TxConfirmed => {
-                    apply_fixed_value_run(
-                        &write_txn,
-                        TXINDEX_TX_CONFIRMED,
-                        TXINDEX_TX_CONFIRMED_VALUES,
-                        op,
-                        &mut ops,
-                    )?;
-                }
-                ColumnFamily::Funding => {
-                    apply_fixed_value_run(
-                        &write_txn,
-                        TXINDEX_FUNDING,
-                        TXINDEX_FUNDING_VALUES,
-                        op,
-                        &mut ops,
-                    )?;
-                }
-                ColumnFamily::Spending => {
-                    apply_fixed_run(&write_txn, TXINDEX_SPENDING, op, &mut ops)?;
-                }
-                ColumnFamily::BlockHeaders => {
-                    apply_fixed_run(&write_txn, TXINDEX_BLOCK_HEADERS, op, &mut ops)?;
-                }
-                ColumnFamily::UtxoMeta => {
-                    apply_byte_run(&write_txn, TXINDEX_META, op, &mut ops)?;
-                }
-                _ => return Err(invalid_txindex_cf()),
-            }
-        }
+        apply_txindex_ops(&write_txn, batch.ops.into_iter())?;
         write_txn.commit().map_err(StorageError::backend)
     }
 }
@@ -348,6 +341,38 @@ impl KvStore for RedbTxIndexStore {
 
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
         self.write_with_durability(batch, Durability::Immediate)
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: RedbWriteBatch,
+    ) -> Result<bool, StorageError> {
+        // Width and family validation happens before any transaction begins so an
+        // invalid request never opens (and aborts) a write transaction. Every
+        // condition is validated, not only the first.
+        validate_txindex_batch(&batch)?;
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            validate_txindex_key(cf, key)?;
+        }
+        let mut write_txn = self.db.begin_write().map_err(StorageError::backend)?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(StorageError::backend)?;
+        for condition in conditions {
+            if !txindex_condition_matches(&write_txn, condition)? {
+                // Dropping the transaction aborts it, so no batch operation is applied.
+                return Ok(false);
+            }
+        }
+        apply_txindex_ops(&write_txn, batch.ops.into_iter())?;
+        write_txn.commit().map_err(StorageError::backend)?;
+        metrics::counter!("storage.writes_total", "backend" => "redb", "durability" => "durable")
+            .increment(1);
+        metrics::histogram!("storage.write_bytes", "backend" => "redb")
+            .record(crate::metric_f64_from_usize(batch.encoded_bytes));
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {
@@ -491,6 +516,27 @@ fn apply_redb_batch_op(
             Ok(())
         }
     }
+}
+
+/// Applies every ordered batch operation inside one open write transaction,
+/// opening each column family's table only once per consecutive run.
+fn apply_redb_ops(
+    write_txn: &redb::WriteTransaction,
+    ops: std::vec::IntoIter<BatchOp>,
+) -> Result<(), StorageError> {
+    let mut ops = ops.peekable();
+    while let Some(op) = ops.next() {
+        let cf = op.cf();
+        let mut table = write_txn
+            .open_table(table_for(cf))
+            .map_err(StorageError::backend)?;
+        apply_redb_batch_op(&mut table, op)?;
+        while ops.peek().is_some_and(|next| next.cf() == cf) {
+            let Some(op) = ops.next() else { break };
+            apply_redb_batch_op(&mut table, op)?;
+        }
+    }
+    Ok(())
 }
 
 struct RedbSnapshot {
@@ -1088,4 +1134,160 @@ fn apply_byte_run(
         apply_redb_batch_op(&mut table, op)?;
     }
     Ok(())
+}
+
+/// Validates every batch operation's family and widths before any transaction
+/// begins, mirroring exactly what the apply path would reject mid-transaction.
+fn validate_txindex_batch(batch: &RedbWriteBatch) -> Result<(), StorageError> {
+    batch.ops.iter().try_for_each(|op| match op {
+        BatchOp::Put { cf, key, value } => {
+            if matches!(cf, ColumnFamily::Spending | ColumnFamily::BlockHeaders)
+                && !value.is_empty()
+            {
+                return Err(fixed_value_error());
+            }
+            validate_txindex_key(*cf, key)
+        }
+        BatchOp::Delete { cf, key } => validate_txindex_key(*cf, key),
+        BatchOp::DeleteRange { cf, start, end } => {
+            validate_txindex_key(*cf, start)?;
+            validate_txindex_key(*cf, end)
+        }
+    })
+}
+
+/// Validates one txindex family/key pair; rejects unsupported families and
+/// fixed-width keys of the wrong length before any transaction begins.
+fn validate_txindex_key(cf: ColumnFamily, key: &[u8]) -> Result<(), StorageError> {
+    match cf {
+        ColumnFamily::TxConfirmed | ColumnFamily::Funding | ColumnFamily::Spending => {
+            fixed_key::<12>(key).map(|_| ())
+        }
+        ColumnFamily::BlockHeaders => fixed_key::<80>(key).map(|_| ()),
+        ColumnFamily::UtxoMeta => Ok(()),
+        _ => Err(invalid_txindex_cf()),
+    }
+}
+
+/// Applies every ordered batch operation inside one open write transaction.
+fn apply_txindex_ops(
+    write_txn: &redb::WriteTransaction,
+    ops: std::vec::IntoIter<BatchOp>,
+) -> Result<(), StorageError> {
+    let mut ops = ops.peekable();
+    while let Some(op) = ops.next() {
+        match op.cf() {
+            ColumnFamily::TxConfirmed => apply_fixed_value_run(
+                write_txn,
+                TXINDEX_TX_CONFIRMED,
+                TXINDEX_TX_CONFIRMED_VALUES,
+                op,
+                &mut ops,
+            )?,
+            ColumnFamily::Funding => apply_fixed_value_run(
+                write_txn,
+                TXINDEX_FUNDING,
+                TXINDEX_FUNDING_VALUES,
+                op,
+                &mut ops,
+            )?,
+            ColumnFamily::Spending => apply_fixed_run(write_txn, TXINDEX_SPENDING, op, &mut ops)?,
+            ColumnFamily::BlockHeaders => {
+                apply_fixed_run(write_txn, TXINDEX_BLOCK_HEADERS, op, &mut ops)?;
+            }
+            ColumnFamily::UtxoMeta => apply_byte_run(write_txn, TXINDEX_META, op, &mut ops)?,
+            _ => return Err(invalid_txindex_cf()),
+        }
+    }
+    Ok(())
+}
+
+fn txindex_condition_matches(
+    write_txn: &redb::WriteTransaction,
+    condition: &WriteCondition<'_>,
+) -> Result<bool, StorageError> {
+    let (cf, key) = condition.location();
+    match cf {
+        ColumnFamily::TxConfirmed => txindex_fixed_value_condition_matches(
+            write_txn,
+            TXINDEX_TX_CONFIRMED,
+            TXINDEX_TX_CONFIRMED_VALUES,
+            key,
+            condition,
+        ),
+        ColumnFamily::Funding => txindex_fixed_value_condition_matches(
+            write_txn,
+            TXINDEX_FUNDING,
+            TXINDEX_FUNDING_VALUES,
+            key,
+            condition,
+        ),
+        ColumnFamily::Spending => {
+            txindex_fixed_condition_matches(write_txn, TXINDEX_SPENDING, key, condition)
+        }
+        ColumnFamily::BlockHeaders => {
+            txindex_fixed_condition_matches(write_txn, TXINDEX_BLOCK_HEADERS, key, condition)
+        }
+        ColumnFamily::UtxoMeta => {
+            let table = write_txn
+                .open_table(TXINDEX_META)
+                .map_err(StorageError::backend)?;
+            let guard = table.get(key).map_err(StorageError::backend)?;
+            Ok(match condition {
+                WriteCondition::Absent { .. } => guard.is_none(),
+                WriteCondition::Equals { expected, .. } => match &guard {
+                    Some(g) => g.value() == *expected,
+                    None => false,
+                },
+            })
+        }
+        _ => Err(invalid_txindex_cf()),
+    }
+}
+
+fn txindex_fixed_value_condition_matches(
+    write_txn: &redb::WriteTransaction,
+    main_def: FixedTable<12>,
+    value_def: TxIndexValueTable,
+    key: &[u8],
+    condition: &WriteCondition<'_>,
+) -> Result<bool, StorageError> {
+    let key = fixed_key::<12>(key)?;
+    let main = write_txn
+        .open_table(main_def)
+        .map_err(StorageError::backend)?;
+    let exists = main.get(&key).map_err(StorageError::backend)?.is_some();
+    match condition {
+        WriteCondition::Absent { .. } => Ok(!exists),
+        WriteCondition::Equals { expected, .. } => {
+            if !exists {
+                return Ok(false);
+            }
+            let values = write_txn
+                .open_table(value_def)
+                .map_err(StorageError::backend)?;
+            let guard = values.get(&key).map_err(StorageError::backend)?;
+            Ok(match &guard {
+                Some(g) => g.value() == *expected,
+                None => expected.is_empty(),
+            })
+        }
+    }
+}
+
+fn txindex_fixed_condition_matches<const N: usize>(
+    write_txn: &redb::WriteTransaction,
+    table_def: FixedTable<N>,
+    key: &[u8],
+    condition: &WriteCondition<'_>,
+) -> Result<bool, StorageError> {
+    let key = fixed_key::<N>(key)?;
+    let table = write_txn
+        .open_table(table_def)
+        .map_err(StorageError::backend)?;
+    let exists = table.get(&key).map_err(StorageError::backend)?.is_some();
+    Ok(match condition {
+        WriteCondition::Absent { .. } => !exists,
+        WriteCondition::Equals { expected, .. } => exists && expected.is_empty(),
+    })
 }

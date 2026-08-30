@@ -17,7 +17,7 @@ use core::fmt;
 use core::mem::size_of;
 use crossbeam_channel::{Receiver, Sender};
 use hashbrown::HashMap;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -191,6 +191,7 @@ impl ChainEventPublisher {
 }
 
 const PROCESS_EPOCH_FILE: &str = "process-epoch";
+const PROCESS_EPOCH_LOCK_FILE: &str = ".process-epoch.lock";
 const PROCESS_EPOCH_TEMP: &str = ".process-epoch.tmp";
 // A u64 in decimal is at most 20 digits; the trailing newline makes 21.
 const PROCESS_EPOCH_MAX_BYTES: u64 = 32;
@@ -217,35 +218,68 @@ fn load_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
 
 /// Allocates the next process epoch, durably, before first use.
 ///
-/// The persisted value is bumped by one and written with the checkpoint
-/// write-temp → sync → rename idiom (the checkpoint.rs `CURRENT` flow) at the
-/// data-dir root — outside the re-writable checkpoint tree, so a checkpoint
-/// wipe or resync can never regress it. A crash before the rename wastes an
-/// epoch number (gaps are fine) and never reuses one.
-///
-/// Allocation is not self-serializing: two processes racing here could both
-/// publish the same value. That twin never becomes observable — every storage
-/// backend takes an exclusive data-dir lock during `NodeState::open`, so the
-/// loser dies before it can write any state that cites its epoch. The storage
-/// lock is the serialization point; do not add one here.
+/// The persistent lock serializes the complete load → increment → temporary
+/// file sync → rename → data-directory sync transaction across processes.
+/// Keeping its descriptor alive through the final directory sync matters:
+/// opening the data directory does not freeze its namespace or mount topology.
+/// The epoch itself lives outside the re-writable checkpoint tree, so a
+/// checkpoint wipe or resync can never regress it. A crash before the rename
+/// may leave a temporary file; gaps are fine, but reuse is not.
 fn allocate_process_epoch(dir: &cap_std::fs::Dir) -> Result<u64> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+    let mut lock_options = cap_std::fs::OpenOptions::new();
+    lock_options
+        .read(true)
+        .write(true)
+        .create(true)
+        .follow(FollowSymlinks::No)
+        .nonblock(true);
+    let lock = dir
+        .open_with(PROCESS_EPOCH_LOCK_FILE, &lock_options)
+        .with_context(|| format!("open process epoch lock {PROCESS_EPOCH_LOCK_FILE}"))?;
+    let lock_metadata = lock
+        .metadata()
+        .with_context(|| format!("inspect process epoch lock {PROCESS_EPOCH_LOCK_FILE}"))?;
+    if !lock_metadata.is_file() {
+        bail!("process epoch lock {PROCESS_EPOCH_LOCK_FILE} is not a regular file");
+    }
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .with_context(|| format!("lock process epoch file {PROCESS_EPOCH_LOCK_FILE}"))?;
+
     let epoch = load_process_epoch(dir)?
         .checked_add(1)
         .context("process epoch counter exhausted")?;
     let bytes = format!("{epoch}\n").into_bytes();
-    // A temp file left by a crash mid-allocation must not block create_new.
-    let _ = dir.remove_file(PROCESS_EPOCH_TEMP);
-    let mut file = crate::checkpoint_fs::create_file(dir, PROCESS_EPOCH_TEMP)
-        .with_context(|| format!("create {PROCESS_EPOCH_TEMP}"))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("write {PROCESS_EPOCH_TEMP}"))?;
-    file.sync_all()
-        .with_context(|| format!("sync {PROCESS_EPOCH_TEMP}"))?;
-    drop(file);
-    dir.rename(PROCESS_EPOCH_TEMP, dir, PROCESS_EPOCH_FILE)
-        .with_context(|| format!("publish {PROCESS_EPOCH_FILE}"))?;
-    crate::checkpoint_fs::sync_dir(dir)
-        .context("sync data dir after allocating the process epoch")?;
+    match dir.remove_file(PROCESS_EPOCH_TEMP) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("remove stale {PROCESS_EPOCH_TEMP}"));
+        }
+    }
+
+    let allocation = (|| -> Result<()> {
+        let mut file = crate::checkpoint_fs::create_file(dir, PROCESS_EPOCH_TEMP)
+            .with_context(|| format!("create {PROCESS_EPOCH_TEMP}"))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("write {PROCESS_EPOCH_TEMP}"))?;
+        file.sync_all()
+            .with_context(|| format!("sync {PROCESS_EPOCH_TEMP}"))?;
+        drop(file);
+        dir.rename(PROCESS_EPOCH_TEMP, dir, PROCESS_EPOCH_FILE)
+            .with_context(|| format!("publish {PROCESS_EPOCH_FILE}"))?;
+        crate::checkpoint_fs::sync_dir(dir)
+            .context("sync data dir after allocating the process epoch")
+    })();
+    if allocation.is_err() {
+        let _ = dir.remove_file(PROCESS_EPOCH_TEMP);
+    }
+    allocation?;
+
+    // `lock` intentionally remains live until after the directory durability
+    // barrier above. Dropping it here releases the cross-process transaction.
+    drop(lock);
     Ok(epoch)
 }
 
@@ -930,11 +964,12 @@ struct OpenTxIndex {
 
 fn open_writer<S>(
     store: &Arc<S>,
+    generation: u64,
 ) -> Result<bitcoin_rs_index::IndexWriter<S>, bitcoin_rs_index::IndexError>
 where
     S: bitcoin_rs_storage::KvStore,
 {
-    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store)) {
+    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation) {
         Ok(writer) => Ok(writer),
         Err(
             error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
@@ -944,8 +979,8 @@ where
                 %error,
                 "resetting incompatible derived transaction index for rebuild"
             );
-            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref())?;
-            bitcoin_rs_index::IndexWriter::open(Arc::clone(store))
+            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref(), generation)?;
+            bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation)
         }
         Err(error) => Err(error),
     }
@@ -954,11 +989,12 @@ where
 fn open_tx_index_store<S>(
     store: Arc<S>,
     batch_limits: bitcoin_rs_index::PreparedBatchLimits,
+    generation: u64,
 ) -> Result<OpenTxIndex>
 where
     S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
 {
-    let writer = open_writer(&store)?;
+    let writer = open_writer(&store, generation)?;
     let writer: Arc<dyn crate::txindex_worker::TxIndexWriter> =
         Arc::new(parking_lot::Mutex::new(writer));
     let reader: Arc<dyn bitcoin_rs_index::IndexReader> =
@@ -981,7 +1017,11 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
     }
 }
 
-fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<OpenTxIndex>> {
+fn open_tx_index(
+    config: &Config,
+    txindex_cache_bytes: u64,
+    epoch: u64,
+) -> Result<Option<OpenTxIndex>> {
     let enabled = tx_index_capabilities(config);
     if enabled.is_empty() {
         return Ok(None);
@@ -1006,6 +1046,7 @@ fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<Ope
             Ok(Some(open_tx_index_store(
                 store,
                 crate::txindex_worker::ROCKSDB_BATCH_LIMITS,
+                epoch,
             )?))
         }
         #[cfg(feature = "fjall")]
@@ -1017,6 +1058,7 @@ fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<Ope
             Ok(Some(open_tx_index_store(
                 store,
                 crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+                epoch,
             )?))
         }
         #[cfg(feature = "redb")]
@@ -1031,6 +1073,7 @@ fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<Ope
             Ok(Some(open_tx_index_store(
                 store,
                 crate::txindex_worker::REDB_BATCH_LIMITS,
+                epoch,
             )?))
         }
         #[cfg(feature = "mdbx")]
@@ -1042,6 +1085,7 @@ fn open_tx_index(config: &Config, txindex_cache_bytes: u64) -> Result<Option<Ope
             Ok(Some(open_tx_index_store(
                 store,
                 crate::txindex_worker::DEFAULT_BATCH_LIMITS,
+                epoch,
             )?))
         }
         other => bail!("unsupported storage backend for txindex: {other}"),
@@ -1422,7 +1466,7 @@ impl NodeState {
         let (chain_events_raw, chain_event_hints_rx_raw) =
             ChainEventPublisher::new(epoch, initial_snapshot);
         let chain_events = Arc::new(chain_events_raw);
-        let tx_index_open = open_tx_index(&config, txindex_cache_bytes)?;
+        let tx_index_open = open_tx_index(&config, txindex_cache_bytes, epoch)?;
         let (tx_index_runtime, tx_index_worker, tx_index_query, tx_query_adapter) =
             match tx_index_open {
                 Some(open) => {
@@ -1451,6 +1495,7 @@ impl NodeState {
                         open.batch_limits,
                         tx_index_capabilities(&config),
                         Arc::clone(&chain_events),
+                        config.index_rollback_rebuild_cutover,
                         wake_rx,
                     )
                     .context("spawn txindex worker")?;
@@ -3722,6 +3767,174 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("node").join("process-epoch"))?,
             b"seven\n",
+            "the refusal must not reset the persisted epoch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn process_epoch_allocation_is_unique_across_processes() -> anyhow::Result<()> {
+        const CHILD_DIR_ENV: &str = "BITCOIN_RS_TEST_EPOCH_CHILD_DIR";
+        const CHILDREN: usize = 8;
+        // Subprocess mode: this same test binary was re-exec'd by the parent
+        // below. Park on the start barrier, then allocate one epoch.
+        if let Ok(data_dir) = std::env::var(CHILD_DIR_ENV) {
+            let data_dir = std::path::PathBuf::from(data_dir);
+            let dir = cap_std::fs::Dir::open_ambient_dir(&data_dir, cap_std::ambient_authority())?;
+            std::fs::write(data_dir.join(format!("ready-{}", std::process::id())), b"")?;
+            let go = data_dir.join("go");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            while !go.exists() {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("epoch child never saw the start barrier");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let epoch = super::allocate_process_epoch(&dir)?;
+            std::fs::write(
+                data_dir.join(format!("epoch-{}", std::process::id())),
+                format!("{epoch}\n"),
+            )?;
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        std::fs::create_dir_all(&data_dir)?;
+
+        // Harness test names are crate-relative; `module_path!()` is not.
+        let test_name = concat!(
+            module_path!(),
+            "::process_epoch_allocation_is_unique_across_processes"
+        )
+        .split("::")
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("::");
+        let exe = std::env::current_exe()?;
+        let mut children = Vec::new();
+        for _ in 0..CHILDREN {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args(["--exact", &test_name])
+                    .env(CHILD_DIR_ENV, &data_dir)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()?,
+            );
+        }
+
+        // Every child must be alive and parked before any allocates, so all
+        // eight genuinely contend for the same lock file on one data dir.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        loop {
+            let ready = std::fs::read_dir(&data_dir)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("ready-"))
+                .count();
+            if ready == CHILDREN {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("epoch children never became ready: {ready}/{CHILDREN}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::write(data_dir.join("go"), b"")?;
+
+        let mut epochs = Vec::new();
+        for child in children {
+            let output = child.wait_with_output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "epoch child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for entry in std::fs::read_dir(&data_dir)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("epoch-") {
+                let text = std::fs::read_to_string(entry.path())?;
+                epochs.push(text.trim().parse::<u64>()?);
+            }
+        }
+        epochs.sort_unstable();
+        assert_eq!(
+            epochs.len(),
+            CHILDREN,
+            "each child reports exactly one epoch"
+        );
+        for (index, epoch) in epochs.iter().enumerate() {
+            assert_eq!(
+                *epoch,
+                u64::try_from(index)? + 1,
+                "concurrent children must each own one distinct epoch: {epochs:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("process-epoch"))?,
+            format!("{}\n", epochs[CHILDREN - 1]),
+            "the persisted file must name the highest allocated epoch"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_epoch_lock_refuses_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        std::fs::create_dir_all(&data_dir)?;
+        std::fs::write(data_dir.join("process-epoch"), b"41\n")?;
+        std::os::unix::fs::symlink("process-epoch", data_dir.join(".process-epoch.lock"))?;
+
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+
+        let Err(error) = NodeState::open(config) else {
+            anyhow::bail!("a symlinked epoch lock must refuse startup");
+        };
+        assert!(
+            error.to_string().contains("process epoch lock"),
+            "the refusal names the lock target: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("process-epoch"))?,
+            "41\n",
+            "the symlink must not be followed and the epoch must not reset"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_epoch_lock_refuses_start() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        std::fs::create_dir_all(&data_dir)?;
+        std::fs::write(data_dir.join("process-epoch"), b"7\n")?;
+        let lock_dir = cap_std::fs::Dir::open_ambient_dir(&data_dir, cap_std::ambient_authority())?;
+        rustix::fs::mkfifoat(
+            &lock_dir,
+            ".process-epoch.lock",
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
+
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+
+        let Err(error) = NodeState::open(config) else {
+            anyhow::bail!("a non-regular epoch lock must refuse startup");
+        };
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "the refusal names the lock type: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("process-epoch"))?,
+            "7\n",
             "the refusal must not reset the persisted epoch"
         );
         Ok(())

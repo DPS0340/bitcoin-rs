@@ -104,7 +104,7 @@ impl CatchupFixture {
 
         let dir = tempfile::tempdir()?;
         let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
-        let writer = Arc::new(Mutex::new(IndexWriter::open(store)?));
+        let writer = Arc::new(Mutex::new(IndexWriter::open(store, 1)?));
 
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(4);
         let runtime = Arc::new(TxIndexRuntime::new(wake_tx));
@@ -117,6 +117,7 @@ impl CatchupFixture {
             body_store: Some(bodies.clone()),
             batch_limits: DEFAULT_BATCH_LIMITS,
             enabled: bitcoin_rs_index::IndexCapabilities::ALL,
+            rollback_rebuild_cutover: u32::MAX,
             wake_rx,
             chain_events: crate::txindex_worker::detached_chain_publisher(),
             quiet_period: REVISION_QUIET_PERIOD,
@@ -291,9 +292,12 @@ fn catch_up_retains_prepared_prefix_until_descendant_target()
     let stale_target = fixture.tip(&fixture.a[..1]);
     fixture.publish_tip(&fixture.a);
     let mut pending = None;
+    let (fence, watermarks) = fixture.writer.lock().fenced_watermarks()?;
 
     let action = fixture.worker.catch_up_to(
         &stale_target,
+        fence,
+        watermarks,
         None,
         bitcoin_rs_index::IndexCapabilities::ALL,
         &mut pending,
@@ -337,10 +341,13 @@ fn expired_pending_prefix_commits_before_descendant_extension()
     let stale_target = fixture.tip(&fixture.a[..1]);
     fixture.publish_tip(&fixture.a);
     let mut pending = None;
+    let (fence, watermarks) = fixture.writer.lock().fenced_watermarks()?;
 
     assert!(matches!(
         fixture.worker.catch_up_to(
             &stale_target,
+            fence,
+            watermarks,
             None,
             bitcoin_rs_index::IndexCapabilities::ALL,
             &mut pending,
@@ -381,9 +388,12 @@ fn complete_rival_prefix_commits_and_repairs_on_next_pass() -> Result<(), Box<dy
     let target = fixture.tip(&fixture.a);
     fixture.publish_tip(&fixture.b);
     let mut pending = None;
+    let (fence, watermarks) = fixture.writer.lock().fenced_watermarks()?;
 
     let action = fixture.worker.catch_up_to(
         &target,
+        fence,
+        watermarks,
         None,
         bitcoin_rs_index::IndexCapabilities::ALL,
         &mut pending,

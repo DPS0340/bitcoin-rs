@@ -39,7 +39,9 @@ pub use corpus::{
     CoreFrameReader, CoreFrameRecord, CoreFrameWriter,
 };
 pub use error::StorageError;
-pub use trait_::{KvIter, KvPair, KvSnapshot, KvStore, PrefixScan, PrefixScanLimit, WriteBatch};
+pub use trait_::{
+    KvIter, KvPair, KvSnapshot, KvStore, PrefixScan, PrefixScanLimit, WriteBatch, WriteCondition,
+};
 
 #[cfg(feature = "fjall")]
 pub use fjall_impl::FjallStore;

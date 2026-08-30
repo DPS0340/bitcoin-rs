@@ -6,7 +6,7 @@ use rust_rocksdb::{
     Options, ReadOptions, WriteBatch as RocksWriteBatch, WriteOptions,
 };
 
-use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch};
+use crate::{ColumnFamily, KvSnapshot, KvStore, StorageError, WriteBatch, WriteCondition};
 
 const BLOCK_SIZE: usize = 4 * 1024 * 1024;
 /// `RocksDB`'s block-cache capacity for unbudgeted opens.
@@ -17,6 +17,8 @@ const WRITE_BUFFER_SIZE: usize = 128 << 20;
 /// `RocksDB`-backed key-value store.
 pub struct RocksDbStore {
     db: rust_rocksdb::DB,
+    // Non-reentrant: public mutators hold this lock while calling the lock-free batch helper.
+    write_lock: parking_lot::Mutex<()>,
 }
 
 impl RocksDbStore {
@@ -65,7 +67,10 @@ impl RocksDbStore {
             .map(|cf| ColumnFamilyDescriptor::new(cf.name(), cf_options.clone()));
         let db = rust_rocksdb::DB::open_cf_descriptors(&db_options, path, descriptors)
             .map_err(StorageError::backend)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            write_lock: parking_lot::Mutex::new(()),
+        })
     }
 
     fn cf_handle(&self, cf: ColumnFamily) -> Result<&rust_rocksdb::ColumnFamily, StorageError> {
@@ -159,21 +164,44 @@ impl KvStore for RocksDbStore {
     }
 
     fn put(&self, cf: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.db
             .put_cf(self.cf_handle(cf)?, key, value)
             .map_err(StorageError::backend)
     }
 
     fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.write_with_durability(batch, "default", false)
     }
 
     fn write_deferred(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.write_with_durability(batch, "deferred", false)
     }
 
     fn write_durable(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         self.write_with_durability(batch, "durable", true)
+    }
+
+    fn write_durable_if(
+        &self,
+        conditions: &[WriteCondition<'_>],
+        batch: RocksDbWriteBatch,
+    ) -> Result<bool, StorageError> {
+        let _guard = self.write_lock.lock();
+        let mut handles = [None; ColumnFamily::ALL.len()];
+        for condition in conditions {
+            let (cf, key) = condition.location();
+            let handle = cached_cf_handle(self, &mut handles, cf)?;
+            let current = self.db.get_cf(handle, key).map_err(StorageError::backend)?;
+            if !condition.matches(current.as_deref()) {
+                return Ok(false);
+            }
+        }
+        self.write_with_durability(batch, "durable", true)?;
+        Ok(true)
     }
 
     fn flush(&self) -> Result<(), StorageError> {

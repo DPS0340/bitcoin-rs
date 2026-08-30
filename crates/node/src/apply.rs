@@ -7362,37 +7362,57 @@ mod consensus_rule_tests {
     }
 
     // --- txindex worker failure isolation fixture ---
-
-    /// A `TxIndex` writer/reader that lets the worker start up cleanly (first
-    /// watermark returns `None`) and then fails on the next storage operation.
-    /// This models a durable-index write fault that appears after the runtime
-    /// has already committed to an asynchronous worker.
+    /// A `TxIndex` writer/reader that lets the worker start up cleanly through
+    /// the current fence API and then fails on the next `fenced_watermarks`
+    /// call. This models a durable-index write fault that appears after the
+    /// runtime has already committed to an asynchronous worker.
     struct FailAfterStartupTxIndex {
-        watermark_calls: std::sync::atomic::AtomicUsize,
+        fence: bitcoin_rs_index::IndexWriteFence,
+        watermarks: bitcoin_rs_index::IndexWatermarks,
+        fenced_calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl FailAfterStartupTxIndex {
-        fn new() -> Self {
-            Self {
-                watermark_calls: std::sync::atomic::AtomicUsize::new(0),
-            }
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let temp = tempfile::tempdir()?;
+            let store = Arc::new(bitcoin_rs_storage::FjallStore::open(temp.path())?);
+            let mut writer = bitcoin_rs_index::IndexWriter::open(store, 1)?;
+            let (fence, watermarks) = writer.fenced_watermarks()?;
+            Ok(Self {
+                fence,
+                watermarks,
+                fenced_calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            })
         }
     }
 
     impl crate::txindex_worker::TxIndexWriter for FailAfterStartupTxIndex {
-        fn watermark(
+        fn fenced_watermarks(
             &self,
-        ) -> Result<Option<bitcoin_rs_index::IndexWatermark>, bitcoin_rs_index::IndexError>
-        {
-            if self
-                .watermark_calls
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                == 0
-            {
-                Ok(None)
-            } else {
-                Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
+        ) -> Result<
+            (
+                bitcoin_rs_index::IndexWriteFence,
+                bitcoin_rs_index::IndexWatermarks,
+            ),
+            bitcoin_rs_index::IndexError,
+        > {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(bitcoin_rs_index::IndexError::UnsupportedRollback);
             }
+            self.fenced_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok((self.fence, self.watermarks))
+        }
+
+        fn commit_forward_with_cursor(
+            &self,
+            _fence: bitcoin_rs_index::IndexWriteFence,
+            _batch: bitcoin_rs_index::PreparedBatch,
+            _cursor: bitcoin_rs_index::ConsumerCursorUpdate<'_>,
+        ) -> Result<bitcoin_rs_index::IndexWatermark, bitcoin_rs_index::IndexError> {
+            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
         }
 
         fn prepare_block(
@@ -7404,28 +7424,24 @@ mod consensus_rule_tests {
             Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
         }
 
-        fn commit_forward(
-            &self,
-            _batch: bitcoin_rs_index::PreparedBatch,
-        ) -> Result<bitcoin_rs_index::IndexWatermark, bitcoin_rs_index::IndexError> {
-            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
-        }
-
-        fn commit_rollback_one(
-            &self,
-            _prev: Option<bitcoin_rs_index::IndexWatermark>,
-            _body: &[u8],
-        ) -> Result<(), bitcoin_rs_index::IndexError> {
-            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
-        }
-
         fn consumer_cursor(&self) -> Result<Option<Vec<u8>>, bitcoin_rs_index::IndexError> {
             Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
         }
 
         fn commit_consumer_cursor(
             &self,
+            _fence: bitcoin_rs_index::IndexWriteFence,
             _cursor: &[u8],
+        ) -> Result<(), bitcoin_rs_index::IndexError> {
+            Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
+        }
+        fn commit_rollback_one_for_with_cursor(
+            &self,
+            _fence: bitcoin_rs_index::IndexWriteFence,
+            _capabilities: bitcoin_rs_index::IndexCapabilities,
+            _prev: Option<bitcoin_rs_index::IndexWatermark>,
+            _body: &[u8],
+            _cursor: bitcoin_rs_index::ConsumerCursorUpdate<'_>,
         ) -> Result<(), bitcoin_rs_index::IndexError> {
             Err(bitcoin_rs_index::IndexError::UnsupportedRollback)
         }
@@ -7459,8 +7475,7 @@ mod consensus_rule_tests {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
         handles.tx_index_runtime = Some(Arc::clone(&runtime));
-
-        let index: Arc<FailAfterStartupTxIndex> = Arc::new(FailAfterStartupTxIndex::new());
+        let index: Arc<FailAfterStartupTxIndex> = Arc::new(FailAfterStartupTxIndex::new()?);
         let writer: Arc<dyn crate::txindex_worker::TxIndexWriter> = index.clone();
         let _worker = crate::txindex_worker::TxIndexWorker::spawn(
             Arc::clone(&runtime),
@@ -7471,16 +7486,16 @@ mod consensus_rule_tests {
             crate::txindex_worker::DEFAULT_BATCH_LIMITS,
             bitcoin_rs_index::IndexCapabilities::ALL,
             Arc::new(crate::state::ChainEventPublisher::detached(0).0),
+            u32::MAX,
             wake_rx,
         )?;
-
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         assert!(
             wait_until(deadline, || {
                 index
-                    .watermark_calls
+                    .fenced_calls
                     .load(std::sync::atomic::Ordering::Acquire)
-                    == 1
+                    >= 2
             }),
             "txindex worker did not complete its startup reconciliation"
         );
@@ -7489,6 +7504,7 @@ mod consensus_rule_tests {
         let genesis_hash = Hash256::from(genesis.block_hash());
         let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
         handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        index.fail.store(true, std::sync::atomic::Ordering::Release);
         runtime.wake();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

@@ -461,7 +461,7 @@ mod tests {
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::transaction::{Transaction, TxOut, Version};
     use bitcoin::{Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, Witness};
-    use bitcoin_rs_storage::{StorageError, WriteBatch};
+    use bitcoin_rs_storage::{StorageError, WriteBatch, WriteCondition};
 
     #[expect(
         clippy::expect_used,
@@ -564,25 +564,52 @@ mod tests {
         assert_eq!(LifecycleState::from_u8(2), None);
     }
 
-    /// Batch double collecting writes without applying them.
-    struct MemBatch;
+    #[derive(Default)]
+    enum SchemaMutation {
+        #[default]
+        Unchanged,
+        Put(Vec<u8>),
+        Delete,
+    }
+
+    /// Batch double carrying the only key this test store supports.
+    #[derive(Default)]
+    struct MemBatch {
+        schema: SchemaMutation,
+    }
 
     impl WriteBatch for MemBatch {
-        fn put(&mut self, _cf: ColumnFamily, _key: &[u8], _value: &[u8]) {}
-        fn delete(&mut self, _cf: ColumnFamily, _key: &[u8]) {}
+        fn put(&mut self, cf: ColumnFamily, key: &[u8], value: &[u8]) {
+            assert_eq!(cf, NAMESPACE_CF);
+            if key == keys::SCHEMA {
+                self.schema = SchemaMutation::Put(value.to_vec());
+            }
+        }
+
+        fn delete(&mut self, cf: ColumnFamily, key: &[u8]) {
+            assert_eq!(cf, NAMESPACE_CF);
+            if key == keys::SCHEMA {
+                self.schema = SchemaMutation::Delete;
+            }
+        }
+
         fn delete_range(&mut self, _cf: ColumnFamily, _start: &[u8], _end: &[u8]) {}
     }
 
-    /// In-memory backend double carrying only the schema marker.
+    /// In-memory backend double carrying only the schema marker behind a
+    /// state lock, so a conditional batch is atomic with its reads.
     struct MemStore {
-        schema: Option<Vec<u8>>,
+        schema: parking_lot::Mutex<Option<Vec<u8>>>,
     }
 
     impl MemStore {
         fn with_schema() -> Arc<Self> {
             Arc::new(Self {
-                schema: Some(SCHEMA_VERSION.to_le_bytes().to_vec()),
+                schema: parking_lot::Mutex::new(Some(SCHEMA_VERSION.to_le_bytes().to_vec())),
             })
+        }
+        fn lock_schema(&self) -> parking_lot::MutexGuard<'_, Option<Vec<u8>>> {
+            self.schema.lock()
         }
     }
 
@@ -592,7 +619,7 @@ mod tests {
         fn get(&self, cf: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
             assert_eq!(cf, NAMESPACE_CF);
             if key == keys::SCHEMA {
-                return Ok(self.schema.clone());
+                return Ok(self.lock_schema().clone());
             }
             Ok(None)
         }
@@ -606,10 +633,15 @@ mod tests {
         }
 
         fn new_batch(&self) -> Self::WriteBatch {
-            MemBatch
+            MemBatch::default()
         }
 
-        fn write(&self, _batch: Self::WriteBatch) -> Result<(), StorageError> {
+        fn write(&self, batch: Self::WriteBatch) -> Result<(), StorageError> {
+            match batch.schema {
+                SchemaMutation::Unchanged => {}
+                SchemaMutation::Put(value) => *self.lock_schema() = Some(value),
+                SchemaMutation::Delete => *self.lock_schema() = None,
+            }
             Ok(())
         }
 
@@ -621,6 +653,33 @@ mod tests {
             Err(StorageError::InvalidOperation(
                 "snapshot unsupported in the MemStore double",
             ))
+        }
+
+        fn write_durable_if(
+            &self,
+            conditions: &[WriteCondition<'_>],
+            batch: Self::WriteBatch,
+        ) -> Result<bool, StorageError> {
+            let mut schema = self.lock_schema();
+            let matched = conditions.iter().all(|condition| {
+                let (cf, key) = condition.location();
+                assert_eq!(cf, NAMESPACE_CF);
+                let current = if key == keys::SCHEMA {
+                    schema.as_deref()
+                } else {
+                    None
+                };
+                condition.matches(current)
+            });
+            if !matched {
+                return Ok(false);
+            }
+            match batch.schema {
+                SchemaMutation::Unchanged => {}
+                SchemaMutation::Put(value) => *schema = Some(value),
+                SchemaMutation::Delete => *schema = None,
+            }
+            Ok(true)
         }
     }
 

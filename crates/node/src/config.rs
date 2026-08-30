@@ -15,6 +15,9 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_RPC_USER: &str = "bitcoin-rs";
 const DEFAULT_RPC_PASSWORD: &str = "bitcoin-rs";
 const DEFAULT_DBCACHE_MB: u64 = 450;
+/// Fork depth (blocks) at which a stale txindex watermark stops the
+/// per-block rewind and routes to a selective reset + rebuild instead.
+const DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER: u32 = 100_000;
 const DEFAULT_ZMQ_HWM: u32 = 1_000;
 const DRYNET4_CONNECT: &str = "drynet4.drivechain.dev:8533";
 const DRYNET4_P2P_MAGIC: [u8; 4] = [0xec, 0xa5, 0xd4, 0x04];
@@ -164,6 +167,15 @@ pub struct Config {
     /// down so share arithmetic stays exact. Effective per-namespace
     /// capacities are logged at startup (`opened storage backend`).
     pub dbcache_mb: u64,
+    /// Fork depth at which a stale txindex watermark routes to a selective
+    /// reset and rebuild instead of a per-block rewind.
+    ///
+    /// Grounded in three measured runs of per-block forward-ingest versus
+    /// rollback cost (see `docs/benchmarks/index-rollback-rebuild-cutover.md`):
+    /// the default routes the 834k-block stale-branch incident shape to a
+    /// rebuild while organic reorgs (tens of blocks) keep rewinding block by
+    /// block.
+    pub index_rollback_rebuild_cutover: u32,
     /// Tracing filter level used when `RUST_LOG` is unset.
     pub log_level: String,
     /// Optional Prometheus metrics bind address.
@@ -233,6 +245,10 @@ impl fmt::Debug for Config {
             .field("txindex", &self.txindex)
             .field("blockfilterindex", &self.blockfilterindex)
             .field("dbcache_mb", &self.dbcache_mb)
+            .field(
+                "index_rollback_rebuild_cutover",
+                &self.index_rollback_rebuild_cutover,
+            )
             .field("log_level", &self.log_level)
             .field("metrics_bind", &self.metrics_bind)
             .field("g2_muhash_samples", &self.g2_muhash_samples)
@@ -295,6 +311,7 @@ impl Config {
             txindex: false,
             blockfilterindex: false,
             dbcache_mb: DEFAULT_DBCACHE_MB,
+            index_rollback_rebuild_cutover: DEFAULT_INDEX_ROLLBACK_REBUILD_CUTOVER,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             metrics_bind: None,
             g2_muhash_samples: None,
@@ -569,6 +586,9 @@ impl Config {
         if let Some(dbcache_mb) = layer.dbcache_mb {
             self.dbcache_mb = dbcache_mb;
         }
+        if let Some(cutover) = layer.index_rollback_rebuild_cutover {
+            self.index_rollback_rebuild_cutover = cutover;
+        }
         if let Some(log_level) = &layer.log_level {
             self.log_level.clone_from(log_level);
         }
@@ -716,6 +736,8 @@ pub(crate) struct ConfigLayer {
     pub(crate) blockfilterindex: Option<bool>,
     #[arg(long = "dbcache-mb")]
     pub(crate) dbcache_mb: Option<u64>,
+    #[arg(long = "index-rollback-rebuild-cutover")]
+    pub(crate) index_rollback_rebuild_cutover: Option<u32>,
     #[arg(long = "log-level")]
     pub(crate) log_level: Option<String>,
     #[arg(long = "metrics-bind")]
@@ -795,6 +817,9 @@ impl ConfigLayer {
                 "BITCOIN_RS_TXINDEX" => layer.txindex = Some(parse_bool(value)?),
                 "BITCOIN_RS_BLOCKFILTERINDEX" => layer.blockfilterindex = Some(parse_bool(value)?),
                 "BITCOIN_RS_DBCACHE_MB" => layer.dbcache_mb = Some(value.parse()?),
+                "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => {
+                    layer.index_rollback_rebuild_cutover = Some(value.parse()?);
+                }
                 "BITCOIN_RS_LOG_LEVEL" => layer.log_level = Some(value.to_owned()),
                 "BITCOIN_RS_METRICS_BIND" => layer.metrics_bind = Some(value.parse()?),
                 "BITCOIN_RS_G2_MUHASH_SAMPLES" => {
