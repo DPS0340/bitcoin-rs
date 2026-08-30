@@ -1,13 +1,13 @@
 //! Node-side mempool mutation observer.
 //!
-//! Bridges committed [`MutationResult`]s from the [`MempoolGateway`] onto
+//! Bridges committed [`MutationEnvelope`]s from the [`MempoolGateway`] onto
 //! Core's unified `sequence` ZMQ topic: accepted changes publish `A` events,
 //! removals publish `R` events — except block-inclusion removals, which Core
 //! suppresses because the block's own `C` event covers the departure.
 
 use std::sync::Arc;
 
-use bitcoin_rs_mempool::{MempoolObserver, MutationOutcome, MutationResult, RemovalReason};
+use bitcoin_rs_mempool::{MempoolObserver, MutationEnvelope, MutationOutcome, RemovalReason};
 use bitcoin_rs_primitives::Txid;
 
 use crate::zmq_publisher::{SequenceEvent, ZmqPublisher};
@@ -38,9 +38,9 @@ impl MempoolSequenceObserver {
 }
 
 impl MempoolObserver for MempoolSequenceObserver {
-    fn on_mutation(&self, result: &MutationResult) {
-        for (offset, change) in result.changes.iter().enumerate() {
-            let Some(sequence) = result.sequence_of(offset) else {
+    fn on_mutation(&self, envelope: &MutationEnvelope) {
+        for (offset, change) in envelope.result.changes.iter().enumerate() {
+            let Some(sequence) = envelope.result.sequence_of(offset) else {
                 continue;
             };
             let txid = Txid(change.txid);
@@ -67,7 +67,7 @@ mod tests {
     use super::MempoolSequenceObserver;
     use crate::zmq_publisher::{SequenceEvent, ZmqNotifier, ZmqPublisher, sequence_payload};
     use bitcoin_rs_mempool::{
-        Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver,
+        AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver,
     };
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
     use parking_lot::{Mutex, RwLock};
@@ -155,7 +155,9 @@ mod tests {
         let admitted = tx(1);
         let txid = admitted.txid();
 
-        gateway.insert_entry(entry(&admitted)).expect("in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&admitted))
+            .expect("in");
 
         let bodies = publisher.sequence_bodies.lock();
         assert_eq!(bodies.len(), 1, "exactly one event for one change");
@@ -171,11 +173,15 @@ mod tests {
         let mut child = tx(3);
         child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
         let child_txid = child.txid();
-        gateway.insert_entry(entry(&parent)).expect("parent in");
-        gateway.insert_entry(entry(&child)).expect("child in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
+            .expect("parent in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
+            .expect("child in");
         publisher.sequence_bodies.lock().clear();
 
-        gateway.remove_by_txid(&parent_txid);
+        gateway.remove_by_txid(AdmissionOrigin::Rpc, &parent_txid);
 
         let bodies = publisher.sequence_bodies.lock();
         assert_eq!(
@@ -193,10 +199,12 @@ mod tests {
         let (gateway, publisher) = wired_gateway();
         let mined = tx(4);
         let mined_txid = mined.txid();
-        gateway.insert_entry(entry(&mined)).expect("in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&mined))
+            .expect("in");
         publisher.sequence_bodies.lock().clear();
 
-        gateway.remove_for_block(&[&mined], &[mined_txid], 8);
+        gateway.remove_for_block(AdmissionOrigin::Block, &[&mined], &[mined_txid], 8);
 
         assert!(
             publisher.sequence_bodies.lock().is_empty(),
@@ -221,10 +229,14 @@ mod tests {
         );
         let low = MempoolEntry::new(Arc::new(tx(5)), 100, 100, 1, 7);
         let high = MempoolEntry::new(Arc::new(tx(6)), 100, 900, 1, 7);
-        gateway.insert_entry(low).expect("low in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, low)
+            .expect("low in");
         publisher.sequence_bodies.lock().clear();
 
-        gateway.insert_entry(high).expect("high in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, high)
+            .expect("high in");
 
         let bodies = publisher.sequence_bodies.lock();
         assert_eq!(

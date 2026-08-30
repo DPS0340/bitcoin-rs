@@ -314,6 +314,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "hashbrown 0.17.1",
+ "metrics",
  "parking_lot",
  "proptest",
  "serde_json",

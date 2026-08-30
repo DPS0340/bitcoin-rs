@@ -122,3 +122,48 @@ impl MutationResult {
             .collect()
     }
 }
+
+/// Identifies the network peer a transaction arrived from.
+///
+/// Plain data by contract: the mempool crate never depends on the p2p
+/// stack, so the node passes a token it minted at connection time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct PeerToken {
+    /// The peer's wire address.
+    pub addr: core::net::SocketAddr,
+    /// The node-local id of the connection the peer arrived on.
+    pub connection_id: u64,
+}
+
+/// How the transaction behind a committed mutation entered the node.
+///
+/// [`AdmissionOrigin::Peer`] and [`AdmissionOrigin::Block`] are the
+/// pre-declared batch contract for the ingress relay (R6/R7) and the
+/// apply-path sweep migration (ING-R34); no production caller emits them
+/// yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionOrigin {
+    /// Submitted through RPC (`sendrawtransaction`).
+    Rpc,
+    /// Relayed in from a network peer.
+    Peer(PeerToken),
+    /// Re-admitted by a reorg's disconnect walk.
+    Reorg,
+    /// Confirmed in by block application.
+    Block,
+}
+
+/// What the gateway hands its observers: the committed result plus how the
+/// mutating transaction entered the node.
+///
+/// The envelope is move-through and zero-alloc: [`MempoolGateway`] moves a
+/// committed [`MutationResult`] into it, publishes `&MutationEnvelope`, and
+/// hands `envelope.result` back to the caller — no clone, no lifetime on
+/// the observer trait.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationEnvelope {
+    /// How the transaction entered the node.
+    pub origin: AdmissionOrigin,
+    /// The committed mutation, in commit order.
+    pub result: MutationResult,
+}

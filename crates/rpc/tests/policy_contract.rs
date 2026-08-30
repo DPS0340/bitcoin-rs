@@ -15,7 +15,7 @@ use std::error::Error;
 
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
-    Mempool, MempoolEntry, MempoolGateway, MempoolLimits, PolicyError, RbfError,
+    AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits, PolicyError, RbfError,
     ReplacementCandidate,
 };
 use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
@@ -1741,43 +1741,8 @@ fn applied_tip_pair(state: &NodeState) -> Result<(Hash256, u32), Box<dyn Error>>
     Ok((tip.hash, tip.height))
 }
 
-#[test]
-fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_the_coinbase()
--> Result<(), Box<dyn Error>> {
-    let (state, _dir) = open_regtest_state()?;
-    let genesis = Network::Regtest.genesis_block();
-    state.apply_block(&genesis)?;
-    for height in 1..=REORG_SEED_BLOCKS {
-        let (prev, _) = applied_tip_pair(&state)?;
-        reorg_mine_and_apply(&state, prev, height, Vec::new())?;
-    }
-    let (seed_tip, seed_height) = applied_tip_pair(&state)?;
-    assert_eq!(seed_height, REORG_SEED_BLOCKS);
-
-    // The matured spend enters the mempool, then a block at height 101
-    // confirms it and drains the pool.
-    let spend = reorg_seed_coinbase_spend_with_fee(REORG_SPEND_FEE_SATS);
-    let spend_txid = spend.txid();
-    {
-        let mempool = state.mempool();
-        let mut guard = mempool.write();
-        let vsize = u32::try_from(spend.vsize()).unwrap_or(u32::MAX);
-        guard.insert_entry(MempoolEntry::new(
-            Arc::new(spend.clone()),
-            vsize,
-            REORG_SPEND_FEE_SATS,
-            1,
-            REORG_SEED_BLOCKS,
-        ))?;
-    }
-    let mined_block =
-        reorg_mine_and_apply(&state, seed_tip, REORG_SEED_BLOCKS + 1, vec![spend.clone()])?;
-    assert!(
-        state.mempool().read().is_empty(),
-        "connect must drain the confirmed spend"
-    );
-
-    let handler = Handler::new(Arc::new(
+fn invalidation_handler(state: &NodeState) -> Handler {
+    Handler::new(Arc::new(
         Context::from_handles(ContextHandles {
             chain: ChainHandles {
                 chain_tip: state.chain_tip(),
@@ -1814,7 +1779,45 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
         .with_chain_control(Arc::new(NodeInvalidator {
             handles: state.apply_handles(),
         })),
-    ));
+    ))
+}
+
+#[test]
+fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_the_coinbase()
+-> Result<(), Box<dyn Error>> {
+    let (state, _dir) = open_regtest_state()?;
+    let genesis = Network::Regtest.genesis_block();
+    state.apply_block(&genesis)?;
+    for height in 1..=REORG_SEED_BLOCKS {
+        let (prev, _) = applied_tip_pair(&state)?;
+        reorg_mine_and_apply(&state, prev, height, Vec::new())?;
+    }
+    let (seed_tip, seed_height) = applied_tip_pair(&state)?;
+    assert_eq!(seed_height, REORG_SEED_BLOCKS);
+
+    // The matured spend enters the mempool, then a block at height 101
+    // confirms it and drains the pool.
+    let spend = reorg_seed_coinbase_spend_with_fee(REORG_SPEND_FEE_SATS);
+    let spend_txid = spend.txid();
+    {
+        let mempool = state.mempool();
+        let mut guard = mempool.write();
+        let vsize = u32::try_from(spend.vsize()).unwrap_or(u32::MAX);
+        guard.insert_entry(MempoolEntry::new(
+            Arc::new(spend.clone()),
+            vsize,
+            REORG_SPEND_FEE_SATS,
+            1,
+            REORG_SEED_BLOCKS,
+        ))?;
+    }
+    let mined_block = reorg_mine_and_apply(&state, seed_tip, REORG_SEED_BLOCKS + 1, vec![spend])?;
+    assert!(
+        state.mempool().read().is_empty(),
+        "connect must drain the confirmed spend"
+    );
+
+    let handler = invalidation_handler(&state);
     let mined_hash = mined_block.block_hash();
     handler.dispatch("invalidateblock", &json!([mined_hash.to_string()]))?;
 
@@ -1842,9 +1845,13 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
         ))),
         None,
     );
-    let committed =
-        gateway.reconsider_disconnected(mined_block.txs.iter().filter(|tx| !is_coinbase(tx)).map(
-            |tx| {
+    let committed = gateway.reconsider_disconnected(
+        AdmissionOrigin::Reorg,
+        mined_block
+            .txs
+            .iter()
+            .filter(|tx| !is_coinbase(tx))
+            .map(|tx| {
                 let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
                 MempoolEntry::new(
                     Arc::new(tx.clone()),
@@ -1853,8 +1860,8 @@ fn invalidateblock_returns_a_mature_coinbase_spend_to_the_mempool_and_excludes_t
                     1,
                     REORG_SEED_BLOCKS,
                 )
-            },
-        ));
+            }),
+    );
     assert_eq!(committed.len(), 1, "one admitted candidate: the spend");
     assert!(gateway.read().contains_txid(&spend_txid));
     Ok(())

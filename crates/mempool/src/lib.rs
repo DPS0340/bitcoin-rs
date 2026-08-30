@@ -29,8 +29,11 @@ pub mod standardness;
 pub use entry::{EntryId, MempoolEntry};
 pub use eviction::evict_lowest_fee_packages;
 pub use fee_estimator::{FeeEstimator, FeeRate};
-pub use gateway::{MempoolGateway, MempoolObserver};
-pub use mutation::{MutationChange, MutationOutcome, MutationResult, RemovalReason};
+pub use gateway::{CompositeObserver, MempoolGateway, MempoolObserver};
+pub use mutation::{
+    AdmissionOrigin, MutationChange, MutationEnvelope, MutationOutcome, MutationResult, PeerToken,
+    RemovalReason,
+};
 pub use pareto::{ParetoFront, SortedParetoFront};
 pub use policy::{MempoolLimits, MempoolPolicySnapshot, PolicyError};
 pub use pool::{
