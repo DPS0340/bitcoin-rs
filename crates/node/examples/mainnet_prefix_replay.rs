@@ -6,11 +6,10 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::ffi::OsString;
-#[cfg(feature = "checksig-census")]
-use std::fs::OpenOptions;
 use std::io::BufReader;
 #[cfg(feature = "checksig-census")]
 use std::io::{Read, Write};
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -21,11 +20,13 @@ use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_consensus::census_checkpoint;
 use bitcoin_rs_node::Network;
 use bitcoin_rs_node::config::Config;
-use bitcoin_rs_node::corpus::CorpusManifest;
-use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
+use bitcoin_rs_node::corpus::{
+    ArchiveInfo, CoreRestClient, CoreRestError, CorpusEntry, CorpusManifest, FetchedBlock,
+    bounded_diagnostic_path, fetch_rest_block,
+};
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_primitives::encode::double_sha256;
-use bitcoin_rs_primitives::{Block, BlockHash, Header, deserialize};
+use bitcoin_rs_primitives::{Block, BlockHash, Hash256, Header, deserialize};
 use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -35,6 +36,11 @@ use sha2::{Digest as _, Sha256};
 const MAX_SERIALIZED_BLOCK_SIZE: u32 = 4_000_000;
 const TXINDEX_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TXINDEX_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cache budget (MiB) a standalone replay runs with. The offline benchmark
+/// controller passes its shared cell budget through `--dbcache-mb`; without
+/// that option the replay defaults to 450, matching the node default.
+const DEFAULT_DBCACHE_MB: u64 = 450;
 
 /// A reader that hashes every byte it yields.
 ///
@@ -63,6 +69,11 @@ impl<R: std::io::Read> HashingReader<R> {
         let mut bytes = [0_u8; 32];
         bytes.copy_from_slice(out.as_ref());
         bytes
+    }
+
+    /// Returns the wrapped reader, discarding the hash state.
+    fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -106,7 +117,7 @@ struct ReplayTotals {
 /// Walks `start_height..=stop_height`, applying each window as it fills.
 fn replay_prefix(
     args: &Args,
-    manifest: Option<&CorpusManifest>,
+    file_inputs: Option<&FileInputs>,
     apply_handles: &bitcoin_rs_node::apply::ApplyHandles,
 ) -> Result<ReplayTotals> {
     let mut tx_count = 0_usize;
@@ -119,7 +130,13 @@ fn replay_prefix(
     let mut prev_hash: Option<BlockHash> = None;
 
     let window = args.window.max(1);
-    let mut source = open_block_source(args, apply_handles.network, manifest)?;
+    let expectations = file_inputs.map(|inputs| ArchiveExpectations::from(&inputs.manifest));
+    let mut source = open_block_source(
+        args,
+        apply_handles.network,
+        expectations,
+        file_inputs.map(|inputs| &inputs.archive_file),
+    )?;
     let mut window_blocks: Vec<Block> = Vec::new();
     let mut window_bytes: Vec<bytes::Bytes> = Vec::new();
     let mut window_bytes_held = 0_usize;
@@ -248,6 +265,75 @@ fn apply_window(
     Ok(())
 }
 
+/// Zero-copy borrowed view of the validated manifest data the file source
+/// and replay preflight consume: archive metadata plus the entry slice.
+///
+/// Production derives it only from a fully loaded, validated
+/// `CorpusManifest`; example tests derive it from bare `ArchiveInfo` +
+/// entries fixtures, so neither path constructs a manifest to fake custody.
+#[derive(Clone, Copy, Debug)]
+struct ArchiveExpectations<'a> {
+    archive: &'a ArchiveInfo,
+    entries: &'a [CorpusEntry],
+}
+
+impl<'a> From<&'a CorpusManifest> for ArchiveExpectations<'a> {
+    fn from(manifest: &'a CorpusManifest) -> Self {
+        Self {
+            archive: &manifest.archive,
+            entries: &manifest.entries,
+        }
+    }
+}
+
+/// Post-load replay preflight shared by production and example tests.
+///
+/// Pure over the validated manifest identity scalars, the borrowed
+/// expectations view, and the descriptor-statted archive size: no loading,
+/// no I/O. Production calls it right after the secure open, before the
+/// streaming digest proof, so cheap identity failures never pay for a full
+/// archive read; the frame and final EOF checks in the read loop stay
+/// beneath it as defense in depth.
+fn validate_file_preflight(
+    manifest_network: Network,
+    manifest_genesis_hash: Hash256,
+    manifest_start_height: u32,
+    manifest_stop_height: u32,
+    expectations: ArchiveExpectations<'_>,
+    requested_stop_height: u32,
+    archive_size: u64,
+    blocks_path: &Path,
+) -> Result<()> {
+    if manifest_network != Network::Mainnet {
+        bail!("corpus manifest network is {manifest_network:?}, expected mainnet");
+    }
+    if manifest_genesis_hash != Network::Mainnet.genesis_block_hash() {
+        bail!(
+            "corpus manifest genesis hash {} does not match mainnet genesis {}",
+            manifest_genesis_hash.to_string_be(),
+            Network::Mainnet.genesis_block_hash().to_string_be()
+        );
+    }
+    if manifest_start_height != 0 {
+        bail!("corpus manifest start height is {manifest_start_height}, expected 0");
+    }
+    if manifest_stop_height != requested_stop_height {
+        bail!(
+            "corpus manifest stop height {manifest_stop_height} does not match \
+             --stop-height {requested_stop_height}"
+        );
+    }
+    if archive_size != expectations.archive.size {
+        bail!(
+            "archive size {} does not match manifest {} for {}",
+            archive_size,
+            expectations.archive.size,
+            bounded_diagnostic_path(blocks_path)
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct FileInputs {
     manifest: CorpusManifest,
@@ -255,8 +341,139 @@ struct FileInputs {
     manifest_bytes_len: u64,
     manifest_sha: [u8; 32],
     blocks_path: PathBuf,
+    /// The one securely opened archive descriptor: regular-file checked,
+    /// size- and SHA-256-proven, and rewound to byte zero. The replay source
+    /// clones this identity instead of reopening `blocks_path`, so replacing
+    /// the path after preflight cannot change the replayed bytes.
+    archive_file: std::fs::File,
 }
 
+/// Rejects anything but a plain regular file — on Windows, any reparse
+/// point (symlink, junction, …) caught from the descriptor's own
+/// attributes — reporting the descriptor's own size.
+fn require_regular_file(file: std::fs::File, blocks_path: &Path) -> Result<(std::fs::File, u64)> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat archive {}", bounded_diagnostic_path(blocks_path)))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // The open already asked for the reparse point itself, so this
+        // attribute is read from the descriptor, never from a path
+        // re-check.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!(
+                "archive {} is a reparse point",
+                bounded_diagnostic_path(blocks_path)
+            );
+        }
+    }
+    if !metadata.is_file() {
+        bail!(
+            "archive {} is not a regular file",
+            bounded_diagnostic_path(blocks_path)
+        );
+    }
+    Ok((file, metadata.len()))
+}
+
+/// Opens the Core-framed archive for preflight and returns the descriptor
+/// plus its own `fstat` length.
+///
+/// Unix: no-follow, non-blocking, close-on-exec flags reject a symlinked
+/// path at open (ELOOP) and keep a FIFO or device from ever blocking the
+/// descriptor before the regular-file check. The size comes from the
+/// descriptor, so there is no window where replay stats one file and reads
+/// another.
+#[cfg(unix)]
+fn secure_open_archive(blocks_path: &Path) -> Result<(std::fs::File, u64)> {
+    // The shared custody opener carries the exact contract replay needs:
+    // the final component is never followed, a FIFO can never block the
+    // open, and the descriptor is close-on-exec.
+    let file =
+        bitcoin_rs_node::corpus::open_custody_input(blocks_path, "archive").map_err(|error| {
+            let message = format!(
+                "open archive {}: {error}",
+                bounded_diagnostic_path(blocks_path)
+            );
+            anyhow::Error::new(error).context(message)
+        })?;
+    require_regular_file(file, blocks_path)
+}
+
+/// Windows: open the final component as the reparse point itself
+/// (FILE_FLAG_OPEN_REPARSE_POINT) so a symlinked path is never followed,
+/// then reject the descriptor when its own attributes carry the reparse
+/// flag (see [`require_regular_file`]).
+#[cfg(windows)]
+fn secure_open_archive(blocks_path: &Path) -> Result<(std::fs::File, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(blocks_path)
+        .with_context(|| format!("open archive {}", bounded_diagnostic_path(blocks_path)))?;
+    require_regular_file(file, blocks_path)
+}
+
+/// Other targets expose no descriptor-level no-follow open primitive in
+/// std; refuse the archive outright rather than silently follow a symlink.
+#[cfg(not(any(unix, windows)))]
+fn secure_open_archive(blocks_path: &Path) -> Result<(std::fs::File, u64)> {
+    bail!(
+        "archive {} cannot be opened with descriptor-level no-follow protection on this platform",
+        bounded_diagnostic_path(blocks_path)
+    );
+}
+
+/// Streams the open archive once to prove its size and SHA-256 against the
+/// manifest, then returns the descriptor rewound to byte zero.
+///
+/// The proof runs against the descriptor, not the path: the bytes replay
+/// will read are exactly the bytes proven here even if the path is replaced
+/// afterward, and a same-size content swap still fails the digest check.
+fn verify_archive_digest(
+    file: std::fs::File,
+    expected: &ArchiveInfo,
+    blocks_path: &Path,
+) -> Result<std::fs::File> {
+    let mut hashing = HashingReader::new(BufReader::with_capacity(1 << 20, file));
+    std::io::copy(&mut hashing, &mut std::io::sink()).with_context(|| {
+        format!(
+            "stream archive {} for the manifest digest proof",
+            bounded_diagnostic_path(blocks_path),
+        )
+    })?;
+    let streamed_size = hashing.bytes_read();
+    if streamed_size != expected.size {
+        bail!(
+            "archive size {} does not match manifest {} for {}",
+            streamed_size,
+            expected.size,
+            bounded_diagnostic_path(blocks_path)
+        );
+    }
+    let streamed_digest = hashing.digest();
+    if streamed_digest != expected.sha256 {
+        bail!(
+            "archive SHA-256 mismatch for {}: manifest {}, streamed {}",
+            bounded_diagnostic_path(blocks_path),
+            to_lower_hex(expected.sha256.as_slice()),
+            to_lower_hex(streamed_digest.as_slice())
+        );
+    }
+    // Unwrap the hashing layer and its buffer, then rewind: the replay
+    // source reads this same open file from byte zero.
+    let mut file = hashing.into_inner().into_inner();
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind archive {}", bounded_diagnostic_path(blocks_path)))?;
+    Ok(file)
+}
+
+/// Loads the manifest, then secure-opens, size-gates, and digest-proves the
+/// archive — everything that must hold before `NodeState::open`.
 fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
     let blocks_path = args
         .blocks_file
@@ -266,45 +483,26 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
         .corpus_manifest
         .as_ref()
         .context("file mode requires --corpus-manifest")?;
-    let (manifest, manifest_bytes) = CorpusManifest::load_with_bytes(manifest_path)
-        .with_context(|| format!("load corpus manifest {}", manifest_path.display()))?;
-    if manifest.network != Network::Mainnet {
-        bail!(
-            "corpus manifest network is {:?}, expected mainnet",
-            manifest.network
-        );
-    }
-    if manifest.genesis_hash != Network::Mainnet.genesis_block_hash() {
-        bail!(
-            "corpus manifest genesis hash {} does not match mainnet genesis {}",
-            manifest.genesis_hash.to_string_be(),
-            Network::Mainnet.genesis_block_hash().to_string_be()
-        );
-    }
-    if manifest.start_height != 0 {
-        bail!(
-            "corpus manifest start height is {}, expected 0",
-            manifest.start_height
-        );
-    }
-    if manifest.stop_height != args.stop_height {
-        bail!(
-            "corpus manifest stop height {} does not match --stop-height {}",
-            manifest.stop_height,
-            args.stop_height
-        );
-    }
-    let archive_size = std::fs::metadata(blocks_path)
-        .with_context(|| format!("stat archive {}", blocks_path.display()))?
-        .len();
-    if archive_size != manifest.archive.size {
-        bail!(
-            "archive size {} does not match manifest {} for {}",
-            archive_size,
-            manifest.archive.size,
-            blocks_path.display()
-        );
-    }
+    let (manifest, manifest_bytes) =
+        CorpusManifest::load_with_bytes(manifest_path).with_context(|| {
+            format!(
+                "load corpus manifest {}",
+                bounded_diagnostic_path(manifest_path)
+            )
+        })?;
+    let expectations = ArchiveExpectations::from(&manifest);
+    let (archive_file, archive_size) = secure_open_archive(blocks_path)?;
+    validate_file_preflight(
+        manifest.network,
+        manifest.genesis_hash,
+        manifest.start_height,
+        manifest.stop_height,
+        expectations,
+        args.stop_height,
+        archive_size,
+        blocks_path,
+    )?;
+    let archive_file = verify_archive_digest(archive_file, expectations.archive, blocks_path)?;
     let manifest_digest = Sha256::digest(&manifest_bytes);
     let mut manifest_sha = [0_u8; 32];
     manifest_sha.copy_from_slice(manifest_digest.as_ref());
@@ -316,8 +514,26 @@ fn prepare_file_inputs(args: &Args) -> Result<FileInputs> {
         manifest_bytes_len,
         manifest_sha,
         blocks_path: blocks_path.clone(),
+        archive_file,
     })
 }
+/// Builds the replay node configuration from parsed arguments.
+///
+/// `--dbcache-mb` (default 450) flows into `Config::dbcache_mb` before
+/// `NodeState::open` divides the budget across storage namespaces; the offline
+/// benchmark controller always passes its shared cell budget explicitly.
+fn replay_config(args: &Args) -> Config {
+    let mut config = Config::default_for_network(Network::Mainnet);
+    config.data_dir.clone_from(&args.data_dir);
+    config.storage_backend.clone_from(&args.storage_backend);
+    config.p2p_listen.clear();
+    config.dns_seeds_enabled = false;
+    config.txindex = args.txindex;
+    config.assume_valid_height = args.assume_valid_height;
+    config.dbcache_mb = args.dbcache_mb;
+    config
+}
+
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if args.stop_height < args.start_height {
@@ -330,21 +546,17 @@ fn main() -> Result<()> {
     #[cfg(feature = "checksig-census")]
     validate_diagnostic_args(&args)?;
 
-    let mut config = Config::default_for_network(Network::Mainnet);
-    config.data_dir.clone_from(&args.data_dir);
-    config.storage_backend.clone_from(&args.storage_backend);
-    config.p2p_listen.clear();
-    config.dns_seeds_enabled = false;
-    config.txindex = args.txindex;
-    config.assume_valid_height = args.assume_valid_height;
+    let config = replay_config(&args);
 
     // In-memory recorder for the apply path's per-stage histograms.
     let metrics_handle =
         bitcoin_rs_node::metrics::install_diagnostic_metrics(Some(([127, 0, 0, 1], 0).into()))
             .context("install metrics recorder")?;
 
-    // Validate manifest identity, range, and archive size before opening state.
-    // The single replay read validates every frame and the final archive digest.
+    // Secure-open the archive, gate manifest identity and range, and prove
+    // the archive size and digest by streaming — all before opening state.
+    // The single replay read still validates every frame and the final
+    // archive digest, on the same descriptor the preflight proved.
     let file_mode = args.blocks_file.is_some();
     let file_inputs = if file_mode {
         Some(prepare_file_inputs(&args).context("prepare file-mode inputs")?)
@@ -367,11 +579,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let totals = replay_prefix(
-        &args,
-        file_inputs.as_ref().map(|inputs| &inputs.manifest),
-        &apply_handles,
-    )?;
+    let totals = replay_prefix(&args, file_inputs.as_ref(), &apply_handles)?;
     let txindex_catchup = if args.txindex {
         Some(wait_for_txindex(&state)?)
     } else {
@@ -381,12 +589,11 @@ fn main() -> Result<()> {
     // Performance custody runs must omit it because process wall and CPU still
     // include the scan; separate validation runs pass this option.
     if let Some(path) = args.validation_output.as_deref() {
-        write_validation_artifact(
-            path,
-            &apply_handles,
-            args.stop_height,
-            totals.stop_hash.as_deref(),
-        )?;
+        let stop_hash = totals
+            .stop_hash
+            .as_deref()
+            .context("custody output requires a concrete stop hash; the replay recorded none")?;
+        write_validation_artifact(path, &apply_handles, args.stop_height, stop_hash)?;
     }
     let artifact = build_replay_artifact(
         &args,
@@ -398,8 +605,8 @@ fn main() -> Result<()> {
     )?;
     let rendered = serde_json::to_string_pretty(&artifact).context("render artifact JSON")?;
     if let Some(output) = args.output {
-        std::fs::write(&output, rendered + "\n")
-            .with_context(|| format!("write {}", output.display()))?;
+        bitcoin_rs_node::corpus::publish_artifact(&output, format!("{rendered}\n").as_bytes())
+            .with_context(|| format!("write {}", bounded_diagnostic_path(&output)))?;
     } else {
         println!("{rendered}");
     }
@@ -560,7 +767,7 @@ fn write_validation_artifact(
     path: &Path,
     handles: &bitcoin_rs_node::apply::ApplyHandles,
     stop_height: u32,
-    stop_hash: Option<&str>,
+    stop_hash: &str,
 ) -> Result<()> {
     let stats = handles
         .utxo
@@ -579,7 +786,8 @@ fn write_validation_artifact(
     });
     let rendered =
         serde_json::to_string_pretty(&artifact).context("render validation artifact JSON")?;
-    std::fs::write(path, rendered + "\n").with_context(|| format!("write {}", path.display()))
+    bitcoin_rs_node::corpus::publish_artifact(path, format!("{rendered}\n").as_bytes())
+        .with_context(|| format!("write {}", bounded_diagnostic_path(path)))
 }
 
 #[derive(Debug)]
@@ -593,6 +801,8 @@ struct Args {
     corpus_manifest: Option<PathBuf>,
     assume_valid_height: u32,
     data_dir: PathBuf,
+    /// Cache budget in MiB for every storage namespace the replay opens.
+    dbcache_mb: u64,
     output: Option<PathBuf>,
     validation_output: Option<PathBuf>,
     window: usize,
@@ -614,6 +824,7 @@ impl Args {
             corpus_manifest: None,
             assume_valid_height: 0,
             data_dir: PathBuf::from(".bitcoin-rs-mainnet-prefix-replay"),
+            dbcache_mb: DEFAULT_DBCACHE_MB,
             output: None,
             validation_output: None,
             window: bitcoin_rs_node::apply::SCRIPT_BATCH_WINDOW,
@@ -626,9 +837,12 @@ impl Args {
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            let arg = arg
-                .into_string()
-                .map_err(|value| anyhow::anyhow!("argument is not UTF-8: {}", value.display()))?;
+            let arg = arg.into_string().map_err(|value| {
+                anyhow::anyhow!(
+                    "argument is not UTF-8: {}",
+                    bounded_diagnostic_path(Path::new(&value))
+                )
+            })?;
             match arg.as_str() {
                 "-h" | "--help" => {
                     print_usage();
@@ -653,6 +867,9 @@ impl Args {
                         .push(next_arg(&mut args, "--bitcoin-cli-arg")?);
                 }
                 "--data-dir" => parsed.data_dir = PathBuf::from(next_arg(&mut args, "--data-dir")?),
+                "--dbcache-mb" => {
+                    parsed.dbcache_mb = next_arg(&mut args, "--dbcache-mb")?.parse()?;
+                }
                 "--output" => parsed.output = Some(PathBuf::from(next_arg(&mut args, "--output")?)),
                 "--validation-output" => {
                     parsed.validation_output =
@@ -726,7 +943,12 @@ fn next_arg(args: &mut impl Iterator<Item = OsString>, name: &str) -> Result<Str
     args.next()
         .with_context(|| format!("{name} requires a value"))?
         .into_string()
-        .map_err(|value| anyhow::anyhow!("{name} value is not UTF-8: {}", value.display()))
+        .map_err(|value| {
+            anyhow::anyhow!(
+                "{name} value is not UTF-8: {}",
+                bounded_diagnostic_path(Path::new(&value))
+            )
+        })
 }
 
 fn parse_height(value: &str) -> Result<u32> {
@@ -776,17 +998,31 @@ fn to_lower_hex(bytes: &[u8]) -> String {
 /// The file source must win outright: building the REST source spawns a
 /// prefetch thread, so choosing it first and discarding it would start an
 /// HTTP pipeline the run never reads.
+/// In file mode `archive_file` is the preflight-opened descriptor: the
+/// source clones it instead of reopening `--blocks-file`, so it reads
+/// exactly the bytes the preflight proved.
 fn open_block_source<'a>(
     args: &'a Args,
     network: Network,
-    manifest: Option<&CorpusManifest>,
+    expectations: Option<ArchiveExpectations<'a>>,
+    archive_file: Option<&'a std::fs::File>,
 ) -> Result<BlockSource<'a>> {
     if let Some(path) = args.blocks_file.as_ref() {
-        let manifest = manifest
-            .with_context(|| "file mode requires a corpus manifest")?
-            .clone();
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("open Core-framed archive {}", path.display()))?;
+        let expectations = expectations.with_context(|| "file mode requires a corpus manifest")?;
+        let file = archive_file
+            .with_context(|| {
+                format!(
+                    "file mode requires the preflighted archive descriptor for {}",
+                    bounded_diagnostic_path(path)
+                )
+            })?
+            .try_clone()
+            .with_context(|| {
+                format!(
+                    "clone preflighted archive descriptor {}",
+                    bounded_diagnostic_path(path)
+                )
+            })?;
         let reader = CoreFrameReader::new(
             HashingReader::new(BufReader::with_capacity(1 << 20, file)),
             network.magic(),
@@ -794,7 +1030,7 @@ fn open_block_source<'a>(
         );
         return Ok(BlockSource::File {
             reader: Box::new(reader),
-            manifest,
+            expectations,
             next_index: 0,
         });
     }
@@ -819,7 +1055,7 @@ enum BlockSource<'a> {
     /// HTTP / second-process CPU overhead that a REST fetch adds.
     File {
         reader: Box<CoreFrameReader<HashingReader<BufReader<std::fs::File>>>>,
-        manifest: CorpusManifest,
+        expectations: ArchiveExpectations<'a>,
         next_index: usize,
     },
 }
@@ -843,7 +1079,7 @@ impl BlockSource<'_> {
                 .with_context(|| format!("prefetch thread gone before height {height}"))?,
             Self::File {
                 reader,
-                manifest,
+                expectations,
                 next_index,
             } => {
                 let offset = reader.offset();
@@ -860,7 +1096,7 @@ impl BlockSource<'_> {
                 if entry_index != expected_index {
                     bail!("manifest entry index mismatch: expected {height}, got {entry_index}");
                 }
-                let entry = manifest
+                let entry = expectations
                     .entries
                     .get(entry_index)
                     .with_context(|| format!("manifest has no entry for height {height}"))?;
@@ -905,7 +1141,9 @@ impl BlockSource<'_> {
     fn ensure_eof(&mut self) -> Result<()> {
         match self {
             Self::File {
-                reader, manifest, ..
+                reader,
+                expectations,
+                ..
             } => {
                 let offset = reader.offset();
                 match reader
@@ -915,18 +1153,18 @@ impl BlockSource<'_> {
                     None => {
                         let hashing = reader.get_ref();
                         let archive_bytes = hashing.bytes_read();
-                        if archive_bytes != manifest.archive.size {
+                        if archive_bytes != expectations.archive.size {
                             bail!(
                                 "archive size mismatch at EOF: manifest {}, read {}",
-                                manifest.archive.size,
+                                expectations.archive.size,
                                 archive_bytes
                             );
                         }
                         let archive_digest = hashing.digest();
-                        if archive_digest != manifest.archive.sha256 {
+                        if archive_digest != expectations.archive.sha256 {
                             bail!(
                                 "archive SHA-256 mismatch at EOF: manifest {}, read {}",
-                                to_lower_hex(manifest.archive.sha256.as_slice()),
+                                to_lower_hex(expectations.archive.sha256.as_slice()),
                                 to_lower_hex(archive_digest.as_slice())
                             );
                         }
@@ -1184,157 +1422,15 @@ fn write_diagnostic_artifact(
     let rendered =
         serde_json::to_string_pretty(&artifact).context("render diagnostic artifact JSON")?;
 
-    ensure_diagnostic_output_absent(output)?;
-    let (mut temp, mut file) = DiagnosticTempOutput::create(output)?;
-    file.write_all(rendered.as_bytes()).with_context(|| {
-        format!(
-            "write temporary diagnostic artifact {}",
-            temp.path.display()
-        )
-    })?;
-    file.write_all(b"\n").with_context(|| {
-        format!(
-            "terminate temporary diagnostic artifact {}",
-            temp.path.display()
-        )
-    })?;
-    file.flush().with_context(|| {
-        format!(
-            "flush temporary diagnostic artifact {}",
-            temp.path.display()
-        )
-    })?;
-    file.sync_all().with_context(|| {
-        format!(
-            "fsync temporary diagnostic artifact {}",
-            temp.path.display()
-        )
-    })?;
-    drop(file);
-
-    temp.publish(output)?;
-    let parent = output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    OpenOptions::new()
-        .read(true)
-        .open(parent)
-        .with_context(|| format!("open diagnostic output directory {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("fsync diagnostic output directory {}", parent.display()))?;
+    bitcoin_rs_node::corpus::publish_artifact(output, format!("{rendered}\n").as_bytes())
+        .with_context(|| {
+            format!(
+                "write diagnostic artifact {}",
+                bounded_diagnostic_path(output)
+            )
+        })?;
 
     Ok(())
-}
-
-#[cfg(feature = "checksig-census")]
-fn ensure_diagnostic_output_absent(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => bail!(
-            "refusing to replace existing diagnostic output {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("inspect diagnostic output destination {}", path.display())),
-    }
-}
-
-#[cfg(feature = "checksig-census")]
-struct DiagnosticTempOutput {
-    path: PathBuf,
-    armed: bool,
-}
-
-#[cfg(feature = "checksig-census")]
-impl DiagnosticTempOutput {
-    fn create(target: &Path) -> Result<(Self, std::fs::File)> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-        let file_name = target.file_name().with_context(|| {
-            format!(
-                "diagnostic output path {} has no file name",
-                target.display()
-            )
-        })?;
-        let parent = target
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create diagnostic output directory {}", parent.display()))?;
-
-        for _ in 0..128 {
-            let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let mut temp_name = file_name.to_os_string();
-            temp_name.push(format!(".tmp.{}.{id}", std::process::id()));
-            let path = parent.join(&temp_name);
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((Self { path, armed: true }, file)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("create temporary diagnostic artifact {}", path.display())
-                    });
-                }
-            }
-        }
-        bail!(
-            "could not reserve a temporary diagnostic artifact name beside {} after 128 attempts",
-            target.display()
-        )
-    }
-
-    fn publish(&mut self, target: &Path) -> Result<()> {
-        rename_noreplace(&self.path, target).with_context(|| {
-            format!(
-                "atomically publish {} without replacing {}",
-                self.path.display(),
-                target.display()
-            )
-        })?;
-        self.armed = false;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "checksig-census")]
-impl Drop for DiagnosticTempOutput {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[cfg(feature = "checksig-census")]
-#[cfg(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        from,
-        rustix::fs::CWD,
-        to,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(Into::into)
-}
-
-#[cfg(feature = "checksig-census")]
-#[cfg(not(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-)))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::hard_link(from, to)?;
-    std::fs::remove_file(from)
 }
 
 #[cfg(feature = "checksig-census")]
@@ -1441,16 +1537,17 @@ fn wait_for_txindex(state: &NodeState) -> Result<Duration> {
 
 fn print_usage() {
     println!(
-        "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--output <path>] [--validation-output <path>] [--txindex]"
+        "usage: mainnet_prefix_replay --stop-height <height> [--blocks-file <core-framed-archive> --corpus-manifest <manifest> | --rest-url <host:port> | --bitcoin-cli <path>] [--assume-valid-height <height>] [--bitcoin-cli-arg <arg>]... [--data-dir <path>] [--dbcache-mb <mb>] [--output <path>] [--validation-output <path>] [--txindex]"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
+    use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry};
     use bitcoin_rs_primitives::{Hash256, consensus_bytes};
     use std::io::Cursor;
+    use std::io::Read as _;
 
     fn regtest_genesis_bytes() -> Vec<u8> {
         consensus_bytes(&Network::Regtest.genesis_block())
@@ -1465,11 +1562,14 @@ mod tests {
         buf
     }
 
-    fn manifest_for_archive(
-        network: Network,
-        archive: &[u8],
-        payloads: &[&[u8]],
-    ) -> CorpusManifest {
+    /// Owned archive metadata plus entries a test borrows into an
+    /// `ArchiveExpectations` view — no synthetic `CorpusManifest`.
+    struct ArchiveFixture {
+        archive: ArchiveInfo,
+        entries: Vec<CorpusEntry>,
+    }
+
+    fn fixture_for_archive(archive: &[u8], payloads: &[&[u8]]) -> ArchiveFixture {
         let mut entries = Vec::new();
         let mut offset = 0_u64;
         for (height, payload) in payloads.iter().enumerate() {
@@ -1489,6 +1589,7 @@ mod tests {
                 .checked_add(payload.len() as u64)
                 .unwrap();
         }
+
         let archive_digest = {
             use sha2::Digest as _;
             let digest = Sha256::digest(archive);
@@ -1496,16 +1597,17 @@ mod tests {
             bytes.copy_from_slice(digest.as_ref());
             bytes
         };
-        CorpusManifest::new(
-            network,
-            ArchiveInfo::new(archive.len() as u64, archive_digest),
+        ArchiveFixture {
+            archive: ArchiveInfo::new(archive.len() as u64, archive_digest),
             entries,
-        )
-        .expect("test manifest is valid")
+        }
     }
 
-    fn write_manifest(manifest: &CorpusManifest, path: &Path) {
-        manifest.save(path).expect("save manifest")
+    fn expectations_for(fixture: &ArchiveFixture) -> ArchiveExpectations<'_> {
+        ArchiveExpectations {
+            archive: &fixture.archive,
+            entries: &fixture.entries,
+        }
     }
 
     fn args_for_file(archive_path: &Path, manifest_path: &Path) -> Args {
@@ -1516,19 +1618,43 @@ mod tests {
     }
 
     #[test]
+    fn dbcache_mb_defaults_to_comparator_parity() {
+        let args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        assert_eq!(args.dbcache_mb, 450);
+        assert_eq!(replay_config(&args).dbcache_mb, 450);
+        assert_eq!(
+            Config::default_for_network(Network::Mainnet).dbcache_mb,
+            450
+        );
+    }
+
+    #[test]
+    fn parsed_dbcache_mb_reaches_the_node_config() {
+        let args = Args::parse(["--dbcache-mb", "449"].map(OsString::from)).unwrap();
+        assert_eq!(args.dbcache_mb, 449);
+        // Fails if the parsed value is dropped from propagation: replay_config
+        // would otherwise leave the 450 default in place.
+        assert_eq!(replay_config(&args).dbcache_mb, 449);
+    }
+
+    #[test]
     fn file_source_reads_core_framed_blocks() {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let archive = write_archive(magic, &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
 
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
-        let manifest_temp = tempfile::NamedTempFile::new().unwrap();
-        write_manifest(&manifest, manifest_temp.path());
-
-        let args = args_for_file(archive_temp.path(), manifest_temp.path());
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let (hash, bytes) = source.fetch(0).unwrap();
         let expected = Network::Regtest.genesis_block().block_hash().to_string();
         assert_eq!(hash, expected);
@@ -1540,13 +1666,19 @@ mod tests {
     #[test]
     fn file_source_rejects_wrong_magic() {
         let archive = write_archive(Network::Mainnet.magic(), &[&regtest_genesis_bytes()[..]]);
-        let manifest =
-            manifest_for_archive(Network::Regtest, &archive, &[&regtest_genesis_bytes()[..]]);
+        let fixture = fixture_for_archive(&archive, &[&regtest_genesis_bytes()[..]]);
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             format!("{err:?}").to_lowercase().contains("wrong magic"),
@@ -1559,14 +1691,21 @@ mod tests {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let full_archive = write_archive(magic, &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &full_archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&full_archive, &[&payload[..]]);
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         let mut truncated = full_archive.clone();
         truncated.truncate(truncated.len() - 10);
         std::fs::write(archive_temp.path(), &truncated).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             format!("{err:?}")
@@ -1581,7 +1720,7 @@ mod tests {
         let payload = regtest_genesis_bytes();
         let magic = Network::Regtest.magic();
         let valid_archive = write_archive(magic, &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &valid_archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&valid_archive, &[&payload[..]]);
         let mut archive = Vec::new();
         archive.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         archive.extend_from_slice(&payload);
@@ -1589,7 +1728,14 @@ mod tests {
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             format!("{err:?}").to_lowercase().contains("wrong magic"),
@@ -1604,12 +1750,19 @@ mod tests {
         // Archive with two frames, manifest expecting one.
         let two_frame_archive = write_archive(magic, &[&payload[..], &payload[..]]);
         let one_frame_archive = write_archive(magic, &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &one_frame_archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&one_frame_archive, &[&payload[..]]);
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &two_frame_archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         source.fetch(0).unwrap();
         let err = source.ensure_eof().unwrap_err();
         assert!(err.to_string().contains("extra frame"), "{err}");
@@ -1620,14 +1773,21 @@ mod tests {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let archive = write_archive(magic, &[&payload[..]]);
-        let mut manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
-        manifest.entries[0].hash = Hash256::from_le_bytes(&[0xab; 32]);
+        let mut fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        fixture.entries[0].hash = Hash256::from_le_bytes(&[0xab; 32]);
 
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("hash mismatch"),
@@ -1640,14 +1800,21 @@ mod tests {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let archive = write_archive(magic, &[&payload[..]]);
-        let mut manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
-        manifest.entries[0].offset = 1;
+        let mut fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        fixture.entries[0].offset = 1;
 
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("offset mismatch"),
@@ -1660,14 +1827,21 @@ mod tests {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let archive = write_archive(magic, &[&payload[..]]);
-        let mut manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
-        manifest.entries[0].payload_length = 1;
+        let mut fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        fixture.entries[0].payload_length = 1;
 
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         let err = source.fetch(0).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("length mismatch"),
@@ -1680,20 +1854,128 @@ mod tests {
         let magic = Network::Regtest.magic();
         let payload = regtest_genesis_bytes();
         let archive = write_archive(magic, &[&payload[..]]);
-        let mut manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
-        manifest.archive.sha256 = [0xcd; 32];
+        let mut fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        fixture.archive.sha256 = [0xcd; 32];
 
         let archive_temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(archive_temp.path(), &archive).unwrap();
 
         let args = args_for_file(archive_temp.path(), Path::new("/nonexistent/manifest.json"));
-        let mut source = open_block_source(&args, Network::Regtest, Some(&manifest)).unwrap();
+        let file = std::fs::File::open(archive_temp.path()).unwrap();
+        let mut source = open_block_source(
+            &args,
+            Network::Regtest,
+            Some(expectations_for(&fixture)),
+            Some(&file),
+        )
+        .unwrap();
         source.fetch(0).unwrap();
         let err = source.ensure_eof().unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("sha-256 mismatch"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn preflight_digest_proof_rejects_same_size_corruption() {
+        let magic = Network::Regtest.magic();
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(magic, &[&payload[..]]);
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        let archive_temp = tempfile::NamedTempFile::new().unwrap();
+        let mut corrupted = archive.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        std::fs::write(archive_temp.path(), &corrupted).unwrap();
+        let err = verify_archive_digest(
+            std::fs::File::open(archive_temp.path()).unwrap(),
+            &fixture.archive,
+            archive_temp.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("sha-256 mismatch"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlinked_archive() {
+        let magic = Network::Regtest.magic();
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(magic, &[&payload[..]]);
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("archive.bin");
+        std::fs::write(&real, &archive).unwrap();
+        let link = dir.path().join("archive-link.bin");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = secure_open_archive(&link).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("symbolic link"),
+            "{err}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preflight_rejects_symlinked_archive_windows() {
+        let magic = Network::Regtest.magic();
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(magic, &[&payload[..]]);
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("archive.bin");
+        std::fs::write(&real, &archive).unwrap();
+        let link = dir.path().join("archive-link.bin");
+        // Creating a file symlink needs developer mode or the symlink
+        // privilege; machines with neither skip this test.
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            return;
+        }
+        let err = secure_open_archive(&link).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("reparse point"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_non_regular_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = secure_open_archive(dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("not a regular file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn preflight_descriptor_pins_bytes_after_path_replacement() {
+        let magic = Network::Regtest.magic();
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(magic, &[&payload[..]]);
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        let archive_temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(archive_temp.path(), &archive).unwrap();
+        let (preflighted, size) = secure_open_archive(archive_temp.path()).unwrap();
+        assert_eq!(size, archive.len() as u64);
+        let mut preflighted =
+            verify_archive_digest(preflighted, &fixture.archive, archive_temp.path()).unwrap();
+        // Replace the path with a different archive: the preflighted
+        // descriptor must still read the proven bytes, from byte zero (the
+        // read below does not seek first).
+        let swapped = write_archive(magic, &[&[0xa5_u8; 80][..]]);
+        let replacement = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(replacement.path(), &swapped).unwrap();
+        std::fs::rename(replacement.path(), archive_temp.path()).unwrap();
+        assert_eq!(std::fs::read(archive_temp.path()).unwrap(), swapped);
+        let mut replayed = Vec::new();
+        preflighted.read_to_end(&mut replayed).unwrap();
+        assert_eq!(replayed, archive);
     }
 
     #[test]
@@ -1715,19 +1997,19 @@ mod tests {
     fn file_preflight_rejects_regtest_manifest() {
         let payload = regtest_genesis_bytes();
         let archive = write_archive(Network::Regtest.magic(), &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Regtest, &archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
 
-        let archive_temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(archive_temp.path(), &archive).unwrap();
-        let manifest_temp = tempfile::NamedTempFile::new().unwrap();
-        write_manifest(&manifest, manifest_temp.path());
-
-        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
-        args.stop_height = 0;
-        args.blocks_file = Some(archive_temp.path().to_path_buf());
-        args.corpus_manifest = Some(manifest_temp.path().to_path_buf());
-
-        let err = prepare_file_inputs(&args).unwrap_err();
+        let err = validate_file_preflight(
+            Network::Regtest,
+            Network::Regtest.genesis_block_hash(),
+            0,
+            0,
+            expectations_for(&fixture),
+            0,
+            archive.len() as u64,
+            Path::new("/tmp/archive"),
+        )
+        .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("mainnet"), "{err}");
     }
 
@@ -1735,22 +2017,21 @@ mod tests {
     fn file_preflight_rejects_stop_height_mismatch() {
         let payload = regtest_genesis_bytes();
         let archive = write_archive(Network::Mainnet.magic(), &[&payload[..]]);
-        let manifest = {
-            let m = manifest_for_archive(Network::Mainnet, &archive, &[&payload[..]]);
-            m
-        };
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
 
-        let archive_temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(archive_temp.path(), &archive).unwrap();
-        let manifest_temp = tempfile::NamedTempFile::new().unwrap();
-        write_manifest(&manifest, manifest_temp.path());
-
-        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
-        args.stop_height = 1; // manifest has stop_height 0
-        args.blocks_file = Some(archive_temp.path().to_path_buf());
-        args.corpus_manifest = Some(manifest_temp.path().to_path_buf());
-
-        let err = prepare_file_inputs(&args).unwrap_err();
+        // The fixture stop height is 0; a requested --stop-height of 1
+        // must be rejected by the pure preflight.
+        let err = validate_file_preflight(
+            Network::Mainnet,
+            Network::Mainnet.genesis_block_hash(),
+            0,
+            0,
+            expectations_for(&fixture),
+            1,
+            archive.len() as u64,
+            Path::new("/tmp/archive"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("stop height"),
             "{err}"
@@ -1761,25 +2042,132 @@ mod tests {
     fn file_preflight_rejects_archive_size_mismatch() {
         let payload = regtest_genesis_bytes();
         let full_archive = write_archive(Network::Mainnet.magic(), &[&payload[..]]);
-        let manifest = manifest_for_archive(Network::Mainnet, &full_archive, &[&payload[..]]);
+        let fixture = fixture_for_archive(&full_archive, &[&payload[..]]);
 
-        let archive_temp = tempfile::NamedTempFile::new().unwrap();
-        let mut truncated = full_archive.clone();
-        truncated.truncate(truncated.len() - 1);
-        std::fs::write(archive_temp.path(), &truncated).unwrap();
-        let manifest_temp = tempfile::NamedTempFile::new().unwrap();
-        write_manifest(&manifest, manifest_temp.path());
-
-        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
-        args.stop_height = 0;
-        args.blocks_file = Some(archive_temp.path().to_path_buf());
-        args.corpus_manifest = Some(manifest_temp.path().to_path_buf());
-
-        let err = prepare_file_inputs(&args).unwrap_err();
+        let err = validate_file_preflight(
+            Network::Mainnet,
+            Network::Mainnet.genesis_block_hash(),
+            0,
+            0,
+            expectations_for(&fixture),
+            0,
+            (full_archive.len() - 1) as u64,
+            Path::new("/tmp/archive"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("archive size"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn preflight_error_bounds_hostile_archive_path() {
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(Network::Mainnet.magic(), &[&payload[..]]);
+        let fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        let hostile = format!("a\n\u{1b}[31m\u{202e}{}", "x".repeat(180));
+        let rendered = validate_file_preflight(
+            Network::Mainnet,
+            Network::Mainnet.genesis_block_hash(),
+            0,
+            0,
+            expectations_for(&fixture),
+            0,
+            (archive.len() - 1) as u64,
+            Path::new(&hostile),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rendered.contains("archive size"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "raw bidi: {rendered:?}");
+        assert!(!rendered.contains(&"x".repeat(40)), "raw run: {rendered:?}");
+        assert!(rendered.contains("sha256="), "no fingerprint: {rendered:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_error_bounds_hostile_path() {
+        let hostile = format!("missing\n\u{1b}[31m.bin");
+        let rendered = secure_open_archive(Path::new(&hostile))
+            .unwrap_err()
+            .to_string();
+        assert!(rendered.contains("open archive"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline: {rendered:?}");
+        assert!(rendered.contains("path:"), "bounded: {rendered:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_error_bounds_hostile_archive_path() {
+        let magic = Network::Regtest.magic();
+        let payload = regtest_genesis_bytes();
+        let archive = write_archive(magic, &[&payload[..]]);
+        let mut fixture = fixture_for_archive(&archive, &[&payload[..]]);
+        fixture.archive.sha256 = [0xcd; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let hostile = format!("a\n\u{1b}[31m.bin");
+        let path = dir.path().join(&hostile);
+        std::fs::write(&path, &archive).unwrap();
+        let rendered =
+            verify_archive_digest(std::fs::File::open(&path).unwrap(), &fixture.archive, &path)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            rendered.to_lowercase().contains("sha-256 mismatch"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline: {rendered:?}");
+        assert!(rendered.contains("path:"), "bounded: {rendered:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn args_parse_bounds_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let rendered = Args::parse(
+            [std::ffi::OsStr::from_bytes(b"--data\n\x1b[31mdir\xff").to_os_string()].into_iter(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rendered.contains("argument is not UTF-8"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline: {rendered:?}");
+        assert!(rendered.contains("path:"), "bounded: {rendered:?}");
+
+        let rendered = Args::parse([
+            OsString::from("--bitcoin-cli"),
+            std::ffi::OsStr::from_bytes(b"cli\n\x1b[31mbinary\xff").to_os_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(rendered.contains("value is not UTF-8"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline: {rendered:?}");
+        assert!(rendered.contains("path:"), "bounded: {rendered:?}");
+    }
+
+    #[cfg(all(unix, feature = "checksig-census"))]
+    #[test]
+    fn diagnostic_write_error_bounds_hostile_output() {
+        let mut args = Args::parse(std::iter::empty::<OsString>()).unwrap();
+        args.output = Some(PathBuf::from("/nonexistent\n\u{1b}[31m/diagnostic.json"));
+        let rendered = write_diagnostic_artifact(
+            &args,
+            7,
+            "0000000000000000000000000000000000000000000000000000000000000007".into(),
+            Duration::ZERO,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rendered.contains("write diagnostic artifact"), "{rendered}");
+        assert!(!rendered.contains('\u{1b}'), "raw escape: {rendered:?}");
+        assert!(!rendered.contains('\n'), "raw newline: {rendered:?}");
+        assert!(rendered.contains("path:"), "bounded: {rendered:?}");
     }
 
     #[cfg(feature = "checksig-census")]
