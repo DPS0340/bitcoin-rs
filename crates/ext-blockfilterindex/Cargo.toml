@@ -16,3 +16,6 @@ bitcoin-rs-ext-api.workspace = true
 bitcoin-rs-storage.workspace = true
 bitcoin.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true
