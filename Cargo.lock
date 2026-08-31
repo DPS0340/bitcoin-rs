@@ -346,7 +346,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "metrics-exporter-prometheus",
- "mimalloc",
  "parking_lot",
  "proptest",
  "quanta",

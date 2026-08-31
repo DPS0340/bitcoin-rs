@@ -18,8 +18,8 @@ through the `ZmqPublisher` trait and its `SocketZmqPublisher` / `TracingZmqPubli
 `shutdown` bridge process signals into graceful shutdown.
 
 The node crate registers only `benches/sync_pipeline.rs` as a Criterion benchmark.
-Corpus export and mainnet replay measurement live under `examples/`, so diagnostic
-recorders and RSS sampling cannot become part of the runtime crate API.
+Large corpus/replay/evidence harnesses are intentionally not shipped by this
+runtime crate.
 
 ## Features
 - `default` (enables `fjall` and `kernel`): the performance-oriented fjall storage
@@ -30,10 +30,6 @@ recorders and RSS sampling cannot become part of the runtime crate API.
 - `mdbx`: forward the mdbx backend to the crates that provide one.
 - `kernel`: route consensus verification through bitcoinkernel
   (`bitcoin-rs-consensus/kernel`).
-- `checksig-census`: `kernel` plus the consensus crate's checksig-census
-  instrumentation.
-- `mimalloc`: pulls the optional `mimalloc` dependency; the
-  `mainnet_prefix_replay` example registers it as the global allocator.
 - `prometheus-http`: enables the `metrics-exporter-prometheus/http-listener` feature;
   the production listener itself is controlled by `metrics_bind`.
 

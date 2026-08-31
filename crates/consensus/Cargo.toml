@@ -14,7 +14,6 @@ workspace = true
 [features]
 default = ["kernel"]
 kernel = ["dep:bitcoinkernel"]
-checksig-census = ["kernel"]
 rocksdb = []
 fjall = []
 redb = []
@@ -40,7 +39,3 @@ hashbrown.workspace = true
 [[bench]]
 name = "merkle"
 harness = false
-
-[[example]]
-name = "kernel_verify_spike"
-required-features = ["kernel"]

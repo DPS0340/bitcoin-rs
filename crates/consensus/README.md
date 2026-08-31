@@ -21,8 +21,6 @@ variants.
 ## Features
 - `kernel` (default): routes script verification through
   [bitcoinkernel](../../CONCEPTS.md#bitcoinkernel)
-- `checksig-census`: enables the `census_checkpoint` module, the non-terminal CHECKSIG
-  census checkpoint ABI wrapper; implies `kernel`
 - `rocksdb`, `fjall`, `redb`: empty in this crate, accepted so workspace-wide feature
   selection does not fail here
 

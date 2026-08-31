@@ -3686,15 +3686,6 @@ mod consensus_rule_tests {
     const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
 
     #[derive(Clone, Copy, Debug, Default)]
-    struct TestMetricsHandle;
-
-    impl TestMetricsHandle {
-        fn snapshot(&self) -> HashMap<String, ()> {
-            HashMap::new()
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Default)]
     struct TestRecorder;
 
     impl Recorder for TestRecorder {
@@ -3724,8 +3715,8 @@ mod consensus_rule_tests {
         }
     }
 
-    fn test_recorder() -> (TestRecorder, TestMetricsHandle) {
-        (TestRecorder, TestMetricsHandle)
+    fn test_recorder() -> TestRecorder {
+        TestRecorder
     }
 
     /// Parses `block` the way production does, so tests exercise the real
@@ -6423,7 +6414,7 @@ mod consensus_rule_tests {
     fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::OP_EQUAL;
-        let (recorder, metrics_handle) = test_recorder();
+        let recorder = test_recorder();
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let prevout = bitcoin::OutPoint {
@@ -6494,13 +6485,6 @@ mod consensus_rule_tests {
             "a skipped block must carry AssumeValidSkipped, not script proof: the proof branch \
              bypasses the trust-gate re-read at commit, so a gate that flips in between would let \
              an unverified block through"
-        );
-        assert_eq!(
-            metrics_handle
-                .snapshot()
-                .get("node.window.verify_success_total"),
-            None,
-            "an empty verification dispatch must not count as script verification",
         );
         let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
         let Some(skipped) = entries.pop() else {
