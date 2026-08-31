@@ -71,12 +71,14 @@ handles well. **The hypothesis is refuted at this scale on this allocator** —
 with two caveats worth keeping: production links mimalloc rather than the system
 allocator, and 645,804 blocks is far more churn than twenty rounds.
 
-## Measured on a real chainstate
+## Historical full-node measurement
 
 A pruned mainnet sync to **height 412,732** (38,145,360 outputs across
-10,519,335 records) settled the assumptions above. Taken from the checkpoint
-path, so sync has stopped and the subsystems have drained — in-flight samples
-swing between 1.1 and 3.2 GB and measure block staging, not the set.
+10,519,335 records) settled the assumptions above. The figures below are
+historical evidence collected by the former checkpoint RSS-attribution hook;
+that hook is no longer part of the node runtime. Current full-node RSS evidence
+must use an external process monitor, while `snapshot_memory` remains the
+supported UTXO-only measurement path.
 
 | Layer | Bytes/output | Total |
 |---|---:|---:|

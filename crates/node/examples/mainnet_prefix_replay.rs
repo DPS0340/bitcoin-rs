@@ -25,12 +25,18 @@ use bitcoin::{Block, BlockHash, Weight};
 use bitcoin_rs_consensus::census_checkpoint;
 use bitcoin_rs_node::Network;
 use bitcoin_rs_node::config::Config;
-use bitcoin_rs_node::corpus::CorpusManifest;
-use bitcoin_rs_node::corpus::{CoreRestClient, CoreRestError, FetchedBlock, fetch_rest_block};
 use bitcoin_rs_node::state::NodeState;
 use bitcoin_rs_storage::CoreFrameReader;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
+
+#[path = "support/corpus.rs"]
+mod corpus;
+#[path = "support/metrics.rs"]
+mod replay_metrics;
+
+use corpus::{CoreRestClient, CoreRestError, CorpusManifest, FetchedBlock, fetch_rest_block};
+use replay_metrics::{MetricValue, MetricsHandle};
 
 /// Consensus-maximum serialized block size in bytes, derived from the
 /// maximum block weight (BIP 141). No valid serialized block can be larger.
@@ -353,10 +359,9 @@ fn main() -> Result<()> {
     config.txindex = args.txindex;
     config.assume_valid_height = args.assume_valid_height;
 
-    // In-memory recorder for the apply path's per-stage histograms.
-    let metrics_handle =
-        bitcoin_rs_node::metrics::install_diagnostic_metrics(Some(([127, 0, 0, 1], 0).into()))
-            .context("install metrics recorder")?;
+    // The replay tool owns its diagnostic recorder; the node runtime only
+    // exposes the production Prometheus path.
+    let metrics_handle = Some(replay_metrics::install().context("install metrics recorder")?);
 
     // Validate manifest identity, range, and archive size before opening state.
     // The single replay read validates every frame and the final archive digest.
@@ -437,11 +442,11 @@ fn build_replay_artifact(
     file_inputs: Option<&FileInputs>,
     totals: &ReplayTotals,
     txindex_catchup: Option<Duration>,
-    metrics_handle: Option<bitcoin_rs_node::metrics::MetricsHandle>,
+    metrics_handle: Option<MetricsHandle>,
 ) -> Result<serde_json::Value> {
     let snapshot = metrics_handle
         .as_ref()
-        .map(bitcoin_rs_node::metrics::MetricsHandle::snapshot)
+        .map(|handle| handle.snapshot())
         .unwrap_or_default();
     let metrics = ArtifactMetrics {
         block_count: args
@@ -704,19 +709,14 @@ impl Args {
 /// utxo — and anything added later), sorted by total time descending.
 /// Deliberately unfiltered: a surprise entry in this list is diagnostic
 /// signal, not noise.
-fn counter_value(
-    snapshot: &hashbrown::HashMap<String, bitcoin_rs_node::metrics::MetricValue>,
-    name: &str,
-) -> u64 {
+fn counter_value(snapshot: &hashbrown::HashMap<String, MetricValue>, name: &str) -> u64 {
     match snapshot.get(name) {
-        Some(bitcoin_rs_node::metrics::MetricValue::Counter(value)) => *value,
+        Some(MetricValue::Counter(value)) => *value,
         _ => 0,
     }
 }
 
-fn stage_decomposition(
-    handle: Option<bitcoin_rs_node::metrics::MetricsHandle>,
-) -> Vec<serde_json::Value> {
+fn stage_decomposition(handle: Option<MetricsHandle>) -> Vec<serde_json::Value> {
     let Some(handle) = handle else {
         return Vec::new();
     };
@@ -724,9 +724,7 @@ fn stage_decomposition(
         .snapshot()
         .into_iter()
         .filter_map(|(name, value)| match value {
-            bitcoin_rs_node::metrics::MetricValue::Histogram { count, sum } => {
-                Some((name, count, sum))
-            }
+            MetricValue::Histogram { count, sum } => Some((name, count, sum)),
             _ => None,
         })
         .collect();
@@ -1437,9 +1435,9 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    use super::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
     use super::*;
     use bitcoin::consensus::Encodable as _;
-    use bitcoin_rs_node::corpus::{ArchiveInfo, CorpusEntry, CorpusManifest};
     use bitcoin_rs_primitives::Hash256;
     use std::io::Cursor;
 

@@ -125,7 +125,3 @@ criterion.workspace = true
 [[bench]]
 name = "sync_pipeline"
 harness = false
-
-[[bench]]
-name = "sync_apply_metrics"
-harness = false

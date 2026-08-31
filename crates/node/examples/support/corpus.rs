@@ -619,7 +619,7 @@ pub fn export_corpus_from_rest(
 /// bytes are decoded only to verify their hash and are written without
 /// re-encoding. The archive is durably published before the validated manifest.
 pub fn export_active_chain_corpus(
-    state: &crate::state::NodeState,
+    state: &bitcoin_rs_node::state::NodeState,
     network: Network,
     stop_height: u32,
     archive_path: impl AsRef<Path>,

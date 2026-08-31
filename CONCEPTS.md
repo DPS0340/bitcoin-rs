@@ -166,13 +166,14 @@ were not handed to the file.
 ### Checkpoint MuHash batch
 
 The independent checkpoint traversal derives CoinStats and MuHash again instead
-of trusting the rolling listener that supplies live state. It encodes exact coin
+of trusting an optional rolling listener. The node runtime keeps only the
+listener's applied height and transaction count on the hot path; the checkpoint
+scan is authoritative for all UTXO-derived fields. It encodes exact coin
 preimages into a bounded arena and computes insert-only partial MuHash values in
 parallel. The arena holds at most 262,144 coins or 16 MiB. Each flush uses no
 more lanes than the active Rayon pool or the 32-lane cap. The larger batch
-reduces partial-value construction and combination. It does not remove the
-listener-versus-traversal check, change preimage bytes, change snapshot bytes,
-or weaken checkpoint durability.
+reduces partial-value construction and combination. It does not change
+preimage bytes, snapshot bytes, or checkpoint durability.
 
 ### Coalesced TxIndex wake
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
@@ -195,7 +196,13 @@ disconnect because flip-flop between competing branches is normal.
 
 State that connection writes and disconnection must account for. The required action depends on how that state is addressed and published.
 
-`coin_stats` needs an explicit inverse for its block-level fields. Its per-coin fields use the UTXO change listener, so the UTXO undo already reverses them. The filter index needs no row rollback because its rows are block-hash-addressed like block bodies; disconnection only repoints its last-tip cache. That cache and the `blocks` RPC pop are best-effort in-process refreshes.
+`coin_stats` needs an explicit inverse for its block-level fields. A caller that
+installs the optional UTXO change listener gets per-coin inverse updates from the
+UTXO undo; the default node instead recomputes those fields during checkpoint
+and stable UTXO reads. The filter index needs no row rollback because its rows
+are block-hash-addressed like block bodies; disconnection only repoints its
+last-tip cache. That cache and the `blocks` RPC pop are best-effort in-process
+refreshes.
 
 `TxIndex` is durable derived state outside the authoritative disconnect transaction. After `applied_tip` moves, the node publishes a revision and a coalesced wake. One worker compares the enabled `TxLookup` and `ScriptHistory` watermarks with applied-tip ancestry, rolls stale cursors back to the common ancestor, and commits count-and-byte-bounded forward batches. Equal cursors share one body scan and atomic commit; divergent cursors move only the lagging capability. It can assemble one pending batch across strict descendant tip revisions. A rival, lower, or absent tip can make the worker commit the complete prepared prefix before the next pass repairs it. Queries gate on the exact capability watermarks they consume and refuse incomplete answers while any required cursor lags or the worker is unavailable.
 

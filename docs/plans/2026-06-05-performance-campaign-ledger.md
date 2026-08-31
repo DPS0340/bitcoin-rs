@@ -4,6 +4,11 @@
 > and the rejected-candidate log for the 2026-06-05 campaign. It describes decisions
 > already landed or already rejected; it is not a description of current behaviour.
 
+The former `sync_apply_metrics` target was a one-shot diagnostic runner rather than
+a reproducible Criterion benchmark. It was retired after its evidence was captured;
+the historical measurements below remain as records, while current sync performance
+measurement uses `crates/node/benches/sync_pipeline.rs` and the mainnet replay example.
+
 ## Current Performance Campaign Status (2026-06-05)
 
 This section tracks the sync/UTXO performance campaign that has landed on `origin/main`.

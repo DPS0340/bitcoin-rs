@@ -75,7 +75,7 @@ bitcoin-rs/
 │   ├── electrum/                 # Electrum protocol over the index
 │   │   └── benches/              # electrum_methods.rs
 │   ├── node/                     # event loop; config (TOML + bitcoin.conf compat + CLI + env); signal handling; metrics; tracing; graceful shutdown
-│   │   └── benches/              # sync_pipeline.rs, sync_apply_metrics.rs
+│   │   └── benches/              # sync_pipeline.rs
 └── bin/
     └── bitcoin-rs/               # main.rs; thin — wires `crates/node`; tests/gates/g01..g15
 ```
@@ -171,7 +171,7 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 
 **G1 — Headers-only sync parity.** `bitcoin-rs --network mainnet` → header chain hash matches `bitcoind`'s `getblockhash` for every height 0..tip.
 
-**G2 — Full IBD UTXO root parity.** Every 10 000 blocks during IBD, our running coinstats hash matches Bitcoin Core's `gettxoutsetinfo` muhash field byte-for-byte.
+**G2 — Retired runtime evidence hook.** The former periodic MuHash sample emitter and its daemon/configuration surface were removed from the node runtime. MuHash correctness remains covered by checkpoint and UTXO snapshot parity tests; full-IBD evidence collection is no longer an acceptance-gate command.
 
 **G3 — Kernel parity gate.** During the first 100 000 mainnet blocks of CI, every block is validated through *both* our Rust validator and `bitcoinkernel`. Any disagreement is a CI hard-fail; the failing block + log is artifacted.
 
@@ -440,7 +440,7 @@ Serialized via `zerocopy::AsBytes` where layout permits; script bytes are length
 
 - [ ] **Step 12: `crates/utxo/tests/defrag_invariants.rs`** — random commits with ~50 % deletions, repeatedly `defrag_one_shard`, assert no entries vanish.
 
-- [ ] **Step 13: `crates/utxo/benches/utxo_commit.rs`** — criterion: commit synthetic 4 MiB blocks at 10 k input + 10 k output density; report p50 / p95 / p99 + entries-per-shard distribution.
+- [ ] **Step 13: `crates/utxo/benches/utxo_commit.rs`** — Criterion coverage for production-shaped UTXO commits: representative shard fan-out, concentrated writes, same-record churn, full spends, and spend fan-out. Listener no-op and build-time duplicate arms are intentionally excluded.
 
 - [ ] **Step 14: Commit.**
 
@@ -818,7 +818,7 @@ git commit -am "feat(bin): bitcoin-rs binary" -m "Op: extend"
 ### Task 20: Verification gates G1–G15 — flat acceptance suite
 
 **Files:**
-- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g02_ibd_muhash_parity,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
+- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
 - CI: `.github/workflows/ci.yml`
 
 Each gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or externally collected evidence; G14 verifies the externally collected evidence contract (gathered by the `scripts/run-g14-*.sh` drivers) and fails closed when it is missing. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all 15 gates are green for two consecutive CI runs on `main`.
@@ -845,4 +845,4 @@ The 2026-05-19 Ultrareview Log moved to [docs/plans/2026-05-19-ultrareview-log.m
 
 **Workspace setup:** The plan's `bitcoin-rs/` subdirectory lives inside the workspace; reference repos (`gocoin/`, `electrs/`, `utreexod/`, `bitcoin/`, `btcd/`) remain readable from the cwd parent.
 
-**Done definition:** All 21 tasks committed, all 15 verification gates green twice on `main`, `cargo +1.95.0 clippy -p bitcoin-rs --all-targets --no-default-features --features "$FEATURES" -- -D warnings` clean, `cargo deny check` clean, `cargo +1.95.0 fmt --check` clean, `target/release/bitcoin-rs --version` prints `0.4.0`, IBD to mainnet tip completes with G2 + G3 + G14 all reporting green.
+**Done definition:** All 21 tasks committed, all active verification gates green twice on `main`, `cargo +1.95.0 clippy -p bitcoin-rs --all-targets --no-default-features --features "$FEATURES" -- -D warnings` clean, `cargo deny check` clean, `cargo +1.95.0 fmt --check` clean, `target/release/bitcoin-rs --version` prints `0.4.0`, IBD to mainnet tip completes with G3 + G14 reporting green.

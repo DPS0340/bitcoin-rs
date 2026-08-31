@@ -158,20 +158,6 @@ pub struct Config {
     pub log_level: String,
     /// Optional Prometheus metrics bind address.
     pub metrics_bind: Option<SocketAddr>,
-    /// Optional path for applied-block G2 `MuHash` samples.
-    pub g2_muhash_samples: Option<PathBuf>,
-    /// Optional final applied height to include in G2 `MuHash` samples.
-    pub g2_muhash_tip_height: Option<u32>,
-    /// Optional path for applied-block G14 UTXO commit timing samples.
-    pub g14_utxo_commit_samples: Option<PathBuf>,
-    /// Optional IBD window start height for G14 UTXO commit samples.
-    pub g14_utxo_commit_ibd_start_height: Option<u32>,
-    /// Optional IBD window stop height for G14 UTXO commit samples.
-    pub g14_utxo_commit_ibd_stop_height: Option<u32>,
-    /// Optional IBD window start block hash for G14 UTXO commit samples.
-    pub g14_utxo_commit_ibd_start_hash: Option<String>,
-    /// Optional IBD window stop block hash for G14 UTXO commit samples.
-    pub g14_utxo_commit_ibd_stop_hash: Option<String>,
     /// ZMQ `hashblock` PUB bind endpoints.
     pub zmqpubhashblock: Vec<String>,
     /// ZMQ `hashtx` PUB bind endpoints.
@@ -224,25 +210,6 @@ impl fmt::Debug for Config {
             .field("dbcache_mb", &self.dbcache_mb)
             .field("log_level", &self.log_level)
             .field("metrics_bind", &self.metrics_bind)
-            .field("g2_muhash_samples", &self.g2_muhash_samples)
-            .field("g2_muhash_tip_height", &self.g2_muhash_tip_height)
-            .field("g14_utxo_commit_samples", &self.g14_utxo_commit_samples)
-            .field(
-                "g14_utxo_commit_ibd_start_height",
-                &self.g14_utxo_commit_ibd_start_height,
-            )
-            .field(
-                "g14_utxo_commit_ibd_stop_height",
-                &self.g14_utxo_commit_ibd_stop_height,
-            )
-            .field(
-                "g14_utxo_commit_ibd_start_hash",
-                &self.g14_utxo_commit_ibd_start_hash,
-            )
-            .field(
-                "g14_utxo_commit_ibd_stop_hash",
-                &self.g14_utxo_commit_ibd_stop_hash,
-            )
             .field("zmqpubhashblock", &self.zmqpubhashblock)
             .field("zmqpubhashtx", &self.zmqpubhashtx)
             .field("zmqpubrawblock", &self.zmqpubrawblock)
@@ -285,13 +252,6 @@ impl Config {
             dbcache_mb: DEFAULT_DBCACHE_MB,
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             metrics_bind: None,
-            g2_muhash_samples: None,
-            g2_muhash_tip_height: None,
-            g14_utxo_commit_samples: None,
-            g14_utxo_commit_ibd_start_height: None,
-            g14_utxo_commit_ibd_stop_height: None,
-            g14_utxo_commit_ibd_start_hash: None,
-            g14_utxo_commit_ibd_stop_hash: None,
             zmqpubhashblock: Vec::new(),
             zmqpubhashtx: Vec::new(),
             zmqpubrawblock: Vec::new(),
@@ -375,33 +335,6 @@ impl Config {
         match self.storage_backend.as_str() {
             "rocksdb" | "fjall" | "redb" | "mdbx" => {}
             other => bail!("unsupported storage backend {other}"),
-        }
-        match (&self.g2_muhash_samples, self.g2_muhash_tip_height) {
-            (Some(_), Some(0)) => bail!("g2_muhash_tip_height must be greater than zero"),
-            (Some(_), None) => bail!("g2_muhash_samples requires g2_muhash_tip_height"),
-            (None, Some(_)) => bail!("g2_muhash_tip_height requires g2_muhash_samples"),
-            (None, None) | (Some(_), Some(_)) => {}
-        }
-        match (
-            &self.g14_utxo_commit_samples,
-            self.g14_utxo_commit_ibd_start_height,
-            self.g14_utxo_commit_ibd_stop_height,
-            &self.g14_utxo_commit_ibd_start_hash,
-            &self.g14_utxo_commit_ibd_stop_hash,
-        ) {
-            (None, None, None, None, None) => {}
-            (Some(_), Some(start_height), Some(stop_height), Some(start_hash), Some(stop_hash)) => {
-                if stop_height < start_height {
-                    bail!(
-                        "g14_utxo_commit_ibd_stop_height must be greater than or equal to g14_utxo_commit_ibd_start_height"
-                    );
-                }
-                validate_block_hash_hex(start_hash, "g14_utxo_commit_ibd_start_hash")?;
-                validate_block_hash_hex(stop_hash, "g14_utxo_commit_ibd_stop_hash")?;
-            }
-            _ => bail!(
-                "g14_utxo_commit_samples requires g14_utxo_commit_ibd_start_height, g14_utxo_commit_ibd_stop_height, g14_utxo_commit_ibd_start_hash, and g14_utxo_commit_ibd_stop_hash"
-            ),
         }
         for (name, hwm) in [
             ("zmqpubhashblockhwm", self.zmqpubhashblockhwm),
@@ -553,13 +486,6 @@ impl Config {
         if layer.clear_metrics_bind {
             self.metrics_bind = None;
         }
-        if let Some(path) = &layer.g2_muhash_samples {
-            self.g2_muhash_samples = Some(path.clone());
-        }
-        if let Some(height) = layer.g2_muhash_tip_height {
-            self.g2_muhash_tip_height = Some(height);
-        }
-        self.apply_g14_utxo_commit_layer(layer);
         if let Some(endpoints) = &layer.zmqpubhashblock {
             self.zmqpubhashblock.clone_from(endpoints);
         }
@@ -608,24 +534,6 @@ impl Config {
             self.p2p_magic = Some(DRYNET4_P2P_MAGIC);
             self.dns_seeds_enabled = false;
             self.connect = vec![DRYNET4_CONNECT.to_owned()];
-        }
-    }
-
-    fn apply_g14_utxo_commit_layer(&mut self, layer: &ConfigLayer) {
-        if let Some(path) = &layer.g14_utxo_commit_samples {
-            self.g14_utxo_commit_samples = Some(path.clone());
-        }
-        if let Some(height) = layer.g14_utxo_commit_ibd_start_height {
-            self.g14_utxo_commit_ibd_start_height = Some(height);
-        }
-        if let Some(height) = layer.g14_utxo_commit_ibd_stop_height {
-            self.g14_utxo_commit_ibd_stop_height = Some(height);
-        }
-        if let Some(hash) = &layer.g14_utxo_commit_ibd_start_hash {
-            self.g14_utxo_commit_ibd_start_hash = Some(hash.clone());
-        }
-        if let Some(hash) = &layer.g14_utxo_commit_ibd_stop_hash {
-            self.g14_utxo_commit_ibd_stop_hash = Some(hash.clone());
         }
     }
 }
@@ -691,20 +599,6 @@ pub(crate) struct ConfigLayer {
     pub(crate) metrics_bind: Option<SocketAddr>,
     #[arg(skip)]
     pub(crate) clear_metrics_bind: bool,
-    #[arg(long = "g2-muhash-samples")]
-    pub(crate) g2_muhash_samples: Option<PathBuf>,
-    #[arg(long = "g2-muhash-tip-height")]
-    pub(crate) g2_muhash_tip_height: Option<u32>,
-    #[arg(long = "g14-utxo-commit-samples")]
-    pub(crate) g14_utxo_commit_samples: Option<PathBuf>,
-    #[arg(long = "g14-utxo-commit-ibd-start-height")]
-    pub(crate) g14_utxo_commit_ibd_start_height: Option<u32>,
-    #[arg(long = "g14-utxo-commit-ibd-stop-height")]
-    pub(crate) g14_utxo_commit_ibd_stop_height: Option<u32>,
-    #[arg(long = "g14-utxo-commit-ibd-start-hash")]
-    pub(crate) g14_utxo_commit_ibd_start_hash: Option<String>,
-    #[arg(long = "g14-utxo-commit-ibd-stop-hash")]
-    pub(crate) g14_utxo_commit_ibd_stop_hash: Option<String>,
     #[arg(long = "zmqpubhashblock", value_delimiter = ',')]
     pub(crate) zmqpubhashblock: Option<Vec<String>>,
     #[arg(long = "zmqpubhashtx", value_delimiter = ',')]
@@ -765,27 +659,6 @@ impl ConfigLayer {
                 "BITCOIN_RS_DBCACHE_MB" => layer.dbcache_mb = Some(value.parse()?),
                 "BITCOIN_RS_LOG_LEVEL" => layer.log_level = Some(value.to_owned()),
                 "BITCOIN_RS_METRICS_BIND" => layer.metrics_bind = Some(value.parse()?),
-                "BITCOIN_RS_G2_MUHASH_SAMPLES" => {
-                    layer.g2_muhash_samples = Some(PathBuf::from(value));
-                }
-                "BITCOIN_RS_G2_MUHASH_TIP_HEIGHT" => {
-                    layer.g2_muhash_tip_height = Some(value.parse()?);
-                }
-                "BITCOIN_RS_G14_UTXO_COMMIT_SAMPLES" => {
-                    layer.g14_utxo_commit_samples = Some(PathBuf::from(value));
-                }
-                "BITCOIN_RS_G14_UTXO_COMMIT_IBD_START_HEIGHT" => {
-                    layer.g14_utxo_commit_ibd_start_height = Some(value.parse()?);
-                }
-                "BITCOIN_RS_G14_UTXO_COMMIT_IBD_STOP_HEIGHT" => {
-                    layer.g14_utxo_commit_ibd_stop_height = Some(value.parse()?);
-                }
-                "BITCOIN_RS_G14_UTXO_COMMIT_IBD_START_HASH" => {
-                    layer.g14_utxo_commit_ibd_start_hash = Some(value.to_owned());
-                }
-                "BITCOIN_RS_G14_UTXO_COMMIT_IBD_STOP_HASH" => {
-                    layer.g14_utxo_commit_ibd_stop_hash = Some(value.to_owned());
-                }
                 "BITCOIN_RS_ZMQPUBHASHBLOCK" => {
                     layer.zmqpubhashblock = Some(parse_string_list(value));
                 }
@@ -824,18 +697,6 @@ impl ConfigLayer {
         }
         Ok(layer)
     }
-}
-
-fn validate_block_hash_hex(value: &str, name: &str) -> Result<()> {
-    let value = value.trim();
-    ensure!(
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{name} must be 64 lowercase hex characters"
-    );
-    Ok(())
 }
 
 fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {

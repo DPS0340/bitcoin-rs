@@ -53,5 +53,5 @@ null result no longer blocks, a p<0.05 regression on a track's gate benches does
 ## Scope Boundaries
 
 - The cross-node faster-than-Core/gocoin verdict stays corpus-blocked (owner: user).
-- The three settled exit-12 targets (`utxo_commit`, `sync_apply_metrics`, `kvstore_backends`) stay closed.
+- The three settled exit-12 targets (`utxo_commit`, the retired `sync_apply_metrics` diagnostic, and `kvstore_backends`) stay closed.
 - No new sync_pipeline sub-bench — not needed as a commit gate under the round-2 policy.

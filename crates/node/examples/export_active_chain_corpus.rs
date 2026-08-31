@@ -10,12 +10,15 @@ use bitcoin_rs_node::Network;
 use bitcoin_rs_node::config::Config;
 use bitcoin_rs_node::state::NodeState;
 
+#[path = "support/corpus.rs"]
+mod corpus;
+
 fn main() -> Result<()> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     let network = parse_network(&args.network)?;
 
     let manifest = if let Some(rest_url) = &args.rest_url {
-        bitcoin_rs_node::corpus::export_corpus_from_rest(
+        corpus::export_corpus_from_rest(
             rest_url,
             network,
             args.stop_height,
@@ -34,7 +37,7 @@ fn main() -> Result<()> {
         config.dns_seeds_enabled = false;
 
         let state = NodeState::open(config).context("open node state")?;
-        bitcoin_rs_node::corpus::export_active_chain_corpus(
+        corpus::export_active_chain_corpus(
             &state,
             network,
             args.stop_height,

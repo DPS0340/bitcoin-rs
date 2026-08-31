@@ -790,7 +790,6 @@ pub(crate) fn write_checkpoint_from_dir(
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
     chain_tx_count: u64,
-    rolling_stats: bool,
 ) -> Result<CheckpointWrite, CheckpointError> {
     write_checkpoint_inner(
         data_dir,
@@ -800,7 +799,6 @@ pub(crate) fn write_checkpoint_from_dir(
         coin_stats,
         applied_tip,
         chain_tx_count,
-        rolling_stats,
         test_failpoint(),
     )
 }
@@ -812,7 +810,6 @@ fn write_checkpoint(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
-    rolling_stats: bool,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let data_dir = open_data_dir(data_dir)?;
     write_checkpoint_from_dir(
@@ -823,7 +820,6 @@ fn write_checkpoint(
         coin_stats,
         applied_tip,
         0,
-        rolling_stats,
     )
 }
 
@@ -843,72 +839,6 @@ fn checkpoint_best_tip_id(
     Ok(applied_id)
 }
 
-/// Logs and gauges what the UTXO set holds in memory, against process RSS.
-///
-/// Runs on the checkpoint path because a checkpoint already walks every record
-/// to serialize the snapshot, so a second pointer-only walk is cheap beside it,
-/// and because a checkpoint is the only moment the set is guaranteed stable.
-///
-/// The residual between `accounted` and RSS is the point: the set can only
-/// account for its own allocations, while the G14 budget is written against the
-/// process. See `docs/benchmarks/utxo-memory.md`.
-fn report_utxo_memory(utxo: &UtxoSet, height: u32) {
-    // Clippy suggests a method reference here; it does not compile, because
-    // `with_stable_view` needs a closure general over the view's lifetime.
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    let report = utxo.with_stable_view(|view| view.memory_report());
-    let accounted = report.accounted_bytes();
-    let rss = crate::metrics::process_rss_bytes();
-
-    metrics::gauge!("node.utxo.records").set(metric_count(report.records));
-    metrics::gauge!("node.utxo.outputs").set(metric_count(report.outputs));
-    metrics::gauge!("node.utxo.record_payload_bytes")
-        .set(metric_count(report.record_payload_bytes));
-    metrics::gauge!("node.utxo.record_allocation_bytes")
-        .set(metric_count(report.record_allocation_bytes));
-    metrics::gauge!("node.utxo.table_bytes").set(metric_count(report.table_bytes));
-    metrics::gauge!("node.utxo.accounted_bytes").set(metric_count(accounted));
-    if let Some(rss) = rss {
-        metrics::gauge!("node.process.rss_bytes").set(metric_count_u64(rss));
-    }
-
-    tracing::info!(
-        height,
-        records = report.records,
-        outputs = report.outputs,
-        record_payload_bytes = report.record_payload_bytes,
-        record_allocation_bytes = report.record_allocation_bytes,
-        table_bytes = report.table_bytes,
-        accounted_bytes = accounted,
-        // Plain numbers, not `?rss`: Debug on an `Option` emits "Some(123)",
-        // which every downstream parser then has to strip.
-        rss_bytes = rss.unwrap_or_default(),
-        rss_known = rss.is_some(),
-        unaccounted_bytes = rss
-            .map(|rss| rss.saturating_sub(accounted.try_into().unwrap_or(u64::MAX)))
-            .unwrap_or_default(),
-        "utxo memory attribution"
-    );
-}
-
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "gauge values are f64 by the metrics crate's contract"
-)]
-fn metric_count(value: usize) -> f64 {
-    value as f64
-}
-
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_precision_loss,
-    reason = "gauge values are f64 by the metrics crate's contract"
-)]
-fn metric_count_u64(value: u64) -> f64 {
-    value as f64
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_checkpoint_inner(
     data_dir: &Dir,
@@ -918,7 +848,6 @@ fn write_checkpoint_inner(
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
     chain_tx_count: u64,
-    rolling_stats: bool,
     #[cfg_attr(not(test), allow(unused_variables))] failpoint: Option<CheckpointFailpoint>,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let Some(applied_tip) = applied_tip else {
@@ -968,8 +897,6 @@ fn write_checkpoint_inner(
     let (utxo_bytes, utxo_sha256) = utxo_writer.finish()?;
     sync_file(&utxo_file, failpoint, CheckpointFailpoint::UtxoSync)?;
 
-    report_utxo_memory(utxo, applied_tip.height);
-
     let listener_stats = coin_stats.snapshot();
     if listener_stats.height != applied_tip.height {
         return Err(CheckpointError::Invalid(format!(
@@ -980,31 +907,13 @@ fn write_checkpoint_inner(
     let mut fused_stats = accumulator.into_stats();
     fused_stats.tx_count = listener_stats.tx_count;
     let record_count = utxo.record_count();
-    let trailer_kind = if rolling_stats {
-        if listener_stats != fused_stats {
-            return Err(CheckpointError::Invalid(
-                "rolling CoinStats does not match the quiesced UTXO traversal".to_owned(),
-            ));
-        }
-        if trailer != listener_stats.muhash.finalize() {
-            return Err(CheckpointError::Invalid(
-                "rolling UTXO trailer does not match CoinStats MuHash".to_owned(),
-            ));
-        }
-        TrailerKindV1::Rolling
-    } else {
-        if trailer == [0_u8; 384] {
-            return Err(CheckpointError::Invalid(
-                "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
-            ));
-        }
-        TrailerKindV1::Scanned
-    };
-    let persisted_stats = if rolling_stats {
-        listener_stats
-    } else {
-        fused_stats
-    };
+    if trailer == [0_u8; 384] {
+        return Err(CheckpointError::Invalid(
+            "scanned UTXO snapshot has a zero MuHash trailer".to_owned(),
+        ));
+    }
+    let trailer_kind = TrailerKindV1::Scanned;
+    let persisted_stats = fused_stats;
 
     let mut coinstats_file = create_file(&staging, COINSTATS_FILE)?;
     let mut coinstats_writer = HashingWriter::new(
@@ -1160,7 +1069,6 @@ pub(crate) fn write_checkpoint_with_failpoint(
     utxo: &UtxoSet,
     coin_stats: &CoinStatsListener,
     applied_tip: Option<&TipSnapshot>,
-    rolling_stats: bool,
     failpoint: CheckpointFailpoint,
 ) -> Result<CheckpointWrite, CheckpointError> {
     let data_dir = open_data_dir(data_dir)?;
@@ -1172,7 +1080,6 @@ pub(crate) fn write_checkpoint_with_failpoint(
         coin_stats,
         applied_tip,
         0,
-        rolling_stats,
         Some(failpoint),
     )
 }
@@ -2141,7 +2048,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { .. }
         ));
@@ -2202,7 +2108,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { .. }
         ));
@@ -2246,7 +2151,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
 
         for failpoint in [
@@ -2275,7 +2179,6 @@ mod tests {
                     &utxo,
                     &listener,
                     Some(&applied_tip),
-                    false,
                     failpoint,
                 )
                 .is_err(),
@@ -2299,7 +2202,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
                 CheckpointFailpoint::CurrentRootSync,
             )
             .is_err()
@@ -2326,12 +2228,11 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
         let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
         let before = fs::read(&current_path)?;
         assert_eq!(
-            super::write_checkpoint(dir.path(), config(), &tree, &utxo, &listener, None, false,)?,
+            super::write_checkpoint(dir.path(), config(), &tree, &utxo, &listener, None)?,
             CheckpointWrite::SkippedNoAppliedTip
         );
         assert_eq!(fs::read(current_path)?, before);
@@ -2350,7 +2251,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_manifest(dir.path(), |manifest| {
             manifest.utxo.codec = "bitcoin-rs-utxo".to_owned();
@@ -2376,7 +2276,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_manifest(dir.path(), |manifest| {
             manifest.utxo.version = 3;
@@ -2404,7 +2303,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let current_path = dir.path().join(CHECKPOINT_ROOT).join(CURRENT_FILE);
         let mut current: CurrentV1 = serde_json::from_slice(&fs::read(&current_path)?)?;
@@ -2430,7 +2328,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
 
         let root = dir.path().join(CHECKPOINT_ROOT);
@@ -2472,7 +2369,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let wrong = HeaderCheckpointConfig {
             network: Network::Testnet3,
@@ -2495,7 +2391,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
             bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
@@ -2525,7 +2420,6 @@ mod tests {
             &UtxoSet::new(),
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_artifact(dir.path(), HEADERS_FILE, |bytes| {
             bytes[HEADER_PREFIX_LEN + 80 + 4] ^= 1;
@@ -2552,7 +2446,6 @@ mod tests {
                 &UtxoSet::new(),
                 &CoinStatsListener::new(CoinStats::new()),
                 Some(&applied_tip),
-                false,
             )?;
             mutate_authenticated_manifest(dir.path(), |manifest| match case {
                 0 => manifest.best_header_tip.hash = "00".repeat(32),
@@ -2583,7 +2476,6 @@ mod tests {
                 &UtxoSet::new(),
                 &CoinStatsListener::new(CoinStats::new()),
                 Some(&applied_tip),
-                false,
             )?;
             mutate_authenticated_artifact(dir.path(), COINSTATS_FILE, |bytes| {
                 bytes[offset] ^= 1;
@@ -2594,31 +2486,6 @@ mod tests {
                 CheckpointLoad::HeadersOnly { .. }
             ));
         }
-        Ok(())
-    }
-
-    #[test]
-    fn rolling_trailer_restores_full_coinstats_state() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let (tree, _, applied) = chain_with_applied_height(0, 0)?;
-        let applied_tip = tip_snapshot(&tree, applied)?;
-        let tree = RwLock::new(tree);
-        let listener = CoinStatsListener::new(CoinStats::new());
-        let mut utxo = UtxoSet::new();
-        utxo.set_listener(Box::new(listener.clone()));
-        super::write_checkpoint(
-            dir.path(),
-            config(),
-            &tree,
-            &utxo,
-            &listener,
-            Some(&applied_tip),
-            true,
-        )?;
-        let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
-            return Err("rolling generation did not restore".into());
-        };
-        assert_eq!(restored.coin_stats, listener.snapshot());
         Ok(())
     }
 
@@ -2652,7 +2519,6 @@ mod tests {
             &utxo,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         let CheckpointLoad::Complete(restored) = load_checkpoint(dir.path(), config())? else {
             return Err("multi-output checkpoint did not restore".into());
@@ -2684,7 +2550,6 @@ mod tests {
             &utxo,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
 
         let root = dir.path().join(CHECKPOINT_ROOT);
@@ -2740,7 +2605,6 @@ mod tests {
             &populated_utxo()?,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
 
         mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
@@ -2767,7 +2631,6 @@ mod tests {
             &utxo,
             &CoinStatsListener::new(CoinStats::new()),
             Some(&applied_tip),
-            false,
         )?;
         mutate_authenticated_artifact(dir.path(), UTXO_FILE, |bytes| {
             let trailer = bytes.len() - 384;
@@ -2805,7 +2668,6 @@ mod tests {
             &utxo,
             &listener,
             Some(&applied_tip),
-            false,
         )?;
         let root = dir.path().join(CHECKPOINT_ROOT);
         let unknown = root.join("operator-note");
@@ -2827,7 +2689,6 @@ mod tests {
                 &utxo,
                 &listener,
                 Some(&applied_tip),
-                false,
             )?,
             CheckpointWrite::Published { generation: 2 }
         );
