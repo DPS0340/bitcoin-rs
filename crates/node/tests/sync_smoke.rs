@@ -13,9 +13,7 @@ use bitcoin::{
 };
 use bitcoin_rs_chain::{BlockTree, TipSnapshot};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-use bitcoin_rs_node::{
-    BlockSync, Config, Network, apply::ApplyHandles, event_loop::EventLoop, state::NodeState,
-};
+use bitcoin_rs_node::{BlockSync, Network, apply::ApplyHandles, event_loop::EventLoop};
 use bitcoin_rs_p2p::{Message, PeerInfo};
 use bitcoin_rs_primitives::{Hash256, OutPoint};
 use bitcoin_rs_utxo::UtxoSet;
