@@ -38,10 +38,6 @@ anyhow.workspace = true
 hashbrown.workspace = true
 
 [[bench]]
-name = "verify_tx"
-harness = false
-
-[[bench]]
 name = "merkle"
 harness = false
 
