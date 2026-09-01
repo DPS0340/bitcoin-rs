@@ -144,10 +144,326 @@ impl TxIndexRuntime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A1: lifecycle snapshot, stable query adapter, namespace registry, heartbeat
+// ---------------------------------------------------------------------------
+
+use hashbrown::HashMap;
+use std::path::{Path, PathBuf};
+
+use arc_swap::ArcSwap;
+
+/// Monotonic publication token. Each worker holds one; a revoked token makes
+/// `rcu` publication a no-op so a late worker cannot publish after abandonment.
+#[derive(Clone, Debug)]
+pub(crate) struct Generation {
+    id: u64,
+    revoked: Arc<AtomicBool>,
+}
+
+impl Generation {
+    pub(crate) fn new(id: u64) -> Self {
+        Self {
+            id,
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+}
+
+/// One immutable lifecycle snapshot published atomically behind `ArcSwap`.
+///
+/// Only `CatchingUp` and `Ready` carry a query payload — the complete existing
+/// `TxIndexQueryEngine`, never a raw reader. `Opening`, `Failed`, and
+/// `ShutdownAbandoned` carry no payload; the adapter returns typed
+/// `Unavailable` for them.
+#[derive(Clone)]
+pub(crate) enum TxIndexLifecycle {
+    Opening,
+    CatchingUp(Arc<TxIndexQueryEngine>),
+    Ready(Arc<TxIndexQueryEngine>),
+    #[allow(dead_code, reason = "reason string retained for future diagnostics")]
+    Failed(CompactString),
+    ShutdownAbandoned,
+}
+
+impl TxIndexLifecycle {
+    fn query_payload(&self) -> Option<&Arc<TxIndexQueryEngine>> {
+        match self {
+            Self::CatchingUp(engine) | Self::Ready(engine) => Some(engine),
+            _ => None,
+        }
+    }
+
+    fn unavailable_reason(&self) -> &'static str {
+        match self {
+            Self::Opening => "txindex is opening",
+            Self::Failed(_) => "txindex is unavailable",
+            Self::ShutdownAbandoned => "txindex was abandoned at shutdown",
+            Self::CatchingUp(_) | Self::Ready(_) => {
+                unreachable!("query_payload is Some for CatchingUp/Ready")
+            }
+        }
+    }
+}
+
+/// Stable outer query adapter constructed before backend open and before RPC
+/// context construction. Each method loads exactly one `ArcSwap` snapshot,
+/// holds that `Arc` for the complete request, and delegates to the captured
+/// query engine if a payload exists. It never reads lifecycle state and query
+/// payload from separate loads.
+#[derive(Clone)]
+pub(crate) struct TxIndexQueryAdapter {
+    lifecycle: Arc<ArcSwap<TxIndexLifecycle>>,
+}
+
+impl TxIndexQueryAdapter {
+    pub(crate) fn new(lifecycle: Arc<ArcSwap<TxIndexLifecycle>>) -> Self {
+        Self { lifecycle }
+    }
+
+    fn load_engine(&self) -> Result<Arc<TxIndexQueryEngine>, TxQueryError> {
+        let snapshot = self.lifecycle.load_full();
+        match snapshot.query_payload() {
+            Some(engine) => Ok(Arc::clone(engine)),
+            None => Err(TxQueryError::Unavailable(
+                snapshot.unavailable_reason().into(),
+            )),
+        }
+    }
+}
+
+impl TxIndexQuery for TxIndexQueryAdapter {
+    fn transaction(&self, txid: &Txid) -> Result<Option<Tx>, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.transaction(txid)
+    }
+
+    fn outpoint_value(&self, outpoint: &OutPoint) -> Result<Option<u64>, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.outpoint_value(outpoint)
+    }
+
+    fn transaction_height(&self, txid: &Txid) -> Result<Option<u32>, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.transaction_height(txid)
+    }
+
+    fn index_info(&self) -> Result<TxIndexInfo, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.index_info()
+    }
+}
+
+impl ScriptIndexQuery for TxIndexQueryAdapter {
+    fn history_snapshot(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<ScriptIndexSnapshot, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.history_snapshot(scripthash)
+    }
+
+    fn unspent_outputs(
+        &self,
+        scripthash: ScriptHash,
+    ) -> Result<Vec<ScriptIndexRecord>, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.unspent_outputs(scripthash)
+    }
+
+    fn spender(&self, outpoint: OutPoint) -> Result<Option<SpendingRecord>, TxQueryError> {
+        let engine = self.load_engine()?;
+        engine.spender(outpoint)
+    }
+}
+
+/// Process-global namespace ownership state.
+#[derive(Debug)]
+enum NamespaceEntry {
+    /// An active open owns this namespace.
+    Active(u64),
+    /// An abandoned open poisoned this namespace permanently.
+    #[allow(dead_code, reason = "poisoned entries are set by the abandon path")]
+    Poisoned,
+}
+
+/// Process-global, process-lifetime namespace map. The key is the canonical
+/// data root joined with one validated fixed child component.
+pub(crate) struct NamespaceRegistry {
+    entries: parking_lot::Mutex<HashMap<PathBuf, NamespaceEntry>>,
+}
+
+impl NamespaceRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Validates the child component: exactly the fixed name, no separator, not
+    /// `.` or `..`, not absolute. Does not canonicalize the child.
+    fn validate_child(root: &Path, child: &str) -> Result<PathBuf, String> {
+        if child.is_empty() {
+            return Err("namespace child is empty".to_owned());
+        }
+        if child.contains(std::path::MAIN_SEPARATOR) {
+            return Err(format!("namespace child {child} contains a path separator"));
+        }
+        if child == "." || child == ".." {
+            return Err(format!("namespace child {child} is a path traversal"));
+        }
+        if Path::new(child).is_absolute() {
+            return Err(format!("namespace child {child} is absolute"));
+        }
+        Ok(root.join(child))
+    }
+
+    /// Atomically claims `Active(owner)` for the key. Rejects an existing
+    /// `Active` or `Poisoned` entry without touching the store.
+    fn claim(&self, key: PathBuf, owner: u64) -> bool {
+        let mut entries = self.entries.lock();
+        match entries.get(&key) {
+            None => {
+                entries.insert(key, NamespaceEntry::Active(owner));
+                true
+            }
+            Some(NamespaceEntry::Active(_) | NamespaceEntry::Poisoned) => false,
+        }
+    }
+
+    /// Releases `Active(owner)` only if the map still contains the same owner.
+    /// Does nothing if the entry was already changed (e.g. poisoned).
+    fn release(&self, key: &Path, owner: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(NamespaceEntry::Active(current)) = entries.get(key) {
+            if *current == owner {
+                entries.remove(key);
+            }
+        }
+    }
+
+    /// Poisons the namespace only if the entry is `Active(owner)`. Used for
+    /// abandoned opens only.
+    #[allow(dead_code, reason = "used by A2 abandon path")]
+    fn poison(&self, key: &Path, owner: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(NamespaceEntry::Active(current)) = entries.get(key) {
+            if *current == owner {
+                entries.insert(key.to_path_buf(), NamespaceEntry::Poisoned);
+            }
+        }
+    }
+
+    /// Returns true if the namespace is poisoned.
+    fn is_poisoned(&self, key: &Path) -> bool {
+        matches!(self.entries.lock().get(key), Some(NamespaceEntry::Poisoned))
+    }
+}
+
+/// One shared process-global namespace registry for all index workers.
+pub(crate) static NAMESPACE_REGISTRY: std::sync::LazyLock<NamespaceRegistry> =
+    std::sync::LazyLock::new(NamespaceRegistry::new);
+
+/// Heartbeat helper: emits a log line every 30 seconds while the worker's
+/// backend open is blocked. Observability only — not a timeout.
+struct Heartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    fn start(capability: &'static str, namespace: String, backend: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let start = Instant::now();
+        let handle = thread::Builder::new()
+            .name(format!("bitcoin-rs-{capability}-heartbeat"))
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Acquire) {
+                    let elapsed = start.elapsed();
+                    tracing::info!(
+                        capability,
+                        namespace = %namespace,
+                        backend = %backend,
+                        elapsed_secs = elapsed.as_secs(),
+                        "index store recovery in progress"
+                    );
+                    for _ in 0..300 {
+                        if stop_clone.load(Ordering::Acquire) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+
+    fn stop_and_join(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Immutable specification for worker-owned store open. Constructed
+/// synchronously in `NodeState::open`; consumed on the worker thread.
+pub(crate) struct TxIndexOpenSpec {
+    pub(crate) data_dir: PathBuf,
+    pub(crate) namespace: &'static str,
+    pub(crate) storage_backend: String,
+    pub(crate) cache_bytes: u64,
+    #[allow(dead_code)]
+    pub(crate) batch_limits: PreparedBatchLimits,
+    pub(crate) epoch: u64,
+    pub(crate) enabled: IndexCapabilities,
+    pub(crate) rollback_rebuild_cutover: u32,
+    pub(crate) canonical_data_root: PathBuf,
+}
+
+/// Test-only keyed open gate. Holds the worker inside the open phase until
+/// released, proving RPC binds and queries see `Opening` while the store is
+/// not yet open. `#[cfg(test)]` only — not a production trait or `Config` field.
+#[cfg(test)]
+pub(crate) static TXINDEX_OPEN_GATE: std::sync::LazyLock<
+    parking_lot::Mutex<Option<crossbeam_channel::Receiver<()>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) fn install_txindex_open_gate() -> crossbeam_channel::Sender<()> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    *TXINDEX_OPEN_GATE.lock() = Some(rx);
+    tx
+}
+
+#[cfg(test)]
+pub(crate) fn wait_txindex_open_gate() {
+    if let Some(rx) = TXINDEX_OPEN_GATE.lock().as_ref() {
+        let _ = rx.recv();
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn wait_txindex_open_gate() {}
 /// Handle used to spawn and join the supervised reconciliation worker.
 pub(crate) struct TxIndexWorker {
     runtime: Arc<TxIndexRuntime>,
     join_handle: Option<JoinHandle<()>>,
+    pub(crate) generation: Option<Generation>,
 }
 
 impl TxIndexWorker {
@@ -161,6 +477,7 @@ impl TxIndexWorker {
     /// its coalesced hint stream and recovers from dropped wakes by
     /// reconciling fresh snapshots.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, reason = "replaced by spawn_with_open")]
     pub(crate) fn spawn(
         runtime: Arc<TxIndexRuntime>,
         writer: Arc<dyn TxIndexWriter>,
@@ -213,7 +530,82 @@ impl TxIndexWorker {
         Ok(Self {
             runtime,
             join_handle: Some(join_handle),
+            generation: None,
         })
+    }
+
+    /// Spawns a worker that opens the store on its own thread, constructs the
+    /// complete query engine, publishes lifecycle snapshots, and runs
+    /// reconciliation — all behind one `catch_unwind`.
+    ///
+    /// The `lifecycle` `ArcSwap` is the publication surface: the caller
+    /// constructs a stable `TxIndexQueryAdapter` over it before this call.
+    /// The `generation` token makes late publication a no-op after
+    /// abandonment. The `shutdown` signal is checked immediately after
+    /// backend open returns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_open(
+        runtime: Arc<TxIndexRuntime>,
+        spec: TxIndexOpenSpec,
+        lifecycle: Arc<ArcSwap<TxIndexLifecycle>>,
+        generation: Generation,
+        applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
+        block_tree: Arc<RwLock<BlockTree>>,
+        body_store: Option<Arc<dyn PruneBodyStore>>,
+        block_source: NodeBlockSource,
+        body_source: Option<Arc<dyn BlockBodySource>>,
+        chain_events: Arc<crate::state::ChainEventPublisher>,
+        shutdown: Arc<AtomicBool>,
+        wake_rx: Receiver<()>,
+    ) -> std::io::Result<Self> {
+        let runtime_for_thread = Arc::clone(&runtime);
+        let generation_for_thread = generation.clone();
+        let runtime_for_error = Arc::clone(&runtime);
+        let join_handle = thread::Builder::new()
+            .name("bitcoin-rs-txindex".to_owned())
+            .spawn(move || {
+                #[allow(clippy::needless_borrow)]
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_worker_with_open(
+                        &runtime_for_thread,
+                        spec,
+                        &lifecycle,
+                        generation_for_thread,
+                        applied_tip,
+                        block_tree,
+                        body_store,
+                        block_source,
+                        body_source,
+                        &chain_events,
+                        &shutdown,
+                        &wake_rx,
+                    );
+                }));
+                match result {
+                    Ok(()) => {}
+                    Err(payload) => {
+                        let message = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("txindex worker panicked during open");
+                        tracing::error!(%message, "txindex worker panicked");
+                        runtime_for_error.publish_failed(message);
+                    }
+                }
+            })?;
+        Ok(Self {
+            runtime,
+            join_handle: Some(join_handle),
+            generation: Some(generation),
+        })
+    }
+
+    /// Returns true if the worker thread has exited.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join_handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
     }
 
     /// Requests shutdown and joins the worker thread.
@@ -232,6 +624,325 @@ impl Drop for TxIndexWorker {
             let _ = handle.join();
         }
     }
+}
+
+/// Result of opening the txindex store: writer, reader, and batch limits.
+pub(crate) struct OpenTxIndex {
+    pub(crate) writer: Arc<dyn TxIndexWriter>,
+    pub(crate) reader: Arc<dyn bitcoin_rs_index::IndexReader>,
+    #[allow(dead_code)]
+    pub(crate) batch_limits: PreparedBatchLimits,
+}
+
+/// Opens an `IndexWriter` with legacy/unsupported-format selective reset.
+pub(crate) fn open_writer<S>(
+    store: &Arc<S>,
+    generation: u64,
+) -> Result<bitcoin_rs_index::IndexWriter<S>, IndexError>
+where
+    S: bitcoin_rs_storage::KvStore,
+{
+    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation) {
+        Ok(writer) => Ok(writer),
+        Err(
+            error @ (IndexError::LegacyCursorlessIndex
+            | IndexError::UnsupportedTxIndexFormatVersion { .. }),
+        ) => {
+            tracing::warn!(
+                %error,
+                "resetting incompatible derived transaction index for rebuild"
+            );
+            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref(), generation)?;
+            bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Worker-owned open: opens the store, constructs writer/reader/engine,
+/// publishes lifecycle, and runs reconciliation — all behind one
+/// `catch_unwind` boundary that starts before directory creation and includes
+/// schema inspection, writer construction, complete query-engine construction,
+/// publication, and the initial reconciliation handoff.
+///
+/// On an ordinary error or panic, publishes `Failed` with a bounded
+/// diagnostic and no query, if the generation is still current. If the token
+/// was revoked, publishes nothing. Converts panic payloads to bounded text.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    clippy::needless_borrow
+)]
+fn run_worker_with_open(
+    runtime: &Arc<TxIndexRuntime>,
+    spec: TxIndexOpenSpec,
+    lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
+    generation: Generation,
+    applied_tip: Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
+    block_tree: Arc<RwLock<BlockTree>>,
+    body_store: Option<Arc<dyn PruneBodyStore>>,
+    block_source: NodeBlockSource,
+    body_source: Option<Arc<dyn BlockBodySource>>,
+    chain_events: &Arc<crate::state::ChainEventPublisher>,
+    shutdown: &Arc<AtomicBool>,
+    wake_rx: &Receiver<()>,
+) {
+    let namespace_key =
+        match NamespaceRegistry::validate_child(&spec.canonical_data_root, spec.namespace) {
+            Ok(key) => key,
+            Err(reason) => {
+                publish_failed_if_current(lifecycle, &generation, &reason);
+                return;
+            }
+        };
+    let registry = &*NAMESPACE_REGISTRY;
+    if !registry.claim(namespace_key.clone(), generation.id()) {
+        let reason = if registry.is_poisoned(&namespace_key) {
+            "txindex namespace is poisoned from a previous abandoned open"
+        } else {
+            "txindex namespace is already active in this process"
+        };
+        publish_failed_if_current(lifecycle, &generation, reason);
+        return;
+    }
+
+    let heartbeat = Heartbeat::start(
+        "txindex",
+        spec.namespace.to_owned(),
+        spec.storage_backend.clone(),
+    );
+
+    let worker_result = open_and_run(
+        runtime,
+        &spec,
+        lifecycle,
+        &generation,
+        &applied_tip,
+        &block_tree,
+        &body_store,
+        &block_source,
+        &body_source,
+        chain_events,
+        shutdown,
+        wake_rx,
+    );
+
+    heartbeat.stop_and_join();
+
+    match worker_result {
+        Ok(()) => {
+            registry.release(&namespace_key, generation.id());
+        }
+        Err(error) => {
+            tracing::error!(%error, "txindex worker open or run failed");
+            publish_failed_if_current(lifecycle, &generation, &error.to_string());
+            registry.release(&namespace_key, generation.id());
+        }
+    }
+}
+
+/// Publishes `Failed` with a bounded reason if the generation is still current.
+fn publish_failed_if_current(
+    lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
+    generation: &Generation,
+    reason: &str,
+) {
+    if generation.is_revoked() {
+        return;
+    }
+    let reason = CompactString::from(reason);
+    lifecycle.rcu(|current| {
+        if generation.is_revoked() {
+            return Arc::clone(current);
+        }
+        Arc::new(TxIndexLifecycle::Failed(reason.clone()))
+    });
+}
+
+/// Publishes a lifecycle transition with generation-checked `rcu`.
+/// A stale token returns the current `Arc` unchanged.
+fn publish_lifecycle(
+    lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
+    generation: &Generation,
+    new: TxIndexLifecycle,
+) {
+    if generation.is_revoked() {
+        return;
+    }
+    let new = Arc::new(new);
+    lifecycle.rcu(|current| {
+        if generation.is_revoked() {
+            Arc::clone(current)
+        } else {
+            Arc::clone(&new)
+        }
+    });
+}
+
+/// Opens the store, constructs the engine, publishes lifecycle, and runs.
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
+fn open_and_run(
+    runtime: &Arc<TxIndexRuntime>,
+    spec: &TxIndexOpenSpec,
+    lifecycle: &Arc<ArcSwap<TxIndexLifecycle>>,
+    generation: &Generation,
+    applied_tip: &Arc<arc_swap::ArcSwapOption<TipSnapshot>>,
+    block_tree: &Arc<RwLock<BlockTree>>,
+    body_store: &Option<Arc<dyn PruneBodyStore>>,
+    block_source: &NodeBlockSource,
+    body_source: &Option<Arc<dyn BlockBodySource>>,
+    chain_events: &Arc<crate::state::ChainEventPublisher>,
+    shutdown: &Arc<AtomicBool>,
+    wake_rx: &Receiver<()>,
+) -> Result<(), TxIndexWorkerError> {
+    // Wait for the test-only open gate before touching the store.
+    wait_txindex_open_gate();
+
+    let txindex_dir = spec.data_dir.join(spec.namespace);
+    std::fs::create_dir_all(&txindex_dir)
+        .map_err(|e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Io(e)))?;
+
+    let open: OpenTxIndex = open_tx_index_on_worker(
+        &spec.storage_backend,
+        &txindex_dir,
+        spec.cache_bytes,
+        spec.batch_limits,
+        spec.epoch,
+    )?;
+
+    // Check shutdown and generation immediately after backend open returns.
+    if shutdown.load(Ordering::Acquire) || generation.is_revoked() || runtime.should_stop() {
+        // Drop all store values (open.writer, open.reader) and exit without
+        // publication or reconciliation.
+        return Ok(());
+    }
+
+    let query_engine = Arc::new(TxIndexQueryEngine::new(
+        Arc::clone(runtime),
+        open.reader,
+        block_source.clone(),
+        Arc::clone(block_tree),
+        Arc::clone(applied_tip),
+        body_source.clone(),
+    ));
+
+    // Publish CatchingUp plus the complete engine atomically.
+    publish_lifecycle(
+        lifecycle,
+        generation,
+        TxIndexLifecycle::CatchingUp(Arc::clone(&query_engine)),
+    );
+
+    // Check shutdown immediately after publication.
+    if shutdown.load(Ordering::Acquire) || generation.is_revoked() || runtime.should_stop() {
+        return Ok(());
+    }
+
+    let worker = Worker {
+        runtime: Arc::clone(runtime),
+        writer: open.writer,
+        applied_tip: Arc::clone(applied_tip),
+        block_tree: Arc::clone(block_tree),
+        body_store: body_store.clone(),
+        batch_limits: spec.batch_limits,
+        enabled: spec.enabled,
+        rollback_rebuild_cutover: spec.rollback_rebuild_cutover,
+        wake_rx: wake_rx.clone(),
+        quiet_period: REVISION_QUIET_PERIOD,
+        chain_events: Arc::clone(chain_events),
+        batch_delay: FORWARD_BATCH_DELAY,
+    };
+
+    worker.run()?;
+
+    // Publish Ready at the exact applied-tip identity.
+    let tip = applied_tip.load_full();
+    if let Some(tip) = tip {
+        let info = query_engine.index_info().map_err(|e| {
+            TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::Backend(e.to_string()))
+        })?;
+        if info.synced && info.best_block_height == tip.height {
+            publish_lifecycle(lifecycle, generation, TxIndexLifecycle::Ready(query_engine));
+        }
+    }
+
+    Ok(())
+}
+
+/// Opens the txindex store on the worker thread, preserving all backend
+/// constructors, cache paths, and batch limits.
+fn open_tx_index_on_worker(
+    storage_backend: &str,
+    txindex_dir: &Path,
+    cache_bytes: u64,
+    batch_limits: PreparedBatchLimits,
+    epoch: u64,
+) -> Result<OpenTxIndex, TxIndexWorkerError> {
+    match storage_backend {
+        #[cfg(feature = "rocksdb")]
+        "rocksdb" => {
+            let store = Arc::new(
+                bitcoin_rs_storage::RocksDbStore::open_with_cache(txindex_dir, cache_bytes)
+                    .map_err(|e| {
+                        TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e))
+                    })?,
+            );
+            open_tx_index_store_on_worker(store, batch_limits, epoch)
+        }
+        #[cfg(feature = "fjall")]
+        "fjall" => {
+            let store = Arc::new(
+                bitcoin_rs_storage::FjallStore::open_with_cache(txindex_dir, cache_bytes).map_err(
+                    |e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e)),
+                )?,
+            );
+            open_tx_index_store_on_worker(store, batch_limits, epoch)
+        }
+        #[cfg(feature = "redb")]
+        "redb" => {
+            let store = Arc::new(
+                bitcoin_rs_storage::open_redb_tx_index_store_with_cache(txindex_dir, cache_bytes)
+                    .map_err(|e| {
+                    TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e))
+                })?,
+            );
+            open_tx_index_store_on_worker(store, batch_limits, epoch)
+        }
+        #[cfg(feature = "mdbx")]
+        "mdbx" => {
+            let store = Arc::new(
+                bitcoin_rs_storage::MdbxStore::open_with_cache(txindex_dir, cache_bytes).map_err(
+                    |e| TxIndexWorkerError::Storage(bitcoin_rs_storage::StorageError::backend(e)),
+                )?,
+            );
+            open_tx_index_store_on_worker(store, batch_limits, epoch)
+        }
+        other => Err(TxIndexWorkerError::Storage(
+            bitcoin_rs_storage::StorageError::Backend(format!(
+                "unsupported storage backend for txindex: {other}"
+            )),
+        )),
+    }
+}
+
+/// Constructs the writer and reader from the opened store.
+fn open_tx_index_store_on_worker<S>(
+    store: Arc<S>,
+    batch_limits: PreparedBatchLimits,
+    epoch: u64,
+) -> Result<OpenTxIndex, TxIndexWorkerError>
+where
+    S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
+{
+    let writer = open_writer(&store, epoch)?;
+    let writer: Arc<dyn TxIndexWriter> = Arc::new(parking_lot::Mutex::new(writer));
+    let reader: Arc<dyn bitcoin_rs_index::IndexReader> =
+        Arc::new(bitcoin_rs_index::Indexer::new(store));
+    Ok(OpenTxIndex {
+        writer,
+        reader,
+        batch_limits,
+    })
 }
 
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
@@ -2154,3 +2865,11 @@ mod catchup_tests;
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "txindex_worker_reconcile_tests.rs"]
 mod reconcile_tests;
+
+#[cfg(test)]
+#[path = "txindex_worker_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "txindex_worker_integration_tests.rs"]
+mod integration_tests;

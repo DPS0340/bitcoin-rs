@@ -157,6 +157,13 @@ impl FilterIndexWorker {
         })
     }
 
+    /// Returns true if the worker thread has exited.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join_handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
     /// Requests shutdown and joins the worker thread.
     pub(crate) fn join(mut self) {
         self.runtime.request_shutdown();
@@ -826,6 +833,16 @@ pub(crate) struct FilterIndexHandle {
 }
 
 impl FilterIndexHandle {
+    /// Returns true if the worker thread has exited.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
+    /// Joins the worker thread (assumes shutdown was already requested).
+    pub(crate) fn join(self) {
+        self.worker.join();
+    }
+
     /// Shuts the worker down and joins it; used by `NodeState` teardown.
     pub(crate) fn shutdown(self) {
         self.status.shutdown();
@@ -833,6 +850,16 @@ impl FilterIndexHandle {
     }
 }
 
+/// Filter-index worker regressions: the reference second consumer at the
+/// chain-event seam (inner unit tests; gate g16 re-runs the named subset).
+///
+/// Named proving surface of `docs/contracts/chain-events.md` `EVT-04` (one
+/// cursor, one atomic batch per block; hash-addressed rows survive
+/// disconnects; a missing body fails the pass without moving the pointer),
+/// `docs/contracts/indexing.md` `IDX-06` (rewind keeps hash-addressed
+/// rows; only the active pointer and cursor move back), and
+/// `docs/contracts/extensions.md` `EXT-03` (a failing namespace store is
+/// reported rather than swallowed).
 #[cfg(test)]
 mod tests {
     use super::*;

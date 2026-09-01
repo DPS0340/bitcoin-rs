@@ -83,6 +83,10 @@ pub enum HealthStatus {
     },
     /// The extension is compiled but not enabled in this run.
     Disabled,
+    /// The index store is opening on its worker; queries are unavailable.
+    Opening,
+    /// The worker was abandoned at shutdown and its namespace is poisoned.
+    ShutdownAbandoned,
 }
 
 /// One live extension instance the node core drives.
@@ -164,12 +168,22 @@ mod tests {
     )]
     #[test]
     fn health_status_serializes_round_trip() {
-        let status = HealthStatus::CatchingUp {
-            processed_height: 3,
-            target_height: 9,
-        };
-        let text = sonic_rs::to_string(&status).expect("serialize");
-        let back: HealthStatus = sonic_rs::from_str(&text).expect("deserialize");
-        assert_eq!(back, status);
+        for status in [
+            HealthStatus::Ready,
+            HealthStatus::CatchingUp {
+                processed_height: 3,
+                target_height: 9,
+            },
+            HealthStatus::Failed {
+                reason: "schema mismatch".to_owned(),
+            },
+            HealthStatus::Disabled,
+            HealthStatus::Opening,
+            HealthStatus::ShutdownAbandoned,
+        ] {
+            let text = sonic_rs::to_string(&status).expect("serialize");
+            let back: HealthStatus = sonic_rs::from_str(&text).expect("deserialize");
+            assert_eq!(back, status);
+        }
     }
 }

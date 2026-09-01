@@ -7,6 +7,7 @@
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::TipSnapshot;
+use bitcoin_rs_ext_api::Extension;
 use bitcoin_rs_primitives::Hash256;
 use bitcoin_rs_primitives::{Block, Tx, Txid, deserialize};
 use bitcoin_rs_rpc::context::{
@@ -21,6 +22,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -956,56 +958,6 @@ impl fmt::Display for CompiledStorageFeatures {
     }
 }
 
-struct OpenTxIndex {
-    writer: Arc<dyn crate::txindex_worker::TxIndexWriter>,
-    reader: Arc<dyn bitcoin_rs_index::IndexReader>,
-    batch_limits: bitcoin_rs_index::PreparedBatchLimits,
-}
-
-fn open_writer<S>(
-    store: &Arc<S>,
-    generation: u64,
-) -> Result<bitcoin_rs_index::IndexWriter<S>, bitcoin_rs_index::IndexError>
-where
-    S: bitcoin_rs_storage::KvStore,
-{
-    match bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation) {
-        Ok(writer) => Ok(writer),
-        Err(
-            error @ (bitcoin_rs_index::IndexError::LegacyCursorlessIndex
-            | bitcoin_rs_index::IndexError::UnsupportedTxIndexFormatVersion { .. }),
-        ) => {
-            tracing::warn!(
-                %error,
-                "resetting incompatible derived transaction index for rebuild"
-            );
-            bitcoin_rs_index::IndexWriter::reset_index(store.as_ref(), generation)?;
-            bitcoin_rs_index::IndexWriter::open(Arc::clone(store), generation)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn open_tx_index_store<S>(
-    store: Arc<S>,
-    batch_limits: bitcoin_rs_index::PreparedBatchLimits,
-    generation: u64,
-) -> Result<OpenTxIndex>
-where
-    S: bitcoin_rs_storage::KvStore + Send + Sync + 'static,
-{
-    let writer = open_writer(&store, generation)?;
-    let writer: Arc<dyn crate::txindex_worker::TxIndexWriter> =
-        Arc::new(parking_lot::Mutex::new(writer));
-    let reader: Arc<dyn bitcoin_rs_index::IndexReader> =
-        Arc::new(bitcoin_rs_index::Indexer::new(store));
-    Ok(OpenTxIndex {
-        writer,
-        reader,
-        batch_limits,
-    })
-}
-
 fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities {
     bitcoin_rs_index::IndexCapabilities {
         // ScriptIndex-backed Esplora responses need exact historical
@@ -1017,11 +969,11 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
     }
 }
 
-fn open_tx_index(
+fn build_tx_index_open_spec(
     config: &Config,
     txindex_cache_bytes: u64,
     epoch: u64,
-) -> Result<Option<OpenTxIndex>> {
+) -> Result<Option<crate::txindex_worker::TxIndexOpenSpec>> {
     let enabled = tx_index_capabilities(config);
     if enabled.is_empty() {
         return Ok(None);
@@ -1029,67 +981,32 @@ fn open_tx_index(
     if config.prune_target_mb > 0 {
         bail!("transaction and script indexing are not compatible with -prune");
     }
-
-    let txindex_dir = config.data_dir.join("txindex");
-    std::fs::create_dir_all(&txindex_dir)
-        .with_context(|| format!("create txindex_dir {}", txindex_dir.display()))?;
-    match config.storage_backend.as_str() {
+    let batch_limits = match config.storage_backend.as_str() {
         #[cfg(feature = "rocksdb")]
-        "rocksdb" => {
-            let store = Arc::new(
-                bitcoin_rs_storage::RocksDbStore::open_with_cache(
-                    &txindex_dir,
-                    txindex_cache_bytes,
-                )
-                .map_err(anyhow::Error::new)?,
-            );
-            Ok(Some(open_tx_index_store(
-                store,
-                crate::txindex_worker::ROCKSDB_BATCH_LIMITS,
-                epoch,
-            )?))
-        }
+        "rocksdb" => crate::txindex_worker::ROCKSDB_BATCH_LIMITS,
         #[cfg(feature = "fjall")]
-        "fjall" => {
-            let store = Arc::new(
-                bitcoin_rs_storage::FjallStore::open_with_cache(&txindex_dir, txindex_cache_bytes)
-                    .map_err(anyhow::Error::new)?,
-            );
-            Ok(Some(open_tx_index_store(
-                store,
-                crate::txindex_worker::DEFAULT_BATCH_LIMITS,
-                epoch,
-            )?))
-        }
+        "fjall" => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
         #[cfg(feature = "redb")]
-        "redb" => {
-            let store = Arc::new(
-                bitcoin_rs_storage::open_redb_tx_index_store_with_cache(
-                    &txindex_dir,
-                    txindex_cache_bytes,
-                )
-                .map_err(anyhow::Error::new)?,
-            );
-            Ok(Some(open_tx_index_store(
-                store,
-                crate::txindex_worker::REDB_BATCH_LIMITS,
-                epoch,
-            )?))
-        }
+        "redb" => crate::txindex_worker::REDB_BATCH_LIMITS,
         #[cfg(feature = "mdbx")]
-        "mdbx" => {
-            let store = Arc::new(
-                bitcoin_rs_storage::MdbxStore::open_with_cache(&txindex_dir, txindex_cache_bytes)
-                    .map_err(anyhow::Error::new)?,
-            );
-            Ok(Some(open_tx_index_store(
-                store,
-                crate::txindex_worker::DEFAULT_BATCH_LIMITS,
-                epoch,
-            )?))
-        }
+        "mdbx" => crate::txindex_worker::DEFAULT_BATCH_LIMITS,
         other => bail!("unsupported storage backend for txindex: {other}"),
-    }
+    };
+    let canonical_data_root = config
+        .data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config.data_dir.clone());
+    Ok(Some(crate::txindex_worker::TxIndexOpenSpec {
+        data_dir: config.data_dir.clone(),
+        namespace: "txindex",
+        storage_backend: config.storage_backend.clone(),
+        cache_bytes: txindex_cache_bytes,
+        batch_limits,
+        epoch,
+        enabled,
+        rollback_rebuild_cutover: config.index_rollback_rebuild_cutover,
+        canonical_data_root,
+    }))
 }
 
 /// Opens the BIP157/158 filter index extension namespace, if enabled.
@@ -1215,7 +1132,9 @@ pub struct NodeState {
     coin_stats: Arc<bitcoin_rs_utxo::stats::CoinStatsListener>,
     tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
     tx_index_worker: Option<crate::txindex_worker::TxIndexWorker>,
-    tx_index_query: Option<Arc<crate::txindex_worker::TxIndexQueryEngine>>,
+    tx_index_lifecycle: Option<Arc<arc_swap::ArcSwap<crate::txindex_worker::TxIndexLifecycle>>>,
+    /// Stable query adapter for txindex/script-index, constructed before open.
+    tx_index_adapter: Option<Arc<crate::txindex_worker::TxIndexQueryAdapter>>,
     /// Enabled BIP157/158 filter index extension, when `--blockfilterindex`.
     filter_index: Option<crate::filterindex_worker::FilterIndexHandle>,
     /// Live capability report backing `getcapabilities`.
@@ -1465,11 +1384,12 @@ impl NodeState {
         // publisher's snapshot into its persisted consumer cursor.
         let (chain_events_raw, chain_event_hints_rx_raw) =
             ChainEventPublisher::new(epoch, initial_snapshot);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let chain_events = Arc::new(chain_events_raw);
-        let tx_index_open = open_tx_index(&config, txindex_cache_bytes, epoch)?;
-        let (tx_index_runtime, tx_index_worker, tx_index_query, tx_query_adapter) =
-            match tx_index_open {
-                Some(open) => {
+        let tx_index_open_spec = build_tx_index_open_spec(&config, txindex_cache_bytes, epoch)?;
+        let (tx_index_runtime, tx_index_worker, tx_index_lifecycle, tx_index_adapter) =
+            match tx_index_open_spec {
+                Some(spec) => {
                     let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
                     let runtime = Arc::new(crate::txindex_worker::TxIndexRuntime::new(wake_tx));
                     let body_source: Arc<dyn bitcoin_rs_rpc::context::BlockBodySource> =
@@ -1477,29 +1397,30 @@ impl NodeState {
                     let block_source = crate::NodeBlockSource::new(Arc::clone(&blocks))
                         .with_block_body_source(Arc::clone(&body_source))
                         .with_block_tree(Arc::clone(&block_tree));
-                    let query = Arc::new(crate::txindex_worker::TxIndexQueryEngine::new(
-                        Arc::clone(&runtime),
-                        Arc::clone(&open.reader),
-                        block_source,
-                        Arc::clone(&block_tree),
-                        Arc::clone(&applied_tip),
-                        Some(body_source),
+                    let lifecycle: Arc<arc_swap::ArcSwap<crate::txindex_worker::TxIndexLifecycle>> =
+                        Arc::new(arc_swap::ArcSwap::from_pointee(
+                            crate::txindex_worker::TxIndexLifecycle::Opening,
+                        ));
+                    let adapter = Arc::new(crate::txindex_worker::TxIndexQueryAdapter::new(
+                        Arc::clone(&lifecycle),
                     ));
-                    let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
-                    let worker = crate::txindex_worker::TxIndexWorker::spawn(
+                    let generation = crate::txindex_worker::Generation::new(spec.epoch);
+                    let worker = crate::txindex_worker::TxIndexWorker::spawn_with_open(
                         Arc::clone(&runtime),
-                        open.writer,
+                        spec,
+                        Arc::clone(&lifecycle),
+                        generation,
                         Arc::clone(&applied_tip),
                         Arc::clone(&block_tree),
                         Some(Arc::clone(&block_body_store)),
-                        open.batch_limits,
-                        tx_index_capabilities(&config),
+                        block_source,
+                        Some(body_source),
                         Arc::clone(&chain_events),
-                        config.index_rollback_rebuild_cutover,
+                        Arc::clone(&shutdown),
                         wake_rx,
                     )
                     .context("spawn txindex worker")?;
-                    (Some(runtime), Some(worker), Some(query), Some(adapter))
+                    (Some(runtime), Some(worker), Some(lifecycle), Some(adapter))
                 }
                 None => (None, None, None, None),
             };
@@ -1512,14 +1433,20 @@ impl NodeState {
             Arc::clone(&applied_tip),
             Arc::clone(&block_tree),
             Arc::clone(&block_body_store),
-            tx_query_adapter.clone(),
+            tx_index_adapter.as_ref().map(|a| {
+                let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = a.clone();
+                adapter
+            }),
             Arc::clone(&chain_events),
             chain_event_hints_rx_raw.clone(),
         )?;
         let capabilities = Arc::new(crate::extensions::NodeCapabilities::new(
             crate::extensions::CapabilityInputs {
                 applied_tip: Arc::clone(&applied_tip),
-                tx_query: tx_query_adapter,
+                tx_query: tx_index_adapter.as_ref().map(|a| {
+                    let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = a.clone();
+                    adapter
+                }),
                 tx_runtime: tx_index_runtime.clone(),
                 txindex_enabled: config.txindex || config.script_index,
                 filter_status: filter_index
@@ -1542,7 +1469,6 @@ impl NodeState {
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let chain_event_hints_rx = Arc::new(Mutex::new(chain_event_hints_rx_raw));
-        let shutdown = Arc::new(AtomicBool::new(false));
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -1617,7 +1543,8 @@ impl NodeState {
             coin_stats,
             tx_index_runtime,
             tx_index_worker,
-            tx_index_query,
+            tx_index_lifecycle,
+            tx_index_adapter,
             filter_index,
             capabilities,
             prune_service,
@@ -1750,9 +1677,9 @@ impl NodeState {
         if !self.config.txindex {
             return None;
         }
-        self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
-            adapter
+        self.tx_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = adapter.clone();
+            q
         })
     }
 
@@ -1762,9 +1689,9 @@ impl NodeState {
     /// enable or advertise the Core `--txindex` contract.
     #[must_use]
     pub fn esplora_tx_index_query(&self) -> Option<Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery>> {
-        self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = query.clone();
-            adapter
+        self.tx_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::TxIndexQuery> = adapter.clone();
+            q
         })
     }
 
@@ -1774,9 +1701,9 @@ impl NodeState {
         if !self.config.script_index {
             return None;
         }
-        self.tx_index_query.as_ref().map(|query| {
-            let adapter: Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery> = query.clone();
-            adapter
+        self.tx_index_adapter.as_ref().map(|adapter| {
+            let q: Arc<dyn bitcoin_rs_rpc::context::ScriptIndexQuery> = adapter.clone();
+            q
         })
     }
 
@@ -1924,9 +1851,11 @@ impl NodeState {
     }
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
-    /// `Headers` batches into. The matching `Receiver` is consumed by
+    /// block headers into. The matching `Receiver` is polled by
     /// `BlockSync::tick` to extend the `BlockTree`.
-    #[must_use]
+    /// Returns a cloned `Sender` that the P2P listener pushes inbound
+    /// block headers into. The matching `Receiver` is polled by
+    /// `BlockSync::tick` to extend the `BlockTree`.
     pub fn inbound_headers_sender(&self) -> Sender<bitcoin_rs_p2p::InboundHeaders> {
         self.inbound_headers_tx.clone()
     }
@@ -1943,9 +1872,7 @@ impl NodeState {
     }
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
-    /// `Block` messages into. The matching `Receiver` is consumed by
-    /// `BlockSync::tick` to apply downloaded blocks.
-    #[must_use]
+    /// blocks into for verification and relay.
     pub fn inbound_blocks_sender(&self) -> Sender<bitcoin_rs_p2p::InboundBlock> {
         self.inbound_blocks_tx.clone()
     }
@@ -2014,6 +1941,70 @@ impl NodeState {
         Arc::clone(&self.apply_handles.shutdown)
     }
 
+    /// Bounded index-worker shutdown: requests both txindex and filter-index
+    /// shutdowns, waits up to `deadline` for clean join, and detaches on
+    /// expiry. On detach, revokes the generation token and publishes
+    /// `ShutdownAbandoned` so queries return typed `Unavailable` instead of
+    /// hitting a torn reader.
+    pub(crate) fn bounded_index_shutdown(&mut self, deadline: Duration) {
+        let start = std::time::Instant::now();
+        if let Some(runtime) = &self.tx_index_runtime {
+            runtime.request_shutdown();
+        }
+        if let Some(handle) = &self.filter_index {
+            handle.status.shutdown();
+        }
+        // Take the worker out of self so we can join it without holding self
+        // mutably across the wait.
+        let tx_index_worker = self.tx_index_worker.take();
+        let filter_index = self.filter_index.take();
+        let tx_deadline = start + deadline;
+        let tx_joined = if let Some(worker) = tx_index_worker {
+            let mut joined = false;
+            while std::time::Instant::now() < tx_deadline {
+                if worker.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if worker.is_finished() {
+                worker.join();
+                joined = true;
+            } else {
+                tracing::warn!("txindex worker still blocked; abandoning join");
+                // Revoke the generation token so late publication is a no-op.
+                if let Some(generation_token) = &worker.generation {
+                    generation_token.revoke();
+                }
+                if let Some(lifecycle) = &self.tx_index_lifecycle {
+                    lifecycle.store(Arc::new(
+                        crate::txindex_worker::TxIndexLifecycle::ShutdownAbandoned,
+                    ));
+                }
+                // Let the worker drop naturally — Drop requests shutdown and
+                // joins, but the thread is detached since it's still running.
+            }
+            joined
+        } else {
+            true
+        };
+        let filter_deadline = start + deadline;
+        if let Some(handle) = filter_index {
+            while std::time::Instant::now() < filter_deadline {
+                if handle.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                handle.join();
+            } else {
+                tracing::warn!("filter index worker still blocked; abandoning join");
+            }
+        }
+        let _ = tx_joined;
+    }
+
     /// Snapshot of the handle set needed by `crate::apply::apply_block`.
     #[must_use]
     pub fn apply_handles(&self) -> crate::apply::ApplyHandles {
@@ -2040,6 +2031,10 @@ impl NodeState {
 impl Drop for NodeState {
     fn drop(&mut self) {
         let _admission = self.apply_handles.admission.close();
+        // Safety net: if `bounded_index_shutdown` was not called (e.g. in
+        // tests that drop `NodeState` directly), still request shutdown and
+        // join. In normal operation these are already `None` because
+        // `bounded_index_shutdown` took them.
         if let Some(runtime) = &self.tx_index_runtime {
             runtime.request_shutdown();
         }
@@ -2160,10 +2155,16 @@ mod tests {
             panic!("txindex query engine missing when enabled");
         };
         assert!(Arc::ptr_eq(&a, &b), "txindex query handle must be stable");
-        assert!(
-            state.data_dir().join("txindex").exists(),
-            "enabled txindex must create storage"
-        );
+        // The worker opens the store asynchronously; the directory appears
+        // once its open completes, not during NodeState::open.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !state.data_dir().join("txindex").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "enabled txindex worker did not create storage within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 
@@ -2182,7 +2183,16 @@ mod tests {
         assert!(state.tx_index_query().is_none());
         assert!(state.esplora_tx_index_query().is_some());
         assert!(state.script_index_query().is_some());
-        assert!(state.data_dir().join("txindex").exists());
+        // The script-index worker shares the txindex storage; it is created
+        // asynchronously once the worker's open completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !state.data_dir().join("txindex").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "script-index worker did not create storage within 30s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 
