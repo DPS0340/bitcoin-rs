@@ -35,12 +35,18 @@ validation, and an opt-in kernel oracle for differential verification.
 
 ## Quick start
 
-Build and run the default node (pure Rust, no C++ toolchain required):
+Build and run the default node with the quick-start profile (pure Rust, no
+C++ toolchain required):
 
 ```sh
-cargo build --release -p bitcoin-rs
-./target/release/bitcoin-rs --data-dir .bitcoin-rs
+cargo build --profile quickstart -p bitcoin-rs
+./target/quickstart/bitcoin-rs --data-dir .bitcoin-rs
 ```
+
+The `quickstart` profile builds ~3x faster than `--release` by dropping LTO
+and raising codegen-units, at the cost of lower runtime throughput — fine for
+booting and exploring.  For sustained IBD or benchmarking, use
+`cargo build --release` instead.
 
 This starts a mainnet node storing state in `.bitcoin-rs` and listening for
 JSON-RPC on `127.0.0.1:8332`.

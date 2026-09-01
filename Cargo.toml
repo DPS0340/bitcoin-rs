@@ -283,6 +283,18 @@ panic         = "abort"
 debug         = "line-tables-only"
 strip         = "symbols"
 
+# Fastest path from clone to a running node.  Inherits `release` but drops
+# fat LTO and raises codegen-units so crates compile in parallel — ~3x
+# faster to build than `--release` at the cost of lower runtime throughput
+# (~2.5–4.5x fewer blocks/s in the sync-apply bench).  Good enough to boot
+# and explore; switch to `--release` for sustained IBD or benchmarking.
+[profile.quickstart]
+inherits     = "release"
+opt-level     = 3
+lto           = false
+codegen-units = 16
+debug         = "none"
+
 [profile.bench]
 opt-level     = 3
 lto           = "fat"
