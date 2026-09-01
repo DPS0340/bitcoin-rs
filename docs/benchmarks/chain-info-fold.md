@@ -1,13 +1,16 @@
-# Chain-info RPC benchmarks
+# Historical chain-info RPC benchmark record
+
+> The Criterion harness recorded on this page was retired after the indexed
+> implementation became the only supported path. The measurements below remain
+> historical evidence, not a current performance contract.
 
 Historical and current benchmarks for `getblockchaininfo` and
 `getchaintxstats`, the two RPCs that folded the node’s whole block-record log.
 
-The first table below is the historical same-process A/B evidence: it compared
+The first table below is historical same-process A/B evidence: it compared
 the retired whole-log baseline against the indexed implementation in one
-Criterion group over one fixture in one process. The current harness in
-`crates/rpc/benches/chaininfo.rs` runs only the indexed implementation plus
-end-to-end `Handler::dispatch` benchmarks.
+Criterion group over one fixture in one process. The former current-only
+`Handler::dispatch` harness was retired with the A/B benchmark.
 
 Because the historical A/B ran both arms in that single process, the ratio
 could not be confounded by the rebuild and baseline drift recorded in

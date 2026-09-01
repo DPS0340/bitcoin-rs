@@ -14,7 +14,6 @@ The checkpoint manifest still records this component under the codec identifier 
 
 ## Features
 
-- `bench-mimalloc`: bench-only toggle that registers mimalloc as the global allocator in `benches/utxo_commit.rs` and `benches/coin_stats_hotpath.rs`; it changes nothing in library builds.
 - `rocksdb`, `fjall`, `redb`, `mdbx`: forward the storage-backend selection into the `storage` crate.
 
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the

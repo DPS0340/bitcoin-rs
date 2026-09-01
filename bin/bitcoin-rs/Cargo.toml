@@ -40,10 +40,6 @@ name = "g01_headers_only_sync"
 path = "tests/gates/g01_headers_only_sync.rs"
 
 [[test]]
-name = "g02_ibd_muhash_parity"
-path = "tests/gates/g02_ibd_muhash_parity.rs"
-
-[[test]]
 name = "g03_kernel_parity"
 path = "tests/gates/g03_kernel_parity.rs"
 

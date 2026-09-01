@@ -886,41 +886,6 @@ impl NodeState {
         };
         let checkpoint_load =
             crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
-        let g2_muhash_sampler = config
-            .g2_muhash_samples
-            .clone()
-            .map(|path| crate::g2_muhash::G2MuhashSampler::open(path, config.g2_muhash_tip_height))
-            .transpose()
-            .context("open G2 MuHash sample writer")?
-            .map(Arc::new);
-        let g14_utxo_commit_sampler = match (
-            config.g14_utxo_commit_samples.as_ref(),
-            config.g14_utxo_commit_ibd_start_height,
-            config.g14_utxo_commit_ibd_stop_height,
-            config.g14_utxo_commit_ibd_start_hash.as_ref(),
-            config.g14_utxo_commit_ibd_stop_hash.as_ref(),
-        ) {
-            (None, None, None, None, None) => None,
-            (
-                Some(path),
-                Some(start_height),
-                Some(stop_height),
-                Some(start_hash),
-                Some(stop_hash),
-            ) => Some(Arc::new(
-                crate::g14_utxo_commit::G14UtxoCommitSampler::open(
-                    path.clone(),
-                    start_height,
-                    stop_height,
-                    start_hash.clone(),
-                    stop_hash.clone(),
-                )
-                .context("open G14 UTXO commit sample writer")?,
-            )),
-            _ => {
-                bail!("g14_utxo_commit_samples requires complete G14 UTXO commit IBD window fields")
-            }
-        };
         let storage = NodeStorage::open(&config)?;
         let undo_store = storage.undo_store();
         // Before anything reads the chainstate, let alone serves or syncs it.
@@ -980,7 +945,7 @@ impl NodeState {
             Arc::new(crate::NoOpZmqPublisher)
         };
         let (
-            mut utxo_set,
+            utxo_set,
             initial_coin_stats,
             block_tree_value,
             restored_applied_tip,
@@ -1029,14 +994,6 @@ impl NodeState {
         };
         let coin_stats_listener =
             bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
-        // The rolling coin-stats listener does per-coin MuHash + event work on
-        // the block-apply hot path. Bitcoin Core does not maintain rolling UTXO
-        // stats during IBD by default; gettxoutsetinfo scans on demand instead
-        // (see scan_coin_stats). Only register the listener when G2 MuHash
-        // sampling needs the rolling accumulator.
-        if config.g2_muhash_samples.is_some() {
-            utxo_set.set_listener(Box::new(coin_stats_listener.clone()));
-        }
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
@@ -1112,8 +1069,6 @@ impl NodeState {
             zmq_publisher: Arc::clone(&zmq_publisher),
             block_body_store: Some(Arc::clone(&block_body_store)),
             undo_store,
-            g2_muhash_sampler,
-            g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
             shutdown: Arc::clone(&shutdown),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -1253,7 +1208,6 @@ impl NodeState {
             applied_tip.as_deref(),
             self.chain_tx_count
                 .load(core::sync::atomic::Ordering::Relaxed),
-            self.config.g2_muhash_samples.is_some(),
         )?;
         // Remove the marker only after this checkpoint publishes the matching
         // UTXO set and applied tip. TxIndex is outside the authoritative
@@ -2816,7 +2770,7 @@ mod tests {
         rescanned.tx_count = listener_after_apply.tx_count;
         assert_ne!(
             listener_after_apply.total_amount, rescanned.total_amount,
-            "G2-disabled resume must not receive rolling UTXO notifications"
+            "default resume must not receive rolling UTXO notifications"
         );
         resumed.write_clean_checkpoint()?;
 
@@ -2873,40 +2827,6 @@ mod tests {
             assert_eq!(resumed.resume_source(), ResumeSource::Checkpoint);
             resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
         }
-        Ok(())
-    }
-
-    #[test]
-    fn rolling_coinstats_resume_continues_through_next_block() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let data_dir = dir.path().join("node-g2");
-        let samples = dir.path().join("g2.samples");
-        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
-        config.data_dir = data_dir.clone();
-        config.p2p_listen.clear();
-        config.g2_muhash_samples = Some(samples.clone());
-        config.g2_muhash_tip_height = Some(2);
-        let state = NodeState::open(config)?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        state.apply_block(&genesis)?;
-        let before = state.coin_stats().snapshot();
-        state.write_clean_checkpoint()?;
-        drop(state);
-
-        let mut reopen_config = crate::Config::default_for_network(crate::Network::Regtest);
-        reopen_config.data_dir = data_dir;
-        reopen_config.p2p_listen.clear();
-        reopen_config.g2_muhash_samples = Some(samples);
-        reopen_config.g2_muhash_tip_height = Some(2);
-        let resumed = NodeState::open(reopen_config)?;
-        assert_eq!(resumed.coin_stats().snapshot(), before);
-        resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;
-        let rolling = resumed.coin_stats().snapshot();
-        let mut scanned = resumed.utxo().with_stable_view(|view| {
-            bitcoin_rs_utxo::stats::scan_coin_stats(view, rolling.height, true)
-        })?;
-        scanned.tx_count = rolling.tx_count;
-        assert_eq!(rolling, scanned);
         Ok(())
     }
 

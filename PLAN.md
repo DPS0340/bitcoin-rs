@@ -50,16 +50,15 @@ bitcoin-rs/
 ├── deny.toml                     # cargo-deny config
 ├── .github/workflows/ci.yml      # fmt + clippy -D warnings + test + bench-smoke + deny
 ├── docs/                         # benchmarks, solutions, plans, policies, getting-started, REST
-├── tools/                        # benchmark-campaign, bip300301-enforcer, checksig-census
-├── scripts/                      # G2/G14 evidence-collection and measurement drivers
+├── tools/                        # bip300301-enforcer integration
+├── scripts/                      # repository maintenance and fixture helpers
 ├── fuzz/                         # cargo-fuzz targets (utxo_snapshot, block/tx decode, p2p, script)
 ├── crates/
 │   ├── primitives/               # Hash256, OutPoint, Tx, Block, Header, varint, network, sighash types
 │   ├── consensus/                # kernel-authoritative validator + parallel Rust path
-│   │   └── benches/              # verify_tx.rs, merkle.rs
+│   │   └── benches/              # merkle.rs
 │   ├── script/                   # interpreter (legacy/segwit/taproot/sighash variants/sigops)
 │   ├── storage/                  # KvStore trait + fjall default + rocksdb + mdbx + redb feature impls
-│   │   └── benches/              # kvstore_backends.rs — rocksdb vs mdbx vs fjall vs redb
 │   ├── utxo/                     # 256-shard HashTable + Bump + self_cell + RwLock; commit/get/undo/defrag/snapshot
 │   │   └── benches/              # utxo_commit.rs
 │   ├── utreexo/                  # rustreexo Pollard/Stump/MemForest; proof attach/verify; bridge-node
@@ -73,9 +72,8 @@ bitcoin-rs/
 │   ├── mining/                   # getblocktemplate (BIP22/23); mining policy from mempool; coinbase template
 │   ├── rpc/                      # Bitcoin-Core-compat JSON-RPC subset
 │   ├── electrum/                 # Electrum protocol over the index
-│   │   └── benches/              # electrum_methods.rs
 │   ├── node/                     # event loop; config (TOML + bitcoin.conf compat + CLI + env); signal handling; metrics; tracing; graceful shutdown
-│   │   └── benches/              # sync_pipeline.rs, sync_apply_metrics.rs
+│   │   └── benches/              # sync_pipeline.rs
 └── bin/
     └── bitcoin-rs/               # main.rs; thin — wires `crates/node`; tests/gates/g01..g15
 ```
@@ -171,17 +169,17 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 
 **G1 — Headers-only sync parity.** `bitcoin-rs --network mainnet` → header chain hash matches `bitcoind`'s `getblockhash` for every height 0..tip.
 
-**G2 — Full IBD UTXO root parity.** Every 10 000 blocks during IBD, our running coinstats hash matches Bitcoin Core's `gettxoutsetinfo` muhash field byte-for-byte.
+**G2 — Retired runtime evidence hook.** The former periodic MuHash sample emitter and its daemon/configuration surface were removed from the node runtime. MuHash correctness remains covered by checkpoint and UTXO snapshot parity tests; full-IBD evidence collection is no longer an acceptance-gate command.
 
 **G3 — Kernel parity gate.** During the first 100 000 mainnet blocks of CI, every block is validated through *both* our Rust validator and `bitcoinkernel`. Any disagreement is a CI hard-fail; the failing block + log is artifacted.
 
 **G4 — Consensus test vectors.** `tx_valid.json`, `tx_invalid.json`, `script_tests.json`, `sighash.json` from Bitcoin Core's `src/test/data/` are vendored into `crates/consensus/tests/vectors/` and run as `#[test]`s; 100 % pass.
 
-**G5 — Electrum protocol parity.** Pointed at the same chain, our `crates/electrum` returns byte-identical responses to a reference electrs build for `blockchain.scripthash.{get_history,get_balance,subscribe,listunspent}`, `blockchain.transaction.get`, `blockchain.estimatefee`, `mempool.get_fee_histogram`, `server.{version,banner,donation_address,peers.subscribe}` over a 10 000-call random sample at tip — the sample size the G14 gate enforces (`EXPECTED_ELECTRUM_SAMPLE_SIZE = 10_000` in `bin/bitcoin-rs/tests/gates/g14_perf_budgets.rs`).
+**G5 — Electrum protocol parity.** Pointed at the same chain, our `crates/electrum` returns byte-identical responses to a reference electrs build for `blockchain.scripthash.{get_history,get_balance,subscribe,listunspent}`, `blockchain.transaction.get`, `blockchain.estimatefee`, `mempool.get_fee_histogram`, `server.{version,banner,donation_address,peers.subscribe}` over a 10 000-call random sample at tip.
 
 **G6 — Snapshot round-trip.** Driven in process through the snapshot API in `crates/utxo/src/snapshot.rs` (`write_snapshot`, then `read_snapshot_strict_v4`): reloading the written snapshot reproduces an identical UTXO set and coinstats hash. There is no CLI flag for this; the gate is `bin/bitcoin-rs/tests/gates/g06_snapshot_roundtrip.rs`, an `#[ignore]`d manual run over a populated UTXO set whose in-memory path is covered by `crates/utxo` unit tests. Format is `bitcoin-rs`'s own LE format (gocoin wire-compat dropped per ultrareview).
 
-**G7 — Storage-backend equivalence.** RocksDB, MDBX (`signet-libmdbx`), fjall, and redb backends all pass G1–G6 with identical chain results. `cargo bench -p bitcoin-rs-storage --bench kvstore_backends` reports throughput + p99 latency for all four in `target/bench-report.md`. **Backend promotion rule:** if MDBX wins by ≥15 % on UTXO-commit p95 AND matches RocksDB on Electrum-history p95, MDBX becomes the new default in the next minor release and the change is documented in [docs/plans/2026-05-19-ultrareview-log.md](docs/plans/2026-05-19-ultrareview-log.md).
+**G7 — Storage-backend equivalence.** RocksDB, MDBX (`signet-libmdbx`), fjall, and redb backends all pass G1–G6 with identical chain results. Backend promotion is decided from retained production-path node sync/apply measurements and correctness evidence; the retired generic KV workload is not a product performance contract.
 
 **G8 — Utreexo parity.** With `--utreexo-mode` (feature `utreexo`) enabled, IBD reproduces the same chain tip + coinstats hash as the rocksdb full-UTXO path.
 
@@ -329,7 +327,6 @@ git commit -am "feat(script): interpreter + sigops + taproot + batch schnorr" -m
 **Files:**
 - Create: `crates/storage/src/{lib,trait_,rocksdb_impl,mdbx_impl,fjall_impl,redb_impl,column_families,write_batch}.rs`
 - Test: `crates/storage/tests/backend_equivalence.rs`
-- Bench: `crates/storage/benches/kvstore_backends.rs`
 
 - [ ] **Step 1: `KvStore` trait.**
 
@@ -363,7 +360,7 @@ pub trait WriteBatch {
 
 - [ ] **Step 7: `backend_equivalence.rs` test** — for each backend: insert 10 000 rows across 5 CFs, read them back, prefix-iterate, delete-range; assert byte-identical results across backends.
 
-- [ ] **Step 8: `crates/storage/benches/kvstore_backends.rs`** — criterion benchmark: write 1M sequential keys, write 1M random keys, point-get 1M keys, prefix-iter 100K-key prefix, 16-thread mixed-read-write workload. Report saved to `target/criterion/kvstore_backends/report/index.html` and an aggregate summary appended to `target/bench-report.md`.
+- **Step 8: No permanent storage benchmark.** The generic multi-backend KV shootout was retired as an experiment; backend equivalence tests plus production-path node measurements are the supported evidence.
 
 - [ ] **Step 9: Commit.**
 
@@ -440,7 +437,7 @@ Serialized via `zerocopy::AsBytes` where layout permits; script bytes are length
 
 - [ ] **Step 12: `crates/utxo/tests/defrag_invariants.rs`** — random commits with ~50 % deletions, repeatedly `defrag_one_shard`, assert no entries vanish.
 
-- [ ] **Step 13: `crates/utxo/benches/utxo_commit.rs`** — criterion: commit synthetic 4 MiB blocks at 10 k input + 10 k output density; report p50 / p95 / p99 + entries-per-shard distribution.
+- [ ] **Step 13: `crates/utxo/benches/utxo_commit.rs`** — Criterion coverage for three production-shaped UTXO commits: normal mixed-shard work, concentrated worst-case work, and spend-heavy work. Correctness edge cases belong in the UTXO test suite.
 
 - [ ] **Step 14: Commit.**
 
@@ -818,10 +815,10 @@ git commit -am "feat(bin): bitcoin-rs binary" -m "Op: extend"
 ### Task 20: Verification gates G1–G15 — flat acceptance suite
 
 **Files:**
-- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g02_ibd_muhash_parity,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
+- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
 - CI: `.github/workflows/ci.yml`
 
-Each gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or externally collected evidence; G14 verifies the externally collected evidence contract (gathered by the `scripts/run-g14-*.sh` drivers) and fails closed when it is missing. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all 15 gates are green for two consecutive CI runs on `main`.
+Each live gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or external infrastructure. The former G14 artifact drivers and harness tests were retired with the completed performance campaign; current performance contracts live in the retained crate benchmarks. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all live gates are green for two consecutive CI runs on `main`.
 
 - [ ] **Step 1–15:** Each gate test as defined in *Verification Gates* above. Each in its own file under `bin/bitcoin-rs/tests/gates/` (`g01_headers_only_sync.rs` through `g15_workspace_version_sync.rs`), each callable independently via `cargo test -p bitcoin-rs --test g<N>_<name>`, with `-- --ignored --nocapture` for the manual gates.
 
@@ -845,4 +842,4 @@ The 2026-05-19 Ultrareview Log moved to [docs/plans/2026-05-19-ultrareview-log.m
 
 **Workspace setup:** The plan's `bitcoin-rs/` subdirectory lives inside the workspace; reference repos (`gocoin/`, `electrs/`, `utreexod/`, `bitcoin/`, `btcd/`) remain readable from the cwd parent.
 
-**Done definition:** All 21 tasks committed, all 15 verification gates green twice on `main`, `cargo +1.95.0 clippy -p bitcoin-rs --all-targets --no-default-features --features "$FEATURES" -- -D warnings` clean, `cargo deny check` clean, `cargo +1.95.0 fmt --check` clean, `target/release/bitcoin-rs --version` prints `0.4.0`, IBD to mainnet tip completes with G2 + G3 + G14 all reporting green.
+**Done definition:** All 21 tasks committed, all active verification gates green twice on `main`, `cargo +1.95.0 clippy -p bitcoin-rs --all-targets --no-default-features --features "$FEATURES" -- -D warnings` clean, `cargo deny check` clean, `cargo +1.95.0 fmt --check` clean, `target/release/bitcoin-rs --version` prints `0.4.0`, and the retained production-path performance benchmarks are green.

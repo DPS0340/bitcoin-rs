@@ -22,14 +22,10 @@ mod checkpoint;
 mod checkpoint_fs;
 /// Layered node configuration.
 pub mod config;
-/// Block corpus manifest for contiguous archive integrity.
-pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
 /// Central synchronous event loop.
 pub mod event_loop;
-mod g14_utxo_commit;
-mod g2_muhash;
 /// Block import pipeline.
 pub mod import;
 /// Tracing initialization.

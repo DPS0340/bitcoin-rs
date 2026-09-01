@@ -23,6 +23,10 @@ tags:
 
 # Native benchmark custody binds program and input identity through inherited descriptors
 
+> Historical pattern: the campaign runner that implemented this custody
+> protocol was retired after the measured campaign. This document preserves
+> the failure analysis; it does not describe supported repository tooling.
+
 ## Context
 
 The benchmark campaign runs candidate and Bitcoin Core processes against the same corpus. A path and a recorded SHA-256 digest do not prove which file a child opened. Another process can replace the path after the runner checks it but before the child opens it. A PATH-resolved launcher adds the same gap for the executable.

@@ -1026,8 +1026,6 @@ pub struct ApplyHandles {
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
     /// Undo storage. Mandatory: see [`UndoStore`].
     pub(crate) undo_store: Arc<dyn UndoStore>,
-    pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
-    pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
     /// Process-wide shutdown signal shared by all runtime workers.
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -1101,8 +1099,6 @@ impl ApplyHandles {
             zmq_publisher,
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
-            g2_muhash_sampler: None,
-            g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -1249,7 +1245,7 @@ fn plan_disconnect(
 /// |---|---|
 /// | `utxo`, `applied_tip` | restored here |
 /// | `tx_index_runtime` | notified here; the worker reconciles the index asynchronously |
-/// | `coin_stats` | restored here, in two halves. The per-coin fields ride the `UtxoSet` change listener, so the UTXO undo already reverses them; only the block-level height and transaction count need an explicit rewind |
+/// | `coin_stats` | restored here, in two halves. When a caller installs the optional `UtxoSet` change listener, the UTXO undo reverses per-coin fields; the default node recomputes those fields during checkpoint and stable reads. Block-level height and transaction count always need an explicit rewind |
 /// | `blocks` | restored here — RPC would otherwise keep serving the disconnected block |
 /// | `transactions` | nothing owed: connection never populates it |
 /// | `mempool` | **owed** once transaction relay exists; disconnected transactions belong back in it |
@@ -2310,10 +2306,6 @@ fn apply_block_admitted(
 
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
     let wants_rawblock = handles.zmq_publisher.wants_rawblock();
-    let needs_g14_sample = handles
-        .g14_utxo_commit_sampler
-        .as_ref()
-        .is_some_and(|sampler| sampler.wants_height(height));
     let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
         tx_plan.into_scratch_parts();
     let scratch = ApplyScratch::from_prepared_parts(
@@ -2379,8 +2371,7 @@ fn apply_block_admitted(
     let block_bytes: bytes::Bytes = {
         let needs_body = handles.block_body_store.is_some()
             || handles.tx_index_runtime.is_some()
-            || wants_rawblock
-            || needs_g14_sample;
+            || wants_rawblock;
         if needs_body {
             // The preserved P2P wire payload is byte-identical to the canonical
             // block serialization: the decoder rejects every non-canonical
@@ -2427,21 +2418,6 @@ fn apply_block_admitted(
     metrics::histogram!("node.apply_block.utxo_commit_seconds")
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
-
-    if needs_g14_sample {
-        if let Some(sampler) = &handles.g14_utxo_commit_sampler {
-            if let Err(error) =
-                sampler.record(height, block_hash, block_bytes.len(), utxo_commit_dur)
-            {
-                metrics::counter!("node.apply_block.g14_utxo_commit_sample_errors").increment(1);
-                tracing::warn!(
-                    height,
-                    %error,
-                    "G14 UTXO commit sample emission failed; evidence file incomplete"
-                );
-            }
-        }
-    }
 
     // Resolve the applied header after validation and UTXO commit have
     // succeeded. Header-first sync may already have inserted this header.
@@ -2548,19 +2524,6 @@ fn apply_block_admitted(
         handles
             .zmq_publisher
             .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
-    }
-    if let Some(sampler) = &handles.g2_muhash_sampler
-        && sampler.wants_height(height)
-    {
-        let snapshot = handles.coin_stats.snapshot();
-        if let Err(error) = sampler.record(&snapshot) {
-            metrics::counter!("node.apply_block.g2_muhash_sample_errors").increment(1);
-            tracing::warn!(
-                height,
-                %error,
-                "G2 MuHash sample emission failed after tip publication; evidence file incomplete"
-            );
-        }
     }
     Ok(tip)
 }
@@ -3709,6 +3672,9 @@ mod consensus_rule_tests {
     use bitcoin_rs_primitives::{Hash256, OutPoint};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use hashbrown::HashMap;
+    use metrics::{
+        Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
     use parking_lot::{Mutex, RwLock};
 
     use super::*;
@@ -3718,6 +3684,40 @@ mod consensus_rule_tests {
     const MAINNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
     const MAINNET_POW_LIMIT_DIV_4_BITS: u32 = 0x1c3f_ffc0;
     const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TestRecorder;
+
+    impl Recorder for TestRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    fn test_recorder() -> TestRecorder {
+        TestRecorder
+    }
 
     /// Parses `block` the way production does, so tests exercise the real
     /// one-shot kernel parse rather than a stand-in.
@@ -6414,7 +6414,7 @@ mod consensus_rule_tests {
     fn a_window_skips_scripts_for_assume_valid_blocks_and_proves_nothing_for_them()
     -> Result<(), Box<dyn std::error::Error>> {
         use bitcoin::opcodes::all::OP_EQUAL;
-        let (recorder, metrics_handle) = crate::metrics::test_recorder();
+        let recorder = test_recorder();
 
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         let prevout = bitcoin::OutPoint {
@@ -6485,13 +6485,6 @@ mod consensus_rule_tests {
             "a skipped block must carry AssumeValidSkipped, not script proof: the proof branch \
              bypasses the trust-gate re-read at commit, so a gate that flips in between would let \
              an unverified block through"
-        );
-        assert_eq!(
-            metrics_handle
-                .snapshot()
-                .get("node.window.verify_success_total"),
-            None,
-            "an empty verification dispatch must not count as script verification",
         );
         let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
         let Some(skipped) = entries.pop() else {

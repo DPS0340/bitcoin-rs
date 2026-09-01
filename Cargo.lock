@@ -240,13 +240,11 @@ dependencies = [
 name = "bitcoin-rs-consensus"
 version = "0.4.0"
 dependencies = [
- "anyhow",
  "bitcoin",
  "bitcoin-rs-primitives",
  "bitcoin-rs-script",
  "bitcoinkernel",
  "criterion",
- "hashbrown 0.17.1",
  "rayon",
  "secp256k1 0.31.1",
  "serde",
@@ -295,7 +293,6 @@ dependencies = [
  "slab",
  "smallvec",
  "thiserror",
- "tinyvec",
  "tracing",
 ]
 
@@ -308,7 +305,6 @@ dependencies = [
  "bitcoin-rs-consensus",
  "bitcoin-rs-mempool",
  "bitcoin-rs-primitives",
- "criterion",
  "parking_lot",
  "proptest",
  "serde",
@@ -346,7 +342,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "metrics-exporter-prometheus",
- "mimalloc",
  "parking_lot",
  "proptest",
  "quanta",
@@ -419,7 +414,6 @@ dependencies = [
  "bitcoin-rs-storage",
  "bitcoin-rs-utxo",
  "compact_str",
- "criterion",
  "crossbeam-channel",
  "hashbrown 0.17.1",
  "miniscript",
@@ -459,11 +453,9 @@ dependencies = [
  "bitcoin-rs-primitives",
  "bytemuck",
  "bytes",
- "criterion",
  "crossbeam-channel",
  "fjall",
  "parking_lot",
- "rayon",
  "redb",
  "rust-rocksdb",
  "serde",

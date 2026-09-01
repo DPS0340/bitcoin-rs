@@ -1,65 +1,35 @@
-//! Deterministic initial-sync proxy benchmark.
-// PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
+//! Canonical current-path block-apply benchmarks.
+//!
+//! The two retained shapes protect distinct production costs: a contiguous
+//! coinbase-only prefix and a mature, spend-heavy prefix that exercises UTXO
+//! removal plus `CoinStats` listener work. Protocol-ordering and burst cases are
+//! correctness tests, not separate long-lived performance contracts.
 #![allow(missing_docs)]
 
 use std::hint::black_box;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Instant;
 
-use arc_swap::ArcSwapOption;
 use bitcoin::absolute;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash as _;
-use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::script::Builder;
 use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, transaction,
+    Amount, Block, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
+    TxOut, Txid, Witness, transaction,
 };
-use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
-use bitcoin_rs_index::BlockSource as _;
-use bitcoin_rs_mempool::{Mempool, MempoolLimits};
-use bitcoin_rs_node::{
-    BlockSync, Config, Network, NoOpZmqPublisher, TxIndexRuntime,
-    apply::ApplyHandles,
-    state::NodeState,
-    sync::{SyncBudget, default_sync_budget},
-};
-use bitcoin_rs_p2p::{Message, PeerInfo};
-use bitcoin_rs_primitives::Hash256;
-use bitcoin_rs_rpc::context::{BlockBodySource, BlockLog, BlockRecord};
-use bitcoin_rs_utxo::UtxoSet;
-use bitcoin_rs_utxo::stats::{CoinStats, CoinStatsListener};
+use bitcoin_rs_node::{Config, Network, state::NodeState};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use crossbeam_channel::unbounded;
-use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
 use tempfile::TempDir;
 
 const PROXY_BLOCKS: u32 = 32;
-const SYNC_PROXY_BLOCKS: u32 = 128;
-const SYNC_PROXY_HEADER_HEIGHT: u32 = 4_096;
-const SYNC_PROXY_BLOCKS_USIZE: usize = 128;
-const SYNC_PROXY_START_HEIGHT: i32 = 4_096;
-const SYNC_PROXY_PEERS: usize = 512;
-const SYNC_OVERSIZED_BURST_BLOCKS: u32 = 1_024;
-const SYNC_OVERSIZED_BURST_BLOCKS_USIZE: usize = 1_024;
-const SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS: u32 = 384;
-const SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_START_HEIGHT: usize = 257;
-const SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_BLOCKS: usize = 128;
-const SPEND_PROXY_COINBASE_MATURITY: u32 = 100;
-const SPEND_PROXY_SPEND_BLOCKS: u32 = 16;
-const SPEND_PROXY_FANOUT: u32 = 64;
-const SPEND_PROXY_COINBASE_OUTPUT_VALUE: u64 = 78_125_000;
-const SPEND_PROXY_SPEND_OUTPUT_VALUE: u64 = 78_124_999;
+const COINBASE_MATURITY: u32 = 100;
+const SPEND_BLOCKS: u32 = 16;
+const SPEND_FANOUT: u32 = 64;
+const COINBASE_OUTPUT_VALUE: u64 = 78_125_000;
+const SPEND_OUTPUT_VALUE: u64 = 78_124_999;
 
-fn sync_pipeline_apply_proxy(c: &mut Criterion) {
+fn sync_pipeline(c: &mut Criterion) {
     let blocks = proxy_blocks(PROXY_BLOCKS);
-    print_proxy_summary(&blocks);
-
-    c.bench_function("sync_pipeline_apply_proxy", |b| {
+    c.bench_function("node_apply/contiguous_32_blocks", |b| {
         b.iter_batched(
             open_regtest_state,
             |(_dir, state)| {
@@ -80,317 +50,27 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
         );
     });
 
-    #[cfg(feature = "rocksdb")]
-    c.bench_function("sync_pipeline_apply_proxy_pruned_rocksdb", |b| {
-        b.iter_batched(
-            open_pruned_regtest_state,
-            |(_dir, state)| {
-                for block in &blocks {
-                    state
-                        .apply_block(black_box(block))
-                        .unwrap_or_else(|error| panic!("pruned proxy apply failed: {error}"));
-                }
-                let tip = state
-                    .applied_tip()
-                    .load_full()
-                    .unwrap_or_else(|| panic!("pruned proxy apply did not publish a tip"));
-                let record = state
-                    .blocks()
-                    .read()
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| panic!("pruned proxy apply did not publish a record"));
-                black_box((tip.height, record.body_size));
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
     let spend_blocks = spend_heavy_proxy_blocks();
-    print_spend_proxy_summary(&spend_blocks);
-    c.bench_function("sync_pipeline_apply_spend_heavy_proxy", |b| {
+    c.bench_function("node_apply/spend_heavy_16_blocks_fanout_64", |b| {
         b.iter_batched(
             open_regtest_state,
             |(_dir, state)| {
                 for block in &spend_blocks {
                     state
                         .apply_block(black_box(block))
-                        .unwrap_or_else(|error| panic!("spend-heavy proxy apply failed: {error}"));
+                        .unwrap_or_else(|error| panic!("spend-heavy apply failed: {error}"));
                 }
                 black_box(
                     state
                         .applied_tip()
                         .load_full()
-                        .unwrap_or_else(|| panic!("spend-heavy proxy did not publish a tip"))
+                        .unwrap_or_else(|| panic!("spend-heavy apply did not publish a tip"))
                         .height,
                 );
             },
             BatchSize::SmallInput,
         );
     });
-}
-
-fn deterministic_initial_sync_proxy(c: &mut Criterion) {
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_pure_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_indexed_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Noop).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_received_scan_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_unsolicited(),
-                |fixture| black_box(fixture.request_after_unsolicited_received()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_reverse_scan_overflow_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new_reverse_scan_overflow(TxIndexMode::Disabled),
-                |fixture| black_box(fixture.run_reverse_scan_overflow()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_in_order_inbound_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::Disabled).prebuild_in_order(),
-                |fixture| black_box(fixture.run_in_order_inbound()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    bench_production_state_sync(c);
-    c.bench_function("deterministic_initial_sync_proxy_many_peers_512", |b| {
-        b.iter_batched(
-            || SyncFixture::new_with_peers(TxIndexMode::Disabled, SYNC_PROXY_PEERS),
-            |fixture| black_box(fixture.run_many_peer_tick()),
-            BatchSize::SmallInput,
-        );
-    });
-    c.bench_function(
-        "deterministic_initial_sync_proxy_oversized_inbound_burst_1024_blocks",
-        |b| {
-            b.iter_batched(
-                || {
-                    SyncFixture::new_with_block_count(
-                        TxIndexMode::Disabled,
-                        1,
-                        SYNC_OVERSIZED_BURST_BLOCKS,
-                    )
-                    .prebuild_oversized_burst()
-                },
-                |fixture| black_box(fixture.run_oversized_inbound_burst()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "rocksdb")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_deep_headers_txindex_rocksdb_128_blocks",
-        |b| {
-            b.iter_batched(
-                || SyncFixture::new(TxIndexMode::RocksDb).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-}
-
-fn bench_production_state_sync(c: &mut Criterion) {
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_128_blocks",
-        |b| {
-            b.iter_batched(
-                || ProductionStateSyncFixture::new(1).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "fjall")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_fjall_all_indexes_128_blocks",
-        |b| {
-            b.iter_batched(
-                || ProductionStateSyncFixture::new_fjall_all_indexes(1).prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "fjall")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_fjall_all_indexes_spend_heavy",
-        |b| {
-            b.iter_batched(
-                || ProductionStateSyncFixture::new_fjall_all_indexes_spend_heavy().prebuild_run(),
-                |fixture| black_box(fixture.run()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_apply_tick_128_blocks",
-        |b| {
-            b.iter_batched(
-                || ProductionStateSyncFixture::new(1).stage_for_contiguous_apply(),
-                |fixture| black_box(fixture.apply_staged()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "fjall")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_fjall_all_indexes_apply_tick_128_blocks",
-        |b| {
-            b.iter_batched(
-                || {
-                    ProductionStateSyncFixture::new_fjall_all_indexes(1)
-                        .stage_for_contiguous_apply()
-                },
-                |fixture| black_box(fixture.apply_staged()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_partial_apply_tick_128_blocks",
-        |b| {
-            b.iter_batched(
-                || ProductionStateSyncFixture::new(1).stage_for_partial_cached_apply(),
-                |fixture| black_box(fixture.apply_staged()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-    #[cfg(feature = "fjall")]
-    c.bench_function(
-        "deterministic_initial_sync_proxy_production_state_fjall_all_indexes_partial_apply_tick_128_blocks",
-        |b| {
-            b.iter_batched(
-                || {
-                    ProductionStateSyncFixture::new_fjall_all_indexes(1)
-                        .stage_for_partial_cached_apply()
-                },
-                |fixture| black_box(fixture.apply_staged()),
-                BatchSize::SmallInput,
-            );
-        },
-    );
-}
-
-fn block_source_height_lookup(c: &mut Criterion) {
-    let source = block_source_fixture(SYNC_PROXY_HEADER_HEIGHT);
-    c.bench_function("block_source_height_lookup_tail_4096", |b| {
-        b.iter(|| {
-            black_box(
-                source
-                    .block_at_height(black_box(SYNC_PROXY_HEADER_HEIGHT))
-                    .unwrap_or_else(|| panic!("missing block at tail height")),
-            );
-        });
-    });
-}
-
-fn print_proxy_summary(blocks: &[Block]) {
-    let (_dir, state) = open_regtest_state();
-    let started = Instant::now();
-    for block in blocks {
-        state
-            .apply_block(block)
-            .unwrap_or_else(|error| panic!("proxy summary apply failed: {error}"));
-    }
-    let elapsed = started.elapsed();
-    let applied_height = state
-        .applied_tip()
-        .load_full()
-        .unwrap_or_else(|| panic!("proxy summary did not publish a tip"))
-        .height;
-    let blocks_per_second = f64::from(applied_height.saturating_add(1)) / elapsed.as_secs_f64();
-    let recorded_body_bytes: usize = state
-        .blocks()
-        .read()
-        .iter()
-        .map(|record| record.body_size)
-        .sum();
-    println!(
-        "sync_pipeline_apply_proxy blocks={} elapsed={elapsed:?} blocks_per_second={blocks_per_second:.2} recorded_body_bytes={recorded_body_bytes}",
-        applied_height.saturating_add(1),
-    );
-}
-
-fn print_spend_proxy_summary(blocks: &[Block]) {
-    let (_dir, state) = open_regtest_state();
-    let started = Instant::now();
-    for block in blocks {
-        state
-            .apply_block(block)
-            .unwrap_or_else(|error| panic!("spend-heavy proxy summary apply failed: {error}"));
-    }
-    let elapsed = started.elapsed();
-    let applied_height = state
-        .applied_tip()
-        .load_full()
-        .unwrap_or_else(|| panic!("spend-heavy proxy summary did not publish a tip"))
-        .height;
-    let transaction_count: usize = blocks.iter().map(|block| block.txdata.len()).sum();
-    let recorded_body_bytes: usize = state
-        .blocks()
-        .read()
-        .iter()
-        .map(|record| record.body_size)
-        .sum();
-    println!(
-        "sync_pipeline_apply_spend_heavy_proxy blocks={} txs={transaction_count} elapsed={elapsed:?} recorded_body_bytes={recorded_body_bytes}",
-        applied_height.saturating_add(1),
-    );
-}
-
-fn block_source_fixture(max_height: u32) -> bitcoin_rs_node::NodeBlockSource {
-    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let records = (0..=max_height)
-        .map(|height| BlockRecord::from_block(height, &block))
-        .collect();
-    bitcoin_rs_node::NodeBlockSource::new(Arc::new(RwLock::new(records))).with_block_body_source(
-        Arc::new(InstalledBlockBody {
-            hash: Hash256::from_le_bytes(block.block_hash().as_byte_array()),
-            bytes: bitcoin::consensus::encode::serialize(&block),
-        }),
-    )
-}
-
-struct InstalledBlockBody {
-    hash: Hash256,
-    bytes: Vec<u8>,
-}
-
-impl BlockBodySource for InstalledBlockBody {
-    fn block_body(&self, _height: u32, hash: Hash256) -> Option<Vec<u8>> {
-        (hash == self.hash).then(|| self.bytes.clone())
-    }
 }
 
 fn open_regtest_state() -> (TempDir, NodeState) {
@@ -402,686 +82,6 @@ fn open_regtest_state() -> (TempDir, NodeState) {
     let state =
         NodeState::open(config).unwrap_or_else(|error| panic!("open node state failed: {error}"));
     (dir, state)
-}
-
-#[cfg(feature = "rocksdb")]
-fn open_pruned_regtest_state() -> (TempDir, NodeState) {
-    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-    let mut config = Config::default_for_network(Network::Regtest);
-    config.data_dir = dir.path().join("node");
-    config.p2p_listen.clear();
-    "rocksdb".clone_into(&mut config.storage_backend);
-    config.txindex = false;
-    config.prune_target_mb = 1;
-    let state = NodeState::open(config)
-        .unwrap_or_else(|error| panic!("open pruned node state failed: {error}"));
-    (dir, state)
-}
-
-struct SyncFixture {
-    sync: BlockSync,
-    inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
-    outbound_rxs: Vec<crossbeam_channel::Receiver<Message>>,
-    peers: Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: Arc<RwLock<HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
-    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    blocks: Vec<Block>,
-    /// Inbound payloads pre-cloned and pre-serialized during (untimed) setup, in
-    /// the exact order the timed scenario sends them. Built off the production
-    /// path so the timed region measures only the channel handoff plus `tick`.
-    prebuilt_inbound: Vec<bitcoin_rs_p2p::InboundBlock>,
-    received_scan_expected: Vec<BlockHash>,
-}
-
-#[derive(Clone, Copy)]
-enum TxIndexMode {
-    Disabled,
-    Noop,
-    #[cfg(feature = "rocksdb")]
-    RocksDb,
-}
-
-impl SyncFixture {
-    fn new(tx_index_mode: TxIndexMode) -> Self {
-        Self::new_with_peers(tx_index_mode, 1)
-    }
-
-    fn new_with_peers(tx_index_mode: TxIndexMode, peer_count: usize) -> Self {
-        Self::new_with_block_count(tx_index_mode, peer_count, SYNC_PROXY_BLOCKS)
-    }
-
-    fn new_with_block_count(
-        tx_index_mode: TxIndexMode,
-        peer_count: usize,
-        block_count: u32,
-    ) -> Self {
-        let mut tree = BlockTree::new();
-        let (blocks, received_scan_expected) = populate_sync_header_chain(&mut tree, block_count);
-
-        let chain_tip = tree.tip_handle();
-        let block_tree = Arc::new(RwLock::new(tree));
-        let applied_tip = Arc::new(ArcSwapOption::empty());
-        let peers = Arc::new(RwLock::new(Vec::new()));
-        let peer_outbound = Arc::new(RwLock::new(HashMap::new()));
-        let (_inbound_headers_tx, inbound_headers_rx_raw) =
-            unbounded::<bitcoin_rs_p2p::InboundHeaders>();
-        let inbound_headers_rx = Arc::new(Mutex::new(inbound_headers_rx_raw));
-        let (inbound_blocks_tx, inbound_blocks_rx_raw) =
-            unbounded::<bitcoin_rs_p2p::InboundBlock>();
-        let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
-        let tx_index_runtime = tx_index_for_mode(tx_index_mode);
-        let handles = apply_handles(
-            Arc::clone(&chain_tip),
-            Arc::clone(&applied_tip),
-            Arc::clone(&block_tree),
-            tx_index_runtime,
-        );
-        let sync = BlockSync::new(
-            handles,
-            Arc::clone(&peers),
-            Arc::clone(&peer_outbound),
-            inbound_headers_rx,
-            inbound_blocks_rx,
-        );
-
-        let outbound_rxs = install_synthetic_peers(&peers, &peer_outbound, peer_count);
-
-        Self {
-            sync,
-            inbound_blocks_tx,
-            outbound_rxs,
-            peers,
-            peer_outbound,
-            applied_tip,
-            blocks,
-            prebuilt_inbound: Vec::new(),
-            received_scan_expected,
-        }
-    }
-
-    /// Pre-clones and pre-serializes the inbound payloads `run` sends, in send
-    /// order: heights `2..=N` reversed, then height 1 last (sent after tick 2).
-    fn prebuild_run(mut self) -> Self {
-        self.prebuilt_inbound = self.blocks[1..]
-            .iter()
-            .rev()
-            .chain(std::iter::once(&self.blocks[0]))
-            .map(|block| bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-            .collect();
-        self
-    }
-
-    /// Pre-builds the single unsolicited payload `request_after_unsolicited_received`
-    /// stages (block height 2).
-    fn prebuild_unsolicited(mut self) -> Self {
-        self.prebuilt_inbound = vec![bitcoin_rs_p2p::InboundBlock::from_decoded(
-            self.blocks[1].clone(),
-        )];
-        self
-    }
-
-    /// Pre-builds the in-order inbound payloads (`run_in_order_inbound`): every
-    /// block in ascending height order.
-    fn prebuild_in_order(mut self) -> Self {
-        self.prebuilt_inbound = self
-            .blocks
-            .iter()
-            .map(|block| bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-            .collect();
-        self
-    }
-
-    /// Pre-builds the oversized burst payloads (`run_oversized_inbound_burst`):
-    /// heights `2..=N` reversed.
-    fn prebuild_oversized_burst(mut self) -> Self {
-        self.prebuilt_inbound = self.blocks[1..]
-            .iter()
-            .rev()
-            .map(|block| bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-            .collect();
-        self
-    }
-
-    fn new_reverse_scan_overflow(tx_index_mode: TxIndexMode) -> Self {
-        let mut fixture =
-            Self::new_with_block_count(tx_index_mode, 0, SYNC_REVERSE_SCAN_OVERFLOW_BODY_BLOCKS);
-        // The bench stages 128 received blocks and still needs to request the
-        // full 128-block pending window, so the received-block budget must
-        // cover both the staged blocks and the new requests.
-        fixture.sync.install_budget(SyncBudget {
-            max_received_blocks: 256,
-            ..default_sync_budget()
-        });
-        let first_index = SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_START_HEIGHT.saturating_sub(1);
-        let last_index = first_index.saturating_add(SYNC_REVERSE_SCAN_OVERFLOW_RECEIVED_BLOCKS);
-        for block in fixture
-            .blocks
-            .get(first_index..last_index)
-            .unwrap_or_else(|| panic!("reverse-scan overflow block range missing"))
-            .iter()
-            .rev()
-        {
-            fixture
-                .inbound_blocks_tx
-                .send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-                .unwrap_or_else(|error| panic!("send staged overflow block failed: {error}"));
-        }
-        fixture.sync.tick();
-        fixture.outbound_rxs = install_synthetic_peers(&fixture.peers, &fixture.peer_outbound, 1);
-        fixture
-    }
-
-    fn run(mut self) -> u32 {
-        self.sync.tick();
-        let getdata_count = match self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory.len(),
-            other => panic!("expected getdata, got {other:?}"),
-        };
-        assert_eq!(getdata_count, SYNC_PROXY_BLOCKS_USIZE);
-        match self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-        {
-            Ok(other) => panic!("expected no getheaders, got {other:?}"),
-            Err(crossbeam_channel::TryRecvError::Empty) => {}
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                panic!("outbound channel disconnected")
-            }
-        }
-
-        // prebuilt_inbound holds heights 2..=N reversed, then height 1 last.
-        // Send the out-of-order tail, tick, then deliver the contiguous head and
-        // tick again — same send order and tick interleaving as before, but the
-        // clone+serialize now happens in setup, not the timed region.
-        let mut prebuilt = std::mem::take(&mut self.prebuilt_inbound).into_iter();
-        let contiguous = prebuilt
-            .next_back()
-            .unwrap_or_else(|| panic!("missing prebuilt contiguous block"));
-        for inbound in prebuilt {
-            self.inbound_blocks_tx
-                .send(inbound)
-                .unwrap_or_else(|error| panic!("send staged block failed: {error}"));
-        }
-        self.sync.tick();
-        self.inbound_blocks_tx
-            .send(contiguous)
-            .unwrap_or_else(|error| panic!("send contiguous block failed: {error}"));
-        self.sync.tick();
-
-        self.applied_tip
-            .load_full()
-            .unwrap_or_else(|| panic!("sync proxy did not publish applied tip"))
-            .height
-    }
-
-    fn run_many_peer_tick(self) -> usize {
-        self.sync.tick();
-        self.outbound_rxs
-            .iter()
-            .map(|rx| {
-                let mut count = 0_usize;
-                while rx.try_recv().is_ok() {
-                    count = count.saturating_add(1);
-                }
-                count
-            })
-            .sum()
-    }
-
-    fn request_after_unsolicited_received(mut self) -> usize {
-        let unsolicited = std::mem::take(&mut self.prebuilt_inbound)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("missing prebuilt unsolicited block"));
-        self.inbound_blocks_tx
-            .send(unsolicited)
-            .unwrap_or_else(|error| panic!("send unsolicited staged block failed: {error}"));
-        self.sync.tick();
-        let requested = match self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected scan-path getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory
-                .into_iter()
-                .map(|item| match item {
-                    Inventory::WitnessBlock(hash) => hash,
-                    other => panic!("expected witness block inventory, got {other:?}"),
-                })
-                .collect::<Vec<_>>(),
-            other => panic!("expected scan-path getdata, got {other:?}"),
-        };
-        assert_eq!(requested, self.received_scan_expected);
-        requested.len()
-    }
-
-    fn run_reverse_scan_overflow(self) -> usize {
-        self.sync.tick();
-        let requested = match self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing overflow outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected overflow scan getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory
-                .into_iter()
-                .map(|item| match item {
-                    Inventory::WitnessBlock(hash) => hash,
-                    other => panic!("expected overflow witness inventory, got {other:?}"),
-                })
-                .collect::<Vec<_>>(),
-            other => panic!("expected overflow scan getdata, got {other:?}"),
-        };
-        let expected = self.blocks[..SYNC_PROXY_BLOCKS_USIZE]
-            .iter()
-            .map(bitcoin::Block::block_hash)
-            .collect::<Vec<_>>();
-        assert_eq!(requested, expected);
-        requested.len()
-    }
-
-    fn run_in_order_inbound(mut self) -> u32 {
-        self.sync.tick();
-        let getdata_count = match self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"))
-            .try_recv()
-            .unwrap_or_else(|error| panic!("expected getdata: {error}"))
-        {
-            NetworkMessage::GetData(inventory) => inventory.len(),
-            other => panic!("expected getdata, got {other:?}"),
-        };
-        assert_eq!(getdata_count, SYNC_PROXY_BLOCKS_USIZE);
-
-        for inbound in std::mem::take(&mut self.prebuilt_inbound) {
-            self.inbound_blocks_tx
-                .send(inbound)
-                .unwrap_or_else(|error| panic!("send in-order block failed: {error}"));
-        }
-        self.sync.tick();
-
-        self.applied_tip
-            .load_full()
-            .unwrap_or_else(|| panic!("in-order sync proxy did not publish applied tip"))
-            .height
-    }
-
-    fn run_oversized_inbound_burst(mut self) -> usize {
-        self.sync.tick();
-        for inbound in std::mem::take(&mut self.prebuilt_inbound) {
-            self.inbound_blocks_tx
-                .send(inbound)
-                .unwrap_or_else(|error| panic!("send oversized burst block failed: {error}"));
-        }
-        self.sync.tick();
-        SYNC_OVERSIZED_BURST_BLOCKS_USIZE.saturating_sub(1)
-    }
-}
-
-struct ProductionStateSyncFixture {
-    _dir: TempDir,
-    state: NodeState,
-    outbound_rxs: Vec<crossbeam_channel::Receiver<Message>>,
-    blocks: Vec<Block>,
-    /// Inbound payloads pre-cloned and pre-serialized during (untimed) setup for
-    /// the `run` scenario, in send order (heights `2..=N` reversed, then height
-    /// 1 last). Left empty for the apply-tick scenarios, which stage in setup.
-    prebuilt_inbound: Vec<bitcoin_rs_p2p::InboundBlock>,
-    expected_getdata_count: usize,
-}
-
-impl ProductionStateSyncFixture {
-    fn new(peer_count: usize) -> Self {
-        Self::with_config(peer_count, production_state_config())
-    }
-
-    #[cfg(feature = "fjall")]
-    fn new_fjall_all_indexes(peer_count: usize) -> Self {
-        let mut config = production_state_config();
-        "fjall".clone_into(&mut config.storage_backend);
-        config.txindex = true;
-        Self::with_config(peer_count, config)
-    }
-
-    fn with_config(peer_count: usize, config: Config) -> Self {
-        Self::with_config_and_header_blocks(
-            peer_count,
-            config,
-            |tree| {
-                let (blocks, _received_scan_expected) =
-                    populate_sync_header_chain(tree, SYNC_PROXY_BLOCKS);
-                blocks
-            },
-            SYNC_PROXY_BLOCKS_USIZE,
-        )
-    }
-
-    #[cfg(feature = "fjall")]
-    fn new_fjall_all_indexes_spend_heavy() -> Self {
-        let mut config = production_state_config();
-        "fjall".clone_into(&mut config.storage_backend);
-        config.txindex = true;
-        let body_blocks = spend_heavy_proxy_blocks()
-            .into_iter()
-            .skip(1)
-            .collect::<Vec<_>>();
-        let expected_getdata_count = body_blocks.len();
-        Self::with_config_and_header_blocks(
-            1,
-            config,
-            |tree| {
-                populate_header_chain_from_blocks(tree, &body_blocks);
-                body_blocks
-            },
-            expected_getdata_count,
-        )
-    }
-
-    fn with_config_and_header_blocks(
-        peer_count: usize,
-        mut config: Config,
-        populate_blocks: impl FnOnce(&mut BlockTree) -> Vec<Block>,
-        expected_getdata_count: usize,
-    ) -> Self {
-        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        config.data_dir = dir.path().join("node");
-        let state = NodeState::open(config)
-            .unwrap_or_else(|error| panic!("open node state failed: {error}"));
-        let blocks = {
-            let block_tree = state.block_tree();
-            let mut tree = block_tree.write();
-            populate_blocks(&mut tree)
-        };
-        let outbound_rxs =
-            install_synthetic_peers(&state.peers(), &state.peer_outbound(), peer_count);
-        Self {
-            _dir: dir,
-            state,
-            outbound_rxs,
-            blocks,
-            prebuilt_inbound: Vec::new(),
-            expected_getdata_count,
-        }
-    }
-
-    /// Pre-clones and pre-serializes the inbound payloads `run` sends, in send
-    /// order: heights `2..=N` reversed, then height 1 last (sent after tick 2).
-    fn prebuild_run(mut self) -> Self {
-        self.prebuilt_inbound = self.blocks[1..]
-            .iter()
-            .rev()
-            .chain(std::iter::once(&self.blocks[0]))
-            .map(|block| bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-            .collect();
-        self
-    }
-
-    fn run(mut self) -> u32 {
-        let sync = self.state.sync();
-        sync.tick();
-        self.assert_getdata_batch();
-        let inbound_blocks_tx = self.state.inbound_blocks_sender();
-        // prebuilt_inbound holds heights 2..=N reversed, then height 1 last.
-        // Send the out-of-order tail, tick, then deliver the contiguous head and
-        // tick again — same send order and tick interleaving, with clone+serialize
-        // moved to setup.
-        let mut prebuilt = std::mem::take(&mut self.prebuilt_inbound).into_iter();
-        let contiguous = prebuilt
-            .next_back()
-            .unwrap_or_else(|| panic!("missing prebuilt contiguous block"));
-        for inbound in prebuilt {
-            inbound_blocks_tx
-                .send(inbound)
-                .unwrap_or_else(|error| panic!("send production staged block failed: {error}"));
-        }
-        sync.tick();
-        inbound_blocks_tx
-            .send(contiguous)
-            .unwrap_or_else(|error| panic!("send production contiguous block failed: {error}"));
-        sync.tick();
-        self.state
-            .applied_tip()
-            .load_full()
-            .unwrap_or_else(|| panic!("production sync proxy did not publish applied tip"))
-            .height
-    }
-
-    fn stage_for_contiguous_apply(self) -> Self {
-        let sync = self.state.sync();
-        sync.tick();
-        self.assert_getdata_batch();
-        let inbound_blocks_tx = self.state.inbound_blocks_sender();
-        for block in self.blocks[1..].iter().rev() {
-            inbound_blocks_tx
-                .send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-                .unwrap_or_else(|error| panic!("send production staged block failed: {error}"));
-        }
-        sync.tick();
-        inbound_blocks_tx
-            .send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-                self.blocks[0].clone(),
-            ))
-            .unwrap_or_else(|error| panic!("send production contiguous block failed: {error}"));
-        self
-    }
-
-    fn stage_for_partial_cached_apply(self) -> Self {
-        let split = self.blocks.len() / 2;
-        let sync = self.state.sync();
-        sync.tick();
-        self.assert_getdata_batch();
-        let inbound_blocks_tx = self.state.inbound_blocks_sender();
-
-        for block in self.blocks[1..split].iter().rev() {
-            inbound_blocks_tx
-                .send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-                .unwrap_or_else(|error| panic!("send first partial staged block failed: {error}"));
-        }
-        sync.tick();
-        inbound_blocks_tx
-            .send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-                self.blocks[0].clone(),
-            ))
-            .unwrap_or_else(|error| panic!("send first partial contiguous block failed: {error}"));
-        sync.tick();
-
-        for block in self.blocks[split + 1..].iter().rev() {
-            inbound_blocks_tx
-                .send(bitcoin_rs_p2p::InboundBlock::from_decoded(block.clone()))
-                .unwrap_or_else(|error| panic!("send second partial staged block failed: {error}"));
-        }
-        sync.tick();
-        inbound_blocks_tx
-            .send(bitcoin_rs_p2p::InboundBlock::from_decoded(
-                self.blocks[split].clone(),
-            ))
-            .unwrap_or_else(|error| panic!("send second partial contiguous block failed: {error}"));
-        self
-    }
-
-    fn apply_staged(self) -> u32 {
-        self.state.sync().tick();
-        self.state
-            .applied_tip()
-            .load_full()
-            .unwrap_or_else(|| panic!("production sync proxy did not publish applied tip"))
-            .height
-    }
-
-    fn assert_getdata_batch(&self) {
-        let rx = self
-            .outbound_rxs
-            .first()
-            .unwrap_or_else(|| panic!("missing primary outbound receiver"));
-        let mut drained_headers = 0_usize;
-        let getdata_count = loop {
-            match rx
-                .try_recv()
-                .unwrap_or_else(|error| panic!("expected production getdata: {error}"))
-            {
-                NetworkMessage::GetData(inventory) => break inventory.len(),
-                NetworkMessage::GetHeaders(_) => {
-                    drained_headers = drained_headers.saturating_add(1);
-                    assert!(
-                        drained_headers <= 32,
-                        "expected production getdata after draining {drained_headers} header requests"
-                    );
-                    continue;
-                }
-                other => panic!("expected production getdata, got {other:?}"),
-            }
-        };
-        assert_eq!(getdata_count, self.expected_getdata_count);
-    }
-}
-
-fn production_state_config() -> Config {
-    let mut config = Config::default_for_network(Network::Regtest);
-    config.p2p_listen.clear();
-    config.txindex = false;
-    config
-}
-
-fn populate_sync_header_chain(
-    tree: &mut BlockTree,
-    body_blocks: u32,
-) -> (Vec<Block>, Vec<BlockHash>) {
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let genesis_id = tree
-        .insert_node(None, genesis.header, NodeStatus::HeaderValid)
-        .unwrap_or_else(|error| panic!("regtest genesis header insert failed: {error}"));
-    let mut tip_id = genesis_id;
-    let mut parent = genesis;
-    let mut prev_hash = parent.block_hash();
-    let mut header_time = parent.header.time;
-    let block_capacity =
-        usize::try_from(body_blocks).unwrap_or_else(|error| panic!("invalid body count: {error}"));
-    let mut blocks = Vec::with_capacity(block_capacity);
-    let mut received_scan_expected = Vec::with_capacity(SYNC_PROXY_BLOCKS_USIZE);
-
-    for height in 1_u32..=SYNC_PROXY_HEADER_HEIGHT {
-        let header = if height <= body_blocks {
-            let block = child_coinbase_block(&parent, height);
-            parent = block.clone();
-            prev_hash = block.block_hash();
-            header_time = block.header.time;
-            blocks.push(block.clone());
-            block.header
-        } else {
-            header_time = header_time.saturating_add(1);
-            let header = child_header(prev_hash, header_time);
-            prev_hash = header.block_hash();
-            header
-        };
-        tip_id = tree
-            .insert_node(Some(tip_id), header, NodeStatus::HeaderValid)
-            .unwrap_or_else(|error| panic!("synthetic header insert failed: {error}"));
-        if height == 1 || (3..=body_blocks).contains(&height) {
-            let node = tree
-                .node(tip_id)
-                .unwrap_or_else(|error| panic!("synthetic header lookup failed: {error}"));
-            received_scan_expected.push(BlockHash::from_byte_array(node.hash.to_le_bytes()));
-        }
-    }
-    (blocks, received_scan_expected)
-}
-
-fn populate_header_chain_from_blocks(tree: &mut BlockTree, blocks: &[Block]) {
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let genesis_id = tree
-        .insert_node(None, genesis.header, NodeStatus::HeaderValid)
-        .unwrap_or_else(|error| panic!("regtest genesis header insert failed: {error}"));
-    let mut tip_id = genesis_id;
-    for block in blocks {
-        tip_id = tree
-            .insert_node(Some(tip_id), block.header, NodeStatus::HeaderValid)
-            .unwrap_or_else(|error| panic!("synthetic body header insert failed: {error}"));
-    }
-}
-
-fn install_synthetic_peers(
-    peers: &Arc<RwLock<Vec<PeerInfo>>>,
-    peer_outbound: &Arc<RwLock<HashMap<SocketAddr, bitcoin_rs_p2p::PeerLease>>>,
-    peer_count: usize,
-) -> Vec<crossbeam_channel::Receiver<Message>> {
-    let mut outbound_rxs = Vec::with_capacity(peer_count);
-    let mut peers = peers.write();
-    let mut peer_outbound = peer_outbound.write();
-    for index in 0..peer_count {
-        let port = u16::try_from(8_333_usize.saturating_add(index))
-            .unwrap_or_else(|error| panic!("invalid synthetic peer port: {error}"));
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        peers.push(synthetic_peer(addr));
-        let (outbound_tx, outbound_rx) = unbounded::<Message>();
-        peer_outbound.insert(addr, bitcoin_rs_p2p::PeerLease::new(outbound_tx));
-        outbound_rxs.push(outbound_rx);
-    }
-    outbound_rxs
-}
-
-#[allow(clippy::arc_with_non_send_sync)]
-fn apply_handles(
-    chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
-    block_tree: Arc<RwLock<BlockTree>>,
-    tx_index_runtime: Option<Arc<TxIndexRuntime>>,
-) -> ApplyHandles {
-    let coin_stats = Arc::new(CoinStatsListener::new(CoinStats::default()));
-    let mut utxo = UtxoSet::new();
-    utxo.set_listener(Box::new((*coin_stats).clone()));
-    let utxo = Arc::new(utxo);
-    ApplyHandles::new(
-        Network::Regtest,
-        chain_tip,
-        applied_tip,
-        block_tree,
-        utxo,
-        coin_stats,
-        tx_index_runtime,
-        Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
-        Arc::new(RwLock::new(BlockLog::new())),
-        Arc::new(RwLock::new(HashMap::<Txid, Transaction>::new())),
-        Arc::new(NoOpZmqPublisher),
-    )
-}
-
-fn tx_index_for_mode(mode: TxIndexMode) -> Option<Arc<TxIndexRuntime>> {
-    match mode {
-        TxIndexMode::Disabled => None,
-        TxIndexMode::Noop => {
-            let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
-            Some(Arc::new(TxIndexRuntime::new(wake_tx)))
-        }
-        #[cfg(feature = "rocksdb")]
-        TxIndexMode::RocksDb => {
-            let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
-            Some(Arc::new(TxIndexRuntime::new(wake_tx)))
-        }
-    }
-}
-
-fn synthetic_peer(addr: SocketAddr) -> PeerInfo {
-    PeerInfo {
-        addr,
-        version: 70_016,
-        services: 0,
-        user_agent: "/bitcoin-rs-sync-bench:0.0.0/".to_owned(),
-        start_height: SYNC_PROXY_START_HEIGHT,
-        conn_time: 0,
-        inbound: false,
-    }
 }
 
 fn proxy_blocks(count: u32) -> Vec<Block> {
@@ -1100,9 +100,9 @@ fn proxy_blocks(count: u32) -> Vec<Block> {
 }
 
 fn spend_heavy_proxy_blocks() -> Vec<Block> {
-    let spend_start_height = SPEND_PROXY_COINBASE_MATURITY.saturating_add(1);
+    let spend_start_height = COINBASE_MATURITY.saturating_add(1);
     let spend_end_height = spend_start_height
-        .saturating_add(SPEND_PROXY_SPEND_BLOCKS)
+        .saturating_add(SPEND_BLOCKS)
         .saturating_sub(1);
     let capacity = usize::try_from(spend_end_height.saturating_add(1))
         .unwrap_or_else(|error| panic!("invalid spend proxy capacity: {error}"));
@@ -1114,7 +114,7 @@ fn spend_heavy_proxy_blocks() -> Vec<Block> {
         let block = if height < spend_start_height {
             child_fanout_coinbase_block(&parent, height)
         } else {
-            let source_height = height.saturating_sub(SPEND_PROXY_COINBASE_MATURITY);
+            let source_height = height.saturating_sub(COINBASE_MATURITY);
             let source_index = usize::try_from(source_height)
                 .unwrap_or_else(|error| panic!("invalid source height: {error}"));
             child_spend_fanout_block(&parent, height, &blocks[source_index])
@@ -1158,23 +158,23 @@ fn child_fanout_coinbase_block(parent: &Block, height: u32) -> Block {
     };
     block.header.merkle_root = block
         .compute_merkle_root()
-        .unwrap_or_else(|| panic!("fanout proxy block should have merkle root"));
+        .unwrap_or_else(|| panic!("fanout block should have merkle root"));
     mine_block_to_declared_target(&mut block);
     block
 }
 
 fn child_spend_fanout_block(parent: &Block, height: u32, source_block: &Block) -> Block {
-    let source_coinbase = source_block
+    let source_txid = source_block
         .txdata
         .first()
-        .unwrap_or_else(|| panic!("spend-heavy source block missing coinbase"));
-    let source_txid = source_coinbase.compute_txid();
+        .unwrap_or_else(|| panic!("spend source missing coinbase"))
+        .compute_txid();
     let mut txdata = Vec::with_capacity(
-        usize::try_from(SPEND_PROXY_FANOUT.saturating_add(1))
-            .unwrap_or_else(|error| panic!("invalid spend proxy fanout: {error}")),
+        usize::try_from(SPEND_FANOUT.saturating_add(1))
+            .unwrap_or_else(|error| panic!("invalid spend fanout: {error}")),
     );
     txdata.push(fanout_coinbase_transaction(height));
-    for vout in 0..SPEND_PROXY_FANOUT {
+    for vout in 0..SPEND_FANOUT {
         txdata.push(spend_proxy_transaction(source_txid, vout));
     }
     let mut block = Block {
@@ -1190,20 +190,9 @@ fn child_spend_fanout_block(parent: &Block, height: u32, source_block: &Block) -
     };
     block.header.merkle_root = block
         .compute_merkle_root()
-        .unwrap_or_else(|| panic!("spend-heavy proxy block should have merkle root"));
+        .unwrap_or_else(|| panic!("spend-heavy block should have merkle root"));
     mine_block_to_declared_target(&mut block);
     block
-}
-
-fn child_header(prev_blockhash: BlockHash, time: u32) -> Header {
-    Header {
-        version: bitcoin::block::Version::ONE,
-        prev_blockhash,
-        merkle_root: TxMerkleNode::all_zeros(),
-        time,
-        bits: CompactTarget::from_consensus(0x207f_ffff),
-        nonce: 0,
-    }
 }
 
 fn coinbase_transaction(height: u32) -> Transaction {
@@ -1224,9 +213,9 @@ fn coinbase_transaction(height: u32) -> Transaction {
 }
 
 fn fanout_coinbase_transaction(height: u32) -> Transaction {
-    let outputs = (0..SPEND_PROXY_FANOUT)
+    let outputs = (0..SPEND_FANOUT)
         .map(|_| TxOut {
-            value: Amount::from_sat(SPEND_PROXY_COINBASE_OUTPUT_VALUE),
+            value: Amount::from_sat(COINBASE_OUTPUT_VALUE),
             script_pubkey: Builder::new().push_int(1).into_script(),
         })
         .collect();
@@ -1257,7 +246,7 @@ fn spend_proxy_transaction(prev_txid: Txid, vout: u32) -> Transaction {
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
+            value: Amount::from_sat(SPEND_OUTPUT_VALUE),
             script_pubkey: Builder::new().push_int(1).into_script(),
         }],
     }
@@ -1280,10 +269,5 @@ fn mine_block_to_declared_target(block: &mut Block) {
     }
 }
 
-criterion_group!(
-    benches,
-    sync_pipeline_apply_proxy,
-    deterministic_initial_sync_proxy,
-    block_source_height_lookup
-);
+criterion_group!(benches, sync_pipeline);
 criterion_main!(benches);

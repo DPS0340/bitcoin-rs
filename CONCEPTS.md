@@ -51,7 +51,7 @@ Stalling detection is the mechanism that identifies the staller and, in the refe
 A validation mode that skips script-signature verification for blocks at or below a configured trusted height while still performing every other consensus check, used to accelerate IBD without abandoning validation; blocks above the height are fully verified. Mainnet nodes in `bitcoin-rs` default to assume-valid enabled at anchor height 938343.
 
 ### Hash-pinned assume-valid anchor
-The mainnet consensus checkpoint (height 938343, block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`) used by default on mainnet to gate historical script verification. The node skips script verification for blocks at or below height 938343 only after validating that the active header chain contains this exact anchor hash. Sub-anchor header tips and diverged chains remain untrusted and trigger full script verification. Passing `--assume-valid-height 0` explicitly requests full verification across all blocks. Custom nonzero heights skip script checks up to that height without hash gating. Non-mainnet networks default to height 0. Replay measurement tools like `mainnet_prefix_replay` retain a default of 0 to ensure full-validation benchmark fidelity.
+The mainnet consensus checkpoint (height 938343, block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`) used by default on mainnet to gate historical script verification. The node skips script verification for blocks at or below height 938343 only after validating that the active header chain contains this exact anchor hash. Sub-anchor header tips and diverged chains remain untrusted and trigger full script verification. Passing `--assume-valid-height 0` explicitly requests full verification across all blocks. Custom nonzero heights skip script checks up to that height without hash gating. Non-mainnet networks default to height 0.
 
 ### Optimized default posture
 The standard node operational configuration tuned for mainnet sync: `fjall` storage backend, multi-peer block download active (outbound peer target 8, pending block budget 128, 16 in-flight requests per peer), hash-pinned assume-valid active on mainnet (height 938343), 450 MiB database cache (`dbcache`, matching Bitcoin Core parity), with the secondary `txindex` and pruning disabled by default.
@@ -64,13 +64,6 @@ The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically suppl
 
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
-
-## Benchmark campaign tooling
-
-### Native benchmark custody
-The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
-
-Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. A successful arm includes complete process and resource measurements. A demonstrated correctness failure remains a failure when the other arm has no result. Later validation recomputes the verdict from the custody artifacts and rechecks every input after the last evidence read. Custody proves internal consistency, not a cryptographic signature.
 
 ## Consensus validation
 
@@ -103,6 +96,9 @@ Parsing each block exactly once with `bitcoinkernel::Block::new` (wrapped as `Ke
 Whether a fan-out pays is decided by per-item work against dispatch cost, not by how parallelizable the loop looks. Measured both directions on the same apply path: script checks (~100 µs per input) wanted *more* parallelism, and a sweep lowering `MIN_PARALLEL_SCRIPT_CHECKS` from 16 to 4 read as 1.15× before it was refuted as a contended-harness artefact (see *Contended-harness tuning artefact*; the standing constant is 32, `crates/consensus/src/verify_tx.rs`); UTXO lookups (~500 ns) wanted *none*, and deleting two rayon fan-outs bought 1.07× and 1.11×. Merkle nodes (~2.6 µs) sit in between: Rayon task fan-out over scalar nodes measured neutral-to-worse (SIMD multi-buffer hashing is a different lever because it reduces cost per group rather than changing task granularity). A threshold has an interior optimum in both directions — below 4 the script threshold turns back up, and pool width peaks at 32 then degrades at 64. Always gate on **elapsed**, never on the stage being targeted: parallel prepare makes `script_prepare` 30% faster and the whole run 4% slower by contending with the script-verify pool. See `docs/solutions/performance-issues/processing-bound-sync-performance-evolution.md`.
 
 The AVX2 Merkle result pins the distinction. Reusing prepared txids and hashing eight independent 64-byte parent pairs in SIMD lanes cut the matched fjall replay from 56.517s to 48.020s (1.177×), while scalar-library swaps and Rayon folds had failed. SIMD paid because it reduced the cost of a homogeneous batch without scheduling more tasks. The same candidate passed the RocksDB and redb gates at 1.171× and 1.112×.
+
+### Retained benchmark contract
+Permanent benchmarks must call the shipped production path, use a product-shaped workload, and protect a regression that still matters. Refactor A/B harnesses, synthetic implementation microbenchmarks, and future-work measuring tools remain only as historical docs or tests. The retained set is the node sync/apply path, a reduced UTXO commit set, end-to-end mempool admission, current Merkle dispatch, and the real-file index resolver.
 
 ### Matched-harness comparison
 The requirement that a cross-node benchmark match every input that is not the thing under test — block source, validation posture, CPU pinning, and time of measurement — before any ratio is quoted. Each mismatch found in this repo moved the headline materially: Core's reference was months stale (67s → re-derived 59.6s); bitcoin-rs fetched blocks over REST from a live `bitcoind` while Core read local `blk*.dat`, which cost ~35s of harness *and* contended for CPU (121.9s → 84.6s once `--blocks-file` matched it); and GoCoin skips script verification below its default `LastTrustedBlock` of #940000, so it must be compared either against an assume-valid bitcoin-rs run or with that asymmetry stated. Interleave both nodes back-to-back on an idle host and quote paired medians; comparing your best run against someone else's old run is not a measurement.
@@ -166,13 +162,14 @@ were not handed to the file.
 ### Checkpoint MuHash batch
 
 The independent checkpoint traversal derives CoinStats and MuHash again instead
-of trusting the rolling listener that supplies live state. It encodes exact coin
+of trusting an optional rolling listener. The node runtime keeps only the
+listener's applied height and transaction count on the hot path; the checkpoint
+scan is authoritative for all UTXO-derived fields. It encodes exact coin
 preimages into a bounded arena and computes insert-only partial MuHash values in
 parallel. The arena holds at most 262,144 coins or 16 MiB. Each flush uses no
 more lanes than the active Rayon pool or the 32-lane cap. The larger batch
-reduces partial-value construction and combination. It does not remove the
-listener-versus-traversal check, change preimage bytes, change snapshot bytes,
-or weaken checkpoint durability.
+reduces partial-value construction and combination. It does not change
+preimage bytes, snapshot bytes, or checkpoint durability.
 
 ### Coalesced TxIndex wake
 The nonblocking notification published immediately after a committed `applied_tip.store`. The publisher increments an atomic revision with `Release` ordering and calls `try_send` on a capacity-one channel. Channel tokens may coalesce or be dropped because they are only wake hints. While a forward batch is pending, each hint returns the worker to reconciliation without changing the batch's original fixed deadline. The worker checks the authoritative revision before it sleeps and also wakes on a bounded timeout when caught up.
@@ -195,7 +192,13 @@ disconnect because flip-flop between competing branches is normal.
 
 State that connection writes and disconnection must account for. The required action depends on how that state is addressed and published.
 
-`coin_stats` needs an explicit inverse for its block-level fields. Its per-coin fields use the UTXO change listener, so the UTXO undo already reverses them. The filter index needs no row rollback because its rows are block-hash-addressed like block bodies; disconnection only repoints its last-tip cache. That cache and the `blocks` RPC pop are best-effort in-process refreshes.
+`coin_stats` needs an explicit inverse for its block-level fields. A caller that
+installs the optional UTXO change listener gets per-coin inverse updates from the
+UTXO undo; the default node instead recomputes those fields during checkpoint
+and stable UTXO reads. The filter index needs no row rollback because its rows
+are block-hash-addressed like block bodies; disconnection only repoints its
+last-tip cache. That cache and the `blocks` RPC pop are best-effort in-process
+refreshes.
 
 `TxIndex` is durable derived state outside the authoritative disconnect transaction. After `applied_tip` moves, the node publishes a revision and a coalesced wake. One worker compares the enabled `TxLookup` and `ScriptHistory` watermarks with applied-tip ancestry, rolls stale cursors back to the common ancestor, and commits count-and-byte-bounded forward batches. Equal cursors share one body scan and atomic commit; divergent cursors move only the lagging capability. It can assemble one pending batch across strict descendant tip revisions. A rival, lower, or absent tip can make the worker commit the complete prepared prefix before the next pass repairs it. Queries gate on the exact capability watermarks they consume and refuse incomplete answers while any required cursor lags or the worker is unavailable.
 
@@ -290,15 +293,20 @@ before it; coinbase maturity and BIP68 remain after it. See
 
 ### Script-check floor
 
+This term records a completed historical measurement. The repository-local
+capture, replay, classifier, and durability executables used to produce it were
+retired after the campaign; the schemas and commands below are evidence
+provenance, not supported tooling.
+
 The native reference baseline for script verification, calculated by running the exact captured input corpus through `CPubKey::Verify` from `libbitcoinkernel-sys 0.3.0` (via bitcoinkernel 0.2.1, embedding Bitcoin Core 31.99.0 development sources: public key parsing, lax DER parsing, signature normalization, and `secp256k1_ecdsa_verify`). The capture pipeline uses same-open parse-stream custody to emit 24 fixed-order u64 counters and four file-bound native streams (`BRSCTX1\0` contexts, `BRSJRN1\0` journal, `BRSREC1\0` records, and 24-counter JSON).
 
 On mainnet 0..150,000, all 2,868,199 input checks are ordinary legacy bare P2PKH spends that execute exactly one `OP_CHECKSIG` and one successful ECDSA verification ($a = 1.0$). `eval_script_entries` equals 5,736,398 ($2 \times 2,868,199$, two evaluator passes per input check: scriptSig + scriptPubKey). All 11 special context counters (`p2sh_redeem_spends`, `native_witness_v0_spends`, `p2sh_wrapped_witness_v0_spends`, `bare_multisig_checks`, `p2sh_multisig_checks`, `native_witness_v0_multisig_checks`, `p2sh_wrapped_witness_v0_multisig_checks`, `taproot_key_path_spends`, `tapscript_spends`, `tapscript_schnorr_checks`, `tapscript_checksigadd_checks`) and all 13 complementary execution counters are zero. The strict `classify-corpus-v2` classifier evaluates the exact product predicate (`_c150_passed`), yielding `all_passed: true` and `c150_passed: true`.
 
-Authoritative C150/Cmodern certification requires file-bound binary streams, strict `mainnet-prefix-replay-v3` inputs, and exact classifier validation. Version 3 makes the replay's always-present txindex timing keys part of the exact contract; their values are nullable when txindex is disabled. The Cmodern product contract is pinned to mainnet height `709635` and block hash `00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`, selected by the recovered diagnostic candidate and independently matched against Bitcoin Core REST. This pin selects the corpus boundary; it does not certify the diagnostic run. Cmodern certification still requires a fresh file-bound replay at that exact tip, valid custody and counter arithmetic, and positive counts for all 11 context classes. Direct Core REST export can export raw blocks before replay, but live REST export cannot replace file-bound census evidence. Sampled evidence (such as `kernel_verify_spike`) cannot certify a product corpus.
+The historical C150/Cmodern certification required file-bound binary streams, strict `mainnet-prefix-replay-v3` inputs, and exact classifier validation. Version 3 made the replay's always-present txindex timing keys part of the exact contract; their values were nullable when txindex was disabled. The Cmodern product contract was pinned to mainnet height `709635` and block hash `00000000000000000001f9ee4f69cbc75ce61db5178175c2ad021fe1df5bad8f`. These requirements describe the retained evidence and do not define a current executable certification workflow.
 
 Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - Y = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
 
-Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+The historical campaign checked replay-state stability with untimed durability proofs across `fjall`, `rocksdb`, and `redb`. Those campaign executables were retired; current durability and reorg correctness are protected by the storage and node test suites. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md` for the retained result.
 
 ### Terminal proof
 
