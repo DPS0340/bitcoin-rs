@@ -1,4 +1,3 @@
-//! Deterministic Bitcoin Core 31.1 P2P compatibility contract tests.
 //!
 //! Every assertion here pins a row of the message table in
 //! `docs/policies/p2p-compatibility.md`: the version/verack handshake shape,
@@ -6,7 +5,7 @@
 //! inv/getdata relay round-trips, the reject-or-ignore policy for malformed
 //! and unsupported messages, and the peer-visible effect of a chain switch
 //! (reorg) and restart at the [`ChainQuery`] seam the node implements.
-
+use bitcoin_rs_p2p::{BannedSubnet, InboundBlock, InboundHeaders, InboundTx, Peer, PeerLease, PeerState};
 use std::error::Error;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -32,7 +31,6 @@ use bitcoin_rs_p2p::wire::{
     MAX_LOCATOR_HASHES, MAX_MESSAGE_PAYLOAD, PROTOCOL_VERSION, PeerError, read_message,
     write_message,
 };
-use bitcoin_rs_p2p::{BannedSubnet, InboundBlock, InboundHeaders, Peer, PeerLease, PeerState};
 use bitcoin_rs_primitives::{
     Block, BlockHash as NativeBlockHash, Hash256, Header, consensus_bytes,
 };
@@ -975,6 +973,7 @@ fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Bo
     >::new()));
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded::<InboundHeaders>();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded::<InboundBlock>();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded::<InboundTx>();
     let banned = Arc::new(parking_lot::RwLock::new(Vec::<BannedSubnet>::new()));
 
     let handle = thread::spawn(move || {
@@ -987,6 +986,7 @@ fn serve_and_handshake_over_tcp(network: Network, magic: Magic) -> Result<(), Bo
             outbound,
             headers_tx,
             blocks_tx,
+            tx_tx,
             banned,
         )
     });

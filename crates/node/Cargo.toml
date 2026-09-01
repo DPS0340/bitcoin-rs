@@ -129,3 +129,4 @@ harness = false
 [[bench]]
 name = "sync_apply_metrics"
 harness = false
+

@@ -324,6 +324,8 @@ class CampaignFixture:
         core_exit: int = 0,
         bad_proof_identity: bool = False,
         affinity: tuple[int, ...] = (0,),
+        cache_budget_mb: int = 450,
+        schedule_seed: int = 42,
     ) -> None:
         self.workspace = workspace
         self.corpus = workspace / "blocks.dat"
@@ -357,6 +359,8 @@ class CampaignFixture:
                 "{corpus_path}",
                 "--corpus-manifest",
                 "{manifest_path}",
+                "--dbcache-mb",
+                str(cache_budget_mb),
                 "--assume-valid-height",
                 "0",
                 "--storage-backend",
@@ -377,6 +381,7 @@ class CampaignFixture:
                 "-blocksxor=0",
                 "-connect=0",
                 "-datadir={data_dir}",
+                f"-dbcache={cache_budget_mb}",
                 "-debuglogfile={result_path}",
                 "-disablewallet=1",
                 "-dnsseed=0",
@@ -412,6 +417,7 @@ class CampaignFixture:
                     "blocked_reason": None if ready else "not configured",
                     "candidate": candidate_program,
                     "core": core_program,
+                    "cache_budget_mb": cache_budget_mb,
                     "corpus_path": str(self.corpus),
                     "corpus_sha256": _sha256(self.corpus),
                     "manifest_path": str(self.manifest),
@@ -423,7 +429,7 @@ class CampaignFixture:
             )
         config: JsonObject = {
             "schema": "benchmark-campaign-config-v2",
-            "schedule_seed": 42,
+            "schedule_seed": schedule_seed,
             "output_root": str(workspace / "out"),
             "cells": cells,
         }
@@ -530,6 +536,219 @@ class ConfigContractTests(WorkspaceTestCase):
             fixture.run()
 
 
+def _fixture_program_command(fixture: CampaignFixture, role: str) -> list[object]:
+    raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+    first = _object(_array(raw["cells"])[0])
+    return list(_array(_object(first[role])["command"]))
+
+
+def _retarget_program_command(
+    fixture: CampaignFixture, role: str, command: list[object]
+) -> None:
+    """Rewrites one arm's command and refreshes the proof identity binding."""
+    raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+    first = _object(_array(raw["cells"])[0])
+    program = _object(first[role])
+    program["command"] = command
+    proof = _object(json.loads(fixture.proof.read_text(encoding="utf-8")))
+    _object(proof[role])["program_identity_sha256"] = _canonical_sha256(program)
+    fixture.proof.write_text(json.dumps(proof), encoding="utf-8")
+    first["proof_sha256"] = _sha256(fixture.proof)
+    fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+
+
+class CacheParityTests(WorkspaceTestCase):
+    def _first_arm_seed(self, role: runner.Role) -> int:
+        for seed in range(256):
+            if schedule_for(TARGET, seed)[0][0] is role:
+                return seed
+        self.fail(f"no seed schedules {role} first")
+
+    def test_config_requires_one_shared_cache_budget(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        campaign = load_config(fixture.config)
+        cell = campaign.cells[0]
+        self.assertEqual(cell.cache_budget_mb, 450)
+        candidate = dict(
+            zip(
+                cell.candidate.command[1::2],
+                cell.candidate.command[2::2],
+                strict=True,
+            )
+        )
+        self.assertEqual(candidate["--dbcache-mb"], str(cell.cache_budget_mb))
+        self.assertIn(f"-dbcache={cell.cache_budget_mb}", cell.core.command)
+
+    def test_missing_cache_budget_field_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        for cell in _array(raw["cells"]):
+            del _object(cell)["cache_budget_mb"]
+        with self.assertRaisesRegex(ContractError, "wrong keys"):
+            parse_config(raw)
+
+    def test_nonpositive_cache_budget_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        _object(_array(raw["cells"])[0])["cache_budget_mb"] = 0
+        with self.assertRaisesRegex(ContractError, "must be a positive integer"):
+            parse_config(raw)
+
+    def test_cache_budget_beyond_u64_is_rejected(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        first = _object(_array(raw["cells"])[0])
+        first["cache_budget_mb"] = (1 << 64) - 1
+        self.assertEqual(parse_config(raw).cells[0].cache_budget_mb, (1 << 64) - 1)
+        first["cache_budget_mb"] = (1 << 64)
+        with self.assertRaisesRegex(ContractError, "within u64 range"):
+            parse_config(raw)
+
+    def test_recorded_arms_execute_the_shared_cache_budget(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        result, result_path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        raw = _object(json.loads(result_path.read_text(encoding="utf-8")))
+        budget = str(result.cell_config.cache_budget_mb)
+        for pair in _array(raw["pairs"]):
+            candidate = _array(_object(_object(pair)["candidate"])["command"])
+            core = _array(_object(_object(pair)["core"])["command"])
+            self.assertEqual(candidate[candidate.index("--dbcache-mb") + 1], budget)
+            self.assertIn(f"-dbcache={budget}", core)
+
+    def test_coherent_alternate_cache_budget_passes(self) -> None:
+        result, _path = CampaignFixture(self.workspace, cache_budget_mb=449).run()
+        self.assertEqual(result.cell_config.cache_budget_mb, 449)
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+
+    def test_candidate_only_cache_mismatch_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CANDIDATE)
+        )
+        command = _fixture_program_command(fixture, "candidate")
+        command[command.index("--dbcache-mb") + 1] = "449"
+        _retarget_program_command(fixture, "candidate", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError,
+                "candidate timed command must not include, omit, or alter",
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_candidate_only_cache_omission_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CANDIDATE)
+        )
+        command = _fixture_program_command(fixture, "candidate")
+        index = command.index("--dbcache-mb")
+        del command[index : index + 2]
+        _retarget_program_command(fixture, "candidate", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError,
+                "candidate timed command must not include, omit, or alter",
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_candidate_only_cache_duplicate_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CANDIDATE)
+        )
+        command = _fixture_program_command(fixture, "candidate")
+        command.extend(["--dbcache-mb", "450"])
+        _retarget_program_command(fixture, "candidate", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError, "candidate command options must not repeat"
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_core_only_cache_mismatch_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CORE)
+        )
+        command = _fixture_program_command(fixture, "core")
+        command[command.index("-dbcache=450")] = "-dbcache=449"
+        _retarget_program_command(fixture, "core", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError,
+                "Core command must exactly match the offline proof contract",
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_core_only_cache_omission_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CORE)
+        )
+        command = _fixture_program_command(fixture, "core")
+        command.remove("-dbcache=450")
+        _retarget_program_command(fixture, "core", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError,
+                "Core command must exactly match the offline proof contract",
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_core_only_cache_duplicate_is_rejected_before_spawn(self) -> None:
+        fixture = CampaignFixture(
+            self.workspace, schedule_seed=self._first_arm_seed(runner.Role.CORE)
+        )
+        command = _fixture_program_command(fixture, "core")
+        command.append("-dbcache=450")
+        _retarget_program_command(fixture, "core", command)
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ContractError, "Core command arguments must not repeat options"
+            ),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_stale_identity_is_rejected_before_command_semantics(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        command = _fixture_program_command(fixture, "candidate")
+        command[command.index("--dbcache-mb") + 1] = "449"
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        _object(_object(_array(raw["cells"])[0])["candidate"])["command"] = command
+        fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+        with (
+            patch.object(runner.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(ContractError, "candidate identity"),
+        ):
+            fixture.run()
+        popen.assert_not_called()
+
+    def test_cache_budget_tampering_fails_result_validation(self) -> None:
+        fixture = CampaignFixture(self.workspace)
+        result, result_path = fixture.run()
+        self.assertEqual(result.valid_pairs, PAIR_COUNT)
+        raw = _object(json.loads(fixture.config.read_text(encoding="utf-8")))
+        _object(_array(raw["cells"])[0])["cache_budget_mb"] = 449
+        fixture.config.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ContractError, "result config hash does not match supplied config"
+        ):
+            validate_result(result_path, fixture.config)
+
+
 class NativeExecutionTests(WorkspaceTestCase):
     def test_complete_seven_pair_run_and_round_trip(self) -> None:
         fixture = CampaignFixture(self.workspace)
@@ -633,15 +852,11 @@ class NativeExecutionTests(WorkspaceTestCase):
         fixture = CampaignFixture(self.workspace, affinity=configured)
         current_affinity = parent_affinity
 
-        def mock_setaffinity(
-            _pid: int, mask: tuple[int, ...] | frozenset[int]
-        ) -> None:
+        def mock_setaffinity(_pid: int, mask: tuple[int, ...] | frozenset[int]) -> None:
             nonlocal current_affinity
             requested = frozenset(mask)
             current_affinity = (
-                frozenset({configured[0]})
-                if requested == configured_set
-                else requested
+                frozenset({configured[0]}) if requested == configured_set else requested
             )
 
         def mock_getaffinity(_pid: int) -> frozenset[int]:
@@ -893,9 +1108,13 @@ class EvidenceCustodyTests(WorkspaceTestCase):
 class HostArchitectureTests(WorkspaceTestCase):
     def test_x86_cell_rejects_aarch64_host(self) -> None:
         fixture = CampaignFixture(self.workspace)
-        with patch.object(runner, "_host_architecture", return_value=Architecture.AARCH64):
-            with self.assertRaisesRegex(ContractError, "requires x86_64.*host is aarch64"):
-                fixture.run()
+        with (
+            patch.object(
+                runner, "_host_architecture", return_value=Architecture.AARCH64
+            ),
+            self.assertRaisesRegex(ContractError, "requires x86_64.*host is aarch64"),
+        ):
+            fixture.run()
 
     def test_aarch64_cell_rejects_x86_host(self) -> None:
         fixture = CampaignFixture(self.workspace)
@@ -927,9 +1146,13 @@ class HostArchitectureTests(WorkspaceTestCase):
                 entry["proof_path"] = None
                 entry["proof_sha256"] = None
         fixture.config.write_text(json.dumps(raw), encoding="utf-8")
-        with patch.object(runner, "_host_architecture", return_value=Architecture.X86_64):
-            with self.assertRaisesRegex(ContractError, "requires aarch64.*host is x86_64"):
-                run_cell(load_config(fixture.config), aarch64_cell)
+        with (
+            patch.object(
+                runner, "_host_architecture", return_value=Architecture.X86_64
+            ),
+            self.assertRaisesRegex(ContractError, "requires aarch64.*host is x86_64"),
+        ):
+            run_cell(load_config(fixture.config), aarch64_cell)
 
     def test_matching_architecture_proceeds(self) -> None:
         fixture = CampaignFixture(self.workspace)
@@ -1059,9 +1282,9 @@ class DescriptorLifetimeTests(WorkspaceTestCase):
         publication_checks: list[int] = []
 
         def mutate_then_publish(path: Path, value: object) -> None:
-            result_files = tuple(sorted(path.parent.glob("pair-*/replay.json"))) + tuple(
-                sorted(path.parent.glob("pair-*/debug.log"))
-            )
+            result_files = tuple(
+                sorted(path.parent.glob("pair-*/replay.json"))
+            ) + tuple(sorted(path.parent.glob("pair-*/debug.log")))
             self.assertEqual(len(result_files), PAIR_COUNT * 2)
             open_targets: set[Path] = set()
             for descriptor in Path("/proc/self/fd").iterdir():
@@ -1080,9 +1303,11 @@ class DescriptorLifetimeTests(WorkspaceTestCase):
             original(path, value)
 
         before = len(tuple(Path("/proc/self/fd").iterdir()))
-        with patch.object(runner, "_atomic_write_json", mutate_then_publish):
-            with self.assertRaisesRegex(ContractError, "native evidence changed"):
-                fixture.run()
+        with (
+            patch.object(runner, "_atomic_write_json", mutate_then_publish),
+            self.assertRaisesRegex(ContractError, "native evidence changed"),
+        ):
+            fixture.run()
         after = len(tuple(Path("/proc/self/fd").iterdir()))
         self.assertEqual(publication_checks, [PAIR_COUNT * 2])
         self.assertEqual(after, before)
@@ -1094,9 +1319,11 @@ class DescriptorLifetimeTests(WorkspaceTestCase):
             raise RuntimeError("unexpected parser failure")
 
         before = len(tuple(Path("/proc/self/fd").iterdir()))
-        with patch.object(runner, "_parse_native_result", fail_parse):
-            with self.assertRaisesRegex(RuntimeError, "unexpected parser failure"):
-                fixture.run()
+        with (
+            patch.object(runner, "_parse_native_result", fail_parse),
+            self.assertRaisesRegex(RuntimeError, "unexpected parser failure"),
+        ):
+            fixture.run()
         after = len(tuple(Path("/proc/self/fd").iterdir()))
         self.assertEqual(after, before)
 

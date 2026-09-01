@@ -156,38 +156,34 @@ port). The `sighash.json` vector runner skips rows whose script-code contains
 `OP_CODESEPARATOR` and reports the count in the test output. The skipped rows
 are a known v1 gap covered by the same `hand-rolled` follow-up.
 
-## 3. Task 9 — BIP157/158 compact-filter index removed
+## 3. Task 9 — compact-filter index moved to the extension boundary
 
-Task 9 specced `crates/filters` (BIP157 cfheaders + BIP158 GCS filter index),
-the `-blockfilterindex` option, and the `getblockfilter` RPC. The
-implementation is removed (issue #143): the node never advertised
-`NODE_COMPACT_FILTERS` and had no P2P handler for `getcfilters`/`getcfheaders`/
-`getcfcheckpt`, so the index was unreachable by BIP157 light clients and served
-only `getblockfilter`. Derived optional state with no in-tree consumer does not
-earn its storage, configuration, and maintenance cost.
+Issue #143 removed the original `crates/filters` implementation. It mixed
+optional BIP157/158 state into the node core but did not advertise
+`NODE_COMPACT_FILTERS` or handle `getcfilters`, `getcfheaders`, or
+`getcfcheckpt`. No light client could reach it.
 
-Compatibility deltas after removal:
+The current implementation restores the useful server-side subset as the
+`crates/ext-blockfilterindex` reference extension:
 
-- `getblockfilter` RPC: method not found (Core serves it only with
-  `-blockfilterindex=1` anyway).
-- `getindexinfo` no longer reports a `basicblockfilterindex` entry; Core also
-  omits indexes that are not enabled, so the previous unconditional entry
-  over-reported.
-- `-blockfilterindex` is no longer recognized by the CLI: clap rejects the
-  unknown option and exits. The `bitcoin.conf` compatibility reader and
-  environment layer ignore the removed `blockfilterindex` /
-  `BITCOIN_RS_BLOCKFILTERINDEX` keys, like other unsupported keys in those
-  layers.
-- Storage: the `filters`/`filter_headers` column families are gone and the
-  surviving `ColumnFamily` discriminants were renumbered — a breaking change
-  under `docs/policies/db-migration.md` §3.1. fjall, MDBX, and redb open
-  tables by name and ignore the retired ones, so those datadirs reopen
-  unchanged; a RocksDB datadir from a binary that created the retired families
-  must be wiped and resynced per §6.2, and an orphaned `<datadir>/filters`
-  directory from an old binary is simply unused.
+- `--blockfilterindex`, the `blockfilterindex` `bitcoin.conf` key, and
+  `BITCOIN_RS_BLOCKFILTERINDEX` enable the extension;
+- `getblockfilter` serves ready filter data, while `getindexinfo` and
+  `getcapabilities` report whether the index is disabled, catching up, ready,
+  or failed;
+- the extension owns `data_dir/blockfilterindex`, including its schema,
+  rows, active pointer, and reconciliation cursor;
+- `blockfilterindex` requires `txindex` and an unpruned body store;
+- a dropped wake-up or failed extension does not block block application.
 
-If a concrete BIP157/158 consumer appears, reintroduce the feature around that
-requirement rather than the speculative shape Task 9 defined.
+This is not full BIP157 peer service. The node still does not advertise
+`NODE_COMPACT_FILTERS` or implement the compact-filter P2P commands. The RPC
+surface exists for local and administrative consumers only. A future light
+client requirement must add and test the P2P contract rather than treating the
+stored index as proof that the protocol is supported.
+
+Old `filters` and `filter_headers` column families remain retired. The extension
+uses its own namespace, so old rows are neither opened nor migrated.
 
 ## §4 — T18 node lifecycle scaffold
 

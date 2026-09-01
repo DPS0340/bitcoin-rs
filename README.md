@@ -35,11 +35,12 @@ validation, and an opt-in kernel oracle for differential verification.
 
 ## Quick start
 
-Build and run the default node (pure Rust, no C++ toolchain required):
+Build and run the default node with the optimized quick-start profile (pure
+Rust, no C++ toolchain required):
 
 ```sh
-cargo build --release -p bitcoin-rs
-./target/release/bitcoin-rs --data-dir .bitcoin-rs
+cargo build --profile quickstart -p bitcoin-rs
+./target/quickstart/bitcoin-rs --data-dir .bitcoin-rs
 ```
 
 This starts a mainnet node storing state in `.bitcoin-rs` and listening for

@@ -49,6 +49,10 @@ criterion.workspace = true
 # on-disk index. This is a dev-dependency feature, not a passthrough: the rpc
 # crate itself exposes no backend feature and gates no code on one.
 bitcoin-rs-storage = { workspace = true, features = ["rocksdb"] }
+# TOCTOU-free fixture custody: the corpus loader opens the corpus directory
+# and each fixture with `O_NOFOLLOW` and stats the same descriptor it reads
+# from (rustix is already workspace-resolved; the lock file gains nothing).
+rustix.workspace = true
 
 [[bench]]
 name = "chaininfo"

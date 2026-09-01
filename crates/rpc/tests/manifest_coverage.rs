@@ -10,6 +10,11 @@
 //!    manifest; drift names the delta and the regen command. Regeneration
 //!    is a separate ignored test, so a coverage run never writes and a
 //!    regen run never passes silently.
+//!
+//! Named proving surface of `docs/contracts/external-api.md`: `API-01`
+//! (manifest rows and the live dispatch registry agree both ways;
+//! `Unimplemented` answers `-32601`) and `API-02` (the checked-in
+//! reference is generated from `MANIFEST`).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -31,11 +36,11 @@ fn shipped(kind: SurfaceKind) -> impl Iterator<Item = &'static Entry> {
     manifest::entries_of_kind(kind).filter(|entry| entry.shipped())
 }
 
-fn not_dispatchable(handler: &Handler, name: &str) -> bool {
-    matches!(
-        handler.dispatch(name, &json!([])),
-        Err(RpcError::MethodNotFound(_))
-    )
+fn method_not_found_error(handler: &Handler, name: &str) -> Option<RpcError> {
+    match handler.dispatch(name, &json!([])) {
+        Err(error @ RpcError::MethodNotFound(_)) => Some(error),
+        _ => None,
+    }
 }
 
 /// Invariant 1 (RPC, bidirectional): the live dispatch registry and the
@@ -79,9 +84,13 @@ fn every_unimplemented_rpc_row_answers_method_not_found() {
         "Unimplemented set must not silently empty out"
     );
     for name in &unimplemented {
-        assert!(
-            not_dispatchable(&handler, name),
-            "`{name}` is declared Unimplemented but the dispatcher answers it"
+        let error = method_not_found_error(&handler, name).unwrap_or_else(|| {
+            panic!("`{name}` is declared Unimplemented but the dispatcher answers it")
+        });
+        assert_eq!(
+            error.code(),
+            -32_601,
+            "`{name}` must return JSON-RPC method-not-found"
         );
     }
     assert!(
@@ -156,7 +165,7 @@ fn pending_extension_rows_do_not_dispatch() {
         .filter(|entry| entry.status == Status::Extension && entry.since == "pending")
     {
         assert!(
-            not_dispatchable(&handler, entry.name),
+            method_not_found_error(&handler, entry.name).is_some(),
             "`{}` is marked since=pending but the dispatcher answers it",
             entry.name
         );

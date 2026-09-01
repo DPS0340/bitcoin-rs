@@ -249,7 +249,6 @@ impl fmt::Debug for Config {
                 "index_rollback_rebuild_cutover",
                 &self.index_rollback_rebuild_cutover,
             )
-            .field("log_level", &self.log_level)
             .field("metrics_bind", &self.metrics_bind)
             .field("g2_muhash_samples", &self.g2_muhash_samples)
             .field("g2_muhash_tip_height", &self.g2_muhash_tip_height)
@@ -820,7 +819,6 @@ impl ConfigLayer {
                 "BITCOIN_RS_INDEX_ROLLBACK_REBUILD_CUTOVER" => {
                     layer.index_rollback_rebuild_cutover = Some(value.parse()?);
                 }
-                "BITCOIN_RS_LOG_LEVEL" => layer.log_level = Some(value.to_owned()),
                 "BITCOIN_RS_METRICS_BIND" => layer.metrics_bind = Some(value.parse()?),
                 "BITCOIN_RS_G2_MUHASH_SAMPLES" => {
                     layer.g2_muhash_samples = Some(PathBuf::from(value));

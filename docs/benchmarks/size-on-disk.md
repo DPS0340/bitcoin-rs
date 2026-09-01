@@ -48,8 +48,7 @@ behind it. That is every test fixture and nothing else.
 ### Why a maintained figure rather than a walk
 
 Measuring means one `stat` per block file — thousands at a mainnet-sized chain,
-which is the same multi-millisecond cost `docs/benchmarks/chain-info-fold.md`
-had just removed from this call. Putting a directory walk back into
+which is the same multi-millisecond cost. Putting a directory walk back into
 `getblockchaininfo` would have undone that.
 
 So the figure is maintained, the way Core maintains `m_blockfile_info`: seeded by

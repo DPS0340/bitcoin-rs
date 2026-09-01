@@ -192,6 +192,14 @@ pub struct PeerSource {
     connection_id: ConnectionId,
 }
 
+impl PeerSource {
+    /// Returns the connection identity stamped at decode time.
+    pub const fn connection_id(&self) -> ConnectionId {
+        self.connection_id
+    }
+}
+
+
 /// Maximum queued messages for one peer connection.
 pub const OUTBOUND_QUEUE_MAX_MESSAGES: usize = 4096;
 /// Maximum queued full wire bytes for one peer connection.

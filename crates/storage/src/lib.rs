@@ -17,6 +17,8 @@ pub mod error;
 pub mod pruning;
 /// Backend-neutral key-value store traits.
 pub mod trait_;
+/// Per-block UTXO undo records and the in-flight disconnect marker.
+pub mod undo;
 
 #[cfg(feature = "fjall")]
 mod fjall_impl;
@@ -42,6 +44,7 @@ pub use error::StorageError;
 pub use trait_::{
     KvIter, KvPair, KvSnapshot, KvStore, PrefixScan, PrefixScanLimit, WriteBatch, WriteCondition,
 };
+pub use undo::{DisconnectMarker, DisconnectPhase, InMemoryUndoStore, KvUndoStore, UndoStore};
 
 #[cfg(feature = "fjall")]
 pub use fjall_impl::FjallStore;

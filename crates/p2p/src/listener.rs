@@ -154,6 +154,7 @@ fn remove_current_peer(
 struct InboundSyncSinks {
     headers_tx: Sender<crate::InboundHeaders>,
     blocks_tx: Sender<crate::InboundBlock>,
+    tx_tx: Sender<crate::InboundTx>,
     wake_tx: SyncWakeHandle,
 }
 
@@ -183,6 +184,12 @@ impl InboundSyncSinks {
             tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound blocks channel disconnected");
         } else {
             wake_sync(self.wake_tx.as_ref());
+        }
+    }
+
+    fn send_tx(&self, source: crate::PeerSource, tx: bitcoin_rs_primitives::Tx) {
+        if let Err(error) = self.tx_tx.send(crate::InboundTx::new(tx, source)) {
+            tracing::warn!(peer_addr = %source.addr, %error, "p2p inbound tx channel disconnected or full");
         }
     }
 }
@@ -231,6 +238,7 @@ pub fn serve_with_shutdown(
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> Result<(), ListenerError> {
     serve_with_shutdown_with_chain_and_sync_wake(
@@ -242,6 +250,7 @@ pub fn serve_with_shutdown(
         peer_outbound,
         inbound_headers_tx,
         inbound_blocks_tx,
+        inbound_tx_tx,
         banned,
         None,
         None,
@@ -260,6 +269,7 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
@@ -278,11 +288,11 @@ pub fn serve_with_shutdown_with_chain_and_sync_wake(
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
         blocks_tx: inbound_blocks_tx,
+        tx_tx: inbound_tx_tx,
         wake_tx: sync_wake_tx,
     };
     serve_connections(addr, &shutdown, magic, &shared, &inbound_sync_sinks)
 }
-
 /// Accept-loop core shared by every listener entry point.
 ///
 /// Bind and `set_nonblocking` failures are fatal and propagated as
@@ -357,7 +367,6 @@ fn serve_connections(
     }
     Ok(())
 }
-
 /// Binds `addr` and runs the accept loop driven by one
 /// [`crate::NetworkControls`] instance.
 ///
@@ -372,6 +381,7 @@ pub fn serve_with_controls(
     controls: Arc<crate::NetworkControls>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
     peer_registered: PeerRegistrationHandle,
@@ -380,6 +390,7 @@ pub fn serve_with_controls(
     let inbound_sync_sinks = InboundSyncSinks {
         headers_tx: inbound_headers_tx,
         blocks_tx: inbound_blocks_tx,
+        tx_tx: inbound_tx_tx,
         wake_tx: sync_wake_tx,
     };
     serve_connections(addr, &shutdown, magic, &shared, &inbound_sync_sinks)
@@ -399,6 +410,7 @@ pub fn spawn_outbound_connection(
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
 ) -> std::thread::JoinHandle<Result<(), crate::wire::PeerError>> {
     spawn_outbound_connection_with_chain_and_sync_wake(
@@ -408,6 +420,7 @@ pub fn spawn_outbound_connection(
         peer_outbound,
         inbound_headers_tx,
         inbound_blocks_tx,
+        inbound_tx_tx,
         banned,
         network_active,
         None,
@@ -425,6 +438,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
     peer_outbound: Arc<RwLock<hashbrown::HashMap<SocketAddr, crate::PeerLease>>>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     banned: Arc<RwLock<Vec<crate::BannedSubnet>>>,
     network_active: Arc<AtomicBool>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
@@ -448,6 +462,7 @@ pub fn spawn_outbound_connection_with_chain_and_sync_wake(
         InboundSyncSinks {
             headers_tx: inbound_headers_tx,
             blocks_tx: inbound_blocks_tx,
+            tx_tx: inbound_tx_tx,
             wake_tx: sync_wake_tx,
         },
     )
@@ -465,6 +480,7 @@ pub fn spawn_outbound_connection_with_controls(
     controls: Arc<crate::NetworkControls>,
     inbound_headers_tx: Sender<crate::InboundHeaders>,
     inbound_blocks_tx: Sender<crate::InboundBlock>,
+    inbound_tx_tx: Sender<crate::InboundTx>,
     chain_query: Option<Arc<dyn crate::dispatch::ChainQuery + 'static>>,
     sync_wake_tx: Option<Sender<()>>,
     peer_registered: PeerRegistrationHandle,
@@ -477,6 +493,7 @@ pub fn spawn_outbound_connection_with_controls(
         InboundSyncSinks {
             headers_tx: inbound_headers_tx,
             blocks_tx: inbound_blocks_tx,
+            tx_tx: inbound_tx_tx,
             wake_tx: sync_wake_tx,
         },
     )
@@ -900,6 +917,9 @@ fn run_message_loop<S: std::io::Read + std::io::Write>(
                     },
                 )?;
                 match message {
+                    crate::Message::Tx(tx) => {
+                        inbound_sync_sinks.send_tx(lease.source(peer_addr), tx);
+                    }
                     crate::Message::Headers(headers) => {
                         inbound_sync_sinks.send_headers(lease.source(peer_addr), headers);
                     }
@@ -1064,6 +1084,7 @@ mod outbound_tests {
         let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         let banned = Arc::new(RwLock::new(Vec::new()));
 
         let handle = spawn_outbound_connection(
@@ -1074,6 +1095,7 @@ mod outbound_tests {
             outbound,
             headers_tx,
             blocks_tx,
+            tx_tx,
             banned,
         );
         let inner = match handle.join() {
@@ -1120,9 +1142,11 @@ mod lease_tests {
     fn sinks() -> InboundSyncSinks {
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         InboundSyncSinks {
             headers_tx,
             blocks_tx,
+            tx_tx,
             wake_tx: None,
         }
     }
@@ -1202,9 +1226,11 @@ mod lease_tests {
     fn sinks_stamp_exact_connection_source() -> Result<(), Box<dyn std::error::Error>> {
         let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         let sinks = InboundSyncSinks {
             headers_tx,
             blocks_tx,
+            tx_tx,
             wake_tx: None,
         };
         let addr = SocketAddr::from(([127, 0, 0, 1], 8333));
@@ -1227,7 +1253,6 @@ mod lease_tests {
         assert_eq!(received.serialized, serialized);
         Ok(())
     }
-
     #[test]
     fn message_loop_exits_before_read_when_cancelled() {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_444));
@@ -1260,9 +1285,11 @@ mod lease_tests {
         }
         let (headers_tx, headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         let test_sinks = InboundSyncSinks {
             headers_tx,
             blocks_tx,
+            tx_tx,
             wake_tx: None,
         };
         let mut peer = Peer::new(
@@ -1414,9 +1441,11 @@ mod resilient_accept_tests {
     fn sinks() -> InboundSyncSinks {
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         InboundSyncSinks {
             headers_tx,
             blocks_tx,
+            tx_tx,
             wake_tx: None,
         }
     }
@@ -1499,9 +1528,11 @@ mod writer_setup_cleanup_tests {
     fn sinks() -> InboundSyncSinks {
         let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
         let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+        let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
         InboundSyncSinks {
             headers_tx,
             blocks_tx,
+            tx_tx,
             wake_tx: None,
         }
     }
@@ -1882,6 +1913,7 @@ mod writer_shutdown_tests {
         let sinks = InboundSyncSinks {
             headers_tx: crossbeam_channel::unbounded().0,
             blocks_tx: crossbeam_channel::unbounded().0,
+            tx_tx: crossbeam_channel::unbounded().0,
             wake_tx: None,
         };
 
@@ -1932,6 +1964,7 @@ mod writer_shutdown_tests {
         let sinks = InboundSyncSinks {
             headers_tx: crossbeam_channel::unbounded().0,
             blocks_tx: crossbeam_channel::unbounded().0,
+            tx_tx: crossbeam_channel::unbounded().0,
             wake_tx: None,
         };
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18_447));

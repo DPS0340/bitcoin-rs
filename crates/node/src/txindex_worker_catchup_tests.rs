@@ -6,6 +6,11 @@
 //! a real `Mutex<IndexWriter<FjallStore>>`: forward preparation may use a
 //! stale same-chain target, and complete stale prefixes self-heal through the
 //! normal rollback path.
+//!
+//! Named proving surface of `docs/contracts/indexing.md`: `IDX-05`
+//! (reconciliation from a persisted watermark — ancestor connect,
+//! abandoned-branch rollback to the common ancestor) and `IDX-06`
+//! (prepared-prefix batching, one atomic commit per block or chunk).
 use hashbrown::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

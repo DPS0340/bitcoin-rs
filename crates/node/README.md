@@ -17,7 +17,25 @@ through the `ZmqPublisher` trait and its `SocketZmqPublisher` / `TracingZmqPubli
 / `NoOpZmqPublisher` implementations and the `TxIndexRuntime` worker; `signal` and
 `shutdown` bridge process signals into graceful shutdown.
 
+## Contract ownership
+
+Behavioral contracts governing node operations are defined in `docs/contracts/`:
+
+- **Chain events and reconciliation**: `NodeState` snapshot replacement, hint emission, and consumer cursor invariants follow [`docs/contracts/chain-events.md`](../../docs/contracts/chain-events.md) (`EVT-01`–`EVT-04`).
+- **Indexing runtimes**: `TxIndexRuntime` and `FilterIndexWorker` capability gating, watermark identity, query consistency, and reorg reconciliation follow [`docs/contracts/indexing.md`](../../docs/contracts/indexing.md) (`IDX-01`–`IDX-07`).
+- **Extension isolation**: Descriptor registration, pre-open validation, and never-abort-core isolation follow [`docs/contracts/extensions.md`](../../docs/contracts/extensions.md) (`EXT-01`–`EXT-05`).
+- **Mempool mutation observer**: Notification and ZMQ event mapping follow [`docs/contracts/mempool-mutations.md`](../../docs/contracts/mempool-mutations.md) (`MPL-01`–`MPL-03`).
+
+## Live gaps
+
+- **Application embedding**: `bitcoin-rs-node` currently runs as a standalone daemon; a typed in-process application engine API is tracked under #145 (open).
+- **Consensus default**: Consensus verification default includes `kernel` for per-crate validation; native pure-Rust verification default is tracked under #166 (open).
+- **Deep reorg memory bounding**: Disconnect planning preloads branch block bodies into memory; streaming bounded-memory disconnect is tracked under #206 (open).
+- **Index recovery decoupling**: Startup currently initializes index stores synchronously; async index recovery and checkpoint fallback transparency are tracked under #208 and #209 (open).
+- **Composition layer slimming**: Shifting domain-specific logic to owning crates and slimming `crates/node` to pure composition is tracked under #217 (open).
+
 ## Features
+
 - `default` (enables `fjall`, `kernel`, and `zmq`): the performance-oriented fjall
   storage backend plus the bitcoinkernel consensus verifier and ZMQ notifications,
   so per-crate `cargo check` works out of the box. The `bitcoin-rs` binary's own
@@ -33,6 +51,5 @@ through the `ZmqPublisher` trait and its `SocketZmqPublisher` / `TracingZmqPubli
   `mainnet_prefix_replay` example registers it as the global allocator.
 - `prometheus-http`: enables the `metrics-exporter-prometheus/http-listener` feature;
   the in-process metrics recorder does not start an HTTP listener.
-
 Part of [`bitcoin-rs`](../../README.md); see [`CONCEPTS.md`](../../CONCEPTS.md) for the
 project vocabulary.

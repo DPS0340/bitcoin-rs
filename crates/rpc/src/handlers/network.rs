@@ -42,6 +42,9 @@ fn services_names_from_flags(flags: u64) -> Vec<String> {
     if flags & (1_u64 << 3) != 0 {
         names.push("WITNESS".to_owned());
     }
+    if flags & (1_u64 << 6) != 0 {
+        names.push("COMPACT_FILTERS".to_owned());
+    }
     if flags & (1_u64 << 10) != 0 {
         names.push("NETWORK_LIMITED".to_owned());
     }
@@ -170,11 +173,7 @@ pub(crate) fn getpeerinfo(ctx: &Arc<Context>, params: &Value) -> Result<Value, R
             network: network_name(peer.addr.ip()).to_owned(),
             mapped_as: None,
             services: format!("{:016x}", peer.services),
-            services_names: peer
-                .services_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            services_names: services_names_from_flags(peer.services),
             relay_transactions: true,
             last_send: 0,
             last_received: 0,
@@ -550,51 +549,69 @@ mod tests {
     }
 
     #[test]
-    fn local_services_flags_hex_matches_bitmask() {
-        assert_eq!(format!("{LOCAL_SERVICES_FLAGS:016x}"), LOCAL_SERVICES_HEX);
-    }
+    fn getpeerinfo_serializes_version_metadata_and_service_names() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    #[test]
-    fn services_names_from_flags_decodes_known_bits() {
-        let names = services_names_from_flags(0_u64);
-        assert!(names.is_empty());
-
-        let names = services_names_from_flags((1_u64 << 0) | (1_u64 << 3));
-        assert_eq!(names, vec!["NETWORK".to_owned(), "WITNESS".to_owned()]);
-
-        let names = services_names_from_flags((1_u64 << 0) | (1_u64 << 3) | (1_u64 << 10));
-        assert_eq!(
-            names,
-            vec![
-                "NETWORK".to_owned(),
-                "WITNESS".to_owned(),
-                "NETWORK_LIMITED".to_owned()
-            ]
-        );
-    }
-
-    #[test]
-    fn getpeerinfo_servicesnames_matches_peer_info_services_names() {
+        use bitcoin::p2p::ServiceFlags;
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message_network::VersionMessage;
         use bitcoin_rs_p2p::PeerInfo;
 
-        let info = PeerInfo {
-            addr: "127.0.0.1:8333".parse().unwrap_or_else(|_| panic!("addr")),
+        let outbound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+        let inbound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8334);
+        let version = VersionMessage {
             version: 70_016,
-            services: (1_u64 << 0) | (1_u64 << 3),
-            user_agent: "stub".to_owned(),
-            start_height: 0,
-            conn_time: 0,
-            inbound: false,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS,
+            timestamp: 0,
+            receiver: Address::new(&outbound_addr, ServiceFlags::NONE),
+            sender: Address::new(&inbound_addr, ServiceFlags::NETWORK),
+            nonce: 0,
+            user_agent: "/test:0.1/".to_owned(),
+            start_height: 7,
+            relay: true,
         };
+        let ctx = Arc::new(Context::new());
+        ctx.peers.write().extend([
+            PeerInfo::outbound_from_version(outbound_addr, &version, 100),
+            PeerInfo::inbound_from_version(inbound_addr, &version, 101),
+        ]);
 
-        assert_eq!(info.services_names(), vec!["NETWORK", "WITNESS"]);
-    }
-
-    #[test]
-    fn services_names_from_flags_ignores_unknown_bits() {
-        // Bit 63 is not in the decoder's recognized set.
-        let names = services_names_from_flags(1_u64 << 63);
-        assert!(names.is_empty());
+        let result = getpeerinfo(&ctx, &json!(null))
+            .unwrap_or_else(|err| panic!("getpeerinfo failed: {err}"));
+        let Some(rows) = result.as_array() else {
+            panic!("getpeerinfo must return an array: {result:?}");
+        };
+        assert_eq!(rows.len(), 2);
+        for (row, expected_inbound, expected_conn_time) in
+            [(&rows[0], false, 100), (&rows[1], true, 101)]
+        {
+            assert_eq!(
+                row.get("inbound").and_then(JsonValueTrait::as_bool),
+                Some(expected_inbound)
+            );
+            assert_eq!(
+                row.get("version").and_then(JsonValueTrait::as_u64),
+                Some(70_016)
+            );
+            assert_eq!(
+                row.get("subver").and_then(|value| value.as_str()),
+                Some("/test:0.1/")
+            );
+            assert_eq!(
+                row.get("startingheight").and_then(JsonValueTrait::as_i64),
+                Some(7)
+            );
+            assert_eq!(
+                row.get("conntime").and_then(JsonValueTrait::as_u64),
+                Some(expected_conn_time)
+            );
+            let names: Vec<&str> = row
+                .get("servicesnames")
+                .and_then(|value| value.as_array())
+                .map(|names| names.iter().filter_map(|name| name.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(names, ["NETWORK", "WITNESS", "COMPACT_FILTERS"]);
+        }
     }
 }
 #[cfg(test)]

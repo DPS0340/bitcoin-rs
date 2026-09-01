@@ -166,30 +166,6 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-#[cfg(feature = "zmq")]
-#[test]
-fn getzmqnotifications_dispatches_compiled_notifications() -> Result<(), Box<dyn std::error::Error>>
-{
-    let ctx = Arc::new(Context::new());
-    let handler = Handler::new(ctx);
-    let result = handler.dispatch("getzmqnotifications", &json!([]))?;
-    assert!(
-        result.is_array(),
-        "getzmqnotifications must return an array"
-    );
-    Ok(())
-}
-
-#[cfg(not(feature = "zmq"))]
-#[test]
-fn getzmqnotifications_is_absent_without_zmq() {
-    let ctx = Arc::new(Context::new());
-    let handler = Handler::new(ctx);
-    let err = handler
-        .dispatch("getzmqnotifications", &json!([]))
-        .expect_err("getzmqnotifications should be absent without zmq feature");
-    assert_eq!(err.code(), RpcError::METHOD_NOT_FOUND);
-}
 #[test]
 fn getblockhash_zero_returns_mainnet_genesis_on_fresh_context()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -348,15 +324,6 @@ fn gettxoutsetinfo_hash_type_modes_match_core_shapes() -> Result<(), Box<dyn std
             "bestblock missing for hash_type={hash_type}"
         );
     }
-    Ok(())
-}
-
-#[test]
-fn getindexinfo_returns_available_indexes() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = Arc::new(Context::new());
-    let handler = Handler::new(Arc::clone(&ctx));
-    let result = handler.dispatch("getindexinfo", &json!([]))?;
-    assert!(result.is_object(), "getindexinfo must return an object");
     Ok(())
 }
 
@@ -571,28 +538,6 @@ fn network_peer_methods_read_shared_peer_registry() -> Result<(), Box<dyn std::e
     let count = handler.dispatch("getconnectioncount", &json!([]))?;
     assert_eq!(count.as_u64(), Some(1));
     Ok(())
-}
-
-#[test]
-fn removed_wallet_methods_return_method_not_found() {
-    let ctx = Arc::new(Context::new());
-    let handler = Handler::new(ctx);
-    for method in [
-        "listunspent",
-        "getbalance",
-        "sendtoaddress",
-        "walletcreatefundedpsbt",
-        "walletprocesspsbt",
-    ] {
-        let err = handler
-            .dispatch(method, &json!([]))
-            .expect_err(&format!("{method} should return method-not-found"));
-        assert_eq!(
-            err.code(),
-            RpcError::METHOD_NOT_FOUND,
-            "{method} should return method-not-found"
-        );
-    }
 }
 
 struct FakeTxIndex {

@@ -12,11 +12,32 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use bitcoin_rs_primitives::{Tx, Txid};
 use hashbrown::HashSet;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, OnceLock};
+
+/// Why a chain-change reservation or finish failed.
+///
+/// Every variant leaves the gateway's chain generation unchanged: a failed
+/// `begin_chain_change` stores nothing, and a failed `finish` leaves the
+/// gateway odd so admission stays closed until a later finish succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ChainChangeError {
+    /// A chain change is already active (the current generation is odd).
+    #[error("a chain change is already active")]
+    AlreadyActive,
+    /// The reserved odd or even value would overflow `u64`.
+    #[error("chain generation overflow")]
+    Overflow,
+    /// The compare-exchange from the odd value to the reserved even value
+    /// failed because the generation moved underneath the guard.
+    #[error("chain generation changed before finish")]
+    GenerationMoved,
+}
 
 /// Interns one [`MempoolGateway`] per pool `Arc` identity.
 ///
@@ -149,6 +170,11 @@ pub struct MempoolGateway {
     pool: Arc<RwLock<Mempool>>,
     observer: OnceLock<Arc<dyn MempoolObserver>>,
     publish: Mutex<()>,
+    /// Even means stable; odd means a chain change is active or a failed
+    /// chain change has closed admission. Initialized to `0` (even/stable)
+    /// in [`Self::shared`]. Compare only for exact equality — never order or
+    /// subtract wrapping counters.
+    chain_generation: AtomicU64,
 }
 
 impl core::fmt::Debug for MempoolGateway {
@@ -184,6 +210,7 @@ impl MempoolGateway {
             pool,
             observer: OnceLock::new(),
             publish: Mutex::new(()),
+            chain_generation: AtomicU64::new(0),
         });
         gateways.push(Arc::downgrade(&gateway));
         gateway
@@ -213,6 +240,51 @@ impl MempoolGateway {
     /// mutations must go through the gateway so observers stay in the loop.
     pub fn read(&self) -> RwLockReadGuard<'_, Mempool> {
         self.pool.read()
+    }
+
+    /// Returns the exact even chain generation, or `None` when a chain
+    /// change is active (odd) or a failed chain change has closed admission.
+    ///
+    /// Uses an `Acquire` load so reads after this call observe writes that
+    /// preceded the last `Release` store. Compare the returned value only
+    /// for exact equality — never order or subtract wrapping counters.
+    #[must_use]
+    pub fn stable_generation(&self) -> Option<u64> {
+        let value = self.chain_generation.load(Ordering::Acquire);
+        (value % 2 == 0).then_some(value)
+    }
+
+    /// Reserves the next chain-change generation and returns a guard that
+    /// owns the exact odd value and the reserved next even value.
+    ///
+    /// Takes `self.pool.write()` before it reads or changes the generation,
+    /// so an inflight admission that already holds the write lock blocks
+    /// `begin_chain_change` until it releases. It rejects an odd current
+    /// value (a chain change is already active). It uses checked arithmetic
+    /// to reserve both the odd value and its following even value before it
+    /// stores anything; if either increment would overflow, it returns an
+    /// error and leaves the generation unchanged. It then stores the odd
+    /// value with `Release` ordering and drops the pool guard.
+    ///
+    /// The returned guard has no `Drop` that changes generation: dropping,
+    /// unwinding, or returning an error leaves the gateway odd. Only
+    /// [`ChainChangeGuard::finish`] may compare-exchange the odd value to
+    /// the reserved even value.
+    pub fn begin_chain_change(self: &Arc<Self>) -> Result<ChainChangeGuard, ChainChangeError> {
+        let _pool_guard = self.pool.write();
+        let current = self.chain_generation.load(Ordering::Relaxed);
+        if current % 2 != 0 {
+            return Err(ChainChangeError::AlreadyActive);
+        }
+        let odd = current.checked_add(1).ok_or(ChainChangeError::Overflow)?;
+        let even = odd.checked_add(1).ok_or(ChainChangeError::Overflow)?;
+        self.chain_generation.store(odd, Ordering::Release);
+        drop(_pool_guard);
+        Ok(ChainChangeGuard {
+            gateway: Arc::clone(self),
+            odd,
+            even,
+        })
     }
 
     /// Commits `pool.insert_entry` and publishes its result.
@@ -414,6 +486,54 @@ impl MempoolGateway {
     }
 }
 
+/// Owns an active chain-change reservation: the exact odd generation and
+/// the reserved next even value.
+///
+/// Has no `Drop` that changes generation. Dropping, unwinding, or returning
+/// an error leaves the gateway odd — admission stays closed. Only
+/// [`Self::finish`] may compare-exchange the odd value to the reserved even
+/// value. One guard covers one externally coherent chain operation: one
+/// connect, one disconnect, one complete `apply_window`, or one full reorg.
+#[derive(Debug)]
+pub struct ChainChangeGuard {
+    gateway: Arc<MempoolGateway>,
+    odd: u64,
+    even: u64,
+}
+
+impl ChainChangeGuard {
+    /// Returns the exact odd generation this guard reserved.
+    #[must_use]
+    pub fn odd_generation(&self) -> u64 {
+        self.odd
+    }
+
+    /// Returns the reserved even value `finish` will store on success.
+    #[must_use]
+    pub fn reserved_even(&self) -> u64 {
+        self.even
+    }
+
+    /// Compare-exchanges the exact odd value to the reserved even value.
+    ///
+    /// A failed compare-exchange is an error and leaves admission closed
+    /// (the generation stays odd). On success the generation becomes the
+    /// reserved even value and admission reopens.
+    pub fn finish(self) -> Result<(), ChainChangeError> {
+        let prev = self.gateway.chain_generation.compare_exchange(
+            self.odd,
+            self.even,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        if prev.is_ok() {
+            Ok(())
+        } else {
+            Err(ChainChangeError::GenerationMoved)
+        }
+    }
+}
+
 /// Test-only causal gate for the publication ordering proof.
 ///
 /// Disarmed, [`park_if_armed`] is a no-op and every mutator passes. Armed,
@@ -472,7 +592,7 @@ mod ordering_gate {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::ordering_gate;
-    use super::{CompositeObserver, MempoolGateway, MempoolObserver};
+    use super::{ChainChangeError, ChainChangeGuard, CompositeObserver, MempoolGateway, MempoolObserver};
     use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationOutcome, RemovalReason};
     use crate::{Mempool, MempoolEntry, MempoolLimits};
     use alloc::sync::Arc;
@@ -1410,5 +1530,221 @@ mod tests {
         assert!(pool_read.contains_txid(&second_txid));
         drop(pool_read);
         ordering_gate::reset();
+    }
+
+    #[test]
+    fn chain_generation_starts_even_at_zero() {
+        let gateway = gateway_with(None);
+        assert_eq!(
+            gateway.stable_generation(),
+            Some(0),
+            "initial generation is even zero"
+        );
+    }
+
+    #[test]
+    fn stable_generation_reads_even_values() {
+        let gateway = gateway_with(None);
+        gateway.chain_generation.store(4, Ordering::Release);
+        assert_eq!(gateway.stable_generation(), Some(4));
+        gateway.chain_generation.store(7, Ordering::Release);
+        assert_eq!(
+            gateway.stable_generation(),
+            None,
+            "odd generation is not stable"
+        );
+    }
+
+    #[test]
+    fn begin_chain_change_rejects_nested_begin() {
+        let gateway = gateway_with(None);
+        let guard = gateway
+            .begin_chain_change()
+            .expect("first begin succeeds on even generation");
+        assert_eq!(guard.odd_generation(), 1);
+        assert_eq!(guard.reserved_even(), 2);
+        assert_eq!(
+            gateway.stable_generation(),
+            None,
+            "odd generation is not stable while a chain change is active"
+        );
+        let err = gateway
+            .begin_chain_change()
+            .expect_err("nested begin rejected while odd");
+        assert_eq!(err, ChainChangeError::AlreadyActive);
+        drop(guard);
+    }
+
+    #[test]
+    fn explicit_finish_restores_even_generation() {
+        let gateway = gateway_with(None);
+        let guard = gateway.begin_chain_change().expect("begin");
+        assert_eq!(guard.odd_generation(), 1);
+        assert_eq!(guard.reserved_even(), 2);
+        guard.finish().expect("finish stores the reserved even value");
+        assert_eq!(
+            gateway.stable_generation(),
+            Some(2),
+            "finish restored the exact reserved even value"
+        );
+    }
+
+    #[test]
+    fn dropping_chain_change_stays_unstable() {
+        let gateway = gateway_with(None);
+        {
+            let _guard = gateway.begin_chain_change().expect("begin");
+            assert_eq!(gateway.stable_generation(), None);
+        }
+        assert_eq!(
+            gateway.stable_generation(),
+            None,
+            "dropping the guard without finish leaves the generation odd"
+        );
+        // A fresh begin on the still-odd gateway must fail.
+        let err = gateway
+            .begin_chain_change()
+            .expect_err("cannot begin while odd after a dropped guard");
+        assert_eq!(err, ChainChangeError::AlreadyActive);
+    }
+
+    #[test]
+    fn chain_generation_overflow_fails_closed() {
+        let gateway = gateway_with(None);
+        // u64::MAX is odd; u64::MAX - 1 is the largest usable even value.
+        // begin must reserve odd = u64::MAX (ok) then even = u64::MAX + 1
+        // (overflow), and fail before storing anything.
+        gateway.chain_generation.store(u64::MAX - 1, Ordering::Relaxed);
+        let err = gateway
+            .begin_chain_change()
+            .expect_err("overflow must fail before any store");
+        assert_eq!(err, ChainChangeError::Overflow);
+        assert_eq!(
+            gateway.chain_generation.load(Ordering::Relaxed),
+            u64::MAX - 1,
+            "generation unchanged after overflow failure"
+        );
+    }
+
+    #[test]
+    fn begin_chain_change_serializes_with_inflight_admission() {
+        let gateway = gateway_with(None);
+
+        // Thread A takes the pool write lock directly, simulating an
+        // inflight admission that has acquired pool.write() but has not
+        // yet mutated or released.
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gateway_a = Arc::clone(&gateway);
+        let a_handle = std::thread::spawn(move || {
+            let _guard = gateway_a.pool().write();
+            held_tx.send(()).expect("test waiting for lock acquisition");
+            // Hold the write lock until the test signals release.
+            release_rx.recv_timeout(core::time::Duration::from_secs(10)).expect("test alive to release");
+            // _guard drops here, releasing the write lock.
+        });
+
+        held_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("thread A acquired the pool write lock");
+
+        // Thread B calls begin_chain_change, which must block on pool.write()
+        // until thread A releases. It must NOT store odd while the admission
+        // holds the write lock.
+        let gateway_b = Arc::clone(&gateway);
+        let (b_done_tx, b_done_rx) = mpsc::channel();
+        let b_handle = std::thread::spawn(move || {
+            let guard = gateway_b.begin_chain_change().expect("begin after lock release");
+            b_done_tx.send(guard).expect("test waiting for begin result");
+        });
+
+        // Give thread B time to block on the write lock. The generation must
+        // still be even (0) — begin has not stored odd yet.
+        std::thread::sleep(core::time::Duration::from_millis(100));
+        assert_eq!(
+            gateway.stable_generation(),
+            Some(0),
+            "begin must not store odd while an admission holds the write lock"
+        );
+
+        // Release thread A's write lock. Thread B's begin_chain_change should
+        // now proceed and store odd.
+        release_tx.send(()).expect("thread A alive");
+        a_handle.join().expect("thread A completed");
+
+        let guard = b_done_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("begin_chain_change returned after lock release");
+        assert_eq!(guard.odd_generation(), 1);
+        assert_eq!(guard.reserved_even(), 2);
+        assert_eq!(gateway.stable_generation(), None);
+        guard.finish().expect("finish restores even");
+        assert_eq!(gateway.stable_generation(), Some(2));
+        b_handle.join().expect("thread B completed");
+    }
+
+    #[test]
+    fn remove_for_block_distinguishes_mined_from_conflicts() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+
+        // A directly mined pool transaction.
+        let mined = tx(10);
+        let mined_txid = mined.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&mined))
+            .expect("mined in");
+
+        // A pool transaction that spends a known outpoint. The block will
+        // include a different transaction spending the same outpoint, making
+        // this one a double-spend conflict.
+        let conflict_tx = tx(11);
+        let conflict_txid = conflict_tx.txid();
+        let spent_outpoint = conflict_tx.inputs[0].previous_output;
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&conflict_tx))
+            .expect("conflict in");
+
+        // A child of the conflict tx — a removed descendant.
+        let mut child = tx(12);
+        child.inputs[0].previous_output = OutPoint::new(conflict_txid, 0);
+        let child_txid = child.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
+            .expect("child in");
+
+        // The block mines `mined` directly and includes a transaction that
+        // double-spends the same outpoint as `conflict_tx`.
+        let mut double_spend = tx(13);
+        double_spend.inputs[0] = TxIn {
+            previous_output: spent_outpoint,
+            script_sig: Vec::new(),
+            sequence: 0xFFFF_FFFF,
+            witness: Vec::new(),
+        };
+        let double_spend_txid = double_spend.txid();
+
+        observer.seen.lock().clear();
+        gateway.remove_for_block(
+            AdmissionOrigin::Block,
+            &[&mined, &double_spend],
+            &[mined_txid, double_spend_txid],
+            8,
+        );
+
+        let seen = observer.seen.lock();
+        // Directly mined: BlockInclusion (no R).
+        // Conflict (conflict_tx): Conflict (R).
+        // Descendant (child): Conflict (R).
+        // Order: mined first, then conflict, then descendant.
+        assert_eq!(
+            *seen,
+            vec![
+                (hash(&mined_txid), removed(RemovalReason::BlockInclusion)),
+                (hash(&conflict_txid), removed(RemovalReason::Conflict)),
+                (hash(&child_txid), removed(RemovalReason::Conflict)),
+            ],
+            "mined is BlockInclusion, conflict and descendant are Conflict, in deterministic order"
+        );
     }
 }

@@ -30,6 +30,7 @@ fn outbound_ban_short_circuits_before_connect_with_typed_error() -> Result<(), B
     let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let banned = Arc::new(RwLock::new(vec![ban(IpSubnet::from_ip(addr.ip()))]));
     let network_active = Arc::new(AtomicBool::new(true));
 
@@ -41,6 +42,7 @@ fn outbound_ban_short_circuits_before_connect_with_typed_error() -> Result<(), B
         outbound,
         headers_tx,
         blocks_tx,
+        tx_tx,
         banned,
     );
     let result = match handle.join() {
@@ -84,6 +86,7 @@ fn inbound_ban_drops_connection_pre_handshake() -> Result<(), Box<dyn Error>> {
     let listener_outbound = Arc::clone(&outbound);
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let banned = Arc::new(RwLock::new(vec![ban(IpSubnet::new(
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
         8,
@@ -100,6 +103,7 @@ fn inbound_ban_drops_connection_pre_handshake() -> Result<(), Box<dyn Error>> {
             listener_outbound,
             headers_tx,
             blocks_tx,
+            tx_tx,
             listener_banned,
         )
     });
@@ -134,6 +138,7 @@ fn network_inactive_drops_inbound_pre_handshake() -> Result<(), Box<dyn Error>> 
     let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let banned = Arc::new(RwLock::new(Vec::new()));
 
     let listener_shutdown = Arc::clone(&shutdown);
@@ -150,6 +155,7 @@ fn network_inactive_drops_inbound_pre_handshake() -> Result<(), Box<dyn Error>> 
             listener_outbound,
             headers_tx,
             blocks_tx,
+            tx_tx,
             banned,
         )
     });
@@ -180,6 +186,7 @@ fn network_active_blocks_outbound_until_reenabled() -> Result<(), Box<dyn Error>
     let outbound = Arc::new(RwLock::new(hashbrown::HashMap::new()));
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let banned = Arc::new(RwLock::new(Vec::new()));
 
     let inactive = spawn_outbound_connection(
@@ -190,6 +197,7 @@ fn network_active_blocks_outbound_until_reenabled() -> Result<(), Box<dyn Error>
         Arc::clone(&outbound),
         headers_tx.clone(),
         blocks_tx.clone(),
+        tx_tx.clone(),
         Arc::clone(&banned),
     );
     let inactive = inactive
@@ -214,6 +222,7 @@ fn network_active_blocks_outbound_until_reenabled() -> Result<(), Box<dyn Error>
         outbound,
         headers_tx,
         blocks_tx,
+        tx_tx,
         banned,
     );
     assert!(join_accept(accept_handle)?);
@@ -334,6 +343,7 @@ fn loopback_peer_pair(shutdown: &Arc<AtomicBool>) -> Result<LoopbackPeer, Box<dy
 
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let listener_shutdown = Arc::clone(shutdown);
     let listener_controls = Arc::clone(&controls);
     let listener = thread::spawn(move || {
@@ -344,6 +354,7 @@ fn loopback_peer_pair(shutdown: &Arc<AtomicBool>) -> Result<LoopbackPeer, Box<dy
             listener_controls,
             headers_tx,
             blocks_tx,
+            tx_tx,
             None,
             None,
             None,
@@ -358,6 +369,7 @@ fn loopback_peer_pair(shutdown: &Arc<AtomicBool>) -> Result<LoopbackPeer, Box<dy
     loop {
         let (dial_headers_tx, _dial_headers_rx) = crossbeam_channel::unbounded();
         let (dial_blocks_tx, _dial_blocks_rx) = crossbeam_channel::unbounded();
+        let (dial_tx_tx, _dial_tx_rx) = crossbeam_channel::unbounded();
         let dial_controls = Arc::clone(&controls);
         let dial = spawn_outbound_connection_with_controls(
             addr,
@@ -365,6 +377,7 @@ fn loopback_peer_pair(shutdown: &Arc<AtomicBool>) -> Result<LoopbackPeer, Box<dy
             dial_controls,
             dial_headers_tx,
             dial_blocks_tx,
+            dial_tx_tx,
             None,
             None,
             None,
@@ -527,6 +540,7 @@ fn setnetworkactive_refuses_new_outbound_activity() -> Result<(), Box<dyn Error>
     // A further dial while inactive must fail without opening activity.
     let (headers_tx, _headers_rx) = crossbeam_channel::unbounded();
     let (blocks_tx, _blocks_rx) = crossbeam_channel::unbounded();
+    let (tx_tx, _tx_rx) = crossbeam_channel::unbounded();
     let dial_controls = Arc::clone(&controls);
     let refused = spawn_outbound_connection_with_controls(
         addr,
@@ -534,6 +548,7 @@ fn setnetworkactive_refuses_new_outbound_activity() -> Result<(), Box<dyn Error>
         dial_controls,
         headers_tx,
         blocks_tx,
+        tx_tx,
         None,
         None,
         None,

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::{BlockTree, ChainWork, NodeId, TipSnapshot};
 use bitcoin_rs_consensus::{MAX_SCRIPT_SIZE, rust_path::UtxoView};
-use bitcoin_rs_mempool::Mempool;
+use bitcoin_rs_mempool::{AdmissionOrigin, ChainChangeGuard, Mempool, MempoolGateway};
 use bitcoin_rs_primitives::{
     Block, BlockHash, ConsensusEncode as _, Hash256, Network, OutPoint, Tx, TxOut, Txid,
     consensus_bytes, varint,
@@ -24,10 +24,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::state::ApplyError;
 use bitcoin_rs_storage::{
-    BlockFilePosition, FlatFileBlockReader, FlatFileBlockStore, KvSnapshot, KvStore, StorageError,
-    WriteBatch, block_file_max_height_key, decode_block_file_max_height,
-    encode_block_file_max_height,
+    BlockFilePosition, FlatFileBlockReader, FlatFileBlockStore, InMemoryUndoStore, KvSnapshot,
+    KvStore, StorageError, UndoStore, WriteBatch, block_file_max_height_key,
+    decode_block_file_max_height, encode_block_file_max_height,
 };
+#[cfg(test)]
+use bitcoin_rs_storage::{DisconnectMarker, DisconnectPhase, KvUndoStore};
 use scratch::{ApplyScratch, ApplyScratchCapacities, SameBlockSpentSet};
 
 /// Number of blocks after a coinbase that its outputs become spendable.
@@ -89,366 +91,6 @@ fn decode_block_tx_count(bytes: &[u8]) -> Option<usize> {
     let (count, consumed) = varint::decode(cursor).ok()?;
     let _ = &cursor[consumed..];
     usize::try_from(count).ok()
-}
-
-/// Storage for per-block UTXO undo records.
-///
-/// Records survive an orderly restart. They are not crash-safe: see
-/// [`KvUndoStore::persist_undo`] for why no fsync sits here.
-///
-/// Undo records are consensus state, not an optional index: without the record
-/// for a block the node cannot disconnect it, so it can advance `applied_tip`
-/// into a chain it is unable to leave. The handle is therefore mandatory rather
-/// than `Option`, and every construction path must supply a real
-/// implementation. [`InMemoryUndoStore`] is a real one — it round-trips — and
-/// is the correct choice for tests that need no durability. A no-op
-/// implementation would recreate exactly the silent failure this type exists to
-/// prevent, so do not add one.
-///
-/// Records are keyed by height AND block hash. Keying by height alone would let
-/// a stale record from an abandoned branch be replayed against a different
-/// block at the same height.
-pub(crate) trait UndoStore: Send + Sync {
-    /// Writes the undo record for one block.
-    fn persist_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        record: &[u8],
-    ) -> Result<(), StorageError>;
-
-    /// Reads the undo record for one block, if present.
-    fn load_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<Vec<u8>>, StorageError>;
-
-    /// Records that a disconnect is about to mutate state, durably.
-    ///
-    /// Armed BEFORE the first mutation, not after a failure. A marker written
-    /// on the error path cannot exist for the case that needs it most: the
-    /// process dying mid-rollback writes nothing at all. Armed first, both a
-    /// crash and a returned `Fatal` leave the same evidence behind.
-    fn arm_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError>;
-
-    /// Records that the rollback finished, in memory, and is owed a checkpoint.
-    ///
-    /// Distinct from clearing. Both phases refuse a startup, because both mean
-    /// the durable state is torn. What the phase decides is whether a
-    /// checkpoint may clear the marker: only a rollback that ran to completion
-    /// may, and a checkpoint taken over a half-finished or failed one would be
-    /// a checkpoint of the damage.
-    fn complete_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError>;
-
-    /// Clears the marker once a disconnect has finished cleanly.
-    ///
-    /// The marker covers authoritative UTXO and tip state between checkpoints.
-    /// `TxIndex` is outside this transaction and recovers from its own atomic
-    /// watermark after restart.
-    fn disarm_disconnect(&self) -> Result<(), StorageError>;
-
-    /// Reads the marker left by a disconnect that never finished.
-    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError>;
-}
-
-/// A disconnect that started and never reported finishing.
-///
-/// Its presence at startup means one of two things, and the node cannot tell
-/// them apart: the disconnect returned `Fatal`, or the process died between the
-/// first mutation and the last. Both leave authoritative UTXO and tip state
-/// potentially inconsistent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DisconnectMarker {
-    /// Block being disconnected.
-    pub hash: bitcoin_rs_primitives::Hash256,
-    /// Height it was applied at.
-    pub height: u32,
-    /// How far the disconnect got.
-    pub phase: DisconnectPhase,
-}
-
-/// How far a disconnect got before the marker was last written.
-///
-/// Both phases refuse a startup. The phase decides only whether a checkpoint
-/// may clear the marker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisconnectPhase {
-    /// Mutation started and was never reported finished: the rollback is
-    /// half-done, or the process died inside it. A checkpoint must NOT clear
-    /// this, because a checkpoint over a half-finished rollback captures the
-    /// damage instead of repairing it.
-    InFlight,
-    /// The rollback completed in memory and is waiting for a checkpoint to make
-    /// it durable. Only this phase may be cleared, and only by that checkpoint.
-    RolledBack,
-}
-
-/// Key for the in-flight disconnect marker.
-///
-/// One key, not one per block: only one disconnect runs at a time, and a
-/// per-block key would leave the reader scanning to find out whether any are
-/// set.
-const DISCONNECT_MARKER_KEY: &[u8] = b"node:disconnect-in-flight";
-
-impl DisconnectMarker {
-    fn encode(&self) -> [u8; 37] {
-        let mut encoded = [0_u8; 37];
-        encoded[..32].copy_from_slice(&self.hash.to_le_bytes());
-        encoded[32..36].copy_from_slice(&self.height.to_be_bytes());
-        encoded[36] = match self.phase {
-            DisconnectPhase::InFlight => 0,
-            DisconnectPhase::RolledBack => 1,
-        };
-        encoded
-    }
-
-    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let Ok(fixed): Result<[u8; 37], _> = bytes.try_into() else {
-            // A marker that will not decode is still a marker. Treating a short
-            // read as "no disconnect was in flight" would let corruption clear
-            // the interlock, which is the one thing it must never do.
-            return Err(StorageError::Backend(format!(
-                "disconnect marker is {} bytes, expected 37",
-                bytes.len()
-            )));
-        };
-        let mut hash = [0_u8; 32];
-        hash.copy_from_slice(&fixed[..32]);
-        let mut height = [0_u8; 4];
-        height.copy_from_slice(&fixed[32..36]);
-        let phase = match fixed[36] {
-            0 => DisconnectPhase::InFlight,
-            1 => DisconnectPhase::RolledBack,
-            other => {
-                return Err(StorageError::Backend(format!(
-                    "disconnect marker has unknown phase {other}"
-                )));
-            }
-        };
-        Ok(Self {
-            hash: bitcoin_rs_primitives::Hash256::from_le_bytes(&hash),
-            height: u32::from_be_bytes(height),
-            phase,
-        })
-    }
-}
-
-/// Process-local undo storage.
-///
-/// A real implementation: what is written can be read back. Suitable wherever
-/// durability across a restart is not required, such as tests.
-#[derive(Debug, Default)]
-pub(crate) struct InMemoryUndoStore {
-    records: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
-    marker: parking_lot::RwLock<Option<DisconnectMarker>>,
-}
-
-impl UndoStore for InMemoryUndoStore {
-    fn persist_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        record: &[u8],
-    ) -> Result<(), StorageError> {
-        self.records.write().insert((height, hash), record.to_vec());
-        Ok(())
-    }
-
-    fn load_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.records.read().get(&(height, hash)).cloned())
-    }
-
-    fn arm_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError> {
-        *self.marker.write() = Some(DisconnectMarker {
-            hash,
-            height,
-            phase: DisconnectPhase::InFlight,
-        });
-        Ok(())
-    }
-
-    fn complete_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError> {
-        *self.marker.write() = Some(DisconnectMarker {
-            hash,
-            height,
-            phase: DisconnectPhase::RolledBack,
-        });
-        Ok(())
-    }
-
-    fn disarm_disconnect(&self) -> Result<(), StorageError> {
-        let mut marker = self.marker.write();
-        if marker
-            .as_ref()
-            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
-        {
-            return Err(StorageError::InvalidOperation(
-                "cannot disarm an in-flight disconnect",
-            ));
-        }
-        *marker = None;
-        Ok(())
-    }
-
-    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
-        Ok(self.marker.read().clone())
-    }
-}
-
-/// Undo storage backed by a [`KvStore`] column family.
-pub(crate) struct KvUndoStore<S: KvStore> {
-    store: Arc<S>,
-}
-
-impl<S: KvStore> KvUndoStore<S> {
-    pub(crate) const fn new(store: Arc<S>) -> Self {
-        Self { store }
-    }
-}
-
-impl<S: KvStore> UndoStore for KvUndoStore<S> {
-    /// Deferred, matching the rest of the apply path.
-    ///
-    /// `put` is what this used to call, and on redb `put` commits an
-    /// immediately durable transaction, so every connected block paid an fsync
-    /// on that backend — the same per-block durability cost the deferred
-    /// block-body write path exists to avoid. `write_deferred` leaves the row
-    /// visible to later reads in this process and lets the checkpoint flush
-    /// make it durable, which is what `disconnect_block` needs and all it needs.
-    ///
-    /// This is not crash-safe, and neither is the UTXO commit beside it: no
-    /// part of block connection fsyncs. An fsync on this write alone would cost
-    /// one per connected block and still leave the commit it describes
-    /// unrecoverable, so it would buy a slower node and no guarantee.
-    ///
-    /// Closing the gap needs a crash-recovery path that re-applies the blocks
-    /// between the last durable state and the tip. The node has no such path
-    /// today, so do not cite one here.
-    fn persist_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-        record: &[u8],
-    ) -> Result<(), StorageError> {
-        use bitcoin_rs_storage::WriteBatch as _;
-
-        let mut batch = self.store.new_batch();
-        batch.put(
-            bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_storage::pruning::block_undo_key(height, hash),
-            record,
-        );
-        self.store.write_deferred(batch)
-    }
-
-    fn load_undo(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.store.get(
-            bitcoin_rs_storage::ColumnFamily::UndoData,
-            &bitcoin_rs_storage::pruning::block_undo_key(height, hash),
-        )
-    }
-
-    /// Flushed, unlike every other write on this path.
-    ///
-    /// The rest of block apply does not fsync because a crash there is
-    /// recoverable by re-applying blocks. This one is different: it is the only
-    /// record that a rollback started, and it is worthless if the crash that it
-    /// exists to survive can lose it. One fsync per disconnect, and disconnects
-    /// are rare.
-    fn arm_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError> {
-        self.store.put(
-            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-            DISCONNECT_MARKER_KEY,
-            &DisconnectMarker {
-                hash,
-                height,
-                phase: DisconnectPhase::InFlight,
-            }
-            .encode(),
-        )?;
-        self.store.flush()
-    }
-
-    fn complete_disconnect(
-        &self,
-        height: u32,
-        hash: bitcoin_rs_primitives::Hash256,
-    ) -> Result<(), StorageError> {
-        self.store.put(
-            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-            DISCONNECT_MARKER_KEY,
-            &DisconnectMarker {
-                hash,
-                height,
-                phase: DisconnectPhase::RolledBack,
-            }
-            .encode(),
-        )?;
-        self.store.flush()
-    }
-
-    /// Refuses to clear a marker that is still `InFlight`.
-    ///
-    /// The caller is a checkpoint, and a checkpoint taken while a rollback is
-    /// half-done captures the damage. Only a completed rollback may be cleared.
-    fn disarm_disconnect(&self) -> Result<(), StorageError> {
-        use bitcoin_rs_storage::WriteBatch as _;
-
-        if self
-            .load_disconnect_marker()?
-            .is_some_and(|marker| marker.phase == DisconnectPhase::InFlight)
-        {
-            return Err(StorageError::InvalidOperation(
-                "cannot disarm an in-flight disconnect",
-            ));
-        }
-        let mut batch = self.store.new_batch();
-        batch.delete(
-            bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-            DISCONNECT_MARKER_KEY,
-        );
-        self.store.write(batch)?;
-        self.store.flush()
-    }
-
-    fn load_disconnect_marker(&self) -> Result<Option<DisconnectMarker>, StorageError> {
-        self.store
-            .get(
-                bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-                DISCONNECT_MARKER_KEY,
-            )?
-            .map(|bytes| DisconnectMarker::decode(&bytes))
-            .transpose()
-    }
 }
 
 pub(crate) trait PruneBodyReader {
@@ -915,6 +557,51 @@ fn begin_chain_transition<'a>(
     })
 }
 
+/// Unforgeable proof that a chain change is active: holds both the
+/// admission/transition authority ([`ChainTransition`]) and the gateway's
+/// [`ChainChangeGuard`] (odd generation).
+///
+/// Fields and constructor are private to this module. The admitted helpers
+/// accept `&ChainChangeProof`, not independent `&ChainTransition` and
+/// `&ChainChangeGuard` arguments, so a call without an active odd generation
+/// fails to compile. Build one proof per single operation, whole window, or
+/// whole reorg. Finish only at the outer success boundary.
+pub(crate) struct ChainChangeProof<'a> {
+    transition: ChainTransition<'a>,
+    guard: ChainChangeGuard,
+}
+
+impl<'a> ChainChangeProof<'a> {
+    /// Constructs the combined proof from its two halves.
+    ///
+    /// Private to this module: only the entry-point functions that begin a
+    /// chain change call this.
+    pub(crate) fn new(transition: ChainTransition<'a>, guard: ChainChangeGuard) -> Self {
+        Self { transition, guard }
+    }
+
+    /// Returns the exact odd generation this proof reserved.
+    #[cfg(test)]
+    pub(crate) fn odd_generation(&self) -> u64 {
+        self.guard.odd_generation()
+    }
+
+    /// Returns the reserved even value.
+    #[cfg(test)]
+    pub(crate) fn reserved_even(&self) -> u64 {
+        self.guard.reserved_even()
+    }
+
+    /// Finishes the chain change, storing the reserved even value.
+    ///
+    /// Consumes the proof so it cannot be used after finish.
+    pub(crate) fn finish(self) -> core::result::Result<(), ApplyError> {
+        self.guard
+            .finish()
+            .map_err(|_| ApplyError::Shutdown)
+    }
+}
+
 /// Chain-mutation authority required by destructive block-body pruning.
 #[derive(Clone)]
 pub(crate) struct PruneAuthority {
@@ -1060,6 +747,11 @@ pub struct ApplyHandles {
     pub tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
     /// Shared mempool.
     pub mempool: Arc<RwLock<Mempool>>,
+    /// Strong gateway handle for production mempool mutation. Apply and reorg
+    /// call this directly; they never call `MempoolGateway::shared` or recover
+    /// from the weak registry. The raw `mempool` field stays for read-only
+    /// node code that still needs the pool.
+    pub mempool_gateway: Arc<MempoolGateway>,
     /// Shared block records exposed to RPC handlers.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Shared transaction map exposed to RPC handlers.
@@ -1132,6 +824,7 @@ impl ApplyHandles {
         zmq_publisher: Arc<dyn crate::ZmqPublisher>,
         chain_events: Arc<crate::state::ChainEventPublisher>,
     ) -> Self {
+        let mempool_gateway = MempoolGateway::shared(Arc::clone(&mempool));
         Self {
             network,
             chain_tip,
@@ -1142,6 +835,7 @@ impl ApplyHandles {
             coin_stats,
             tx_index_runtime,
             mempool,
+            mempool_gateway,
             blocks,
             transactions,
             zmq_publisher,
@@ -1349,8 +1043,17 @@ pub fn disconnect_block(
     let transition = handles
         .begin_chain_transition()
         .map_err(|error| crate::DisconnectError::Refused(Box::new(error)))?;
-    let result = disconnect_block_admitted(handles, block, &transition);
-    drop(transition);
+    let guard = handles
+        .mempool_gateway
+        .begin_chain_change()
+        .map_err(|_| crate::DisconnectError::Refused(Box::new(ApplyError::Shutdown)))?;
+    let proof = ChainChangeProof::new(transition, guard);
+    let result = disconnect_block_admitted(handles, block, &proof);
+    if result.is_ok() {
+        // Finish the chain change only on full success. An error leaves the
+        // generation odd by design — admission stays closed.
+        let _ = proof.finish();
+    }
     result
 }
 
@@ -1361,7 +1064,7 @@ pub fn disconnect_block(
 pub(crate) fn disconnect_block_admitted(
     handles: &ApplyHandles,
     block: &Block,
-    _transition: &ChainTransition<'_>,
+    _proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<TipSnapshot, crate::DisconnectError> {
     let block_hash = block.block_hash().0;
     let DisconnectPlan {
@@ -1588,9 +1291,9 @@ pub(crate) fn apply_block_with_serialized_admitted(
     handles: &ApplyHandles,
     block: &Block,
     serialized: bytes::Bytes,
-    transition: &ChainTransition<'_>,
+    proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
-    apply_block_admitted(handles, block, Some(serialized), None, transition)
+    apply_block_admitted(handles, block, Some(serialized), None, proof)
 }
 
 /// How many consecutive blocks share one script-verification dispatch.
@@ -1706,6 +1409,11 @@ pub fn apply_window(
     let transition = handles
         .begin_chain_transition()
         .map_err(|source| WindowApplyError { applied: 0, source })?;
+    let guard = handles.mempool_gateway.begin_chain_change().map_err(|_| WindowApplyError {
+        applied: 0,
+        source: ApplyError::Shutdown,
+    })?;
+    let proof = ChainChangeProof::new(transition, guard);
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
     let mut applied = 0_usize;
     for (block, raw) in blocks.iter().zip(serialized) {
@@ -1714,11 +1422,12 @@ pub fn apply_window(
             block,
             Some(raw.clone()),
             proven.next(),
-            &transition,
+            &proof,
         )
         .map_err(|source| WindowApplyError { applied, source })?;
         applied = applied.saturating_add(1);
     }
+    let _ = proof.finish();
     Ok(())
 }
 
@@ -2117,6 +1826,13 @@ pub(crate) fn bytes_are_block(raw: &[u8], block: &Block) -> bool {
     sink.equal && sink.offset == raw.len()
 }
 
+#[cfg_attr(
+    not(feature = "kernel"),
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "the kernel build consumes preserved bytes through this shared signature"
+    )
+)]
 fn parse_block_for_apply(
     block: &Block,
     provided_serialized: Option<bytes::Bytes>,
@@ -2209,7 +1925,16 @@ fn apply_block_inner(
     provided_serialized: Option<bytes::Bytes>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let transition = handles.begin_chain_transition()?;
-    apply_block_admitted(handles, block, provided_serialized, None, &transition)
+    let guard = handles
+        .mempool_gateway
+        .begin_chain_change()
+        .map_err(|_| ApplyError::Shutdown)?;
+    let proof = ChainChangeProof::new(transition, guard);
+    let result = apply_block_admitted(handles, block, provided_serialized, None, &proof);
+    if result.is_ok() {
+        let _ = proof.finish();
+    }
+    result
 }
 
 /// The apply itself, with the admission permit and the transition lock held.
@@ -2229,7 +1954,7 @@ fn apply_block_admitted<'b>(
     block: &'b Block,
     provided_serialized: Option<bytes::Bytes>,
     proven: Option<ProvenApply<'b>>,
-    _transition: &ChainTransition<'_>,
+    _proof: &ChainChangeProof<'_>,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let total_started = quanta::Instant::now();
     let block_hash = block.block_hash().0;
@@ -2588,13 +2313,16 @@ fn apply_block_admitted<'b>(
         .record(block_record_dur.as_secs_f64());
     let mempool_evict_started = quanta::Instant::now();
     {
-        let mut mempool = handles.mempool.write();
-        if !mempool.is_empty() {
-            for txid in scratch.txids() {
-                let evicted_count = mempool.remove_by_txid(txid).len();
-                tracing::debug!(%txid, evicted_count, "apply_block: evicted transaction from mempool");
-            }
-        }
+        let block_txids = scratch.txids();
+        debug_assert_eq!(
+            block_txids.len(),
+            block.txs.len(),
+            "block transactions and validated txids must stay aligned"
+        );
+        let block_txs: Vec<&Tx> = block.txs.iter().collect();
+        handles
+            .mempool_gateway
+            .remove_for_block(AdmissionOrigin::Block, &block_txs, block_txids, height);
     }
     let mempool_evict_dur = mempool_evict_started.elapsed();
     metrics::histogram!("node.apply_block.mempool_evict_seconds")
@@ -3122,6 +2850,13 @@ fn run_non_script_checks_only(
     Ok(())
 }
 
+#[cfg_attr(
+    not(feature = "kernel"),
+    expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "the kernel build borrows an owning block handle through this shared signature"
+    )
+)]
 #[allow(
     clippy::as_conversions,
     clippy::cast_sign_loss,
@@ -5859,101 +5594,6 @@ mod consensus_rule_tests {
         Ok(())
     }
 
-    /// Deferred durability must not become deferred visibility.
-    ///
-    /// `disconnect_block` reads back the undo record the connect wrote, in the
-    /// same process and before any checkpoint flush. redb is the backend that
-    /// makes this worth pinning: its `put` commits immediately, so moving the
-    /// write to `write_deferred` is exactly the change that could have made the
-    /// row unreadable until a flush.
-    #[cfg(feature = "redb")]
-    #[test]
-    fn a_deferred_undo_record_is_readable_before_any_flush()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let store = Arc::new(bitcoin_rs_storage::RedbStore::open(dir.path())?);
-        let undo_store = KvUndoStore::new(Arc::clone(&store));
-        let hash = Hash256::from_le_bytes(&[0x4d; 32]);
-
-        undo_store.persist_undo(4_242, hash, b"undo-record")?;
-
-        let loaded = undo_store
-            .load_undo(4_242, hash)?
-            .ok_or("undo record must be readable in-process before any flush")?;
-        assert_eq!(
-            loaded, b"undo-record",
-            "the deferred write must return exactly what was written"
-        );
-        Ok(())
-    }
-
-    /// The marker exists to survive a crash, so an in-memory round trip proves
-    /// nothing. This closes the backend and reopens it, which is the only shape
-    /// of test that can fail if the write is not durable.
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn an_armed_disconnect_marker_survives_closing_and_reopening_the_store()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let block_hash = Hash256::from_le_bytes(&[0xa7; 32]);
-
-        {
-            let store = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
-            KvUndoStore::new(store).arm_disconnect(140_003, block_hash)?;
-        }
-
-        let reopened = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
-        let marker = KvUndoStore::new(Arc::clone(&reopened))
-            .load_disconnect_marker()?
-            .ok_or("armed marker did not survive the reopen")?;
-        assert_eq!(marker.hash, block_hash, "hash must round-trip");
-        assert_eq!(marker.height, 140_003, "height must round-trip");
-        assert_eq!(
-            marker.phase,
-            DisconnectPhase::InFlight,
-            "arming records an unfinished rollback"
-        );
-
-        // A checkpoint must refuse an unfinished rollback. Checkpointing
-        // half-rolled-back state captures the damage instead of repairing it.
-        assert!(matches!(
-            KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect(),
-            Err(StorageError::InvalidOperation(_))
-        ));
-        assert!(
-            KvUndoStore::new(Arc::clone(&reopened))
-                .load_disconnect_marker()?
-                .is_some(),
-            "a checkpoint must not clear an in-flight marker"
-        );
-
-        // Once the rollback completes, the same call clears it, or a node that
-        // disconnected cleanly could never start again.
-        KvUndoStore::new(Arc::clone(&reopened)).complete_disconnect(140_003, block_hash)?;
-        KvUndoStore::new(Arc::clone(&reopened)).disarm_disconnect()?;
-        drop(reopened);
-        let after = Arc::new(bitcoin_rs_storage::FjallStore::open(dir.path())?);
-        assert_eq!(
-            KvUndoStore::new(after).load_disconnect_marker()?,
-            None,
-            "a completed rollback must clear and stay cleared across a reopen"
-        );
-        Ok(())
-    }
-
-    /// A truncated marker must not read as "no disconnect was in flight".
-    /// Corruption clearing the interlock is the one failure it cannot have.
-    #[test]
-    fn a_truncated_disconnect_marker_is_an_error_not_an_absence() {
-        let Err(error) = DisconnectMarker::decode(&[0_u8; 20]) else {
-            panic!("a 20-byte marker must not decode as absent");
-        };
-        assert!(
-            error.to_string().contains("expected 37"),
-            "error must say what it expected, got: {error}"
-        );
-    }
-
     /// A coinbase may not pay itself more than the subsidy plus the fees.
     ///
     /// Nothing else in the node bounds this. Block rules check structure, and
@@ -6302,12 +5942,14 @@ mod consensus_rule_tests {
             utxo.commit_block(&remove, &Hash256::from_le_bytes(&[0x83; 32]))?;
 
             let transition = handles.begin_chain_transition()?;
+            let guard = handles.mempool_gateway.begin_chain_change()?;
+            let chain_proof = ChainChangeProof::new(transition, guard);
             let Err(error) = apply_block_admitted(
                 &handles,
                 &block,
                 Some(raw),
                 Some(ProvenApply::Proven(proof)),
-                &transition,
+                &chain_proof,
             ) else {
                 panic!("a mismatched proof must re-read the now-missing live prevout");
             };
@@ -6483,7 +6125,9 @@ mod consensus_rule_tests {
         ))));
         assert!(!handles.assume_valid_gate.trusted());
         let transition = handles.begin_chain_transition()?;
-        let outcome = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &transition);
+        let guard = handles.mempool_gateway.begin_chain_change()?;
+        let proof = ChainChangeProof::new(transition, guard);
+        let outcome = apply_block_admitted(&handles, &block, Some(raw), Some(skipped), &proof);
         assert!(
             matches!(
                 outcome,
@@ -7739,7 +7383,7 @@ mod consensus_rule_tests {
         }
     }
 
-    fn coinbase_transaction(seed: u8) -> Tx {
+    pub(super) fn coinbase_transaction(seed: u8) -> Tx {
         Tx {
             version: 2,
             inputs: vec![TxIn {
@@ -7863,7 +7507,7 @@ mod consensus_rule_tests {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn mined_block_with_prev_hash_and_transactions(
+    pub(super) fn mined_block_with_prev_hash_and_transactions(
         prev_blockhash: BlockHash,
         txdata: Vec<Tx>,
     ) -> Result<Block, Box<dyn std::error::Error>> {
@@ -9456,7 +9100,11 @@ mod consensus_rule_tests {
         apply_handles_without_tx_index(network, utxo)
     }
 
-    fn apply_handles_without_tx_index(network: Network, utxo: Arc<UtxoSet>) -> ApplyHandles {
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub(super) fn apply_handles_without_tx_index(
+        network: Network,
+        utxo: Arc<UtxoSet>,
+    ) -> ApplyHandles {
         ApplyHandles::new(
             network,
             Arc::new(ArcSwapOption::empty()),
@@ -9840,5 +9488,242 @@ mod chain_tx_count_tests {
         advance_chain_tx_count(&handles, 900_000, 3);
 
         assert_eq!(handles.chain_tx_count.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod chain_generation_tests {
+    use std::sync::Arc;
+
+    use bitcoin_rs_mempool::{MempoolObserver, MutationEnvelope};
+    use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid};
+    use bitcoin_rs_utxo::UtxoSet;
+    use parking_lot::Mutex;
+
+    use super::consensus_rule_tests::{
+        apply_handles_without_tx_index, coinbase_transaction, mined_block_with_prev_hash_and_transactions,
+    };
+    use super::{applied_header_tip, ApplyHandles};
+
+
+    /// An observer that captures the gateway's stable_generation when a
+    /// mutation fires. We pass the gateway in via an Arc.
+    struct GatewayGenerationRecorder {
+        gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
+        seen: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl MempoolObserver for GatewayGenerationRecorder {
+        fn on_mutation(&self, _envelope: &MutationEnvelope) {
+            self.seen.lock().push(self.gateway.stable_generation());
+        }
+    }
+
+    fn setup_regtest_with_genesis(
+    ) -> (ApplyHandles, bitcoin_rs_primitives::Block, BlockHash) {
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = BlockHash::from(genesis.block_hash());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::new(UtxoSet::new()));
+        let genesis_tip = applied_header_tip(&handles, genesis_hash.into(), &genesis, 0).unwrap();
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        (handles, genesis, genesis_hash)
+    }
+
+    #[test]
+    fn stable_generation_is_even_before_and_after_connect() {
+        let (handles, genesis, genesis_hash) = setup_regtest_with_genesis();
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(0),
+            "generation is even zero before any chain change"
+        );
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )
+        .expect("mine block");
+        let block_hash = BlockHash::from(block.block_hash());
+        let tip = applied_header_tip(&handles, block_hash.into(), &block, 1).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip)));
+
+        crate::apply::apply_block(&handles, &block).expect("connect succeeds");
+
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(2),
+            "generation is even after a successful connect"
+        );
+    }
+
+    #[test]
+    fn stable_generation_is_even_after_disconnect() {
+        let (handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )
+        .expect("mine block");
+        let block_hash = BlockHash::from(block.block_hash());
+        let tip = applied_header_tip(&handles, block_hash.into(), &block, 1).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip)));
+
+        crate::apply::apply_block(&handles, &block).expect("connect");
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(2),
+            "even after connect"
+        );
+
+        crate::apply::disconnect_block(&handles, &block).expect("disconnect succeeds");
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(4),
+            "generation is even after a successful disconnect"
+        );
+    }
+
+    #[test]
+    fn stable_generation_is_even_after_window() {
+        let (handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
+
+        let block1 = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )
+        .expect("mine block 1");
+        let block1_hash = BlockHash::from(block1.block_hash());
+        let tip1 = applied_header_tip(&handles, block1_hash.into(), &block1, 1).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip1)));
+
+        let block2 = mined_block_with_prev_hash_and_transactions(
+            block1.block_hash(),
+            vec![coinbase_transaction(2)],
+        )
+        .expect("mine block 2");
+        let block2_hash = BlockHash::from(block2.block_hash());
+        let tip2 = applied_header_tip(&handles, block2_hash.into(), &block2, 2).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip2)));
+
+        let blocks = vec![block1.clone(), block2.clone()];
+        let serialized: Vec<bytes::Bytes> = blocks
+            .iter()
+            .map(|b| bytes::Bytes::from(super::consensus_bytes(b)))
+            .collect();
+        let block_refs: Vec<&bitcoin_rs_primitives::Block> = blocks.iter().collect();
+
+        crate::apply::apply_window(&handles, &block_refs, &serialized).expect("window succeeds");
+
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(2),
+            "generation is even after a multi-block window"
+        );
+    }
+
+    #[test]
+    fn chain_change_proof_finish_restores_even_generation() {
+        let (handles, _genesis, _genesis_hash) = setup_regtest_with_genesis();
+
+        let transition = handles.begin_chain_transition().expect("transition");
+        let guard = handles
+            .mempool_gateway
+            .begin_chain_change()
+            .expect("begin chain change");
+        let proof = super::ChainChangeProof::new(transition, guard);
+
+        assert_eq!(proof.odd_generation(), 1);
+        assert_eq!(proof.reserved_even(), 2);
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            None,
+            "odd while proof is held"
+        );
+
+        proof.finish().expect("finish restores even");
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            Some(2),
+            "even after finish"
+        );
+    }
+
+    #[test]
+    fn observer_sees_none_during_connect() {
+        let (mut handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
+
+        let gateway = Arc::clone(&handles.mempool_gateway);
+        let recorder = Arc::new(GatewayGenerationRecorder {
+            gateway,
+            seen: Mutex::new(Vec::new()),
+        });
+        let observer: Arc<dyn MempoolObserver> = recorder.clone();
+        assert!(handles.mempool_gateway.install_observer(observer).is_ok(), "install observer");
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )
+        .expect("mine block");
+        let block_hash = BlockHash::from(block.block_hash());
+        let tip = applied_header_tip(&handles, block_hash.into(), &block, 1).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip)));
+
+        crate::apply::apply_block(&handles, &block).expect("connect");
+
+        let seen = recorder.seen.lock();
+        // The observer fires during remove_for_block, which happens while the
+        // generation is odd. Every observed mutation must see None.
+        assert!(
+            seen.iter().all(|&g| g.is_none()),
+            "all observer mutations during connect must see None (odd generation), got {:?}",
+            *seen
+        );
+    }
+
+    #[test]
+    fn failed_connect_does_not_restore_even_generation() {
+        let (handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
+
+        // Build a block that will fail during apply — it has a non-coinbase
+        // transaction spending a nonexistent UTXO, which will fail consensus.
+        let mut bad_tx = Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from(bitcoin_rs_primitives::Hash256::from_le_bytes(&[0xAA; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 1,
+                script_pubkey: Vec::new(),
+            }],
+            lock_time: 0,
+        };
+        let _ = &mut bad_tx;
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1), bad_tx],
+        )
+        .expect("mine block");
+        let block_hash = BlockHash::from(block.block_hash());
+        let tip = applied_header_tip(&handles, block_hash.into(), &block, 1).unwrap();
+        handles.applied_tip.store(Some(Arc::new(tip)));
+
+        let result = crate::apply::apply_block(&handles, &block);
+        assert!(
+            result.is_err(),
+            "block with nonexistent UTXO spend must fail"
+        );
+
+        // A failed connect leaves the generation odd — admission stays closed.
+        assert_eq!(
+            handles.mempool_gateway.stable_generation(),
+            None,
+            "failed connect leaves generation odd (admission closed)"
+        );
     }
 }

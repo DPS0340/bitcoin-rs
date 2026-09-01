@@ -46,6 +46,9 @@ pub mod metrics;
 pub mod mining;
 /// Node-side active-chain view for server-side P2P responders.
 pub mod p2p_chain;
+/// P2P transaction ingress consumer: drains the bounded `InboundTx` channel
+/// and admits through the one `MempoolGateway`.
+pub mod tx_ingress;
 /// Chain-event reconciliation seam for index consumers.
 pub mod reconcile;
 

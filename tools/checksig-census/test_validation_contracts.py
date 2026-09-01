@@ -26,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 # Make sibling modules importable when run directly
 sys.path.insert(0, str(Path(__file__).parent))
@@ -6681,12 +6680,6 @@ def main():
     meta_path = Path(os.environ["FAKE_CENSUS_META"])
     stage_dir = Path(os.environ["FAKE_CENSUS_STAGE"])
     replay_path = Path(sys.argv[sys.argv.index("--output") + 1])
-    data_dir = Path(sys.argv[sys.argv.index("--data-dir") + 1])
-    # The parent lent the child a directory through an inherited
-    # descriptor: record a deterministic state sentinel under the actual
-    # --data-dir argv string, never under a replay-relative default.
-    data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "fake-child-state").write_bytes(b"fake-child-state\\n")
     for name in ("BRS_CENSUS_CONTEXTS", "BRS_CENSUS_RECORDS", "BRS_CENSUS_JOURNAL"):
         src = stage_dir / f"{name}.bin"
         dst = Path(os.environ[name])
@@ -6695,11 +6688,12 @@ def main():
     counters_path.write_bytes((stage_dir / "counters.json").read_bytes())
     meta = json.loads(meta_path.read_text())
     replay = meta["replay"]
-    if (
-        replay["data_dir"]
-        == "_FAKE_CENSUS_CHILD_TEST_FIND_CMODERN_HEIGHT_SETTINGS_MISMATCH_DATA_DIR"
-    ):
-        replay["data_dir"] = str(data_dir)
+    # Mirror the real node: the child echoes its own --data-dir verbatim,
+    # so the parent's equality check binds the descriptor-rooted live
+    # state path. FAKE_CENSUS_DATA_DIR injects a child-reported mismatch.
+    replay["data_dir"] = os.environ.get(
+        "FAKE_CENSUS_DATA_DIR", sys.argv[sys.argv.index("--data-dir") + 1]
+    )
     replay_path.write_text(json.dumps(replay, indent=2) + "\\n")
     write_frame(PREFACE, 3)
     for row in meta["rows"]:
@@ -6727,20 +6721,6 @@ def main():
 if __name__ == "__main__":
     main()
 """
-
-
-def _captured_child_data_dir(replay_path: Path) -> str:
-    """Return the exact data_dir literal recorded by a completed live run.
-
-    The live child saw the parent's lent directory through an inherited
-    descriptor, so the recorded ``/proc/self/fd/<n>/state`` string is
-    historical authentic argv text: the fd number is dead once the child
-    exits. Treat it as inert text only — never resolve, open, or stat it.
-    """
-    replay = json.loads(replay_path.read_text())
-    data_dir = replay["data_dir"]
-    assert data_dir.startswith("/proc/self/fd/") and data_dir.endswith("/state")
-    return data_dir
 
 
 def _make_fake_binary(tmp: Path) -> Path:
@@ -6916,6 +6896,7 @@ def _build_meta(
     tmp: Path,
     stage: Path,
     ceiling: int,
+    work_dir: Path,
     *,
     replay_overrides: dict[str, object] | None = None,
 ) -> Path:
@@ -6953,7 +6934,7 @@ def _build_meta(
         "stop_reason": "controller-request",
         "storage_backend": "fjall",
         "txindex": False,
-        "data_dir": "_FAKE_CENSUS_CHILD_TEST_FIND_CMODERN_HEIGHT_SETTINGS_MISMATCH_DATA_DIR",
+        "data_dir": str(work_dir / "state"),
         "elapsed_seconds": 0.0,
     }
     if replay_overrides:
@@ -6972,7 +6953,7 @@ def test_find_cmodern_height_fake_child_success() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7002,105 +6983,6 @@ def test_find_cmodern_height_fake_child_success() -> None:
         )
 
 
-def test_find_cmodern_height_holds_work_directory_after_substitution() -> None:
-    """After anchor admission the held work directory keeps every effect.
-
-    A same-directory-name adversary renames the anchored work directory
-    away and plants a fresh substitute at the original pathname the moment
-    both directory anchors are acquired and the shared-mount check passes
-    — before state, sidecar, stderr, or any child artifact exists. The
-    state directory, every evidence file, and every accepted custody
-    digest must bind the held original while the substitute stays
-    completely empty.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        stage = _write_diagnostic_stage(tmp)
-        work_dir = tmp / "work"
-        work_dir.mkdir()
-        output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
-        child = _make_fake_binary(tmp)
-        held_work_dir = tmp / "work.held"
-        substitute = tmp / "work-substitute"
-        swapped = False
-        real_shared_mount = analyze._require_shared_source_mount
-
-        def shared_mount_then_substitute(
-            source_fd: int, others: list[tuple[str, int]]
-        ) -> None:
-            nonlocal swapped
-            real_shared_mount(source_fd, others)
-            if not swapped:
-                swapped = True
-                os.rename(work_dir, held_work_dir)
-                substitute.mkdir()
-                os.rename(substitute, work_dir)
-
-        os.environ["FAKE_CENSUS_META"] = str(meta_path)
-        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
-        try:
-            with patch.object(
-                analyze,
-                "_require_shared_source_mount",
-                shared_mount_then_substitute,
-            ):
-                _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
-        finally:
-            os.environ.pop("FAKE_CENSUS_META", None)
-            os.environ.pop("FAKE_CENSUS_STAGE", None)
-
-        assert swapped, "substitution must fire after anchor admission"
-        assert not any(work_dir.iterdir()), (
-            "the substituted pathname must remain completely empty"
-        )
-        state_sentinel = held_work_dir / "state" / "fake-child-state"
-        assert state_sentinel.is_file(), (
-            "the child state sentinel must land under the held original"
-        )
-        assert (held_work_dir / "stderr.log").is_file()
-        for artifact in analyze._diagnostic_artifact_paths(held_work_dir).values():
-            assert artifact.is_file(), (
-                "every evidence file must land under the held original"
-            )
-
-        candidate = json.loads(output.read_text())
-        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
-        assert candidate["final_stream_counts"]["context_rows"] == 10
-        assert candidate["child_teardown"] == "clean"
-        assert candidate["salvaged_from"] is None
-
-        # Custody digests bind the bytes under the held original.
-        held_digests = {
-            "brshgt1_sidecar": held_work_dir / "brshgt1.bin",
-            "brsctx1": held_work_dir / "brsctx1.bin",
-            "brsrec1": held_work_dir / "brsrec1.bin",
-            "brsjrn1": held_work_dir / "brsjrn1.bin",
-            "child_replay_json": held_work_dir / "replay_diagnostic.json",
-            "counters_json": held_work_dir / "counters.json",
-        }
-        for custody_name, held_path in held_digests.items():
-            assert (
-                candidate["custody"][custody_name]["sha256"]
-                == hashlib.sha256(held_path.read_bytes()).hexdigest()
-            ), custody_name
-
-        # Report paths keep the original operator spelling only.
-        for record in candidate["custody"].values():
-            assert record["path"].startswith(str(work_dir) + os.sep)
-            assert not record["path"].startswith(str(held_work_dir) + os.sep)
-            assert "/proc/self/fd/" not in record["path"]
-
-        # The replay data_dir is the exact inert descriptor-transport
-        # string the child saw. Inspect it as text only; never resolve,
-        # open, or stat it after the run.
-        replay = json.loads((held_work_dir / "replay_diagnostic.json").read_text())
-        assert replay["data_dir"].startswith("/proc/self/fd/")
-        assert replay["data_dir"].endswith("/state")
-        number = replay["data_dir"][len("/proc/self/fd/") : -len("/state")]
-        assert number.isdigit()
-
-
 def test_finalize_candidate_binds_validated_bytes_not_substitute() -> None:
     """Published custody digests come from validated bytes, never reopens.
 
@@ -7116,7 +6998,7 @@ def test_finalize_candidate_binds_validated_bytes_not_substitute() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         replay_path = work_dir / "replay_diagnostic.json"
         counters_path = work_dir / "counters.json"
@@ -7124,23 +7006,17 @@ def test_finalize_candidate_binds_validated_bytes_not_substitute() -> None:
         original_validate_replay = analyze._validate_replay_diagnostic
         original_validate_counters = analyze._validate_native_counters
 
-        def sabotage_then_validate(replay_fd, display_path, final, *args, **kwargs):
-            result = original_validate_replay(
-                replay_fd, display_path, final, *args, **kwargs
-            )
+        def sabotage_then_validate(path, final, *args, **kwargs):
+            result = original_validate_replay(path, final, *args, **kwargs)
             captured.append(("replay", result["sha256"]))
-            # Mutate only the display pathname after validation: the
-            # validator's bytes live on the retained descriptor, so a
-            # fresh inode at the pathname cannot touch the published
-            # custody digest.
-            display_path.write_text(json.dumps({"schema": "substitute"}) + "\n")
+            path.write_text(json.dumps({"schema": "substitute"}) + "\n")
             return result
 
-        def fifo_then_validate_counters(counters_fd, display_path, final):
-            result = original_validate_counters(counters_fd, display_path, final)
+        def fifo_then_validate_counters(path, final, **_kwargs):
+            result = original_validate_counters(path, final)
             captured.append(("counters", result["sha256"]))
-            display_path.unlink()
-            os.mkfifo(display_path)
+            path.unlink()
+            os.mkfifo(path)
             return result
 
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
@@ -7183,6 +7059,7 @@ def test_diagnostic_child_executes_verified_inode_after_path_swap() -> None:
         binary.write_text("#!/bin/sh\necho VERIFIED-INODE-A\n")
         binary.chmod(0o755)
         binary_fd, custody = analyze._open_verified_executable(binary)
+        work_fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             assert custody["sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
 
@@ -7192,20 +7069,25 @@ def test_diagnostic_child_executes_verified_inode_after_path_swap() -> None:
             # Rename a different inode over the verified pathname; the
             # original inode lives on only through the held descriptor.
             os.replace(substitute, binary)
-            work_dirfd, work_missing = analyze._walk_dirfd_nofollow(tmp)
-            assert not work_missing
-            try:
-                proc, stderr_file = analyze._launch_diagnostic_child(
-                    binary,
-                    "127.0.0.1:18443",
-                    100,
-                    "fjall",
-                    False,
-                    binary_fd=binary_fd,
-                    work_dirfd=work_dirfd,
-                )
-            finally:
-                os.close(work_dirfd)
+            proc, stderr_file = analyze._launch_diagnostic_child(
+                binary,
+                "127.0.0.1:18443",
+                100,
+                work_fd,
+                {
+                    "contexts": tmp / "brsctx1.bin",
+                    "records": tmp / "brsrec1.bin",
+                    "journal": tmp / "brsjrn1.bin",
+                    "sidecar": tmp / "brshgt1.bin",
+                    "replay": tmp / "replay_diagnostic.json",
+                    "stderr": tmp / "stderr.log",
+                    "counters": tmp / "counters.json",
+                },
+                tmp / "state",
+                "fjall",
+                False,
+                binary_fd,
+            )
             try:
                 observed = proc.stdout.read().decode()
                 proc.wait(timeout=10)
@@ -7214,6 +7096,7 @@ def test_diagnostic_child_executes_verified_inode_after_path_swap() -> None:
             assert "VERIFIED-INODE-A" in observed
             assert "SUBSTITUTE-B" not in observed
         finally:
+            os.close(work_fd)
             os.close(binary_fd)
 
         decoy = tmp / "decoy-target"
@@ -7238,6 +7121,68 @@ def test_diagnostic_child_executes_verified_inode_after_path_swap() -> None:
         )
 
 
+def test_diagnostic_run_confines_all_writes_to_held_work_dir_after_path_swap() -> None:
+    """Every live write follows the held work-dir descriptor, not the pathname.
+
+    Once the work-dir anchor is taken, the pathname is renamed away and a
+    decoy substitute takes its place. The scan must still succeed, every
+    artifact — including the child's argv/env targets and the state
+    directory — must land in the held original, and the substitute must
+    receive nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        work_dir = tmp / "work"
+        work_dir.mkdir()
+        output = tmp / "candidate.json"
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        moved = tmp / "work.moved"
+        substitute = tmp / "work-substitute"
+        swapped = False
+        real_walk = analyze._walk_dirfd_nofollow
+
+        def swap_after_work_anchor(path: Path) -> tuple[int, list[str]]:
+            nonlocal swapped
+            result = real_walk(path)
+            if not swapped and Path(path) == work_dir:
+                swapped = True
+                os.rename(work_dir, moved)
+                substitute.mkdir()
+                (substitute / "state").mkdir()
+                (substitute / "decoy.bin").write_bytes(b"decoy bytes")
+                os.rename(substitute, work_dir)
+            return result
+
+        analyze._walk_dirfd_nofollow = swap_after_work_anchor
+        try:
+            _run_diagnostic_scan(child, "127.0.0.1:18443", 100, work_dir, output)
+        finally:
+            analyze._walk_dirfd_nofollow = real_walk
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        assert swapped, "pathname swap must fire after the anchor is taken"
+        candidate = json.loads(output.read_text())
+        assert candidate["schema"] == "cmodern-candidate-diagnostic-v2"
+        sidecar = moved / "brshgt1.bin"
+        assert (
+            candidate["custody"]["brshgt1_sidecar"]["sha256"]
+            == hashlib.sha256(sidecar.read_bytes()).hexdigest()
+        )
+        for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin"):
+            assert (moved / name).exists()
+            assert not (work_dir / name).exists()
+        assert not (work_dir / "brshgt1.bin").exists()
+        assert not any((work_dir / "state").iterdir()), (
+            "the decoy state directory must never receive child writes"
+        )
+        assert (work_dir / "decoy.bin").read_bytes() == b"decoy bytes"
+
+
 def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> None:
     """A failed live finalization must not publish its sidecar count."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -7246,18 +7191,18 @@ def test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched() -> Non
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         validate_replay = analyze._validate_replay_diagnostic
 
         def reject_replay(
-            _replay_fd: int,
-            _display_path: Path,
+            _path: Path,
             _final: DiagnosticCheckpoint,
             _ceiling: int,
             _storage_backend: str,
             _txindex: bool,
             _data_dir: str,
+            **_kwargs: object,
         ) -> None:
             raise AnalyzerError("late replay validation failure")
 
@@ -7292,7 +7237,7 @@ def test_find_cmodern_height_post_stop_timeout_finalizes_honestly() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7326,7 +7271,7 @@ def test_find_cmodern_height_rejects_pipe_filling_trailing_output() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7375,7 +7320,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7417,7 +7362,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             output,
             "127.0.0.1:18443",
             100,
-            _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            str(source_dir / "state"),
         )
         assert _directory_hashes(source_dir) == source_before
 
@@ -7459,22 +7404,7 @@ def test_salvage_cmodern_height_recovers_committed_prefixes_without_source_mutat
             journal_end=candidate["final_stream_endpoints"]["journal_end"],
         )
         recovered_paths = analyze._diagnostic_artifact_paths(recovery_dir)
-        recovery_dirfd = analyze._walk_dirfd_nofollow(recovery_dir)[0]
-        recovered_fds: dict[str, int] = {}
-        try:
-            for name in ("contexts", "records", "journal", "sidecar"):
-                recovered_fds[name] = analyze._open_custody_input(
-                    recovered_paths[name].name,
-                    1 << 32,
-                    f"salvage recovery {name}",
-                    "DIAG-SALVAGE",
-                    dir_fd=recovery_dirfd,
-                )
-            analyze._validate_terminal_streams(recovered_fds, recovered_paths, final)
-        finally:
-            for recovered_fd in recovered_fds.values():
-                os.close(recovered_fd)
-            os.close(recovery_dirfd)
+        analyze._validate_terminal_streams(recovered_paths, final)
 
         for filename, count_field, magic in (
             ("brsctx1.bin", "context_rows", analyze.CONTEXT_MAGIC),
@@ -7529,7 +7459,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7614,7 +7544,7 @@ def test_salvage_cmodern_height_rejects_tail_change_before_clone() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "tail change before clone",
                 "source changed during materialization",
@@ -7636,7 +7566,7 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7662,24 +7592,20 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
         validate_terminal_streams = analyze._validate_terminal_streams
 
         def mutate_then_validate(
-            artifact_fds: dict[str, int],
-            display_paths: dict[str, Path],
+            recovery_paths: dict[str, Path],
             final: DiagnosticCheckpoint,
+            **_kwargs: object,
         ) -> dict[str, dict[str, object]]:
-            # Mutate the recovery clone in place through a writable
-            # same-inode descriptor so the retained read-only fd the
-            # validator borrows observes exactly the bytes that diverge
-            # from the validated source committed body.
-            mutation_fd = os.open(display_paths["contexts"], os.O_RDWR)
+            context_fd = os.open(recovery_paths["contexts"], os.O_RDWR)
             try:
                 offset = HEADER_SIZE + 4
-                original = os.pread(mutation_fd, 1, offset)
+                original = os.pread(context_fd, 1, offset)
                 assert len(original) == 1
-                assert os.pwrite(mutation_fd, bytes([original[0] ^ 1]), offset) == 1
-                os.fsync(mutation_fd)
+                assert os.pwrite(context_fd, bytes([original[0] ^ 1]), offset) == 1
+                os.fsync(context_fd)
             finally:
-                os.close(mutation_fd)
-            return validate_terminal_streams(artifact_fds, display_paths, final)
+                os.close(context_fd)
+            return validate_terminal_streams(recovery_paths, final, **_kwargs)
 
         analyze._validate_terminal_streams = mutate_then_validate
         try:
@@ -7691,7 +7617,7 @@ def test_salvage_cmodern_height_rejects_recovery_stream_mutation() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "mutated recovery stream",
                 "recovered contexts body does not match",
@@ -7716,7 +7642,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7751,23 +7677,19 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
             if key in captured_signatures:
                 return captured_signatures[key]
             signature = dirfd_signature(dir_fd, name)
-            # Diverge the recovery contexts body after its signature is
-            # captured. The mutation must be visible through the retained
-            # recovery descriptor (same inode, different bytes), so it is
-            # written in place: the signature stays baselined to the
-            # original clone while the body is no longer source-identical.
+            # Replace the recovery contexts file with a semantically valid body
+            # (same size and row count, different bytes) after its signature is
+            # captured. The replacement is the race: the signature is baselined
+            # to the original clone, but the body is no longer source-identical.
             if name == "brsctx1.bin" and "recovery" in directory.parts:
                 captured_signatures[key] = signature
                 path = directory / name
-                mutation_fd = os.open(path, os.O_RDWR)
-                try:
-                    offset = HEADER_SIZE + 4 + CONTEXT_MIN_ROW_SIZE + 3
-                    original = os.pread(mutation_fd, 1, offset)
-                    assert len(original) == 1
-                    assert os.pwrite(mutation_fd, bytes([original[0] ^ 1]), offset) == 1
-                    os.fsync(mutation_fd)
-                finally:
-                    os.close(mutation_fd)
+                data = path.read_bytes()
+                mutated = bytearray(data)
+                mutated[HEADER_SIZE + 4 + CONTEXT_MIN_ROW_SIZE + 3] ^= 1
+                path.write_bytes(bytes(mutated))
+                with path.open("rb") as f:
+                    os.fsync(f.fileno())
             return signature
 
         def stable_mutated_fd(fd: int) -> tuple[int, int, int, int, int]:
@@ -7785,7 +7707,7 @@ def test_salvage_cmodern_height_rejects_pre_signature_body_replacement() -> None
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "pre-signature body replacement",
                 "recovered contexts body does not match",
@@ -7809,7 +7731,7 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -7841,35 +7763,27 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
             return dirfd_signature(dir_fd, name)
 
         def mutate_then_validate(
-            replay_fd: int,
-            display_path: Path,
+            path: Path,
             final: DiagnosticCheckpoint,
             ceiling: int,
             storage_backend: str,
             txindex: bool,
-            data_dir: str,
+            data_dir: str | None,
+            **_kwargs: object,
         ) -> dict[str, object]:
-            # Rewrite the clone in place so the retained fd — the only
-            # custody authority — observes the semantically valid but
-            # byte-different document.
-            replay = json.loads(os.pread(replay_fd, os.fstat(replay_fd).st_size, 0))
+            replay = json.loads(path.read_text())
             replay["elapsed_seconds"] = 1.0
-            payload = (json.dumps(replay, indent=2) + "\n").encode("utf-8")
-            mutation_fd = os.open(display_path, os.O_WRONLY)
-            try:
-                assert os.pwrite(mutation_fd, payload, 0) == len(payload)
-                os.ftruncate(mutation_fd, len(payload))
-                os.fsync(mutation_fd)
-            finally:
-                os.close(mutation_fd)
+            path.write_text(json.dumps(replay, indent=2) + "\n")
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
             return validate_replay(
-                replay_fd,
-                display_path,
+                path,
                 final,
                 ceiling,
                 storage_backend,
                 txindex,
                 data_dir,
+                **_kwargs,
             )
 
         analyze._dirfd_signature = stable_replay_signature
@@ -7883,7 +7797,7 @@ def test_salvage_rejects_semantically_valid_exact_replay_replacement() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "semantically valid exact replay replacement",
                 "exact recovery replay does not match source",
@@ -7922,9 +7836,11 @@ def _run_post_publication_replacement_case(
             rollback_fsynced = True
         return original_fsync(fd)
 
-    def publish_then_replace(dir_fd: int, name: str, content: bytes) -> None:
+    def publish_then_replace(
+        dir_fd: int, name: str, content: bytes, *, forbidden_ancestor=None
+    ) -> None:
         nonlocal published
-        anchored_publish(dir_fd, name, content)
+        anchored_publish(dir_fd, name, content, forbidden_ancestor=forbidden_ancestor)
         published = True
         artifact_root = source_dir if replaced_set == "source" else recovery_dir
         artifact = artifact_root / "replay_diagnostic.json"
@@ -7945,7 +7861,7 @@ def _run_post_publication_replacement_case(
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             ),
             f"post-publication {replaced_set} replacement",
             f"{replaced_set} changed after candidate publication",
@@ -7966,7 +7882,7 @@ def test_salvage_orphans_candidate_after_post_publication_replacement() -> None:
             source_dir = tmp / "source"
             source_dir.mkdir()
             clean_output = tmp / "clean.json"
-            meta_path = _build_meta(tmp, stage, 100)
+            meta_path = _build_meta(tmp, stage, 100, source_dir)
             child = _make_fake_binary(tmp)
             os.environ["FAKE_CENSUS_META"] = str(meta_path)
             os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8006,7 +7922,7 @@ def test_salvage_orphans_candidate_on_post_publication_interrupt() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8044,7 +7960,7 @@ def test_salvage_orphans_candidate_on_post_publication_interrupt() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "post-publication interrupt",
             )
@@ -8062,7 +7978,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8122,7 +8038,7 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "zeroed recovery sidecar count",
                 "recovered sidecar declared row count",
@@ -8138,14 +8054,20 @@ def test_salvage_cmodern_height_rejects_zeroed_recovery_sidecar_count() -> None:
 
 
 def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
-    """Salvage preserves exact data-dir provenance text."""
+    """Salvage binds the replay document by custody, not pathname equality.
+
+    The operator ``--data-dir`` (kept here with a spelling pathlib would
+    normalize) is provenance only: salvage passes no expected pathname to
+    validation, so the retained source custody — never an expired
+    ``/proc`` path or the replay string — binds the document.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         stage = _write_diagnostic_stage(tmp)
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8180,27 +8102,27 @@ def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
             finally:
                 os.close(fd)
 
-        captured_data_dir: list[str] = []
+        captured_data_dir: list[str | None] = []
         original_validate = analyze._validate_replay_diagnostic
 
         def capture_validate(
-            replay_fd: int,
-            display_path: Path,
+            path: Path,
             final: analyze.DiagnosticCheckpoint,
             ceiling: int,
             storage_backend: str,
             txindex: bool,
-            data_dir: str,
+            data_dir: str | None,
+            **_kwargs: object,
         ) -> dict[str, object]:
             captured_data_dir.append(data_dir)
             return original_validate(
-                replay_fd,
-                display_path,
+                path,
                 final,
                 ceiling,
                 storage_backend,
                 txindex,
                 data_dir,
+                **_kwargs,
             )
 
         recovery_dir = tmp / "recovery"
@@ -8222,7 +8144,10 @@ def test_salvage_preserves_exact_data_dir_text_through_to_validation() -> None:
         finally:
             analyze._validate_replay_diagnostic = original_validate
 
-        assert captured_data_dir == [raw_data_dir]
+        # Custody mode: salvage passes no expected pathname, so the
+        # provenance string is never compared against the live record and
+        # never used for I/O.
+        assert captured_data_dir == [None]
 
 
 def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
@@ -8233,7 +8158,7 @@ def test_find_cmodern_height_assembles_fragmented_child_frames() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8257,7 +8182,7 @@ def test_find_cmodern_height_reaps_failed_child() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         bad = tmp / "bad_child.py"
         bad.write_text(
             "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'NOTMAGIC!!')\nsys.stdout.buffer.flush()\nsys.exit(1)\n"
@@ -8289,7 +8214,7 @@ def test_find_cmodern_height_destination_race() -> None:
         work_dir.mkdir()
         output = tmp / "candidate.json"
         output.write_text("racer\n")
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -8344,18 +8269,9 @@ def test_validate_replay_diagnostic_accepts_a1_artifact_without_rest_url() -> No
             journal_rows=0,
             journal_end=0,
         )
-        replay_fd = analyze._open_custody_input(
-            replay_path,
-            analyze._REPLAY_MAX_BYTES,
-            "child replay JSON",
-            "DIAG-CUSTODY",
+        _validate_replay_diagnostic(
+            replay_path, final, 11, "fjall", False, str(tmp / "state")
         )
-        try:
-            _validate_replay_diagnostic(
-                replay_fd, replay_path, final, 11, "fjall", False, str(tmp / "state")
-            )
-        finally:
-            os.close(replay_fd)
 
 
 def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
@@ -8394,29 +8310,14 @@ def test_validate_replay_diagnostic_rejects_invented_rest_url() -> None:
             journal_rows=0,
             journal_end=0,
         )
-        replay_fd = analyze._open_custody_input(
-            replay_path,
-            analyze._REPLAY_MAX_BYTES,
-            "child replay JSON",
-            "DIAG-CUSTODY",
+        _raises_with(
+            AnalyzerError,
+            lambda: _validate_replay_diagnostic(
+                replay_path, final, 11, "fjall", False, str(tmp / "state")
+            ),
+            "invented rest_url",
+            "rest_url",
         )
-        try:
-            _raises_with(
-                AnalyzerError,
-                lambda: _validate_replay_diagnostic(
-                    replay_fd,
-                    replay_path,
-                    final,
-                    11,
-                    "fjall",
-                    False,
-                    str(tmp / "state"),
-                ),
-                "invented rest_url",
-                "rest_url",
-            )
-        finally:
-            os.close(replay_fd)
 
 
 def test_find_cmodern_height_settings_mismatch_storage_backend() -> None:
@@ -8431,6 +8332,7 @@ def test_find_cmodern_height_settings_mismatch_storage_backend() -> None:
             tmp,
             stage,
             100,
+            work_dir,
             replay_overrides={"storage_backend": "rocksdb"},
         )
         child = _make_fake_binary(tmp)
@@ -8463,6 +8365,7 @@ def test_find_cmodern_height_settings_mismatch_txindex() -> None:
             tmp,
             stage,
             100,
+            work_dir,
             replay_overrides={"txindex": True},
         )
         child = _make_fake_binary(tmp)
@@ -8491,15 +8394,11 @@ def test_find_cmodern_height_settings_mismatch_data_dir() -> None:
         work_dir = tmp / "work"
         work_dir.mkdir()
         output = tmp / "candidate.json"
-        meta_path = _build_meta(
-            tmp,
-            stage,
-            100,
-            replay_overrides={"data_dir": str(tmp / "other_state")},
-        )
+        meta_path = _build_meta(tmp, stage, 100, work_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        os.environ["FAKE_CENSUS_DATA_DIR"] = str(tmp / "other_state")
         try:
             _raises_with(
                 AnalyzerError,
@@ -8511,6 +8410,7 @@ def test_find_cmodern_height_settings_mismatch_data_dir() -> None:
             )
             assert not output.exists(), "candidate must not be published"
         finally:
+            os.environ.pop("FAKE_CENSUS_DATA_DIR", None)
             os.environ.pop("FAKE_CENSUS_META", None)
             os.environ.pop("FAKE_CENSUS_STAGE", None)
 
@@ -9102,6 +9002,201 @@ def test_atomic_publish_pre_link_failure_leaves_no_trace() -> None:
         assert not any(tmp.glob(".*out.json*")), "pre-link failure leaves no trace"
 
 
+def test_salvage_rejects_inplace_overwrite_during_parent_fsync() -> None:
+    """An in-place overwrite during the publication fsync is rejected.
+
+    The publisher holds the anonymous inode through the parent fsync; a
+    same-length rewrite of the linked leaf during that fsync changes the
+    retained inode's stable metadata, so salvage fails loudly and the
+    tampered entry stays behind as a named orphan.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        original_fsync = os.fsync
+        tampered: dict[str, bytes] = {}
+
+        def overwrite_leaf_during_dir_fsync(fd: int) -> None:
+            status = os.fstat(fd)
+            if (
+                "bytes" not in tampered
+                and stat.S_ISDIR(status.st_mode)
+                and Path(os.readlink(f"/proc/self/fd/{fd}")) == output.parent
+                and output.exists()
+            ):
+                original_fsync(fd)
+                original = output.read_bytes()
+                tampered["bytes"] = bytes(len(original))
+                output.write_bytes(tampered["bytes"])
+                return
+            original_fsync(fd)
+
+        os.fsync = overwrite_leaf_during_dir_fsync
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "mutated in place",
+                "DIAG-OUTPUT",
+            )
+        finally:
+            os.fsync = original_fsync
+        assert tampered["bytes"]
+        assert output.exists()
+        assert output.read_bytes() == tampered["bytes"]
+
+
+def test_salvage_rejects_inplace_overwrite_after_leaf_identity_proof() -> None:
+    """A write landing after the leaf proof is caught by the final re-proof.
+
+    The publisher re-proves the retained inode's stable metadata once more
+    as the linearization point: an os.stat hook that overwrites the same
+    inode (dirfd-relative, no-follow) during the publish leaf stat — after
+    ancestry, metadata, digest, and leaf identity have all passed — must
+    still fail the publication.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        original_stat = os.stat
+        fired = {"done": False}
+        tampered: dict[str, bytes] = {}
+
+        def overwrite_at_leaf_stat(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if (
+                not fired["done"]
+                and path == output.name
+                and kwargs.get("follow_symlinks") is False
+                and kwargs.get("dir_fd") is not None
+            ):
+                fired["done"] = True
+                tampered["bytes"] = bytes(result.st_size)
+                write_fd = os.open(
+                    output.name,
+                    os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=kwargs["dir_fd"],
+                )
+                try:
+                    payload = bytes(result.st_size)
+                    assert os.pwrite(write_fd, payload, 0) == len(payload)
+                    os.fsync(write_fd)
+                finally:
+                    os.close(write_fd)
+            return result
+
+        os.stat = overwrite_at_leaf_stat
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "mutated in place",
+                "custody proof ran",
+                "DIAG-OUTPUT",
+            )
+        finally:
+            os.stat = original_stat
+        assert fired["done"]
+        assert output.exists()
+        assert output.read_bytes() == tampered["bytes"]
+
+
+def test_atomic_publish_rejects_inplace_overwrite_during_parent_fsync() -> None:
+    """The shared publisher rejects an in-place rewrite during its fsync.
+
+    Same attack as the salvage case, aimed directly at
+    ``_atomic_publish_no_replace``: overwriting the linked leaf during the
+    parent-directory fsync changes the retained inode's stable metadata
+    and digest inputs, so publication is refused while the tampered entry
+    remains on disk.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target = tmp / "out.json"
+        from analyze import _atomic_publish_no_replace
+
+        original_fsync = os.fsync
+        tampered: dict[str, bytes] = {}
+
+        def overwrite_target_during_dir_fsync(fd: int) -> None:
+            status = os.fstat(fd)
+            if (
+                "bytes" not in tampered
+                and stat.S_ISDIR(status.st_mode)
+                and Path(os.readlink(f"/proc/self/fd/{fd}")) == target.parent
+                and target.exists()
+            ):
+                original_fsync(fd)
+                original = target.read_bytes()
+                tampered["bytes"] = bytes(len(original))
+                target.write_bytes(tampered["bytes"])
+                return
+            original_fsync(fd)
+
+        os.fsync = overwrite_target_during_dir_fsync
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: _atomic_publish_no_replace(target, b"candidate"),
+                "mutated in place",
+                "DIAG-OUTPUT",
+            )
+        finally:
+            os.fsync = original_fsync
+        assert tampered["bytes"]
+        assert target.read_bytes() == tampered["bytes"]
+
+
 def test_clone_committed_source_fallback_copies_only_committed_size() -> None:
     """The non-FICLONE fallback must copy only committed_size bytes, not the
     full source file.  Forces the EXDEV fallback and proves via pread tracking
@@ -9176,6 +9271,7 @@ def test_open_verified_executable_survives_in_place_source_overwrite() -> None:
         binary.write_text("#!/bin/sh\necho SEALED-SNAPSHOT-A\n")
         binary.chmod(0o755)
         binary_fd, custody = analyze._open_verified_executable(binary)
+        work_fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             assert custody["sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
 
@@ -9186,20 +9282,25 @@ def test_open_verified_executable_survives_in_place_source_overwrite() -> None:
                 os.fsync(stream.fileno())
             assert binary.read_bytes() == b"#!/bin/sh\necho OVERWRITE-B\n"
 
-            work_dirfd, work_missing = analyze._walk_dirfd_nofollow(tmp)
-            assert not work_missing
-            try:
-                proc, stderr_file = analyze._launch_diagnostic_child(
-                    binary,
-                    "127.0.0.1:18443",
-                    100,
-                    "fjall",
-                    False,
-                    binary_fd=binary_fd,
-                    work_dirfd=work_dirfd,
-                )
-            finally:
-                os.close(work_dirfd)
+            proc, stderr_file = analyze._launch_diagnostic_child(
+                binary,
+                "127.0.0.1:18443",
+                100,
+                work_fd,
+                {
+                    "contexts": tmp / "brsctx1.bin",
+                    "records": tmp / "brsrec1.bin",
+                    "journal": tmp / "brsjrn1.bin",
+                    "sidecar": tmp / "brshgt1.bin",
+                    "replay": tmp / "replay_diagnostic.json",
+                    "stderr": tmp / "stderr.log",
+                    "counters": tmp / "counters.json",
+                },
+                tmp / "state",
+                "fjall",
+                False,
+                binary_fd,
+            )
             try:
                 observed = proc.stdout.read().decode()
                 proc.wait(timeout=10)
@@ -9208,6 +9309,7 @@ def test_open_verified_executable_survives_in_place_source_overwrite() -> None:
             assert "SEALED-SNAPSHOT-A" in observed
             assert "OVERWRITE-B" not in observed
         finally:
+            os.close(work_fd)
             os.close(binary_fd)
 
 
@@ -9264,7 +9366,7 @@ def test_salvage_requires_precreated_empty_recovery_directory() -> None:
         stage = _write_diagnostic_stage(tmp)
         source_dir = tmp / "source"
         source_dir.mkdir()
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9287,7 +9389,7 @@ def test_salvage_requires_precreated_empty_recovery_directory() -> None:
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             ),
             "pre-created and empty",
             "DIAG-SETUP",
@@ -9305,7 +9407,7 @@ def test_salvage_requires_precreated_empty_recovery_directory() -> None:
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             ),
             "must be empty",
             "DIAG-SETUP",
@@ -9328,7 +9430,7 @@ def test_salvage_holds_precreated_recovery_directory_after_substitution() -> Non
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9347,9 +9449,13 @@ def test_salvage_holds_precreated_recovery_directory_after_substitution() -> Non
         swapped = False
         anchored_publish = analyze._atomic_publish_anchored
 
-        def publish_then_substitute_recovery(dir_fd, name, content):
+        def publish_then_substitute_recovery(
+            dir_fd, name, content, *, forbidden_ancestor=None
+        ):
             nonlocal swapped
-            anchored_publish(dir_fd, name, content)
+            anchored_publish(
+                dir_fd, name, content, forbidden_ancestor=forbidden_ancestor
+            )
             if not swapped:
                 swapped = True
                 os.rename(recovery_dir, hidden)
@@ -9365,7 +9471,7 @@ def test_salvage_holds_precreated_recovery_directory_after_substitution() -> Non
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             )
         finally:
             analyze._atomic_publish_anchored = anchored_publish
@@ -9396,7 +9502,7 @@ def test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9429,7 +9535,7 @@ def test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "different mount",
                 "mnt_id 9",
@@ -9453,7 +9559,7 @@ def test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "mount identity (mnt_id) unavailable",
                 "DIAG-SETUP",
@@ -9477,7 +9583,7 @@ def test_salvage_rejects_leaf_substitution_during_parent_fsync() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9521,7 +9627,7 @@ def test_salvage_rejects_leaf_substitution_during_parent_fsync() -> None:
                     output,
                     "127.0.0.1:18443",
                     100,
-                    _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                    str(source_dir / "state"),
                 ),
                 "was substituted",
                 "parent",
@@ -9529,9 +9635,218 @@ def test_salvage_rejects_leaf_substitution_during_parent_fsync() -> None:
             )
         finally:
             os.fsync = original_fsync
-        assert swapped["done"]
-        assert output.exists(), "the substituted entry stays as a named orphan"
-        assert json.loads(output.read_text())["schema"] == "substitute"
+
+
+def test_salvage_rejects_recovery_reparented_under_source_before_materialization() -> (
+    None
+):
+    """Recovery reparented under the source before materialization is refused.
+
+    Ancestry is re-proved immediately before the first recovery mutation:
+    reconstructing and then renaming the held recovery directory beneath
+    the source must fail salvage before any clone lands, leaving the moved
+    directory empty and no candidate behind.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        reconstruct = analyze._reconstruct_diagnostic_from_fds
+
+        def reparent_after_reconstruction(row_count, source_fds):
+            result = reconstruct(row_count, source_fds)
+            os.rename(recovery_dir, source_dir / recovery_dir.name)
+            return result
+
+        analyze._reconstruct_diagnostic_from_fds = reparent_after_reconstruction
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "moved beneath the source",
+                "before materialization",
+                "DIAG-SALVAGE",
+            )
+        finally:
+            analyze._reconstruct_diagnostic_from_fds = reconstruct
+        assert not output.exists()
+        assert not recovery_dir.exists()
+        moved_dir = source_dir / "recovery"
+        assert moved_dir.is_dir()
+        assert not any(moved_dir.iterdir()), (
+            "no clone may land before the pre-materialization refusal"
+        )
+
+
+def test_salvage_rejects_recovery_reparented_under_source_after_materialization_sync() -> (
+    None
+):
+    """Recovery reparented under the source at the materialization sync fails.
+
+    The materialization fsync is the sync point: reparenting the held
+    recovery directory beneath the source during that fsync must fail
+    right after it returns, with the cloned evidence preserved where it
+    landed so the operator can see exactly what was moved.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = tmp / "salvaged.json"
+        original_fsync = os.fsync
+        moved = {"done": False}
+
+        def reparent_during_recovery_fsync(fd: int) -> None:
+            status = os.fstat(fd)
+            if (
+                not moved["done"]
+                and stat.S_ISDIR(status.st_mode)
+                and Path(os.readlink(f"/proc/self/fd/{fd}")) == recovery_dir
+            ):
+                moved["done"] = True
+                original_fsync(fd)
+                os.rename(recovery_dir, source_dir / recovery_dir.name)
+                return
+            original_fsync(fd)
+
+        os.fsync = reparent_during_recovery_fsync
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "moved beneath the source",
+                "during materialization",
+                "DIAG-SALVAGE",
+            )
+        finally:
+            os.fsync = original_fsync
+        assert moved["done"]
+        assert not output.exists()
+        moved_dir = source_dir / "recovery"
+        for name in ("brsctx1.bin", "brsrec1.bin", "brsjrn1.bin", "brshgt1.bin"):
+            assert (moved_dir / name).exists(), "clones landed before the check"
+        assert not (tmp / "recovery").exists()
+
+
+def test_salvage_rejects_output_reparented_under_source_during_publication_fsync() -> (
+    None
+):
+    """The output parent reparented under the source during publication fails.
+
+    Ancestry is re-proved after the publication parent fsync: renaming the
+    held output directory beneath the protected source during that fsync
+    must fail the publication even though the candidate rode along, and
+    the failed run leaves the linked candidate where it landed plus the
+    recovery evidence for operator cleanup.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        stage = _write_diagnostic_stage(tmp)
+        source_dir = tmp / "source"
+        source_dir.mkdir()
+        clean_output = tmp / "clean.json"
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
+        child = _make_fake_binary(tmp)
+        os.environ["FAKE_CENSUS_META"] = str(meta_path)
+        os.environ["FAKE_CENSUS_STAGE"] = str(stage)
+        try:
+            _run_diagnostic_scan(
+                child, "127.0.0.1:18443", 100, source_dir, clean_output
+            )
+        finally:
+            os.environ.pop("FAKE_CENSUS_META", None)
+            os.environ.pop("FAKE_CENSUS_STAGE", None)
+
+        out_dir = tmp / "published"
+        out_dir.mkdir()
+        recovery_dir = tmp / "recovery"
+        recovery_dir.mkdir()
+        output = out_dir / "salvaged.json"
+        original_fsync = os.fsync
+        reparented = {"done": False}
+
+        def reparent_output_parent_during_fsync(fd: int) -> None:
+            status = os.fstat(fd)
+            if (
+                not reparented["done"]
+                and stat.S_ISDIR(status.st_mode)
+                and Path(os.readlink(f"/proc/self/fd/{fd}")) == out_dir
+                and output.exists()
+            ):
+                reparented["done"] = True
+                original_fsync(fd)
+                os.rename(out_dir, source_dir / out_dir.name)
+                return
+            original_fsync(fd)
+
+        os.fsync = reparent_output_parent_during_fsync
+        try:
+            _raises_with(
+                AnalyzerError,
+                lambda: analyze._salvage_diagnostic_scan(
+                    source_dir,
+                    recovery_dir,
+                    output,
+                    "127.0.0.1:18443",
+                    100,
+                    str(source_dir / "state"),
+                ),
+                "moved beneath the protected source",
+                "DIAG-OUTPUT",
+            )
+        finally:
+            os.fsync = original_fsync
+        assert reparented["done"]
+        assert not output.exists()
+        assert (source_dir / "published" / "salvaged.json").exists()
+        assert any(recovery_dir.iterdir()), "recovery evidence survives the failed run"
 
 
 def test_salvage_refuses_replaced_ancestor_symlink() -> None:
@@ -9545,7 +9860,7 @@ def test_salvage_refuses_replaced_ancestor_symlink() -> None:
         stage = _write_diagnostic_stage(tmp)
         source_dir = tmp / "source"
         source_dir.mkdir()
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9575,7 +9890,7 @@ def test_salvage_refuses_replaced_ancestor_symlink() -> None:
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             ),
             "refusing path component",
             "DIAG-SETUP",
@@ -9599,7 +9914,7 @@ def test_salvage_source_pathname_substitution_reads_only_held_original() -> None
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9620,7 +9935,7 @@ def test_salvage_source_pathname_substitution_reads_only_held_original() -> None
             reference_output,
             "127.0.0.1:18443",
             100,
-            _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+            str(source_dir / "state"),
         )
         reference = json.loads(reference_output.read_text())
         source_before = _directory_hashes(source_dir)
@@ -9666,7 +9981,7 @@ def test_salvage_source_pathname_substitution_reads_only_held_original() -> None
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             )
         finally:
             analyze._open_custody_input = real_open
@@ -9716,7 +10031,7 @@ def test_salvage_rejects_output_nested_under_source() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9741,7 +10056,7 @@ def test_salvage_rejects_output_nested_under_source() -> None:
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             ),
             "output nested under source",
             "DIAG-SETUP: output must be outside source",
@@ -9765,7 +10080,7 @@ def test_salvage_refuses_symlinked_source_path_to_substitute() -> None:
         real_dir = tmp / "real"
         real_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, real_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -9980,6 +10295,7 @@ def main() -> int:
         test_classify_corpus_ecdsa_reject_record_counts_entry,
         test_classify_corpus_schnorr_reject_record_counts_entry,
         test_diagnostic_child_executes_verified_inode_after_path_swap,
+        test_diagnostic_run_confines_all_writes_to_held_work_dir_after_path_swap,
         test_classify_corpus_reason8_tapscript_skip,
         test_classify_corpus_ecdsa_fail_record,
         test_classify_corpus_ecdsa_success_record,
@@ -10002,7 +10318,6 @@ def main() -> int:
         test_count_context_records_disk_scratch_dir_smoke,
         test_count_context_records_disk_restores_env_on_failure,
         test_find_cmodern_height_fake_child_success,
-        test_find_cmodern_height_holds_work_directory_after_substitution,
         test_find_cmodern_height_late_failure_keeps_sidecar_count_unpatched,
         test_find_cmodern_height_post_stop_timeout_finalizes_honestly,
         test_find_cmodern_height_rejects_pipe_filling_trailing_output,
@@ -10036,6 +10351,9 @@ def main() -> int:
         test_atomic_publish_post_link_failure_leaves_named_orphan,
         test_atomic_publish_no_replace_collision,
         test_atomic_publish_pre_link_failure_leaves_no_trace,
+        test_salvage_rejects_inplace_overwrite_during_parent_fsync,
+        test_atomic_publish_rejects_inplace_overwrite_during_parent_fsync,
+        test_salvage_rejects_inplace_overwrite_after_leaf_identity_proof,
         test_find_cmodern_height_settings_mismatch_storage_backend,
         test_find_cmodern_height_settings_mismatch_txindex,
         test_find_cmodern_height_settings_mismatch_data_dir,
@@ -10067,6 +10385,9 @@ def main() -> int:
         test_salvage_holds_precreated_recovery_directory_after_substitution,
         test_salvage_rejects_cross_mount_recovery_via_injected_fdinfo,
         test_salvage_rejects_leaf_substitution_during_parent_fsync,
+        test_salvage_rejects_recovery_reparented_under_source_before_materialization,
+        test_salvage_rejects_recovery_reparented_under_source_after_materialization_sync,
+        test_salvage_rejects_output_reparented_under_source_during_publication_fsync,
     ]
     passed = 0
     failed = 0
@@ -10675,7 +10996,7 @@ def test_salvage_rejects_recovery_nested_under_source_without_mutation() -> None
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -10703,7 +11024,7 @@ def test_salvage_rejects_recovery_nested_under_source_without_mutation() -> None
                         output,
                         "127.0.0.1:18443",
                         100,
-                        _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                        str(source_dir / "state"),
                     )
                 ),
                 "recovery nested under source",
@@ -10731,7 +11052,7 @@ def test_salvage_publishes_into_held_output_parent_after_substitution() -> None:
         source_dir = tmp / "source"
         source_dir.mkdir()
         clean_output = tmp / "clean.json"
-        meta_path = _build_meta(tmp, stage, 100)
+        meta_path = _build_meta(tmp, stage, 100, source_dir)
         child = _make_fake_binary(tmp)
         os.environ["FAKE_CENSUS_META"] = str(meta_path)
         os.environ["FAKE_CENSUS_STAGE"] = str(stage)
@@ -10775,7 +11096,7 @@ def test_salvage_publishes_into_held_output_parent_after_substitution() -> None:
                 output,
                 "127.0.0.1:18443",
                 100,
-                _captured_child_data_dir(source_dir / "replay_diagnostic.json"),
+                str(source_dir / "state"),
             )
         finally:
             analyze._open_custody_input = real_open

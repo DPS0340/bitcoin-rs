@@ -128,24 +128,16 @@ is hashed. Every child launch executes that held sealed descriptor through
 `/proc/self/fd`, so a binary overwritten in place or swapped at its
 pathname after verification is never run.
 
-After the controller anchors the work directory, every live diagnostic
-filesystem effect is relative to that one held descriptor: the `state`
-directory and sidecar are created through it, the child inherits it and
-receives only `/proc/self/fd/<work-fd>/...` paths for its state and
-evidence files, and the streams, replay document, and counters are
-acquired, validated, hashed, patched, and fsynced through descriptors
-anchored there. The original operator pathname text remains display and
-provenance only — it is never resolved again for live I/O. A principal
-able to rename the anchored directory and plant a substitute can no
-longer move any effect or any accepted byte: a deterministic regression
-(`test_find_cmodern_height_holds_work_directory_after_substitution`)
-renames and substitutes the pathname right after anchor admission and
-proves the substitute stays empty while the held original receives the
-state, evidence, and custody digests. What is outside the threat model:
-same-authority mutation of entries inside the protected directory after
-anchoring (a principal already permitted to mutate the held directory
-can create or replace entries directly), and no pathname-namespace
-atomicity is claimed for the protected directory itself.
+The live scan itself never re-resolves `--work-dir` after the anchor is
+taken. The state directory, evidence streams, sidecar, stderr log,
+counters, and replay output are all created and read beneath the held
+work-dir descriptor via its `/proc/self/fd` path, and the child inherits
+that descriptor (`pass_fds`), receiving descriptor-rooted `--data-dir`,
+`--output`, and `BRS_CENSUS_*` paths so a renamed work directory cannot
+redirect the destructive replay into a substitute. A live run's recorded
+child `data_dir` is therefore the `/proc/self/fd/<fd>/state` form;
+operator pathnames appear only in custody display strings, and an
+unavailable `/proc/self/fd` fails setup closed.
 
 If the child wrote the terminal checkpoint but did not exit before the controller deadline, preserve the failed work directory and recover into new paths:
 
@@ -155,7 +147,7 @@ python3 analyze.py salvage-cmodern-height \
   --recovery-dir "$EXP/out/cmodern-recovery" \
   --rest-url 127.0.0.1:18443 \
   --stop-height 961741 \
-  --data-dir '/proc/self/fd/<work-fd>/state' \
+  --data-dir "$EXP/out/cmodern-diagnostic/state" \
   --storage-backend fjall \
   --output "$EXP/out/cmodern-candidate.json"
 ```
@@ -178,15 +170,23 @@ share the source's mount (`mnt_id` from `/proc/self/fdinfo`) before the
 first mutation; cross-mount custody fails closed. The output parent is
 held through publication: immediately before the candidate is linked, its
 ancestry is rechecked against the held source identity and the link is
-made through that descriptor; the published descriptor stays live through
-the parent-directory fsync and a final no-follow re-stat of the leaf
-rejects any substitution racing that sync. Failed runs leave the
-candidate and recovery evidence in place as named orphans reported on
+made through that descriptor. The published descriptor stays live through
+the parent-directory fsync, after which publication re-proves ancestry
+against the held source identity — a parent reparented beneath the source
+fails the run and leaves the linked candidate as a reported orphan — then
+re-proves the retained inode's stable metadata and SHA-256 against the
+written object, refusing any in-place mutation of the owner-writable
+leaf, and finally re-stats the leaf no-follow to reject any substitution
+racing that sync. Recovery ancestry is re-proved the same way immediately
+before the first recovery mutation and again after the materialization
+fsync; post-write drift is treated as source contamination and fails
+loudly with the evidence left in place.
+Failed runs leave the candidate and recovery evidence in place as named orphans reported on
 stderr for operator cleanup. Recovery and output paths must therefore be
 fully resolved real directories; missing, non-empty, substituted, or
 cross-mount recovery directories and missing output parents fail closed.
 
-`--rest-url` comes from the original controller command. The child replay JSON does not contain that value, so salvaged candidates label it `operator_supplied_original_argv`. `--data-dir` must match the exact descriptor-backed child argv string recorded in `replay_diagnostic.json`; salvage preserves that authenticated literal verbatim and never resolves, rewrites, or reopens it. That value is historical text — the inherited `/proc/self/fd/<work-fd>/state` transport path of the live child is dead once the child exits — so salvage treats it as inert authenticated provenance text only.
+`--rest-url` comes from the original controller command. The child replay JSON does not contain that value, so salvaged candidates label it `operator_supplied_original_argv`. `--data-dir` must match the exact string in `replay_diagnostic.json`. Do not resolve or rewrite it.
 
 ### Run A — authoritative C150 cumulative evidence
 
@@ -395,11 +395,18 @@ the same shared artifact (`--validation PATH`), re-derives size and digest
 from its own descriptors, and rejects any proof whose binding or state
 disagrees with it.
 
-Publication uses one crash-safe path: bytes are written to a scratch inode
-with no directory entry, fsynced, linked into a retained parent-directory
-descriptor without replacing any existing entry, re-proven through a
-dirfd-relative no-follow reopen (device, inode, streamed digest over a
-fixed 1 MiB buffer), and made durable by a directory fsync. Multi-entry
+Publication uses one crash-safe path: bytes are written to a scratch
+`O_RDWR` inode with no directory entry, fsynced, linked into a retained
+parent-directory descriptor without replacing any existing entry, and
+made durable by a directory fsync. The scratch descriptor stays open
+through that fsync; afterward publication re-proves, through the
+retained inode itself, the complete stable metadata (device, inode, size,
+`mtime_ns`, `ctime_ns`) and the SHA-256 of the written object, re-proves
+the parent's ancestry when a forbidden ancestor is declared, and only
+then re-stats the leaf no-follow to tie the name to that inode. An
+in-place overwrite of the linked, owner-writable inode during or after
+the directory fsync therefore fails the publication instead of passing an
+identity-only check. Multi-entry
 publications run under a guard that never pathname-unlinks a published
 entry: an inode verified through a descriptor can be redirected by a
 concurrent rename before an unlink lands, which would delete a
@@ -764,7 +771,11 @@ cargo run -p bitcoin-rs-node --example verify_replay_durability -- --self-test-a
 
 It prints `ANCHOR-SELF-TEST-OK` after swapping the pathname for a
 substitute and proving the held anchor still reads and writes the
-original directory while the substitute is rejected.
+original directory while the substitute is rejected, after proving an
+in-place mutation of the linked output during the post-fsync window is
+refused (`mutated in place`), and after proving an output directory
+reparented beneath the anchored data directory is refused (`ancestry
+reached the anchored data directory`).
 
 ## Binary formats
 

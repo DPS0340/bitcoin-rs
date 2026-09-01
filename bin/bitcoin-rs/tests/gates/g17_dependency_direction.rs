@@ -32,6 +32,12 @@
 //!
 //! The gate fails loudly, naming the offending edge, when any assertion does
 //! not hold.
+//!
+//! Contract: `docs/contracts/architecture.md` —
+//! `workspace_dependency_direction_is_one_way` pins `ARCH-01` (one-way
+//! layer edges), `ARCH-02` (engine-crate exclusivity), `ARCH-03` (backend
+//! feature-forwarding confinement), and `ARCH-04` (RPC storage
+//! independence).
 
 #![allow(clippy::expect_used)]
 

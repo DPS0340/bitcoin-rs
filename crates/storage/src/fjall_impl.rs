@@ -191,6 +191,40 @@ impl KvStore for FjallStore {
     }
 }
 
+/// Measurement-only settle/accounting surface for benchmark harnesses.
+///
+/// Compiled only under the `fjall-measurement` feature; production builds
+/// never carry these accessors, and none of them change store behavior.
+#[cfg(feature = "fjall-measurement")]
+impl FjallStore {
+    /// Blocks until the column family's active memtable is rotated and
+    /// flushed into L0 tables. A no-op when the memtable is already empty.
+    pub fn settle_keyspace(&self, cf: ColumnFamily) -> Result<(), StorageError> {
+        self.keyspace(cf)?
+            .rotate_memtable_and_wait()
+            .map_err(StorageError::backend)
+    }
+
+    /// Runs a blocking major compaction over the column family.
+    pub fn major_compact_keyspace(&self, cf: ColumnFamily) -> Result<(), StorageError> {
+        self.keyspace(cf)?
+            .major_compact()
+            .map_err(StorageError::backend)
+    }
+
+    /// Returns the table+blob disk bytes the backend attributes to this
+    /// column family.
+    pub fn keyspace_disk_bytes(&self, cf: ColumnFamily) -> Result<u64, StorageError> {
+        Ok(self.keyspace(cf)?.disk_space())
+    }
+
+    /// Returns `(table_count, blob_file_count)` for this column family.
+    pub fn keyspace_table_counts(&self, cf: ColumnFamily) -> Result<(usize, usize), StorageError> {
+        let keyspace = self.keyspace(cf)?;
+        Ok((keyspace.table_count(), keyspace.blob_file_count()))
+    }
+}
+
 fn cached_keyspace<'store>(
     store: &'store FjallStore,
     keyspaces: &mut [Option<&'store Keyspace>],

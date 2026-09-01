@@ -1,24 +1,13 @@
 # UTXO set memory attribution
 
-Step 2.1 of the memory campaign: measurement only, no encoding change. It exists
-to decide whether the encoding and allocation work planned after it is worth
-doing at all.
+> **Campaign status:** Measurement-only; no encoding change. Evidence is sealed in
+> [`data/utxo-memory-decision-v1.json`](data/utxo-memory-decision-v1.json) when the
+> attribution campaign completes. The synthetic harness
+> (`crates/utxo/examples/utxo_memory_attribution.rs`) and the snapshot fixture
+> (`crates/utxo/examples/snapshot_memory.rs`) were retired by #224. The retained
+> `record_codec` benchmark measures the current codec; the live test
+> `crates/utxo/tests/record_codec_equivalence.rs` covers codec equivalence.
 
-The question. `UtxoSet` is fully memory-resident across 256 shards with no
-eviction tier, and the published tip-RSS evidence reached **13.83 GiB at height
-645,804** without making the tip, against a G14 budget of 16 GiB. Nothing had
-ever attributed that figure. The record constants predict roughly 5 GB at that
-height, leaving ~9 GiB unexplained, and the plan named allocator fragmentation
-across tens of millions of small allocations as the leading suspect.
-
-Harness: `crates/utxo/examples/utxo_memory_attribution.rs`, backed by
-`UtxoSetView::memory_report()`. Synthetic set with a mainnet-shaped script mix
-(P2WPKH 22 B, P2PKH 25 B, P2SH 23 B, P2TR 34 B) and 1.5 live outputs per record.
-System allocator, Apple Silicon.
-
-```
-cargo run -p bitcoin-rs-utxo --example utxo_memory_attribution --release -- [records] [churn_rounds]
-```
 
 ## What a UTXO costs
 
@@ -186,7 +175,8 @@ Same file, same machine, only the codec differs
 
 **The synthetic bench was 5.1% optimistic.** It predicted 11.75 B/output of
 payload; the real chainstate gives **11.18**. The figure to quote is 11.18.
-
+Same file, same machine, only the codec differs (live test in
+`crates/utxo/tests/record_codec_equivalence.rs`).
 Two things corroborate the instrument. The v4 payload here is 55.08 B/output
 against the 55.1 the original attribution run measured by a completely different
 route, and the RSS saving (11.49) is slightly *larger* than the payload saving

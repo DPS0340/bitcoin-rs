@@ -13,9 +13,9 @@ ones that have none: `rpc` (9,137 LOC), `mempool` (4,254), `p2p` (3,295),
 `chain` (3,010), `filters` (771).
 
 Six candidates and the negative results are retained so the next reader does not
-re-derive the survey. Candidates A, B, and C have since landed; their result
-documents are linked below. Candidates D, E, and F remain survey findings whose
-implementation or value is unresolved.
+re-derive the survey. Candidates A through D have since landed; their result
+documents or implementation evidence are linked below. Candidates E and F
+remain survey findings whose implementation or value is unresolved.
 
 Every `file:line` below is against the tree this page lands on and was
 re-verified there. The cross-references *out* of it are forward-looking:
@@ -168,29 +168,30 @@ the workload — here, acceptance and template building, not `insert` in isolati
 ## D — `dbcache_mb` never reaches a storage backend
 
 **Update: landed.** The budget now divides across the persistent namespaces
-(chainstate 70%, txindex 20%, filters 10%, disabled shares redistribute to
-chainstate) and every backend accepts its share through
-`open_with_cache` (`crates/storage/src/cache_budget.rs`). The analysis below is
-the historical record of the gap this candidate closed.
+(chainstate 70%, txindex 20%, filters 10%, with disabled shares returned to
+chainstate) and reaches every backend through `open_with_cache`
+(`crates/storage/src/cache_budget.rs`). For MDBX, the share bounds the
+write-side dirty-page pool; reads remain OS-cached. The analysis below records
+the gap this candidate closed.
 
-Parsed from CLI and `bitcoin.conf` (`crates/node/src/config.rs:162`,
-`crates/node/src/bitcoin_conf_compat.rs:64`), carried through config layering
-(`config.rs:574`), and referenced **nowhere in `crates/storage`** — verified by
-search, zero hits at the time. Tracked as issue #51.
+At survey time, `dbcache_mb` was parsed from CLI and `bitcoin.conf`
+(`crates/node/src/config.rs:162`,
+`crates/node/src/bitcoin_conf_compat.rs:64`) and carried through config layering
+(`config.rs:574`), but no storage constructor consumed it. Tracked as issue
+#51.
 
-It has already cost this campaign once: `docs/benchmarks/utxo-memory.md` had to
-retract a claim that 450 MB of residual RSS was the configured `dbcache`, because
-the setting reaches no constructor. fjall takes builder defaults and RocksDB a
-fixed 256 MiB block cache.
+That gap had already cost the campaign once:
+`docs/benchmarks/utxo-memory.md` retracted a claim that 450 MB of residual RSS
+was the configured `dbcache`. The setting reached no constructor; fjall used
+builder defaults and RocksDB used a fixed 256 MiB block cache.
 
-The consequence for everything else on this page: **there is no lever between
-configuration and the backends**, so the one budget that is at risk cannot be
-tuned, and the non-UTXO residual cannot be attributed by turning a knob and
-re-measuring.
+Without a path from configuration to each backend, the at-risk memory budget
+could not be tuned and the non-UTXO residual could not be attributed by changing
+one budget and measuring again.
 
-This is a design question before it is an optimization — `dbcache_mb` means
-different things to four backends — so it does not fit the refactor-set contract
-as stated.
+This needed a storage-budget design before it could become an optimization:
+`dbcache_mb` means different things to the four backends. The landed
+`CacheBudget` contract now owns that distinction.
 
 ## E — `load_range` opens the file once per position
 
@@ -252,7 +253,8 @@ Checked during the survey and cleared. Recorded so nobody re-checks them.
 - **A** — landed; see `docs/benchmarks/gettxoutproof.md`.
 - **B** — landed; see `docs/benchmarks/block-record-footprint.md`.
 - **C** — landed; see `docs/benchmarks/mempool-pareto.md`.
-- **D** — still needs a decision on what `dbcache_mb` should mean per backend first.
+- **D** — landed; see `crates/storage/src/cache_budget.rs` and the backend
+  `open_with_cache` implementations.
 - **E** — gate on a production ScriptIndex measurement. Do not build it against
   synthetic fixtures.
 - **F** — the height half is gated on the BIP30 investigation; the script half is

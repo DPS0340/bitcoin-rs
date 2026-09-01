@@ -1,3 +1,14 @@
+//! Reconciliation regressions for the txindex worker: forward and
+//! rival-branch repair, watermark rollback, missing-body reset-and-rebuild,
+//! cursor identity, and interrupted-run convergence over a real
+//! `FjallStore` writer.
+//!
+//! Named proving surface of `docs/contracts/indexing.md` (`IDX-04`
+//! selective reset preserves the sibling capability, `IDX-06` reorg
+//! rollback and forward reconciliation, `IDX-07` supervised reset and
+//! rebuild) and `docs/contracts/chain-events.md` (`EVT-03` consumer-cursor
+//! identity and positional reconciliation, `EVT-04` hash-addressed row
+//! retention and cursor repair).
 #![cfg(all(test, feature = "fjall"))]
 
 use hashbrown::HashMap;

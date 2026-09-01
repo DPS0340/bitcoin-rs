@@ -11,7 +11,7 @@ use std::sync::Arc;
 use alloc::vec::Vec;
 
 use bitcoin_rs_chain::{NodeId, ReorgPlan, current_unix_seconds, plan_reorg};
-use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry, MempoolGateway};
+use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry};
 use bitcoin_rs_primitives::{Block, DecodeError, Hash256, Tx, Txid};
 use bitcoin_rs_storage::StorageError;
 use hashbrown::HashMap;
@@ -28,6 +28,11 @@ pub fn invalidate_block(
     let transition = handles
         .begin_chain_transition()
         .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+    let guard = handles
+        .mempool_gateway
+        .begin_chain_change()
+        \.map_err(|_| ReorgError::Unavailable(Box::new(ApplyError::Shutdown)))?;
+    let proof = crate::apply::ChainChangeProof::new(transition, guard);
 
     loop {
         let (root, target) = {
@@ -72,8 +77,9 @@ pub fn invalidate_block(
         };
         debug_assert_eq!(published_target, target);
 
-        let (_, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &transition);
+        let (_, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
         if outcome.is_ok() {
+            let _ = proof.finish();
             reconsider_disconnected_transactions(handles, &disconnect);
         }
         return outcome;
@@ -257,6 +263,11 @@ where
         let transition = handles
             .begin_chain_transition()
             .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+        let guard = handles
+            .mempool_gateway
+            .begin_chain_change()
+            \.map_err(|_| ReorgError::Unavailable(Box::new(ApplyError::Shutdown)))?;
+        let proof = crate::apply::ChainChangeProof::new(transition, guard);
 
         // Preloading is optimistic. Only an identical plan recomputed while the
         // transition lock is held may mutate chainstate.
@@ -264,16 +275,15 @@ where
             return Ok(());
         };
         if plan != authoritative {
-            drop(transition);
             continue;
         }
 
-        let (connected, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &transition);
-        drop(transition);
+        let (connected, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
         for body in &connect[..connected] {
             connected_body(body.hash);
         }
         outcome?;
+        let _ = proof.finish();
         reconsider_disconnected_transactions(handles, &disconnect);
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
@@ -286,10 +296,10 @@ fn execute_loaded_plan(
     handles: &ApplyHandles,
     disconnect: &[LoadedBranchBody],
     connect: &[LoadedBranchBody],
-    transition: &crate::apply::ChainTransition<'_>,
+    proof: &crate::apply::ChainChangeProof<'_>,
 ) -> (usize, core::result::Result<(), ReorgError>) {
     for body in disconnect {
-        match crate::apply::disconnect_block_admitted(handles, &body.block, transition) {
+        match crate::apply::disconnect_block_admitted(handles, &body.block, proof) {
             Ok(_) => {}
             Err(error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. })) => {
                 handles.admission.close_permanently();
@@ -313,7 +323,7 @@ fn execute_loaded_plan(
             handles,
             &body.block,
             body.serialized.clone(),
-            transition,
+            proof,
         ) {
             Ok(_) => connected += 1,
             Err(source) => {
@@ -381,17 +391,8 @@ fn reconsider_disconnected_transactions(handles: &ApplyHandles, disconnect: &[Lo
             entries.push(entry);
         }
     }
-    if entries.is_empty() {
-        return;
-    }
-    // run() composed and installed the gateway's observer legs once, so
-    // this path reaches that same process-wide gateway through the pool
-    // Arc the handles already carry. Direct-NodeState tests intern an
-    // observer-less gateway and publish nothing — exactly the no-op
-    // publisher behavior of the private instance this replaces. The
-    // committed results belong to the observer; re-admission itself is
-    // best-effort and drops whatever the pool refuses.
-    let _ = MempoolGateway::shared(Arc::clone(&handles.mempool))
+    let _ = handles
+        .mempool_gateway
         .reconsider_disconnected(AdmissionOrigin::Reorg, entries);
 }
 

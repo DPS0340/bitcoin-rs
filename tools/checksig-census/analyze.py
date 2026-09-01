@@ -62,8 +62,6 @@ _MAX_CAPTURE_ENTRIES = EXPECTED_FFI_VERIFY_ENTRIES_FULL
 _BINARY_MAX_BYTES = 1 << 30
 """Child-executable custody ceiling: the same 1 GiB bound the benchmark
 custody docs pin for binary artifacts."""
-_DIAGNOSTIC_ARTIFACT_MAX_BYTES = 1 << 32
-"""Bound for every retained diagnostic stream and sidecar artifact."""
 
 COUNTER_NAMES: list[str] = [
     "verify_script_calls",
@@ -900,7 +898,11 @@ def _write_brshgt1_row(fd: int, row: DiagnosticCheckpoint) -> None:
 
 
 def _patch_brshgt1_count(sidecar_fd: int, count: int, parent_dirfd: int) -> None:
-    """Patch the row count through retained sidecar and parent descriptors."""
+    """Patch the row count through the retained sidecar descriptor.
+
+    The patch lands via ``pwrite`` and the parent directory is synced through
+    the descriptor the caller already holds, so no pathname is consulted.
+    """
     header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
     if len(header) != BRSHGT1_HEADER_STRUCT.size:
         raise AnalyzerError("DIAG-SIDECAR: cannot read header for count patch")
@@ -1130,9 +1132,12 @@ def _read_diagnostic_streams(
     dict[str, int],
 ]:
     """Open the evidence streams and parse one committed block."""
-    ctx_fd = os.open(paths["contexts"], os.O_RDONLY)
-    rec_fd = os.open(paths["records"], os.O_RDONLY)
-    jrn_fd = os.open(paths["journal"], os.O_RDONLY)
+    open_flags = (
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    ctx_fd = os.open(paths["contexts"], open_flags)
+    rec_fd = os.open(paths["records"], open_flags)
+    jrn_fd = os.open(paths["journal"], open_flags)
     try:
         return _read_diagnostic_streams_from_fds(row, prev, ctx_fd, rec_fd, jrn_fd)
     finally:
@@ -1232,114 +1237,107 @@ def _linkat_empty_path(fd: int, dir_fd: int, name: str) -> None:
         raise OSError(err, os.strerror(err))
 
 
-def _atomic_publish_anchored(dir_fd: int, name: str, content: bytes) -> None:
-    """Publish ``content`` as ``name`` inside the held directory ``dir_fd``.
+def _atomic_publish_anchored(
+    dir_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    forbidden_ancestor: tuple[int, int] | None = None,
+) -> None:
+    """Publish ``content`` as ``name`` inside held ``dir_fd``.
 
-    The bytes are written into an ``O_TMPFILE`` scratch inode that has no
-    directory entry, fsynced, linked into the held directory with
-    ``linkat(AT_EMPTY_PATH)``, and then proven: the entry is reopened
-    ``O_NOFOLLOW`` relative to the same descriptor and its device, inode,
-    and content digest must equal the written object. An existing
-    destination is never replaced. Once the link exists the entry is never
-    pathname-unlinked: an inode verified through a descriptor can be
-    redirected by a concurrent rename before an unlink lands, so a failure
-    after the link leaves the entry in place as a named orphan and reports
-    it on stderr for operator cleanup. Pre-link failures leave nothing
-    behind because the anonymous inode dies with its descriptor. The
-    caller retains ownership of ``dir_fd``.
+    The anonymous inode remains open read-write through the parent fsync.
+    After that durability boundary, its complete stable metadata and digest
+    are re-proved through the retained descriptor, ancestry is optionally
+    rechecked, and a no-follow leaf stat ties the visible name to that
+    inode. A second metadata re-proof through the retained descriptor is
+    the final custody proof and linearization point; a post-link failure
+    leaves the named orphan for operator cleanup.
     """
+    if not hasattr(os, "O_TMPFILE"):
+        raise AnalyzerError(
+            "DIAG-OUTPUT: this platform has no anonymous-file support; "
+            "publication requires O_TMPFILE"
+        )
     link_created = False
     completed = False
+    fd = os.open(
+        ".",
+        os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        0o644,
+        dir_fd=dir_fd,
+    )
     try:
-        fd = os.open(".", os.O_TMPFILE | os.O_WRONLY, 0o644, dir_fd=dir_fd)
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written == 0:
+                raise AnalyzerError("DIAG-OUTPUT: zero-byte write to temporary file")
+            view = view[written:]
+        os.fsync(fd)
+        written_digest = _sha256_fd(fd)
         try:
-            view = memoryview(content)
-            while view:
-                written = os.write(fd, view)
-                if written == 0:
-                    raise AnalyzerError(
-                        "DIAG-OUTPUT: zero-byte write to temporary file"
-                    )
-                view = view[written:]
-            os.fsync(fd)
-            written_stat = os.fstat(fd)
-            written_inode = (written_stat.st_dev, written_stat.st_ino)
-            try:
-                # The anonymous inode is linked while its descriptor is open.
-                _linkat_empty_path(fd, dir_fd, name)
-                link_created = True
-            except FileExistsError as exc:
-                raise AnalyzerError(
-                    f"DIAG-OUTPUT: output already exists: {name}"
-                ) from exc
-            except OSError as exc:
-                raise AnalyzerError(
-                    f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
-                ) from exc
-        finally:
-            os.close(fd)
-        written_digest = hashlib.sha256(content).hexdigest()
+            _linkat_empty_path(fd, dir_fd, name)
+            link_created = True
+        except FileExistsError as exc:
+            raise AnalyzerError(f"DIAG-OUTPUT: output already exists: {name}") from exc
+        except OSError as exc:
+            raise AnalyzerError(
+                f"DIAG-OUTPUT: atomic no-replace publication failed: {exc}"
+            ) from exc
 
-        # Prove the published object: same inode as the written one and the
-        # same content, re-opened without following a final symlink.
-        published = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=dir_fd,
-        )
+        # linkat bumps the inode's ctime, so the retained-inode baseline is
+        # captured after the link exists and before the parent fsync; the
+        # digest above stays over the written bytes.
+        written_signature = _fd_signature(fd)
+        os.fsync(dir_fd)
+        if forbidden_ancestor is not None and _dirfd_contains_identity(
+            dir_fd, forbidden_ancestor
+        ):
+            raise AnalyzerError(
+                "DIAG-OUTPUT: publication parent moved beneath the protected "
+                f"source while {name} was synced; refusing the publication"
+            )
+        if _fd_signature(fd) != written_signature:
+            raise AnalyzerError(
+                "DIAG-OUTPUT: published output was mutated in place while the "
+                "parent directory was synced; refusing in-place mutation"
+            )
+        if _sha256_fd(fd) != written_digest:
+            raise AnalyzerError(
+                "DIAG-OUTPUT: published output content differs from the written "
+                "object; refusing in-place mutation"
+            )
         try:
-            published_stat = os.fstat(published)
-            if (
-                published_stat.st_dev,
-                published_stat.st_ino,
-            ) != written_inode:
-                raise AnalyzerError(
-                    f"DIAG-OUTPUT: published output {name} is not the written inode"
-                )
-            published_digest = hashlib.sha256()
-            while True:
-                chunk = os.read(published, 1 << 20)
-                if not chunk:
-                    break
-                published_digest.update(chunk)
-            if published_digest.hexdigest() != written_digest:
-                raise AnalyzerError(
-                    f"DIAG-OUTPUT: published output {name} content differs "
-                    "from the written object"
-                )
-            # The published descriptor and its captured identity stay live
-            # through the parent directory fsync; a no-follow re-stat of the
-            # leaf afterwards rejects a substitution racing the sync.
-            os.fsync(dir_fd)
-            try:
-                published_leaf = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-            except OSError as exc:
-                raise AnalyzerError(
-                    "DIAG-OUTPUT: published output "
-                    f"{_bounded_fact(name)} disappeared while the parent "
-                    f"directory was synced: {_bounded_error_line(exc)}"
-                ) from exc
-            if (published_leaf.st_dev, published_leaf.st_ino) != (
-                published_stat.st_dev,
-                published_stat.st_ino,
-            ):
-                raise AnalyzerError(
-                    "DIAG-OUTPUT: published output "
-                    f"{_bounded_fact(name)} was substituted while the parent "
-                    "directory was synced; refusing the publication"
-                )
-        finally:
-            os.close(published)
+            published_leaf = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AnalyzerError(
+                f"DIAG-OUTPUT: published output {_bounded_fact(name)} disappeared "
+                f"after the parent directory was synced: {_bounded_error_line(exc)}"
+            ) from exc
+        if (published_leaf.st_dev, published_leaf.st_ino) != written_signature[:2]:
+            raise AnalyzerError(
+                f"DIAG-OUTPUT: published output {_bounded_fact(name)} was substituted "
+                "while the parent directory was synced; refusing the publication"
+            )
+        # Final custody proof and linearization point: a same-uid write that
+        # landed after the digest or during the leaf proof changed the
+        # retained inode's stable metadata, so this second equality check
+        # closes the post-digest window. Nothing fallible may follow it
+        # before the publication is declared complete.
+        if _fd_signature(fd) != written_signature:
+            raise AnalyzerError(
+                "DIAG-OUTPUT: published output was mutated in place while its "
+                "custody proof ran; refusing the publication"
+            )
         completed = True
     finally:
+        os.close(fd)
         if link_created and not completed:
-            # Never pathname-unlink a linked entry: a concurrent rename could
-            # redirect the unlink to a substitute. Leave the entry in place
-            # as a named orphan and report it for operator cleanup.
             print(
-                "DIAG-OUTPUT: failed publication left orphan entry "
-                f"{_bounded_fact(name)} (dev {written_inode[0]}, "
-                f"ino {written_inode[1]}) for operator cleanup",
+                "DIAG-OUTPUT: failed publication left "
+                f"{_bounded_fact(name)} (dev {written_signature[0]}, "
+                f"inode {written_signature[1]}) as a named orphan for operator cleanup",
                 file=sys.stderr,
             )
     if not link_created:
@@ -1447,8 +1445,8 @@ def _open_verified_executable(path: Path) -> tuple[int, dict[str, object]]:
             "custody is not possible"
         )
 
-    add_seals = getattr(fcntl, "F_ADD_SEALS", 1034)
-    get_seals = getattr(fcntl, "F_GET_SEALS", 1035)
+    add_seals = getattr(fcntl, "F_ADD_SEALS", 1033)
+    get_seals = getattr(fcntl, "F_GET_SEALS", 1034)
     seal_write = getattr(fcntl, "F_SEAL_WRITE", 0x8)
     seal_grow = getattr(fcntl, "F_SEAL_GROW", 0x4)
     seal_shrink = getattr(fcntl, "F_SEAL_SHRINK", 0x2)
@@ -1572,44 +1570,32 @@ def _open_verified_executable(path: Path) -> tuple[int, dict[str, object]]:
     return retained_fd, custody
 
 
-def _diagnostic_child_path(work_dirfd: int, leaf: str) -> str:
-    """Return one fixed diagnostic leaf under the inherited work anchor.
-
-    The numeric ``/proc/self/fd/<work-dirfd>/...`` string is process-local
-    child transport: it is valid only while this process holds
-    ``work_dirfd`` and is never treated as durable path provenance.
-    """
-    if not leaf or leaf in (".", "..") or os.sep in leaf:
-        raise AnalyzerError(f"DIAG-SETUP: invalid diagnostic child leaf {leaf!r}")
-    if os.altsep and os.altsep in leaf:
-        raise AnalyzerError(f"DIAG-SETUP: invalid diagnostic child leaf {leaf!r}")
-    return f"/proc/self/fd/{work_dirfd}/{leaf}"
-
-
 def _launch_diagnostic_child(
     binary: Path,
     rest_url: str,
     ceiling: int,
+    work_fd: int,
+    io_paths: dict[str, Path],
+    state_path: Path,
     storage_backend: str,
     txindex: bool,
-    *,
     binary_fd: int,
-    work_dirfd: int,
 ) -> tuple[subprocess.Popen, BinaryIO]:
-    """Launch the sealed child with the work descriptor as its namespace."""
-    proc_fd_dir = Path("/proc/self/fd")
-    if not proc_fd_dir.is_dir():
-        raise AnalyzerError(
-            "DIAG-SETUP: /proc/self/fd is unavailable; cannot execute the "
-            "verified descriptor without a pathname fallback"
-        )
+    """Launch the child by executing the sealed snapshot descriptor.
+
+    ``argv[0]`` keeps the operator-visible path string, but the execve target
+    is the held memfd's ``/proc/self/fd`` magic link. ``pass_fds`` keeps the
+    snapshot alive for a shebang interpreter and hands the child the caller's
+    work-dir descriptor at the same number, so the descriptor-rooted I/O
+    paths in argv and the environment resolve inside the held directory.
+    """
     env = os.environ.copy()
     env.update(
         {
-            "BRS_CENSUS_COUNTERS": _diagnostic_child_path(work_dirfd, "counters.json"),
-            "BRS_CENSUS_CONTEXTS": _diagnostic_child_path(work_dirfd, "brsctx1.bin"),
-            "BRS_CENSUS_RECORDS": _diagnostic_child_path(work_dirfd, "brsrec1.bin"),
-            "BRS_CENSUS_JOURNAL": _diagnostic_child_path(work_dirfd, "brsjrn1.bin"),
+            "BRS_CENSUS_CONTEXTS": str(io_paths["contexts"]),
+            "BRS_CENSUS_COUNTERS": str(io_paths["counters"]),
+            "BRS_CENSUS_RECORDS": str(io_paths["records"]),
+            "BRS_CENSUS_JOURNAL": str(io_paths["journal"]),
             "BRS_CENSUS_LABEL": "cmodern-diagnostic",
         }
     )
@@ -1627,32 +1613,29 @@ def _launch_diagnostic_child(
         "--stop-height",
         str(ceiling),
         "--data-dir",
-        _diagnostic_child_path(work_dirfd, "state"),
+        str(state_path),
         "--output",
-        _diagnostic_child_path(work_dirfd, "replay_diagnostic.json"),
+        str(io_paths["replay"]),
         "--storage-backend",
         storage_backend,
     ]
     if txindex:
         command.append("--txindex")
-
     stderr_fd = os.open(
-        "stderr.log",
+        io_paths["stderr"],
         os.O_WRONLY
         | os.O_CREAT
         | os.O_EXCL
-        | os.O_NOFOLLOW
-        | os.O_CLOEXEC
-        | os.O_NONBLOCK,
-        0o666,
-        dir_fd=work_dirfd,
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o644,
     )
-    stderr_file = os.fdopen(stderr_fd, "wb", closefd=True)
+    stderr_file = os.fdopen(stderr_fd, "wb")
     try:
         proc = subprocess.Popen(
             command,
             executable=f"/proc/self/fd/{binary_fd}",
-            pass_fds=(binary_fd, work_dirfd),
+            pass_fds=(binary_fd, work_fd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_file,
@@ -1667,17 +1650,22 @@ def _launch_diagnostic_child(
 
 
 def _validate_replay_diagnostic(
-    replay_fd: int,
-    display_path: Path,
+    path: Path,
     final: DiagnosticCheckpoint,
     ceiling: int,
     storage_backend: str,
     txindex: bool,
-    data_dir: str,
+    data_dir: str | None,
+    *,
+    dir_fd: int | None = None,
 ) -> dict[str, object]:
-    """Validate replay bytes borrowed from one retained descriptor."""
-    _child_replay_bytes, raw = _load_bounded_json_from_fd(
-        replay_fd, display_path, _REPLAY_MAX_BYTES, "child replay JSON", "DIAG-CUSTODY"
+    """Validate the child replay document from one bounded descriptor.
+
+    Returns the custody record (path, byte count, sha256) computed from
+    the exact validated bytes, so finalization never re-opens the path.
+    """
+    _child_replay_bytes, raw = _load_bounded_json_fd(
+        path, _REPLAY_MAX_BYTES, "child replay JSON", "DIAG-CUSTODY", dir_fd=dir_fd
     )
     if not isinstance(raw, dict):
         raise AnalyzerError("DIAG-CUSTODY: child replay JSON root is not an object")
@@ -1753,7 +1741,9 @@ def _validate_replay_diagnostic(
         raise AnalyzerError(
             f"DIAG-CUSTODY: txindex {_bounded_fact(raw['txindex'])} != {txindex!r}"
         )
-    if raw["data_dir"] != data_dir:
+    if not isinstance(raw["data_dir"], str):
+        raise AnalyzerError("DIAG-CUSTODY: child replay data_dir must be a string")
+    if data_dir is not None and raw["data_dir"] != data_dir:
         raise AnalyzerError(
             f"DIAG-CUSTODY: data_dir {_bounded_fact(raw['data_dir'])} != {data_dir!r}"
         )
@@ -1773,18 +1763,19 @@ def _validate_replay_diagnostic(
             f"DIAG-CUSTODY: elapsed_seconds must be non-negative, got {elapsed_f}"
         )
     return {
-        "path": str(display_path),
+        "path": str(path),
         "bytes": len(_child_replay_bytes),
         "sha256": hashlib.sha256(_child_replay_bytes).hexdigest(),
     }
 
 
 def _validate_native_counters(
-    counters_fd: int, display_path: Path, final: DiagnosticCheckpoint
+    path: Path, final: DiagnosticCheckpoint, *, dir_fd: int | None = None
 ) -> dict[str, object]:
-    """Validate counters bytes borrowed from one retained descriptor."""
-    _diag_counters_bytes, raw = _load_bounded_json_from_fd(
-        counters_fd, display_path, _COUNTERS_MAX_BYTES, "counters JSON", "DIAG-CUSTODY"
+    """Validate terminal counters from one bounded descriptor and return
+    the custody record computed from the exact validated bytes."""
+    _diag_counters_bytes, raw = _load_bounded_json_fd(
+        path, _COUNTERS_MAX_BYTES, "counters JSON", "DIAG-CUSTODY", dir_fd=dir_fd
     )
     if not isinstance(raw, dict):
         raise AnalyzerError("DIAG-CUSTODY: counters JSON root is not an object")
@@ -1800,92 +1791,104 @@ def _validate_native_counters(
                 f"DIAG-CUSTODY: counters {field} {getattr(counters, field)} != {value}"
             )
     return {
-        "path": str(display_path),
+        "path": str(path),
         "bytes": len(_diag_counters_bytes),
         "sha256": hashlib.sha256(_diag_counters_bytes).hexdigest(),
     }
 
 
 def _validate_terminal_streams(
-    artifact_fds: dict[str, int],
-    display_paths: dict[str, Path],
-    final: DiagnosticCheckpoint,
+    paths: dict[str, Path], final: DiagnosticCheckpoint, *, dir_fd: int | None = None
 ) -> dict[str, dict[str, object]]:
-    """Bind terminal framing and digests to the retained artifact fds."""
     custody: dict[str, dict[str, object]] = {}
-    stream_specs = {
-        "contexts": (CONTEXT_MAGIC, final.context_rows, final.context_end),
-        "records": (RECORD_MAGIC, final.record_rows, final.record_end),
-        "journal": (JOURNAL_MAGIC, final.journal_rows, final.journal_end),
+    rooted = {name: _rooted_io_path(path, dir_fd) for name, path in paths.items()}
+    context_iter = iter_context_inputs(rooted["contexts"])
+    for _ in context_iter:
+        continue
+    context_custody = context_iter.custody()
+    if (
+        context_custody["count"] != final.context_rows
+        or context_custody["bytes"] != final.context_end
+    ):
+        raise AnalyzerError("DIAG-CUSTODY: terminal context header/checkpoint mismatch")
+    custody["contexts"] = {
+        "path": str(paths["contexts"]),
+        "bytes": context_custody["bytes"],
+        "sha256": format(context_custody["sha256"], "064x"),
+        "body_sha256": format(context_custody["body_sha256"], "064x"),
     }
-    for name, (expected_magic, expected_count, expected_end) in stream_specs.items():
-        fd = artifact_fds[name]
-        file_size = os.fstat(fd).st_size
-        if file_size > _DIAGNOSTIC_ARTIFACT_MAX_BYTES:
+
+    record_iter, record_custody = iter_records_with_custody(rooted["records"])
+    for _ in record_iter:
+        continue
+    record_count = (record_custody["bytes"] - HEADER_SIZE) // RECORD_SIZE
+    if record_count != final.record_rows or record_custody["bytes"] != final.record_end:
+        raise AnalyzerError("DIAG-CUSTODY: terminal record header/checkpoint mismatch")
+    custody["records"] = {
+        "path": str(paths["records"]),
+        "bytes": record_custody["bytes"],
+        "sha256": format(record_custody["sha256"], "064x"),
+        "body_sha256": format(record_custody["body_sha256"], "064x"),
+    }
+
+    journal_iter, journal_custody = iter_journal_with_custody(rooted["journal"])
+    for _ in journal_iter:
+        continue
+    journal_count = (journal_custody["bytes"] - HEADER_SIZE) // JOURNAL_SIZE
+    if (
+        journal_count != final.journal_rows
+        or journal_custody["bytes"] != final.journal_end
+    ):
+        raise AnalyzerError("DIAG-CUSTODY: terminal journal header/checkpoint mismatch")
+    custody["journal"] = {
+        "path": str(paths["journal"]),
+        "bytes": journal_custody["bytes"],
+        "sha256": format(journal_custody["sha256"], "064x"),
+        "body_sha256": format(journal_custody["body_sha256"], "064x"),
+    }
+
+    sidecar_size = os.stat(rooted["sidecar"], follow_symlinks=False).st_size
+    # _validate_sidecar_terminal_fd already validated framing; derive the
+    # row count from the validated size.
+    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
+    sidecar_fd = os.open(
+        rooted["sidecar"],
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
+        if len(sidecar_header) != BRSHGT1_HEADER_STRUCT.size:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar short header")
+        magic, _ = BRSHGT1_HEADER_STRUCT.unpack(sidecar_header)
+        if magic != DIAGNOSTIC_MAGIC:
+            raise AnalyzerError("DIAG-CUSTODY: terminal sidecar wrong magic")
+        expected_size = BRSHGT1_HEADER_STRUCT.size + sidecar_count * DIAGNOSTIC_ROW_SIZE
+        if sidecar_size != expected_size:
             raise AnalyzerError(
-                f"DIAG-CUSTODY: terminal {name} size {file_size} exceeds "
-                f"{_DIAGNOSTIC_ARTIFACT_MAX_BYTES}"
+                f"DIAG-CUSTODY: terminal sidecar size {sidecar_size} != {expected_size}"
             )
-        if file_size != expected_end:
-            raise AnalyzerError(
-                f"DIAG-CUSTODY: terminal {name} size {file_size} != {expected_end}"
-            )
-        before = _fd_signature(fd)
-        header = os.pread(fd, HEADER_SIZE, 0)
-        if len(header) != HEADER_SIZE:
-            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} short header")
-        magic, declared_count = HEADER_STRUCT.unpack(header)
-        if magic != expected_magic:
-            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} wrong magic {magic!r}")
-        if declared_count != expected_count:
-            raise AnalyzerError(
-                f"DIAG-CUSTODY: terminal {name} count {declared_count} != {expected_count}"
-            )
-        full_hasher = hashlib.sha256(header)
+        full_hasher = hashlib.sha256()
         body_hasher = hashlib.sha256()
-        offset = HEADER_SIZE
-        while offset < file_size:
-            chunk = os.pread(fd, min(8 * 1024 * 1024, file_size - offset), offset)
+        full_hasher.update(sidecar_header)
+        offset = BRSHGT1_HEADER_STRUCT.size
+        body_end = expected_size
+        while offset < body_end:
+            chunk = os.pread(
+                sidecar_fd, min(8 * 1024 * 1024, body_end - offset), offset
+            )
             if not chunk:
-                raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} ended at {offset}")
+                raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
             full_hasher.update(chunk)
             body_hasher.update(chunk)
             offset += len(chunk)
-        if os.pread(fd, 1, file_size) or _fd_signature(fd) != before:
-            raise AnalyzerError(f"DIAG-CUSTODY: terminal {name} changed while hashing")
-        custody[name] = {
-            "path": str(display_paths[name]),
-            "bytes": file_size,
+        custody["sidecar"] = {
+            "path": str(paths["sidecar"]),
+            "bytes": sidecar_size,
             "sha256": full_hasher.hexdigest(),
             "body_sha256": body_hasher.hexdigest(),
         }
-
-    sidecar_fd = artifact_fds["sidecar"]
-    sidecar_size = os.fstat(sidecar_fd).st_size
-    sidecar_count = (sidecar_size - BRSHGT1_HEADER_STRUCT.size) // DIAGNOSTIC_ROW_SIZE
-    _validate_sidecar_terminal_fd(sidecar_fd, sidecar_count, final)
-    before = _fd_signature(sidecar_fd)
-    sidecar_header = os.pread(sidecar_fd, BRSHGT1_HEADER_STRUCT.size, 0)
-    full_hasher = hashlib.sha256(sidecar_header)
-    body_hasher = hashlib.sha256()
-    offset = BRSHGT1_HEADER_STRUCT.size
-    while offset < sidecar_size:
-        chunk = os.pread(
-            sidecar_fd, min(8 * 1024 * 1024, sidecar_size - offset), offset
-        )
-        if not chunk:
-            raise AnalyzerError(f"DIAG-CUSTODY: terminal sidecar ended at {offset}")
-        full_hasher.update(chunk)
-        body_hasher.update(chunk)
-        offset += len(chunk)
-    if os.pread(sidecar_fd, 1, sidecar_size) or _fd_signature(sidecar_fd) != before:
-        raise AnalyzerError("DIAG-CUSTODY: terminal sidecar changed while hashing")
-    custody["sidecar"] = {
-        "path": str(display_paths["sidecar"]),
-        "bytes": sidecar_size,
-        "sha256": full_hasher.hexdigest(),
-        "body_sha256": body_hasher.hexdigest(),
-    }
+    finally:
+        os.close(sidecar_fd)
     return custody
 
 
@@ -1918,8 +1921,7 @@ def _validate_sidecar_terminal_fd(
 
 
 def _finalize_candidate(
-    display_paths: dict[str, Path],
-    artifact_fds: dict[str, int],
+    paths: dict[str, Path],
     sidecar_row_count: int,
     final: DiagnosticCheckpoint,
     cumulative_counts: dict[str, int],
@@ -1929,11 +1931,12 @@ def _finalize_candidate(
     output_path: Path,
     storage_backend: str,
     txindex: bool,
-    data_dir: str,
+    data_dir: str | None,
     teardown: DiagnosticTeardown,
     recovery_dirfd: int,
     output_parent_fd: int,
     recovery_signatures: dict[str, tuple[int, int, int, int, int]] | None = None,
+    sidecar_fd: int | None = None,
     source_dirfd: int | None = None,
 ) -> None:
     """Validate terminal proof, finalize custody, then publish one candidate.
@@ -1950,31 +1953,34 @@ def _finalize_candidate(
     immediately before the candidate is linked through the retained
     ``output_parent_fd``.
     """
+    if sidecar_fd is None:
+        raise AnalyzerError(
+            "DIAG-CUSTODY: finalization requires the retained sidecar descriptor"
+        )
     if recovery_signatures is not None:
         for name, signature in recovery_signatures.items():
-            if _dirfd_signature(recovery_dirfd, display_paths[name].name) != signature:
+            if _dirfd_signature(recovery_dirfd, paths[name].name) != signature:
                 raise AnalyzerError(
                     f"DIAG-SALVAGE: recovery {name} changed before validation"
                 )
-    sidecar_fd = artifact_fds["sidecar"]
     declared_count = _validate_sidecar_terminal_fd(sidecar_fd, sidecar_row_count, final)
     if recovery_signatures is not None and declared_count != sidecar_row_count:
         raise AnalyzerError(
             f"DIAG-SALVAGE: recovered sidecar declared row count "
             f"{declared_count} != {sidecar_row_count}"
         )
-    stream_custody = _validate_terminal_streams(artifact_fds, display_paths, final)
+    stream_custody = _validate_terminal_streams(paths, final, dir_fd=recovery_dirfd)
     replay_custody = _validate_replay_diagnostic(
-        artifact_fds["replay"],
-        display_paths["replay"],
+        paths["replay"],
         final,
         ceiling,
         storage_backend,
         txindex,
         data_dir,
+        dir_fd=recovery_dirfd,
     )
     counters_custody = _validate_native_counters(
-        artifact_fds["counters"], display_paths["counters"], final
+        paths["counters"], final, dir_fd=recovery_dirfd
     )
     if len(first_heights) != len(CONTEXT_COUNTER_NAMES):
         raise AnalyzerError("DIAG-CUSTODY: terminal proof lacks all 11 contexts")
@@ -1996,8 +2002,7 @@ def _finalize_candidate(
     custody["counters"] = counters_custody
     finalized_recovery_signatures = {
         name: _dirfd_signature(recovery_dirfd, path.name)
-        for name, path in display_paths.items()
-        if name != "stderr"
+        for name, path in paths.items()
     }
     source_custody = teardown.source_custody
     if source_custody is not None:
@@ -2122,21 +2127,25 @@ def _finalize_candidate(
     )
     rendered = json.dumps(candidate, indent=2).encode("utf-8") + b"\n"
     for name, signature in finalized_recovery_signatures.items():
-        if _dirfd_signature(recovery_dirfd, display_paths[name].name) != signature:
+        if _dirfd_signature(recovery_dirfd, paths[name].name) != signature:
             raise AnalyzerError(
                 f"DIAG-CUSTODY: {name} changed before candidate publication"
             )
+    forbidden_ancestor: tuple[int, int] | None = None
     if source_custody is not None and source_dirfd is not None:
         # Immediately before publication: recheck the held output parent
         # against the held source identity, then link the candidate through
         # that descriptor. The checked pathname is never rewalked.
         source_anchor_stat = os.fstat(source_dirfd)
-        if _dirfd_contains_identity(
-            output_parent_fd,
-            (source_anchor_stat.st_dev, source_anchor_stat.st_ino),
-        ):
+        forbidden_ancestor = (source_anchor_stat.st_dev, source_anchor_stat.st_ino)
+        if _dirfd_contains_identity(output_parent_fd, forbidden_ancestor):
             raise AnalyzerError("DIAG-SALVAGE: output must be outside source")
-    _atomic_publish_anchored(output_parent_fd, output_path.name, rendered)
+    _atomic_publish_anchored(
+        output_parent_fd,
+        output_path.name,
+        rendered,
+        forbidden_ancestor=forbidden_ancestor,
+    )
 
 
 def _send_control(proc: subprocess.Popen, control: bytes) -> None:
@@ -2228,61 +2237,66 @@ def _run_diagnostic_scan(
     binary_fd: int | None = None,
 ) -> None:
     owned_binary_fd = False
-    output_parent_fd: int | None = None
-    work_dirfd: int | None = None
-    artifact_fds: dict[str, int] = {}
+    if binary_fd is None:
+        binary_fd, _binary_custody = _open_verified_executable(binary)
+        owned_binary_fd = True
+    # Every live diagnostic entry is created and read beneath the held
+    # work-dir descriptor, the child receives descriptor-rooted paths, and
+    # operator pathnames appear only in custody display strings.
+    output_parent = output_path.parent if str(output_path.parent) else Path(".")
+    output_parent_fd, output_missing = _walk_dirfd_nofollow(output_parent)
+    if output_missing:
+        os.close(output_parent_fd)
+        raise AnalyzerError(
+            f"DIAG-SETUP: output parent directory does not exist: {output_parent}"
+        )
+    recovery_dirfd, work_missing = _walk_dirfd_nofollow(work_dir)
+    if work_missing:
+        os.close(recovery_dirfd)
+        raise AnalyzerError(f"DIAG-SETUP: work directory component missing: {work_dir}")
+    _require_shared_source_mount(
+        recovery_dirfd,
+        (("output parent", output_parent_fd),),
+    )
+    proc_fd_dir = Path("/proc/self/fd")
+    if not proc_fd_dir.is_dir():
+        raise AnalyzerError(
+            "DIAG-SETUP: /proc/self/fd is unavailable; live diagnostics cannot "
+            "confine child I/O beneath the held work-dir descriptor"
+        )
+    paths = {
+        "contexts": work_dir / "brsctx1.bin",
+        "records": work_dir / "brsrec1.bin",
+        "journal": work_dir / "brsjrn1.bin",
+        "sidecar": work_dir / "brshgt1.bin",
+        "replay": work_dir / "replay_diagnostic.json",
+        "stderr": work_dir / "stderr.log",
+        "counters": work_dir / "counters.json",
+    }
+    held_root = _held_root(recovery_dirfd)
+    io_paths = {name: held_root / path.name for name, path in paths.items()}
+    held_state = held_root / "state"
+    os.mkdir(held_state, 0o755)
+    sidecar_fd: int | None = os.open(
+        io_paths["sidecar"],
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o644,
+    )
+    _write_brshgt1_preface(sidecar_fd)
     proc: subprocess.Popen | None = None
     stderr_file: BinaryIO | None = None
     child_closed = False
     try:
-        if binary_fd is None:
-            binary_fd, _binary_custody = _open_verified_executable(binary)
-            owned_binary_fd = True
-        output_parent = output_path.parent if str(output_path.parent) else Path(".")
-        output_parent_fd, output_missing = _walk_dirfd_nofollow(output_parent)
-        if output_missing:
-            raise AnalyzerError(
-                f"DIAG-SETUP: output parent directory does not exist: {output_parent}"
-            )
-        work_dirfd, work_missing = _walk_dirfd_nofollow(work_dir)
-        if work_missing:
-            raise AnalyzerError(
-                f"DIAG-SETUP: work directory component missing: {work_dir}"
-            )
-        _require_shared_source_mount(
-            work_dirfd,
-            (("output parent", output_parent_fd),),
-        )
-        display_paths = {
-            "contexts": work_dir / "brsctx1.bin",
-            "records": work_dir / "brsrec1.bin",
-            "journal": work_dir / "brsjrn1.bin",
-            "sidecar": work_dir / "brshgt1.bin",
-            "replay": work_dir / "replay_diagnostic.json",
-            "stderr": work_dir / "stderr.log",
-            "counters": work_dir / "counters.json",
-        }
-        os.mkdir("state", 0o777, dir_fd=work_dirfd)
-        artifact_fds["sidecar"] = os.open(
-            "brshgt1.bin",
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | os.O_CLOEXEC
-            | os.O_NONBLOCK,
-            0o644,
-            dir_fd=work_dirfd,
-        )
-        _write_brshgt1_preface(artifact_fds["sidecar"])
         proc, stderr_file = _launch_diagnostic_child(
             binary,
             rest_url,
             ceiling,
+            recovery_dirfd,
+            io_paths,
+            held_state,
             storage_backend,
             txindex,
-            binary_fd=binary_fd,
-            work_dirfd=work_dirfd,
+            binary_fd,
         )
         if proc.stdout is None:
             raise AnalyzerError("DIAG-SETUP: child stdout is not piped")
@@ -2294,29 +2308,14 @@ def _run_diagnostic_scan(
 
         while True:
             row = _read_checkpoint_row(proc.stdout)
-            if "contexts" not in artifact_fds:
-                for name in ("contexts", "records", "journal"):
-                    artifact_fds[name] = _open_custody_input(
-                        display_paths[name].name,
-                        _DIAGNOSTIC_ARTIFACT_MAX_BYTES,
-                        f"diagnostic {name}",
-                        "DIAG-CUSTODY",
-                        dir_fd=work_dirfd,
-                    )
             file_sizes = {
-                "context": os.fstat(artifact_fds["contexts"]).st_size,
-                "record": os.fstat(artifact_fds["records"]).st_size,
-                "journal": os.fstat(artifact_fds["journal"]).st_size,
+                "context": os.stat(io_paths["contexts"], follow_symlinks=False).st_size,
+                "record": os.stat(io_paths["records"], follow_symlinks=False).st_size,
+                "journal": os.stat(io_paths["journal"], follow_symlinks=False).st_size,
             }
             _validate_checkpoint_bounds(row, previous, file_sizes)
             classified, _records, _journal, _context_map, record_counts = (
-                _read_diagnostic_streams_from_fds(
-                    row,
-                    previous,
-                    artifact_fds["contexts"],
-                    artifact_fds["records"],
-                    artifact_fds["journal"],
-                )
+                _read_diagnostic_streams(row, previous, io_paths)
             )
             block_counts = {
                 **_diagnostic_spend_counts(classified),
@@ -2329,7 +2328,7 @@ def _run_diagnostic_scan(
                 first_heights,
             )
 
-            _write_brshgt1_row(artifact_fds["sidecar"], row)
+            _write_brshgt1_row(sidecar_fd, row)
             row_count += 1
             if len(first_heights) == len(CONTEXT_COUNTER_NAMES):
                 expected_h = max(first_heights.values())
@@ -2357,21 +2356,9 @@ def _run_diagnostic_scan(
         _close_stream(stderr_file)
         child_closed = True
 
-        os.fsync(artifact_fds["sidecar"])
-        for name, max_bytes in (
-            ("replay", _REPLAY_MAX_BYTES),
-            ("counters", _COUNTERS_MAX_BYTES),
-        ):
-            artifact_fds[name] = _open_custody_input(
-                display_paths[name].name,
-                max_bytes,
-                f"diagnostic {name}",
-                "DIAG-CUSTODY",
-                dir_fd=work_dirfd,
-            )
+        os.fsync(sidecar_fd)
         _finalize_candidate(
-            display_paths,
-            artifact_fds,
+            paths,
             row_count,
             row,
             cumulative_counts,
@@ -2381,24 +2368,26 @@ def _run_diagnostic_scan(
             output_path,
             storage_backend,
             txindex,
-            _diagnostic_child_path(work_dirfd, "state"),
+            str(held_state),
             teardown,
-            recovery_dirfd=work_dirfd,
+            recovery_dirfd=recovery_dirfd,
             output_parent_fd=output_parent_fd,
+            sidecar_fd=sidecar_fd,
         )
+        os.close(sidecar_fd)
+        sidecar_fd = None
+        if owned_binary_fd:
+            os.close(binary_fd)
+            binary_fd = None
     finally:
-        try:
-            if proc is not None and stderr_file is not None and not child_closed:
-                _reap_child(proc, stderr_file)
-        finally:
-            for fd in artifact_fds.values():
-                os.close(fd)
-            if owned_binary_fd and binary_fd is not None:
-                os.close(binary_fd)
-            if output_parent_fd is not None:
-                os.close(output_parent_fd)
-            if work_dirfd is not None:
-                os.close(work_dirfd)
+        if proc is not None and stderr_file is not None and not child_closed:
+            _reap_child(proc, stderr_file)
+        if sidecar_fd is not None:
+            os.close(sidecar_fd)
+        if owned_binary_fd and binary_fd is not None:
+            os.close(binary_fd)
+        os.close(output_parent_fd)
+        os.close(recovery_dirfd)
 
 
 def _diagnostic_artifact_paths(root: Path) -> dict[str, Path]:
@@ -2825,6 +2814,22 @@ def _verify_retained_files(
             raise AnalyzerError(f"DIAG-SALVAGE: {phase}: {paths[name]}")
 
 
+def _held_root(dirfd: int) -> Path:
+    """Return the one descriptor-rooted path mechanism used by a live run.
+
+    ``/proc/self/fd/<dirfd>`` re-resolves through the kernel to the held
+    directory for as long as the descriptor stays open, so every leaf
+    beneath it is reached without consulting the operator's mutable
+    pathname again.
+    """
+    return Path(f"/proc/self/fd/{dirfd}")
+
+
+def _rooted_io_path(path: Path, dir_fd: int | None) -> Path:
+    """Resolve a custody leaf beneath ``dir_fd`` when one is supplied."""
+    return path if dir_fd is None else _held_root(dir_fd) / path.name
+
+
 def _walk_dirfd_nofollow(path: Path) -> tuple[int, list[str]]:
     """Open the deepest existing ancestor of *path* without symlinks.
 
@@ -3203,6 +3208,14 @@ def _salvage_diagnostic_scan(
             "source changed during reconstruction",
             dir_fd=source_anchor,
         )
+        # Immediately before the first recovery mutation: re-prove that the
+        # held recovery directory's namespace ancestry still lies outside
+        # the protected source.
+        if _dirfd_contains_identity(recovery_dirfd, source_anchor_id):
+            raise AnalyzerError(
+                "DIAG-SALVAGE: recovery directory moved beneath the source "
+                "before materialization"
+            )
         recovery_paths, source_custody, recovery_signatures = _materialize_recovery_dir(
             source_paths,
             source_fds,
@@ -3210,6 +3223,14 @@ def _salvage_diagnostic_scan(
             source_reconstruction,
             recovery_dirfd,
         )
+        # The materialization sync just completed; re-prove that the held
+        # recovery directory still lies outside the protected source before
+        # any further custody step.
+        if _dirfd_contains_identity(recovery_dirfd, source_anchor_id):
+            raise AnalyzerError(
+                "DIAG-SALVAGE: recovery directory moved beneath the source "
+                "during materialization"
+            )
         _verify_retained_files(
             source_paths,
             source_fds,
@@ -3249,7 +3270,6 @@ def _salvage_diagnostic_scan(
         )
         _finalize_candidate(
             recovery_paths,
-            recovery_fds,
             source_reconstruction.row_count,
             source_reconstruction.final,
             source_reconstruction.cumulative_counts,
@@ -3259,11 +3279,12 @@ def _salvage_diagnostic_scan(
             output_path,
             storage_backend,
             txindex,
-            data_dir,
+            None,
             teardown,
             recovery_dirfd=recovery_dirfd,
             output_parent_fd=output_parent_fd,
             recovery_signatures=recovery_signatures,
+            sidecar_fd=recovery_fds["sidecar"],
             source_dirfd=source_anchor,
         )
         try:
@@ -5214,57 +5235,33 @@ def _read_exact_with_signature(fd: int, size: int, label: str) -> bytes:
     return data
 
 
-def _load_bounded_json_from_fd(
-    fd: int,
-    display_path: Path,
+def _load_bounded_json_fd(
+    path: Path,
     max_bytes: int,
     label: str,
     scope: str = "CTX-CUSTODY",
+    *,
+    dir_fd: int | None = None,
 ) -> tuple[bytes, object]:
-    """Read and parse bounded JSON while borrowing one retained fd."""
-    input_stat = os.fstat(fd)
-    if not stat_module.S_ISREG(input_stat.st_mode):
-        raise AnalyzerError(f"{scope}: {label} {display_path} is not a regular file")
-    if input_stat.st_size > max_bytes:
-        raise AnalyzerError(
-            f"{scope}: {label} {display_path} is {input_stat.st_size} bytes; "
-            f"the bounded ceiling is {max_bytes}"
+    """Read one bounded JSON custody input from a single descriptor.
+
+    The bytes are read exactly once from the contract-open fd and parsed
+    from that buffer; recursion overflows become ``AnalyzerError`` instead
+    of leaking an unbounded resource failure.
+    """
+    rooted_path = _rooted_io_path(path, dir_fd)
+    fd = _open_custody_input(rooted_path, max_bytes, label, scope)
+    try:
+        input_stat = os.fstat(fd)
+        data = _read_exact_with_signature(
+            fd, input_stat.st_size, f"{scope}: {label} {path}"
         )
-    before = _fd_signature(fd)
-    chunks: list[bytes] = []
-    offset = 0
-    while offset < input_stat.st_size:
-        chunk = os.pread(fd, min(1 << 20, input_stat.st_size - offset), offset)
-        if not chunk:
-            raise AnalyzerError(
-                f"{scope}: {label} {display_path} shrank while being read"
-            )
-        chunks.append(chunk)
-        offset += len(chunk)
-    if os.pread(fd, 1, input_stat.st_size):
-        raise AnalyzerError(f"{scope}: {label} {display_path} grew while being read")
-    if _fd_signature(fd) != before:
-        raise AnalyzerError(
-            f"{scope}: {label} {display_path} changed identity or metadata while being read"
-        )
-    data = b"".join(chunks)
+    finally:
+        os.close(fd)
     try:
         return data, json.loads(data, object_pairs_hook=_reject_duplicate_keys)
     except RecursionError as exc:
-        raise AnalyzerError(
-            f"{scope}: {label} {display_path} nests JSON too deeply"
-        ) from exc
-
-
-def _load_bounded_json_fd(
-    path: Path, max_bytes: int, label: str, scope: str = "CTX-CUSTODY"
-) -> tuple[bytes, object]:
-    """Open one bounded JSON input and delegate parsing to its retained fd."""
-    fd = _open_custody_input(path, max_bytes, label, scope)
-    try:
-        return _load_bounded_json_from_fd(fd, path, max_bytes, label, scope)
-    finally:
-        os.close(fd)
+        raise AnalyzerError(f"{scope}: {label} {path} nests JSON too deeply") from exc
 
 
 def _read_manifest_bounded(path: Path) -> bytes:

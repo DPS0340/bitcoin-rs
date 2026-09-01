@@ -17,6 +17,11 @@
 //! - the `bitcoin-rs` binary itself, spawned below, must exit non-zero on an
 //!   invalid combination with the literal dependency error and without any
 //!   sign of networking.
+//!
+//! Named in `docs/contracts/extensions.md` "Proven by": the binary arm pins
+//! `EXT-02` (validation literals refuse an invalid combination before
+//! `NodeState::open` or any listener binds); the test arms pin `EXT-03`
+//! (a failing or lagging consumer never blocks the apply path).
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -41,7 +41,7 @@ fn bootstrap_drain_was_reached() -> bool {
     BOOTSTRAP_DRAIN_REACHED.with(std::cell::Cell::take)
 }
 
-const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 const BOOTSTRAP_JOIN_DEADLINE: Duration = Duration::from_secs(1);
 const RPC_MAX_CONNECTIONS: usize = 128;
 const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -140,6 +140,7 @@ fn spawn_p2p_listeners(
     banned: BannedSubnets,
     inbound_headers_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundHeaders>,
     inbound_blocks_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundBlock>,
+    inbound_tx_tx: crossbeam_channel::Sender<bitcoin_rs_p2p::InboundTx>,
     sync_wake_tx: crossbeam_channel::Sender<()>,
     chain_query: P2pChainQuery,
     peer_registered: Arc<
@@ -160,6 +161,7 @@ fn spawn_p2p_listeners(
         let listener_banned = Arc::clone(&banned);
         let listener_inbound_headers_tx = inbound_headers_tx.clone();
         let listener_inbound_blocks_tx = inbound_blocks_tx.clone();
+        let listener_inbound_tx_tx = inbound_tx_tx.clone();
         let listener_sync_wake_tx = sync_wake_tx.clone();
         let listener_chain_query = Arc::clone(&chain_query);
         let listener_peer_registered = Arc::clone(&peer_registered);
@@ -175,6 +177,7 @@ fn spawn_p2p_listeners(
                     listener_peer_outbound,
                     listener_inbound_headers_tx,
                     listener_inbound_blocks_tx,
+                    listener_inbound_tx_tx,
                     listener_banned,
                     Some(listener_chain_query),
                     Some(listener_sync_wake_tx),
@@ -243,13 +246,13 @@ fn spawn_p2p_outbound_drain(
     let outbound_peer_outbound = state.peer_outbound();
     let outbound_banned = state.banned_subnets();
     let outbound_headers_tx = state.inbound_headers_sender();
-    let outbound_peer_registered = Arc::clone(&peer_registered);
+    let outbound_tx_tx = state.inbound_tx_sender();
     let outbound_blocks_tx = state.inbound_blocks_sender();
     let outbound_sync_wake_tx = sync_wake_tx;
     let outbound_shutdown = Arc::clone(shutdown);
     let outbound_chain_query = Arc::clone(&chain_query);
+    let outbound_peer_registered = Arc::clone(&peer_registered);
     let outbound_network_active = state.network_active();
-
     Ok(std::thread::Builder::new()
         .name("bitcoin-rs-p2p-outbound-drain".to_owned())
         .spawn(move || {
@@ -278,7 +281,6 @@ fn spawn_p2p_outbound_drain(
                             &outbound_registry,
                             &outbound_peer_outbound,
                         ) {
-                            tracing::debug!(addr = %addr, "p2p outbound request skipped: already active");
                             continue;
                         }
                         let handle = bitcoin_rs_p2p::listener::spawn_outbound_connection_with_chain_and_sync_wake(
@@ -288,6 +290,7 @@ fn spawn_p2p_outbound_drain(
                             Arc::clone(&outbound_peer_outbound),
                             outbound_headers_tx.clone(),
                             outbound_blocks_tx.clone(),
+                            outbound_tx_tx.clone(),
                             Arc::clone(&outbound_banned),
                             Arc::clone(&outbound_network_active),
                             Some(Arc::clone(&outbound_chain_query)),
@@ -602,7 +605,7 @@ pub fn run(mut config: Config) -> Result<()> {
 
     let injected_shutdown = config.shutdown_signal.take();
     crate::extensions::validate_extensions(&config)?;
-    let state = NodeState::open(config)?;
+    let mut state = NodeState::open(config)?;
     if state.resume_source() != crate::state::ResumeSource::Checkpoint {
         crash_recovery::recover_if_needed(&state)?;
     }
@@ -724,6 +727,7 @@ pub fn run(mut config: Config) -> Result<()> {
         Arc::clone(&banned),
         state.inbound_headers_sender(),
         state.inbound_blocks_sender(),
+        state.inbound_tx_sender(),
         sync_wake_tx.clone(),
         Arc::clone(&p2p_chain_query),
         Arc::clone(&peer_registered),
@@ -735,6 +739,13 @@ pub fn run(mut config: Config) -> Result<()> {
         Arc::clone(&p2p_chain_query),
         Arc::clone(&peer_registered),
     )?;
+    let tx_ingress_worker = crate::tx_ingress::spawn_tx_ingress_consumer(
+        &state,
+        Arc::clone(&mempool_gateway),
+        Arc::clone(&mining_control),
+        Arc::clone(&shutdown),
+        state.inbound_tx_rx_handle(),
+    );
     let bootstrap_worker = if state.config().connect.is_empty() {
         spawn_dns_peer_maintenance(
             state.config(),
@@ -747,6 +758,9 @@ pub fn run(mut config: Config) -> Result<()> {
         spawn_fixed_peer_bootstrap(&state, &shutdown)?
     };
     loop_handle.spin(&shutdown)?;
+    // Bounded index-worker shutdown: request both shutdowns, wait up to
+    // `DRAIN_DEADLINE` for clean join, detach on expiry.
+    state.bounded_index_shutdown(DRAIN_DEADLINE);
     match rpc_thread.join() {
         Ok(Ok(())) => tracing::info!("rpc listener exited cleanly"),
         Ok(Err(error)) => tracing::warn!(%error, "rpc listener exited with i/o error"),
@@ -770,6 +784,11 @@ pub fn run(mut config: Config) -> Result<()> {
         tracing::info!("P2P outbound drain exited cleanly");
     } else {
         tracing::error!("P2P outbound drain panicked");
+    }
+    if matches!(tx_ingress_worker.join(), Ok(())) {
+        tracing::info!("tx ingress consumer exited cleanly");
+    } else {
+        tracing::error!("tx ingress consumer panicked");
     }
     shutdown::drain_and_shutdown(DRAIN_DEADLINE)?;
     // Attempt the clean checkpoint before joining the bootstrap worker, but defer

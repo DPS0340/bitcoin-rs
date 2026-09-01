@@ -72,16 +72,20 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # Compile exactly the 7 retained Criterion targets. Bin package has no bench
+      # targets; all benchmarks live in their own crates. No allocator A/B lane:
+      # the `bench-mimalloc` feature and duplicate compile were retired by #224
+      # (bench-only mimalloc was a campaign artefact, not production). After #225
+      # the script_index bench is added to this list.
       - run: |
-          cargo bench -p bitcoin-rs --no-run \
-            --no-default-features --features "${FULL_NODE_FEATURES}"
-      # Crate-level bench targets are unreachable from -p bitcoin-rs; compile
-      # them in both allocator configurations so bench-mimalloc breakage is
-      # visible to CI.
-      - run: cargo bench -p bitcoin-rs-utxo --no-run
-      - run: |
-          cargo bench -p bitcoin-rs-utxo --no-run \
-            --features bench-mimalloc
+          cargo bench -p bitcoin-rs-consensus --no-run --no-default-features --bench merkle
+          cargo bench -p bitcoin-rs-consensus --no-run --no-default-features --bench verify_tx
+          cargo bench -p bitcoin-rs-storage   --no-run --no-default-features --features fjall --bench kvstore_backends
+          cargo bench -p bitcoin-rs-utxo     --no-run --no-default-features --features fjall --bench record_codec
+          cargo bench -p bitcoin-rs-utxo     --no-run --no-default-features --features fjall --bench utxo_commit
+          cargo bench -p bitcoin-rs-mining   --no-run --no-default-features --bench candidate
+          cargo bench -p bitcoin-rs-node     --no-run --no-default-features --features fjall --bench sync_pipeline
+
 
   # The imported qa-assets corpora (fuzz/corpus/, provenance in
   # fuzz/CORPUS_PROVENANCE.md) only pay off if they are exercised: build every

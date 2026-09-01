@@ -1,3 +1,10 @@
+//! Query-gating tests for the txindex query engine: the ready invariant
+//! (`ready ⇔ cursor == applied_tip` on the active chain), watermark and
+//! revision ABA detection, and refusal (`Retry`/`Unavailable`) of stale,
+//! rival-tip, or torn reads.
+//!
+//! Named proving surface of `docs/contracts/indexing.md` `IDX-03` (query
+//! gating and snapshot consistency).
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwapOption;

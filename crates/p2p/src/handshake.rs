@@ -210,7 +210,7 @@ mod tests {
 
     use super::{Peer, PeerError, PeerState, run_inbound_handshake, version_message};
     use crate::handshake::feature_messages;
-    use crate::wire::{Message, write_message};
+    use crate::wire::{Message, read_message, write_message};
 
     struct ScriptedStream {
         inbound: Cursor<Vec<u8>>,
@@ -279,25 +279,24 @@ mod tests {
             !peer.stream.written.is_empty(),
             "wire responses are written"
         );
-
-        let outbound_version = peer
-            .receiver
-            .try_recv()
-            .map_err(|_| PeerError::Protocol("missing outbound version"))?;
+        // Decode the wire bytes written during the handshake to verify the
+        // outbound message sequence: Version, feature messages, Verack.
+        let mut written = Cursor::new(std::mem::take(&mut peer.stream.written));
+        let outbound_version = read_message(&mut written, magic)
+            .map_err(|_| PeerError::Protocol("missing outbound version"))?
+            .0;
         assert!(matches!(outbound_version, Message::Version(_)));
 
         for expected in feature_messages() {
-            let actual = peer
-                .receiver
-                .try_recv()
-                .map_err(|_| PeerError::Protocol("missing outbound feature message"))?;
+            let actual = read_message(&mut written, magic)
+                .map_err(|_| PeerError::Protocol("missing outbound feature message"))?
+                .0;
             assert_eq!(actual, expected);
         }
 
-        let outbound_verack = peer
-            .receiver
-            .try_recv()
-            .map_err(|_| PeerError::Protocol("missing outbound verack"))?;
+        let outbound_verack = read_message(&mut written, magic)
+            .map_err(|_| PeerError::Protocol("missing outbound verack"))?
+            .0;
         assert_eq!(outbound_verack, Message::Verack);
 
         Ok(())

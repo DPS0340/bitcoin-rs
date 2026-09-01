@@ -28,8 +28,9 @@ fn serve_with_shutdown_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
         crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let (inbound_blocks_tx, _inbound_blocks_rx) =
         crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundBlock>();
+    let (inbound_tx_tx, _inbound_tx_rx) =
+        crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundTx>();
     let banned = Arc::new(parking_lot::RwLock::new(Vec::new()));
-
     let listener_outbound = Arc::clone(&outbound);
     let listener_banned = Arc::clone(&banned);
     let listener_network_active = Arc::clone(&network_active);
@@ -43,6 +44,7 @@ fn serve_with_shutdown_exits_when_flag_set() -> Result<(), Box<dyn Error>> {
             listener_outbound,
             inbound_headers_tx,
             inbound_blocks_tx,
+            inbound_tx_tx,
             listener_banned,
         );
         let _ = tx.send(result);
@@ -106,8 +108,9 @@ fn serve_with_shutdown_returns_without_accepting_when_flag_preset() -> Result<()
         crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundHeaders>();
     let (inbound_blocks_tx, _inbound_blocks_rx) =
         crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundBlock>();
+    let (inbound_tx_tx, _inbound_tx_rx) =
+        crossbeam_channel::unbounded::<bitcoin_rs_p2p::InboundTx>();
     let banned = Arc::new(parking_lot::RwLock::new(Vec::new()));
-
     let handle = thread::spawn(move || {
         let result = serve_with_shutdown(
             addr,
@@ -118,6 +121,7 @@ fn serve_with_shutdown_returns_without_accepting_when_flag_preset() -> Result<()
             outbound,
             inbound_headers_tx,
             inbound_blocks_tx,
+            inbound_tx_tx,
             banned,
         );
         let _ = tx.send(result);

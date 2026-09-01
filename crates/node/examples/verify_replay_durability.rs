@@ -11,16 +11,17 @@
 //! already exist and is resolved once with no-follow descriptors, refused
 //! if that walk reaches the anchored data directory or sits on a different
 //! mount than the store (descriptor `statx` mount IDs, failing closed), and
-//! the proof is published only through the retained descriptor with a
-//! post-fsync no-follow identity proof against the still-held unnamed
-//! inode. `--self-test-anchor` proves these properties on
-//! any host without a store.
+//! the proof is published only through the retained descriptor: after the
+//! parent fsync, the publication re-proves ancestry plus the retained
+//! inode's stable metadata and content digest before the no-follow identity
+//! proof against that still-held unnamed inode. `--self-test-anchor` proves
+//! these properties on any host without a store.
 
 #![allow(missing_docs)]
 #![allow(clippy::print_stdout)]
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -357,7 +358,12 @@ impl AnchoredDir {
 /// existing parent, resolves it once with no-follow descriptors, refuses
 /// any output whose walk reaches the anchored data directory by
 /// device/inode or whose parent sits on another mount, and publishes only
-/// through the retained descriptor.
+/// through the retained descriptor. Publication re-proves ancestry after
+/// the parent fsync — a reparent beneath the anchored directory is refused
+/// loudly with the leaf still linked — and requires the retained inode's
+/// stable metadata and content to match the written bytes before the
+/// no-follow leaf identity check, then re-proves that metadata once more
+/// as the final linearization proof.
 struct AnchoredOutput<'a> {
     /// The anchored data directory: publication must never reach it.
     anchor: &'a AnchoredDir,
@@ -453,11 +459,16 @@ impl<'a> AnchoredOutput<'a> {
     /// Publishes `bytes` at the prepared leaf through the retained
     /// descriptor; no pathname is re-resolved. The ancestry proof is redone
     /// from the held fd, the mount equality is re-proved, and the retained
-    /// unnamed inode stays live through the parent fsync: after that sync
-    /// the published leaf is re-statted no-follow and must still be that
-    /// inode. Directory descriptors preserve identity, not namespace
-    /// immutability; a process that can rename the parent can still move it
-    /// between any userspace check and `linkat`.
+    /// read-write unnamed inode stays live through the parent fsync: after
+    /// that sync the publication re-proves ancestry, requires the retained
+    /// inode's metadata and content to still match the written bytes,
+    /// re-stats the published leaf no-follow as that same inode, and closes
+    /// with a second full metadata comparison of the retained inode — the
+    /// linearization point, with no fallible custody check after it.
+    /// Directory descriptors preserve identity, not namespace immutability;
+    /// the one userspace window that remains opens at `linkat` and closes
+    /// with the post-fsync proofs, which the retained inode makes
+    /// deterministic.
     fn publish(&self, bytes: &[u8]) -> Result<()> {
         self.publish_with_post_fsync(bytes, |_, _| Ok(()))
     }
@@ -504,7 +515,7 @@ impl<'a> AnchoredOutput<'a> {
             bounded_path_context(&self.operator_output)
         );
 
-        let (written, written_identity) = self.write_and_link(bytes)?;
+        let (written, written_stat) = self.write_and_link(bytes)?;
         rustix::fs::fsync(&self.parent_fd).with_context(|| {
             format!(
                 "sync output-parent directory: {}",
@@ -513,6 +524,48 @@ impl<'a> AnchoredOutput<'a> {
         })?;
         after_parent_fsync(&self.parent_fd, &self.leaf)?;
 
+        // Post-fsync proofs, in order: ancestry (reparenting beneath the
+        // anchor is source contamination), then the retained inode's
+        // metadata, then its content, then the no-follow leaf identity
+        // tying the published name to the proven inode, and finally a
+        // second full metadata comparison as the linearization point — an
+        // in-place write that slipped past the content proof still moves
+        // mtime/ctime, and nothing fallible runs after it.
+        ensure_ancestry_outside_anchor(self.anchor, &self.parent_fd, &self.operator_output)?;
+        let live_stat = rustix::fs::fstat(&written).context("fstat retained output inode")?;
+        let stable_metadata = (
+            live_stat.st_dev,
+            live_stat.st_ino,
+            live_stat.st_size,
+            live_stat.st_mtime,
+            live_stat.st_mtime_nsec,
+            live_stat.st_ctime,
+            live_stat.st_ctime_nsec,
+        ) == (
+            written_stat.st_dev,
+            written_stat.st_ino,
+            written_stat.st_size,
+            written_stat.st_mtime,
+            written_stat.st_mtime_nsec,
+            written_stat.st_ctime,
+            written_stat.st_ctime_nsec,
+        );
+        ensure!(
+            stable_metadata,
+            "post-fsync output inode was mutated in place; refusing publication: {}",
+            bounded_path_context(&self.operator_output)
+        );
+        written
+            .seek(io::SeekFrom::Start(0))
+            .context("rewind retained output inode")?;
+        let mut reread = Vec::new();
+        written
+            .read_to_end(&mut reread)
+            .context("reread retained output inode")?;
+        ensure!(
+            Sha256::digest(&reread) == Sha256::digest(bytes),
+            "post-fsync output content differs from the written object; refusing in-place mutation"
+        );
         let published = rustix::fs::statat(&self.parent_fd, &self.leaf, AtFlags::SYMLINK_NOFOLLOW)
             .with_context(|| {
                 format!(
@@ -521,8 +574,37 @@ impl<'a> AnchoredOutput<'a> {
                 )
             })?;
         ensure!(
-            (published.st_dev, published.st_ino) == written_identity,
+            (published.st_dev, published.st_ino) == (written_stat.st_dev, written_stat.st_ino),
             "post-fsync output identity differs from the still-held written inode; refusing substitution: {}",
+            bounded_path_context(&self.operator_output)
+        );
+
+        // Linearization point: re-fstat the retained inode and require the
+        // full baseline tuple unchanged. An in-place write that landed
+        // after the content proof still moves mtime/ctime — ctime cannot
+        // be forged back by a same-uid writer — and no fallible custody
+        // check follows this one.
+        let final_stat = rustix::fs::fstat(&written).context("fstat retained output inode")?;
+        let final_unchanged = (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_size,
+            final_stat.st_mtime,
+            final_stat.st_mtime_nsec,
+            final_stat.st_ctime,
+            final_stat.st_ctime_nsec,
+        ) == (
+            written_stat.st_dev,
+            written_stat.st_ino,
+            written_stat.st_size,
+            written_stat.st_mtime,
+            written_stat.st_mtime_nsec,
+            written_stat.st_ctime,
+            written_stat.st_ctime_nsec,
+        );
+        ensure!(
+            final_unchanged,
+            "post-fsync output inode was mutated after its content proof; refusing publication: {}",
             bounded_path_context(&self.operator_output)
         );
         drop(written);
@@ -530,13 +612,18 @@ impl<'a> AnchoredOutput<'a> {
     }
 
     /// Writes and syncs one unnamed inode in the held parent and hard links it
-    /// to the leaf without replacement. The returned file keeps that inode
-    /// alive until publication has been directory-synced and re-verified.
-    fn write_and_link(&self, bytes: &[u8]) -> Result<(std::fs::File, (u64, u64))> {
+    /// to the leaf without replacement. The scratch descriptor is opened
+    /// read-write so publication can re-read the inode for its post-fsync
+    /// metadata and content proofs; the returned full stat — captured after
+    /// the link lands, because `linkat` itself bumps the inode's `ctime` —
+    /// is the snapshot those proofs compare against. The returned file
+    /// keeps that inode alive until publication has been directory-synced
+    /// and re-verified.
+    fn write_and_link(&self, bytes: &[u8]) -> Result<(std::fs::File, rustix::fs::Stat)> {
         let written = rustix::fs::openat(
             &self.parent_fd,
             ".",
-            OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .with_context(|| {
@@ -550,7 +637,6 @@ impl<'a> AnchoredOutput<'a> {
             .write_all(bytes)
             .context("write unnamed output bytes")?;
         written.sync_all().context("sync unnamed output bytes")?;
-        let written_stat = rustix::fs::fstat(&written).context("fstat unnamed output")?;
         // Keep the unavoidable namespace race window to one syscall. The
         // early check above prevents any output mutation when reparenting
         // is already visible.
@@ -572,7 +658,11 @@ impl<'a> AnchoredOutput<'a> {
                 error.into()
             }
         })?;
-        Ok((written, (written_stat.st_dev, written_stat.st_ino)))
+        // The metadata baseline is captured after the link lands: `linkat`
+        // itself bumps the inode's `ctime`, so a pre-link snapshot would
+        // fail every honest publication's post-fsync metadata proof.
+        let written_stat = rustix::fs::fstat(&written).context("fstat unnamed output")?;
+        Ok((written, written_stat))
     }
 
     /// No-follow stat of the final leaf relative to the held parent:
@@ -752,6 +842,8 @@ struct OutputSelfTestEvidence {
     nested_rejection: String,
     swapped_publication: String,
     post_fsync_substitution_rejection: String,
+    post_fsync_inplace_rejection: String,
+    reparented_ancestry_rejection: String,
 }
 
 /// Swap the data-dir pathname out from under a held anchor and prove the
@@ -781,6 +873,14 @@ fn anchor_self_test() -> Result<()> {
     println!(
         "  post-fsync leaf substitution rejected: {}",
         output.post_fsync_substitution_rejection
+    );
+    println!(
+        "  post-fsync same-inode overwrite rejected: {}",
+        output.post_fsync_inplace_rejection
+    );
+    println!(
+        "  reparent-under-anchor publication rejected: {}",
+        output.reparented_ancestry_rejection
     );
     println!(
         "anchor self-test: held (dev {}, ino {}) stayed authoritative across the pathname swap",
@@ -858,9 +958,11 @@ fn anchor_self_test_in(base: &Path, anchor: &AnchoredDir) -> Result<AnchorSelfTe
 
 /// Proves the output custody cases against a live anchor: an absent
 /// nested output path beneath the data directory is refused before its
-/// missing parents or leaf are created, and a parent pathname swapped
-/// after preparation cannot redirect publication away from the retained
-/// descriptor.
+/// missing parents or leaf are created, a parent pathname swapped after
+/// preparation cannot redirect publication away from the retained
+/// descriptor, and after the parent fsync a substituted leaf, a
+/// same-inode overwrite, and a reparent of the output directory beneath
+/// the anchored data directory are each refused.
 fn output_self_test_in(base: &Path, anchor: &AnchoredDir) -> Result<OutputSelfTestEvidence> {
     // Case 1: the walk reaches the anchored inode at `store.moved`
     // itself, so both missing components and the leaf must never be
@@ -918,11 +1020,77 @@ fn output_self_test_in(base: &Path, anchor: &AnchoredDir) -> Result<OutputSelfTe
         "self-test did not substitute the published leaf at the intended seam"
     );
 
+    // Case 4: overwrite the linked leaf in place during the post-fsync
+    // hook. The inode identity is unchanged, so only the retained
+    // read-write descriptor can prove the mutation: the metadata guard
+    // fires because ctime cannot be forged back, and the content digest is
+    // the depth layer behind it.
+    let overwrite_dir = base.join("overwrite");
+    std::fs::create_dir_all(&overwrite_dir)?;
+    let overwrite = AnchoredOutput::prepare(anchor, &overwrite_dir.join("proof.json"))?;
+    let post_fsync_inplace_rejection =
+        match overwrite.publish_with_post_fsync(b"original-proof", |parent_fd, leaf| {
+            let tampered = rustix::fs::openat(
+                parent_fd,
+                leaf,
+                OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .context("self-test open linked leaf for in-place overwrite")?;
+            let mut tampered = std::fs::File::from(tampered);
+            tampered
+                .write_all(b"tampered-proof")
+                .context("self-test overwrite linked leaf in place")?;
+            tampered
+                .sync_all()
+                .context("self-test sync overwritten leaf")?;
+            Ok(())
+        }) {
+            Ok(()) => bail!("post-fsync in-place overwrite was accepted"),
+            Err(error) => error.to_string(),
+        };
+    ensure!(
+        post_fsync_inplace_rejection.contains("mutated in place"),
+        "in-place overwrite was rejected for the wrong reason: {post_fsync_inplace_rejection}"
+    );
+    ensure!(
+        std::fs::read(overwrite_dir.join("proof.json"))?.as_slice() == b"tampered-proof",
+        "self-test did not overwrite the linked leaf at the intended seam"
+    );
+
+    // Case 5: reparent the held output directory beneath the anchored data
+    // directory while the publication syncs. The leaf is already linked, so
+    // the post-fsync ancestry re-proof must catch the contamination even
+    // though every earlier check passed.
+    let demote_dir = base.join("demote-me");
+    std::fs::create_dir_all(&demote_dir)?;
+    let demoted = AnchoredOutput::prepare(anchor, &demote_dir.join("proof.json"))?;
+    let demoted_under_anchor = base.join("store.moved").join("demoted");
+    let reparented_ancestry_rejection =
+        match demoted.publish_with_post_fsync(b"original-proof", |_, _| {
+            std::fs::rename(&demote_dir, &demoted_under_anchor)
+                .context("self-test reparent output directory under the anchor")?;
+            Ok(())
+        }) {
+            Ok(()) => bail!("reparented-under-anchor publication was accepted"),
+            Err(error) => error.to_string(),
+        };
+    ensure!(
+        reparented_ancestry_rejection.contains("ancestry reached the anchored data directory"),
+        "reparent-under-anchor was rejected for the wrong reason: {reparented_ancestry_rejection}"
+    );
+    ensure!(
+        std::fs::read(demoted_under_anchor.join("proof.json"))?.as_slice() == b"original-proof",
+        "reparented publication did not land beneath the anchored directory"
+    );
+
     Ok(OutputSelfTestEvidence {
         nested_rejection,
         swapped_publication: "published via the retained descriptor, not the swapped pathname"
             .to_string(),
         post_fsync_substitution_rejection,
+        post_fsync_inplace_rejection,
+        reparented_ancestry_rejection,
     })
 }
 

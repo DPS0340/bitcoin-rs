@@ -2,13 +2,13 @@
 //! durability path, and explicit budgeted cache sizes are configured verbatim
 //! (no backend floor may raise a share above its allocation).
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use bitcoin_rs_storage::cache_budget::{MIN_DBCACHE_BYTES, split_cache_budget};
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
+use bitcoin_rs_storage::{ColumnFamily, KvStore, StorageError, WriteBatch};
 use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder,
     SharedString, Unit,
@@ -140,10 +140,24 @@ fn cache_capacity(backend: &str) -> String {
     format!("storage.cache_capacity_bytes{{backend=\"{backend}\"}}")
 }
 
-fn put_one_row(store: &impl KvStore) {
+fn assert_cache_capacity(
+    recorder: &LabeledRecorder,
+    backend: &str,
+    share: u64,
+) -> Result<(), std::num::TryFromIntError> {
+    let expected = f64::from(u32::try_from(share)?);
+    assert_eq!(
+        recorder.gauge(&cache_capacity(backend)).to_bits(),
+        expected.to_bits()
+    );
+    Ok(())
+}
+
+#[cfg(any(feature = "fjall", feature = "rocksdb", feature = "mdbx"))]
+fn put_one_row(store: &impl KvStore) -> Result<(), StorageError> {
     let mut batch = store.new_batch();
     batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-    store.write(batch).expect("batch write");
+    store.write(batch)
 }
 
 #[test]
@@ -152,12 +166,12 @@ fn fjall_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Er
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), filters_share())?;
-    metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        put_one_row(&store)?;
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
-    });
+        store.write_durable(batch)
+    })?;
     assert_eq!(recorder.counter(&writes_total("fjall", "default")), 1);
     assert_eq!(recorder.counter(&writes_total("fjall", "durable")), 1);
     assert_eq!(
@@ -174,11 +188,11 @@ fn fjall_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::err
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
-    metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), share)
-            .expect("fjall open with budgeted share");
-    });
-    assert_eq!(recorder.gauge(&cache_capacity("fjall")), share as f64);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        let _store = bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), share)?;
+        Ok(())
+    })?;
+    assert_cache_capacity(&recorder, "fjall", share)?;
     Ok(())
 }
 
@@ -188,14 +202,14 @@ fn redb_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Err
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), filters_share())?;
-    metrics::with_local_recorder(&recorder, || {
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
         let mut deferred = store.new_batch();
         deferred.put(ColumnFamily::BlockBodies, b"deferred-key", b"value");
-        store.write_deferred(deferred).expect("deferred write");
+        store.write_deferred(deferred)?;
         let mut durable = store.new_batch();
         durable.put(ColumnFamily::BlockBodies, b"durable-key", b"value");
-        store.write_durable(durable).expect("durable write");
-    });
+        store.write_durable(durable)
+    })?;
     assert_eq!(recorder.counter(&writes_total("redb", "deferred")), 1);
     assert_eq!(recorder.counter(&writes_total("redb", "durable")), 1);
     assert_eq!(
@@ -212,11 +226,11 @@ fn redb_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::erro
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
-    metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), share)
-            .expect("redb open with budgeted share");
-    });
-    assert_eq!(recorder.gauge(&cache_capacity("redb")), share as f64);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        let _store = bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), share)?;
+        Ok(())
+    })?;
+    assert_cache_capacity(&recorder, "redb", share)?;
     Ok(())
 }
 
@@ -227,14 +241,11 @@ fn redb_txindex_wrapper_configures_the_budgeted_share_verbatim()
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
-    metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::open_redb_tx_index_store_with_cache(dir.path(), share)
-            .expect("redb txindex open with budgeted share");
-    });
-    assert_eq!(
-        recorder.gauge(&cache_capacity("redb-txindex")),
-        share as f64
-    );
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        let _store = bitcoin_rs_storage::open_redb_tx_index_store_with_cache(dir.path(), share)?;
+        Ok(())
+    })?;
+    assert_cache_capacity(&recorder, "redb-txindex", share)?;
     Ok(())
 }
 
@@ -244,15 +255,15 @@ fn rocksdb_deferred_and_durable_writes_count_once() -> Result<(), Box<dyn std::e
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), filters_share())?;
-    metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        put_one_row(&store)?;
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_deferred(batch).expect("deferred write");
+        store.write_deferred(batch)?;
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
-    });
+        store.write_durable(batch)
+    })?;
     // Each durability path counts exactly once: write_deferred must not leak a
     // second increment through the default write path it delegates to.
     assert_eq!(recorder.counter(&writes_total("rocksdb", "default")), 1);
@@ -272,11 +283,11 @@ fn rocksdb_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::e
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
-    metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), share)
-            .expect("rocksdb open with budgeted share");
-    });
-    assert_eq!(recorder.gauge(&cache_capacity("rocksdb")), share as f64);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        let _store = bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), share)?;
+        Ok(())
+    })?;
+    assert_cache_capacity(&recorder, "rocksdb", share)?;
     Ok(())
 }
 
@@ -286,12 +297,12 @@ fn mdbx_durable_write_counts_once() -> Result<(), Box<dyn std::error::Error>> {
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), filters_share())?;
-    metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        put_one_row(&store)?;
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
-    });
+        store.write_durable(batch)
+    })?;
     // write_durable must not leak a second increment through the default write
     // path it delegates to.
     assert_eq!(recorder.counter(&writes_total("mdbx", "durable")), 1);
@@ -310,10 +321,10 @@ fn mdbx_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::erro
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let share = filters_share();
-    metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), share)
-            .expect("mdbx open with budgeted share");
-    });
-    assert_eq!(recorder.gauge(&cache_capacity("mdbx")), share as f64);
+    metrics::with_local_recorder(&recorder, || -> Result<(), StorageError> {
+        let _store = bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), share)?;
+        Ok(())
+    })?;
+    assert_cache_capacity(&recorder, "mdbx", share)?;
     Ok(())
 }

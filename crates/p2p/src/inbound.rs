@@ -1,6 +1,6 @@
 //! Inbound payloads received from peers.
 
-use bitcoin_rs_primitives::{Block, Header, consensus_bytes};
+use bitcoin_rs_primitives::{Block, Header, Tx, consensus_bytes};
 
 /// A block received from a peer with its wire payload preserved.
 ///
@@ -23,6 +23,19 @@ pub struct InboundHeaders {
     pub source: Option<crate::PeerSource>,
 }
 
+/// A decoded `tx` message from one peer connection.
+///
+/// Carries the exact [`ConnectionId`](crate::ConnectionId) stamped at
+/// decode time so the node consumer can attribute the admission to the
+/// originating connection — never a socket address, node id, or later
+/// connection at the same address.
+pub struct InboundTx {
+    /// Decoded transaction.
+    pub tx: Tx,
+    /// Delivering connection identity.
+    pub source: crate::PeerSource,
+}
+
 impl InboundBlock {
     /// Wraps a decoded block with freshly computed canonical serialization.
     ///
@@ -38,6 +51,14 @@ impl InboundBlock {
     }
 }
 
+impl InboundTx {
+    /// Wraps a decoded transaction with its delivering connection identity.
+    #[must_use]
+    pub fn new(tx: Tx, source: crate::PeerSource) -> Self {
+        Self { tx, source }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -49,5 +70,28 @@ mod tests {
             .unwrap();
 
         assert!(super::InboundBlock::from_decoded(block).source.is_none());
+    }
+
+    #[test]
+    fn inbound_tx_carries_exact_connection_id() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let bytes = bitcoin::consensus::encode::serialize(&genesis);
+        let block = bitcoin_rs_primitives::Block::consensus_decode(&bytes)
+            .map_err(|_| panic!("genesis block must decode natively"))
+            .unwrap();
+        let tx = block.txs[0].clone();
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18_333);
+        let lease = crate::PeerLease::new(
+            crossbeam_channel::unbounded::<crate::Message>().0,
+        );
+        let source = lease.source(addr);
+        let inbound = super::InboundTx::new(tx, source);
+        assert_eq!(inbound.source.addr, addr);
+        // The ConnectionId is the one stamped at lease creation, not a
+        // re-wrapped address or a later connection.
+        assert!(lease.is_current(inbound.source));
     }
 }

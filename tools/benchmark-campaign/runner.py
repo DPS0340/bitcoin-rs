@@ -173,6 +173,9 @@ class CellConfig:
     blocked_reason: str | None
     candidate: ProgramIdentity
     core: ProgramIdentity
+    # Required positive shared cache budget (MiB). Both arm commands must name
+    # exactly this value; the canonical config hash binds it.
+    cache_budget_mb: int
     corpus_path: str
     corpus_sha256: str
     manifest_path: str
@@ -795,6 +798,7 @@ def _cell_config_from_json(value: object, field: str) -> CellConfig:
                 "blocked_reason",
                 "candidate",
                 "core",
+                "cache_budget_mb",
                 "corpus_path",
                 "corpus_sha256",
                 "manifest_path",
@@ -806,6 +810,13 @@ def _cell_config_from_json(value: object, field: str) -> CellConfig:
         ),
     )
     reason = _optional_text(item["blocked_reason"], f"{field}.blocked_reason")
+    cache_budget_mb = _uint(
+        item["cache_budget_mb"], f"{field}.cache_budget_mb", positive=True
+    )
+    if cache_budget_mb > (1 << 64) - 1:
+        raise ContractError(
+            f"{field}.cache_budget_mb must be a positive integer within u64 range"
+        )
     affinity_raw = _array(item["affinity"], f"{field}.affinity")
     affinity = tuple(
         _uint(cpu, f"{field}.affinity[{index}]")
@@ -859,6 +870,7 @@ def _cell_config_from_json(value: object, field: str) -> CellConfig:
         blocked_reason=reason,
         candidate=candidate,
         core=core,
+        cache_budget_mb=cache_budget_mb,
         corpus_path=corpus_path,
         corpus_sha256=_hash(item["corpus_sha256"], f"{field}.corpus_sha256"),
         manifest_path=manifest_path,
@@ -875,6 +887,7 @@ def _cell_config_json(config: CellConfig) -> dict[str, object]:
         "blocked_reason": config.blocked_reason,
         "candidate": _program_json(config.candidate),
         "core": _program_json(config.core),
+        "cache_budget_mb": config.cache_budget_mb,
         "corpus_path": config.corpus_path,
         "corpus_sha256": config.corpus_sha256,
         "manifest_path": config.manifest_path,
@@ -996,6 +1009,7 @@ def _verify_command_semantics(
             "blocksxor": "0",
             "connect": "0",
             "datadir": paths["data_dir"],
+            "dbcache": str(config.cache_budget_mb),
             "debuglogfile": paths["result_path"],
             "disablewallet": "1",
             "dnsseed": "0",
@@ -1019,6 +1033,7 @@ def _verify_command_semantics(
         "--stop-height": str(proof.state.height),
         "--blocks-file": paths["corpus_path"],
         "--corpus-manifest": paths["manifest_path"],
+        "--dbcache-mb": str(config.cache_budget_mb),
         "--assume-valid-height": "0",
         "--storage-backend": config.cell.backend.value,
         "--data-dir": paths["data_dir"],

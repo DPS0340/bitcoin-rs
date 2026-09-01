@@ -32,7 +32,7 @@ pub mod wtxid;
 
 pub use connection::{ConnectionId, PeerLease, PeerSource, PeerStats};
 pub use dispatch::{ChainQuery, InventoryServing};
-pub use inbound::{InboundBlock, InboundHeaders};
+pub use inbound::{InboundBlock, InboundHeaders, InboundTx};
 pub use listener::spawn_outbound_connection;
 pub use peer::{
     AddNodeError, AddedNodeInfo, BanError, ConnectedPeer, ConnectionCounts, DnsResolver,
