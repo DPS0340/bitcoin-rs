@@ -171,7 +171,6 @@ impl ChainRollbackEvent {
         serde_json::from_slice(trimmed).ok()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn is_valid_for(&self, expected_format: &str, genesis_hash: &str) -> bool {
         self.format == expected_format && self.genesis_hash == genesis_hash
     }
@@ -311,6 +310,10 @@ fn sync_dir(dir: &Path) -> Result<(), EvidenceError> {
 // ---------------------------------------------------------------------------
 
 /// Writes the applied-tip witness using the bounded current/prev protocol.
+///
+/// The rotation check is semantic: a parseable but foreign-genesis or
+/// wrong-format current is INVALID and is removed without displacing a
+/// valid `.prev`, mirroring `read_witness`'s acceptance criteria.
 pub(crate) fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(), EvidenceError> {
     write_bounded(
         dir,
@@ -318,7 +321,10 @@ pub(crate) fn write_witness(dir: &Path, witness: &AppliedTipWitness) -> Result<(
         WITNESS_FILE,
         WITNESS_PREV,
         WITNESS_TMP,
-        |data| AppliedTipWitness::from_json(data).is_some(),
+        |data| {
+            AppliedTipWitness::from_json(data)
+                .is_some_and(|w| w.is_valid_for(WITNESS_FORMAT, &witness.genesis_hash))
+        },
     )
 }
 
@@ -343,6 +349,10 @@ pub(crate) fn read_witness(dir: &Path, genesis_hash: &str) -> Option<AppliedTipW
 
 /// Writes the chain-rollback event marker using the bounded current/prev
 /// protocol. Last-event-wins; prior valid event preserved as `.prev`.
+///
+/// The rotation check is semantic: a parseable but foreign-genesis or
+/// wrong-format current is INVALID and is removed without displacing a
+/// valid `.prev`, mirroring `read_marker`'s acceptance criteria.
 pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(), EvidenceError> {
     write_bounded(
         dir,
@@ -350,7 +360,10 @@ pub(crate) fn write_marker(dir: &Path, event: &ChainRollbackEvent) -> Result<(),
         MARKER_FILE,
         MARKER_PREV,
         MARKER_TMP,
-        |data| ChainRollbackEvent::from_json(data).is_some(),
+        |data| {
+            ChainRollbackEvent::from_json(data)
+                .is_some_and(|e| e.is_valid_for(MARKER_FORMAT, &event.genesis_hash))
+        },
     )
 }
 
@@ -1149,6 +1162,131 @@ mod tests {
             snapshot.warnings().len(),
             2,
             "warning store is still readable after marker failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A2 repair (RecA12c4): semantic rotation — a parseable but foreign-genesis
+    // or wrong-format current cannot displace a valid .prev
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn foreign_genesis_current_cannot_displace_valid_prev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let genesis = "aaaa";
+        let w1 = AppliedTipWitness::new(genesis, 1, 100, "aaa", 1000);
+        let w2 = AppliedTipWitness::new(genesis, 2, 200, "bbb", 2000);
+
+        // Establish a valid current (w2) and a valid .prev (w1).
+        write_witness(dir.path(), &w1).expect("write w1");
+        write_witness(dir.path(), &w2).expect("write w2 -> w1 rotates to .prev");
+        assert_eq!(read_witness(dir.path(), genesis), Some(w2.clone()));
+
+        // Plant a parseable but FOREIGN-GENESIS current directly. This is the
+        // bug class: parseable JSON that the old parse-only validator accepted.
+        let foreign = AppliedTipWitness::new("bbbb", 3, 300, "ccc", 3000);
+        let foreign_bytes = format!("{}\n", foreign.to_json());
+        std::fs::write(dir.path().join(WITNESS_FILE), foreign_bytes.as_bytes())
+            .expect("plant foreign current");
+        assert!(
+            AppliedTipWitness::from_json(&std::fs::read(dir.path().join(WITNESS_FILE)).unwrap())
+                .is_some(),
+            "foreign current is parseable JSON"
+        );
+
+        // A subsequent valid write must classify the foreign current INVALID:
+        // remove it, keep the valid .prev (w1), then publish the new current.
+        let w3 = AppliedTipWitness::new(genesis, 4, 400, "ddd", 4000);
+        write_witness(dir.path(), &w3).expect("write w3 over foreign current");
+        assert_eq!(read_witness(dir.path(), genesis), Some(w3.clone()));
+
+        // Removal path: delete the current; the valid .prev (w1) must survive
+        // and read_bounded must never surface the foreign record.
+        std::fs::remove_file(dir.path().join(WITNESS_FILE)).expect("remove current");
+        assert_eq!(
+            read_witness(dir.path(), genesis),
+            Some(w1.clone()),
+            "valid .prev survives; foreign current never displaced it"
+        );
+        let raw = read_bounded(dir.path(), WITNESS_FILE, WITNESS_PREV)
+            .expect("bounded read returns .prev bytes");
+        assert!(
+            AppliedTipWitness::from_json(&raw).is_some_and(|w| w.genesis_hash == genesis),
+            "read_bounded returns the valid .prev, never the foreign record"
+        );
+
+        // Same contract for a WRONG-FORMAT current (parseable, our genesis, bad format).
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        write_witness(dir2.path(), &w1).expect("write w1");
+        write_witness(dir2.path(), &w2).expect("write w2 -> w1 to .prev");
+        let mut wrong_format = w2;
+        wrong_format.format = "999".to_owned();
+        std::fs::write(
+            dir2.path().join(WITNESS_FILE),
+            format!("{}\n", wrong_format.to_json()).as_bytes(),
+        )
+        .expect("plant wrong-format current");
+        write_witness(dir2.path(), &w3).expect("write w3 over wrong-format current");
+        std::fs::remove_file(dir2.path().join(WITNESS_FILE)).expect("remove current");
+        assert_eq!(
+            read_witness(dir2.path(), genesis),
+            Some(w1),
+            "valid .prev survives a wrong-format current"
+        );
+    }
+
+    #[test]
+    fn foreign_genesis_marker_current_cannot_displace_valid_prev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let genesis = "aaaa";
+        let mk = |epoch: u64, time: u64| {
+            ChainRollbackEvent::new(
+                genesis,
+                epoch,
+                time,
+                RollbackEventKind::CheckpointFallback {
+                    restored_height: 100,
+                    restored_hash: "aaa".to_owned(),
+                    source: "checkpoint".to_owned(),
+                    old_height: 200,
+                    old_hash: "bbb".to_owned(),
+                },
+            )
+        };
+        let e1 = mk(1, 1000);
+        let e2 = mk(2, 2000);
+
+        write_marker(dir.path(), &e1).expect("write e1");
+        write_marker(dir.path(), &e2).expect("write e2 -> e1 to .prev");
+
+        // Plant a parseable foreign-genesis marker current.
+        let foreign = ChainRollbackEvent::new(
+            "bbbb",
+            3,
+            3000,
+            RollbackEventKind::CheckpointFallback {
+                restored_height: 100,
+                restored_hash: "aaa".to_owned(),
+                source: "checkpoint".to_owned(),
+                old_height: 200,
+                old_hash: "bbb".to_owned(),
+            },
+        );
+        std::fs::write(
+            dir.path().join(MARKER_FILE),
+            format!("{}\n", foreign.to_json()).as_bytes(),
+        )
+        .expect("plant foreign marker current");
+
+        let e3 = mk(4, 4000);
+        write_marker(dir.path(), &e3).expect("write e3 over foreign current");
+        assert_eq!(read_marker(dir.path(), genesis), Some(e3));
+
+        std::fs::remove_file(dir.path().join(MARKER_FILE)).expect("remove current");
+        assert_eq!(
+            read_marker(dir.path(), genesis),
+            Some(e1),
+            "valid marker .prev survives; foreign current never displaced it"
         );
     }
 }

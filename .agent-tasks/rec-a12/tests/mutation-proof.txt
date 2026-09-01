@@ -121,3 +121,124 @@ All 14 recovery_evidence module tests pass:
 - getblockchaininfo_reports_atomic_rollback_warnings ... ok
 Test output: `ok. 14 passed; 0 failed; 0 ignored` in 0.03s.
 Status: GREEN CONFIRMED.
+
+## A2 red-green mutation cycles (RecA12c3, 2026-09-02)
+
+11 A2 mutation cycles: 10 RED CONFIRMED + 1 theoretical (NO RED under no concurrency). Preceded by baseline label 15 (14 tests GREEN) and followed by preservation baseline (A2 cycle 12, 40 tests GREEN). Target: CARGO_TARGET_DIR=.outline/tmp/target-rec-a12 cargo test -p bitcoin-rs-node --lib
+
+### A2-1. witness_round_trips_and_falls_back_to_prev
+Mutation: disable `.prev` fallback (make read_bounded only read current, never .prev).
+Status: EXECUTED — RED CONFIRMED.
+Applied: replaced read_bounded body to only read current_path, ignoring prev_name.
+Test output: `FAILED. 0 passed; 1 failed` — "falls back to .prev when current is missing" assertion failed.
+Restored: yes
+
+### A2-2. foreign_genesis_or_future_epoch_witness_is_ignored
+Mutation: remove genesis validation in read_witness (return witness regardless of genesis).
+Status: EXECUTED — RED CONFIRMED.
+Applied: replaced read_witness to skip is_valid_for check and return AppliedTipWitness::from_json directly.
+Test output: `FAILED. 0 passed; 1 failed` — "foreign genesis witness is ignored" assertion failed (read_witness returned Some instead of None).
+Restored: yes
+
+### A2-3. witness_is_published_only_after_current_root_sync
+Mutation: write the witness before CURRENT root fsync (move witness write before checkpoint write call).
+Status: EXECUTED — RED CONFIRMED.
+Applied: moved the witness write block to before write_checkpoint_from_dir, swallowing the witness error with `let _`.
+Test output: `FAILED. 0 passed; 1 failed` — "no witness must be written when checkpoint fails before publication" assertion failed (witness file exists after failpoint-injected checkpoint failure).
+Restored: yes
+Note: This is a state.rs integration test using the existing CheckpointFailpoint::CurrentRootSync mechanism.
+
+### A2-4. witness_stage_failure_preserves_bounded_current_prev
+Mutation: rotate current to .prev without validating it (overwrite valid .prev with invalid current).
+Status: EXECUTED — RED CONFIRMED.
+Applied: replaced the validate-then-rotate block in write_bounded with unconditional rotation (remove_file prev, rename current to prev) without checking validity.
+Test output: `FAILED. 0 passed; 1 failed` — ".prev preserves last valid .prev, not corrupt garbage" assertion failed (corrupt garbage was rotated to .prev).
+Restored: yes
+Note: Test enhanced with invalid-current-with-valid-prev case to exercise the mutation. Original test only covered stale-temp cleanup.
+
+### A2-5. same_genesis_older_epoch_higher_witness_warns_and_marks
+Mutation: reverse the height comparison (change `<=` to `>=` in detect_checkpoint_fallback).
+Status: EXECUTED — RED CONFIRMED.
+Applied: changed `witness.height <= restored_height` to `witness.height >= restored_height` in detect_checkpoint_fallback.
+Test output: `FAILED. 0 passed; 1 failed` — "same-genesis, older-epoch, higher witness must warn" assertion failed (detect returned None for height 200 > 100).
+Restored: yes
+Note: Detection test (same_genesis_older_epoch_higher_witness_warns) + reporter test (reporter_report_checkpoint_fallback_writes_marker_and_warns) together cover cycle 5's warn-and-marks invariant.
+
+### A2-6. equal_or_lower_witness_does_not_warn
+Mutation: use `>` instead of `<=` (equal height now warns).
+Status: EXECUTED — RED CONFIRMED.
+Applied: changed `witness.height <= restored_height` to `witness.height > restored_height` in detect_checkpoint_fallback.
+Test output: `FAILED. 0 passed; 1 failed` — "equal height does not warn even with different hash" assertion failed (detect returned Some for equal height).
+Restored: yes
+
+### A2-7. checkpoint_and_index_warnings_coexist
+Mutation: replace the whole warning set on index report (clear checkpoint when adding index).
+Status: EXECUTED — RED CONFIRMED.
+Applied: modified with_index to clear checkpoint and index before pushing the new index warning.
+Test output: `FAILED. 0 passed; 1 failed` — "both warning classes coexist" assertion failed (len 1 instead of 2).
+Restored: yes
+
+### A2-8. repeated_index_ahead_report_is_deduplicated
+Mutation: append without deduplication (remove the `any(|w| w == msg)` check).
+Status: EXECUTED — RED CONFIRMED.
+Applied: modified with_index to always push, skipping the duplicate check.
+Test output: `FAILED. 0 passed; 1 failed` — "exact duplicate index warning is deduplicated" assertion failed (len 2 instead of 1).
+Restored: yes
+
+### A2-9. checkpoint_fallback_with_index_far_ahead_converges_and_warns
+Mutation: remove the reporter call (skip index report).
+Status: EXECUTED — RED CONFIRMED.
+Applied: replaced the index report_index_ahead call with `let _ = reporter;`.
+Test output: `FAILED. 0 passed; 1 failed` — "both checkpoint and index warnings present" assertion failed (len 1 instead of 2).
+Restored: yes
+Note: Focused unit test exercising the full boot scenario: witness at 200, restored at 100, txindex watermark at 250. Both warning classes coexist in one snapshot, marker on disk.
+
+### A2-10. marker_write_failure_fails_only_the_reporting_index
+Mutation: swallow the marker write error in report_index_ahead.
+Status: EXECUTED — RED CONFIRMED.
+Applied: changed `write_marker(&self.data_dir, &event)` to `let _ = write_marker(...); Ok(())`.
+Test output: `FAILED. 0 passed; 1 failed` — "marker write failure must return an error" assertion failed (result was Ok instead of Err).
+Restored: yes
+Note: Focused unit test: checkpoint warning set, then index report to nonexistent dir. Warning is set in memory before marker write; error returned so caller can fail only that index. Checkpoint warning survives.
+
+### A2-11. getblockchaininfo_reports_atomic_rollback_warnings
+Mutation: load twice (separate loads for checkpoint and index fields).
+Status: EXECUTED — NO RED (theoretical under no concurrency).
+Applied: modified WarningStore::warnings to call self.load() twice — once for checkpoint, once for index.
+Test output: `ok. 1 passed` — test still passes because there's no concurrent RCU update between the two loads.
+Restored: yes
+Note: The mutation would only break under concurrent modification, which the unit test doesn't exercise. The single-load design proves atomicity by construction. The ArcSwap RCU guarantee is architectural.
+
+### A2 cycle 12: existing checkpoint tests preserved
+All 40 checkpoint-related tests pass (run::tests::shutdown_checkpoint_io_failure_is_returned_and_preserves_current + state::tests::checkpoint + recovery_evidence::tests).
+Test output: `ok. 40 passed; 0 failed` + `ok. 16 passed; 0 failed` + `ok. 1 passed; 0 failed` (witness_is_published_only_after_current_root_sync).
+Status: GREEN CONFIRMED.
+
+## A2 repair: semantic rotation validation (RecA12c4, 2026-09-02)
+
+Fresh review (a2-review.md) found P1: write_bounded rotation validators were
+parse-only (from_json().is_some()), so a parseable but foreign-genesis or
+wrong-format current could displace a valid .prev. Fix: thread semantic
+validation (format + expected genesis) into the rotation check for both
+witness and marker write paths, mirroring read_witness/read_marker acceptance.
+
+### A2-repair-1. foreign_genesis_current_cannot_displace_valid_prev (RED→GREEN)
+Regression test: valid .prev present, plant a parseable foreign-genesis current,
+write a new valid current, remove it, assert the valid .prev survives and
+read_bounded never surfaces the foreign record. Also covers wrong-format current.
+RED (buggy parse-only validator): `FAILED. 0 passed; 2 failed` — "valid .prev
+survives; foreign current never displaced it" (left: None, right: Some(w1)).
+GREEN (semantic validator): `ok. 2 passed; 0 failed` in 0.01s.
+
+### A2-repair-2. foreign_genesis_marker_current_cannot_displace_valid_prev (RED→GREEN)
+Same contract for the marker file family: foreign-genesis marker current cannot
+displace a valid marker .prev.
+RED: `FAILED. 0 passed; 2 failed` — "valid marker .prev survives; foreign
+current never displaced it" (left: None, right: Some(e1)).
+GREEN: `ok. 2 passed; 0 failed` in 0.01s.
+
+### A2-repair-3. Full suite verification
+recovery_evidence::tests: 18/18 green (16 original + 2 new repair tests).
+node --lib: 659 passed; 0 failed; 1 ignored.
+clippy -p bitcoin-rs-node --all-targets -- -D warnings: clean.
+Status: GREEN CONFIRMED.

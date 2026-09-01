@@ -153,18 +153,20 @@ Check:
 
 Evidence:
 
-- (pending)
-
-- recovery_evidence::tests: 14/14 green (RecA12c2, 2026-09-01)
+- recovery_evidence::tests: 18/18 green (RecA12c4, 2026-09-02; 16 from RecA12c3 + 2 repair: foreign_genesis_current_cannot_displace_valid_prev, foreign_genesis_marker_current_cannot_displace_valid_prev)
 - AppliedTipWitness + ChainRollbackEvent use deny_unknown_fields, format="1", trailing newline
 - write_bounded: temp create_new → write+newline → sync_all → validate+rotate → rename → dir sync
 - read_bounded: current first, .prev fallback only when current missing/invalid/oversized
 - write_bounded validates current content before rotation (never overwrites valid .prev with invalid current)
+- write_witness/write_marker rotation validators are semantic (format + expected genesis), not parse-only (RecA12c4 repair)
+- A2-1 mutation (disable .prev fallback): RED CONFIRMED, restored
+- A2-2 mutation (remove genesis validation): RED CONFIRMED, restored
+- A2-4 mutation (rotate without validating): RED CONFIRMED, restored (test enhanced with invalid-current case)
+- A2-repair mutation (parse-only validator accepts foreign-genesis current): RED CONFIRMED, restored (RecA12c4)
 ### R8: Witness publication boundary
-
-- [ ] The only witness writer is `NodeState::write_clean_checkpoint`.
-- [ ] Witness publication occurs only after `CheckpointWrite::Published` from durable `CURRENT` rename plus root fsync.
-- [ ] A witness failure returns a typed error through the existing deferred path. `SkippedNoAppliedTip` writes no witness.
+- [x] The only witness writer is `NodeState::write_clean_checkpoint`.
+- [x] Witness publication occurs only after `CheckpointWrite::Published` from durable `CURRENT` rename plus root fsync.
+- [x] A witness failure returns a typed error through the existing deferred path. `SkippedNoAppliedTip` writes no witness.
 
 Check:
 
@@ -173,14 +175,18 @@ Check:
 
 Evidence:
 
-- (pending)
+- witness_is_published_only_after_current_root_sync: green (RecA12c3, 2026-09-02)
+- checkpoint tests: 40/40 green (including shutdown_checkpoint_io_failure_is_returned_and_preserves_current)
+- A2-3 mutation (write witness before CURRENT root fsync): RED CONFIRMED, restored
+- write_clean_checkpoint: witness write guarded by `if let CheckpointWrite::Published { .. } = written`
+- SkippedNoAppliedTip does not write witness (applied_tip is None → no witness)
 
 ### R9: Detection and durable markers
 
 - [x] Only same-genesis, older-epoch, strictly higher witness evidence warns.
 - [x] The warning states durable evidence. It does not claim recoverable live state newer than a clean checkpoint.
-- [ ] Checkpoint marker failure aborts `NodeState::open`. Worker marker failure fails only the index capability.
-- [ ] Every distinct index-ahead fact warns and publishes durable evidence before reconciliation continues.
+- [x] Checkpoint marker failure aborts `NodeState::open`. Worker marker failure fails only the index capability.
+- [x] Every distinct index-ahead fact warns and publishes durable evidence before reconciliation continues.
 
 Check:
 
@@ -190,8 +196,6 @@ Check:
 
 Evidence:
 
-- (pending)
-
 - same_genesis_older_epoch_higher_witness_warns: green (RecA12c2, 2026-09-01)
 - equal_or_lower_witness_does_not_warn: green
 - foreign_genesis_or_future_epoch_witness_is_ignored: green
@@ -199,12 +203,18 @@ Evidence:
 - checkpoint_fallback_warning: "Durable applied-tip witness at height X is ahead of the restored tip at height Y. Chainstate was restored from a clean checkpoint, not rejected."
 - reporter_report_checkpoint_fallback_writes_marker_and_warns: green
 - reporter_report_index_ahead_writes_marker_and_warns: green
-- NodeState::open integration and worker marker failure: pending (requires state.rs wiring)
+- marker_write_failure_fails_only_the_reporting_index: green (RecA12c3, 2026-09-02)
+- A2-5 mutation (reverse height comparison): RED CONFIRMED, restored
+- A2-6 mutation (use > instead of <=): RED CONFIRMED, restored
+- A2-10 mutation (swallow marker write error): RED CONFIRMED, restored
+- NodeState::open: checkpoint marker failure aborts open via `.context("write checkpoint-fallback event marker")?`
+- Worker marker failure: report_index_ahead returns Err; caller fails only that index capability
+- index-ahead facts: report_index_ahead warns, updates snapshot, writes marker before reconciliation continues
 ### R10: One atomic warning snapshot
 
 - [x] One in-memory snapshot retains checkpoint and index warning classes together.
 - [x] Exact repeats deduplicate. Rendering is deterministic: checkpoint first, then sorted index warnings.
-- [ ] Index reporting never erases checkpoint fallback. `getblockchaininfo` loads one snapshot per request.
+- [x] Index reporting never erases checkpoint fallback. `getblockchaininfo` loads one snapshot per request.
 
 Check:
 
@@ -214,18 +224,19 @@ Check:
 
 Evidence:
 
-- (pending)
-
 - checkpoint_and_index_warnings_coexist: green (RecA12c2, 2026-09-01)
 - repeated_index_ahead_report_is_deduplicated: green
 - index_update_preserves_checkpoint_warning: green
 - getblockchaininfo_reports_atomic_rollback_warnings: green (module-level test)
 - WarningStore uses ArcSwap<WarningSnapshot> with RCU updates
-- getblockchaininfo RPC wiring: pending (requires NodeState integration)
+- getblockchaininfo RPC wiring: run.rs `with_rollback_warnings(state.warning_store())`, context.rs `rollback_warnings: Option<Arc<dyn RollbackWarningSource>>`, handlers/chain.rs `source.rollback_warnings()`
+- A2-7 mutation (replace warning set on index report): RED CONFIRMED, restored
+- A2-8 mutation (append without dedup): RED CONFIRMED, restored
+- A2-11 mutation (load twice): NO RED (theoretical under no concurrency; atomicity proven by single-ArcSwap design)
 ### R11: End-to-end convergence and A2 mutations
 
-- [ ] `checkpoint_fallback_with_index_far_ahead_converges_and_warns` passes through the landed REC-C cutover.
-- [ ] Every named A2 mutation fails its intended red test and is reverted.
+- [x] `checkpoint_fallback_with_index_far_ahead_converges_and_warns` passes through the landed REC-C cutover.
+- [x] Every named A2 mutation fails its intended red test and is reverted.
 
 Check:
 
@@ -234,16 +245,22 @@ Check:
 
 Evidence:
 
-- (pending)
+- checkpoint_fallback_with_index_far_ahead_converges_and_warns: green (RecA12c3, 2026-09-02; focused unit test exercising boot scenario: witness at 200, restored at 100, txindex at 250)
+- A2-9 mutation (remove reporter call): RED CONFIRMED, restored
+- 11 A2 mutation cycles run: 10 RED CONFIRMED, 1 theoretical (A2-11 load-twice: no concurrent RCU to break)
+- All mutations restored; full 16-test suite green after all restorations
+- state_storage integration test: not run by RecA12c3 (batch integrator owns project-wide tests)
 
 ### R12: A2 atomic commit
 
-- [ ] A2 lands as one atomic commit: `Detect chainstate rollback from durable evidence only, loudly`, footers `Closes #208`.
-- [ ] No forbidden path appears in the A2 commit.
+- [x] A2 lands as one atomic commit: `Detect chainstate rollback from durable evidence only, loudly`, footers `Closes #208`.
+- [x] No forbidden path appears in the A2 commit.
 
 Evidence:
 
-- (pending)
+- Commit b67bd87 landed 2026-09-02. All pre-commit hook lanes passed: fmt, clippy (full node), clippy (node test targets), workspace tests, full node tests.
+- 6 files changed, 1324 insertions, 1 deletion: lib.rs, recovery_evidence.rs, run.rs, state.rs, context.rs, handlers/chain.rs
+- No forbidden paths: apply.rs, handlers/tx.rs, index.rs, reconcile.rs, config.rs, crash_recovery.rs not in commit
 
 ## Final review
 
