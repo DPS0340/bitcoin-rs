@@ -48,6 +48,8 @@ pub mod mining;
 pub mod p2p_chain;
 /// Chain-event reconciliation seam for index consumers.
 pub mod reconcile;
+/// Durable rollback evidence: witness and marker file protocol, warning snapshot.
+mod recovery_evidence;
 
 /// Switching the applied chain from one branch to another.
 pub mod reorg;

@@ -1171,6 +1171,8 @@ pub struct NodeState {
     apply_handles: crate::apply::ApplyHandles,
     sync: Arc<crate::BlockSync>,
     replayed: Mutex<Vec<u32>>,
+    /// Process-wide rollback-evidence warning snapshot (`ArcSwap`).
+    warning_store: Arc<crate::recovery_evidence::WarningStore>,
 }
 
 impl NodeState {
@@ -1347,6 +1349,55 @@ impl NodeState {
                 )
             }
         };
+        // A2: Create the process-wide rollback-evidence warning store before
+        // any detection or worker spawn. One ArcSwap holds the complete
+        // immutable snapshot; getblockchaininfo loads one per request.
+        let warning_store = Arc::new(crate::recovery_evidence::WarningStore::new());
+        // A2: Read the durable applied-tip witness and detect checkpoint
+        // fallback. Emit a structured WARN, update the warning snapshot, and
+        // durably publish the event marker — only after all conditions hold:
+        // valid format/bounds, matching genesis, older writer epoch, and
+        // strictly greater witness height than the restored tip.
+        let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        let restored_height = restored_applied_tip.as_ref().map_or(0, |tip| tip.height);
+        let restored_hash = restored_applied_tip
+            .as_ref()
+            .map_or_else(|| config.network.genesis_block_hash(), |tip| tip.hash)
+            .to_string_be();
+        if let Some(witness) =
+            crate::recovery_evidence::read_witness(&config.data_dir, &genesis_hex)
+        {
+            if let Some((witness_height, _)) = crate::recovery_evidence::detect_checkpoint_fallback(
+                &witness,
+                epoch,
+                &genesis_hex,
+                restored_height,
+            ) {
+                let reporter = crate::recovery_evidence::RecoveryReporter::new(
+                    Arc::clone(&warning_store),
+                    config.data_dir.clone(),
+                    genesis_hex.clone(),
+                    epoch,
+                );
+                let source = match resume_source {
+                    ResumeSource::Cold => "cold",
+                    ResumeSource::HeadersOnly => "headers-only",
+                    ResumeSource::Checkpoint => "checkpoint",
+                };
+                reporter
+                    .report_checkpoint_fallback(
+                        witness_height,
+                        restored_height,
+                        &restored_hash,
+                        source,
+                        &witness.block_hash,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs()),
+                    )
+                    .context("write checkpoint-fallback event marker")?;
+            }
+        }
         // Anchor the initial snapshot before `restored_applied_tip` is moved
         // into the applied-tip slot: a restored node resumes at its restored
         // tip, a fresh one at genesis, both with an untouched sequence.
@@ -1574,6 +1625,7 @@ impl NodeState {
             apply_handles,
             sync,
             replayed: Mutex::new(Vec::new()),
+            warning_store,
         })
     }
 
@@ -1638,6 +1690,25 @@ impl NodeState {
                 .load(core::sync::atomic::Ordering::Relaxed),
             self.config.g2_muhash_samples.is_some(),
         )?;
+        // A2: Only after `CheckpointWrite::Published` and root fsync, write
+        // the applied-tip witness for the same captured tip. A witness failure
+        // is not swallowed: return a typed checkpoint error.
+        if let crate::checkpoint::CheckpointWrite::Published { .. } = written {
+            if let Some(tip) = applied_tip.as_ref() {
+                let genesis_hex = self.config.network.genesis_block_hash().to_string_be();
+                let witness = crate::recovery_evidence::AppliedTipWitness::new(
+                    genesis_hex,
+                    self.chain_events.epoch(),
+                    tip.height,
+                    tip.hash.to_string_be(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                );
+                crate::recovery_evidence::write_witness(&self.data_dir, &witness)
+                    .map_err(|e| crate::checkpoint::CheckpointError::Invalid(e.to_string()))?;
+            }
+        }
         // Remove the marker only after this checkpoint publishes the matching
         // UTXO set and applied tip. TxIndex is outside the authoritative
         // disconnect transaction and recovers from its own atomic capability watermarks.
@@ -1849,6 +1920,12 @@ impl NodeState {
         &self,
     ) -> Arc<Mutex<crossbeam_channel::Receiver<std::net::SocketAddr>>> {
         Arc::clone(&self.p2p_outbound_rx)
+    }
+
+    /// Returns the rollback-evidence warning store for `getblockchaininfo`.
+    #[must_use]
+    pub(crate) fn warning_store(&self) -> Arc<crate::recovery_evidence::WarningStore> {
+        Arc::clone(&self.warning_store)
     }
 
     /// Returns a cloned `Sender` that the P2P listener pushes inbound
@@ -4032,5 +4109,66 @@ mod tests {
             | u32::from(bytes[low + 1]) << 8
             | u32::from(bytes[low + 2]) << 16;
         window <= mantissa && bytes[usize::from(exponent)..].iter().all(|&byte| byte == 0)
+    }
+
+    // -----------------------------------------------------------------------
+    // A2 cycle 3: witness is published only after CURRENT root fsync
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn witness_is_published_only_after_current_root_sync() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("node");
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = data_dir.clone();
+        config.p2p_listen.clear();
+
+        let state = NodeState::open(config.clone())?;
+        let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        let tip = state.apply_block(&genesis)?;
+
+        // Publish a checkpoint — witness must be written after Published.
+        state.publish_checkpoint()?;
+        let witness_path = data_dir.join("applied-tip-witness.json");
+        assert!(
+            witness_path.exists(),
+            "witness file must exist after checkpoint publication"
+        );
+        let genesis_hex = config.network.genesis_block_hash().to_string_be();
+        let witness = crate::recovery_evidence::read_witness(&data_dir, &genesis_hex)
+            .ok_or_else(|| anyhow::anyhow!("witness must be readable"))?;
+        assert_eq!(witness.height, tip.height);
+        assert_eq!(witness.block_hash, tip.hash.to_string_be());
+        drop(state);
+
+        // Now inject a failpoint at CurrentRootSync — the last stage before
+        // the checkpoint is considered Published. The checkpoint must fail,
+        // and no new witness must be written for the failed checkpoint.
+        let dir2 = tempfile::tempdir()?;
+        let data_dir2 = dir2.path().join("node");
+        let mut config2 = crate::Config::default_for_network(crate::Network::Regtest);
+        config2.data_dir = data_dir2.clone();
+        config2.p2p_listen.clear();
+
+        let state2 = NodeState::open(config2.clone())?;
+        let genesis2 = bitcoin_rs_primitives::Network::Regtest.genesis_block();
+        state2.apply_block(&genesis2)?;
+
+        // Inject failpoint at the final root fsync — checkpoint fails before
+        // returning Published, so no witness should be written.
+        crate::checkpoint::inject_next_checkpoint_failpoint(
+            crate::checkpoint::CheckpointFailpoint::CurrentRootSync,
+        );
+        let result = state2.publish_checkpoint();
+        assert!(
+            result.is_err(),
+            "checkpoint must fail when CurrentRootSync fails"
+        );
+        let witness_path2 = data_dir2.join("applied-tip-witness.json");
+        assert!(
+            !witness_path2.exists(),
+            "no witness must be written when checkpoint fails before publication"
+        );
+        Ok(())
     }
 }

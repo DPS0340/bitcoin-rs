@@ -467,6 +467,16 @@ pub trait BlockBodySource: Send + Sync {
     }
 }
 
+/// Read-only source of rollback-evidence warnings for `getblockchaininfo`.
+///
+/// Implemented by the node crate's `WarningStore`. Each call loads one
+/// immutable snapshot; the handler copies rendered strings into the
+/// existing `warnings` field without reading disk or reparsing markers.
+pub trait RollbackWarningSource: Send + Sync {
+    /// Returns rendered warnings in deterministic order.
+    fn rollback_warnings(&self) -> Vec<String>;
+}
+
 impl BlockRecord {
     /// Builds a record from a decoded Bitcoin block.
     ///
@@ -1183,6 +1193,11 @@ pub struct Context {
     pub debug_log_path: Option<PathBuf>,
     /// Limits concurrent full-block REST response materializations.
     rest_render_budget: Arc<RestRenderBudget>,
+    /// Rollback-evidence warning source for `getblockchaininfo`.
+    ///
+    /// `None` in test contexts; populated by `NodeState` with the process-wide
+    /// `WarningStore`. Each request loads one immutable snapshot.
+    pub rollback_warnings: Option<Arc<dyn RollbackWarningSource>>,
 }
 // SAFETY: `Context` is shared by RPC worker threads. Each mutable subsystem
 // handle behind it uses atomics, channels, or locks for interior mutation.
@@ -1253,6 +1268,7 @@ impl Context {
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
         }
     }
     /// Builds a context that shares pre-existing handles owned elsewhere.
@@ -1322,6 +1338,7 @@ impl Context {
             zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
             debug_log_path: None,
             rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
         }
     }
 
@@ -1337,6 +1354,13 @@ impl Context {
     #[must_use]
     pub fn with_block_body_source(mut self, source: Arc<dyn BlockBodySource>) -> Self {
         self.block_body_source = Some(source);
+        self
+    }
+
+    /// Attaches the rollback-evidence warning source for `getblockchaininfo`.
+    #[must_use]
+    pub fn with_rollback_warnings(mut self, source: Arc<dyn RollbackWarningSource>) -> Self {
+        self.rollback_warnings = Some(source);
         self
     }
 

@@ -696,6 +696,7 @@ pub fn run(mut config: Config) -> Result<()> {
     }));
     rpc_context = rpc_context.with_zmq_notifications(state.active_zmq_notifications());
     rpc_context = rpc_context.with_debug_log_path(state.data_dir().join("debug.log"));
+    rpc_context = rpc_context.with_rollback_warnings(state.warning_store());
     let rpc_handler = Arc::new(bitcoin_rs_rpc::Handler::new(Arc::new(rpc_context)));
     let rpc_server = bitcoin_rs_rpc::RpcServer::bind(
         state.config().rpc_bind,
