@@ -466,3 +466,121 @@ fn heartbeat_starts_before_blocking_open_and_stops_on_exit() {
 
     // If we reach here, the heartbeat stopped and joined successfully.
 }
+
+// ---------------------------------------------------------------------------
+// 10. blocked_open_abandonment_detaches_and_poisons
+// ---------------------------------------------------------------------------
+
+/// Reviewer-mandated pathological case: when the worker's backend open is
+/// blocked indefinitely past the shutdown deadline, the abandonment path must
+/// (a) return within the deadline (not hang on Drop's join), (b) revoke the
+/// generation, (c) publish `ShutdownAbandoned`, and (d) poison the namespace
+/// so subsequent claims are rejected.
+#[test]
+fn blocked_open_abandonment_detaches_and_poisons() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Install the open gate so the worker blocks inside open.
+    let gate = install_txindex_open_gate();
+
+    let inputs = build_worker_inputs(dir.path(), 42);
+
+    let mut worker = TxIndexWorker::spawn_with_open(
+        Arc::clone(&inputs.runtime),
+        inputs.spec,
+        Arc::clone(&inputs.lifecycle),
+        inputs.generation.clone(),
+        Arc::clone(&inputs.applied_tip),
+        Arc::clone(&inputs.block_tree),
+        None,
+        inputs.block_source,
+        None,
+        Arc::clone(&inputs.chain_events),
+        Arc::clone(&inputs.shutdown),
+        inputs.wake_rx,
+    )
+    .expect("spawn");
+
+    // Give the worker time to start, claim the namespace, and block on the gate.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // The worker is still blocked (not finished).
+    assert!(
+        !worker.is_finished(),
+        "worker should still be blocked at the gate"
+    );
+
+    // Simulate bounded_index_shutdown's abandonment path.
+    let deadline = std::time::Duration::from_millis(500);
+    let start = std::time::Instant::now();
+
+    // Poll up to the deadline (matching bounded_index_shutdown's loop).
+    while std::time::Instant::now() < start + deadline {
+        if worker.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Worker is still blocked — abandon.
+    assert!(
+        !worker.is_finished(),
+        "worker must still be blocked past the deadline"
+    );
+
+    // Abandon: revoke, publish ShutdownAbandoned, poison, detach.
+    if let Some(token) = &worker.generation {
+        token.revoke();
+    }
+    inputs
+        .lifecycle
+        .store(Arc::new(TxIndexLifecycle::ShutdownAbandoned));
+    worker.poison_namespace();
+    worker.detach();
+
+    let elapsed = start.elapsed();
+
+    // Abandonment must be bounded — well within deadline + slack.
+    assert!(
+        elapsed < deadline + std::time::Duration::from_secs(5),
+        "abandonment must be bounded, took {elapsed:?}"
+    );
+
+    // Generation is revoked.
+    assert!(
+        worker
+            .generation
+            .as_ref()
+            .is_some_and(Generation::is_revoked),
+        "generation must be revoked after abandonment"
+    );
+
+    // Lifecycle is ShutdownAbandoned.
+    let snapshot = inputs.lifecycle.load();
+    assert!(
+        matches!(**snapshot, TxIndexLifecycle::ShutdownAbandoned),
+        "lifecycle must be ShutdownAbandoned after abandonment"
+    );
+
+    // Namespace is Poisoned (subsequent claim rejected).
+    let namespace_key = dir.path().join("txindex");
+    assert!(
+        NAMESPACE_REGISTRY.is_poisoned(&namespace_key),
+        "namespace must be poisoned after abandonment"
+    );
+    assert!(
+        !NAMESPACE_REGISTRY.claim(namespace_key, 999),
+        "poisoned namespace must reject subsequent claims"
+    );
+
+    // Drop the worker — must not hang (detach was called).
+    drop(worker);
+
+    // Clean up: request shutdown and release the gate so the worker
+    // thread can exit cleanly.
+    inputs.runtime.request_shutdown();
+    inputs.shutdown.store(true, Ordering::Release);
+    drop(gate);
+
+    // If we reach here without hanging, the abandonment is truly bounded.
+}

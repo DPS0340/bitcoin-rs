@@ -64,11 +64,11 @@ Evidence:
 
 ### R3: Namespace ownership and bounded shutdown
 
-- [ ] The namespace map key is canonical data root plus validated fixed child without child canonicalization.
-- [ ] The map has `Active(owner)` and permanent `Poisoned`. Poison applies only to abandoned opens.
-- [ ] `Active(owner)` releases only after normal store drop. Poisoned never clears in-process.
-- [ ] Bounded shutdown uses the shared deadline. Revocation, `ShutdownAbandoned`, poison, and detach occur on expiry.
-- [ ] A late opener cannot publish after revocation and does not reconcile.
+- [x] The namespace map key is canonical data root plus validated fixed child without child canonicalization.
+- [x] The map has `Active(owner)` and permanent `Poisoned`. Poison applies only to abandoned opens.
+- [x] `Active(owner)` releases only after normal store drop. Poisoned never clears in-process.
+- [x] Bounded shutdown uses the shared deadline. Revocation, `ShutdownAbandoned`, poison, and detach occur on expiry.
+- [x] A late opener cannot publish after revocation and does not reconcile.
 
 Check:
 
@@ -76,6 +76,7 @@ Check:
 - `CARGO_TARGET_DIR=/home/alpha/blockchain/bitcoin-rs/.outline/tmp/target-rec-a12 cargo test -p bitcoin-rs-node --lib fresh_namespace_opens_and_normal_reopen_succeeds -- --test-threads=1`
 - `CARGO_TARGET_DIR=/home/alpha/blockchain/bitcoin-rs/.outline/tmp/target-rec-a12 cargo test -p bitcoin-rs-node --lib poisoned_namespace_never_reopens_in_process -- --test-threads=1`
 - `CARGO_TARGET_DIR=/home/alpha/blockchain/bitcoin-rs/.outline/tmp/target-rec-a12 cargo test -p bitcoin-rs-node --lib late_open_cannot_publish_after_revocation -- --test-threads=1`
+- `CARGO_TARGET_DIR=/home/alpha/blockchain/bitcoin-rs/.outline/tmp/target-rec-a12c2 cargo test -p bitcoin-rs-node --lib blocked_open_abandonment_detaches_and_poisons -- --test-threads=1`
 
 Evidence:
 
@@ -88,6 +89,11 @@ Evidence:
 - bounded_index_shutdown in state.rs uses DRAIN_DEADLINE, revokes generation, publishes ShutdownAbandoned
 - NamespaceRegistry::validate_child rejects empty, separator, ., .., absolute paths
 - open_and_run checks shutdown and generation.is_revoked() after backend open
+- blocked_open_abandonment_detaches_and_poisons: green (RecA12c2, 2026-09-01)
+- TxIndexWorker::detach() sets join_handle=None so Drop does not join
+- TxIndexWorker::poison_namespace() calls NAMESPACE_REGISTRY.poison(key, owner)
+- bounded_index_shutdown abandonment branch calls poison_namespace() + detach()
+- RED evidence: drop without detach hangs (timeout 15s killed process) — mutation-proof.txt #13
 
 ### R4: Backend matrix and boot independence
 
@@ -136,9 +142,9 @@ Evidence:
 
 ### R7: Sidecar codec and bounded recovery
 
-- [ ] Witness and marker files use bounded versioned `deny_unknown_fields` JSON with trailing newline.
-- [ ] Temp-fsync, validated rotation, publish rename, and dir-fsync recovery is implemented for both file families.
-- [ ] Invalid current falls back to valid `.prev`. Valid `.prev` is never overwritten by invalid current.
+- [x] Witness and marker files use bounded versioned `deny_unknown_fields` JSON with trailing newline.
+- [x] Temp-fsync, validated rotation, publish rename, and dir-fsync recovery is implemented for both file families.
+- [x] Invalid current falls back to valid `.prev`. Valid `.prev` is never overwritten by invalid current.
 
 Check:
 
@@ -149,6 +155,11 @@ Evidence:
 
 - (pending)
 
+- recovery_evidence::tests: 14/14 green (RecA12c2, 2026-09-01)
+- AppliedTipWitness + ChainRollbackEvent use deny_unknown_fields, format="1", trailing newline
+- write_bounded: temp create_new → write+newline → sync_all → validate+rotate → rename → dir sync
+- read_bounded: current first, .prev fallback only when current missing/invalid/oversized
+- write_bounded validates current content before rotation (never overwrites valid .prev with invalid current)
 ### R8: Witness publication boundary
 
 - [ ] The only witness writer is `NodeState::write_clean_checkpoint`.
@@ -166,8 +177,8 @@ Evidence:
 
 ### R9: Detection and durable markers
 
-- [ ] Only same-genesis, older-epoch, strictly higher witness evidence warns.
-- [ ] The warning states durable evidence. It does not claim recoverable live state newer than a clean checkpoint.
+- [x] Only same-genesis, older-epoch, strictly higher witness evidence warns.
+- [x] The warning states durable evidence. It does not claim recoverable live state newer than a clean checkpoint.
 - [ ] Checkpoint marker failure aborts `NodeState::open`. Worker marker failure fails only the index capability.
 - [ ] Every distinct index-ahead fact warns and publishes durable evidence before reconciliation continues.
 
@@ -181,10 +192,18 @@ Evidence:
 
 - (pending)
 
+- same_genesis_older_epoch_higher_witness_warns: green (RecA12c2, 2026-09-01)
+- equal_or_lower_witness_does_not_warn: green
+- foreign_genesis_or_future_epoch_witness_is_ignored: green
+- detect_checkpoint_fallback: checks format, genesis, epoch < current, height > restored
+- checkpoint_fallback_warning: "Durable applied-tip witness at height X is ahead of the restored tip at height Y. Chainstate was restored from a clean checkpoint, not rejected."
+- reporter_report_checkpoint_fallback_writes_marker_and_warns: green
+- reporter_report_index_ahead_writes_marker_and_warns: green
+- NodeState::open integration and worker marker failure: pending (requires state.rs wiring)
 ### R10: One atomic warning snapshot
 
-- [ ] One in-memory snapshot retains checkpoint and index warning classes together.
-- [ ] Exact repeats deduplicate. Rendering is deterministic: checkpoint first, then sorted index warnings.
+- [x] One in-memory snapshot retains checkpoint and index warning classes together.
+- [x] Exact repeats deduplicate. Rendering is deterministic: checkpoint first, then sorted index warnings.
 - [ ] Index reporting never erases checkpoint fallback. `getblockchaininfo` loads one snapshot per request.
 
 Check:
@@ -197,6 +216,12 @@ Evidence:
 
 - (pending)
 
+- checkpoint_and_index_warnings_coexist: green (RecA12c2, 2026-09-01)
+- repeated_index_ahead_report_is_deduplicated: green
+- index_update_preserves_checkpoint_warning: green
+- getblockchaininfo_reports_atomic_rollback_warnings: green (module-level test)
+- WarningStore uses ArcSwap<WarningSnapshot> with RCU updates
+- getblockchaininfo RPC wiring: pending (requires NodeState integration)
 ### R11: End-to-end convergence and A2 mutations
 
 - [ ] `checkpoint_fallback_with_index_far_ahead_converges_and_warns` passes through the landed REC-C cutover.

@@ -1959,7 +1959,7 @@ impl NodeState {
         let tx_index_worker = self.tx_index_worker.take();
         let filter_index = self.filter_index.take();
         let tx_deadline = start + deadline;
-        let tx_joined = if let Some(worker) = tx_index_worker {
+        let tx_joined = if let Some(mut worker) = tx_index_worker {
             let mut joined = false;
             while std::time::Instant::now() < tx_deadline {
                 if worker.is_finished() {
@@ -1981,8 +1981,12 @@ impl NodeState {
                         crate::txindex_worker::TxIndexLifecycle::ShutdownAbandoned,
                     ));
                 }
-                // Let the worker drop naturally — Drop requests shutdown and
-                // joins, but the thread is detached since it's still running.
+                // Poison the namespace so it cannot be reclaimed in this process.
+                worker.poison_namespace();
+                // Detach the join handle so Drop does not block on join.
+                // The worker thread continues running but will exit after
+                // shutdown is observed; Drop is a no-op for the handle.
+                worker.detach();
             }
             joined
         } else {

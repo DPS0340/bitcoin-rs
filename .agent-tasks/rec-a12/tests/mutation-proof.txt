@@ -84,3 +84,40 @@ Restored: yes
 ### 12. heartbeat_starts_and_stops
 Mutation: start the heartbeat after open or skip stop_and_join on panic.
 Status: THEORETICAL — the unit test verifies stop_and_join doesn't hang, but can't detect a leaked thread. The mutation would leak the heartbeat thread without the test catching it. The integration test has the same limitation.
+
+## A1 abandonment fix (RecA12c2, 2026-09-01)
+
+### 13. blocked_open_drop_hangs_without_detach (RED)
+Mutation: drop a blocked TxIndexWorker without calling detach().
+Status: EXECUTED — RED CONFIRMED (hang).
+Applied: created temporary test `red_evidence_drop_without_detach_hangs` that spawns a worker blocked at TXINDEX_OPEN_GATE, then drops it without calling detach().
+Test output: test started but never completed — `timeout 15 cargo test ... red_evidence_drop_without_detach` killed the process after 15s. The test printed `test txindex_worker::integration_tests::red_evidence_drop_without_detach_hangs ...` with no `ok` or `FAILED` — it hung at `drop(worker)` because `Drop::join()` blocks on the stuck worker thread.
+Root cause: `TxIndexWorker::Drop` (txindex_worker.rs ~628-635 on HEAD b87b0df) unconditionally calls `handle.join()`. When the worker thread is blocked inside `open_tx_index_on_worker` (parked at `wait_txindex_open_gate`), `join()` blocks indefinitely. The abandonment branch in `bounded_index_shutdown` (state.rs ~1974-1987 on HEAD) lets the worker drop naturally, triggering this `Drop::join()`.
+Restored: yes (temporary test removed).
+
+### 14. blocked_open_abandonment_detaches_and_poisons (GREEN)
+Fix: added `TxIndexWorker::detach()` (sets `join_handle = None` so `Drop` is a no-op for the handle) and `TxIndexWorker::poison_namespace()` (calls `NAMESPACE_REGISTRY.poison(key, owner)` for owner-matched poisoning). `bounded_index_shutdown` now calls `worker.poison_namespace()` and `worker.detach()` in the abandonment branch.
+Test: `blocked_open_abandonment_detaches_and_poisons` — parks the worker's backend open via TXINDEX_OPEN_GATE, polls up to 500ms deadline, then abandons: revokes generation, publishes ShutdownAbandoned, poisons namespace, detaches. Asserts elapsed < deadline + 5s, generation revoked, lifecycle is ShutdownAbandoned, namespace is Poisoned (subsequent claim rejected), and `drop(worker)` does not hang.
+Test output: `ok. 1 passed; 0 failed` — all assertions pass in 0.71s.
+Status: GREEN CONFIRMED.
+
+## A2 recovery_evidence cycles (RecA12c2, 2026-09-01)
+
+### 15. recovery_evidence::tests (14 tests, GREEN)
+All 14 recovery_evidence module tests pass:
+- witness_round_trips_and_falls_back_to_prev ... ok
+- foreign_genesis_or_future_epoch_witness_is_ignored ... ok
+- witness_stage_failure_preserves_bounded_current_prev ... ok
+- same_genesis_older_epoch_higher_witness_warns ... ok
+- equal_or_lower_witness_does_not_warn ... ok
+- checkpoint_and_index_warnings_coexist ... ok
+- repeated_index_ahead_report_is_deduplicated ... ok
+- index_update_preserves_checkpoint_warning ... ok
+- marker_round_trips ... ok
+- marker_last_event_wins_preserves_prev ... ok
+- reporter_report_checkpoint_fallback_writes_marker_and_warns ... ok
+- reporter_report_index_ahead_writes_marker_and_warns ... ok
+- oversized_evidence_file_is_ignored ... ok
+- getblockchaininfo_reports_atomic_rollback_warnings ... ok
+Test output: `ok. 14 passed; 0 failed; 0 ignored` in 0.03s.
+Status: GREEN CONFIRMED.

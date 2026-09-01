@@ -295,7 +295,6 @@ enum NamespaceEntry {
     /// An active open owns this namespace.
     Active(u64),
     /// An abandoned open poisoned this namespace permanently.
-    #[allow(dead_code, reason = "poisoned entries are set by the abandon path")]
     Poisoned,
 }
 
@@ -356,7 +355,6 @@ impl NamespaceRegistry {
 
     /// Poisons the namespace only if the entry is `Active(owner)`. Used for
     /// abandoned opens only.
-    #[allow(dead_code, reason = "used by A2 abandon path")]
     fn poison(&self, key: &Path, owner: u64) {
         let mut entries = self.entries.lock();
         if let Some(NamespaceEntry::Active(current)) = entries.get(key) {
@@ -464,6 +462,8 @@ pub(crate) struct TxIndexWorker {
     runtime: Arc<TxIndexRuntime>,
     join_handle: Option<JoinHandle<()>>,
     pub(crate) generation: Option<Generation>,
+    /// Canonical namespace key for poisoning on abandonment.
+    namespace_key: Option<PathBuf>,
 }
 
 impl TxIndexWorker {
@@ -531,6 +531,7 @@ impl TxIndexWorker {
             runtime,
             join_handle: Some(join_handle),
             generation: None,
+            namespace_key: None,
         })
     }
 
@@ -558,6 +559,9 @@ impl TxIndexWorker {
         shutdown: Arc<AtomicBool>,
         wake_rx: Receiver<()>,
     ) -> std::io::Result<Self> {
+        // Compute the namespace key before moving `spec` into the thread.
+        let namespace_key =
+            NamespaceRegistry::validate_child(&spec.canonical_data_root, spec.namespace).ok();
         let runtime_for_thread = Arc::clone(&runtime);
         let generation_for_thread = generation.clone();
         let runtime_for_error = Arc::clone(&runtime);
@@ -598,6 +602,7 @@ impl TxIndexWorker {
             runtime,
             join_handle: Some(join_handle),
             generation: Some(generation),
+            namespace_key,
         })
     }
 
@@ -615,8 +620,24 @@ impl TxIndexWorker {
             let _ = handle.join();
         }
     }
-}
 
+    /// Detaches the worker thread so `Drop` will not join it. Used by the
+    /// abandonment path in `bounded_index_shutdown` when the worker is still
+    /// blocked past the deadline. The thread continues running; dropping the
+    /// `JoinHandle` detaches it.
+    pub(crate) fn detach(&mut self) {
+        self.join_handle = None;
+    }
+
+    /// Poisons the namespace associated with this worker. Used by the
+    /// abandonment path so the namespace is permanently `Poisoned` and
+    /// subsequent claims are rejected.
+    pub(crate) fn poison_namespace(&self) {
+        if let (Some(key), Some(token)) = (&self.namespace_key, &self.generation) {
+            NAMESPACE_REGISTRY.poison(key, token.id());
+        }
+    }
+}
 impl Drop for TxIndexWorker {
     fn drop(&mut self) {
         self.runtime.request_shutdown();
