@@ -177,7 +177,7 @@ All gates must pass before bitcoin-rs is shippable. Not phased — these are fla
 
 **G5 — Electrum protocol parity.** Pointed at the same chain, our `crates/electrum` returns byte-identical responses to a reference electrs build for `blockchain.scripthash.{get_history,get_balance,subscribe,listunspent}`, `blockchain.transaction.get`, `blockchain.estimatefee`, `mempool.get_fee_histogram`, `server.{version,banner,donation_address,peers.subscribe}` over a 10 000-call random sample at tip.
 
-**G6 — Snapshot round-trip.** Driven in process through the snapshot API in `crates/utxo/src/snapshot.rs` (`write_snapshot`, then `read_snapshot_strict_v4`): reloading the written snapshot reproduces an identical UTXO set and coinstats hash. There is no CLI flag for this; the gate is `bin/bitcoin-rs/tests/gates/g06_snapshot_roundtrip.rs`, an `#[ignore]`d manual run over a populated UTXO set whose in-memory path is covered by `crates/utxo` unit tests. Format is `bitcoin-rs`'s own LE format (gocoin wire-compat dropped per ultrareview).
+**G6 — Snapshot round-trip.** Driven in process through the snapshot API in `crates/utxo/src/snapshot.rs` (`write_snapshot`, then `read_snapshot_strict_v4`): reloading a current-format snapshot reproduces the UTXO set and coinstats hash. The contract is covered by the focused `crates/utxo` tests and the fixed v4 golden fixture. Format is `bitcoin-rs`'s own LE format (gocoin wire-compat dropped per ultrareview).
 
 **G7 — Storage-backend equivalence.** RocksDB, MDBX (`signet-libmdbx`), fjall, and redb backends all pass G1–G6 with identical chain results. Backend promotion is decided from retained production-path node sync/apply measurements and correctness evidence; the retired generic KV workload is not a product performance contract.
 
@@ -815,7 +815,7 @@ git commit -am "feat(bin): bitcoin-rs binary" -m "Op: extend"
 ### Task 20: Verification gates G1–G15 — flat acceptance suite
 
 **Files:**
-- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
+- Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
 - CI: `.github/workflows/ci.yml`
 
 Each live gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or external infrastructure. The former G14 artifact drivers and harness tests were retired with the completed performance campaign; current performance contracts live in the retained crate benchmarks. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all live gates are green for two consecutive CI runs on `main`.

@@ -1,4 +1,4 @@
-//! Contract tests for the index resolver's legacy and invalid-position fallbacks.
+//! Contract tests for the index resolver's missing and invalid-position fallbacks.
 //!
 //! Positions are an optimization of persisted rows, not an authority. A row
 //! with no usable position must still resolve against the canonical block, and
@@ -156,7 +156,11 @@ fn a_decodable_but_mismatching_position_still_falls_back() {
     };
     let a_bytes = bitcoin::consensus::encode::serialize(&block_a);
     let b_bytes = bitcoin::consensus::encode::serialize(&block_b);
-    assert_eq!(a_bytes.len(), b_bytes.len(), "positions must land on a decoy");
+    assert_eq!(
+        a_bytes.len(),
+        b_bytes.len(),
+        "positions must land on a decoy"
+    );
 
     let store = Arc::new(MemoryStore::default());
     let mut indexer = Indexer::new(Arc::clone(&store));

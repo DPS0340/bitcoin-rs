@@ -75,14 +75,11 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 
 When a feature, algorithm, interface, or data layout changes, maintainers must remove the old code path completely in the same change-set.
 
-**One exception, and it is not a shim.** A reader that still accepts an older
-on-disk format is permitted where refusing it would destroy data the node
-cannot rebuild. `read_snapshot` accepts UTXO snapshot versions 2, 3 and 4 for
-that reason. The distinction is direction: reading an old format to recover
-state is recovery, while writing one, or translating in place to keep an old
-consumer working, is a shim and is prohibited. A retained reader must be
-write-only-forward — the node writes the current version and never the old one
-— and `docs/policies/db-migration.md` governs when one may be retained at all.
+The UTXO snapshot reader is a clean-cutover boundary: `read_snapshot_strict_v4`
+accepts only complete version-4 snapshots and rejects versions 2 and 3. The
+node can rebuild or resynchronize chainstate, so no legacy reader is retained
+for this format. A future recovery exception would require an explicit
+maintainer decision and matching migration policy before adding a reader.
 
 ### 5.2 RPC Deprecation Policy
 - `bitcoin-rs-rpc` does not provide deprecation windows or compatibility shims for RPC endpoints.

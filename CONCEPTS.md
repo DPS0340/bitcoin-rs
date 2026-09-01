@@ -177,6 +177,12 @@ The nonblocking notification published immediately after a committed `applied_ti
 ### Provably unspendable outputs (UTXO admission)
 Outputs the UTXO set never admits because no spend of them can ever be valid: an output whose `scriptPubKey` starts with `OP_RETURN`, and one longer than `MAX_SCRIPT_SIZE`. Excluding them at admission keeps the set smaller without changing any consensus outcome, so the snapshot codec carries its own version tag, `bitcoin-rs-utxo-spendable-v1`, and a set written by an older codec is not interchangeable with one written by this rule. See `docs/solutions/logic-errors/exclude-provably-unspendable-utxos.md`.
 
+### UTXO snapshot read contract
+The node accepts only complete native version-4 snapshots: the exact magic and
+version, validated v4 records, the declared record count, a 384-byte MuHash
+trailer, and end-of-file. Versions 2 and 3 are unsupported; chainstate is
+rebuilt or resynchronized instead of being loaded through a legacy reader.
+
 ### Undo record
 
 The per-block inverse of a UTXO commit: the outputs the block spent, with

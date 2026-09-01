@@ -588,7 +588,7 @@ mod spentby_tests {
 
     use bitcoin::hashes::Hash as _;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-    use bitcoin_rs_mempool::{Mempool, MempoolEntry};
+    use bitcoin_rs_mempool::MempoolEntry;
 
     use super::*;
 
@@ -642,6 +642,7 @@ mod spentby_tests {
             1,
             3,
         );
+        let child_b_txid = child_b.compute_txid();
         let child_c = tx_with(&[OutPoint::new(child_a_txid, 0)], 1, 4);
         let loner = tx_with(&[OutPoint::new(Txid::from_byte_array([9_u8; 32]), 0)], 1, 5);
 
@@ -667,7 +668,7 @@ mod spentby_tests {
                 };
             }
         }
-        let mut expected = [child_a_txid, child_b.compute_txid()]
+        let mut expected = [child_a_txid, child_b_txid]
             .map(|txid| txid.to_string())
             .to_vec();
         expected.sort();

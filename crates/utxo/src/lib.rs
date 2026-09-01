@@ -36,7 +36,8 @@ pub use set::{
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,
-    read_snapshot, read_snapshot_strict_v4_observed, write_snapshot, write_snapshot_observed,
+    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
+    write_snapshot_observed,
 };
 pub use undo_codec::{
     UNDO_FORMAT_VERSION, UndoCodecError, decode as decode_undo, encode as encode_undo,

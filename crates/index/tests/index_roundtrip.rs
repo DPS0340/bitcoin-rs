@@ -32,7 +32,6 @@ impl MemoryStore {
         let guard = self.cfs.read();
         guard[cf.index()].len()
     }
-
 }
 
 impl KvStore for MemoryStore {
