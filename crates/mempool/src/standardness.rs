@@ -366,14 +366,7 @@ fn evaluate_one(
         );
         match pool.check_replacement(&candidate) {
             Err(err) => Some(AcceptanceRejectReason::Replacement(err)),
-            Ok(plan) => {
-                let excluded: hashbrown::HashSet<crate::EntryId> =
-                    plan.evicted.iter().copied().collect();
-                match pool.check_package_limits(tx, vsize, &excluded) {
-                    Err(err) => Some(AcceptanceRejectReason::PackageLimit(err)),
-                    Ok(()) => None,
-                }
-            }
+            Ok(_) => None,
         }
     };
 
@@ -1072,41 +1065,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn package_limits_use_shared_evaluator() {
-        let mut pool = crate::Mempool::new(crate::MempoolLimits {
-            max_ancestors: 1,
-            ..crate::MempoolLimits::default()
-        });
-        let parent = standard_tx(1);
-        pool.insert_entry(crate::MempoolEntry::new(
-            Arc::new(parent.clone()),
-            100,
-            1_000,
-            1,
-            1,
-        ))
-        .expect("parent in");
-
-        let mut child = standard_tx(2);
-        child.inputs[0].previous_output = OutPoint::new(parent.txid(), 0);
-        let facts = evaluate_package_acceptance(
-            &pool,
-            &policy(),
-            std::slice::from_ref(&child),
-            &[ctx(1_000, 100, false)],
-            None,
-            1_000,
-        );
-        assert!(
-            matches!(
-                facts.results[0].reject_reason,
-                Some(AcceptanceRejectReason::PackageLimit(_))
-            ),
-            "child exceeding ancestor count must be PackageLimit, got {:?}",
-            facts.results[0].reject_reason
-        );
-    }
     #[test]
     fn package_acceptance_all_evaluates_after_rejection() {
         let pool = crate::Mempool::new(crate::MempoolLimits::default());

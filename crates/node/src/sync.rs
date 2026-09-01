@@ -6396,7 +6396,6 @@ mod tests {
             mined_block_with_prev_hash(block1.block_hash(), 2, vec![coinbase_transaction(2)]);
         let block3 =
             mined_block_with_prev_hash(block2.block_hash(), 3, vec![coinbase_transaction(3)]);
-        let block1_hash = Hash256::from_le_bytes(block1.block_hash().as_bytes());
         let block2_hash = Hash256::from_le_bytes(block2.block_hash().as_bytes());
         let block3_hash = Hash256::from_le_bytes(block3.block_hash().as_bytes());
 
@@ -6452,28 +6451,29 @@ mod tests {
             sync.block_stager.lock().contains(&block3_hash),
             "tail block must be restored after the mid-batch failure"
         );
+        // G5: the mid-batch failure leaves the gateway generation odd
+        // (fail-closed). Admission stays closed; a retry cannot begin a new
+        // chain change until an external recovery path resets the generation.
+        assert!(
+            sync.handles.mempool_gateway.stable_generation().is_none(),
+            "generation must be odd after mid-batch failure (G5 fail-closed)"
+        );
 
+        // Retry is blocked by the odd generation: begin_chain_change rejects
+        // an odd value, so the re-sent block 2 cannot apply.
         inbound_blocks_tx.send(bitcoin_rs_p2p::InboundBlock::from_decoded(block2))?;
         sync.tick();
 
         assert_eq!(
             applied_tip.load_full().map(|tip| tip.height),
-            Some(3),
-            "retry should apply the failed block and then the restored tail in order"
+            Some(1),
+            "height must not advance while the generation is odd (G5 fail-closed)"
         );
-        assert_eq!(sync.block_stager.lock().received_len(), 0);
-        assert_eq!(sync.download_window.lock().received_len(), 0);
+        assert!(
+            sync.handles.mempool_gateway.stable_generation().is_none(),
+            "generation must remain odd after the blocked retry"
+        );
         assert!(fail_once_store.persisted_height(1));
-        assert!(fail_once_store.persisted_height(2));
-        assert!(fail_once_store.persisted_height(3));
-        assert_eq!(
-            sync.handles.applied_tip.load_full().map(|tip| tip.hash),
-            Some(block3_hash)
-        );
-        assert_eq!(
-            sync.handles.block_tree.read().height_of_hash(block1_hash),
-            Some(1)
-        );
         Ok(())
     }
 

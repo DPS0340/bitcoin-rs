@@ -1422,21 +1422,17 @@ pub fn apply_window(
         })?;
     let proof = ChainChangeProof::new(transition, guard);
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
-    let result = (|| {
-        let mut applied = 0_usize;
-        for (block, raw) in blocks.iter().zip(serialized) {
-            apply_block_admitted(handles, block, Some(raw.clone()), proven.next(), &proof)
-                .map_err(|source| WindowApplyError { applied, source })?;
-            applied = applied.saturating_add(1);
-        }
-        Ok(())
-    })();
-    // Finish the chain change on both success and failure. A partial apply
-    // commits a consistent prefix (UTXO and tip are advanced to `applied`),
-    // so releasing the generation is safe. Leaving it odd would block the
-    // caller's retry: begin_chain_change rejects an odd generation.
+    let mut applied = 0_usize;
+    for (block, raw) in blocks.iter().zip(serialized) {
+        apply_block_admitted(handles, block, Some(raw.clone()), proven.next(), &proof)
+            .map_err(|source| WindowApplyError { applied, source })?;
+        applied = applied.saturating_add(1);
+    }
+    // G5: finish only on success. An error after begin leaves the generation
+    // odd by design — admission stays closed until an external recovery path
+    // resets it.
     let _ = proof.finish();
-    result
+    Ok(())
 }
 
 /// A window that failed partway, and how many of its blocks committed first.

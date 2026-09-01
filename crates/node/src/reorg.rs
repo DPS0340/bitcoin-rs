@@ -272,22 +272,27 @@ where
         let transition = handles
             .begin_chain_transition()
             .map_err(|source| ReorgError::Unavailable(Box::new(source)))?;
+
+        // Preloading is optimistic. Only an identical plan recomputed while the
+        // transition lock is held may mutate chainstate.
+        let Some(authoritative) = current_reorg_plan(handles, target)? else {
+            return Ok(());
+        };
+        if plan != authoritative {
+            drop(transition);
+            continue;
+        }
+
+        // G5: start the guard after fallible read-only planning and before the
+        // first chain mutation. A replan above drops the transition without
+        // beginning a generation, so the gateway stays even and the loop
+        // retries. An error during execution leaves the generation odd by
+        // design — admission stays closed.
         let guard = handles
             .mempool_gateway
             .begin_chain_change()
             .map_err(|_| ReorgError::Unavailable(Box::new(ApplyError::Shutdown)))?;
         let proof = crate::apply::ChainChangeProof::new(transition, guard);
-
-        // Preloading is optimistic. Only an identical plan recomputed while the
-        // transition lock is held may mutate chainstate.
-        let Some(authoritative) = current_reorg_plan(handles, target)? else {
-            let _ = proof.finish();
-            return Ok(());
-        };
-        if plan != authoritative {
-            let _ = proof.finish();
-            continue;
-        }
 
         let (connected, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
         for body in &connect[..connected] {
