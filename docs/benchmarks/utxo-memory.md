@@ -142,9 +142,10 @@ measured. The 13.83 GiB figure everything here is projected from comes from
 *excluded* evidence at height 645,804, on a run that never made the tip.
 
 **If G14 tip RSS measures well under budget — say below 10 GiB — this
-complexity is not earning its keep and reverting is the right call.** v4 is
-retained in the tree as the equivalence oracle and the benchmark's `before`
-arm, so a revert is a revert rather than a rewrite.
+complexity is not earning its keep and reverting is the right call.** The
+historical v4 implementation and its comparison harness have since been
+retired; the measurements below remain evidence for that decision, not a
+current compatibility or benchmark contract.
 
 The second thing that would change the answer is outputs per record. The
 projection holds it at 3.626; it has not converged (2.296 at height 183k, 4.056
@@ -338,33 +339,18 @@ per entry.
 
 ### How it is checked
 
-- `crates/utxo/tests/record_codec_equivalence.rs`, 7 tests. v4 is retained as
-  the oracle and both codecs run over the same inputs; equality is **per field**
-  over every decoded `OneUtxoOut`, in order, because comparing encoded bytes
-  would be meaningless when the layouts are supposed to differ. Size is asserted
-  as a property, not a spot check.
-- `non_canonical_v5_spellings_are_rejected` covers what the variable-length and
-  fixed-width layouts each introduced: a non-minimal varint, the amount escape
-  used for a value the compact form already covers, and a directory wider than
-  the record needs. `UtxoRecord` compares by bytes, so a second spelling of one
-  record is a correctness bug.
-- `find_output_decompresses_at_most_the_amount_it_returns` asserts the *work*,
-  not the time: one amount decompression for a hit, none for a miss, none for
-  `max_vout`, no matter how many outputs the record holds. A wall-clock
-  assertion in a test suite is a flake generator; counting the expensive
-  operation is the same claim made deterministically.
+The former `record_codec_equivalence` integration test and `record_codec`
+benchmark were retired with the A/B harness. Historical v4/v5 equivalence and
+size checks remain on this page as evidence; current record correctness is
+covered by the unit tests in `crates/utxo/src/record.rs` and the snapshot and
+commit integration tests. The deterministic `find_output` work-count test
+remains because it protects the lookup algorithm without asserting wall time.
 
-Reproduce:
+Reproduce the retained production-shaped benchmark:
 
 ```
-cargo bench -p bitcoin-rs-utxo --bench record_codec
-cargo bench -p bitcoin-rs-utxo --bench utxo_commit -- "lookup|spend_fanout_64"
+cargo bench -p bitcoin-rs-utxo --bench utxo_commit
 ```
-
-The `utxo_commit` arms cannot be paired in one run — only one codec is compiled
-in — so the v4 comparison was taken A-B-A across a stash, with the two v5 runs
-agreeing to 0.1-2.9%. That drift bounds the rebuild effect well below every
-ratio quoted above.
 
 ## Superseded: the pre-measurement sizing
 

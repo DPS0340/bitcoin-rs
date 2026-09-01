@@ -1557,35 +1557,6 @@ mod tests {
     }
 
     #[test]
-    fn gettxoutproof_index_path_matches_the_scan_it_replaces() {
-        let blocks = [distinct_block(1), distinct_block(2), distinct_block(3)];
-        let Some(wanted) = blocks[2]
-            .txdata
-            .first()
-            .map(bitcoin::Transaction::compute_txid)
-        else {
-            panic!("block has no transactions");
-        };
-
-        let scan_ctx = context_with_blocks(&blocks);
-        let scanned =
-            proof_for(&scan_ctx, &[wanted]).unwrap_or_else(|err| panic!("scan path failed: {err}"));
-
-        let mut index_ctx = Context::new();
-        index_ctx.tx_index = Some(Arc::new(HeightQuery(|_: &Txid| Ok(Some(2)))));
-        install_blocks(&mut index_ctx, &blocks);
-        let index_ctx = Arc::new(index_ctx);
-        let indexed = proof_for(&index_ctx, &[wanted])
-            .unwrap_or_else(|err| panic!("index path failed: {err}"));
-
-        assert_eq!(
-            indexed.as_str(),
-            scanned.as_str(),
-            "the index path must return the proof the scan would have returned"
-        );
-    }
-
-    #[test]
     fn gettxoutproof_index_path_does_not_read_unrelated_block_bodies() {
         // Records without a body force a `BlockBodySource` read, so a scan over
         // them panics; only skipping them entirely keeps this test green.

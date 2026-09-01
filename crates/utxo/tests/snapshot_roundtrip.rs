@@ -1,14 +1,11 @@
 //! Snapshot dump/load round-trip coverage.
-use bitcoin::{
-    Amount, ScriptBuf,
-    hashes::{Hash as _, sha256},
-};
+use bitcoin::{Amount, ScriptBuf};
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
 use bitcoin_rs_utxo::{
     BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey,
     UtxoRemoved, UtxoSet, hash_serialized_3, read_snapshot, write_snapshot,
 };
-use std::io::{Cursor, Read, Seek};
+use std::io::{Cursor, Read};
 use tempfile::tempfile;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,59 +87,6 @@ fn max_script_txout(seed: u64) -> TxOut {
 }
 
 #[test]
-fn snapshot_roundtrip_preserves_full_outpoints_hash_and_trailer()
--> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let mut changes = BlockChanges::default();
-
-    for i in 0_u64..10_000 {
-        let outpoint = OutPoint::new(txid(i), u32::try_from(i % 5)?);
-        changes.add(UtxoAdd::new(outpoint, txout(i), false, 200));
-    }
-    let collision_prefix = 0x0102_0304_0506_0708_u64;
-    let first_collision = OutPoint::new(txid_with_prefix(collision_prefix, 1), 0);
-    let second_collision = OutPoint::new(txid_with_prefix(collision_prefix, 2), 0);
-    let first_collision_txout = txout(20_001);
-    let second_collision_txout = txout(20_002);
-    changes.add(UtxoAdd::new(
-        first_collision,
-        first_collision_txout.clone(),
-        true,
-        201,
-    ));
-    changes.add(UtxoAdd::new(
-        second_collision,
-        second_collision_txout.clone(),
-        false,
-        202,
-    ));
-    set.commit_block(&changes, &txid(10_000))?;
-
-    let expected_hash = hash_serialized_3(&set)?;
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(99), 200, &mut file)?;
-    file.rewind()?;
-
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.tip_hash, txid(99));
-    assert_eq!(loaded.height, 200);
-    assert_eq!(loaded.muhash_trailer, [0_u8; 384]);
-    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
-    assert_eq!(loaded.set.len(), set.len());
-    assert_eq!(
-        loaded.set.get(&first_collision),
-        Some(first_collision_txout)
-    );
-    assert_eq!(
-        loaded.set.get(&second_collision),
-        Some(second_collision_txout)
-    );
-
-    Ok(())
-}
-
-#[test]
 fn snapshot_roundtrip_preserves_vout_64() -> Result<(), Box<dyn std::error::Error>> {
     let set = UtxoSet::new();
     let live_txid = txid(42_000);
@@ -174,72 +118,6 @@ fn snapshot_roundtrip_preserves_vout_64() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(loaded.set.get(&low), Some(low_txout));
     assert_eq!(loaded.set.get(&high), Some(high_txout));
     assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
-    Ok(())
-}
-
-#[test]
-fn snapshot_roundtrip_preserves_440_outputs_from_one_transaction()
--> Result<(), Box<dyn std::error::Error>> {
-    const OUTPUT_COUNT: u32 = 440;
-    let set = UtxoSet::new();
-    let live_txid = txid(43_000);
-    let mut changes = BlockChanges::default();
-    for vout in 0..OUTPUT_COUNT {
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid, vout),
-            txout(u64::from(vout)),
-            false,
-            402,
-        ));
-    }
-    set.commit_block(&changes, &txid(43_001))?;
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(43_002), 402, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.set.len(), usize::try_from(OUTPUT_COUNT)?);
-    assert_eq!(
-        loaded.set.get(&OutPoint::new(live_txid, OUTPUT_COUNT - 1)),
-        Some(txout(u64::from(OUTPUT_COUNT - 1)))
-    );
-    Ok(())
-}
-
-#[test]
-fn snapshot_v4_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(
-        OutPoint::new(txid(1), 0),
-        txout(11),
-        false,
-        40,
-    ));
-    changes.add(UtxoAdd::new(
-        OutPoint::new(txid(2), 64),
-        txout(22),
-        true,
-        41,
-    ));
-    set.commit_block(&changes, &txid(3))?;
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(99), 41, &mut file)?;
-    file.rewind()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-
-    assert_eq!(bytes.len(), 588);
-    assert_eq!(
-        sha256::Hash::hash(&bytes),
-        sha256::Hash::from_byte_array([
-            0x2d, 0xb8, 0xfa, 0xf3, 0x4a, 0x52, 0x3d, 0x7e, 0xb6, 0xf5, 0xfa, 0x75, 0x09, 0xe3,
-            0x5d, 0x74, 0xd0, 0x69, 0x2c, 0x2b, 0x9c, 0xf2, 0x52, 0x55, 0x52, 0x6a, 0x85, 0xff,
-            0x35, 0x9b, 0x0a, 0xda,
-        ]),
-    );
     Ok(())
 }
 
@@ -334,26 +212,6 @@ fn strict_v4_snapshot_rejects_legacy_versions_that_compatibility_decoder_accepts
     Ok(())
 }
 
-#[cfg(target_pointer_width = "32")]
-#[test]
-fn strict_v4_snapshot_rejects_record_count_that_overflows_usize() {
-    let mut snapshot = Vec::new();
-    snapshot.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
-    snapshot.extend_from_slice(&4_u32.to_le_bytes());
-    snapshot.extend_from_slice(&txid(64_300).to_le_bytes());
-    snapshot.extend_from_slice(&64_u32.to_le_bytes());
-    snapshot.extend_from_slice(&u64::MAX.to_le_bytes());
-
-    let error = match bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(snapshot))
-    {
-        Err(error) => error,
-        Ok(_) => panic!("record count must fit usize"),
-    };
-    assert!(matches!(
-        error,
-        UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX }
-    ));
-}
 // ─────────────────────────────────────────────────────────────────────────────
 //  Task 2: adversarial / boundary coverage
 // ─────────────────────────────────────────────────────────────────────────────

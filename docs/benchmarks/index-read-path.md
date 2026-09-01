@@ -10,8 +10,8 @@ flat-file fixture. The `before_scan` and `after_fast` arms described below are
 historical evidence from the retired refactor harness; they are not current
 targets.
 
-The arms call different functions — the retained `*_scan` reference against the
-position-backed resolver — over the same rows and block files.
+The historical arms called different functions — the former `*_scan` reference
+against the position-backed resolver — over the same rows and block files.
 
 > **Harness correction, 2026-08-13 (second).** Between the resolver rewrite
 > landing and this revision, the two `electrum_methods.rs` arms were *literally
@@ -158,14 +158,14 @@ most once per matching transaction, via `Option::get_or_insert_with`.
 `resolve_unspent_outputs` no longer duplicates the walk at all — it delegates and
 drops the height. Pure code motion; no behavioural change.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 8 tests against
-the naive `resolve_unspent_outputs*_scan` references retained in the crate:
-single funding output, one transaction paying the target twice (the lazy txid
-must be computed once and reused by both entries), two transactions paying the
-target in one block (ingest collapses these into a single row), multiple
-heights, an unresolvable height, an `OP_RETURN` target that ingest never indexed,
-a never-indexed scripthash, and a `proptest` over random block/transaction/output
-shapes. Equality is over the full result vector, not a spot check.
+**Historical equivalence (retired).** The former `resolver_equivalence`
+integration tests compared the unspent-output resolvers with naive scan-only
+references over single and multiple heights, duplicate matches, unresolvable
+heights, never-indexed scripts, and random block/transaction/output shapes.
+The tests and public scan-only oracle methods were retired with the A/B
+harness. Current resolver behavior is covered by the Indexer unit tests and
+the transaction-position contract tests; the private full-scan helpers remain
+the live fallback path.
 
 **Historical speed**, paired arms in one run, from the retired
 `crates/index/benches/history_resolve.rs` harness.
@@ -191,11 +191,9 @@ because it agrees with the paired result: `get_balance` and `listunspent` each
 fell about 50% at 1 and 8 heights. The 64-height groups are excluded per the
 noise floor above; on this run their identical arms disagreed by 1.7x.
 
-**Reference retention.** The `_scan` functions stay in the crate as the
-equivalence oracle and the `before` arm. They deliberately keep the eager txid:
-an oracle that shares an optimization with the implementation it checks cannot
-catch a fault in that optimization. They are not the fallback path; the measured
-fixtures show the positioned resolvers were faster.
+**Reference retirement.** The scan-only oracle and benchmark `before` arm were
+removed after the comparison was completed. The historical numbers above remain
+evidence for the lazy-txid change, not a current test or runtime contract.
 
 ## Landed: transaction byte positions in row values
 
@@ -258,9 +256,9 @@ untested branch was the only one that matters in production.
 **Change.** `resolve_script_history`, `resolve_unspent_outputs{,_with_height}`
 and `resolve_transaction` now read each row's `TxPosition` list, fetch only
 those byte ranges through `BlockSource::block_bytes_at_height`, and decode only
-those transactions. The public `*_scan` methods survive as correctness oracles
-and benchmark `before` arms; production resolvers use private per-height full-scan
-helpers when positioned resolution fails.
+those transactions. Production resolvers use private per-height full-scan
+helpers when positioned resolution fails; the former public scan-only oracle
+methods were retired with the comparison harness.
 
 **The all-or-scan rule is what makes this safe.** A resolver falls back to a full
 block scan the moment any single position fails to resolve; it never skips a
@@ -328,29 +326,14 @@ The 64-height `subscribe` and `get_balance` groups, previously unusable at
 2.0-2.4x identical-arm spread, are now stable: the `after` arm got cheap enough
 that host thermal noise no longer dominates the group.
 
-**Equivalence.** `crates/index/tests/resolver_equivalence.rs`, 12 tests. Every
-assertion runs **twice** — once against a source that can serve ranges and once
-against one that declines — so the position path and the scan fallback are both
-checked against the same `_scan` oracle.
-
-**One of the twelve tests the read shape, not the result**, and it exists because
-the other eleven cannot catch the most likely regression. Equivalence is measured
-*against scanning*, so deleting the position path entirely leaves all eleven
-green. `the_position_path_reads_ranges_and_never_whole_blocks` counts the calls
-its source serves and asserts that the position path loads zero whole blocks and
-at least one range, and that a source declining ranges is the mirror image.
-Raised in review of PR #80.
-
-Beyond the shared fixtures:
-
-- `stale_positions_from_a_superseded_block_fall_back_to_scanning` indexes block
-  A and serves block B at the same height.
-- `a_stale_position_that_decodes_but_does_not_match_still_forces_a_scan` does the
-  same with both blocks holding equally sized transactions, so A's offset lands
-  exactly on a transaction boundary in B and yields a **valid** transaction that
-  funds something else.
-- `rows_without_positions_fall_back_to_scanning` blanks every row value to
-  reproduce a database written before this format.
+**Historical equivalence (retired).** The former `resolver_equivalence` tests
+ran each case once with a range-serving source and once with a source that
+declined ranges, comparing both paths with the scan-only oracle. They also
+covered the read shape, stale positions from a superseded block, valid-looking
+but mismatching stale positions, and rows written before positions existed.
+The test suite and public oracle methods were retired with the A/B harness; the
+private all-or-scan fallback remains production code, with current row-value
+coverage in `tx_positions.rs` and resolver unit tests.
 
 **Mutation-verified.**
 

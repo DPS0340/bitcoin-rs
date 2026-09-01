@@ -11,9 +11,6 @@ const TXID_LEN: usize = 32;
 const OUTPUT_COUNT_OFFSET: usize = TXID_LEN;
 const LEGACY_INLINE_LEN_OFFSET: usize = OUTPUT_COUNT_OFFSET + core::mem::size_of::<u32>();
 const RECORD_HEADER_LEN: usize = LEGACY_INLINE_LEN_OFFSET + core::mem::size_of::<u8>();
-/// Fixed per-output metadata width of the retained v4 layout:
-/// `vout(4) || value(8) || height(4) || coinbase(1) || script_len(2)`.
-const OUTPUT_METADATA_LEN_V4: usize = 19;
 /// Largest v5 payload prologue, for the encoder's stack buffer: 10 bytes for
 /// the amount varint (or the escape sentinel), 8 for a raw escaped amount, and
 /// 5 for the packed height. The script needs none — it is the rest.
@@ -135,16 +132,16 @@ const LEGACY_INLINE_CAPACITY: usize = 8;
 ///
 /// [`compress_amount`] maps the whole money supply below 2^54, so `u64::MAX` is
 /// unreachable as a compressed amount and is free as an escape. No
-/// consensus-valid output can need it — but `Amount` is a plain `u64`, v4
-/// stored one losslessly, and a codec that started rejecting values its
-/// predecessor accepted would not be an equivalent replacement.
+/// consensus-valid output can need it — but `Amount` is a plain `u64`, so the
+/// record codec preserves every representable value for lossless round trips.
 const AMOUNT_ESCAPE: u64 = u64::MAX;
 
 /// Packs the two per-output facts that always travel together into one varint.
 ///
 /// `coinbase` occupies the low bit, so a height under 2^20 — every height
-/// Bitcoin will reach for centuries — costs 3 bytes for both fields where v4
-/// spent 5. Kept per-output rather than hoisted into the record header, which
+/// Bitcoin will reach for centuries — costs 3 bytes for both fields instead of
+/// separate fixed-width fields. Kept per-output rather than hoisted into the
+/// record header, which
 /// would save 3 more: hoisting needs "every output of a record shares one
 /// height" to hold, and BIP30's duplicate coinbase txids are exactly the case
 /// where it might not.
@@ -1075,15 +1072,6 @@ impl<'a> OutputParts<'a> {
             .checked_add(script_len)
             .ok_or(UtxoError::RecordTooLarge { len: script_len })
     }
-
-    /// Validated v4 encoded size (19-byte metadata + script). Oracle only.
-    fn encoded_len_v4(&self) -> Result<usize, UtxoError> {
-        let script_len = self.script.len();
-        u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
-        OUTPUT_METADATA_LEN_V4
-            .checked_add(script_len)
-            .ok_or(UtxoError::RecordTooLarge { len: script_len })
-    }
 }
 
 /// Outcome of staging a coalesced remove run without materializing removals.
@@ -1234,11 +1222,8 @@ fn encode_record(
     writer.push(&output_count.to_le_bytes())?;
     writer.push(&[legacy_inline_len_u8])?;
     writer.push(&[pack_widths(vout_width, len_width)?])?;
-    // One `push` per directory entry. Staging both directories in a
-    // `SmallVec` scratch and copying once was tried and measured *slower* —
-    // 505.7ns against 428.5ns to encode a 16-output record — because setting up
-    // the scratch costs more than the bounds checks it saves at one or two
-    // bytes per entry.
+    // One `push` per directory entry is cheaper than staging both directories
+    // in a scratch buffer: the entries are only one or two bytes each.
     for output in outputs {
         push_dir_entry(&mut writer, u64::from(output.vout), vout_width)?;
     }
@@ -1247,44 +1232,6 @@ fn encode_record(
     }
     for output in outputs {
         write_payload(&mut writer, output)?;
-    }
-    writer.finish()?;
-    debug_assert_eq!(buf.as_bytes().len(), payload_len);
-    Ok(buf)
-}
-
-/// [`encode_record`] against the retained v4 output layout. Oracle and
-/// benchmark arm only; nothing in the crate encodes v4 any more.
-fn encode_record_v4(
-    txid: Hash256,
-    legacy_inline_len: usize,
-    outputs: &[OutputParts<'_>],
-) -> Result<ThinRecordBuf, UtxoError> {
-    let output_count = u32::try_from(outputs.len())
-        .map_err(|_| UtxoError::RecordTooLarge { len: outputs.len() })?;
-    if legacy_inline_len > LEGACY_INLINE_CAPACITY || legacy_inline_len > outputs.len() {
-        return Err(UtxoError::CorruptRecord);
-    }
-
-    let mut payload_len = RECORD_HEADER_LEN;
-    for output in outputs {
-        payload_len = payload_len
-            .checked_add(output.encoded_len_v4()?)
-            .ok_or(UtxoError::RecordTooLarge { len: payload_len })?;
-    }
-    if payload_len > usize::try_from(isize::MAX).unwrap_or(usize::MAX) {
-        return Err(UtxoError::RecordTooLarge { len: payload_len });
-    }
-
-    let legacy_inline_len_u8 =
-        u8::try_from(legacy_inline_len).map_err(|_| UtxoError::CorruptRecord)?;
-    let mut buf = ThinRecordBuf::with_capacity(payload_len)?;
-    let mut writer = RecordWriter::new(&mut buf);
-    writer.push(&txid.to_le_bytes())?;
-    writer.push(&output_count.to_le_bytes())?;
-    writer.push(&[legacy_inline_len_u8])?;
-    for output in outputs {
-        write_output_v4(&mut writer, output)?;
     }
     writer.finish()?;
     debug_assert_eq!(buf.as_bytes().len(), payload_len);
@@ -1305,9 +1252,8 @@ fn amount_parts(value: u64) -> (u64, bool) {
 /// `vout` and the payload length live in the directories, and the script length
 /// is not stored at all — the script is the remainder of the payload.
 ///
-/// The `u16` script-length ceiling is kept from v4, so both codecs accept
-/// exactly the same set of outputs and the equivalence between them is
-/// unconditional.
+/// The `u16` script-length ceiling bounds the remainder of the payload and
+/// keeps record sizes representable by the directory.
 fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Result<(), UtxoError> {
     use crate::compress::write_varint_at;
 
@@ -1315,9 +1261,8 @@ fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Res
     u16::try_from(script_len).map_err(|_| UtxoError::ScriptTooLarge { len: script_len })?;
     let (amount, escaped) = amount_parts(output.value);
 
-    // Laid into one stack buffer and copied once, mirroring v4. Issuing a
-    // bounds-checked `push` per field instead measured 3.2x slower to encode a
-    // 16-output record — the varints are cheap, the per-push overhead was not.
+    // Lay the variable-length prologue into one stack buffer and copy it once.
+    // Issuing a bounds-checked `push` per field adds overhead to every output.
     let mut prologue = [0_u8; PAYLOAD_PROLOGUE_MAX_LEN];
     let mut at = write_varint_at(amount, &mut prologue, 0).ok_or(UtxoError::CorruptRecord)?;
     if escaped {
@@ -1338,33 +1283,6 @@ fn write_payload(writer: &mut RecordWriter<'_>, output: &OutputParts<'_>) -> Res
     .ok_or(UtxoError::CorruptRecord)?;
 
     writer.push(prologue.get(..at).ok_or(UtxoError::CorruptRecord)?)?;
-    writer.push(output.script)?;
-    Ok(())
-}
-
-/// Appends one output in the retained v4 layout: a fixed 19-byte metadata block
-/// plus the script.
-///
-/// Not reachable from any live path — [`encode_record`] writes v5. It is the
-/// equivalence oracle and the benchmark's `before` arm, and it is what proves
-/// the replacement is both smaller and lossless.
-fn write_output_v4(
-    writer: &mut RecordWriter<'_>,
-    output: &OutputParts<'_>,
-) -> Result<(), UtxoError> {
-    let script_len = u16::try_from(output.script.len()).map_err(|_| UtxoError::ScriptTooLarge {
-        len: output.script.len(),
-    })?;
-    // Pack the canonical 19-byte metadata header (`vout || value || height ||
-    // coinbase || script_len`, all little-endian) into one stack array, then
-    // emit it followed by the script in a single two-push sequence.
-    let mut meta = [0_u8; OUTPUT_METADATA_LEN_V4];
-    meta[0..4].copy_from_slice(&output.vout.to_le_bytes());
-    meta[4..12].copy_from_slice(&output.value.to_le_bytes());
-    meta[12..16].copy_from_slice(&output.height.to_le_bytes());
-    meta[16] = u8::from(output.coinbase);
-    meta[17..19].copy_from_slice(&script_len.to_le_bytes());
-    writer.push(&meta)?;
     writer.push(output.script)?;
     Ok(())
 }
@@ -1441,8 +1359,8 @@ fn payload_offset(bytes: &[u8], layout: &V5Layout, index: usize) -> Result<usize
 /// walk never re-sums the length directory.
 ///
 /// Every rejection here exists to keep the encoding canonical, so that equal
-/// records are byte-equal — a property v4's fixed-width fields gave for free
-/// and one that `UtxoRecord`'s byte-wise `PartialEq` depends on.
+/// records are byte-equal, which `UtxoRecord`'s byte-wise `PartialEq` depends
+/// on.
 fn decode_output_at<'a>(
     bytes: &'a [u8],
     layout: &V5Layout,
@@ -1483,8 +1401,7 @@ fn decode_output_at<'a>(
     let coinbase = packed & 1 == 1;
 
     // Whatever is left of the payload is the script, so no length is stored.
-    // The v4 ceiling is still enforced: a record a v4 build could not have
-    // written must not decode here either.
+    // Keep the script length within the representable record bound.
     let script_pubkey = body.get(cursor..).ok_or(UtxoError::CorruptRecord)?;
     u16::try_from(script_pubkey.len()).map_err(|_| UtxoError::CorruptRecord)?;
 
@@ -1500,179 +1417,10 @@ fn decode_output_at<'a>(
     ))
 }
 
-/// Decodes one output in the retained v4 layout. Oracle and benchmark arm only;
-/// see [`write_output_v4`].
-fn decode_output_v4(bytes: &[u8], offset: usize) -> Result<(OneUtxoOut<'_>, usize), UtxoError> {
-    let metadata_end = offset
-        .checked_add(OUTPUT_METADATA_LEN_V4)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let metadata = bytes
-        .get(offset..metadata_end)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let vout = read_u32(metadata, 0).ok_or(UtxoError::CorruptRecord)?;
-    let value = read_u64(metadata, 4).ok_or(UtxoError::CorruptRecord)?;
-    let height = read_u32(metadata, 12).ok_or(UtxoError::CorruptRecord)?;
-    let coinbase = match metadata[16] {
-        0 => false,
-        1 => true,
-        _ => return Err(UtxoError::CorruptRecord),
-    };
-    let script_len = usize::from(read_u16(metadata, 17).ok_or(UtxoError::CorruptRecord)?);
-    let next = metadata_end
-        .checked_add(script_len)
-        .ok_or(UtxoError::CorruptRecord)?;
-    let script_pubkey = bytes
-        .get(metadata_end..next)
-        .ok_or(UtxoError::CorruptRecord)?;
-    Ok((
-        OneUtxoOut {
-            vout,
-            value,
-            script_pubkey,
-            coinbase,
-            height,
-        },
-        next,
-    ))
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(core::mem::size_of::<u16>())?;
-    let bytes = bytes.get(offset..end)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(core::mem::size_of::<u32>())?;
     let bytes = bytes.get(offset..end)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(core::mem::size_of::<u64>())?;
-    let bytes = bytes.get(offset..end)?;
-    Some(u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
-}
-
-/// Both record payload codecs, side by side, for the equivalence test and the
-/// paired benchmark.
-///
-/// The codec itself is `pub(crate)` and stays that way; this is the smallest
-/// surface that lets an out-of-crate test drive v4 and v5 over identical inputs
-/// and compare bytes as well as fields. Inputs and outputs are
-/// [`OneUtxoOut`], which is the type the rest of the crate reads records
-/// through, so nothing here is a test-only shape.
-#[doc(hidden)]
-pub struct RecordCodec;
-
-#[doc(hidden)]
-impl RecordCodec {
-    /// Encodes a whole record payload with the current v5 output layout.
-    pub fn encode_v5(txid: Hash256, outputs: &[OneUtxoOut<'_>]) -> Result<Vec<u8>, UtxoError> {
-        let parts = view_parts(outputs);
-        let inline = parts.len().min(LEGACY_INLINE_CAPACITY);
-        Ok(encode_record(txid, inline, &parts)?.as_bytes().to_vec())
-    }
-
-    /// Encodes the same payload with the retained v4 output layout.
-    pub fn encode_v4(txid: Hash256, outputs: &[OneUtxoOut<'_>]) -> Result<Vec<u8>, UtxoError> {
-        let parts = view_parts(outputs);
-        let inline = parts.len().min(LEGACY_INLINE_CAPACITY);
-        Ok(encode_record_v4(txid, inline, &parts)?.as_bytes().to_vec())
-    }
-
-    /// Decodes every output of a v5 payload, borrowing scripts from `bytes`.
-    pub fn decode_v5(bytes: &[u8]) -> Result<Vec<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let layout = V5Layout::read(bytes, header.output_count)?;
-        let mut outputs = Vec::with_capacity(layout.count);
-        let mut payload = layout.payloads;
-        for index in 0..layout.count {
-            let (output, next) = decode_output_at(bytes, &layout, index, payload)?;
-            outputs.push(output);
-            payload = next;
-        }
-        if payload != bytes.len() {
-            return Err(UtxoError::CorruptRecord);
-        }
-        Ok(outputs)
-    }
-
-    /// Decodes every output of a v4 payload, borrowing scripts from `bytes`.
-    pub fn decode_v4(bytes: &[u8]) -> Result<Vec<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let mut outputs = Vec::with_capacity(header.output_count);
-        let mut cursor = RECORD_HEADER_LEN;
-        for _ in 0..header.output_count {
-            let (output, next) = decode_output_v4(bytes, cursor)?;
-            outputs.push(output);
-            cursor = next;
-        }
-        if cursor != bytes.len() {
-            return Err(UtxoError::CorruptRecord);
-        }
-        Ok(outputs)
-    }
-
-    /// Finds one output in a v5 payload by `vout`, decoding only the match.
-    ///
-    /// The hot read: `Shard::get`, `get_entry` and `get_meta` all resolve a
-    /// spent input through this shape, so it is the operation a codec change
-    /// has to be judged on. Mirrors [`UtxoRecord::find_output`] exactly.
-    pub fn find_v5(bytes: &[u8], vout: u32) -> Result<Option<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let layout = V5Layout::read(bytes, header.output_count)?;
-        for index in 0..layout.count {
-            if layout.vout_at(bytes, index)? == vout {
-                let payload = payload_offset(bytes, &layout, index)?;
-                return decode_output_at(bytes, &layout, index, payload)
-                    .map(|(output, _)| Some(output));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The same search over a v4 payload.
-    ///
-    /// Written as the naive full decode, because that is what the shipped code
-    /// did — and it is nonetheless the arm to beat. Every v4 field sits at a
-    /// constant offset, so when only `vout` is read the optimizer deletes the
-    /// loads for the rest: v4 gets lazy skipping for free from LLVM, without
-    /// anyone designing it. v5 cannot be given the same treatment, because each
-    /// varint's length is what locates the next field, so the reads are a
-    /// serial dependency chain that no optimizer can remove.
-    ///
-    /// That asymmetry is the real cost of the variable-length layout, and it
-    /// only shows up in a benchmark shaped like the hot path.
-    pub fn find_v4(bytes: &[u8], vout: u32) -> Result<Option<OneUtxoOut<'_>>, UtxoError> {
-        let header = decode_header(bytes)?;
-        let mut cursor = RECORD_HEADER_LEN;
-        for _ in 0..header.output_count {
-            let (output, next) = decode_output_v4(bytes, cursor)?;
-            if output.vout == vout {
-                return Ok(Some(output));
-            }
-            cursor = next;
-        }
-        Ok(None)
-    }
-}
-
-fn view_parts<'a>(outputs: &[OneUtxoOut<'a>]) -> Vec<OutputParts<'a>> {
-    outputs
-        .iter()
-        .map(|output| {
-            OutputParts::new(
-                output.vout,
-                output.value,
-                output.script_pubkey,
-                output.coinbase,
-                output.height,
-            )
-        })
-        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1773,37 +1521,6 @@ mod tests {
                 .position(|output| output.vout == vout)
                 .map(|index| self.overflow.swap_remove(index))
         }
-
-        fn encode(&self, txid: Hash256) -> Result<Vec<u8>, UtxoError> {
-            if self.inline.len() > MODEL_INLINE_CAPACITY {
-                return Err(UtxoError::CorruptRecord);
-            }
-
-            let output_count =
-                u32::try_from(self.output_count()).map_err(|_| UtxoError::RecordTooLarge {
-                    len: self.output_count(),
-                })?;
-            let inline_len =
-                u8::try_from(self.inline.len()).map_err(|_| UtxoError::CorruptRecord)?;
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&txid.to_le_bytes());
-            bytes.extend_from_slice(&output_count.to_le_bytes());
-            bytes.push(inline_len);
-            for output in self.outputs() {
-                let script_len = u16::try_from(output.script_pubkey.len()).map_err(|_| {
-                    UtxoError::ScriptTooLarge {
-                        len: output.script_pubkey.len(),
-                    }
-                })?;
-                bytes.extend_from_slice(&output.vout.to_le_bytes());
-                bytes.extend_from_slice(&output.value.to_le_bytes());
-                bytes.extend_from_slice(&output.height.to_le_bytes());
-                bytes.push(u8::from(output.coinbase));
-                bytes.extend_from_slice(&script_len.to_le_bytes());
-                bytes.extend_from_slice(&output.script_pubkey);
-            }
-            Ok(bytes)
-        }
     }
 
     enum EditorOperation {
@@ -1818,25 +1535,16 @@ mod tests {
 
     fn assert_record_matches_model(
         record: &UtxoRecord,
-        txid: Hash256,
         model: &LegacyArrayVecModel,
     ) -> Result<(), UtxoError> {
         assert_eq!(record.output_count(), model.output_count());
 
-        // The model serializes v4 independently of the crate's codec, which is
-        // what makes it an oracle for ordering and for the inline/overflow
-        // partition. The record is v5, so the comparison runs the record's own
-        // descriptors — and its own inline length, which is not always
-        // `min(count, 8)` — back through the retained v4 encoder. Byte
-        // equality then still means "same outputs, same order, same partition"
-        // without the test having to reimplement the varint layout.
-        let expected_bytes = model.encode(txid)?;
-        let actual_v4 = encode_record_v4(
-            txid,
+        // The inline partition is part of the editor's behavior.
+        assert_eq!(
             record.header().legacy_inline_len,
-            &record.output_parts(),
-        )?;
-        assert_eq!(actual_v4.as_bytes(), expected_bytes.as_slice());
+            model.inline.len(),
+            "the record and model disagree on the inline partition"
+        );
 
         let actual_outputs = record
             .outputs()
@@ -1891,19 +1599,15 @@ mod tests {
                 u32::MAX,
             )],
         )?;
-        // Deliberately the worst case for v5: `u32::MAX` in both the vout and
-        // the height costs 5 varint bytes each, where a real output pays 1 and
-        // 3. Even here v5 is 15 metadata+script bytes against v4's 21.
+        // Deliberately maxes both directory widths: `u32::MAX` in the vout and
+        // height costs 5 varint bytes each, where a real output pays 1 and
+        // 3. Even here the output representation is 15 metadata+script bytes.
         //   varint(u32::MAX) = 5, varint(compress(42)) = 2,
         //   varint(u32::MAX << 1 | 1) = 5, varint(2) = 1, script = 2
         assert_eq!(
             record.encoded_bytes().len(),
             RECORD_HEADER_LEN + 15,
             "v5 output layout changed"
-        );
-        assert!(
-            record.encoded_bytes().len() < RECORD_HEADER_LEN + OUTPUT_METADATA_LEN_V4 + 2,
-            "v5 must not be larger than v4 even on its worst-case input"
         );
         let output = record.outputs().next().ok_or(UtxoError::CorruptRecord)?;
         assert_eq!(output.vout, u32::MAX);
@@ -1925,8 +1629,7 @@ mod tests {
             OwnedUtxoOut::new(1, 1, vec![0x51], false, 1),
             OwnedUtxoOut::new(127, 100_000_000, vec![0x00; 22], true, 840_000),
             OwnedUtxoOut::new(128, 2_099_999_999_999_999, script.clone(), false, 1_048_576),
-            // Above the money supply: takes the escape, which is the only case
-            // where v5 is larger than v4.
+            // Above the money supply: takes the raw amount escape.
             OwnedUtxoOut::new(u32::MAX, u64::MAX, script, true, u32::MAX),
         ];
         for case in cases {
@@ -1948,7 +1651,7 @@ mod tests {
     }
 
     /// An amount above the money supply cannot occur in a consensus-valid
-    /// block, but v4 stored one losslessly and so must v5.
+    /// block, but the record representation still preserves it losslessly.
     #[test]
     fn an_amount_above_the_money_supply_survives_the_escape() -> Result<(), UtxoError> {
         for value in [
@@ -2103,7 +1806,7 @@ mod tests {
             );
         }
 
-        // A script longer than the `u16` ceiling v4 could express.
+        // A script longer than the `u16` payload ceiling.
         let mut oversize = vec![0x01, 0x02];
         oversize.extend_from_slice(&vec![0x51; 65_536]);
         assert!(matches!(
@@ -2127,7 +1830,7 @@ mod tests {
         ];
         let mut model = LegacyArrayVecModel::from_outputs(&initial);
         let mut record = UtxoRecord::from_owned_outputs(txid, &initial)?;
-        assert_record_matches_model(&record, txid, &model)?;
+        assert_record_matches_model(&record, &model)?;
 
         let operations = vec![
             EditorOperation::Add {
@@ -2202,7 +1905,7 @@ mod tests {
                     }
                 }
             }
-            assert_record_matches_model(&record, txid, &model)?;
+            assert_record_matches_model(&record, &model)?;
         }
         Ok(())
     }
@@ -2220,11 +1923,11 @@ mod tests {
         Ok(())
     }
 
-    /// The speed half of this refactor set, asserted deterministically.
+    /// The work contract behind `find_output`, asserted deterministically.
     ///
     /// `find_output` is the hot read — every spent input lands there — and what
-    /// made the first v5 draft slower than v4 was decoding every output it
-    /// rejected. Timing that in a test would flake; counting the expensive
+    /// made an earlier layout slower by decoding every output it rejected.
+    /// Timing that in a test would flake; counting the expensive
     /// operation does not. One decompression for a hit, none for a miss, no
     /// matter how many outputs the record holds.
     #[test]

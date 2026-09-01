@@ -21,6 +21,7 @@ core.*
 !PLAN.md
 !DEVIATIONS.md
 .antigravitycli/
+.agent-tasks/
 
 # lean-ctx local tooling cache
 .lean-ctx/

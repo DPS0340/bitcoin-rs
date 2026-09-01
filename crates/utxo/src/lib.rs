@@ -27,7 +27,7 @@ pub mod stats;
 pub mod undo_codec;
 
 pub use key::{UtxoBuildHasher, UtxoKey};
-pub use record::{OneUtxoOut, RecordCodec, UtxoRecord};
+pub use record::{OneUtxoOut, UtxoRecord};
 pub use set::{
     BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
     UtxoCommittedEvent, UtxoError, UtxoInserted, UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet,
