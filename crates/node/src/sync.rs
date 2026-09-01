@@ -803,6 +803,7 @@ impl BlockSync {
         (!plan.disconnect.is_empty()).then_some(chain_tip.tip_id)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_buffered_blocks(&self, next_expected_hash: Option<Hash256>) -> (usize, usize) {
         let mut applied = 0_usize;
         let mut failed = 0_usize;
@@ -888,6 +889,29 @@ impl BlockSync {
                     self.block_stager
                         .lock()
                         .restore_many(drained[restore_from..].iter().cloned());
+                    if error.disposition == crate::apply::WindowApplyDisposition::Permanent {
+                        // The failed block's descendants can never become
+                        // valid, so they must not occupy bounded download
+                        // state or the frontier would cycle on them forever.
+                        // Purge every invalidated hash from the stager and
+                        // from the window's pending/received maps; the
+                        // expected-apply cache is dropped below because the
+                        // round failed.
+                        {
+                            let mut stager = self.block_stager.lock();
+                            for invalid_hash in &error.invalidated {
+                                stager.retire_applied(invalid_hash);
+                            }
+                        }
+                        {
+                            let mut window = self.download_window.lock();
+                            for invalid_hash in &error.invalidated {
+                                window.drop_for_retry(invalid_hash);
+                            }
+                        }
+                        metrics::counter!("node.sync.invalidated_blocks")
+                            .increment(u64::try_from(error.invalidated.len()).unwrap_or(u64::MAX));
+                    }
                     break;
                 }
             };
@@ -6849,12 +6873,15 @@ mod tests {
             "the chain stops at the last good block"
         );
 
-        // The two blocks after the failure were never attempted, so they must be
-        // back on the stager rather than silently dropped.
+        // The merkle-root rejection is a permanent consensus failure, so the
+        // window invalidated the corrupted block and its (never-attempted)
+        // descendants while the transition was held. They can never become
+        // applicable, so instead of returning to the stager they are purged
+        // from it: the frontier must not cycle on invalidated blocks.
         let restored = fixture.sync.block_stager.lock().received_len();
         assert_eq!(
-            restored, 2,
-            "suffix after the failure returns to the stager"
+            restored, 0,
+            "invalidated blocks and their descendants are purged, not restored"
         );
         Ok(())
     }
@@ -8083,6 +8110,343 @@ mod tests {
                 .lock()
                 .peer_in_staller_cooldown(peer_addr, Instant::now()),
             "local-clock rejection must not blame the peer"
+        );
+        Ok(())
+    }
+
+    /// Failure-injecting undo store: clearing the in-flight marker always
+    /// fails, which is exactly the `MarkerStuck` fatal condition. Everything
+    /// else delegates to the real store it wraps.
+    struct DisarmFailsUndoStore {
+        inner: Arc<dyn crate::apply::UndoStore>,
+    }
+
+    impl crate::apply::UndoStore for DisarmFailsUndoStore {
+        fn persist_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+            record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.persist_undo(height, hash, record)
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn complete_disconnect(
+            &self,
+            _height: u32,
+            _hash: Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            // A completed rollback that cannot record itself is exactly the
+            // `MarkerStuck` fatal condition.
+            Err(bitcoin_rs_storage::StorageError::backend(
+                "injected marker-clear failure",
+            ))
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<bitcoin_rs_storage::DisconnectMarker>, bitcoin_rs_storage::StorageError>
+        {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    /// Mines `depth` regtest blocks on genesis and applies them. Block 1's
+    /// coinbase pays the full subsidy, and the tip block carries a matured
+    /// spend of that coin paying a fee far above min-relay, so a reorg that
+    /// disconnects the chain has a real readmission candidate. Returns the
+    /// handles, the blocks, and their serialized bodies for the reorg body
+    /// loader.
+    #[allow(clippy::type_complexity)]
+    fn matured_chain(
+        depth: u32,
+    ) -> Result<
+        (
+            ApplyHandles,
+            Vec<Block>,
+            HashMap<Hash256, (Block, bytes::Bytes)>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let genesis = Network::Regtest.genesis_block();
+        let mut tree = BlockTree::new();
+        let mut parent = tree.insert_node(None, genesis.header, NodeStatus::HeaderValid)?;
+        let subsidy = 5_000_000_000_u64;
+        let mut prev_hash = genesis.block_hash();
+        let mut blocks: Vec<Block> = Vec::new();
+        for height in 1..=depth {
+            let mut coinbase = coinbase_transaction(height);
+            if height == 1 {
+                coinbase.outputs[0].value = subsidy;
+            }
+            let mut txs = vec![coinbase];
+            if height == depth {
+                let first_txid = blocks[0].txs[0].txid();
+                txs.push(Tx {
+                    version: 2,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint::new(first_txid, 0),
+                        script_sig: push_int(1),
+                        sequence: 0xffff_ffff,
+                        witness: Vec::new(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: subsidy - 100_000,
+                        script_pubkey: Vec::new(),
+                    }],
+                    lock_time: 0,
+                });
+            }
+            let block = mined_block_with_prev_hash(prev_hash, height, txs);
+            parent = tree.insert_node(Some(parent), block.header, NodeStatus::HeaderValid)?;
+            prev_hash = block.block_hash();
+            blocks.push(block);
+        }
+        let chain_tip = tree.tip_handle();
+        let applied_tip = Arc::new(ArcSwapOption::empty());
+        let handles = apply_handles(chain_tip, applied_tip, Arc::new(RwLock::new(tree)));
+        crate::apply::apply_block(&handles, &genesis)?;
+        for block in &blocks {
+            crate::apply::apply_block(&handles, block)?;
+        }
+        let bodies: HashMap<Hash256, (Block, bytes::Bytes)> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                    (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+                )
+            })
+            .collect();
+        Ok((handles, blocks, bodies))
+    }
+
+    #[test]
+    fn permanent_forward_failure_purges_invalid_blocks_without_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, _peers, _peer_outbound, applied_tip, main, _blocks_tx) =
+            sync_with_mined_chain(1)?;
+        sync.ensure_genesis_tip();
+        stage_body(&sync, &main[0]);
+        assert_eq!(sync.apply_buffered_blocks(None), (1, 0));
+
+        let main_hash = main[0].block_hash();
+        let bad = mined_block_with_prev_hash(main_hash, 2, vec![coinbase_transaction(2)]);
+        // The value change alters the txid, so the staged body contradicts the
+        // header's merkle root: a permanent consensus failure.
+        let mut bad_body = bad.clone();
+        bad_body.txs[0].outputs[0].value = 2;
+        let descendant =
+            mined_block_with_prev_hash(bad.block_hash(), 3, vec![coinbase_transaction(3)]);
+        {
+            let mut tree = sync.handles.block_tree.write();
+            let main_id = tree
+                .lookup(Hash256::from_le_bytes(main_hash.as_bytes()))
+                .ok_or_else(|| std::io::Error::other("missing applied main block"))?;
+            let bad_id = tree.insert_node(Some(main_id), bad.header, NodeStatus::HeaderValid)?;
+            tree.insert_node(Some(bad_id), descendant.header, NodeStatus::HeaderValid)?;
+        }
+        stage_body(&sync, &bad_body);
+        stage_body(&sync, &descendant);
+
+        assert_eq!(
+            sync.apply_buffered_blocks(None),
+            (0, 1),
+            "the permanent failure must stop the window with nothing committed"
+        );
+        let bad_hash = Hash256::from_le_bytes(bad.block_hash().as_bytes());
+        let descendant_hash = Hash256::from_le_bytes(descendant.block_hash().as_bytes());
+        assert!(!sync.block_stager.lock().contains(&bad_hash));
+        let descendant_staged = sync.block_stager.lock().contains(&descendant_hash);
+        assert!(
+            !descendant_staged,
+            "invalid descendants must be purged from bounded staging"
+        );
+        assert_eq!(
+            sync.apply_buffered_blocks(None),
+            (0, 0),
+            "the frontier must not cycle: nothing re-offers the invalidated blocks"
+        );
+        assert_eq!(applied_tip.load_full().map(|tip| tip.height), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_reorg_readmits_only_still_disconnected_transactions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (handles, main, mut bodies) = matured_chain(101)?;
+        let tip = main
+            .last()
+            .ok_or_else(|| std::io::Error::other("empty chain"))?;
+        let spend_txid = tip.txs[1].txid();
+        // A competing branch rooted at block 50 with four more blocks of
+        // work: switching to it disconnects the 51-block suffix (including
+        // the matured spend) while the spent coin itself stays live below
+        // the fork point, and the 105th fork body contradicts its own
+        // header merkle root, so the connect dies permanently mid-walk.
+        let fork_root_hash = main[49].block_hash();
+        let mut tree = handles.block_tree.write();
+        let mut fork_parent = tree
+            .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+            .ok_or_else(|| std::io::Error::other("missing fork root node"))?;
+        let mut fork_prev = fork_root_hash;
+        let mut fork_blocks = Vec::new();
+        for height in 51..=105_u32 {
+            let mut coinbase = coinbase_transaction(height);
+            // Distinguish the branch: same-height coinbases on both chains
+            // must not carry identical txids, or the fork headers collide.
+            coinbase.outputs[0].script_pubkey = push_int(2);
+            let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
+            fork_parent =
+                tree.insert_node(Some(fork_parent), block.header, NodeStatus::HeaderValid)?;
+            fork_prev = block.block_hash();
+            fork_blocks.push(block);
+        }
+        let fork_target = fork_parent;
+        drop(tree);
+        let mut corrupt = fork_blocks[fork_blocks.len() - 1].clone();
+        corrupt.txs[0].outputs[0].value = 2;
+        let last = fork_blocks.len() - 1;
+        fork_blocks[last] = corrupt;
+        for block in &fork_blocks {
+            bodies.insert(
+                Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            );
+        }
+        let connected_count = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = std::rc::Rc::clone(&connected_count);
+
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            fork_target,
+            |hash| bodies.get(&hash).cloned(),
+            move |_hash| counter.set(counter.get() + 1),
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::reorg::ReorgError::ConnectFailed {
+                    disconnected: 51,
+                    connected: 54,
+                    ..
+                })
+            ),
+            "the walk must report its exact committed prefixes, got {outcome:?}"
+        );
+        assert_eq!(
+            connected_count.get(),
+            54,
+            "only the committed connect prefix is retired to the caller"
+        );
+        let connected_tip = Hash256::from_le_bytes(fork_blocks[53].block_hash().as_bytes());
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(connected_tip),
+            "the successful connected prefix is the final active chain"
+        );
+        let mempool = handles.mempool.read();
+        assert_eq!(
+            mempool.len(),
+            1,
+            "exactly the still-off-chain tx is readmitted"
+        );
+        assert!(
+            mempool.contains_txid(&spend_txid),
+            "the disconnected matured spend stays eligible"
+        );
+        assert_eq!(
+            mempool.sequence_number(),
+            1,
+            "reconsideration runs exactly once for the partial switch"
+        );
+        let reconnected_txid = fork_blocks[0].txs[0].txid();
+        let reconnected_in_pool = mempool.contains_txid(&reconnected_txid);
+        assert!(
+            !reconnected_in_pool,
+            "reconnected-block transactions are confirmed, never readmitted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fatal_disconnect_readmits_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut handles, main, mut bodies) = matured_chain(101)?;
+        let tip = main
+            .last()
+            .ok_or_else(|| std::io::Error::other("empty chain"))?;
+        let spend_txid = tip.txs[1].txid();
+        // The in-flight marker can never be cleared, so the very first
+        // disconnect dies fatal after rolling back cleanly. The wrapper keeps
+        // the real records; only the disarm fails.
+        let real_store = Arc::clone(&handles.undo_store);
+        handles.undo_store = Arc::new(DisarmFailsUndoStore { inner: real_store });
+        let fork_root_hash = main[49].block_hash();
+        let mut tree = handles.block_tree.write();
+        let mut fork_parent = tree
+            .lookup(Hash256::from_le_bytes(fork_root_hash.as_bytes()))
+            .ok_or_else(|| std::io::Error::other("missing fork root node"))?;
+        let mut fork_prev = fork_root_hash;
+        let mut fork_blocks = Vec::new();
+        for height in 51..=52_u32 {
+            let mut coinbase = coinbase_transaction(height);
+            coinbase.outputs[0].script_pubkey = push_int(2);
+            let block = mined_block_with_prev_hash(fork_prev, height, vec![coinbase]);
+            fork_parent =
+                tree.insert_node(Some(fork_parent), block.header, NodeStatus::HeaderValid)?;
+            fork_prev = block.block_hash();
+            fork_blocks.push(block);
+        }
+        let fork_target = fork_parent;
+        drop(tree);
+        for block in &fork_blocks {
+            bodies.insert(
+                Hash256::from_le_bytes(block.block_hash().as_bytes()),
+                (block.clone(), bytes::Bytes::from(consensus_bytes(block))),
+            );
+        }
+
+        let outcome = crate::reorg::switch_to_branch(
+            &handles,
+            fork_target,
+            |hash| bodies.get(&hash).cloned(),
+            |_| {},
+        );
+
+        assert!(
+            matches!(outcome, Err(crate::reorg::ReorgError::Fatal(_))),
+            "a stuck disconnect marker is fatal, got {outcome:?}"
+        );
+        assert!(
+            handles.mempool.read().is_empty(),
+            "a fatal disconnect must never reconsider disconnected transactions"
+        );
+        assert_eq!(handles.mempool.read().sequence_number(), 0);
+        let spend_in_pool = handles.mempool.read().contains_txid(&spend_txid);
+        assert!(
+            !spend_in_pool,
+            "the off-chain matured spend must not be readmitted after a fatal disconnect"
         );
         Ok(())
     }

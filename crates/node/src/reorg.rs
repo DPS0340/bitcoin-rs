@@ -14,7 +14,7 @@ use bitcoin_rs_chain::{NodeId, ReorgPlan, current_unix_seconds, plan_reorg};
 use bitcoin_rs_mempool::{AdmissionOrigin, MempoolEntry};
 use bitcoin_rs_primitives::{Block, DecodeError, Hash256, Tx, Txid};
 use bitcoin_rs_storage::StorageError;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::apply::ApplyHandles;
 use crate::{ApplyError, DisconnectError};
@@ -86,10 +86,27 @@ pub fn invalidate_block(
         };
         debug_assert_eq!(published_target, target);
 
-        let (_, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
-        if outcome.is_ok() {
-            let _ = proof.finish();
-            reconsider_disconnected_transactions(handles, &disconnect);
+        let (progress, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
+        match &outcome {
+            // A fatal disconnect marker left the chainstate torn: abort
+            // without reconsidering anything.
+            Err(ReorgError::Fatal(_)) => {}
+            // Nonfatal: the final active chain is the successful connected
+            // prefix. Reconsider exactly the disconnected transactions that
+            // remain off-chain, once, while the transition is still held.
+            Ok(()) => {
+                let _ = proof.finish();
+                reconsider_disconnected_transactions(
+                    handles,
+                    &disconnect[..progress.disconnected],
+                    &connect[..progress.connected],
+                );
+            }
+            Err(_) => reconsider_disconnected_transactions(
+                handles,
+                &disconnect[..progress.disconnected],
+                &connect[..progress.connected],
+            ),
         }
         return outcome;
     }
@@ -188,6 +205,8 @@ pub enum ReorgError {
     /// disconnecting is what just refused.
     #[error("reorg stopped at height {stopped_at}: {source}")]
     Refused {
+        /// Fully disconnected blocks before the refusal, in plan order.
+        disconnected: usize,
         /// Height the applied tip reached before stopping.
         stopped_at: u32,
         /// Why the disconnect refused.
@@ -209,6 +228,10 @@ pub enum ReorgError {
     /// the transition. Operational failures leave `invalidated` empty.
     #[error("reorg stopped after connecting to height {stopped_at} at block {hash}: {source}")]
     ConnectFailed {
+        /// Fully disconnected blocks before the failure, in plan order.
+        disconnected: usize,
+        /// Fully connected new-branch blocks before the failure, in plan order.
+        connected: usize,
         /// Hash of the block that failed to connect.
         hash: Hash256,
         /// Height the applied tip reached before stopping.
@@ -294,13 +317,26 @@ where
             .map_err(|_| ReorgError::Unavailable(Box::new(ApplyError::Shutdown)))?;
         let proof = crate::apply::ChainChangeProof::new(transition, guard);
 
-        let (connected, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
-        for body in &connect[..connected] {
+        let (progress, outcome) = execute_loaded_plan(handles, &disconnect, &connect, &proof);
+        match &outcome {
+            // A fatal disconnect marker left the chainstate torn: abort
+            // without reconsidering anything.
+            Err(ReorgError::Fatal(_)) => {}
+            // Every other outcome leaves the final active chain known: the
+            // successful connected prefix. Reconsider exactly the
+            // disconnected transactions that remain off-chain, exactly once,
+            // while the chain transition is still held.
+            _ => reconsider_disconnected_transactions(
+                handles,
+                &disconnect[..progress.disconnected],
+                &connect[..progress.connected],
+            ),
+        }
+        for body in &connect[..progress.connected] {
             connected_body(body.hash);
         }
         outcome?;
         let _ = proof.finish();
-        reconsider_disconnected_transactions(handles, &disconnect);
         if let Some((hash, height)) = missing_connect {
             return Err(ReorgError::MissingBody { hash, height });
         }
@@ -308,23 +344,40 @@ where
     }
 }
 
+/// How far a loaded branch-switch walk got before it stopped.
+///
+/// Both counts are exact committed progress: every block past them was left
+/// untouched by this walk.
+#[derive(Clone, Copy, Debug)]
+struct LoadedPlanProgress {
+    /// Fully disconnected blocks, in plan (old-tip-down) order.
+    disconnected: usize,
+    /// Fully connected new-branch blocks, in plan (ancestor-child-up) order.
+    connected: usize,
+}
+
 fn execute_loaded_plan(
     handles: &ApplyHandles,
     disconnect: &[LoadedBranchBody],
     connect: &[LoadedBranchBody],
     proof: &crate::apply::ChainChangeProof<'_>,
-) -> (usize, core::result::Result<(), ReorgError>) {
+) -> (LoadedPlanProgress, core::result::Result<(), ReorgError>) {
+    let mut progress = LoadedPlanProgress {
+        disconnected: 0,
+        connected: 0,
+    };
     for body in disconnect {
         match crate::apply::disconnect_block_admitted(handles, &body.block, proof) {
-            Ok(_) => {}
+            Ok(_) => progress.disconnected += 1,
             Err(error @ (DisconnectError::Fatal { .. } | DisconnectError::MarkerStuck { .. })) => {
                 handles.admission.close_permanently();
-                return (0, Err(ReorgError::Fatal(Box::new(error))));
+                return (progress, Err(ReorgError::Fatal(Box::new(error))));
             }
             Err(error) => {
                 return (
-                    0,
+                    progress,
                     Err(ReorgError::Refused {
+                        disconnected: progress.disconnected,
                         stopped_at: body.height,
                         source: Box::new(error),
                     }),
@@ -333,7 +386,6 @@ fn execute_loaded_plan(
         }
     }
 
-    let mut connected = 0_usize;
     for body in connect {
         match crate::apply::apply_block_with_serialized_admitted(
             handles,
@@ -341,9 +393,9 @@ fn execute_loaded_plan(
             body.serialized.clone(),
             proof,
         ) {
-            Ok(_) => connected += 1,
+            Ok(_) => progress.connected += 1,
             Err(source) => {
-                let invalidated = if is_permanent_invalid(&source) {
+                let invalidated = if crate::apply::is_permanent_apply_error(&source) {
                     let mut tree = handles.block_tree.write();
                     tree.lookup(body.hash)
                         .and_then(|node_id| tree.invalidate_subtree(node_id).ok())
@@ -352,8 +404,10 @@ fn execute_loaded_plan(
                     Vec::new()
                 };
                 return (
-                    connected,
+                    progress,
                     Err(ReorgError::ConnectFailed {
+                        disconnected: progress.disconnected,
+                        connected: progress.connected,
                         hash: body.hash,
                         stopped_at: body.height.saturating_sub(1),
                         source: Box::new(source),
@@ -363,7 +417,7 @@ fn execute_loaded_plan(
             }
         }
     }
-    (connected, Ok(()))
+    (progress, Ok(()))
 }
 
 /// Re-admits the transactions a completed disconnect walk carried out of the
@@ -386,16 +440,26 @@ fn execute_loaded_plan(
 /// refusal (duplicate, policy floor, package limits) is final and the
 /// transaction is dropped, matching Core's best-effort re-add — and a
 /// parent that its own successful insert immediately evicted (size
-/// pressure) drops its spenders the same way. An empty
-/// disconnect set flows through as the no-op it is.
-fn reconsider_disconnected_transactions(handles: &ApplyHandles, disconnect: &[LoadedBranchBody]) {
+/// pressure) drops its spenders the same way. Transactions the successful
+/// connected prefix put back on-chain are excluded by txid, matching Core's
+/// `ReconsiderDisconnectedTransactions`: they are confirmed again, not
+/// disconnected. An empty disconnect set flows through as the no-op it is.
+fn reconsider_disconnected_transactions(
+    handles: &ApplyHandles,
+    disconnect: &[LoadedBranchBody],
+    reconnected: &[LoadedBranchBody],
+) {
     let height = handles.applied_tip.load_full().map_or(0, |tip| tip.height);
     let time = u64::from(current_unix_seconds());
+    let still_on_chain: HashSet<Txid> = reconnected
+        .iter()
+        .flat_map(|body| body.block.txs.iter().map(bitcoin_rs_primitives::Tx::txid))
+        .collect();
     let mut offered: HashMap<Txid, Vec<u64>> = HashMap::new();
     let mut entries = Vec::new();
     for body in disconnect.iter().rev() {
         for tx in &body.block.txs {
-            if is_coinbase(tx) {
+            if is_coinbase(tx) || still_on_chain.contains(&tx.txid()) {
                 continue;
             }
             let Some((entry, output_values)) =
@@ -600,27 +664,4 @@ fn validate_branch_body(
         serialized,
         height,
     })
-}
-
-/// Returns true when a connect failure is a permanent block-invalidity
-/// condition, not an operational error.
-///
-/// Only these failures poison the branch: the block and its descendants can
-/// never become valid, so invalidating the subtree is safe and the node
-/// republishes the best valid tip rather than retrying the same block.
-/// Operational failures (storage, UTXO commit, undo record) are transient
-/// and must not permanently mark a block invalid.
-fn is_permanent_invalid(error: &ApplyError) -> bool {
-    match error {
-        ApplyError::ProofOfWork { .. }
-        | ApplyError::TargetAboveLimit
-        | ApplyError::NbitsNonRetargetMismatch { .. } => true,
-        ApplyError::Consensus(error) => !matches!(
-            error,
-            bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
-                | bitcoin_rs_consensus::ConsensusError::Kernel(_)
-                | bitcoin_rs_consensus::ConsensusError::Encoding(_)
-        ),
-        _ => false,
-    }
 }

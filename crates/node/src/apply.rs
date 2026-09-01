@@ -1382,6 +1382,7 @@ pub fn window_len(sizes: impl IntoIterator<Item = usize>) -> usize {
 ///
 /// Propagates the first failing apply, leaving earlier blocks applied, which is
 /// what applying them one at a time would also do.
+#[allow(clippy::result_large_err)]
 pub fn apply_window(
     handles: &ApplyHandles,
     blocks: &[&Block],
@@ -1395,6 +1396,8 @@ pub fn apply_window(
                 blocks.len(),
                 serialized.len()
             ))),
+            disposition: WindowApplyDisposition::Operational,
+            invalidated: Box::default(),
         });
     }
     // One admission permit and one transition lock for the whole window.
@@ -1412,20 +1415,41 @@ pub fn apply_window(
     // write side, and re-locking the transition would leave gaps between commits.
     let transition = handles
         .begin_chain_transition()
-        .map_err(|source| WindowApplyError { applied: 0, source })?;
+        .map_err(|source| WindowApplyError {
+            applied: 0,
+            source,
+            disposition: WindowApplyDisposition::Operational,
+            invalidated: Box::default(),
+        })?;
     let guard = handles
         .mempool_gateway
         .begin_chain_change()
         .map_err(|_| WindowApplyError {
             applied: 0,
             source: ApplyError::Shutdown,
+            disposition: WindowApplyDisposition::Operational,
+            invalidated: Box::default(),
         })?;
     let proof = ChainChangeProof::new(transition, guard);
     let mut proven = prove_window(handles, blocks, serialized).into_iter();
     let mut applied = 0_usize;
     for (block, raw) in blocks.iter().zip(serialized) {
-        apply_block_admitted(handles, block, Some(raw.clone()), proven.next(), &proof)
-            .map_err(|source| WindowApplyError { applied, source })?;
+        apply_block_admitted(handles, block, Some(raw.clone()), proven.next(), &proof).map_err(
+            |source| {
+                let disposition = if is_permanent_apply_error(&source) {
+                    WindowApplyDisposition::Permanent
+                } else {
+                    WindowApplyDisposition::Operational
+                };
+                let invalidated = invalidate_failed_subtree(handles, block, &source);
+                WindowApplyError {
+                    applied,
+                    source,
+                    disposition,
+                    invalidated,
+                }
+            },
+        )?;
         applied = applied.saturating_add(1);
     }
     // G5: finish only on success. An error after begin leaves the generation
@@ -1433,6 +1457,56 @@ pub fn apply_window(
     // resets it.
     let _ = proof.finish();
     Ok(())
+}
+
+/// Marks the failed block's header subtree invalid while the chain transition
+/// is still held, so the window caller can purge download state without the
+/// frontier ever re-offering a descendant of a permanently invalid block.
+///
+/// Only permanent failures invalidate. Operational failures (storage, UTXO
+/// commit, shutdown) are transient: the block stays retryable, so nothing may
+/// be marked `Invalid` here. A header missing from the tree (rejected before
+/// insertion, e.g. prev-hash mismatch or `PoW` failure) has no subtree to
+/// invalidate, which leaves the list empty and the classification untouched.
+fn invalidate_failed_subtree(
+    handles: &ApplyHandles,
+    block: &Block,
+    source: &ApplyError,
+) -> Box<[Hash256]> {
+    if !is_permanent_apply_error(source) {
+        return Box::default();
+    }
+    let hash = block.block_hash().0;
+    let mut tree = handles.block_tree.write();
+    let Some(node_id) = tree.lookup(hash) else {
+        return Box::default();
+    };
+    tree.invalidate_subtree(node_id)
+        .unwrap_or_default()
+        .into_boxed_slice()
+}
+
+/// Returns true when an apply failure is a permanent block-invalidity
+/// condition, not an operational error.
+///
+/// Only these failures poison the branch: the block and its descendants can
+/// never become valid, so invalidating the subtree is safe and the node
+/// republishes the best valid tip rather than retrying the same block.
+/// Operational failures (storage, UTXO commit, undo record, shutdown) are
+/// transient and must not permanently mark a block invalid.
+pub(crate) fn is_permanent_apply_error(error: &ApplyError) -> bool {
+    match error {
+        ApplyError::ProofOfWork { .. }
+        | ApplyError::TargetAboveLimit
+        | ApplyError::NbitsNonRetargetMismatch { .. } => true,
+        ApplyError::Consensus(error) => !matches!(
+            error,
+            bitcoin_rs_consensus::ConsensusError::PrevoutMatrixSize { .. }
+                | bitcoin_rs_consensus::ConsensusError::Kernel(_)
+                | bitcoin_rs_consensus::ConsensusError::Encoding(_)
+        ),
+        _ => false,
+    }
 }
 
 /// A window that failed partway, and how many of its blocks committed first.
@@ -1446,6 +1520,14 @@ pub struct WindowApplyError {
     pub applied: usize,
     /// What stopped the block at index `applied`.
     pub source: ApplyError,
+    /// How the caller must treat this failure: `Permanent` failures poisoned
+    /// the failed block's header subtree while the chain transition was still
+    /// held; `Operational` failures poisoned nothing.
+    pub disposition: WindowApplyDisposition,
+    /// Hashes marked invalid under the held transition when `disposition` is
+    /// [`WindowApplyDisposition::Permanent`]: the failed block and every
+    /// descendant, in deterministic slab order. Empty otherwise.
+    pub invalidated: Box<[Hash256]>,
 }
 
 impl core::fmt::Display for WindowApplyError {
@@ -1462,6 +1544,36 @@ impl std::error::Error for WindowApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
+}
+
+impl WindowApplyError {
+    /// Failure kind the caller should act on.
+    #[must_use]
+    pub const fn disposition(&self) -> WindowApplyDisposition {
+        self.disposition
+    }
+
+    /// Hashes invalidated for a `Permanent` failure, empty otherwise.
+    #[must_use]
+    pub fn invalidated(&self) -> &[Hash256] {
+        &self.invalidated
+    }
+}
+
+/// Whether a window failure is permanent or operational.
+///
+/// The caller must not re-classify the source error: the node classifier and
+/// the reorg classifier are the same predicate, and the disposition here is
+/// what that predicate decided at the failure point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowApplyDisposition {
+    /// The failed block and its descendants can never be valid. Their header
+    /// subtrees were invalidated under the window's chain transition; purge
+    /// every returned hash from staged/download state without retrying.
+    Permanent,
+    /// Transient failure (storage, UTXO commit, shutdown). Nothing was
+    /// invalidated; the failed block and its tail stay retryable.
+    Operational,
 }
 
 /// Prepares consecutive blocks against one overlay and verifies all their input
@@ -2038,10 +2150,10 @@ fn apply_block_admitted<'b>(
         tx_plan,
         resolved,
     } = prepared;
-    // Before any mutation. A header the tree has never seen skips header sync's
-    // timestamp rules entirely, and `applied_header_tip` — where the insert
-    // happens — runs after the UTXO commit, so checking there would reject the
-    // block with its outputs already installed.
+    // Before any mutation. A header the tree has never seen skips header
+    // sync's timestamp rules entirely, so this gate applies them itself; the
+    // header insert in `applied_header_tip` below is part of the same
+    // fallible preparation phase and still precedes the first write.
     check_unseen_header_timestamp(handles, block, block_hash)?;
 
     let block_rules_started = quanta::Instant::now();
@@ -2255,6 +2367,18 @@ fn apply_block_admitted<'b>(
         .record(block_body_persist_dur.as_secs_f64());
     block_body_persist_result?;
 
+    // Prove every fallible piece of block-tree bookkeeping before the first
+    // UTXO mutation. Header resolution (inserting the header when header-first
+    // sync has not seen it), the applied-height check, and the cumulative
+    // transaction-count derivation can all fail; proving them here keeps every
+    // rejection before the UTXO commit, so a failed block leaves no applied
+    // outputs behind, and it leaves the publication tail infallible.
+    let block_tree_insert_started = quanta::Instant::now();
+    let tip = applied_header_tip(handles, block_hash, block, height)?;
+    let block_tree_insert_dur = block_tree_insert_started.elapsed();
+    metrics::histogram!("node.apply_block.block_tree_insert_seconds")
+        .record(block_tree_insert_dur.as_secs_f64());
+
     let utxo_commit_started = quanta::Instant::now();
     let utxo_commit_result = handles.utxo.commit_borrowed_block(&changes, &block_hash);
     let utxo_commit_dur = utxo_commit_started.elapsed();
@@ -2277,15 +2401,9 @@ fn apply_block_admitted<'b>(
         }
     }
 
-    // Resolve the applied header after validation and UTXO commit have
-    // succeeded. Header-first sync may already have inserted this header.
-    let block_tree_insert_started = quanta::Instant::now();
-    let block_tree_insert_result = applied_header_tip(handles, block_hash, block, height);
-    let block_tree_insert_dur = block_tree_insert_started.elapsed();
-    metrics::histogram!("node.apply_block.block_tree_insert_seconds")
-        .record(block_tree_insert_dur.as_secs_f64());
-    let tip = block_tree_insert_result?;
-
+    // Everything past the UTXO commit publishes values prepared above and
+    // cannot fail: the tip snapshot was resolved from the tree before the
+    // first write, so the publication tail is infallible.
     let block_record_started = quanta::Instant::now();
     {
         let block_record = BlockRecord::from_block(height, block);
@@ -2499,9 +2617,9 @@ fn applied_header_tip(
     height: u32,
 ) -> core::result::Result<TipSnapshot, ApplyError> {
     let mut tree = handles.block_tree.write();
-    // No timestamp check here: this runs after the UTXO commit, so rejecting a
-    // block at this point would leave its outputs and index rows installed.
-    // `check_unseen_header_timestamp` does it before any mutation.
+    // No timestamp check here: `check_unseen_header_timestamp` ran just before
+    // this call, in the same pre-mutation phase, and this whole function runs
+    // before the first write so a rejection here leaves nothing behind.
     let node_id = match tree.lookup(block_hash) {
         Some(node_id) => node_id,
         None => tree.insert_header(block.header, bitcoin_rs_chain::node::NodeStatus::Active)?,
@@ -5772,7 +5890,7 @@ mod consensus_rule_tests {
         );
 
         // And it must be refused before anything is written. The check first
-        // lived in `applied_header_tip`, which runs AFTER the UTXO commit, so
+        // lived in `applied_header_tip`, which now runs BEFORE any mutation, so
         // the rejection left the block's outputs installed and later validation
         // could spend coins from a block outside the applied chain.
         assert_eq!(
@@ -8970,6 +9088,7 @@ mod consensus_rule_tests {
                 apply_window(&handles, &[&child], core::slice::from_ref(&raw)),
                 Err(WindowApplyError {
                     source: ApplyError::Shutdown,
+                    disposition: WindowApplyDisposition::Operational,
                     ..
                 })
             ),
@@ -9308,6 +9427,237 @@ mod consensus_rule_tests {
     fn empty_utxo() -> Arc<UtxoSet> {
         Arc::new(UtxoSet::new())
     }
+    /// Failure-injecting undo store: every persist fails, everything else
+    /// delegates to a real in-memory store.
+    struct FailingUndoPersist {
+        inner: InMemoryUndoStore,
+    }
+
+    impl UndoStore for FailingUndoPersist {
+        fn persist_undo(
+            &self,
+            _height: u32,
+            _hash: bitcoin_rs_primitives::Hash256,
+            _record: &[u8],
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            Err(bitcoin_rs_storage::StorageError::backend(
+                "injected undo-persist failure",
+            ))
+        }
+
+        fn load_undo(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> Result<Option<Vec<u8>>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_undo(height, hash)
+        }
+
+        fn arm_disconnect(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.arm_disconnect(height, hash)
+        }
+
+        fn complete_disconnect(
+            &self,
+            height: u32,
+            hash: bitcoin_rs_primitives::Hash256,
+        ) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.complete_disconnect(height, hash)
+        }
+
+        fn disarm_disconnect(&self) -> Result<(), bitcoin_rs_storage::StorageError> {
+            self.inner.disarm_disconnect()
+        }
+
+        fn load_disconnect_marker(
+            &self,
+        ) -> Result<Option<DisconnectMarker>, bitcoin_rs_storage::StorageError> {
+            self.inner.load_disconnect_marker()
+        }
+    }
+
+    #[test]
+    fn permanent_window_failure_invalidates_failed_subtree_and_descendants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let handles = empty_apply_handles_for_network(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_tip = applied_header_tip(&handles, genesis.block_hash().0, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let applied = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &applied)?;
+        let applied_hash = applied.block_hash().0;
+
+        let bad = mined_block_with_prev_hash_and_transactions(
+            applied.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        // Corrupt the body against its own header: the txid changes, so the
+        // header merkle root no longer matches and block rules reject the
+        // block with a permanent consensus error before any write.
+        let mut bad_body = bad.clone();
+        bad_body.txs[0].outputs[0].value = 2;
+        let descendant = mined_block_with_prev_hash_and_transactions(
+            bad.block_hash(),
+            vec![coinbase_transaction(3)],
+        )?;
+        {
+            let mut tree = handles.block_tree.write();
+            tree.insert_header(bad.header, NodeStatus::HeaderValid)?;
+            tree.insert_header(descendant.header, NodeStatus::HeaderValid)?;
+        }
+        let bad_hash = bad.block_hash().0;
+        let descendant_hash = descendant.block_hash().0;
+        let raw = bytes::Bytes::from(consensus_bytes(&bad_body));
+
+        let outcome = apply_window(&handles, &[&bad_body], core::slice::from_ref(&raw));
+        let Err(error) = outcome else {
+            panic!("a body contradicting its header merkle root must fail");
+        };
+        assert_eq!(error.disposition(), WindowApplyDisposition::Permanent);
+        assert_eq!(
+            error.invalidated(),
+            &[bad_hash, descendant_hash],
+            "the failed block and every descendant are invalid, in slab order"
+        );
+        {
+            let tree = handles.block_tree.read();
+            assert_eq!(
+                tree.node_by_hash(bad_hash).map(|node| node.status),
+                Some(NodeStatus::Invalid)
+            );
+            assert_eq!(
+                tree.node_by_hash(descendant_hash).map(|node| node.status),
+                Some(NodeStatus::Invalid)
+            );
+        }
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied_hash),
+            "invalidation republishes the valid prefix, never the failed block"
+        );
+        assert_eq!(handles.utxo.len(), 1, "the failed block committed nothing");
+        Ok(())
+    }
+
+    #[test]
+    fn operational_window_failure_keeps_failed_block_retryable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut handles = empty_apply_handles_for_network(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_tip = applied_header_tip(&handles, genesis.block_hash().0, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let applied = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &applied)?;
+        let applied_hash = applied.block_hash().0;
+        // The block's header was never accepted by header sync, so tree
+        // preparation would have to insert it; the block stays unseen unless
+        // apply gets that far.
+        let bad = mined_block_with_prev_hash_and_transactions(
+            applied.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let bad_hash = bad.block_hash().0;
+        // The persisted-undo write fails: an operational error.
+        handles.undo_store = Arc::new(FailingUndoPersist {
+            inner: InMemoryUndoStore::default(),
+        });
+        let raw = bytes::Bytes::from(consensus_bytes(&bad));
+
+        let outcome = apply_window(&handles, &[&bad], core::slice::from_ref(&raw));
+        let Err(error) = outcome else {
+            panic!("an undo-persist failure must fail the window");
+        };
+        assert_eq!(error.disposition(), WindowApplyDisposition::Operational);
+        assert!(
+            error.invalidated().is_empty(),
+            "operational failures must not mark the block or its subtree invalid"
+        );
+        {
+            let tree = handles.block_tree.read();
+            assert!(
+                tree.node_by_hash(bad_hash).is_none(),
+                "tree preparation runs before the failing persist and must leave no node behind"
+            );
+        }
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied_hash),
+            "the failed block must not move the applied tip"
+        );
+        assert_eq!(
+            handles.utxo.len(),
+            1,
+            "the failed block must not commit outputs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn precommit_persist_failure_leaves_utxo_and_tip_untouched()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut handles = empty_apply_handles_for_network(Network::Regtest);
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_tip = applied_header_tip(&handles, genesis.block_hash().0, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+        let applied = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &applied)?;
+        let applied_hash = applied.block_hash().0;
+        let block_log_len = handles.blocks.read().len();
+        let utxo_len = handles.utxo.len();
+        handles.undo_store = Arc::new(FailingUndoPersist {
+            inner: InMemoryUndoStore::default(),
+        });
+        let next = mined_block_with_prev_hash_and_transactions(
+            applied.block_hash(),
+            vec![coinbase_transaction(2)],
+        )?;
+        let next_hash = next.block_hash().0;
+
+        let outcome = apply_block(&handles, &next);
+        assert!(
+            matches!(outcome, Err(ApplyError::UndoPersistence(_))),
+            "the injected persist failure must surface as UndoPersistence, got {outcome:?}"
+        );
+        assert_eq!(
+            handles.applied_tip.load_full().map(|tip| tip.hash),
+            Some(applied_hash),
+            "a precommit bookkeeping failure must not move the tip"
+        );
+        assert_eq!(handles.utxo.len(), utxo_len, "no outputs may commit");
+        assert_eq!(
+            handles.blocks.read().len(),
+            block_log_len,
+            "the block log must not grow past the failed bookkeeping"
+        );
+        assert!(
+            handles.block_tree.read().node_by_hash(next_hash).is_none(),
+            "fallible tree preparation must precede the first UTXO mutation and stay absent on failure"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn check_pow_limit_and_continuity_for_seeded_tip(
+    handles: &ApplyHandles,
+    block: &Block,
+    height: u32,
+) -> core::result::Result<(), ApplyError> {
+    let prior = handles.chain_tip.load_full();
+    check_pow_limit_and_continuity(handles, prior.as_deref(), block, height)
 }
 
 #[cfg(test)]
@@ -9488,16 +9838,6 @@ mod admission_tests {
         assert!(thread.join().is_ok());
         assert!(matches!(admission.enter(), Err(ApplyError::Shutdown)));
     }
-}
-
-#[cfg(test)]
-fn check_pow_limit_and_continuity_for_seeded_tip(
-    handles: &ApplyHandles,
-    block: &Block,
-    height: u32,
-) -> core::result::Result<(), ApplyError> {
-    let prior = handles.chain_tip.load_full();
-    check_pow_limit_and_continuity(handles, prior.as_deref(), block, height)
 }
 
 #[cfg(test)]
