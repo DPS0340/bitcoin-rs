@@ -8322,9 +8322,9 @@ mod consensus_rule_tests {
 
     /// In-memory bodies, so a branch switch can reload the blocks it needs.
     #[derive(Default)]
-    struct MapBodyStore {
-        bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
-        failed_reads: parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
+    pub(super) struct MapBodyStore {
+        pub(super) bodies: parking_lot::RwLock<HashMap<(u32, bitcoin_rs_primitives::Hash256), Vec<u8>>>,
+        pub(super) failed_reads: parking_lot::RwLock<HashSet<(u32, bitcoin_rs_primitives::Hash256)>>,
     }
 
     struct ReorgBodyLoadingFixture {
@@ -10095,6 +10095,122 @@ mod chain_generation_tests {
             seen.iter().all(|&g| g.is_none()),
             "all observer mutations during connect must see None (odd generation), got {:?}",
             *seen
+        );
+    }
+
+    #[test]
+    fn invalidate_block_reconsiders_under_held_transition() {
+        use bitcoin_rs_primitives::{TxIn, consensus_bytes};
+        use bitcoin_rs_script::push_int;
+
+        use super::consensus_rule_tests::MapBodyStore;
+
+        let utxo = Arc::new(UtxoSet::new());
+        let mut handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let bodies = Arc::new(MapBodyStore::default());
+        let body_handle: Arc<dyn crate::apply::PruneBodyStore> = bodies.clone();
+        handles.block_body_store = Some(body_handle);
+
+        let genesis = Network::Regtest.genesis_block();
+        let genesis_hash = genesis.block_hash();
+        let genesis_tip = applied_header_tip(&handles, genesis_hash.into(), &genesis, 0)
+            .unwrap_or_else(|error| panic!("genesis tip: {error}"));
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        // Build a 101-block chain: block 1's coinbase carries the full
+        // subsidy, and the tip block spends it after 100 confirmations
+        // (coinbase maturity). The spend is the transaction that
+        // reconsideration must readmit when the tip is invalidated.
+        let subsidy = 5_000_000_000_u64;
+        let mut prev_hash = genesis.block_hash();
+        let mut first_txid = None;
+        let mut spend_txid = None;
+        let mut tip_hash: bitcoin_rs_primitives::Hash256 = genesis_hash.into();
+        for height in 1..=101_u32 {
+            let mut coinbase = coinbase_transaction(u8::try_from(height).unwrap_or(0xFF));
+            if height == 1 {
+                coinbase.outputs[0].value = subsidy;
+            }
+            let mut txs = vec![coinbase];
+            if height == 101 {
+                let first = first_txid.expect("block 1 txid must exist");
+                txs.push(Tx {
+                    version: 2,
+                    inputs: vec![TxIn {
+                        previous_output: OutPoint::new(first, 0),
+                        script_sig: push_int(1),
+                        sequence: 0xffff_ffff,
+                        witness: Vec::new(),
+                    }],
+                    outputs: vec![TxOut {
+                        value: subsidy - 100_000,
+                        script_pubkey: Vec::new(),
+                    }],
+                    lock_time: 0,
+                });
+            }
+            let block = mined_block_with_prev_hash_and_transactions(prev_hash, txs)
+                .unwrap_or_else(|error| panic!("mine block {height}: {error}"));
+            if height == 1 {
+                first_txid = Some(block.txs[0].txid());
+            }
+            if height == 101 {
+                spend_txid = Some(block.txs[1].txid());
+            }
+            let raw = bytes::Bytes::from(consensus_bytes(&block));
+            let tip =
+                crate::apply::apply_block_with_serialized(&handles, &block, raw.clone())
+                    .unwrap_or_else(|error| panic!("apply block {height}: {error}"));
+            bodies
+                .bodies
+                .write()
+                .insert((tip.height, tip.hash), raw.to_vec());
+            prev_hash = block.block_hash();
+            tip_hash = tip.hash;
+        }
+        let spend_txid = spend_txid.expect("block 101 must have a spend tx");
+
+        // Install the generation recorder before invalidation so it captures
+        // every mempool mutation during reconsideration.
+        let gateway = Arc::clone(&handles.mempool_gateway);
+        let recorder = Arc::new(GatewayGenerationRecorder {
+            gateway,
+            seen: Mutex::new(Vec::new()),
+        });
+        let observer: Arc<dyn MempoolObserver> = recorder.clone();
+        assert!(
+            handles.mempool_gateway.install_observer(observer).is_ok(),
+            "install observer"
+        );
+
+        crate::reorg::invalidate_block(&handles, tip_hash)
+            .unwrap_or_else(|error| panic!("invalidate tip: {error}"));
+
+        // The spend must have been readmitted to the mempool.
+        assert!(
+            handles.mempool.read().contains_txid(&spend_txid),
+            "the disconnected spend must be readmitted"
+        );
+        // Every observer mutation during reconsideration must have seen an odd
+        // generation (None). If reconsideration ran after proof.finish(), the
+        // generation would be even and the recorder would see Some(_).
+        let seen = recorder.seen.lock();
+        assert!(
+            !seen.is_empty(),
+            "reconsideration must produce at least one mempool mutation"
+        );
+        assert!(
+            seen.iter().all(|&g| g.is_none()),
+            "reconsideration must run while the chain transition is held (odd generation), \
+             got {:?}",
+            *seen
+        );
+        // After invalidation completes, the generation is even again
+        // (admission reopens). The exact value depends on how many chain
+        // changes preceded this call.
+        assert!(
+            handles.mempool_gateway.stable_generation().is_some(),
+            "generation must be even after successful invalidation"
         );
     }
 

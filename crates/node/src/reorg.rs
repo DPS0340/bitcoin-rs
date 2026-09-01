@@ -95,12 +95,12 @@ pub fn invalidate_block(
             // prefix. Reconsider exactly the disconnected transactions that
             // remain off-chain, once, while the transition is still held.
             Ok(()) => {
-                let _ = proof.finish();
                 reconsider_disconnected_transactions(
                     handles,
                     &disconnect[..progress.disconnected],
                     &connect[..progress.connected],
                 );
+                let _ = proof.finish();
             }
             Err(_) => reconsider_disconnected_transactions(
                 handles,
