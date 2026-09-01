@@ -1,4 +1,4 @@
-//! Block-record lookup cost under `getblock` and `getblockheader`.
+//! Current block-record lookup cost under `getblock` and `getblockheader`.
 //!
 //! `Context::record_for_hash` resolves a hash to a block record. Step 1 asks the
 //! block tree, which answers with the height — and then scanned the block-record
@@ -10,18 +10,9 @@
 //! endpoint and `gettxoutproof`'s explicit-hash path each paid a walk
 //! proportional to chain length. `verifychain` pays one per block it checks.
 //!
-//! Both arms of the refactor set run here over one fixture in one process, so
-//! the ratio cannot be confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
-//! `before_scan` is the linear find that was there; `after_search` is
-//! [`record_at_height_hash`], the binary search plus duplicate-height walk that
-//! replaced it.
-//!
 //! Two lookup positions are measured. A hash at the *end* of the log is the
-//! worst case for a forward scan and the one a tip-following client asks for; a
-//! hash in the *middle* costs the scan half as much and is what a wallet
-//! rescanning history asks for. Measuring only one would flatter the scan in
-//! whichever direction was chosen.
+//! common tip-following case; a hash in the *middle* is what a wallet rescanning
+//! history asks for.
 // PERF: Criterion emits public harness items whose docs are irrelevant here.
 #![allow(missing_docs)]
 // A fixture that fails to build has no meaningful degraded mode: a lookup that
@@ -60,17 +51,6 @@ fn records(count: u32) -> Vec<BlockRecord> {
         .collect()
 }
 
-/// The scan that was in `record_for_hash`, kept here as the `before` arm and as
-/// the oracle the search is checked against.
-///
-/// Written out rather than called through the crate: it is two lines, and an
-/// oracle that shares code with the implementation cannot disagree with it.
-fn scan_for(records: &[BlockRecord], height: u32, hash: Hash256) -> Option<&BlockRecord> {
-    records
-        .iter()
-        .find(|candidate| candidate.hash == hash && candidate.height == height)
-}
-
 fn bench_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("block_record_lookup");
     group.sample_size(20);
@@ -81,17 +61,7 @@ fn bench_lookup(c: &mut Criterion) {
         for (label, height) in [("tip", count.saturating_sub(1)), ("middle", count / 2)] {
             let hash = hash_for(height);
 
-            // Prove both arms find the same record before timing either.
-            assert_eq!(
-                scan_for(&log, height, hash).map(|record| record.time),
-                record_at_height_hash(&log, height, hash).map(|record| record.time),
-                "the arms disagree at {label}; the benchmark would be meaningless"
-            );
-
-            group.bench_function(format!("before_scan/{label}/{count}"), |b| {
-                b.iter(|| black_box(scan_for(&log, height, hash).map(|record| record.time)));
-            });
-            group.bench_function(format!("after_search/{label}/{count}"), |b| {
+            group.bench_function(format!("height_search/{label}/{count}"), |b| {
                 b.iter(|| {
                     black_box(record_at_height_hash(&log, height, hash).map(|record| record.time))
                 });

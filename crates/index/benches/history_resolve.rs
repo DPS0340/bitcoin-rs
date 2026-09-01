@@ -1,15 +1,7 @@
 //! Index read-path resolver benchmark.
 //!
-//! Every group holds **both arms** of a refactor set over one identical
-//! fixture, so the before/after ratio comes from a single run and cannot be
-//! confounded by the rebuild and baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
-//!
-//! `before_scan` calls the naive `_scan` reference kept in the crate; `after_fast`
-//! calls whatever the production resolver currently does. Where a set has not
-//! landed yet both arms call the same function, and their spread then reports
-//! the harness noise floor. A group whose arms differ by less than the 1.05x
-//! noise band does not ship.
+//! Each group measures the current position-backed resolver over a
+//! production-shaped flat-file fixture.
 //!
 //! Blocks are served from a **real `FlatFileBlockStore`**, the same path
 //! production takes through `FlatFilePruneBodyStore`: open, `fstat`, seek, read.
@@ -274,13 +266,7 @@ fn build_fixture(heights: u32, txs_per_block: usize) -> Fixture {
     }
 }
 
-/// Emits the paired `before`/`after` arms for one fixture.
-///
-/// The `before_*` arms call the retained `*_scan` references, which read and
-/// fully deserialize a whole block per row; the `after_*` arms call the
-/// position-backed resolvers. Same fixture, same store, one run, so the spread
-/// between them is the win rather than a comparison against a stored baseline.
-/// Repoint the `after_*` closures — never the `before_*` ones.
+/// Measures the current position-backed resolvers for one fixture.
 fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     let Fixture {
         indexer,
@@ -292,16 +278,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     } = fixture;
 
     let mut history = c.benchmark_group(format!("resolve_script_history/{label}"));
-    history.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_script_history_scan(black_box(*target), source)
-                    .expect("resolve history"),
-            )
-        });
-    });
-    history.bench_function("after_fast", |b| {
+    history.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -313,16 +290,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     history.finish();
 
     let mut unspent = c.benchmark_group(format!("resolve_unspent/{label}"));
-    unspent.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_unspent_outputs_with_height_scan(black_box(*target), source)
-                    .expect("resolve unspent"),
-            )
-        });
-    });
-    unspent.bench_function("after_fast", |b| {
+    unspent.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -334,16 +302,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     unspent.finish();
 
     let mut transaction = c.benchmark_group(format!("resolve_transaction/{label}"));
-    transaction.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_transaction_scan(black_box(*target_txid), source)
-                    .expect("resolve transaction"),
-            )
-        });
-    });
-    transaction.bench_function("after_fast", |b| {
+    transaction.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer
@@ -355,16 +314,7 @@ fn bench_fixture(c: &mut Criterion, label: &str, fixture: &Fixture) {
     transaction.finish();
 
     let mut outpoint = c.benchmark_group(format!("resolve_outpoint_value/{label}"));
-    outpoint.bench_function("before_scan", |b| {
-        b.iter(|| {
-            black_box(
-                indexer
-                    .resolve_outpoint_value(black_box(*target_outpoint), source)
-                    .expect("resolve outpoint value"),
-            )
-        });
-    });
-    outpoint.bench_function("after_fast", |b| {
+    outpoint.bench_function("positioned", |b| {
         b.iter(|| {
             black_box(
                 indexer

@@ -23,7 +23,6 @@ bitcoin-rs-consensus.workspace = true
 bitcoin-rs-script.workspace = true
 bitcoin.workspace = true
 hashbrown.workspace = true
-tinyvec.workspace = true
 smallvec.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true

@@ -295,7 +295,6 @@ dependencies = [
  "slab",
  "smallvec",
  "thiserror",
- "tinyvec",
  "tracing",
 ]
 

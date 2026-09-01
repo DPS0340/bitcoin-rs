@@ -1,13 +1,4 @@
-//! Mempool priority-index refactor-set benchmark.
-//!
-//! Both arms run over one identical fixture in one process, so the before/after
-//! ratio comes from a single run and cannot be confounded by the rebuild and
-//! baseline drift recorded in
-//! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
-//!
-//! `before_sorted` is `SortedParetoFront`, the flat vector that did a linear
-//! `remove` and a full `sort_by` on every insert. `after_ordered` is
-//! `ParetoFront`, the ordered set that replaced it.
+//! Current mempool priority-index scaling benchmark.
 //!
 //! `mempool_insert_entry` is the end-to-end path an attacker actually drives:
 //! `Mempool::insert_entry` calls `recompute_all_metadata`, which rebuilds the
@@ -28,12 +19,10 @@ use bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
     transaction,
 };
-use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits, ParetoFront, SortedParetoFront};
+use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits, ParetoFront};
 use criterion::{Criterion, criterion_group, criterion_main};
 
-/// Index fill sizes. The largest is far below a Core-default mempool (~10^5
-/// transactions at `-maxmempool=300MB`); the quadratic arm cannot be measured
-/// there in reasonable time, which is itself the finding.
+/// Index fill sizes, including a production-scale order of magnitude.
 const FILL_SIZES: [u64; 4] = [1_000, 4_000, 16_000, 50_000];
 
 /// End-to-end sizes.
@@ -82,31 +71,7 @@ fn bench_index_fill(c: &mut Criterion) {
     for size in FILL_SIZES {
         let entries = (0..size).map(entry).collect::<Vec<_>>();
 
-        // Prove both arms index the same fixture before timing either. An arm
-        // that dropped entries would be timed as a spectacular, meaningless win.
-        let mut check_before = SortedParetoFront::new();
-        let mut check_after = ParetoFront::new();
-        for (index, item) in entries.iter().enumerate().take(1_000) {
-            let id = u32::try_from(index).expect("fixture id fits u32");
-            check_before.insert(id, item);
-            check_after.insert(id, item);
-        }
-        assert_eq!(
-            check_before.top_n(check_before.len()).collect::<Vec<_>>(),
-            check_after.top_n(check_after.len()).collect::<Vec<_>>(),
-            "the arms order differently; the benchmark would be meaningless"
-        );
-
-        group.bench_function(format!("before_sorted/fill/{size}"), |b| {
-            b.iter(|| {
-                let mut front = SortedParetoFront::new();
-                for (index, item) in entries.iter().enumerate() {
-                    front.insert(u32::try_from(index).unwrap_or(u32::MAX), item);
-                }
-                black_box(front.len())
-            });
-        });
-        group.bench_function(format!("after_ordered/fill/{size}"), |b| {
+        group.bench_function(format!("ordered_fill/{size}"), |b| {
             b.iter(|| {
                 let mut front = ParetoFront::new();
                 for (index, item) in entries.iter().enumerate() {
@@ -161,28 +126,7 @@ fn bench_lowest_fee_rate_lookup(c: &mut Criterion) {
         "lookup fixture must keep every entry"
     );
 
-    let scanned = pool
-        .entries
-        .iter()
-        .map(|(_index, entry)| entry.fee_rate)
-        .min();
-    assert_eq!(
-        scanned,
-        pool.lowest_fee_rate(),
-        "matched lookup arms must observe the same floor"
-    );
-
-    group.bench_function("before_scan/lookup/51200", |b| {
-        b.iter(|| {
-            black_box(
-                pool.entries
-                    .iter()
-                    .map(|(_index, entry)| entry.fee_rate)
-                    .min(),
-            )
-        });
-    });
-    group.bench_function("after_maintained/lookup/51200", |b| {
+    group.bench_function("maintained_lookup/51200", |b| {
         b.iter(|| black_box(pool.lowest_fee_rate()));
     });
 

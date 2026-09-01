@@ -5,9 +5,9 @@
 //! rebuild and baseline drift recorded in
 //! `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 //!
-//! `before_scan` is the pre-index path: no `tx_index` on the `Context`, so the
+//! `txindex_off` is the supported pre-index path: no `tx_index` on the `Context`, so the
 //! handler walks every block record, loads each body, deserializes it and hashes
-//! every transaction in it. `after_index` is the same call on the same fixture
+//! every transaction in it. `txindex_on` is the same call on the same fixture
 //! with a populated txindex attached.
 //!
 //! Block bodies are served from a **real `FlatFileBlockStore`**, the same path
@@ -297,10 +297,10 @@ fn bench_txoutproof(c: &mut Criterion) {
             ("first_block", fixture.first_txid),
             ("last_block", fixture.last_txid),
         ] {
-            group.bench_function(format!("before_scan/{shape}/{position}"), |b| {
+            group.bench_function(format!("txindex_off/{shape}/{position}"), |b| {
                 b.iter(|| black_box(dispatch_proof(&fixture.scanning, txid)));
             });
-            group.bench_function(format!("after_index/{shape}/{position}"), |b| {
+            group.bench_function(format!("txindex_on/{shape}/{position}"), |b| {
                 b.iter(|| black_box(dispatch_proof(&fixture.indexed, txid)));
             });
         }

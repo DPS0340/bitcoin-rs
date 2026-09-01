@@ -2,7 +2,7 @@
 //!
 //! `getblockchaininfo` and `getchaintxstats` read running sums off `BlockLog`
 //! and binary-search it; the whole-log fold they replaced was deleted with
-//! its oracle. `after_indexed` measures that read path directly; the two
+//! its oracle. `indexed` measures that read path directly; the two
 //! dispatch arms measure the end-to-end RPC calls as they stand now. The
 //! historical before/after ratio lives in `docs/benchmarks/chain-info-fold.md`.
 //!
@@ -84,7 +84,7 @@ fn bench_chaininfo(c: &mut Criterion) {
             .saturating_add(1)
             .saturating_sub(DEFAULT_WINDOW.min(u64::from(applied).saturating_add(1)));
 
-        group.bench_function(format!("after_indexed/{count}"), |b| {
+        group.bench_function(format!("indexed/{count}"), |b| {
             b.iter(|| {
                 let log = ctx.blocks.read();
                 black_box((log.size_on_disk(), chain_stats(&log, applied, window)))

@@ -23,6 +23,10 @@ tags:
 
 # Small-window benchmarks do not predict at-scale throughput
 
+> The `mainnet_prefix_replay` executable used for the measurements below was
+> retired after the campaign. The workload-matching lesson remains current;
+> the commands are historical provenance, not supported tooling.
+
 ## Context
 
 The project's optimization roadmap rested on a measured-looking premise: bitcoin-rs beats
@@ -92,7 +96,7 @@ entropy.
 
 - At-scale replay (repo-native, measurement-grade):
   `target/release/examples/mainnet_prefix_replay --stop-height 150000 --rest-url 127.0.0.1:8332`
-  against a `bitcoind -rest` serving a synced datadir (`crates/node/examples/mainnet_prefix_replay.rs`).
+  against a `bitcoind -rest` serving a synced datadir (the campaign executable is now retired).
 - Matched-validation Core side:
   `bitcoind -reindex-chainstate -assumevalid=0 -connect=0` (elapsed from `debug.log`
   start → `UpdateTip height=N`).

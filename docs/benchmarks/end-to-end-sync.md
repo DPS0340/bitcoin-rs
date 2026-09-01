@@ -286,4 +286,4 @@ Artifact: [`rs-replay-150k-kernel.json`](data/end-to-end-sync/rs-replay-150k-ker
 
 ## Harness
 
-The attached JSON was emitted by `crates/node/examples/mainnet_prefix_replay.rs`. The artifacts record the range, boundary hashes, backend, index flags, source kind, data directory, elapsed/fetch/decode time, block and transaction counts, peak RSS, commit, and stage timers. They do not capture enough launch or host state to reconstruct the exact original command. A future publishable G14 run must use the repository G14 daemon adapters and evidence manifest instead of reconstructing missing provenance from these files.
+The attached JSON was emitted by the former `mainnet_prefix_replay` campaign executable. The artifacts record the range, boundary hashes, backend, index flags, source kind, data directory, elapsed/fetch/decode time, block and transaction counts, peak RSS, commit, and stage timers. They do not capture enough launch or host state to reconstruct the exact original command. The replay executable and G14 artifact adapters have been retired; these files are historical evidence, not inputs to a supported runner.

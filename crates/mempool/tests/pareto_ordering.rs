@@ -3,11 +3,12 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use std::collections::BTreeMap;
 use std::error::Error;
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use bitcoin_rs_mempool::{MempoolEntry, ParetoFront, SortedParetoFront};
+use bitcoin_rs_mempool::{MempoolEntry, ParetoFront};
 
 #[test]
 fn top_n_returns_highest_rate_entries() -> Result<(), Box<dyn Error>> {
@@ -50,65 +51,79 @@ fn seeded_entry(seed: u32) -> MempoolEntry {
     )
 }
 
-/// The replacement must order identically to the implementation it replaced.
-///
-/// Compared over the *whole* index rather than a prefix: a `top_n(10)` check
-/// passes while everything below the tenth entry is misordered, and the miner
-/// reads the whole index (`mining::policy` calls `top_n(len())`).
+fn expected_order(entries: &BTreeMap<u32, MempoolEntry>) -> Vec<u32> {
+    let mut ordered = entries.iter().collect::<Vec<_>>();
+    ordered.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .modified_fee_rate()
+            .cmp(&left.modified_fee_rate())
+            .then_with(|| {
+                right
+                    .modified_ancestor_fee_rate()
+                    .cmp(&left.modified_ancestor_fee_rate())
+            })
+            .then_with(|| left.time.cmp(&right.time))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    ordered.into_iter().map(|(id, _)| *id).collect()
+}
+
+/// The maintained index must match an independent ordering model over its
+/// complete contents, not only the prefix returned to a small template.
 #[test]
-fn ordering_matches_the_sorted_front_it_replaced() {
+fn ordering_matches_the_priority_model() {
     let mut front = ParetoFront::new();
-    let mut oracle = SortedParetoFront::new();
+    let mut model = BTreeMap::new();
 
     for seed in 0_u32..400 {
         let entry = seeded_entry(seed);
         front.insert(seed, &entry);
-        oracle.insert(seed, &entry);
+        model.insert(seed, entry);
     }
 
     assert_eq!(
         front.len(),
-        oracle.len(),
+        model.len(),
         "the indexes hold different counts"
     );
     assert_eq!(
         front.top_n(front.len()).collect::<Vec<_>>(),
-        oracle.top_n(oracle.len()).collect::<Vec<_>>(),
-        "the replacement must order exactly as the sorted front did"
+        expected_order(&model),
+        "the index must follow the priority specification"
     );
 }
 
 /// The same, driven through a mixed sequence of inserts, replacements and
 /// removals rather than a single fill — the shape the mempool actually applies.
 #[test]
-fn ordering_matches_the_sorted_front_under_inserts_removals_and_replacements() {
+fn ordering_matches_the_model_under_inserts_removals_and_replacements() {
     let mut front = ParetoFront::new();
-    let mut oracle = SortedParetoFront::new();
+    let mut model = BTreeMap::new();
 
     for seed in 0_u32..300 {
         let entry = seeded_entry(seed);
         front.insert(seed, &entry);
-        oracle.insert(seed, &entry);
+        model.insert(seed, entry);
 
         if seed % 3 == 0 {
             // Re-insert with different priority fields: a replacement, which is
             // what `recompute_all_metadata` does when an ancestor fee changes.
             let replacement = seeded_entry(seed.wrapping_add(1_000));
             front.insert(seed, &replacement);
-            oracle.insert(seed, &replacement);
+            model.insert(seed, replacement);
         }
         if seed % 5 == 0 {
             let target = seed / 2;
             assert_eq!(
                 front.remove(target),
-                oracle.remove(target),
+                model.remove(&target).is_some(),
                 "removal must agree on whether {target} was indexed"
             );
         }
 
         assert_eq!(
             front.top_n(front.len()).collect::<Vec<_>>(),
-            oracle.top_n(oracle.len()).collect::<Vec<_>>(),
+            expected_order(&model),
             "diverged after seed {seed}"
         );
     }

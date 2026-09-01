@@ -11,14 +11,10 @@ ever attributed that figure. The record constants predict roughly 5 GB at that
 height, leaving ~9 GiB unexplained, and the plan named allocator fragmentation
 across tens of millions of small allocations as the leading suspect.
 
-Harness: `crates/utxo/examples/utxo_memory_attribution.rs`, backed by
-`UtxoSetView::memory_report()`. Synthetic set with a mainnet-shaped script mix
-(P2WPKH 22 B, P2PKH 25 B, P2SH 23 B, P2TR 34 B) and 1.5 live outputs per record.
-System allocator, Apple Silicon.
-
-```
-cargo run -p bitcoin-rs-utxo --example utxo_memory_attribution --release -- [records] [churn_rounds]
-```
+The retired `utxo_memory_attribution` example used
+`UtxoSetView::memory_report()` over a synthetic set with a mainnet-shaped script
+mix and 1.5 live outputs per record. The measurements below are retained as
+historical evidence; the one-off executable is no longer supported.
 
 ## What a UTXO costs
 
@@ -77,8 +73,8 @@ A pruned mainnet sync to **height 412,732** (38,145,360 outputs across
 10,519,335 records) settled the assumptions above. The figures below are
 historical evidence collected by the former checkpoint RSS-attribution hook;
 that hook is no longer part of the node runtime. Current full-node RSS evidence
-must use an external process monitor, while `snapshot_memory` remains the
-supported UTXO-only measurement path.
+must use an external process monitor. The former `snapshot_memory` helper was
+also retired with the completed memory campaign.
 
 | Layer | Bytes/output | Total |
 |---|---:|---:|
@@ -176,7 +172,7 @@ Everything above about size came from a synthetic fixture. The same 2.03 GiB
 `utxo-v4.dat` a real pruned sync produced at height 412,732 — 10,519,335 records
 and **38,145,360 outputs** — was then loaded by a v4 build and a v5 build.
 Same file, same machine, only the codec differs
-(`crates/utxo/examples/snapshot_memory.rs`).
+using the now-retired `snapshot_memory` campaign helper.
 
 | Layer | v4 | v5 | Saved |
 |---|---:|---:|---:|
@@ -204,11 +200,6 @@ instead of 433 fixture ones.
 What this does **not** measure is full-node tip RSS: it loads the UTXO set alone,
 with no fjall, CoinStats, block-record log or runtime alongside it. The G14 gate
 still needs a synced tip node with `txindex` and the remaining derived indexes.
-
-```
-cargo run -p bitcoin-rs-utxo --example snapshot_memory --release -- \
-    <datadir>/chainstate-checkpoints/gen-*/utxo-v4.dat [manifest-trailer-sha256]
-```
 
 ### Where the two layouts cross over
 

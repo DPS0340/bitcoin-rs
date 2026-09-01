@@ -50,7 +50,7 @@ bitcoin-rs/
 ├── deny.toml                     # cargo-deny config
 ├── .github/workflows/ci.yml      # fmt + clippy -D warnings + test + bench-smoke + deny
 ├── docs/                         # benchmarks, solutions, plans, policies, getting-started, REST
-├── tools/                        # benchmark-campaign, bip300301-enforcer, checksig-census
+├── tools/                        # bip300301-enforcer integration
 ├── scripts/                      # G2/G14 evidence-collection and measurement drivers
 ├── fuzz/                         # cargo-fuzz targets (utxo_snapshot, block/tx decode, p2p, script)
 ├── crates/
@@ -821,7 +821,7 @@ git commit -am "feat(bin): bitcoin-rs binary" -m "Op: extend"
 - Create: `bin/bitcoin-rs/tests/gates/{g01_headers_only_sync,g03_kernel_parity,g04_consensus_vectors,g05_electrum_parity,g06_snapshot_roundtrip,g07_storage_equivalence,g08_utreexo_parity,g09_wallet_psbt_roundtrip,g10_reorg_deep,g11_crash_recovery,g12_graceful_shutdown,g13_lints_clean,g14_perf_budgets,g15_workspace_version_sync}.rs`
 - CI: `.github/workflows/ci.yml`
 
-Each gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or externally collected evidence; G14 verifies the externally collected evidence contract (gathered by the `scripts/run-g14-*.sh` drivers) and fails closed when it is missing. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all 15 gates are green for two consecutive CI runs on `main`.
+Each live gate is a `#[test]` under `bin/bitcoin-rs/tests/gates/`. Most are `#[ignore]`d manual gates that need live peers or external infrastructure. The former G14 artifact drivers and harness tests were retired with the completed performance campaign; current performance contracts live in the retained crate benchmarks. CI (`.github/workflows/ci.yml`) runs the non-ignored gates in the workspace test lane. Plan is "done" when all live gates are green for two consecutive CI runs on `main`.
 
 - [ ] **Step 1–15:** Each gate test as defined in *Verification Gates* above. Each in its own file under `bin/bitcoin-rs/tests/gates/` (`g01_headers_only_sync.rs` through `g15_workspace_version_sync.rs`), each callable independently via `cargo test -p bitcoin-rs --test g<N>_<name>`, with `-- --ignored --nocapture` for the manual gates.
 

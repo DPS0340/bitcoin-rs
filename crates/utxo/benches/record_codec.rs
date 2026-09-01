@@ -1,4 +1,4 @@
-//! Paired benchmark for the v4 and v5 `UtxoRecord` payload codecs.
+//! Versioned benchmark for the v4 and v5 `UtxoRecord` payload codecs.
 //!
 //! This set carries a third acceptance criterion beyond equivalence and speed:
 //! **bytes**. v5 exists because a mainnet attribution run put the UTXO set at
@@ -102,13 +102,13 @@ fn bench_codec(c: &mut Criterion, count: usize) {
     group.throughput(Throughput::Bytes(
         u64::try_from(encoded_v4.len()).unwrap_or(0),
     ));
-    group.bench_function("before_v4", |b| {
+    group.bench_function("v4", |b| {
         b.iter(|| black_box(RecordCodec::encode_v4(txid(), black_box(&views)).expect("encodes")));
     });
     group.throughput(Throughput::Bytes(
         u64::try_from(encoded_v5.len()).unwrap_or(0),
     ));
-    group.bench_function("after_v5", |b| {
+    group.bench_function("v5", |b| {
         b.iter(|| black_box(RecordCodec::encode_v5(txid(), black_box(&views)).expect("encodes")));
     });
     group.finish();
@@ -117,13 +117,13 @@ fn bench_codec(c: &mut Criterion, count: usize) {
     group.throughput(Throughput::Bytes(
         u64::try_from(encoded_v4.len()).unwrap_or(0),
     ));
-    group.bench_function("before_v4", |b| {
+    group.bench_function("v4", |b| {
         b.iter(|| black_box(RecordCodec::decode_v4(black_box(&encoded_v4)).expect("decodes")));
     });
     group.throughput(Throughput::Bytes(
         u64::try_from(encoded_v5.len()).unwrap_or(0),
     ));
-    group.bench_function("after_v5", |b| {
+    group.bench_function("v5", |b| {
         b.iter(|| black_box(RecordCodec::decode_v5(black_box(&encoded_v5)).expect("decodes")));
     });
     group.finish();
@@ -141,12 +141,12 @@ fn bench_codec(c: &mut Criterion, count: usize) {
     for (label, needle) in [("hit_first", 0), ("hit_last", last), ("miss", u32::MAX)] {
         let mut group =
             c.benchmark_group(format!("record_codec/find_output/{label}/outputs_{count}"));
-        group.bench_function("before_v4", |b| {
+        group.bench_function("v4", |b| {
             b.iter(|| {
                 black_box(RecordCodec::find_v4(black_box(&encoded_v4), black_box(needle)).ok())
             });
         });
-        group.bench_function("after_v5", |b| {
+        group.bench_function("v5", |b| {
             b.iter(|| {
                 black_box(RecordCodec::find_v5(black_box(&encoded_v5), black_box(needle)).ok())
             });

@@ -1,22 +1,9 @@
-//! Refactor-set benchmark for the mempool `spentby` answer.
+//! Current-path scaling benchmark for the mempool `spentby` answer.
 //!
 //! `getrawmempool true` renders a `spentby` list for every entry in the pool.
-//! The handler used to answer each one by walking every other entry's inputs,
-//! so the whole response cost `O(pool inputs)` per entry — quadratic in the
-//! pool — while holding the mempool read lock that transaction acceptance
-//! needs. The replacement asks the `spending` index instead.
-//!
-//! Both arms of the refactor set run in one group over one identical pool:
-//! `before_scan` is the scan, written out here so it cannot drift into calling
-//! the code it is being compared against; `after_index` is the shipped path.
-//! The group is parameterised by pool size because the claim is about the
-//! *shape* of the curve, not a single number — `before_scan` should roughly
-//! quadruple when the pool doubles while `after_index` roughly doubles.
-// PERF: Criterion emits public harness items whose docs are irrelevant to the benchmark report.
+//! The benchmark protects the maintained spending index over several pool
+//! sizes without retaining the quadratic scan it replaced.
 #![allow(missing_docs)]
-// A fixture that fails to build has no meaningful degraded mode here: a pool
-// that silently stayed empty would be timed as a fast return and reported as a
-// win. Panicking is the correct outcome, so `expect` is confined to setup.
 #![allow(clippy::expect_used)]
 
 use std::hint::black_box;
@@ -49,10 +36,6 @@ fn tx_with(inputs: &[OutPoint], outputs: u32, tag: u64) -> Transaction {
     }
 }
 
-/// A pool of `pairs` independent parent -> child packages, so every parent has
-/// exactly one spender and no package exceeds the ancestor policy limits. The
-/// spend graph is deliberately shallow: the cost being measured is *finding*
-/// the spenders, not walking a deep package.
 fn pool_with(pairs: u64) -> Mempool {
     let mut pool = Mempool::new(MempoolLimits {
         max_total_bytes: 0,
@@ -74,30 +57,6 @@ fn pool_with(pairs: u64) -> Mempool {
     pool
 }
 
-/// The answer the RPC handler used to compute, spelled out rather than shared
-/// with the implementation.
-fn spentby_by_scan(pool: &Mempool) -> Vec<Vec<String>> {
-    let mut rendered = Vec::with_capacity(pool.len());
-    for (_index, entry) in &pool.entries {
-        let txid = entry.tx.compute_txid();
-        let mut spentby = Vec::new();
-        for (_candidate_index, candidate) in &pool.entries {
-            for input in &candidate.tx.input {
-                if input.previous_output.txid == txid {
-                    spentby.push(candidate.tx.compute_txid().to_string());
-                    break;
-                }
-            }
-        }
-        spentby.sort();
-        spentby.dedup();
-        rendered.push(spentby);
-    }
-    rendered
-}
-
-/// The shipped path: the cached txid for the key, the `spending` index for the
-/// spenders.
 fn spentby_by_index(pool: &Mempool) -> Vec<Vec<String>> {
     let mut rendered = Vec::with_capacity(pool.len());
     for (index, _entry) in &pool.entries {
@@ -119,24 +78,8 @@ fn bench_spentby(criterion: &mut Criterion) {
     for pairs in [256_u64, 1_024, 2_048] {
         let pool = pool_with(pairs);
         let entries = pool.len();
-
-        // Same fixture, same answer: a difference here would mean one arm is
-        // measuring less work than the other.
-        assert_eq!(
-            spentby_by_scan(&pool),
-            spentby_by_index(&pool),
-            "the two arms must render the same spentby lists"
-        );
-
         group.bench_with_input(
-            BenchmarkId::new("before_scan", entries),
-            &pool,
-            |b, pool| {
-                b.iter(|| black_box(spentby_by_scan(black_box(pool))));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("after_index", entries),
+            BenchmarkId::new("spending_index", entries),
             &pool,
             |b, pool| {
                 b.iter(|| black_box(spentby_by_index(black_box(pool))));

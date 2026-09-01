@@ -20,6 +20,11 @@ tags:
 
 # CHECKSIG census and the script-check floor
 
+> Historical campaign result: the repository-local capture, analysis,
+> classifier, and replay-durability executables were retired after this result
+> was recorded. Paths and schemas below document provenance rather than a
+> supported workflow.
+
 Status: **OPEN.** The CHECKSIG census over mainnet blocks 0..150,000 shows
 that `CPubKey::Verify` from libbitcoinkernel-sys 0.3.0 (via bitcoinkernel 0.2.1,
 embedding Bitcoin Core 31.99.0 development sources) accounts for 39.32 µs
@@ -118,11 +123,12 @@ weakening C150.
 
 ## Reproduce the experiment
 
-Use the complete tracked workflow in
-[`tools/checksig-census/README.md`](../../../tools/checksig-census/README.md). It
-reconstructs the patched native source, isolates build outputs, records source
-integrity, captures the corpus twice, runs the three timing panels, and applies
-the analyzer gates.
+The retired CHECKSIG-census harness reconstructed the patched native source,
+isolated build outputs, recorded source integrity, captured the corpus twice,
+ran the three timing panels, and applied the analyzer gates. Its exact command
+sequence was removed with the campaign infrastructure. A reopened investigation
+must build a current harness against the current bitcoinkernel dependency rather
+than treating the old commands as reproducible product tooling.
 
 ## Three-run timing and decision arithmetic
 
@@ -156,13 +162,12 @@ Because $r = 46.5889\% \ge 27.7291\%$, the verdict is **OPEN**.
 
 The census replays rest on stores proven stable across reorg and reopen, so a
 census counter cannot be an artifact of a corrupted or drifting chainstate.
-Untimed durability verification (`crates/node/examples/verify_replay_durability.rs`)
+The retired untimed replay-durability verifier
 covers `fjall`, `rocksdb`, and `redb`, and leaves the original stores
 byte-identical. The store digests, per-backend file counts and byte totals,
 proof-artifact sizes and SHA-256 values, the digest framing, and the custody
-summary path are in
-[`tools/checksig-census/README.md`](../../../tools/checksig-census/README.md),
-section *Durability proofs and custody*.
+summary path were recorded by the historical procedure under *Durability proofs
+and custody*; the executable verifier itself is no longer retained.
 
 ## Scope and limits
 
