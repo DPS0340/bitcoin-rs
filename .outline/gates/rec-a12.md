@@ -270,4 +270,4 @@ Evidence:
 
 Evidence:
 
-- (pending)
+- (pending)- [x] Fresh reviewer acceptance: PASS (2026-09-02; 94005bc re-audit: fresh checkout recovery_evidence 18/18 green; semantic witness/marker rotation validation; cumulative A1 b87b0df + aa8db8d + A2 b67bd87 + repair 94005bc contracts reviewed; repair commit exactly 3 files; mutation-proof labels reconciled).
