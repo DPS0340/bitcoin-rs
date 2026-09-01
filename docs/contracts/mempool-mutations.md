@@ -3,7 +3,8 @@
 The single mutation gateway in front of the mempool, the records it emits,
 and the ZMQ `sequence` mapping built on them. Owners: `MempoolGateway` in
 `crates/mempool/src/gateway.rs`; `MutationResult`/`MutationOutcome`/
-`RemovalReason` in `crates/mempool/src/mutation.rs`; the node-side observer
+`RemovalReason`/`MutationEnvelope`/`AdmissionOrigin` in
+`crates/mempool/src/mutation.rs`; the node-side observer
 in `crates/node/src/mempool_observer.rs`; payload encoding in
 `crates/node/src/zmq_publisher.rs`.
 
@@ -29,6 +30,12 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   observer delays later publications; it can never roll anything back or
   reorder the stream. Sequences were assigned in step 2, so a lagging
   observer still sees a gap-free, ordered stream.
+- The observer receives a `&MutationEnvelope` — the committed `MutationResult`
+  paired with the `AdmissionOrigin` that identifies how the transaction
+  entered the node (`Rpc`, `Peer`, `Reorg`, or `Block`). The envelope is
+  move-through and zero-alloc: the gateway moves the result into the
+  envelope, publishes `&MutationEnvelope`, and hands `envelope.result` back
+  to the caller.
 - Observers are best-effort mirrors. Observer errors and panics never affect
   the committed mutation. An observer must never route mutations back
   through the gateway or otherwise take the mempool write lock: re-entrancy
@@ -56,6 +63,35 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
 - `BlockInclusion` emits no `R`: the block `C` event covers it. Every other
   removal reason emits `R`. Accepted changes emit `A`. One event per change,
   in commit order.
+
+### `MPL-04`: Generation-validated admission and chain-change fencing
+
+- `MempoolGateway` carries a `chain_generation` atomic counter. Even values
+  mean the chain is stable and admission is open; odd values mean a chain
+  change (connect, disconnect, or reorg) is in progress and admission is
+  closed. `stable_generation()` returns `Some(even)` when stable, `None`
+  when a chain change is active.
+- `begin_chain_change` takes the pool write lock, stores the next odd value,
+  and returns a `ChainChangeGuard` that owns the reservation. The guard has
+  no `Drop` that changes generation: dropping, unwinding, or an error leaves
+  the generation odd — admission stays closed. Only `finish` may
+  compare-exchange the odd value to the reserved even value, reopening
+  admission. One guard covers one externally coherent chain operation.
+- `admit_transaction` is the one atomic admission operation for RPC
+  `sendrawtransaction`. The caller captures `expected_generation` (an even
+  value from `stable_generation`) and `expected_sequence` (from a read
+  guard), then calls `admit_transaction` with both tokens. The gateway takes
+  the write lock once and checks, in order: (1) exact chain generation
+  equals the request and is even, (2) current pool sequence equals the
+  request, (3) exact transaction identity. A mismatch returns a transient
+  error (`GenerationChanged` or `MempoolChanged`) and the caller retries
+  with fresh facts — it never re-uses a captured even generation.
+- `reconsider_disconnected` re-admits transactions displaced by a reorg
+  through the same `commit` path with `AdmissionOrigin::Reorg`. It processes
+  candidates in order and withholds descendants of a refused or
+  immediately-evicted parent, so a reorg sweep cannot create orphaned
+  ancestry.
+
 ## Proven by
 
 - `crates/mempool/src/gateway.rs` (inline tests):
@@ -65,7 +101,15 @@ in `crates/node/src/mempool_observer.rs`; payload encoding in
   `replacement_tags_direct_conflicts_and_descendants`,
   `observer_panic_does_not_roll_back_the_mutation`,
   `insert_reports_accepted_then_policy_evictions`,
-  `sequence_base_matches_per_change_assignment`.
+  `sequence_base_matches_per_change_assignment`,
+  `stable_generation_reads_even_values`,
+  `reconsider_disconnected_admits_in_order_once_per_candidate`,
+  `reconsider_disconnected_withholds_descendants_of_a_refused_parent`.
+- `crates/node/src/apply.rs` (inline tests, `chain_generation_tests` module):
+  `stable_generation_is_even_before_and_after_connect`,
+  `stable_generation_is_even_after_disconnect`.
+- `crates/rpc/src/handlers/tx.rs` (inline tests):
+  admission retry rebuilds context after a transient rejection.
 - `crates/node/src/mempool_observer.rs`:
   `admission_publishes_one_a_frame_with_core_payload_bytes`,
   `explicit_removal_publishes_r_frames_in_commit_order`,

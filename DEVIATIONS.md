@@ -156,38 +156,34 @@ port). The `sighash.json` vector runner skips rows whose script-code contains
 `OP_CODESEPARATOR` and reports the count in the test output. The skipped rows
 are a known v1 gap covered by the same `hand-rolled` follow-up.
 
-## 3. Task 9 — BIP157/158 compact-filter index removed
+## 3. Task 9 — compact-filter index moved to the extension boundary
 
-Task 9 specced `crates/filters` (BIP157 cfheaders + BIP158 GCS filter index),
-the `-blockfilterindex` option, and the `getblockfilter` RPC. The
-implementation is removed (issue #143): the node never advertised
-`NODE_COMPACT_FILTERS` and had no P2P handler for `getcfilters`/`getcfheaders`/
-`getcfcheckpt`, so the index was unreachable by BIP157 light clients and served
-only `getblockfilter`. Derived optional state with no in-tree consumer does not
-earn its storage, configuration, and maintenance cost.
+Issue #143 removed the original `crates/filters` implementation. It mixed
+optional BIP157/158 state into the node core but did not advertise
+`NODE_COMPACT_FILTERS` or handle `getcfilters`, `getcfheaders`, or
+`getcfcheckpt`. No light client could reach it.
 
-Compatibility deltas after removal:
+The current implementation restores the useful server-side subset as the
+`crates/ext-blockfilterindex` reference extension:
 
-- `getblockfilter` RPC: method not found (Core serves it only with
-  `-blockfilterindex=1` anyway).
-- `getindexinfo` no longer reports a `basicblockfilterindex` entry; Core also
-  omits indexes that are not enabled, so the previous unconditional entry
-  over-reported.
-- `-blockfilterindex` is no longer recognized by the CLI: clap rejects the
-  unknown option and exits. The `bitcoin.conf` compatibility reader and
-  environment layer ignore the removed `blockfilterindex` /
-  `BITCOIN_RS_BLOCKFILTERINDEX` keys, like other unsupported keys in those
-  layers.
-- Storage: the `filters`/`filter_headers` column families are gone and the
-  surviving `ColumnFamily` discriminants were renumbered — a breaking change
-  under `docs/policies/db-migration.md` §3.1. fjall, MDBX, and redb open
-  tables by name and ignore the retired ones, so those datadirs reopen
-  unchanged; a RocksDB datadir from a binary that created the retired families
-  must be wiped and resynced per §6.2, and an orphaned `<datadir>/filters`
-  directory from an old binary is simply unused.
+- `--blockfilterindex`, the `blockfilterindex` `bitcoin.conf` key, and
+  `BITCOIN_RS_BLOCKFILTERINDEX` enable the extension;
+- `getblockfilter` serves ready filter data, while `getindexinfo` and
+  `getcapabilities` report whether the index is disabled, catching up, ready,
+  or failed;
+- the extension owns `data_dir/blockfilterindex`, including its schema,
+  rows, active pointer, and reconciliation cursor;
+- `blockfilterindex` requires `txindex` and an unpruned body store;
+- a dropped wake-up or failed extension does not block block application.
 
-If a concrete BIP157/158 consumer appears, reintroduce the feature around that
-requirement rather than the speculative shape Task 9 defined.
+This is not full BIP157 peer service. The node still does not advertise
+`NODE_COMPACT_FILTERS` or implement the compact-filter P2P commands. The RPC
+surface exists for local and administrative consumers only. A future light
+client requirement must add and test the P2P contract rather than treating the
+stored index as proof that the protocol is supported.
+
+Old `filters` and `filter_headers` column families remain retired. The extension
+uses its own namespace, so old rows are neither opened nor migrated.
 
 ## §4 — T18 node lifecycle scaffold
 
@@ -242,6 +238,12 @@ placeholder. Live infrastructure runs are operator responsibilities.
 
 ## §7 — Integration layer: NodeState wiring + listeners + synthetic apply_block
 
+**Note:** This section records the integration-layer session. Several items
+have been subsequently superseded by the one-session overhaul: the Electrum
+listener and TLS config were removed with the Electrum interface, and
+persisted block-body serving for P2P is now wired. Superseded items are
+marked inline below.
+
 Follow-up to §4..§6. The session that opened with the T18..T20 scaffold
 closed by wiring the source-of-truth subsystem handles into the node
 lifecycle. The wiring covers the active-chain consensus pipeline through
@@ -250,8 +252,9 @@ non-contextual rules, BIP30/34, contextual BIP113/BIP68 checks, BIP9
 CSV/Segwit activation, BlockTree insertion, and script verification. The P2P
 handshake, per-peer
 outbound queues, block-sync `getheaders` / `getdata` download loop, and bounded
-server-side `getheaders` / `getdata` responses are wired; persisted block-body
-serving remains deferred.
+server-side `getheaders` / `getdata` responses are wired; persisted
+block-body serving is now wired through `load_active_block_at_height`
+(`crates/node/src/p2p_chain.rs`), which reads from `block_body_source`.
 
 ### What is now wired
 
@@ -294,16 +297,19 @@ serving remains deferred.
 - `getblockchaininfo`'s `initialblockdownload` follows Core's definition: `chainwork >= nMinimumChainWork && tip age <= 24h`, latched false once satisfied, matching `UpdateIBDStatus` / `Chain::IsTipRecent`. `Network::minimum_chain_work()` carries that per-network constant from the same `kernel/chainparams.cpp` the assume-valid anchor comes from. **It is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. Core's `-maxtipage` override is not wired; the 24-hour default stands. IBD is evaluated, and therefore latched, when an RPC caller asks for it, rather than continuously during validation as in Core.
 - `getblockchaininfo`'s `verificationprogress` is Core's `GuessVerificationProgress`: transactions verified over transactions estimated to exist, extrapolated from the per-network `ChainTxData` observation `Network::chain_tx_data()` carries from `kernel/chainparams.cpp`, and switching to a height-derived tip age within two hours of the tip exactly as Core does. **`ChainTxData` is Core's per-release tuning, not a consensus rule, and goes stale as the chain grows** — it needs re-copying whenever the pinned Core revision moves. When `Context::chain_tx_count()` is `None` — a datadir written before the node tracked a cumulative transaction count, which cannot be recovered without re-reading every block body — the field falls back to the old `applied / headers` height ratio rather than reporting Core's `0.0`, because a confident zero on a synced node breaks every caller that gates on this value. That fallback disappears once such a node resyncs.
 - Active-chain DAA retarget validation is wired into header acceptance and `apply_block`: non-retarget heights inherit parent `nBits` unless the network's minimum-difficulty exception applies, retarget heights recompute the expected target over the prior interval with Core's 4x timespan clamp, the network proof-of-work limit cap, and Testnet4's BIP94 period-base rule. Unit coverage pins header pre-insertion rejection, boundary accept/reject cases, clamp behavior, testnet minimum-difficulty exception, and Testnet4 BIP94 behavior.
-- Electrum TLS cert config is honored as plaintext-with-warning until a
-  matching `electrum_tls_key` field lands; the warning surfaces on every
-  boot that configures `electrum_tls_cert` without TLS wiring.
+- Electrum TLS cert config — moot. The Electrum interface was removed;
+  the TLS cert config field no longer exists.
 
 ### What is NOT yet wired (consensus correctness gates)
 
 - **No historical DAA fixture parity.** Header acceptance and active-chain retarget calculation are unit-covered, but they are not yet checked against historical mainnet/testnet retarget windows.
-- **Contextual transaction checks remain node-local.** BIP113 MTP nLocktime, BIP68 sequence locks, and BIP9 CSV/Segwit activation are wired through the node apply path, but the lower-level consensus crate still exposes `verify_transaction(tx, prevouts, height, flags)` rather than a reusable context-rich transaction API.
-- **No persisted block-body serving path for P2P.** P2P `getdata` can serve bodies still present in the in-memory `BlockRecord` cache, but it does not read persisted pruned-body rows after restart or cache eviction; unavailable inventory is reported with `notfound`.
-- **Electrum index updates are not triggered by tip advance.** Coinstats (`handles.coin_stats.finish_block`) is wired into `apply_block` (`crates/node/src/apply.rs`); only the Electrum index still waits on a listener.
+- **Persisted block-body serving for P2P — resolved.** P2P `getdata` now
+  serves blocks from the persisted body store through
+  `load_active_block_at_height` (`crates/node/src/p2p_chain.rs`), behind a
+  production headroom gate. The earlier `notfound`-only posture for
+  persisted bodies is superseded.
+- **Electrum index updates — moot.** The Electrum interface was removed;
+  the index update trigger is no longer applicable.
 - **G14 empirical validation still deferred.** The `faster than Bitcoin
   Core` claim requires multi-day same-window live mainnet IBD against
   `bitcoin-rs` and `bitcoind`. Operator responsibility.
@@ -421,11 +427,13 @@ and the benchmark's `before` arm, so a revert is a revert, not a rewrite.
 
 ## One-session overhaul: filter index re-introduced behind the extension model
 
-The Task 9 removal of `crates/filters` (above) removed a derived index that
-had no in-tree consumer. The one-session overhaul re-introduces the BIP157/158
-basic filter index as the second reconciliation consumer on the chain-event
-boundary (`docs/contracts/chain-events.md`, `docs/contracts/extensions.md`),
-which is the consumer the removal said derived state needs to earn its cost:
+The original `crates/filters` implementation (§3 above) was removed under
+issue #143 because it mixed optional BIP157/158 state into the node core
+with no reachable consumer. The one-session overhaul re-introduces the
+BIP157/158 basic filter index as the second reconciliation consumer on the
+chain-event boundary (`docs/contracts/chain-events.md`,
+`docs/contracts/extensions.md`), which is the consumer the removal said
+derived state needs to earn its cost:
 
 - `crates/ext-blockfilterindex` owns the namespace schema; the worker loop
   lives in `crates/node/src/filterindex_worker.rs`, mirroring the txindex

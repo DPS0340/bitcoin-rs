@@ -116,7 +116,15 @@ Owners:
 
 ## Live gaps
 
-- **Asynchronous recovery decoupling**: Index stores are currently opened synchronously during node initialization; decoupling index recovery from authoritative chain listener readiness is tracked under #208 and #209 (open).
+- **Asynchronous recovery decoupling**: Index stores now open on their
+  worker threads (`TxIndexWorker::spawn_with_open`), not synchronously
+  during `NodeState::open`. Durable recovery-evidence detection
+  (`crates/node/src/recovery_evidence.rs`) validates the applied-tip
+  witness semantically before rotating the current record and detects
+  checkpoint fallback from durable evidence. Full decoupling of index
+  recovery from authoritative chain listener readiness is tracked under
+  #208 and #209 (open on GitHub; #208 addressed on this branch by
+  `b67bd87`).
 - **Deep reorg memory bounding**: Disconnect planning preloads branch block bodies into memory; streaming bounded-memory disconnect is tracked under #206 (open).
 ## Proven by
 

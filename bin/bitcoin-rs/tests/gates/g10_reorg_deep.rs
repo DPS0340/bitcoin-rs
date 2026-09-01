@@ -20,6 +20,10 @@
 //!
 //! Not exercised here: full-stack 100-block reorg execution, coinstats
 //! rewind, mempool reconsideration, and live `pubsequence` emission.
+//!
+//! Named in `docs/contracts/indexing.md`: the planner and single-block arms
+//! check restoration boundaries; the txindex arms pin `IDX-06` rollback and
+//! forward reconciliation.
 
 use std::process::Command;
 

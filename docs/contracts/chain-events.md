@@ -4,7 +4,10 @@ The seam between the block-apply commit path and index consumers that mirror
 the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
 `ChainEventPublisher`, `NodeState::active_chain_snapshot` in
 `crates/node/src/state.rs`; `ConsumerCursor` and the reconciliation plan in
-`crates/node/src/reconcile.rs`.
+`crates/node/src/reconcile.rs`; `UndoStore`, `DisconnectMarker`,
+`DisconnectPhase` in `crates/storage/src/undo.rs` and
+`crates/node/src/apply.rs`; `ChainChangeProof`, `ChainChangeGuard` in
+`crates/node/src/apply.rs`.
 
 ## Clauses
 
@@ -64,10 +67,34 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   pointer and cursor to the common ancestor and never deletes rows;
   re-derived rows are idempotent overwrites. A consumer whose rows embed the
   height (txindex position rows) deletes exactly its own rows during
-  rollback, guarded by the watermark identity.
+- rollback, guarded by the watermark identity.
 - A consumer that cannot obtain a required body reports failure and stops;
   it never blocks the apply path, and a restart re-plans from the persisted
   pointer.
+
+### `EVT-05`: Durable disconnect marker and chain-change proof
+
+- An authoritative block disconnect arms a `DisconnectMarker` in the
+  `UndoStore` before the UTXO mutation, not on the error path. A process
+  that dies during rollback writes no error, which is the case the marker
+  must detect. The marker carries `(height, block_hash, phase)`.
+- `DisconnectPhase` is `InFlight` or `RolledBack`. `InFlight` means the
+  authoritative rollback started and did not report completion; a checkpoint
+  must not clear it because that would make a torn UTXO set durable.
+  `RolledBack` means the in-memory UTXO set and applied tip moved together
+  and still need one clean checkpoint. Startup refuses either phase and names
+  the directories to remove. Only the checkpoint that publishes the
+  rolled-back authoritative state may remove the marker.
+- `ChainChangeProof` binds a `ChainTransition` to the `ChainChangeGuard`
+  that reserved the active odd generation. Apply-path functions accept
+  `&ChainChangeProof`, not independent `&ChainTransition` and
+  `&ChainChangeGuard` arguments, so a call without an active odd generation
+  cannot compile. The proof's `odd_generation` returns the exact reserved
+  value.
+- The `UndoStore` trait (`crates/storage/src/undo.rs`) abstracts the
+  durable marker over all four backends. `KvUndoStore` writes the marker
+  through the `KvStore::write` path; `InMemoryUndoStore` is the test
+  default. The marker lives in the `UndoData` column family.
 
 ## Live gaps
 
@@ -96,3 +123,10 @@ the applied chain. Owners: `ChainSnapshot`, `ChainEventHint`,
   `worker_indexes_genesis_then_child_with_retained_rows`,
   `rewind_keeps_hash_addressed_rows`,
   `store_write_failure_is_reported_not_swallowed`.
+- `crates/node/src/apply.rs`:
+  `a_clean_disconnect_leaves_no_in_flight_marker`,
+  `chain_change_proof_finish_restores_even_generation`,
+  `stable_generation_is_even_before_and_after_connect`,
+  `stable_generation_is_even_after_disconnect`.
+- `crates/node/src/state.rs`:
+  `checkpoint_refuses_inflight_disconnect_and_preserves_state`.

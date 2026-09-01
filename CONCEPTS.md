@@ -51,7 +51,7 @@ Stalling detection is the mechanism that identifies the staller and, in the refe
 A validation mode that skips script-signature verification for blocks at or below a configured trusted height while still performing every other consensus check, used to accelerate IBD without abandoning validation; blocks above the height are fully verified. Mainnet nodes in `bitcoin-rs` default to assume-valid enabled at anchor height 938343.
 
 ### Hash-pinned assume-valid anchor
-The mainnet consensus checkpoint (height 938343, block `00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac`) used by default on mainnet to gate historical script verification. The node skips script verification for blocks at or below height 938343 only after validating that the active header chain contains this exact anchor hash. Sub-anchor header tips and diverged chains remain untrusted and trigger full script verification. Passing `--assume-valid-height 0` explicitly requests full verification across all blocks. Custom nonzero heights skip script checks up to that height without hash gating. Non-mainnet networks default to height 0. Replay measurement tools like `mainnet_prefix_replay` retain a default of 0 to ensure full-validation benchmark fidelity.
+custom nonzero heights skip script checks up to that height without hash gating. Non-mainnet networks default to height 0. The rust interpreter (portable posture) is tested only at assume-valid 0; production node defaults to hash-pinned mainnet anchor at height 938343.
 
 ### Optimized default posture
 The standard node operational configuration tuned for mainnet sync: `fjall` storage backend, multi-peer block download active (outbound peer target 8, pending block budget 128, 16 in-flight requests per peer), hash-pinned assume-valid active on mainnet (height 938343), 450 MiB database cache (`dbcache`, matching Bitcoin Core parity), with the secondary `txindex` and pruning disabled by default.
@@ -65,13 +65,12 @@ The user-facing `BITCOIN_RS_NETWORK`/`--network` selection that atomically suppl
 ### Sync regimes (download-bound vs processing-bound)
 The two distinct cost regimes any sync measurement must name before its numbers mean anything. **Download-bound:** wall-clock is decided by the network path (peer scheduling, per-peer bandwidth, staller handling) — the regime of live IBD. **Processing-bound:** blocks are already local and wall-clock is decided by validation plus storage commit — the regime of reindex and offline replay. A node can rank differently in the two regimes, so a faster-than-X claim is meaningless without stating which regime was measured and with what validation posture. Within a regime the comparison is only as good as its least-matched input — see *Matched-harness comparison*.
 
-## Benchmark campaign tooling
+## Benchmark evidence
 
-### Native benchmark custody
-The benchmark-campaign contract that binds each timed arm to hash-verified program and input objects held open for the child, while excluding proof and evidence processing from the measured interval and keeping the result inside its configured run.
-
-Programs and inputs stay role-bound for the full cell. Before each child starts, the runner sets CPU affinity and requires the kernel's effective mask to equal the configured mask; it then restores the caller's mask. After the child exits, the runner fingerprints its native evidence, parses it through a retained descriptor, and verifies the configured path and descriptor before and after result publication. A successful arm includes complete process and resource measurements. A demonstrated correctness failure remains a failure when the other arm has no result. Later validation recomputes the verdict from the custody artifacts and rechecks every input after the last evidence read. Custody proves internal consistency, not a cryptographic signature.
-
+All benchmark evidence and campaign tooling is retired by #224. The sealed evidence
+ledger is at `docs/benchmarks/data/evidence-retirement-v1.json`; the 36-cell
+historical matrix is at `docs/benchmarks/data/historical-evidence-matrix-v1.json`.
+The seven live benchmark targets are listed in `.agent-tasks/224/GOALS.md`.
 ## Consensus validation
 
 ### bitcoinkernel
@@ -302,18 +301,15 @@ Authoritative C150/Cmodern certification requires file-bound binary streams, str
 
 Native `CPubKey::Verify` execution averages 39.32 µs per attempt ($Y$), while width-1 kernel verification takes 73.62 µs per check ($X$). The residual $R = X - Y = 34.30\ \mu\text{s/check}$ represents non-ECDSA overhead (legacy sighash re-serialization, script parsing/evaluation, and FFI wrapper costs). The residual is a ceiling over non-native per-check work, not a promised or wholly removable gain. At 46.59% of per-check verification cost, this residual exceeds the 27.73% threshold required for a 5% total wall-time improvement (a 5.85s ceiling within the 12.55s script stage), keeping the non-crypto script optimization lever open.
 
-Replay state stability is certified by untimed durability proofs (`crates/node/examples/verify_replay_durability.rs`) across all three storage backends (`fjall`, `rocksdb`, `redb`). Probes run on disposable reflink copies (`cp --reflink=always -a`), keeping original store contents untouched and byte-identical (`custody-summary.json`). Each backend executes production `switch_to_branch` parent/back reorg with durable bodies and undo records, publishes checkpoint generation 2, reopens twice, and confirms exact invariant equality (`before == after`). See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
-
-### Terminal proof
-
-A `BRSHGT1` checkpoint that binds one replay height and block hash to the committed row counts and byte endpoints of the `BRSCTX1`, `BRSREC1`, and `BRSJRN1` evidence streams. The proof is complete when every committed slice validates, all 11 Cmodern context classes have appeared, and the checkpoint height equals the last first-occurrence height. Child process exit is a separate fact. Slow chainstate teardown or a forced post-proof kill does not erase completed evidence and must not be reported as a clean exit.
-
-Offline recovery preserves the failed source directory, hashes source bytes during semantic reconstruction, and materializes only the committed prefixes in a new single-writer directory. It creates missing recovery ancestors root-to-leaf and fsyncs each parent. Each clone states `EXACT_FULL_FILE` or `DIFFERS_FROM_SOURCE`; exact JSON clones must match the source size and digest, while normalized binary bodies must match their validated source bodies. Source and recovery descriptors and paths stay stable through candidate publication. A late mismatch durably removes the candidate. See `docs/solutions/performance/checksig-census-and-the-script-check-floor.md`.
+Replay state stability across all three storage backends (`fjall`, `rocksdb`, `redb`) is
+covered by the g10_reorg_deep gate (`bin/bitcoin-rs/tests/gates/g10_reorg_deep.rs`),
+which exercises `switch_to_branch` parent/back reorg with durable bodies and undo
+records and asserts exact invariant equality. Evidence is sealed in `evidence-retirement-v1.json`.
+The terminal-proof and offline-recovery campaigns previously described here are
+retired by #224; their custodian artifacts are listed in the evidence ledger.
 
 ### Front-half duplication
 
-The failure mode where a batched fast path recomputes the sequential path's
-preparation instead of replacing it, so a real saving is paid straight back.
 Cross-block script batching cut crypto dispatch from 44.08s to 12.53s and moved
 wall time not at all, because the batch resolved every prevout and parsed every
 block that `apply_block` then resolved and parsed again for coinbase maturity,
@@ -324,6 +320,38 @@ preparation happens once.
 
 ### Disconnect marker phase
 The durable record that an authoritative block disconnect started and how far it got. It is armed and flushed before the UTXO mutation, not written on the error path: a process that dies during rollback writes no error, which is the case the marker must detect. `TxIndex` is outside this transaction and recovers from its own atomic capability watermarks. `InFlight` means the authoritative rollback started and did not report completion; a checkpoint must not clear it because that would make a torn UTXO set durable. `RolledBack` means the in-memory UTXO set and applied tip moved together and still need one clean checkpoint. Startup refuses either phase. Only the checkpoint that publishes the rolled-back authoritative state may remove the marker.
+
+### Chain generation
+The even/odd atomic counter on `MempoolGateway` that fences admission
+against chain changes (`crates/mempool/src/gateway.rs`). Even values mean
+the chain is stable and admission is open; odd values mean a connect,
+disconnect, or reorg is in progress and admission is closed.
+`stable_generation` returns `Some(even)` when stable, `None` when a chain
+change is active. `begin_chain_change` takes the pool write lock, stores the
+next odd value, and returns a `ChainChangeGuard` that owns the reservation.
+Only `finish` may compare-exchange the odd value to the reserved even value,
+reopening admission. A failed chain change leaves the generation odd —
+admission stays closed until the operator restarts or the chain change
+completes.
+
+### Admission origin
+The `AdmissionOrigin` enum on `MutationEnvelope` that identifies how a
+transaction entered the node (`crates/mempool/src/mutation.rs`): `Rpc`
+(submitted through `sendrawtransaction`), `Peer` (relayed from a network
+peer, carrying a `PeerToken`), `Reorg` (re-admitted by a disconnect walk via
+`reconsider_disconnected`), or `Block` (confirmed by block application). The
+observer receives the origin alongside the committed `MutationResult` so
+downstream consumers (ZMQ publisher, metrics) can distinguish relay from
+reorg re-admission without inspecting call sites.
+
+### Chain-change proof
+The type-level binding of a `ChainTransition` to the `ChainChangeGuard` that
+reserved the active odd generation (`crates/node/src/apply.rs`). Apply-path
+functions accept `&ChainChangeProof`, not independent `&ChainTransition` and
+`&ChainChangeGuard` arguments, so a call without an active odd generation
+cannot compile. The proof's `odd_generation` returns the exact reserved
+value, letting admission checks compare against a specific generation rather
+than a snapshot that may have moved.
 
 ### Count-and-byte bound
 A window sized by whichever of two caps binds first. A count alone is wrong wherever item size varies by orders of magnitude: early-chain blocks average 4.6 KB, so 1024 of them is 5 MB, while at the tip the same 1024 is 2 GB. A byte cap alone is wrong in the other direction, letting a window hold tens of thousands of tiny items. Taking the minimum makes the batch large exactly where items are small and per-batch overhead dominates, and small where items are large and it does not. The script window uses it, and the same shape is owed by the sync staging budget, whose count is still sized for tip-scale blocks. One item larger than the whole byte cap still goes through alone: refusing it would stall the chain rather than process it.

@@ -15,7 +15,7 @@ ledger. This page adds nothing normative; it places the policy under the
   surface against Bitcoin Core 31.1. Consensus script and sighash validation
   are governed by consensus rules.
 - **Scope**: admission checks in `crates/mempool/src/standardness.rs`,
-  `limits.rs`, `rbf.rs`, `eviction.rs`, `policy.rs`, and the RPC surface
+  `policy.rs`, `rbf.rs`, `eviction.rs`, and the RPC surface
   `sendrawtransaction` / `testmempoolaccept` in `crates/rpc/src/handlers/tx.rs`.
 - Standardness rules, BIP125 RBF rules 1–6, package limits, and eviction
   ranking follow the policy document.
