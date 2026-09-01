@@ -91,7 +91,7 @@ Stored once in `bitcoin-rs/Cargo.toml` under `[workspace.dependencies]`. Per-cra
 | `mimalloc` | `>=0.1.50` | `[]` | `#[global_allocator]` in `bin/bitcoin-rs`; latest 0.1.50 (2026-04) [purpleprotocol/mimalloc_rust](https://github.com/purpleprotocol/mimalloc_rust) |
 | `bitcoinkernel` | `>=0.2, <0.3` | `[]` | default-on consensus authority; active manifest line. Plan accepts the alpha cost because parity gating is the load-bearing safety net. |
 | `bitcoin` | `>=0.32, <0.33` | `["std", "secp-recovery", "serde"]` + the crate's rand feature (exact name in `Cargo.toml`) | encode/decode + types. Stay on stable 0.32.x; 0.33 is still `0.33.0-beta` as of 2026-05 — wait for final |
-| `secp256k1` | `>=0.31` | `["std", "alloc", "recovery", "rand", "serde", "global-context"]` | latest stable 0.31.x; 0.32 is still beta. Batch Schnorr `verify_schnorr_batch` available in 0.31+ |
+| `secp256k1` | `>=0.31` | `["std", "alloc", "recovery", "rand", "serde", "global-context"]` | latest stable 0.31.x; 0.32 is still beta. Used for the shipped Schnorr verification path |
 | `sha2` | `>=0.11, <0.12` | `[]` | active manifest line; 0.11 exposes no `std`/`asm` feature, so SHA acceleration changes require fresh G14 evidence |
 | `bitcoin_hashes` | `>=0.14.100, <0.15` | `["std"]` | active manifest line aligned with `bitcoin 0.32`; 0.14 exposes no `asm` feature and 1.0 breaks the current bitcoin-io graph |
 | `hashbrown` | `>=0.17.1, <0.18` | `["inline-more", "default-hasher", "allocator-api2"]` | `HashTable` API is the stable raw-insertion API (the old `raw-entry` API is deprecated); MSRV 1.95 matches; no `nightly` feature |
@@ -291,14 +291,19 @@ git commit -am "feat(consensus): kernel-authoritative validator + Rust parallel 
 ### Task 3: `crates/script` — interpreter (legacy / segwit / taproot)
 
 **Files:**
-- Create: `crates/script/src/{lib,interpreter,opcodes,stack,sigops,sighash_cache,taproot}.rs`
+- Create: `crates/script/src/{lib,interpreter,opcodes,sigops,sighash_cache}.rs`
 - Test: `crates/script/tests/{interpreter,proptest}.rs`
 
-Port shape from `bitcoin/src/script/interpreter.cpp`. Stack is `tinyvec::ArrayVec<ScriptItem, 1000>` (MAX_STACK_DEPTH); script item is `enum ScriptItem { Num(i64), Bytes(SmallVec<[u8; 32]>) }`. Opcode dispatch is a flat `match` on `u8` — no jump table, no method lookup; LLVM produces a contiguous switch.
+The shipped implementation delegates script execution to the audited
+`bitcoin::Script` verifier and keeps the public surface limited to the
+production wrapper, opcode types, sigop counting, and sighash cache. A future
+hand-rolled interpreter must introduce its execution state together with a
+real production consumer and independent contract coverage; speculative stack,
+taproot-helper, and batch-verification modules are not retained.
 
 - [ ] **Step 1: Opcode constants** — copy from `bitcoin::blockdata::opcodes::all::*`, no re-derivation.
 
-- [ ] **Step 2: `Interpreter::execute(&Script, &mut Stack, flags) -> Result<bool, ScriptError>`** — main loop. Each opcode is its own function; the `match` is the dispatcher.
+- [ ] **Step 2: Hand-rolled execution** — only introduce an execution-state API when a production consumer exists; keep the current audited verifier as the only shipped path until then.
 
 - [ ] **Step 3: BIP66 strict-DER, BIP62 low-S** — per-rule, behind `flags`.
 
@@ -310,14 +315,14 @@ Port shape from `bitcoin/src/script/interpreter.cpp`. Stack is `tinyvec::ArrayVe
 
 - [ ] **Step 7: `script_tests.json` runner** — `crates/consensus`'s vector runner exercises this transitively, but a `crates/script`-local runner tests in isolation against `script_tests.json`.
 
-- [ ] **Step 8: Batch Schnorr verify** — when block has ≥16 taproot inputs, batch via `secp256k1::verify_schnorr_batch`. Bench delta committed.
+- [ ] **Step 8: Batch Schnorr verify** — deferred until a production caller and an at-scale benchmark establish a current contract; no standalone helper API is retained.
 
 - [ ] **Step 9: Property tests** — random valid p2pkh / p2wpkh / p2tr → assemble + execute → assert success. Random invalid → assert failure.
 
 - [ ] **Step 10: Commit.**
 
 ```bash
-git commit -am "feat(script): interpreter + sigops + taproot + batch schnorr" -m "Op: extend"
+git commit -am "feat(script): interpreter + sigops + taproot" -m "Op: extend"
 ```
 
 ---

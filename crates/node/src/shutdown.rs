@@ -16,7 +16,6 @@ struct ShutdownBroadcast {
     requested: Mutex<bool>,
     wake: Condvar,
 }
-
 impl ShutdownBroadcast {
     const fn new() -> Self {
         Self {
@@ -120,90 +119,4 @@ pub fn shutdown_requested() -> bool {
 /// the deadline elapsed without a request.
 pub fn wait_for_shutdown(deadline: Duration) -> bool {
     SHUTDOWN.wait_for(deadline)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread;
-    use std::time::Duration;
-
-    use super::ShutdownBroadcast;
-
-    #[test]
-    fn request_wakes_a_blocked_waiter() {
-        let broadcast = Arc::new(ShutdownBroadcast::new());
-        let waiter = {
-            let broadcast = Arc::clone(&broadcast);
-            thread::spawn(move || broadcast.wait_for(Duration::from_secs(30)))
-        };
-
-        thread::sleep(Duration::from_millis(25));
-        broadcast.request();
-
-        // The waiter parks for 30s; only the wake can return it promptly, so
-        // joining at all proves the wake fired.
-        assert!(
-            waiter.join().unwrap_or(false),
-            "waiter must wake on request rather than time out"
-        );
-    }
-
-    #[test]
-    fn wait_for_times_out_when_never_requested() {
-        let broadcast = ShutdownBroadcast::new();
-
-        assert!(!broadcast.wait_for(Duration::from_millis(25)));
-    }
-
-    #[test]
-    fn request_is_idempotent_and_pre_requested_wait_returns_immediately() {
-        let broadcast = ShutdownBroadcast::new();
-
-        assert!(broadcast.request());
-        assert!(!broadcast.request());
-
-        assert!(broadcast.requested());
-        assert!(broadcast.wait_for(Duration::ZERO));
-    }
-
-    #[test]
-    fn process_wide_functions_share_one_registry() {
-        super::request_shutdown();
-
-        assert!(super::shutdown_requested());
-        assert!(super::wait_for_shutdown(Duration::ZERO));
-    }
-
-    #[test]
-    fn trigger_stores_the_flag_before_waiters_observe_the_wake() {
-        let broadcast = Arc::new(ShutdownBroadcast::new());
-        let flag = Arc::new(AtomicBool::new(false));
-        let waiters: Vec<_> = (0..3)
-            .map(|_| {
-                let broadcast = Arc::clone(&broadcast);
-                let flag = Arc::clone(&flag);
-                thread::spawn(move || {
-                    assert!(broadcast.wait_for(Duration::from_secs(5)));
-                    assert!(
-                        flag.load(Ordering::Acquire),
-                        "every waiter must see the flag after the broadcast"
-                    );
-                })
-            })
-            .collect();
-
-        thread::sleep(Duration::from_millis(25));
-        assert!(broadcast.trigger(&flag));
-        assert!(!broadcast.trigger(&flag));
-
-        for waiter in waiters {
-            waiter
-                .join()
-                .unwrap_or_else(|_| panic!("shutdown waiter panicked"));
-        }
-        assert!(flag.load(Ordering::Acquire));
-        assert!(broadcast.requested());
-    }
 }

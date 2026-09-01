@@ -1,4 +1,4 @@
-//! Script verification, sigop counting, sighash caching, and taproot helpers.
+//! Script verification, sigop counting, and sighash caching.
 //!
 //! ## V1 implementation note
 //!
@@ -10,8 +10,6 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-/// Rayon-backed Schnorr verification helpers.
-pub mod batch;
 /// Script verification wrapper.
 pub mod interpreter;
 /// Opcode re-exports and local opcode newtype.
@@ -20,13 +18,7 @@ pub mod opcodes;
 pub mod sighash_cache;
 /// Signature operation counters.
 pub mod sigops;
-/// Bounded stack infrastructure for the future hand-rolled interpreter.
-pub mod stack;
-/// Taproot verification helpers.
-pub mod taproot;
-
 pub use interpreter::{Interpreter, ScriptError, VerifyFlags};
-pub use stack::{ScriptItem, Stack, StackError};
 
 /// Borrowed script type from the `bitcoin` crate.
 pub type Script = bitcoin::Script;

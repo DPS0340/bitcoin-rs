@@ -9,7 +9,8 @@ use hashbrown::HashTable;
 use slab::Slab;
 
 use crate::{
-    Bip9Cache, CachedState, ChainError,
+    CachedState, ChainError,
+    bip9_cache::Bip9Cache,
     node::{BlockHeader, BlockTreeNode, ChainWork, NodeId, NodeStatus},
     tip::TipSnapshot,
 };
@@ -325,12 +326,6 @@ impl BlockTree {
     /// Stores the cached BIP9 deployment state for `(node_id, deployment_id)`.
     pub fn cache_bip9_state(&self, node_id: NodeId, deployment_id: u32, state: CachedState) {
         self.bip9_cache.insert(node_id, deployment_id, state);
-    }
-
-    /// Returns the number of cached BIP9 deployment-state entries.
-    #[must_use]
-    pub fn cached_bip9_state_len(&self) -> usize {
-        self.bip9_cache.len()
     }
 
     /// Builds a block locator starting from `tip_id`. For active tips, returns

@@ -13,8 +13,8 @@ proof of work, compact-target validation against the network's difficulty rules
 (`validate_header_nbits`), median-time-past and future-drift bounds
 (`validate_header_timestamp`, `current_unix_seconds`) — returning the new `NodeId`s.
 `plan_reorg` walks parent pointers to the common ancestor and returns a `ReorgPlan`
-naming the blocks to disconnect and connect. `Bip9Cache` memoizes versionbits deployment
-states per node (`insert`, `get`) and is invalidated on reorg. `BlockTreeNode` carries
+naming the blocks to disconnect and connect. An internal `Bip9Cache` memoizes
+versionbits deployment states per node and is invalidated on reorg. `BlockTreeNode` carries
 parent, height, and header hash with a `NodeStatus` (header-valid, active, or
 off-best-chain), and every failure surfaces as a structured `ChainError` variant.
 
