@@ -1137,12 +1137,17 @@ mod tests {
     use alloc::sync::Arc;
 
     use bitcoin_rs_chain::NodeStatus;
-    use bitcoin_rs_mempool::MempoolEntry;
+    use bitcoin_rs_mempool::{
+        AdmissionOrigin, MempoolEntry, arm_admission_park, reset_admission_park,
+    };
     use bitcoin_rs_primitives::{
         Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
         encode::double_sha256,
     };
+    use bitcoin_rs_utxo::{BlockChanges, UtxoAdd};
     use sonic_rs::{JsonContainerTrait as _, JsonValueTrait as _, json};
+    use std::sync::mpsc;
+    use std::thread;
 
     use super::getrawtransaction;
     use super::hex_encode;
@@ -2127,6 +2132,157 @@ mod tests {
             result.as_ref().is_ok_and(|value| value.as_str().is_some()),
             "the scan should answer from the body source: {result:?}"
         );
+    }
+
+    /// P2WPKH script: OP_0 + push-20 + fixed 20-byte key hash.
+    fn retry_p2wpkh() -> Vec<u8> {
+        [vec![0x00, 0x14], vec![0x11; 20]].concat()
+    }
+
+    /// Funds a UTXO in the context's UTXO set and returns the outpoint.
+    fn retry_fund_utxo(ctx: &Context, label: u8, value: u64) -> OutPoint {
+        let mut changes = BlockChanges::default();
+        changes.add(UtxoAdd::new(
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+            TxOut {
+                value,
+                script_pubkey: retry_p2wpkh(),
+            },
+            false,
+            1,
+        ));
+        ctx.utxo
+            .commit_block(&changes, &Hash256::from_le_bytes(&[0xaa; 32]))
+            .unwrap_or_else(|err| panic!("commit_block failed: {err}"));
+        OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0)
+    }
+
+    /// One-input one-output tx spending `prevout` with `output_value` sats.
+    fn retry_tx(prevout: OutPoint, output_value: u64) -> Tx {
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: prevout,
+                script_sig: Vec::new(),
+                sequence: 0xffff_ffff,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: output_value,
+                script_pubkey: retry_p2wpkh(),
+            }],
+        }
+    }
+
+    /// Consensus hex for RPC submission.
+    fn retry_raw_hex(tx: &Tx) -> String {
+        hex_encode(&consensus_bytes(tx))
+    }
+
+    /// Proves `sendrawtransaction` rebuilds admission context on retry: the
+    /// first attempt captures context from a mempool state where the child's
+    /// parent is absent (missing inputs), parks at the gateway seam, the test
+    /// changes the chain generation (forcing `GenerationChanged`) and admits
+    /// the parent, then releases the park. The retried attempt must observe
+    /// the FRESH mempool state — the parent now provides the child's prevout —
+    /// and succeed. If the context were reused from the first attempt (the
+    /// r4c3 mutation), the stale `missing_inputs` flag would reject the child.
+    #[test]
+    fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = Arc::new(Context::new());
+        reset_admission_park();
+
+        // Parent spends a confirmed UTXO; child spends the parent's output.
+        // The parent output is NOT in the UTXO set, so the child's prevout is
+        // only available while the parent is in the mempool.
+        let parent_prevout = retry_fund_utxo(&ctx, 0x70, 100_000);
+        let parent = retry_tx(parent_prevout, 90_000);
+        let parent_txid = parent.txid();
+        let child_prevout = OutPoint::new(parent_txid, 0);
+        let child = retry_tx(child_prevout, 80_000);
+        let child_txid = child.txid();
+        let child_hex = retry_raw_hex(&child);
+
+        // Arm the admission park gate: the first `admit_transaction` on this
+        // gateway will block before the write lock, signal `parked`, and wait
+        // for `release`.
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let target = Arc::as_ptr(&ctx.mempool).expose_provenance();
+        arm_admission_park(target, parked_tx, release_rx);
+
+        let ctx_clone = Arc::clone(&ctx);
+        let handler = Handler::new(Arc::clone(&ctx));
+        let admission =
+            thread::spawn(move || handler.dispatch("sendrawtransaction", &json!([child_hex])));
+
+        // Wait for the first attempt to park at the gateway seam.
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("first admission parked at the gateway seam");
+
+        // While the first attempt is parked (before the write lock, holding
+        // no guard), change the chain generation so the first attempt's
+        // captured generation token is stale, and admit the parent so the
+        // mempool sequence bumps and the parent's output is available.
+        let guard = ctx_clone
+            .mempool
+            .begin_chain_change()
+            .expect("begin chain change on even generation");
+        guard
+            .finish()
+            .expect("finish chain change to next even generation");
+
+        let parent_vsize = u32::try_from(parent.vsize()).unwrap_or(u32::MAX);
+        ctx_clone
+            .mempool
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(parent), parent_vsize, 10_000, 0, 1),
+            )
+            .expect("parent admitted to the mempool");
+
+        // Release the park: the first attempt proceeds, sees the stale
+        // generation token, and returns `GenerationChanged` — retrying with
+        // fresh facts.
+        release_tx.send(()).expect("release the parked admission");
+
+        let result = admission.join().expect("admission thread did not panic");
+
+        reset_admission_park();
+
+        // The retried admission must succeed: the parent is now in the
+        // mempool, the child's prevout is available, and the context was
+        // rebuilt from the fresh mempool state.
+        let txid_str = result
+            .as_ref()
+            .map_err(|err| format!("sendrawtransaction failed: {err}"))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| format!("expected txid string, got {value:?}"))
+            });
+        assert_eq!(
+            txid_str.expect("child admitted on retry"),
+            child_txid.to_string(),
+            "the retried admission must observe the fresh mempool state"
+        );
+
+        // The child must be in the mempool.
+        assert!(
+            ctx.mempool.read().contains_txid(&child_txid),
+            "the child must be pooled after successful retry"
+        );
+        // The parent must still be in the mempool.
+        assert!(
+            ctx.mempool.read().contains_txid(&parent_txid),
+            "the parent must remain pooled"
+        );
+
+        Ok(())
     }
 }
 

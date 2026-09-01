@@ -16,6 +16,7 @@ default = []
 rocksdb = []
 fjall = []
 redb = []
+test-seam = []
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true

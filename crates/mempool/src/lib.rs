@@ -33,6 +33,8 @@ pub use gateway::{
     AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, ChainChangeGuard,
     CompositeObserver, MempoolGateway, MempoolObserver,
 };
+#[cfg(any(test, feature = "test-seam"))]
+pub use gateway::{arm_admission_park, reset_admission_park};
 pub use mutation::{
     AdmissionOrigin, MutationChange, MutationEnvelope, MutationOutcome, MutationResult, PeerToken,
     RemovalReason,

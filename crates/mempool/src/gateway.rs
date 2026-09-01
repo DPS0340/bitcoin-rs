@@ -441,6 +441,14 @@ impl MempoolGateway {
     /// before mutation.
     #[allow(clippy::needless_pass_by_value)]
     pub fn admit_transaction(&self, request: AdmissionRequest) -> Result<AdmitOutcome, AdmitError> {
+        // Test-only causal seam: parks the first admission BEFORE acquiring
+        // the write lock so a cross-crate test can mutate the pool and
+        // generation between the caller's capture and the gateway's
+        // re-check, forcing a deterministic transient error. Disarmed, this
+        // is a no-op. One shot: the park consumes the arm.
+        #[cfg(any(test, feature = "test-seam"))]
+        ordering_gate::park_if_armed(std::ptr::from_ref(self).expose_provenance());
+
         let mut pool = self.pool.write();
 
         // 1. Exact chain generation check (even and matches request).
@@ -697,7 +705,7 @@ impl ChainChangeGuard {
 /// after sequencing, while it still holds the pool write guard. It signals
 /// the test on `parked` and blocks on `release`. One shot: the park consumes
 /// the arm.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-seam"))]
 mod ordering_gate {
     use parking_lot::Mutex;
     use std::sync::mpsc::{Receiver, Sender};
@@ -742,6 +750,24 @@ mod ordering_gate {
         // thread drops the sender and the park dissolves instead of hanging.
         let _ = release_rx.recv();
     }
+}
+
+/// Cross-crate test seam: arms the admission park gate so the next
+/// `admit_transaction` on the gateway at `target` blocks before the write
+/// lock, signalling `parked_tx` and waiting on `release_rx`.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn arm_admission_park(
+    target: usize,
+    parked_tx: std::sync::mpsc::Sender<()>,
+    release_rx: std::sync::mpsc::Receiver<()>,
+) {
+    ordering_gate::arm(target, parked_tx, release_rx);
+}
+
+/// Cross-crate test seam: disarms the admission park gate.
+#[cfg(any(test, feature = "test-seam"))]
+pub fn reset_admission_park() {
+    ordering_gate::reset();
 }
 
 #[cfg(test)]
