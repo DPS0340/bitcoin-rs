@@ -7851,16 +7851,45 @@ mod tests {
     }
 
     #[test]
+    fn handshake_publication_preserves_pre_registered_current_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
+            sync_with_header_chain(1)?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 18_447));
+        let (tx, _rx) = unbounded::<Message>();
+        let current = PeerLease::new(tx);
+
+        // The listener registers a connection before its handshake and then
+        // publishes metadata through this callback after the handshake.
+        peer_outbound.write().insert(addr, current.clone());
+        let registration = sync.peer_registration_handle();
+
+        assert!(!registration(
+            addr,
+            current.clone(),
+            synthetic_peer(addr, 2),
+        ));
+        assert!(!current.is_cancelled());
+        assert!(
+            peer_outbound
+                .read()
+                .get(&addr)
+                .is_some_and(|registered| registered.same_connection(&current))
+        );
+        assert_eq!(&*peers.read(), &[synthetic_peer(addr, 2)]);
+        Ok(())
+    }
+
+    #[test]
     fn peer_registration_reconnects_after_outbound_map_removal()
     -> Result<(), Box<dyn std::error::Error>> {
         let (sync, peers, peer_outbound, _block_tree, _applied_tip, _expected) =
             sync_with_header_chain(1)?;
         let addr = SocketAddr::from(([127, 0, 0, 1], 18_448));
         let (old_tx, _old_rx) = unbounded::<Message>();
+        let old = PeerLease::new(old_tx);
         peers.write().push(synthetic_peer(addr, 1));
-        peer_outbound
-            .write()
-            .insert(addr, bitcoin_rs_p2p::PeerLease::new(old_tx));
+        peer_outbound.write().insert(addr, old.clone());
         let now = Instant::now();
         sync.download_window
             .lock()
@@ -7874,6 +7903,8 @@ mod tests {
             replacement.clone(),
             synthetic_peer(addr, 2),
         ));
+        assert!(old.is_cancelled());
+        assert!(!replacement.is_cancelled());
         assert!(
             peer_outbound
                 .read()
