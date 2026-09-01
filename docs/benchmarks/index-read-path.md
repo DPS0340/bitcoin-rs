@@ -4,11 +4,11 @@ Baseline for the ScriptIndex resolver read path, captured before any optimizatio
 Prior performance campaigns covered the sync and apply path only; `crates/index`
 had no benchmarks for this resolver, so no read-path number existed.
 
-Harness: `crates/index/benches/history_resolve.rs`. It is Criterion and holds the
-`before_scan` and `after_fast` arms of a refactor set in one group over one
-fixture. At the **baseline** commit both arms called the same code, which is
-what the noise-floor section below measures; both harnesses now run genuinely
-different paths in each arm.
+Harness: `crates/index/benches/history_resolve.rs`. It is Criterion and measures
+only the retained current position-backed resolver over a production-shaped
+flat-file fixture. The `before_scan` and `after_fast` arms described below are
+historical evidence from the retired refactor harness; they are not current
+targets.
 
 The arms call different functions — the retained `*_scan` reference against the
 position-backed resolver — over the same rows and block files.
@@ -112,9 +112,8 @@ precise number.
 250 KB blocks.** Since the index bench shows the cost is linear in block size,
 the same address over tip-sized blocks projects several times higher again.
 This is a synthetic fixture on a laptop and is **not** the G14 gate — that
-remains `scripts/measure-g14-electrum-rss.sh` against a mainnet-tip node over a
-real 10,000-scripthash corpus, and it remains unclaimed. What the number
-establishes is direction and shape, not a gate result.
+historical gate remains unclaimed after the campaign tooling was retired. What
+the number establishes is direction and shape, not a gate result.
 
 `subscribe` runs the same resolution and then hashes the status. An Electrum
 wallet issues one per address on connect, so it is the highest-volume caller of
@@ -168,7 +167,8 @@ heights, an unresolvable height, an `OP_RETURN` target that ingest never indexed
 a never-indexed scripthash, and a `proptest` over random block/transaction/output
 shapes. Equality is over the full result vector, not a spot check.
 
-**Speed**, paired arms in one run, `crates/index/benches/history_resolve.rs`.
+**Historical speed**, paired arms in one run, from the retired
+`crates/index/benches/history_resolve.rs` harness.
 In-memory harness, and unaffected by that: both arms here are scan-path variants,
 so both are CPU-bound and I/O cancels out of the ratio.
 

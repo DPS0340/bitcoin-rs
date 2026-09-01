@@ -33,8 +33,6 @@ rayon.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-anyhow.workspace = true
-hashbrown.workspace = true
 
 [[bench]]
 name = "merkle"

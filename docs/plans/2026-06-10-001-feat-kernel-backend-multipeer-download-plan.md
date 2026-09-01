@@ -57,12 +57,14 @@ apply path is what keeps download — not validation — the constraint. Campaig
 prerequisite for Campaign B's win being realizable, which is the substantive argument for the
 kernel-first sequencing (user-confirmed), beyond its lower risk profile.
 
-Baseline decomposition for the current best replay (296.2 s elapsed, artifact
-`rs-replay-150k-parverify.json`): script-verify stage sums 200.7 s (serial-overlay path 105.0 s
+Baseline decomposition for the historical best replay (296.2 s elapsed, artifact
+`rs-replay-150k-parverify.json`; the replay harness was retired in PR #227):
+script-verify stage sums 200.7 s (serial-overlay path 105.0 s
 over 23,883 blocks + parallel path 95.7 s over 44,008), leaving a non-script floor of ~95.5 s
 (residual fetch stall ~33 s, persist/commit/decode/micro-stages the rest). Measurement
-artifacts: `~/bench-g14/results/`; harness `crates/node/examples/mainnet_prefix_replay.rs`
-(REST block source, stop-hash assertion, stage decomposition).
+artifacts: `~/bench-g14/results/`; historical harness
+`crates/node/examples/mainnet_prefix_replay.rs` (REST block source, stop-hash
+assertion, stage decomposition).
 
 ---
 
@@ -239,7 +241,8 @@ deferred until U2 produces data (binary size, build-dependency cost); see Open Q
   before any apply-path surgery. If the hypothesis fails here, U1's integration, CI work, and
   feature plumbing are never built.
 - **Files:**
-  - Create: `crates/consensus/examples/kernel_verify_spike.rs` (feature-gated `kernel`),
+  - Create: `crates/consensus/examples/kernel_verify_spike.rs` (historical,
+    feature-gated `kernel`),
     reusing the fixture-extraction approach planned for U3 (sampled heavy blocks + prevouts
     from the local datadir, serialized to a small on-disk corpus the example loads).
 - **Approach:** Replay the sampled blocks' script verification through

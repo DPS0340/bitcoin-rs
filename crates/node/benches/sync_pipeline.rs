@@ -2,7 +2,7 @@
 //!
 //! The two retained shapes protect distinct production costs: a contiguous
 //! coinbase-only prefix and a mature, spend-heavy prefix that exercises UTXO
-//! removal plus CoinStats listener work. Protocol-ordering and burst cases are
+//! removal plus `CoinStats` listener work. Protocol-ordering and burst cases are
 //! correctness tests, not separate long-lived performance contracts.
 #![allow(missing_docs)]
 

@@ -1,5 +1,8 @@
 # `getrawmempool true`: answering `spentby` from the spend index
 
+> The synthetic rendering benchmark is retired. The spending index remains
+> protected by correctness tests and the production RPC path.
+
 `getrawmempool true` renders one entry object per mempool transaction, and each
 of those carries a `spentby` list — the in-pool transactions that spend one of
 this transaction's outputs.
@@ -17,8 +20,8 @@ transaction's own outputs, a range scan over the index.
 
 ## Measured
 
-Refactor-set benchmark, `crates/mempool/benches/spentby.rs`. Both arms run in
-one Criterion group over one identical pool. `before_scan` is the scan, written
+The retired refactor-set benchmark ran both arms in one Criterion group over one
+identical pool. `before_scan` was the scan, written
 out in the benchmark rather than shared with the code it is compared against;
 `after_index` is the shipped path. The two arms are asserted to render identical
 output before either is timed.

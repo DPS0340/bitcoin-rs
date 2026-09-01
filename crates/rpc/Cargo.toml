@@ -45,17 +45,3 @@ tracing.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile = "3"
-criterion.workspace = true
-
-[[bench]]
-name = "chaininfo"
-harness = false
-
-[[bench]]
-name = "blocklookup"
-harness = false
-
-[[bench]]
-name = "txoutproof"
-harness = false
-required-features = ["rocksdb"]

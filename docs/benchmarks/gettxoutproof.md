@@ -1,12 +1,15 @@
-# `gettxoutproof` benchmarks
+# Historical `gettxoutproof` benchmark record
+
+> The benchmark and its scan/index A/B harness were retired after the indexed
+> production query path shipped. The results below remain historical evidence.
 
 Baseline and refactor-set measurement for the one RPC handler that did unbounded
 work per call. `crates/rpc` had no benchmarks at all before this page, so no
 number existed for it.
 
-Harness: `crates/rpc/benches/txoutproof.rs`. Criterion, both arms of the refactor
-set in one group over one fixture in one process, so the ratio cannot be
-confounded by the rebuild and baseline drift recorded in
+The retired Criterion harness measured both arms of the refactor set in one
+group over one fixture in one process, so the ratio could not be confounded by
+the rebuild and baseline drift recorded in
 `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 
 The arms differ by whether the `Context` carries a txindex. `before_scan` is the

@@ -97,6 +97,9 @@ Whether a fan-out pays is decided by per-item work against dispatch cost, not by
 
 The AVX2 Merkle result pins the distinction. Reusing prepared txids and hashing eight independent 64-byte parent pairs in SIMD lanes cut the matched fjall replay from 56.517s to 48.020s (1.177×), while scalar-library swaps and Rayon folds had failed. SIMD paid because it reduced the cost of a homogeneous batch without scheduling more tasks. The same candidate passed the RocksDB and redb gates at 1.171× and 1.112×.
 
+### Retained benchmark contract
+Permanent benchmarks must call the shipped production path, use a product-shaped workload, and protect a regression that still matters. Refactor A/B harnesses, synthetic implementation microbenchmarks, and future-work measuring tools remain only as historical docs or tests. The retained set is the node sync/apply path, a reduced UTXO commit set, end-to-end mempool admission, current Merkle dispatch, and the real-file index resolver.
+
 ### Matched-harness comparison
 The requirement that a cross-node benchmark match every input that is not the thing under test — block source, validation posture, CPU pinning, and time of measurement — before any ratio is quoted. Each mismatch found in this repo moved the headline materially: Core's reference was months stale (67s → re-derived 59.6s); bitcoin-rs fetched blocks over REST from a live `bitcoind` while Core read local `blk*.dat`, which cost ~35s of harness *and* contended for CPU (121.9s → 84.6s once `--blocks-file` matched it); and GoCoin skips script verification below its default `LastTrustedBlock` of #940000, so it must be compared either against an assume-valid bitcoin-rs run or with that asymmetry stated. Interleave both nodes back-to-back on an idle host and quote paired medians; comparing your best run against someone else's old run is not a measurement.
 

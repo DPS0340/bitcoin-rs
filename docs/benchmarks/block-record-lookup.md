@@ -1,13 +1,16 @@
-# Block-record lookup benchmarks
+# Historical block-record lookup benchmark record
+
+> The RPC benchmark harness was retired after the indexed resolver shipped.
+> This page preserves the old measurement and its rationale only.
 
 Baseline and refactor-set measurement for `Context::record_for_hash`, the
 hash-to-record resolver under `getblock`, `getblockheader`, `getblockstats`,
 `getrawtransaction` with a blockhash, the REST block endpoint, and
 `gettxoutproof`'s explicit-hash path.
 
-Harness: `crates/rpc/benches/blocklookup.rs`. Criterion, both arms of the
-refactor set in one group over one fixture in one process, so the ratio cannot be
-confounded by the rebuild and baseline drift recorded in
+The retired Criterion harness measured both arms of the refactor set in one
+group over one fixture in one process, so the ratio could not be confounded by
+the rebuild and baseline drift recorded in
 `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 
 ## What was wrong

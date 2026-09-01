@@ -38,8 +38,9 @@ null result no longer blocks, a p<0.05 regression on a track's gate benches does
   commits first as `fix(node)`. Part B (apply-side `expected_apply_cache` repopulation) commits on
   its cache-coherence structural argument plus unit tests (miss→populate→hit, invalidation on failed
   apply / tip move, horizon cap) as `perf(node)`.
-- **R3 (T3 mimalloc):** commits as bench infrastructure (`bench-mimalloc` feature, plain
-  dev-dependency, default OFF, zero `src/` changes) if both configurations build/test/clippy clean.
+- **R3 (T3 mimalloc, historical):** the former `bench-mimalloc` A/B infrastructure was
+  used to establish allocator parity and is now retired; retained benchmarks use the
+  production allocator directly.
   The A/B delta is recorded as a bench-fidelity finding. Only track adding a dependency —
   flagged and accepted.
 - **R4 (regression veto):** serial measurement barrier on idle pinned cores, one bench at a time:

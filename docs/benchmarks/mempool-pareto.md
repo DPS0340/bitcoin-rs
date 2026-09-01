@@ -1,12 +1,16 @@
-# Mempool priority-index benchmarks
+# Historical mempool priority-index benchmark record
+
+> The original Pareto A/B and implementation-only fill harnesses are retired.
+> The retained `crates/mempool/benches/pareto.rs` benchmark drives only the
+> production `Mempool::insert_entry` path.
 
 Baseline and refactor-set measurement for `ParetoFront`, the mempool's fee
 priority index. `crates/mempool` had no benchmarks before this page, so no number
 existed for it.
 
-Harness: `crates/mempool/benches/pareto.rs`. Criterion, both arms of the refactor
-set in one group over one fixture in one process, so the ratio cannot be
-confounded by the rebuild and baseline drift recorded in
+The retired Criterion harness measured both arms of the refactor set in one
+group over one fixture in one process, so the ratio could not be confounded by
+the rebuild and baseline drift recorded in
 `docs/solutions/best-practices/criterion-bench-trust-rebuild-drift-baselines-allocator.md`.
 
 ## What was wrong
@@ -15,7 +19,7 @@ confounded by the rebuild and baseline drift recorded in
 a linear `remove` followed by `sort_by` over the whole index. Filling an index of
 `n` entries was therefore `O(n^2 log n)`.
 
-This is not an idle path. `Mempool::insert_entry` — the path that accepts a
+At the historical baseline this was not an idle path. `Mempool::insert_entry` — the path that accepts a
 transaction from a peer — calls `recompute_all_metadata`, which discards the
 priority index and re-inserts every entry. So the quadratic cost was paid once
 per accepted transaction, by anyone able to put transactions in the mempool.
@@ -57,7 +61,7 @@ pins it.
 
 ## Closing the outer quadratic
 
-Replacing the index was not enough. `Mempool::insert_entry` called
+The historical implementation did more than replace the index. `Mempool::insert_entry` called
 `recompute_all_metadata`, which walked every entry on every insert, and then
 consulted `total_vsize()`, which folded every entry again. With the index fixed
 and nothing else changed, `insert_entry` still measured an exponent of **2.17**.
@@ -114,8 +118,9 @@ fixes the staleness and deletes the duplicate accounting.
 
 ## Correctness, and how the tests were checked
 
-The flat-vector index is retained whole as `SortedParetoFront`: it is the oracle
-the equivalence tests compare against and the benchmark's `before` arm. Five
+The historical flat-vector index was retained as `SortedParetoFront`: it was the
+oracle the equivalence tests compared against and the benchmark's `before` arm.
+Five
 tests cover the set in `crates/mempool/tests/pareto_ordering.rs`, and the two
 equivalence tests compare the *whole* index rather than a prefix — a `top_n(10)`
 check passes while everything below the tenth entry is misordered, and
