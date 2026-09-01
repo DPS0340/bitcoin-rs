@@ -444,15 +444,22 @@ fn descendant_count_limit_rejects_the_26th_child() -> Result<(), Box<dyn Error>>
 #[test]
 fn acceptance_preview_gap_ancestor_limits_surface_only_at_admission() -> Result<(), Box<dyn Error>>
 {
-    // Pins the documented preview gap: the acceptance seam does not carry the
-    // package limits, so testmempoolaccept reports allowed for a tx the
-    // admission gate then rejects. Deviation ledger, row "package limits".
+    // R3 closed the documented preview gap: the acceptance seam now carries
+    // package limits via check_package_limits, so testmempoolaccept and the
+    // admission gate agree on ancestor limits.
     let (pool, txs) = chain_pool(25)?;
     let tip = txs.last().ok_or("empty chain")?;
     let candidate = tx(OutPoint::new(tip.txid(), 0), 1_000, 0xFF_FF_FF_FF);
     assert!(
-        preview_allowed(&pool, &candidate, context(4_000, 4_000)),
-        "preview currently misses ancestor limits (documented gap)"
+        !preview_allowed(&pool, &candidate, context(4_000, 4_000)),
+        "preview now enforces ancestor limits (gap closed by R3)"
+    );
+    assert_eq!(
+        preview_reason(&pool, &candidate, context(4_000, 4_000)),
+        Some(AcceptanceRejectReason::PackageLimit(
+            PolicyError::TooManyAncestors
+        )),
+        "preview must report the same ancestor-limit reason as admission"
     );
     let mut pool = pool;
     let err = pool

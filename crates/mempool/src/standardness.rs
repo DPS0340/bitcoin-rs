@@ -14,7 +14,7 @@ use bitcoin_rs_script::{
 };
 use thiserror::Error;
 
-use crate::{Mempool, RbfError, ReplacementCandidate};
+use crate::{Mempool, PolicyError, RbfError, ReplacementCandidate};
 
 /// Maximum weight of a standard transaction (400 000 weight units).
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
@@ -194,6 +194,9 @@ pub enum AcceptanceRejectReason {
     /// Conflicting replacement fails BIP125.
     #[error(transparent)]
     Replacement(#[from] RbfError),
+    /// Transaction exceeds ancestor or descendant package limits.
+    #[error(transparent)]
+    PackageLimit(#[from] PolicyError),
     /// Next-block BIP68 relative sequence locks are unmet.
     #[error("non-BIP68-final")]
     NonBip68Final,
@@ -202,13 +205,11 @@ pub enum AcceptanceRejectReason {
     ScriptVerify,
 }
 
-/// Evaluates non-mutating package acceptance policy facts.
+/// Mempool-owned seam behind `testmempoolaccept`.
 ///
-/// This is the mempool-owned seam behind `testmempoolaccept`: it composes
-/// standardness, presence, missing-input, min-relay / max-fee, and BIP125
-/// replacement checks against the live pool without inserting anything.
-/// Consensus script verification remains outside this module.
-///
+/// It composes standardness, presence, missing-input, min-relay / max-fee,
+/// and BIP125 replacement checks against the live pool without inserting
+/// anything. Consensus script verification remains outside this module.
 /// `contexts` must have the same length as `txs`. `incremental_relay_fee_sat_per_kvb`
 /// feeds the size-pressure mempool-min floor and BIP125 rule 4.
 #[must_use]
@@ -275,6 +276,58 @@ pub fn evaluate_package_acceptance(
     }
 }
 
+/// Evaluates all transactions in a package without stopping after the first
+/// rejection. Each row gets its own independent verdict.
+///
+/// This is the `testmempoolaccept` form: it reports every row's acceptance
+/// status, including rows after an earlier rejected row.
+#[must_use]
+pub fn evaluate_package_acceptance_all(
+    pool: &Mempool,
+    policy: &StandardnessPolicy,
+    txs: &[Tx],
+    contexts: &[PackageTxContext],
+    max_feerate_sat_per_kvb: Option<u64>,
+    incremental_relay_fee_sat_per_kvb: u64,
+) -> PackageAcceptanceFacts {
+    assert_eq!(
+        txs.len(),
+        contexts.len(),
+        "package txs and contexts must align"
+    );
+
+    if txs.is_empty() || txs.len() > MAX_PACKAGE_COUNT {
+        return PackageAcceptanceFacts {
+            package_error: Some(AcceptanceRejectReason::PackageTooLarge),
+            results: Vec::new(),
+        };
+    }
+
+    let mempool_min_fee =
+        crate::eviction::mempool_min_fee_sat_per_kvb(pool, incremental_relay_fee_sat_per_kvb);
+
+    let results = txs
+        .iter()
+        .zip(contexts.iter())
+        .map(|(tx, context)| {
+            evaluate_one(
+                pool,
+                policy,
+                tx,
+                *context,
+                max_feerate_sat_per_kvb,
+                mempool_min_fee,
+                incremental_relay_fee_sat_per_kvb,
+            )
+        })
+        .collect();
+
+    PackageAcceptanceFacts {
+        package_error: None,
+        results,
+    }
+}
+
 fn evaluate_one(
     pool: &Mempool,
     policy: &StandardnessPolicy,
@@ -296,7 +349,7 @@ fn evaluate_one(
 
     let reject = if pool.contains_txid(&txid) {
         Some(AcceptanceRejectReason::AlreadyInMempool)
-    } else if context.missing_inputs {
+    } else if is_coinbase(tx) || context.missing_inputs {
         Some(AcceptanceRejectReason::MissingInputs)
     } else if let Err(err) = is_standard_tx(tx, policy) {
         Some(AcceptanceRejectReason::NonStandard(err))
@@ -304,7 +357,7 @@ fn evaluate_one(
         Some(AcceptanceRejectReason::MinRelayFeeNotMet)
     } else if max_feerate_sat_per_kvb.is_some_and(|max| fee_rate > max) {
         Some(AcceptanceRejectReason::MaxFeeExceeded)
-    } else if !pool.conflicts_for(tx).is_empty() {
+    } else {
         let candidate = ReplacementCandidate::new(
             Arc::new(tx.clone()),
             vsize,
@@ -312,11 +365,16 @@ fn evaluate_one(
             incremental_relay_fee_sat_per_kvb,
         );
         match pool.check_replacement(&candidate) {
-            Ok(_) => None,
             Err(err) => Some(AcceptanceRejectReason::Replacement(err)),
+            Ok(plan) => {
+                let excluded: hashbrown::HashSet<crate::EntryId> =
+                    plan.evicted.iter().copied().collect();
+                match pool.check_package_limits(tx, vsize, &excluded) {
+                    Err(err) => Some(AcceptanceRejectReason::PackageLimit(err)),
+                    Ok(()) => None,
+                }
+            }
         }
-    } else {
-        None
     };
 
     TxAcceptanceFact {
@@ -329,6 +387,14 @@ fn evaluate_one(
         base_fee: Some(context.fee),
         reject_reason: reject,
     }
+}
+
+/// Returns true if `tx` is a coinbase transaction: exactly one input whose
+/// previous output is the null outpoint (zero txid, `vout == u32::MAX`).
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1
+        && tx.inputs[0].previous_output.txid == Txid::default()
+        && tx.inputs[0].previous_output.vout == u32::MAX
 }
 
 /// Minimum non-witness serialization Core relays, `tx-size-small`.
@@ -511,7 +577,7 @@ fn is_standard_nulldata(script: &[u8]) -> bool {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
-    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut};
+    use bitcoin_rs_primitives::{OutPoint, Tx, TxIn, TxOut, Txid};
     use bitcoin_rs_script::{is_multisig, minimal_non_dust, opcode, push_data};
 
     const DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
@@ -972,5 +1038,97 @@ mod tests {
             dup.results[0].reject_reason,
             Some(AcceptanceRejectReason::AlreadyInMempool)
         );
+    }
+
+    #[test]
+    fn coinbase_requires_null_prevout() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let coinbase = Tx {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid::default(), u32::MAX),
+                script_sig: vec![0x51],
+                sequence: u32::MAX,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 50 * 100_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            lock_time: 0,
+        };
+        let facts = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            std::slice::from_ref(&coinbase),
+            &[ctx(0, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            facts.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MissingInputs),
+            "coinbase maps to MissingInputs"
+        );
+    }
+
+    #[test]
+    fn package_limits_use_shared_evaluator() {
+        let mut pool = crate::Mempool::new(crate::MempoolLimits {
+            max_ancestors: 1,
+            ..crate::MempoolLimits::default()
+        });
+        let parent = standard_tx(1);
+        pool.insert_entry(crate::MempoolEntry::new(
+            Arc::new(parent.clone()),
+            100,
+            1_000,
+            1,
+            1,
+        ))
+        .expect("parent in");
+
+        let mut child = standard_tx(2);
+        child.inputs[0].previous_output = OutPoint::new(parent.txid(), 0);
+        let facts = evaluate_package_acceptance(
+            &pool,
+            &policy(),
+            std::slice::from_ref(&child),
+            &[ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert!(
+            matches!(
+                facts.results[0].reject_reason,
+                Some(AcceptanceRejectReason::PackageLimit(_))
+            ),
+            "child exceeding ancestor count must be PackageLimit, got {:?}",
+            facts.results[0].reject_reason
+        );
+    }
+    #[test]
+    fn package_acceptance_all_evaluates_after_rejection() {
+        let pool = crate::Mempool::new(crate::MempoolLimits::default());
+        let first = standard_tx(1);
+        let second = standard_tx(2);
+        let facts = evaluate_package_acceptance_all(
+            &pool,
+            &policy(),
+            &[first, second.clone()],
+            &[ctx(1_000, 100, true), ctx(1_000, 100, false)],
+            None,
+            1_000,
+        );
+        assert_eq!(
+            facts.results[0].reject_reason,
+            Some(AcceptanceRejectReason::MissingInputs)
+        );
+        assert_eq!(
+            facts.results[1].allowed,
+            Some(true),
+            "evaluate-all must still evaluate the second row after the first rejects"
+        );
+        assert_eq!(facts.results[1].txid, second.txid());
     }
 }

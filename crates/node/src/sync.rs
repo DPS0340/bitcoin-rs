@@ -7387,6 +7387,8 @@ mod tests {
         applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
         block_tree: Arc<RwLock<BlockTree>>,
     ) -> ApplyHandles {
+        let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let mempool_gateway = bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool));
         ApplyHandles::new(
             Network::Regtest,
             chain_tip,
@@ -7397,7 +7399,8 @@ mod tests {
                 bitcoin_rs_utxo::stats::CoinStats::default(),
             )),
             None,
-            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            mempool,
+            mempool_gateway,
             Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
             Arc::new(crate::NoOpZmqPublisher),

@@ -494,6 +494,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "fjall",
+ "hashbrown 0.17.1",
  "metrics",
  "parking_lot",
  "rayon",

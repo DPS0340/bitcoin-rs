@@ -554,6 +554,8 @@ fn apply_handles_with_coin_stats_and_utxo(
     let mut utxo = UtxoSet::new();
     utxo.set_listener(Box::new((*coin_stats).clone()));
     let utxo = Arc::new(utxo);
+    let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+    let mempool_gateway = bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool));
     let handles = ApplyHandles::new(
         network,
         chain_tip,
@@ -562,7 +564,8 @@ fn apply_handles_with_coin_stats_and_utxo(
         Arc::clone(&utxo),
         Arc::clone(&coin_stats),
         None,
-        Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+        mempool,
+        mempool_gateway,
         Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),

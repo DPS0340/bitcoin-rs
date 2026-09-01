@@ -1479,6 +1479,7 @@ impl NodeState {
             coin_stats: Arc::clone(&coin_stats),
             tx_index_runtime: tx_index_runtime.clone(),
             mempool: Arc::clone(&mempool),
+            mempool_gateway: bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool)),
             blocks: Arc::clone(&blocks),
             transactions: Arc::clone(&transactions),
             zmq_publisher: Arc::clone(&zmq_publisher),

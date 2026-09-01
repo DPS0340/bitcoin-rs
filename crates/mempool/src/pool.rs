@@ -906,7 +906,7 @@ impl Mempool {
             for conflict in self.conflicts_for(tx) {
                 self.remove_entry_and_descendants_into(
                     conflict,
-                    RemovalReason::BlockInclusion,
+                    RemovalReason::Conflict,
                     &mut changes,
                 );
             }
