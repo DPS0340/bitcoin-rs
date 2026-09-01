@@ -39,6 +39,65 @@ pub enum ChainChangeError {
     GenerationMoved,
 }
 
+// ---------------------------------------------------------------------------
+// Atomic admission — one generation-revalidated gateway operation.
+// ---------------------------------------------------------------------------
+
+/// Resolved context and exact state tokens for one admission attempt.
+///
+/// The caller captures `expected_generation` (an even value read from
+/// [`MempoolGateway::stable_generation`]) and `expected_sequence` (read from
+/// the pool under a read guard) **before** resolving UTXO data. The gateway
+/// re-checks both under the write lock so a chain change or mempool mutation
+/// between capture and commit is caught as a transient error, not a stale
+/// write.
+pub struct AdmissionRequest {
+    /// The transaction to admit.
+    pub tx: Arc<Tx>,
+    /// Resolved per-transaction context (fee, vsize, sigop cost, missing
+    /// inputs) from the mempool and UTXO set.
+    pub context: crate::standardness::PackageTxContext,
+    /// Caller-supplied maximum fee rate in sat/kvB; `None` means no cap.
+    pub max_feerate_sat_per_kvb: Option<u64>,
+    /// Wall-clock seconds for the mempool entry timestamp.
+    pub time: u64,
+    /// Current applied block height for the mempool entry.
+    pub height: u32,
+    /// How the transaction entered the node.
+    pub origin: AdmissionOrigin,
+    /// Exact even chain generation the caller captured before admission.
+    pub expected_generation: u64,
+    /// Exact mempool sequence the caller captured before admission.
+    pub expected_sequence: u64,
+}
+
+/// The outcome of one admission attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmitOutcome {
+    /// The transaction was committed to the pool. The result carries every
+    /// `Removed` change in commit order followed by exactly one `Accepted`.
+    Committed(crate::mutation::MutationResult),
+    /// The exact transaction was already present. No envelope, sequence, or
+    /// publication was produced — the caller returns normal txid success.
+    AlreadyKnown,
+}
+
+/// Why an admission attempt did not commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AdmitError {
+    /// The chain generation changed between capture and the write-lock
+    /// check. The caller must retry with a fresh stable generation.
+    #[error("chain generation changed before admission")]
+    GenerationChanged,
+    /// The mempool sequence changed between capture and the write-lock
+    /// check. The caller must retry with fresh facts.
+    #[error("mempool sequence changed before admission")]
+    MempoolChanged,
+    /// The transaction was rejected by policy. The reason is mempool-owned.
+    #[error(transparent)]
+    Policy(#[from] crate::standardness::AcceptanceRejectReason),
+}
+
 /// Interns one [`MempoolGateway`] per pool `Arc` identity.
 ///
 /// This is the crate's one piece of process-global state, and it exists
@@ -363,6 +422,103 @@ impl MempoolGateway {
         })
     }
 
+    /// One atomic admission operation. Takes `pool.write()` once, then checks
+    /// in this order before any policy mutation:
+    ///
+    /// 1. exact chain generation equals the request value and is even,
+    /// 2. current `pool.sequence_number()` equals the request sequence,
+    /// 3. exact transaction identity is already present.
+    ///
+    /// The exact duplicate returns [`AdmitOutcome::AlreadyKnown`] successfully
+    /// and creates no envelope, sequence, or publication. For a new
+    /// transaction, policy is evaluated under the same write guard and the
+    /// established `replace_transaction` path performs the mutation —
+    /// preserving under-lock BIP125 and package-limit revalidation. On
+    /// success, one `MutationResult` whose ordered removals precede exactly
+    /// one accepted change is published via the existing commit/publish seam.
+    ///
+    /// Any mismatch or rejection returns before publish-mutex acquisition and
+    /// before mutation.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn admit_transaction(&self, request: AdmissionRequest) -> Result<AdmitOutcome, AdmitError> {
+        let mut pool = self.pool.write();
+
+        // 1. Exact chain generation check (even and matches request).
+        let generation = self.chain_generation.load(Ordering::Acquire);
+        if generation != request.expected_generation || !generation.is_multiple_of(2) {
+            return Err(AdmitError::GenerationChanged);
+        }
+
+        // 2. Exact mempool sequence check.
+        if pool.sequence_number() != request.expected_sequence {
+            return Err(AdmitError::MempoolChanged);
+        }
+        // 3. Exact duplicate → AlreadyKnown (no envelope, no sequence, no
+        //    publication).
+        let txid = request.tx.txid();
+        if pool.contains_txid(&txid) {
+            return Ok(AdmitOutcome::AlreadyKnown);
+        }
+        // 4. Policy evaluation under the same write guard. `evaluate_one`
+        //    checks standardness, missing inputs, coinbase, min-relay,
+        //    max-fee, and replacement — but NOT package limits (those are
+        //    enforced by `replace_transaction` below).
+        let policy = pool.policy_snapshot();
+        let mempool_min_fee = crate::eviction::mempool_min_fee_sat_per_kvb(
+            &pool,
+            policy.incremental_relay_fee_sat_per_kvb,
+        );
+        let fact = crate::standardness::evaluate_one(
+            &pool,
+            &policy.standardness,
+            &request.tx,
+            request.context,
+            request.max_feerate_sat_per_kvb,
+            mempool_min_fee,
+            policy.incremental_relay_fee_sat_per_kvb,
+        );
+        if let Some(reason) = fact.reject_reason {
+            return Err(AdmitError::Policy(reason));
+        }
+
+        // 5. Mutate under the same write guard via `replace_transaction`,
+        //    which handles BIP125 replacement, package limits, and insert.
+        let candidate = ReplacementCandidate::new(
+            Arc::clone(&request.tx),
+            fact.vsize,
+            fact.base_fee.unwrap_or(0),
+            policy.incremental_relay_fee_sat_per_kvb,
+        );
+        let result = pool
+            .replace_transaction(candidate, request.time, request.height, fact.sigop_cost)
+            .map_err(|rbf| {
+                // Map RbfError to the correct AcceptanceRejectReason variant.
+                // `replace_transaction` re-checks replacement and package
+                // limits; its errors must map to the same reason class the
+                // preview would have reported.
+                match rbf {
+                    RbfError::Mempool(crate::pool::MempoolError::Policy(policy_err)) => {
+                        AdmitError::Policy(
+                            crate::standardness::AcceptanceRejectReason::PackageLimit(policy_err),
+                        )
+                    }
+                    other => AdmitError::Policy(
+                        crate::standardness::AcceptanceRejectReason::Replacement(other),
+                    ),
+                }
+            })?;
+
+        // 6. Publish via the existing seam.
+        let envelope = MutationEnvelope {
+            origin: request.origin,
+            result,
+        };
+        let publish = self.acquire_publish_lock();
+        drop(pool);
+        self.publish(&envelope, publish);
+        Ok(AdmitOutcome::Committed(envelope.result))
+    }
+
     /// Commits `pool.remove_entry_and_descendants` and publishes its result.
     pub fn remove_entry_and_descendants(
         &self,
@@ -592,8 +748,10 @@ mod ordering_gate {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::ordering_gate;
+    use super::{AdmissionRequest, AdmitError, AdmitOutcome};
     use super::{ChainChangeError, CompositeObserver, MempoolGateway, MempoolObserver};
     use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationOutcome, RemovalReason};
+    use crate::standardness::PackageTxContext;
     use crate::{Mempool, MempoolEntry, MempoolLimits};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -651,6 +809,32 @@ mod tests {
             outputs: vec![TxOut {
                 value: 1_000,
                 script_pubkey: vec![0x51, label],
+            }],
+        }
+    }
+
+    /// Builds a tx with a standard P2PKH output for admission tests that
+    /// pass `evaluate_one`'s standardness check.
+    fn standard_tx(label: u8) -> Tx {
+        let mut script = Vec::with_capacity(25);
+        script.push(0x76); // OP_DUP
+        script.push(0xa9); // OP_HASH160
+        script.push(0x14); // push 20 bytes
+        script.extend_from_slice(&[label; 20]);
+        script.push(0x88); // OP_EQUALVERIFY
+        script.push(0xac); // OP_CHECKSIG
+        Tx {
+            version: 2,
+            lock_time: 0,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0),
+                script_sig: Vec::new(),
+                sequence: 0xFFFF_FFFF,
+                witness: Vec::new(),
+            }],
+            outputs: vec![TxOut {
+                value: 10_000,
+                script_pubkey: script,
             }],
         }
     }
@@ -717,6 +901,248 @@ mod tests {
 
     fn removed(reason: RemovalReason) -> MutationOutcome {
         MutationOutcome::Removed(reason)
+    }
+
+    /// Builds an `AdmissionRequest` for `tx` with the gateway's current
+    /// stable generation and pool sequence, a standard context (1 000 sat
+    /// fee, 100 vbyte, 0 sigop, no missing inputs), and the given origin.
+    fn admit_request(
+        gateway: &MempoolGateway,
+        tx: &Tx,
+        origin: AdmissionOrigin,
+    ) -> AdmissionRequest {
+        let generation = gateway
+            .stable_generation()
+            .expect("generation is even in test setup");
+        let sequence = gateway.read().sequence_number();
+        AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context: PackageTxContext {
+                fee: 1_000,
+                vsize: 100,
+                sigop_cost: 0,
+                missing_inputs: false,
+            },
+            max_feerate_sat_per_kvb: None,
+            time: 1,
+            height: 1,
+            origin,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        }
+    }
+
+    #[test]
+    fn stale_generation_rejects_without_mutation_or_publication() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let candidate = tx(40);
+
+        // Capture tokens at the current even generation.
+        let mut request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+
+        // Simulate a chain change: bump the generation to an odd value
+        // directly, as a chain change would.
+        let current = gateway.chain_generation.load(Ordering::Relaxed);
+        gateway
+            .chain_generation
+            .store(current + 1, Ordering::Release);
+
+        // The request still carries the old even generation.
+        request.expected_generation = current;
+
+        let outcome = gateway.admit_transaction(request);
+        assert!(
+            matches!(outcome, Err(AdmitError::GenerationChanged)),
+            "stale generation must return GenerationChanged, got {outcome:?}"
+        );
+        assert_eq!(
+            gateway.read().sequence_number(),
+            0,
+            "no sequence change on stale generation"
+        );
+        assert!(
+            observer.seen.lock().is_empty(),
+            "no observer call on stale generation"
+        );
+        assert!(
+            !gateway.read().contains_txid(&candidate.txid()),
+            "no mutation on stale generation"
+        );
+    }
+
+    #[test]
+    fn stale_mempool_sequence_rejects_without_mutation_or_publication() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let candidate = tx(41);
+
+        // Insert a different tx to bump the sequence.
+        let other = tx(42);
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&other))
+            .expect("other tx admitted");
+        observer.seen.lock().clear();
+
+        // Capture tokens with the current sequence.
+        let mut request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+        let captured_sequence = request.expected_sequence;
+
+        // Bump the sequence by removing the other tx.
+        gateway.remove_by_txid(AdmissionOrigin::Rpc, &other.txid());
+
+        // The request still carries the old sequence.
+        request.expected_sequence = captured_sequence;
+
+        let outcome = gateway.admit_transaction(request);
+        assert!(
+            matches!(outcome, Err(AdmitError::MempoolChanged)),
+            "stale sequence must return MempoolChanged, got {outcome:?}"
+        );
+        assert!(
+            !gateway.read().contains_txid(&candidate.txid()),
+            "no added transaction on stale sequence"
+        );
+        // The observer saw the remove_by_txid but no admission publication.
+        let seen = observer.seen.lock();
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the remove_by_txid publication, no extra observer call from admission"
+        );
+    }
+
+    #[test]
+    fn exact_duplicate_is_success_without_second_publication() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let candidate = tx(43);
+        let txid = candidate.txid();
+
+        // Pre-insert the tx.
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&candidate))
+            .expect("first insert");
+        observer.seen.lock().clear();
+
+        // Admission with the exact same tx must return AlreadyKnown.
+        let request = admit_request(&gateway, &candidate, AdmissionOrigin::Rpc);
+        let outcome = gateway.admit_transaction(request);
+        assert!(
+            matches!(outcome, Ok(AdmitOutcome::AlreadyKnown)),
+            "exact duplicate must return AlreadyKnown, got {outcome:?}"
+        );
+        assert!(
+            observer.seen.lock().is_empty(),
+            "no second publication on duplicate"
+        );
+        assert_eq!(
+            gateway.read().sequence_number(),
+            1,
+            "no sequence change on duplicate"
+        );
+        assert!(
+            gateway.read().contains_txid(&txid),
+            "original entry is still there"
+        );
+    }
+
+    #[test]
+    fn admit_transaction_publishes_ordered_removals_then_one_accept() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+
+        // Set up a conflict: insert a tx, then admit a replacement.
+        let mut original = standard_tx(44);
+        original.inputs[0].sequence = 0xFFFF_FFFD; // RBF signal (< 0xFFFF_FFFE)
+        let original_txid = original.txid();
+        // The replacement spends the same input as the original but
+        // signals RBF (sequence < 0xFFFF_FFFF) and pays a higher fee.
+        let mut replacement = standard_tx(45);
+        replacement.inputs[0].previous_output = original.inputs[0].previous_output;
+        replacement.inputs[0].sequence = 0xFFFF_FFFE; // RBF signal
+        // Higher fee to pass BIP125 (original output is 10 000, replacement
+        // output is 5 000, so fee = 5 000 > original fee = 0).
+        replacement.outputs[0].value = 5_000;
+        let replacement_txid = replacement.txid();
+
+        // Fund the original's output in the UTXO set so the replacement
+        // can resolve its input. Actually, the pool handles this: the
+        // original is in the pool, so the replacement spends a mempool
+        // parent. We need the context to reflect this.
+        // For the admission test, we build context manually.
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&original))
+            .expect("original admitted");
+        observer.seen.lock().clear();
+
+        // Build a request for the replacement. The context has
+        // missing_inputs: false because the parent is in the pool.
+        let generation = gateway.stable_generation().expect("generation is even");
+        let sequence = gateway.read().sequence_number();
+        let request = AdmissionRequest {
+            tx: Arc::new(replacement.clone()),
+            context: PackageTxContext {
+                fee: 5_000, // 10 000 - 5 000
+                vsize: 100,
+                sigop_cost: 0,
+                missing_inputs: false,
+            },
+            max_feerate_sat_per_kvb: None,
+            time: 1,
+            height: 1,
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+
+        let outcome = gateway.admit_transaction(request);
+        assert!(
+            matches!(outcome, Ok(AdmitOutcome::Committed(_))),
+            "replacement must commit, got {outcome:?}"
+        );
+
+        let seen = observer.seen.lock();
+        // The replacement evicts the original (Removed) then admits the
+        // replacement (Accepted) — removals first, then exactly one Accept.
+        let mut removed_count = 0;
+        let mut accepted_count = 0;
+        for (_, outcome) in seen.iter() {
+            match outcome {
+                MutationOutcome::Removed(_) => removed_count += 1,
+                MutationOutcome::Accepted => accepted_count += 1,
+            }
+        }
+        assert!(
+            removed_count >= 1,
+            "at least one removal (the replaced original)"
+        );
+        assert_eq!(
+            accepted_count, 1,
+            "exactly one Accepted, not {accepted_count}"
+        );
+        // The Removed events must precede the Accepted event.
+        let accepted_index = seen
+            .iter()
+            .position(|(_, o)| *o == MutationOutcome::Accepted)
+            .expect("an Accepted event");
+        for (i, (_, outcome)) in seen.iter().enumerate() {
+            if i < accepted_index {
+                assert!(
+                    matches!(outcome, MutationOutcome::Removed(_)),
+                    "removals must precede the Accepted event"
+                );
+            }
+        }
+        // The original is gone, the replacement is in.
+        assert!(
+            !gateway.read().contains_txid(&original_txid),
+            "replaced original must be gone"
+        );
+        assert!(
+            gateway.read().contains_txid(&replacement_txid),
+            "replacement must be in the pool"
+        );
     }
 
     #[test]

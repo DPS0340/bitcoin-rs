@@ -588,6 +588,15 @@ impl Mempool {
         self.estimator.estimate(conf_target_blocks)
     }
 
+    /// Returns the estimator's last decayed height, or `None` before the first
+    /// connected block. A connected block ages the estimator even when the
+    /// pool is empty, so this is the observable proof that `remove_for_block`
+    /// fired `block_connected`.
+    #[must_use]
+    pub fn estimator_last_decayed_height(&self) -> Option<u32> {
+        self.estimator.last_decayed_height()
+    }
+
     /// Copies the pool's mining state into one immutable snapshot.
     ///
     /// Everything block-template selection needs is read in this single

@@ -10,13 +10,13 @@ use crate::script_util::{
 use bitcoin::consensus::encode::serialize as bitcoin_serialize;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
-use bitcoin_rs_mempool::standardness::{StandardnessError, is_standard_tx};
-use bitcoin_rs_mempool::{
-    AdmissionOrigin, EntryId, MempoolPolicySnapshot, PolicyError, RbfError, ReplacementCandidate,
+use bitcoin_rs_mempool::standardness::{
+    AcceptanceRejectReason, PackageTxContext as MempoolPackageTxContext,
+    evaluate_package_acceptance_all,
 };
+use bitcoin_rs_mempool::{AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome};
 use bitcoin_rs_primitives::{
-    Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, Wtxid, consensus_bytes,
+    Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     deserialize as native_deserialize,
 };
 use miniscript::psbt::PsbtExt as _;
@@ -433,62 +433,74 @@ pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<V
     let tx = decode_tx(raw)?;
     let txid = tx.txid();
 
-    // Already-known submissions remain successful.
-    {
-        let pool = ctx.mempool.read();
-        if pool.contains_txid(&txid) {
-            return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
-        }
-    }
+    // A tx already confirmed in the chain is always "known" — no
+    // generation or mempool guard needed.
     if ctx.transactions.read().contains_key(&txid) {
         return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
     }
 
-    let (fact, policy) = {
-        let pool = ctx.mempool.read();
-        // One coherent guard: the same live pool read feeds both the
-        // acceptance facts and the policy record quoted alongside them, so
-        // admission never mixes pre- and post-reconfiguration policy.
-        let policy = pool.policy_snapshot();
-        let contexts = package_contexts(ctx, &pool, std::slice::from_ref(&tx));
-        let fact = evaluate_package_acceptance(
-            &pool,
-            std::slice::from_ref(&tx),
-            &contexts,
-            max_feerate,
-            policy,
-        )
-        .into_iter()
-        .next()
-        .ok_or_else(|| RpcError::Internal("package acceptance returned no rows".to_owned()))?;
-        (fact, policy)
-    };
+    // Bounded retry: each attempt reads a fresh stable generation, captures
+    // the exact mempool sequence under a read guard, resolves UTXO data
+    // without the guard, then calls admit_transaction with both tokens. A
+    // chain change or mempool mutation between capture and commit returns a
+    // transient error and the loop retries with fresh facts — it never
+    // re-uses a captured even generation.
+    #[allow(clippy::items_after_statements)]
+    const MAX_ADMISSION_RETRIES: usize = 4;
+    for _ in 0..MAX_ADMISSION_RETRIES {
+        let Some(generation) = ctx.mempool.stable_generation() else {
+            continue; // chain change active or failed — retry
+        };
 
-    if let Some(reason) = fact.reject_reason {
-        return Err(reject_to_rpc_error(&reason));
+        // Under one gateway read guard: already-known lookup, capture exact
+        // sequence, snapshot policy, resolve mempool-dependent context.
+        let (sequence, _policy, mempool_prevouts) = {
+            let pool = ctx.mempool.read();
+            if pool.contains_txid(&txid) {
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            let sequence = pool.sequence_number();
+            let policy = pool.policy_snapshot();
+            let mempool_prevouts = resolve_mempool_prevouts(&pool, &tx);
+            (sequence, policy, mempool_prevouts)
+        };
+
+        // Without a pool guard: resolve UTXO data and combine with the
+        // mempool-dependent prevouts captured above.
+        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+
+        let request = AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context,
+            max_feerate_sat_per_kvb: max_feerate,
+            time: unix_time_secs(),
+            height: ctx.applied_height(),
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+
+        match ctx.mempool.admit_transaction(request) {
+            Ok(AdmitOutcome::Committed(_)) => {
+                let _ = ctx.add_transaction(tx);
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            Ok(AdmitOutcome::AlreadyKnown) => {
+                // The exact transaction was added between our read-guard
+                // check and the write-guard commit. Return normal txid
+                // success without a second add_transaction.
+                return typed_to_sonic(&v31::SendRawTransaction(txid.to_string()));
+            }
+            Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
+            Err(AdmitError::Policy(reason)) => {
+                return Err(reject_reason_to_rpc_error(reason));
+            }
+        }
     }
 
-    // WHY: on a non-conflicting tx replace_transaction commits exactly what
-    // insert_entry would, and on a conflicting spend it applies the BIP125
-    // sweep the acceptance fact above already vetted; insert_entry cannot
-    // admit a conflicting tx at all.
-    let candidate = ReplacementCandidate::new(
-        Arc::new(tx.clone()),
-        fact.vsize,
-        fact.base_fee.unwrap_or(0),
-        policy.incremental_relay_fee_sat_per_kvb,
-    );
-    ctx.mempool
-        .replace_transaction(
-            AdmissionOrigin::Rpc,
-            candidate,
-            unix_time_secs(),
-            ctx.applied_height(),
-            fact.sigop_cost,
-        )
-        .map_err(|error| RpcError::Internal(error.to_string()))?;
-    let _ = ctx.add_transaction(tx);
-    typed_to_sonic(&v31::SendRawTransaction(txid.to_string()))
+    Err(RpcError::Internal(
+        "admission retry exhausted: chain or mempool changed during submission".to_owned(),
+    ))
 }
 
 pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {
@@ -510,10 +522,17 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
     let pool = ctx.mempool.read();
     let policy = pool.policy_snapshot();
     let contexts = package_contexts(ctx, &pool, &txs);
-    let facts = evaluate_package_acceptance(&pool, &txs, &contexts, max_feerate, policy);
+    let facts = evaluate_package_acceptance_all(
+        &pool,
+        &policy.standardness,
+        &txs,
+        &contexts,
+        max_feerate,
+        policy.incremental_relay_fee_sat_per_kvb,
+    );
 
-    let mut rows = Vec::with_capacity(facts.len());
-    for fact in facts {
+    let mut rows = Vec::with_capacity(facts.results.len());
+    for fact in &facts.results {
         let fees = fact.base_fee.map(|fee| v31::MempoolAcceptanceFees {
             base: sat_to_btc(fee),
             effective_fee_rate: None,
@@ -522,10 +541,10 @@ pub(crate) fn testmempoolaccept(ctx: &Arc<Context>, params: &Value) -> Result<Va
         rows.push(v31::MempoolAcceptance {
             txid: fact.txid.to_string(),
             wtxid: fact.wtxid.to_string(),
-            allowed: fact.allowed,
-            vsize: fact.allowed.then(|| i64::from(fact.vsize)),
+            allowed: fact.allowed.unwrap_or(false),
+            vsize: fact.allowed.unwrap_or(false).then(|| i64::from(fact.vsize)),
             fees,
-            reject_reason: fact.reject_reason.map(|reason| reason.to_string()),
+            reject_reason: fact.reject_reason.map(reject_reason_to_frozen_string),
             reject_details: None,
         });
     }
@@ -721,62 +740,96 @@ fn parse_btc_amount(value: &Value) -> Result<u64, RpcError> {
 }
 
 // ---------------------------------------------------------------------------
-// Package acceptance — adapted from R2 to current Mempool/standardness APIs.
+// Prevout / context resolution and frozen reason mapping.
 // ---------------------------------------------------------------------------
 
-/// Per-transaction context computed from UTXO and mempool state.
-struct PackageTxContext {
-    fee: u64,
-    vsize: u32,
-    sigop_cost: u32,
-    missing_inputs: bool,
-}
-
-/// Per-transaction acceptance result.
-struct AcceptanceFact {
-    txid: Txid,
-    wtxid: Wtxid,
-    allowed: bool,
-    vsize: u32,
-    base_fee: Option<u64>,
-    sigop_cost: u32,
-    reject_reason: Option<RejectReason>,
-}
-
-/// Reason a transaction was rejected from mempool acceptance.
-enum RejectReason {
-    AlreadyInMempool,
-    MissingInputs,
-    NonStandard(StandardnessError),
-    MaxFeeExceeded,
-    MinRelayFeeNotMet,
-    Replacement(RbfError),
-    PackageLimit(PolicyError),
-}
-
-impl core::fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::AlreadyInMempool => write!(f, "txn-already-in-mempool"),
-            Self::MissingInputs => write!(f, "missing-inputs"),
-            Self::NonStandard(error) => write!(f, "{error}"),
-            Self::MaxFeeExceeded => write!(f, "max-fee-exceeded"),
-            Self::MinRelayFeeNotMet => write!(f, "min-relay-fee-not-met"),
-            Self::PackageLimit(error) => write!(f, "{error}"),
-            Self::Replacement(error) => write!(f, "{error}"),
-        }
+/// Maps an [`AcceptanceRejectReason`] to the frozen RPC error code and
+/// string. `MaxFeeExceeded` is a parameter error (-32602); all others are
+/// internal errors (-32603). The string for `MinRelayFeeNotMet` uses the
+/// frozen hyphenated form `min-relay-fee-not-met`, not the mempool's Display.
+fn reject_reason_to_rpc_error(reason: AcceptanceRejectReason) -> RpcError {
+    match reason {
+        AcceptanceRejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
+        other => RpcError::Internal(reject_reason_to_frozen_string(other)),
     }
 }
 
-fn reject_to_rpc_error(reason: &RejectReason) -> RpcError {
+/// Maps an [`AcceptanceRejectReason`] to the frozen RPC reject-reason string.
+/// Every variant matches the mempool's `Display` except `MinRelayFeeNotMet`,
+/// which uses the frozen hyphenated form.
+fn reject_reason_to_frozen_string(reason: AcceptanceRejectReason) -> String {
     match reason {
-        RejectReason::MaxFeeExceeded => RpcError::InvalidParams("max-fee-exceeded"),
-        RejectReason::AlreadyInMempool
-        | RejectReason::MissingInputs
-        | RejectReason::MinRelayFeeNotMet
-        | RejectReason::NonStandard(_)
-        | RejectReason::Replacement(_)
-        | RejectReason::PackageLimit(_) => RpcError::Internal(reason.to_string()),
+        AcceptanceRejectReason::MinRelayFeeNotMet => "min-relay-fee-not-met".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// Resolves mempool-dependent prevouts for a single tx under a read guard.
+/// Returns `(txid, vout, value, script_pubkey)` tuples for inputs whose
+/// prevout is a mempool parent transaction.
+fn resolve_mempool_prevouts(
+    pool: &bitcoin_rs_mempool::Mempool,
+    tx: &Tx,
+) -> HashMap<OutPoint, TxOut> {
+    let mut prevouts = HashMap::new();
+    for input in &tx.inputs {
+        if input.previous_output == OutPoint::default() {
+            continue;
+        }
+        if let Some(parent) = pool.transaction_by_txid(&input.previous_output.txid)
+            && let Ok(vout) = usize::try_from(input.previous_output.vout)
+            && let Some(output) = parent.outputs.get(vout)
+        {
+            prevouts.insert(input.previous_output, output.clone());
+        }
+    }
+    prevouts
+}
+
+/// Combines mempool-dependent prevouts (captured under a read guard) with
+/// UTXO-set prevouts (resolved without a pool guard) to build the full
+/// per-transaction context. Inputs found in neither source are marked
+/// missing.
+fn resolve_full_context(
+    ctx: &Context,
+    tx: &Tx,
+    mempool_prevouts: &HashMap<OutPoint, TxOut>,
+) -> MempoolPackageTxContext {
+    let mut missing_inputs = false;
+    let mut input_value = 0_u64;
+    let mut prevouts: Vec<(OutPoint, TxOut)> = Vec::new();
+
+    for input in &tx.inputs {
+        if input.previous_output == OutPoint::default() {
+            missing_inputs = true;
+            continue;
+        }
+        if let Some(output) = mempool_prevouts.get(&input.previous_output) {
+            input_value = input_value.saturating_add(output.value);
+            prevouts.push((input.previous_output, output.clone()));
+            continue;
+        }
+        if let Some(live) = ctx.utxo.get_entry(&input.previous_output) {
+            input_value = input_value.saturating_add(live.txout.value);
+            prevouts.push((input.previous_output, live.txout.clone()));
+            continue;
+        }
+        missing_inputs = true;
+    }
+
+    let output_value = tx
+        .outputs
+        .iter()
+        .fold(0_u64, |sum, output| sum.saturating_add(output.value));
+    let fee = input_value.saturating_sub(output_value);
+    let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
+    let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
+
+    MempoolPackageTxContext {
+        fee,
+        vsize,
+        sigop_cost,
+        missing_inputs,
     }
 }
 
@@ -784,7 +837,7 @@ fn package_contexts(
     ctx: &Context,
     pool: &bitcoin_rs_mempool::Mempool,
     txs: &[Tx],
-) -> Vec<PackageTxContext> {
+) -> Vec<MempoolPackageTxContext> {
     let mut package_outputs: HashMap<(Txid, u32), u64> = HashMap::new();
     let mut contexts = Vec::with_capacity(txs.len());
 
@@ -834,7 +887,7 @@ fn package_contexts(
         let vsize = u32::try_from(tx.vsize()).unwrap_or(u32::MAX);
         let sigop_cost = u32::try_from(total_sigop_cost(tx, &prevouts)).unwrap_or(u32::MAX);
 
-        contexts.push(PackageTxContext {
+        contexts.push(MempoolPackageTxContext {
             fee,
             vsize,
             sigop_cost,
@@ -918,86 +971,6 @@ fn count_accurate(script: &[u8]) -> u32 {
         }
     }
     count
-}
-
-fn evaluate_package_acceptance(
-    pool: &bitcoin_rs_mempool::Mempool,
-    txs: &[Tx],
-    contexts: &[PackageTxContext],
-    max_feerate: Option<u64>,
-    policy: MempoolPolicySnapshot,
-) -> Vec<AcceptanceFact> {
-    // The floor tracks the pool's live min-relay / mempool-min state so both
-    // admission surfaces quote the same policy verdict.
-    let min_relay_fee = mempool_min_fee_sat_per_kvb(pool, policy.incremental_relay_fee_sat_per_kvb);
-    let mut facts = Vec::with_capacity(txs.len());
-
-    for (tx, ctx) in txs.iter().zip(contexts) {
-        let txid = tx.txid();
-        let wtxid = tx.wtxid();
-        let vsize = ctx.vsize;
-        let base_fee = if ctx.missing_inputs {
-            None
-        } else {
-            Some(ctx.fee)
-        };
-
-        let reject_reason = if pool.contains_txid(&txid) {
-            Some(RejectReason::AlreadyInMempool)
-        } else if ctx.missing_inputs {
-            Some(RejectReason::MissingInputs)
-        } else {
-            match is_standard_tx(tx, &policy.standardness) {
-                Ok(()) => {
-                    // Fee rate checks.
-                    let fee_rate = if ctx.vsize > 0 {
-                        ctx.fee * 1_000 / u64::from(ctx.vsize)
-                    } else {
-                        0
-                    };
-                    if fee_rate < min_relay_fee {
-                        Some(RejectReason::MinRelayFeeNotMet)
-                    } else if let Some(max_rate) = max_feerate
-                        && fee_rate > max_rate
-                    {
-                        Some(RejectReason::MaxFeeExceeded)
-                    } else {
-                        let candidate = ReplacementCandidate::new(
-                            Arc::new(tx.clone()),
-                            ctx.vsize,
-                            ctx.fee,
-                            policy.incremental_relay_fee_sat_per_kvb,
-                        );
-                        match pool.check_replacement(&candidate) {
-                            Err(error) => Some(RejectReason::Replacement(error)),
-                            Ok(plan) => {
-                                let excluded: HashSet<EntryId> =
-                                    plan.evicted.iter().copied().collect();
-                                match pool.check_package_limits(tx, ctx.vsize, &excluded) {
-                                    Err(error) => Some(RejectReason::PackageLimit(error)),
-                                    Ok(()) => None,
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(error) => Some(RejectReason::NonStandard(error)),
-            }
-        };
-
-        let allowed = reject_reason.is_none();
-        facts.push(AcceptanceFact {
-            txid,
-            wtxid,
-            allowed,
-            vsize,
-            base_fee,
-            sigop_cost: ctx.sigop_cost,
-            reject_reason,
-        });
-    }
-
-    facts
 }
 
 pub(crate) fn finalizepsbt(_ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {

@@ -7,6 +7,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use hashbrown::HashSet;
+
 use bitcoin_rs_primitives::{Tx, TxOut, Txid, Wtxid};
 use bitcoin_rs_script::{
     Instruction, is_multisig, is_op_return, is_p2a, is_p2pk, is_p2pkh, is_p2sh, is_p2tr, is_p2wpkh,
@@ -14,7 +16,7 @@ use bitcoin_rs_script::{
 };
 use thiserror::Error;
 
-use crate::{Mempool, PolicyError, RbfError, ReplacementCandidate};
+use crate::{EntryId, Mempool, PolicyError, RbfError, ReplacementCandidate};
 
 /// Maximum weight of a standard transaction (400 000 weight units).
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
@@ -328,7 +330,7 @@ pub fn evaluate_package_acceptance_all(
     }
 }
 
-fn evaluate_one(
+pub(crate) fn evaluate_one(
     pool: &Mempool,
     policy: &StandardnessPolicy,
     tx: &Tx,
@@ -366,7 +368,13 @@ fn evaluate_one(
         );
         match pool.check_replacement(&candidate) {
             Err(err) => Some(AcceptanceRejectReason::Replacement(err)),
-            Ok(_) => None,
+            Ok(plan) => {
+                let excluded: HashSet<EntryId> = plan.evicted.iter().copied().collect();
+                match pool.check_package_limits(tx, vsize, &excluded) {
+                    Err(err) => Some(AcceptanceRejectReason::PackageLimit(err)),
+                    Ok(()) => None,
+                }
+            }
         }
     };
 

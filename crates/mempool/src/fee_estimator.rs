@@ -275,6 +275,15 @@ impl FeeEstimator {
         result
     }
 
+    /// Returns the last height whose decay was applied, or `None` before the
+    /// first `block_connected` call. A connected block ages the estimator even
+    /// when it confirms nothing the pool tracked, so this is the observable
+    /// proof that `block_connected` fired.
+    #[must_use]
+    pub fn last_decayed_height(&self) -> Option<u32> {
+        self.last_decayed_height
+    }
+
     /// Returns the bucket index for a fee rate: the highest bucket whose
     /// lower bound is <= the given rate. Rates below the first bucket clamp
     /// to index 0.

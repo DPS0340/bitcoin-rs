@@ -932,7 +932,7 @@ fn assert_both_rpcs_agree_on_replacement_rejection(
     tx: &Tx,
     expected_reason_fragment: &str,
     expected_rbf_error: RbfError,
-    pool: &Mempool,
+    mempool: &Arc<MempoolGateway>,
 ) -> Result<sonic_rs::Value, Box<dyn Error>> {
     // sendrawtransaction must reject.
     let message = internal_message(
@@ -982,6 +982,7 @@ fn assert_both_rpcs_agree_on_replacement_rejection(
         input_value.saturating_sub(output_value)
     };
     let candidate = ReplacementCandidate::new(Arc::new(tx.clone()), vsize, fee, 1_000);
+    let pool = mempool.read();
     assert_eq!(
         pool.check_replacement(&candidate),
         Err(expected_rbf_error),
@@ -1003,7 +1004,7 @@ fn bip125_rule1_nonsignaling_originals_reject_on_both_rpcs() -> Result<(), Box<d
         &replacement,
         "BIP125 rule 1",
         RbfError::Rule1NoOptIn,
-        &ctx.mempool.read(),
+        &ctx.mempool,
     )?;
 
     // A rejected replacement leaves the original pooled.
@@ -1029,7 +1030,7 @@ fn bip125_rule4_replacement_must_pay_incremental_relay_fee_on_both_rpcs()
         &replacement,
         "BIP125 rule 4",
         RbfError::Rule4InsufficientIncrementalFee,
-        &ctx.mempool.read(),
+        &ctx.mempool,
     )?;
     Ok(())
 }
@@ -1068,7 +1069,7 @@ fn bip125_rule5_too_many_evicted_descendants_reject_on_both_rpcs() -> Result<(),
         &replacement,
         "BIP125 rule 5",
         RbfError::Rule5TooManyEvictions,
-        &ctx.mempool.read(),
+        &ctx.mempool,
     )?;
     Ok(())
 }

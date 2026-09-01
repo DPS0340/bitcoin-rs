@@ -30,7 +30,8 @@ pub use entry::{EntryId, MempoolEntry};
 pub use eviction::evict_lowest_fee_packages;
 pub use fee_estimator::{FeeEstimator, FeeRate};
 pub use gateway::{
-    ChainChangeError, ChainChangeGuard, CompositeObserver, MempoolGateway, MempoolObserver,
+    AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, ChainChangeGuard,
+    CompositeObserver, MempoolGateway, MempoolObserver,
 };
 pub use mutation::{
     AdmissionOrigin, MutationChange, MutationEnvelope, MutationOutcome, MutationResult, PeerToken,
