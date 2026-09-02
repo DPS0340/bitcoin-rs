@@ -2,7 +2,7 @@
 //! durability path, and explicit budgeted cache sizes are configured verbatim
 //! (no backend floor may raise a share above its allocation).
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -140,23 +140,43 @@ fn cache_capacity(backend: &str) -> String {
     format!("storage.cache_capacity_bytes{{backend=\"{backend}\"}}")
 }
 
-fn put_one_row(store: &impl KvStore) {
+fn put_one_row(store: &impl KvStore) -> Result<(), bitcoin_rs_storage::StorageError> {
     let mut batch = store.new_batch();
     batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-    store.write(batch).expect("batch write");
+    store.write(batch)?;
+    Ok(())
+}
+
+/// Asserts a gauge equals the expected byte count. The values are small
+/// integers (< 2^24) that f64 represents exactly, so a direct equality
+/// check is safe — but `clippy::float_cmp` requires an explicit tolerance.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts < 2^24, lossless in f64"
+)]
+#[expect(clippy::as_conversions, reason = "byte counts < 2^24, lossless in f64")]
+fn assert_gauge_eq(recorder: &LabeledRecorder, key: &str, expected: u64) {
+    let actual = recorder.gauge(key);
+    assert!(
+        (actual - expected as f64).abs() < 1.0,
+        "{key}: expected {expected}, got {actual}"
+    );
 }
 
 #[test]
-#[cfg(feature = "fjall")]
 fn fjall_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Error>> {
     let recorder = LabeledRecorder::default();
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), filters_share())?;
     metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+        let Ok(()) = put_one_row(&store) else {
+            panic!("fjall default write failed")
+        };
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
+        let Ok(()) = store.write_durable(batch) else {
+            panic!("fjall durable write failed")
+        };
     });
     assert_eq!(recorder.counter(&writes_total("fjall", "default")), 1);
     assert_eq!(recorder.counter(&writes_total("fjall", "durable")), 1);
@@ -175,10 +195,11 @@ fn fjall_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::err
     let dir = tempfile::tempdir()?;
     let share = filters_share();
     metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), share)
-            .expect("fjall open with budgeted share");
+        let Ok(_store) = bitcoin_rs_storage::FjallStore::open_with_cache(dir.path(), share) else {
+            panic!("fjall open with budgeted share failed")
+        };
     });
-    assert_eq!(recorder.gauge(&cache_capacity("fjall")), share as f64);
+    assert_gauge_eq(&recorder, &cache_capacity("fjall"), share);
     Ok(())
 }
 
@@ -191,10 +212,14 @@ fn redb_counts_each_durability_path_once() -> Result<(), Box<dyn std::error::Err
     metrics::with_local_recorder(&recorder, || {
         let mut deferred = store.new_batch();
         deferred.put(ColumnFamily::BlockBodies, b"deferred-key", b"value");
-        store.write_deferred(deferred).expect("deferred write");
+        let Ok(()) = store.write_deferred(deferred) else {
+            panic!("redb deferred write failed")
+        };
         let mut durable = store.new_batch();
         durable.put(ColumnFamily::BlockBodies, b"durable-key", b"value");
-        store.write_durable(durable).expect("durable write");
+        let Ok(()) = store.write_durable(durable) else {
+            panic!("redb durable write failed")
+        };
     });
     assert_eq!(recorder.counter(&writes_total("redb", "deferred")), 1);
     assert_eq!(recorder.counter(&writes_total("redb", "durable")), 1);
@@ -213,10 +238,11 @@ fn redb_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::erro
     let dir = tempfile::tempdir()?;
     let share = filters_share();
     metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), share)
-            .expect("redb open with budgeted share");
+        let Ok(_store) = bitcoin_rs_storage::RedbStore::open_with_cache(dir.path(), share) else {
+            panic!("redb open with budgeted share failed")
+        };
     });
-    assert_eq!(recorder.gauge(&cache_capacity("redb")), share as f64);
+    assert_gauge_eq(&recorder, &cache_capacity("redb"), share);
     Ok(())
 }
 
@@ -228,13 +254,12 @@ fn redb_txindex_wrapper_configures_the_budgeted_share_verbatim()
     let dir = tempfile::tempdir()?;
     let share = filters_share();
     metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::open_redb_tx_index_store_with_cache(dir.path(), share)
-            .expect("redb txindex open with budgeted share");
+        let Ok(_store) = bitcoin_rs_storage::open_redb_tx_index_store_with_cache(dir.path(), share)
+        else {
+            panic!("redb txindex open with budgeted share failed")
+        };
     });
-    assert_eq!(
-        recorder.gauge(&cache_capacity("redb-txindex")),
-        share as f64
-    );
+    assert_gauge_eq(&recorder, &cache_capacity("redb-txindex"), share);
     Ok(())
 }
 
@@ -245,13 +270,19 @@ fn rocksdb_deferred_and_durable_writes_count_once() -> Result<(), Box<dyn std::e
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), filters_share())?;
     metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+        let Ok(()) = put_one_row(&store) else {
+            panic!("rocksdb default write failed")
+        };
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_deferred(batch).expect("deferred write");
+        let Ok(()) = store.write_deferred(batch) else {
+            panic!("rocksdb deferred write failed")
+        };
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
+        let Ok(()) = store.write_durable(batch) else {
+            panic!("rocksdb durable write failed")
+        };
     });
     // Each durability path counts exactly once: write_deferred must not leak a
     // second increment through the default write path it delegates to.
@@ -273,10 +304,12 @@ fn rocksdb_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::e
     let dir = tempfile::tempdir()?;
     let share = filters_share();
     metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), share)
-            .expect("rocksdb open with budgeted share");
+        let Ok(_store) = bitcoin_rs_storage::RocksDbStore::open_with_cache(dir.path(), share)
+        else {
+            panic!("rocksdb open with budgeted share failed")
+        };
     });
-    assert_eq!(recorder.gauge(&cache_capacity("rocksdb")), share as f64);
+    assert_gauge_eq(&recorder, &cache_capacity("rocksdb"), share);
     Ok(())
 }
 
@@ -287,10 +320,14 @@ fn mdbx_durable_write_counts_once() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let store = bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), filters_share())?;
     metrics::with_local_recorder(&recorder, || {
-        put_one_row(&store);
+        let Ok(()) = put_one_row(&store) else {
+            panic!("mdbx default write failed")
+        };
         let mut batch = store.new_batch();
         batch.put(ColumnFamily::BlockBodies, b"metrics-key", b"value");
-        store.write_durable(batch).expect("durable write");
+        let Ok(()) = store.write_durable(batch) else {
+            panic!("mdbx durable write failed")
+        };
     });
     // write_durable must not leak a second increment through the default write
     // path it delegates to.
@@ -311,9 +348,10 @@ fn mdbx_configures_the_budgeted_share_verbatim() -> Result<(), Box<dyn std::erro
     let dir = tempfile::tempdir()?;
     let share = filters_share();
     metrics::with_local_recorder(&recorder, || {
-        bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), share)
-            .expect("mdbx open with budgeted share");
+        let Ok(_store) = bitcoin_rs_storage::MdbxStore::open_with_cache(dir.path(), share) else {
+            panic!("mdbx open with budgeted share failed")
+        };
     });
-    assert_eq!(recorder.gauge(&cache_capacity("mdbx")), share as f64);
+    assert_gauge_eq(&recorder, &cache_capacity("mdbx"), share);
     Ok(())
 }

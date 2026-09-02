@@ -15,7 +15,7 @@
 #![allow(clippy::print_stdout)]
 #![allow(clippy::expect_used)]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::Path;
 
 use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch};
@@ -29,7 +29,7 @@ const INDEX_ROWS: u32 = 200_000;
 
 /// Number of block-body rows (large keys, large values).
 /// 5000 × 16 KiB = ~80 MiB, enough to trigger fjall's 64 MiB memtable flush
-/// in the block_bodies keyspace so SST files are produced.
+/// in the `block_bodies` keyspace so SST files are produced.
 const BLOCK_BODY_ROWS: u32 = 5_000;
 
 /// Number of undo rows (medium values).
@@ -62,14 +62,18 @@ fn logical_data_size() -> u64 {
     ];
 
     for &(_, key_len, val_len) in index_cfs {
-        total += u64::from(INDEX_ROWS) * (key_len as u64 + val_len as u64);
+        total += u64::from(INDEX_ROWS)
+            * (u64::try_from(key_len).expect("key length fits in u64")
+                + u64::try_from(val_len).expect("value length fits in u64"));
     }
 
     // BlockBodies: 37-byte key + BLOCK_BODY_VALUE_BYTES value.
-    total += u64::from(BLOCK_BODY_ROWS) * (37 + BLOCK_BODY_VALUE_BYTES as u64);
+    total += u64::from(BLOCK_BODY_ROWS)
+        * (37 + u64::try_from(BLOCK_BODY_VALUE_BYTES).expect("block-body value size fits in u64"));
 
     // UndoData: 37-byte key + UNDO_VALUE_BYTES value.
-    total += u64::from(UNDO_ROWS) * (37 + UNDO_VALUE_BYTES as u64);
+    total += u64::from(UNDO_ROWS)
+        * (37 + u64::try_from(UNDO_VALUE_BYTES).expect("undo value size fits in u64"));
 
     total
 }
@@ -127,7 +131,8 @@ fn synthetic_key(index: u32, len: usize) -> Vec<u8> {
     key[..copy_len].copy_from_slice(&bytes[..copy_len]);
     // Fill the rest with a deterministic pattern.
     for (i, byte) in key.iter_mut().enumerate().skip(copy_len) {
-        *byte = ((index as usize).wrapping_add(i * 31) & 0xFF) as u8;
+        let idx = usize::try_from(index).expect("u32 fits usize on all Rust targets");
+        *byte = u8::try_from(idx.wrapping_add(i * 31) & 0xFF).expect("masked value fits in u8");
     }
     key
 }
@@ -141,7 +146,8 @@ fn synthetic_val(index: u32, len: usize) -> Vec<u8> {
     let copy_len = bytes.len().min(len);
     val[..copy_len].copy_from_slice(&bytes[..copy_len]);
     for (i, byte) in val.iter_mut().enumerate().skip(copy_len) {
-        *byte = ((index as usize).wrapping_add(i * 37) & 0xFF) as u8;
+        let idx = usize::try_from(index).expect("u32 fits usize on all Rust targets");
+        *byte = u8::try_from(idx.wrapping_add(i * 37) & 0xFF).expect("masked value fits in u8");
     }
     val
 }
@@ -165,7 +171,7 @@ fn dir_size(path: &Path) -> u64 {
             if file_type.is_dir() {
                 total += recurse(&entry.path());
             } else if file_type.is_file() {
-                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                total += entry.metadata().map_or(0, |m| m.len());
             }
         }
         total
@@ -186,8 +192,7 @@ fn fjall_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
             if path.is_dir() {
                 let name = path
                     .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .map_or(String::new(), |n| n.to_string_lossy().to_string());
                 let size = dir_size(&path);
                 dirs.push((name, size));
             }
@@ -205,9 +210,12 @@ fn fjall_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
         .flatten()
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.ends_with(".jnl") {
-                Some(e.metadata().map(|m| m.len()).unwrap_or(0))
+            let is_journal = e
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jnl"));
+            if is_journal {
+                Some(e.metadata().map_or(0, |m| m.len()))
             } else {
                 None
             }
@@ -218,15 +226,17 @@ fn fjall_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
 
 /// Measures per-column-family bytes for redb. redb uses a single file, so
 /// per-CF breakdown is not available from the filesystem.
+#[cfg(feature = "redb")]
 fn redb_cf_sizes(_root: &Path) -> (HashMap<String, u64>, u64) {
     (HashMap::new(), 0)
 }
 
 /// Measures per-column-family bytes for rocksdb. Each CF is a separate
 /// directory under the DB root.
+#[cfg(feature = "rocksdb")]
 fn rocksdb_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
     let mut sizes = HashMap::new();
-    for cf in ColumnFamily::ALL.iter() {
+    for cf in ColumnFamily::ALL {
         let cf_dir = root.join(cf.name());
         if cf_dir.is_dir() {
             sizes.insert(cf.name().to_string(), dir_size(&cf_dir));
@@ -237,8 +247,45 @@ fn rocksdb_cf_sizes(root: &Path) -> (HashMap<String, u64>, u64) {
 
 // ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
 
+/// Converts bytes to mebibytes for display. Storage footprints in this tool
+/// are at most a few hundred MiB (< 2^28), well within f64's 52-bit mantissa
+/// which represents integers exactly up to 2^53, so the cast is lossless.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts < 2^28, lossless in f64"
+)]
+#[expect(clippy::as_conversions, reason = "byte counts < 2^28, lossless in f64")]
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// Converts bytes to kibibytes for display. Per-CF sizes are at most a few
+/// MiB (< 2^24), well within f64's exact-integer range.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts < 2^24, lossless in f64"
+)]
+#[expect(clippy::as_conversions, reason = "byte counts < 2^24, lossless in f64")]
+fn kib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0
+}
+
+/// Computes the write-amplification ratio as a double. Both operands are at
+/// most a few hundred MiB (< 2^28), so the f64 cast is lossless and the
+/// division preserves full precision at these magnitudes.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts < 2^28, lossless in f64"
+)]
+#[expect(clippy::as_conversions, reason = "byte counts < 2^28, lossless in f64")]
+fn amplification_ratio(total: u64, logical: u64) -> f64 {
+    if logical > 0 {
+        total as f64 / logical as f64
+    } else {
+        0.0
+    }
+}
 fn main() {
     let backend = std::env::args()
         .nth(1)
@@ -254,7 +301,7 @@ fn main() {
     println!("Undo value:  {UNDO_VALUE_BYTES} B");
     println!(
         "Logical data size: {logical} bytes ({:.2} MiB)",
-        logical as f64 / (1024.0 * 1024.0)
+        mib(logical)
     );
     println!();
 
@@ -307,25 +354,18 @@ fn print_results(
     cf_sizes: &HashMap<String, u64>,
     journal: u64,
 ) {
-    let amplification = if logical > 0 {
-        total as f64 / logical as f64
-    } else {
-        0.0
-    };
+    let amplification = amplification_ratio(total, logical);
     println!("--- {backend} ---");
-    println!(
-        "Total on-disk:     {total} bytes ({:.2} MiB)",
-        total as f64 / (1024.0 * 1024.0)
-    );
+    println!("Total on-disk:     {total} bytes ({:.2} MiB)", mib(total));
     println!(
         "Logical data:      {logical} bytes ({:.2} MiB)",
-        logical as f64 / (1024.0 * 1024.0)
+        mib(logical)
     );
     println!("Write amplification: {amplification:.3}x");
     if journal > 0 {
         println!(
             "Journal:           {journal} bytes ({:.2} MiB)",
-            journal as f64 / (1024.0 * 1024.0)
+            mib(journal)
         );
     }
     println!();
@@ -336,10 +376,7 @@ fn print_results(
         let mut entries: Vec<_> = cf_sizes.iter().collect();
         entries.sort_by(|a, b| b.1.cmp(a.1));
         for (name, size) in entries {
-            println!(
-                "  {name:<20} {size:>12} bytes ({:.2} KiB)",
-                *size as f64 / 1024.0
-            );
+            println!("  {name:<20} {size:>12} bytes ({:.2} KiB)", kib(*size));
         }
     }
     println!();

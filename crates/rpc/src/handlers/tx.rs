@@ -2231,7 +2231,7 @@ mod tests {
         );
     }
 
-    /// P2WPKH script: OP_0 + push-20 + fixed 20-byte key hash.
+    /// P2WPKH script: `OP_0` + push-20 + fixed 20-byte key hash.
     fn retry_p2wpkh() -> Vec<u8> {
         [vec![0x00, 0x14], vec![0x11; 20]].concat()
     }
@@ -2286,8 +2286,7 @@ mod tests {
     /// and succeed. If the context were reused from the first attempt (the
     /// r4c3 mutation), the stale `missing_inputs` flag would reject the child.
     #[test]
-    fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn sendrawtransaction_rebuilds_admission_context_after_transient_rejection() {
         let ctx = Arc::new(Context::new());
         reset_admission_park();
 
@@ -2378,8 +2377,6 @@ mod tests {
             ctx.mempool.read().contains_txid(&parent_txid),
             "the parent must remain pooled"
         );
-
-        Ok(())
     }
 }
 

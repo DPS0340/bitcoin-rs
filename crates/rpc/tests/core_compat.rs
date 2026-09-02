@@ -182,10 +182,10 @@ fn network_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::
 
 /// Both validateaddress failure classes answer exactly Core's sparse
 /// `{"isvalid": false}` object: `isvalid` is the only key and every
-/// valid-only field (address, scriptPubKey, isscript, iswitness,
-/// witness_version, witness_program) is absent. The pinned corepc type
+/// valid-only field (`address`, `scriptPubKey`, `isscript`, `iswitness`,
+/// `witness_version`, `witness_program`) is absent. The pinned corepc type
 /// models those fields as required, so this branch cannot round-trip
-/// through `typed()` and is pinned by key-set assertions (local_shape).
+/// through `typed()` and is pinned by key-set assertions (`local_shape`).
 fn assert_sparse_invalid(value: &sonic_rs::Value) {
     let object = value
         .as_object()
@@ -252,11 +252,10 @@ fn util_responses_deserialize_into_pinned_types() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn mining_responses_error_without_a_control() -> Result<(), Box<dyn std::error::Error>> {
+fn mining_responses_error_without_a_control() {
     let handler = Handler::new(Arc::new(Context::new()));
     assert!(handler.dispatch("getblocktemplate", &json!([{}])).is_err());
     assert!(handler.dispatch("getmininginfo", &json!([])).is_err());
-    Ok(())
 }
 
 /// Mirrors the `handler_smoke` mining-control fixture so the typed mining
