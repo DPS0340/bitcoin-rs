@@ -12,14 +12,14 @@
 //!    in `crates/primitives/tests/testdata/` is parsed through both
 //!    `Block::consensus_decode` (native) and `KernelBlock::parse` (kernel),
 //!    and their transaction counts and txids are compared byte-for-byte.
-//!    This is a real structural differential: the kernel's CTransaction
+//!    This is a real structural differential: the kernel's `CTransaction`
 //!    hashing (Core's runtime SHA-256) vs native `Tx::txid`.
 //!
 //! 2. **Script-verdict parity** (6 committed mainnet fixtures × 4–6
 //!    mutations each): delegates to `kernel_block_parity`, the existing
 //!    kernel-vs-interpreter differential over all 5 script classes.
 //!
-//! 3. **Vector oracle parity** (121 tx_valid + 84 tx_invalid rows):
+//! 3. **Vector oracle parity** (121 `tx_valid` + 84 `tx_invalid` rows):
 //!    delegates to `kernel_vector_parity`, which feeds Core's own
 //!    consensus test vectors through the kernel and asserts the kernel's
 //!    verdict matches the expected outcome.
@@ -92,9 +92,7 @@ fn block_parse_parity() -> TestResult {
             native_count,
             kernel_count,
             "block {} (hash {}): transaction count mismatch: native={}, kernel={}",
-            path.file_name()
-                .expect("path should have filename")
-                .to_string_lossy(),
+            path.display(),
             native_hash,
             native_count,
             kernel_count,
@@ -108,9 +106,7 @@ fn block_parse_parity() -> TestResult {
                 native_txid,
                 kernel_txid,
                 "block {} (hash {}): txid mismatch at tx[{i}]: native={}, kernel={}",
-                path.file_name()
-                    .expect("path should have filename")
-                    .to_string_lossy(),
+                path.display(),
                 native_hash,
                 native_txid,
                 kernel_txid,
@@ -155,7 +151,7 @@ fn script_verdict_parity() -> TestResult {
 }
 
 /// Vector oracle parity: delegates to the consensus crate's
-/// `kernel_vector_parity` test, which feeds Core's tx_valid/tx_invalid
+/// `kernel_vector_parity` test, which feeds Core's `tx_valid`/`tx_invalid`
 /// consensus vectors through the kernel and asserts verdict equality.
 #[test]
 fn vector_oracle_parity() -> TestResult {
@@ -194,8 +190,8 @@ fn block_parse_parity_goes_red_on_corruption() -> TestResult {
     // Take the smallest block to keep the test fast.
     let smallest = block_files
         .iter()
-        .min_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX))
-        .expect("block files should not be empty");
+        .min_by_key(|p| std::fs::metadata(p).map_or(u64::MAX, |m| m.len()))
+        .ok_or("block files should not be empty")?;
     let raw = std::fs::read(smallest)?;
     assert!(
         raw.len() > 81,
@@ -205,7 +201,7 @@ fn block_parse_parity_goes_red_on_corruption() -> TestResult {
     // Corrupt the transaction-count varint at byte 80 (right after the
     // 80-byte header). Setting it to 0xFF triggers a varint extension
     // (0xFF = read 8 bytes as u64), which will overshoot the buffer.
-    let mut corrupted = raw.clone();
+    let mut corrupted = raw;
     corrupted[80] = 0xFF;
 
     // At least one engine must reject the corrupted block.
@@ -235,7 +231,7 @@ fn block_testdata_dir() -> PathBuf {
 
 fn collect_block_files(dir: &PathBuf) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "bin"))
         .map(|entry| entry.path())
         .collect();
