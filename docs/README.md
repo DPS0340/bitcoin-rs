@@ -20,9 +20,10 @@ This page maps it to what you might want.
   toolchain and dependency rules;
   [db-migration.md](policies/db-migration.md) covers on-disk schema changes.
 - [benchmarks/](benchmarks/) holds the benchmark methodology in
-  [end-to-end-sync.md](benchmarks/end-to-end-sync.md) and the raw run data
-  under `data/`. Read the methodology before quoting any number: the results
-  depend on CPU pinning and on whether the harness competes with the node.
+  [end-to-end-sync.md](benchmarks/end-to-end-sync.md). Read the methodology
+  before quoting any number: the results depend on CPU pinning and on whether
+  the harness competes with the node. Raw run evidence lives in the
+  corresponding PR discussions, not in the tree.
 
 ## Explanation
 
@@ -34,19 +35,6 @@ Search it before debugging a recurring problem or designing in an area someone
 has already touched. Several entries record approaches that were measured and
 rejected, which is the cheapest kind of result to reuse.
 
-## Internal working notes
-
-These two are the project thinking aloud. They are kept because the reasoning
-is useful, not because they describe current behaviour. Do not treat either as
-a description of how the node works today.
-
-- [plans/](plans/) holds design blueprints for multi-step campaigns, each dated
-  and scoped to the work that prompted it, plus the historical records moved out
-  of `PLAN.md`: the
-  [2026-06-05 performance campaign ledger](plans/2026-06-05-performance-campaign-ledger.md)
-  and the [2026-05-19 Ultrareview log](plans/2026-05-19-ultrareview-log.md).
-- [brainstorms/](brainstorms/) holds exploratory requirements from before a
-  direction was settled.
 
 ## Known gaps
 

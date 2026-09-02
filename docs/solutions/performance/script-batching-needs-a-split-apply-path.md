@@ -302,8 +302,8 @@ Every run reached height 150,000 and block
 The result is too large to be scheduler noise: it removes 17.98 seconds from
 the replay median and 152.31 CPU-seconds.
 Full commands, binary and corpus hashes, run order, every run value, and
-identity fields are retained in
-`docs/benchmarks/data/end-to-end-sync/window-validation-proof-custody-v1.json`.
+identity fields are retained in the `window-validation-proof-custody-v1`
+custody packet (commit `044550c6`).
 
 The production change makes the evidence precise instead of widening a
 script-only proof:
@@ -352,8 +352,8 @@ and hash. A separate baseline/candidate pair produced byte-identical
 `headers-v1.dat`, `utxo-v4.dat`, `coinstats-v1.dat`, `manifest-v1.json`, and
 `CURRENT` artifacts. Reorg and two-reopen durability proofs also matched across
 fjall, RocksDB, and redb. The full panel, external wall values, artifact
-digests, and backend proofs are in
-`docs/benchmarks/data/end-to-end-sync/checkpoint-write-buffer-custody-v1.json`.
+digests, and backend proofs are in the `checkpoint-write-buffer-custody-v1`
+custody packet (commit `3092eabf`).
 
 ## Enlarge exact checkpoint MuHash batches
 
@@ -387,8 +387,8 @@ artifact hashes remain byte-identical. The exact MuHash and serialized
 CoinStats match the serial oracle at one and four Rayon threads. Fjall,
 RocksDB, and redb also pass the reorg and two-reopen durability proof. Full
 experiments, interleaved wall values, run hashes, artifact digests, and backend
-proofs are in
-`docs/benchmarks/data/end-to-end-sync/checkpoint-muhash-batching-custody-v1.json`.
+proofs are in the `checkpoint-muhash-batching-custody-v1` custody packet
+(commit `fb59ab45`).
 
 ## Also corrected
 

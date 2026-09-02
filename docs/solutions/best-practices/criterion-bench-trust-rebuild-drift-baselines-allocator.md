@@ -71,6 +71,4 @@ history, not executable regression contracts.
 ## Related
 
 - [small-window-benchmarks-do-not-predict-at-scale-throughput](small-window-benchmarks-do-not-predict-at-scale-throughput.md)
-  - cross-node measurement methodology for single-machine benchmark hygiene.
-- [utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path](../architecture-patterns/utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path.md)
-  - why a synthetic listener-only win is not production evidence.
+  — the cross-node measurement methodology this note's single-machine hygiene supports.

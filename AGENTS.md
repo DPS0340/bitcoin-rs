@@ -14,7 +14,6 @@
   space reaches the reserve. Record compact results and delete the disposable fixture
   before starting the next run, because accumulated benchmark copies have exhausted
   the workstation's home dataset.
-- For each implementation task, record verifiable goals in
-  `.agent-tasks/<task-id>/GOALS.md` and place task-local proof in its sibling
-  `tests/` directory; delete the task directory after the change merges so
-  temporary acceptance evidence does not become permanent project policy.
+- Acceptance criteria belong in the issue or PR description; execution proof
+  belongs in CI logs and artifacts. Local agent scratch and task plans stay in
+  the gitignored `.agent-tasks/` directory and are never committed.
