@@ -89,11 +89,14 @@ maintainer decision and matching migration policy before adding a reader.
 ### 5.3 On-Disk Format Deprecation Policy
 - On-disk storage schemas do not maintain backward-compatibility translation shims.
 - When key-value column families, block file encodings, or checkpoint formats change, the system does not convert old databases in place.
-- Every datadir carries the current `CURRENT_SCHEMA` epoch and identity. A
-   missing marker on a non-empty datadir or a mismatched epoch fails before
-   normal persistent-state startup and requires the operator to remove/recreate
-   the datadir and resync; a network, P2P magic, or backend identity mismatch is
-   a configuration error. A checkpoint `CURRENT` is its sole commit point, so
-   unpublished generation residue yields `Cold` and a referenced invalid
-   generation is current-state corruption. There is no `HeadersOnly`
-   compatibility fallback.
+- Every datadir carries the current `CURRENT_SCHEMA` epoch. An unmarked
+   non-empty datadir is implicitly epoch `0`: it is adopted and marked while
+   epoch `0` is current, but requires removal/recreation and resync after the
+   epoch advances. A mismatched marker fails before normal persistent-state
+   startup and requires the operator to remove/recreate the datadir and resync.
+   Network/backend datadir ownership and multi-process locking are separate
+   configuration and lifecycle concerns, not persistent schema compatibility
+   ([issue #242](https://github.com/gosuda/bitcoin-rs/issues/242)).
+   A checkpoint `CURRENT` is its sole commit point, so unpublished generation
+   residue yields `Cold` and a referenced invalid generation is current-state
+   corruption. There is no `HeadersOnly` compatibility fallback.

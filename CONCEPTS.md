@@ -185,18 +185,19 @@ snapshot makes startup fail with an explicit datadir remove-and-resync
 instruction instead of selecting a legacy reader or a validated-headers
 fallback.
 
-### Datadir schema identity
+### Datadir schema marker
 The one current persistent-format authority at the datadir root, stored in
-`CURRENT_SCHEMA` as a canonical epoch-and-identity record. The record binds the
-current epoch to the resolved consensus network, genesis hash, effective P2P
-magic, and storage backend, and is initialized and file-synced before any
-checkpoint or KV store opens. A missing marker on a non-empty directory, a
-malformed marker, or an older epoch is an incompatible datadir and fails before
-normal startup; an identity mismatch is a configuration error that asks for
-matching settings or another datadir. The node never deletes or converts
-state. `Cold` means there is no committed checkpoint: no checkpoint root and a
-root containing only unpublished generation/temp residue both take this path.
-If `CURRENT` exists, only its referenced generation is considered; an invalid
+`CURRENT_SCHEMA` as a serialized epoch marker and initialized and file-synced
+before any checkpoint or KV store opens. An unmarked non-empty directory is
+implicitly baseline epoch 0: it is adopted and marked while epoch 0 is current,
+but fails before normal startup once the epoch advances. A malformed marker or
+older epoch is an incompatible datadir. Network/backend datadir ownership and
+multi-process locking are separate configuration and lifecycle concerns, not
+part of the persistent schema marker; see [issue #242](https://github.com/gosuda/bitcoin-rs/issues/242).
+The node never deletes or converts state.
+`Cold` means there is no committed checkpoint: no checkpoint root and a root
+containing only unpublished generation/temp residue both take this path. If
+`CURRENT` exists, only its referenced generation is considered; an invalid
 referenced generation is current-state corruption and has no legacy fallback.
 Ordinary filesystem I/O failures remain operational errors and are not
 reclassified as datadir incompatibility. Directory-entry durability is

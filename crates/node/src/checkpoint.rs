@@ -531,17 +531,6 @@ pub(crate) enum CheckpointWrite {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum IncompatibleCheckpoint {
-    #[error(
-        "incompatible bitcoin-rs datadir: checkpoint {component} version {version} is unsupported; remove or replace the datadir and restart to perform a full resync"
-    )]
-    UnsupportedVersion {
-        component: &'static str,
-        version: u32,
-    },
-}
-
-#[derive(Debug, Error)]
 pub(crate) enum CheckpointCorruption {
     #[error(
         "corrupt current-schema checkpoint: {reason}; remove or replace the datadir and restart to perform a full resync"
@@ -551,8 +540,6 @@ pub(crate) enum CheckpointCorruption {
 
 #[derive(Debug, Error)]
 pub(crate) enum CheckpointLoadError {
-    #[error(transparent)]
-    Incompatible(#[from] IncompatibleCheckpoint),
     #[error(transparent)]
     Corrupt(#[from] CheckpointCorruption),
     #[error(transparent)]
@@ -675,7 +662,7 @@ pub(crate) fn load_checkpoint_from_dir(
         // leftover from a first publication that crashed before the pointer
         // became visible; none of that generation is committed state.
         Ok(None) => return Ok(CheckpointLoad::Cold),
-        Err(error) => return Err(classify_load_error(error)),
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
     let generation_dir = root.open_dir(&current.directory).map_err(|error| {
         classify_open_error(
@@ -685,7 +672,7 @@ pub(crate) fn load_checkpoint_from_dir(
     })?;
     let manifest = match read_manifest(&generation_dir, &current, config) {
         Ok(manifest) => manifest,
-        Err(error) => return Err(classify_load_error(error)),
+        Err(error) => return Err(classify_checkpoint_error(error)),
     };
     if manifest.headers.version != HEADER_VERSION {
         return Err(corrupt_checkpoint(format!(
@@ -730,13 +717,6 @@ pub(crate) fn load_checkpoint_from_dir(
     match load_payloads(&generation_dir, &manifest, restored_headers) {
         Ok(restored) => Ok(CheckpointLoad::Complete(Box::new(restored))),
         Err(error) => Err(classify_checkpoint_error(error)),
-    }
-}
-
-fn classify_load_error(error: LoadStageError) -> CheckpointLoadError {
-    match error {
-        LoadStageError::Incompatible(error) => CheckpointLoadError::Incompatible(error),
-        LoadStageError::Candidate(error) => classify_checkpoint_error(error),
     }
 }
 
@@ -875,10 +855,7 @@ fn write_checkpoint_inner(
     let current_generation = match read_current(&root) {
         Ok(Some(current)) => current.generation,
         Ok(None) => 0,
-        Err(LoadStageError::Candidate(error)) => return Err(error),
-        Err(LoadStageError::Incompatible(error)) => {
-            return Err(CheckpointError::Invalid(error.to_string()));
-        }
+        Err(error) => return Err(error),
     };
     let (generation, paths, staging) = allocate_generation(&root, current_generation)?;
 
@@ -1200,38 +1177,24 @@ fn rename_current(
     Ok(())
 }
 
-enum LoadStageError {
-    Incompatible(IncompatibleCheckpoint),
-    Candidate(CheckpointError),
-}
-
-impl From<CheckpointError> for LoadStageError {
-    fn from(error: CheckpointError) -> Self {
-        Self::Candidate(error)
-    }
-}
-
-fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, LoadStageError> {
+fn read_current(root: &CheckpointRoot) -> Result<Option<CurrentV1>, CheckpointError> {
     let bytes = match read_file(root.dir(), CURRENT_FILE, MAX_CHECKPOINT_METADATA_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(checkpoint_file_error(CURRENT_FILE, error).into()),
+        Err(error) => return Err(checkpoint_file_error(CURRENT_FILE, error)),
     };
     let current: CurrentV1 = serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
     if current.version != CURRENT_VERSION {
-        return Err(LoadStageError::Incompatible(
-            IncompatibleCheckpoint::UnsupportedVersion {
-                component: "CURRENT",
-                version: current.version,
-            },
-        ));
+        return Err(CheckpointError::Invalid(format!(
+            "CURRENT checkpoint version {} is not current",
+            current.version
+        )));
     }
     if current.format != CURRENT_FORMAT {
         return Err(CheckpointError::Invalid(format!(
             "unexpected CURRENT format {}",
             current.format
-        ))
-        .into());
+        )));
     }
     let expected_directory = generation_name(current.generation);
     if current.directory != expected_directory || !valid_generation_name(&current.directory) {
@@ -1248,14 +1211,14 @@ fn read_manifest(
     generation_dir: &Dir,
     current: &CurrentV1,
     config: HeaderCheckpointConfig,
-) -> Result<CheckpointManifestV1, LoadStageError> {
+) -> Result<CheckpointManifestV1, CheckpointError> {
     let bytes = read_file(generation_dir, MANIFEST_FILE, MAX_CHECKPOINT_METADATA_BYTES)
         .map_err(|error| checkpoint_file_error(MANIFEST_FILE, error))?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if digest != decode_hex::<32>(&current.manifest_sha256)? {
-        return Err(
-            CheckpointError::Invalid("manifest SHA256 does not match CURRENT".to_owned()).into(),
-        );
+        return Err(CheckpointError::Invalid(
+            "manifest SHA256 does not match CURRENT".to_owned(),
+        ));
     }
     let manifest: CheckpointManifestV1 =
         serde_json::from_slice(&bytes).map_err(CheckpointError::Json)?;
@@ -1263,21 +1226,18 @@ fn read_manifest(
         return Err(CheckpointError::Invalid(format!(
             "manifest version {} is not current",
             manifest.version
-        ))
-        .into());
+        )));
     }
     if manifest.format != MANIFEST_FORMAT {
         return Err(CheckpointError::Invalid(format!(
             "unexpected manifest format {}",
             manifest.format
-        ))
-        .into());
+        )));
     }
     if manifest.generation != current.generation {
         return Err(CheckpointError::Invalid(
             "manifest generation does not match CURRENT".to_owned(),
-        )
-        .into());
+        ));
     }
     let expected_network = network_name(config.network);
     if manifest.network != expected_network
@@ -1286,8 +1246,7 @@ fn read_manifest(
     {
         return Err(CheckpointError::Invalid(
             "checkpoint network, magic, or genesis does not match configuration".to_owned(),
-        )
-        .into());
+        ));
     }
     Ok(manifest)
 }
@@ -2353,7 +2312,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_current_version_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
+    fn unsupported_current_version_is_current_checkpoint_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (tree, _, applied) = chain_with_applied_height(0, 0)?;
         let applied_tip = tip_snapshot(&tree, applied)?;
@@ -2370,7 +2330,13 @@ mod tests {
         let mut current: CurrentV1 = serde_json::from_slice(&fs::read(&current_path)?)?;
         current.version = current.version.saturating_add(1);
         fs::write(current_path, serde_json::to_vec(&current)?)?;
-        assert!(load_checkpoint(dir.path(), config()).is_err());
+        let Err(CheckpointLoadError::Corrupt(CheckpointCorruption::Invalid { reason })) =
+            load_checkpoint(dir.path(), config())
+        else {
+            return Err("unsupported CURRENT version was not reported as corruption".into());
+        };
+        assert!(reason.contains("CURRENT checkpoint version"));
+        assert!(!reason.contains("incompatible bitcoin-rs datadir"));
         Ok(())
     }
 
