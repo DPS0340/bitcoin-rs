@@ -89,4 +89,8 @@ maintainer decision and matching migration policy before adding a reader.
 ### 5.3 On-Disk Format Deprecation Policy
 - On-disk storage schemas do not maintain backward-compatibility translation shims.
 - When key-value column families, block file encodings, or checkpoint formats change, the system does not convert old databases in place.
-- Incompatible CHECKPOINT formats trigger automatic fallback to `HeadersOnly` or `Cold` start resync (`crates/node/src/checkpoint.rs`), requiring the node to rebuild state cleanly. Key-value column families and flat block files carry no version metadata, so nothing detects an incompatible one and no fallback fires; changing either requires the operator to wipe the datadir, which is why `docs/policies/db-migration.md` makes that step the safeguard rather than the version bump.
+- Every datadir carries the current `CURRENT_SCHEMA` epoch. A missing marker
+   on a non-empty datadir, a mismatched epoch, or an incompatible checkpoint
+   fails before normal persistent-state startup and requires the operator to
+   remove/recreate the datadir and resync. `Cold` startup is reserved for a
+   genuinely new datadir; there is no `HeadersOnly` compatibility fallback.

@@ -1000,9 +1000,8 @@ pub struct ApplyHandles {
     /// Bitcoin Core's `CBlockIndex::m_chain_tx_count`, including its convention
     /// that zero means *unset* rather than *empty* (`HaveNumChainTxs()`). Only a
     /// chain applied from genesis by a node that maintains this counter can know
-    /// it; a datadir written before it existed restores as unknown and stays
-    /// unknown, because nothing short of re-reading every block body could
-    /// recover the history.
+    /// it; a cold start before genesis or an arithmetic inconsistency leaves it
+    /// unknown until the chain is applied again.
     ///
     /// Kept beside `applied_tip` and moved with it, so the pair is always
     /// consistent: a count that lagged its tip would be worse than no count.

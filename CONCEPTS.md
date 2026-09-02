@@ -180,8 +180,19 @@ Outputs the UTXO set never admits because no spend of them can ever be valid: an
 ### UTXO snapshot read contract
 The node accepts only complete native version-4 snapshots: the exact magic and
 version, validated v4 records, the declared record count, a 384-byte MuHash
-trailer, and end-of-file. Versions 2 and 3 are unsupported; chainstate is
-rebuilt or resynchronized instead of being loaded through a legacy reader.
+trailer, and end-of-file. Versions 2 and 3 are unsupported; an incompatible
+snapshot makes startup fail with an explicit datadir remove-and-resync
+instruction instead of selecting a legacy reader or a validated-headers
+fallback.
+
+### Datadir schema epoch
+The one current persistent-format marker at the datadir root, stored in
+`CURRENT_SCHEMA` as the exact bytes `1\n`. A genuinely empty directory gets the
+marker initialized and synced before any checkpoint or KV store opens. A
+missing marker on a non-empty directory, a malformed marker, or an older epoch
+is an incompatible datadir and fails before normal startup; the node never
+deletes or converts it. The `Cold` startup path therefore means only a marked
+new directory with no checkpoint root. See `docs/policies/db-migration.md`.
 
 ### Undo record
 

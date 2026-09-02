@@ -510,7 +510,6 @@ const PRUNEHEIGHT_METADATA_KEY: &[u8] = b"node:pruneheight";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResumeSource {
     Cold,
-    HeadersOnly,
     Checkpoint,
 }
 
@@ -880,6 +879,12 @@ impl NodeState {
             .with_context(|| format!("create data_dir {}", config.data_dir.display()))?;
         let checkpoint_data_dir = crate::checkpoint_fs::open_data_dir(&config.data_dir)
             .with_context(|| format!("open data_dir {}", config.data_dir.display()))?;
+        crate::checkpoint_fs::ensure_current_schema(&checkpoint_data_dir).with_context(|| {
+            format!(
+                "validate CURRENT_SCHEMA for datadir {}",
+                config.data_dir.display()
+            )
+        })?;
         let checkpoint_config = crate::checkpoint::HeaderCheckpointConfig {
             network: config.network,
             genesis: config.network.genesis_block_hash(),
@@ -952,30 +957,14 @@ impl NodeState {
             restored_chain_tx_count,
             resume_source,
         ) = match checkpoint_load {
-            crate::checkpoint::CheckpointLoad::Cold { reason } => {
-                if let Some(reason) = reason {
-                    tracing::warn!(%reason, "chainstate checkpoint rejected; starting cold");
-                }
-                (
-                    bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_utxo::stats::CoinStats::default(),
-                    bitcoin_rs_chain::BlockTree::new(),
-                    None,
-                    0,
-                    ResumeSource::Cold,
-                )
-            }
-            crate::checkpoint::CheckpointLoad::HeadersOnly { tree, reason } => {
-                tracing::warn!(%reason, "chainstate payload rejected; retaining validated headers only");
-                (
-                    bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_utxo::stats::CoinStats::default(),
-                    tree,
-                    None,
-                    0,
-                    ResumeSource::HeadersOnly,
-                )
-            }
+            crate::checkpoint::CheckpointLoad::Cold => (
+                bitcoin_rs_utxo::UtxoSet::new(),
+                bitcoin_rs_utxo::stats::CoinStats::default(),
+                bitcoin_rs_chain::BlockTree::new(),
+                None,
+                0,
+                ResumeSource::Cold,
+            ),
             crate::checkpoint::CheckpointLoad::Complete(restored) => {
                 tracing::info!(
                     height = restored.applied_tip.height,
@@ -1969,6 +1958,13 @@ mod tests {
         let mut config = crate::Config::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("legacy-node");
         config.p2p_listen.clear();
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(
+            config
+                .data_dir
+                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
+            b"1\n",
+        )?;
         std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
         let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
         store.put(
@@ -1985,10 +1981,88 @@ mod tests {
         let Err(error) = NodeState::open(config) else {
             anyhow::bail!("legacy inline block body unexpectedly opened");
         };
-        let message = error.to_string();
+        let message = format!("{error:#}");
         assert!(message.contains(&datadir));
         assert!(message.contains("predates the flat-file block store"));
         assert!(message.contains("must be resynced"));
+        Ok(())
+    }
+
+    #[test]
+    fn new_datadir_initializes_current_schema_before_storage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+
+        let _state = NodeState::open(config.clone())?;
+        assert_eq!(
+            std::fs::read(
+                config
+                    .data_dir
+                    .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE)
+            )?,
+            b"1\n"
+        );
+        assert!(config.data_dir.join("chainstate").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unmarked_nonempty_datadir_is_refused_before_storage_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("legacy-node");
+        config.p2p_listen.clear();
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(config.data_dir.join("legacy-state"), b"old")?;
+
+        let error = match NodeState::open(config.clone()) {
+            Ok(_) => anyhow::bail!("unmarked non-empty datadir unexpectedly opened"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("CURRENT_SCHEMA"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("remove or replace"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("full resync"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !config.data_dir.join("chainstate").exists(),
+            "schema refusal must happen before storage initialization"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_datadir_schema_is_refused_before_storage_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("old-node");
+        config.p2p_listen.clear();
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(
+            config
+                .data_dir
+                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
+            b"0\n",
+        )?;
+
+        let error = match NodeState::open(config.clone()) {
+            Ok(_) => anyhow::bail!("mismatched datadir schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("current datadir schema epoch"));
+        assert!(message.contains("full resync"));
+        assert!(!config.data_dir.join("chainstate").exists());
         Ok(())
     }
 
@@ -2249,6 +2323,13 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(
+            config
+                .data_dir
+                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
+            b"1\n",
+        )?;
         let blocks_dir = config.data_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
         let prunable_file = blocks_dir.join("blk00000.dat");
@@ -2324,6 +2405,14 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
+
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(
+            config
+                .data_dir
+                .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE),
+            b"1\n",
+        )?;
 
         // Two files present before the store opens, so the earlier one is not
         // the append target and is therefore prunable. Same shape as
