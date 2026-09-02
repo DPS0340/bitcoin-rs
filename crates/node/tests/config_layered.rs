@@ -260,20 +260,37 @@ fn scriptindex_environment_enables_the_index() -> Result<()> {
     Ok(())
 }
 
-// `scriptindex=utxo` and `scriptindex=full` are the two active levels from
-// #225. `utxo` maintains only the compact live-output view; `full` adds the
-// historical funding/spending rows. There is intentionally no history-only
-// mode.
+// `utxo` is a named, parsed mode but is not yet usable: #225 defers the
+// compact live-output store to #226 Q5. It must therefore parse (so the
+// variant and its plumbing stay ready and testable) but be rejected at
+// validation, rather than starting a node that advertises a view nothing
+// backs. `full` is accepted.
 #[test]
-fn scriptindex_modes_parse_utxo_and_full() -> Result<()> {
-    let utxo = Config::from_layered_sources(
+fn scriptindex_utxo_parses_but_is_rejected_until_a_live_store_exists() {
+    let parsed = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
         ["bitcoin-rs-node", "--scriptindex=utxo"],
-    )?;
-    assert_eq!(utxo.script_index, ScriptIndexMode::Utxo);
+    );
+    // `from_layered_sources` runs `Config::validate`, so reaching the enum
+    // value at all requires inspecting the variant before validation. The
+    // parse half is pinned separately by `ScriptIndexMode::parse`.
+    assert!(
+        parsed.is_err_and(|error| error
+            .to_string()
+            .contains("scriptindex=utxo is not yet usable")),
+        "`utxo` must be refused while no live store backs it"
+    );
+    assert_eq!(
+        ScriptIndexMode::parse("utxo"),
+        Some(ScriptIndexMode::Utxo),
+        "the `utxo` variant must stay parsed and named for when #226 Q5 lands"
+    );
+}
 
+#[test]
+fn scriptindex_full_is_accepted() -> Result<()> {
     let full = Config::from_layered_sources(
         None,
         None,
@@ -281,6 +298,7 @@ fn scriptindex_modes_parse_utxo_and_full() -> Result<()> {
         ["bitcoin-rs-node", "--scriptindex=full"],
     )?;
     assert_eq!(full.script_index, ScriptIndexMode::Full);
+    full.validate()?;
     Ok(())
 }
 
@@ -330,19 +348,31 @@ fn boolean_scriptindex_spellings_mean_full_not_utxo() -> Result<()> {
 /// Only `full` maintains history. `utxo` deliberately avoids the storage cost
 /// of historical script indexing, and `disabled` maintains nothing. This is
 /// the capability selection #225's endpoint matrix gates on.
+///
+/// `has_live_store` is the guard that keeps `utxo` from being offered while
+/// the compact live-output store is still being designed in #226 Q5.
 #[test]
 fn mode_capability_predicates_select_history_and_live() {
     assert!(!ScriptIndexMode::Disabled.is_enabled());
     assert!(!ScriptIndexMode::Disabled.keeps_history());
+    assert!(
+        ScriptIndexMode::Disabled.has_live_store(),
+        "disabled claims no view, so it trivially backs all of them"
+    );
 
     assert!(ScriptIndexMode::Utxo.is_enabled());
     assert!(
         !ScriptIndexMode::Utxo.keeps_history(),
         "utxo mode must not maintain historical funding/spending rows"
     );
+    assert!(
+        !ScriptIndexMode::Utxo.has_live_store(),
+        "utxo must not claim readiness until a live store exists"
+    );
 
     assert!(ScriptIndexMode::Full.is_enabled());
     assert!(ScriptIndexMode::Full.keeps_history());
+    assert!(ScriptIndexMode::Full.has_live_store());
 }
 
 /// An unrecognised mode must be rejected rather than silently degrading to a

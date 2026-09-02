@@ -123,11 +123,16 @@ pub struct ZmqPublication {
 ///
 /// `ScriptIndex` is rebuildable derived state, so the mode is a capability
 /// selection rather than a storage compatibility question: `utxo` maintains
-/// the compact live-output view, `full` adds historical funding/spending rows.
+/// only the compact live-output view, `full` adds historical funding/spending
+/// rows.
 ///
 /// The boolean spellings remain behaviorally compatible: `--scriptindex`,
 /// `--scriptindex=true`, and `BITCOIN_RS_SCRIPTINDEX=true` all mean
 /// [`Self::Full`], and `false` means [`Self::Disabled`].
+///
+/// [`Self::Utxo`] is parsed and named but not yet accepted by
+/// [`Config::validate`]: the durable live-output store it describes does not
+/// exist. See [`ScriptIndexMode::has_live_store`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptIndexMode {
@@ -135,6 +140,10 @@ pub enum ScriptIndexMode {
     #[default]
     Disabled,
     /// Maintain only the compact live-output view.
+    ///
+    /// Named and parsed, but **not accepted** by [`Config::validate`] until
+    /// the durable live-output store exists. See
+    /// [`ScriptIndexMode::has_live_store`].
     Utxo,
     /// Maintain both the live-output view and historical script activity.
     Full,
@@ -154,6 +163,25 @@ impl ScriptIndexMode {
     #[must_use]
     pub const fn keeps_history(self) -> bool {
         matches!(self, Self::Full)
+    }
+
+    /// Whether this mode has a durable store backing every view it claims.
+    ///
+    /// `utxo` is the one mode that does not, yet. Its whole purpose is the
+    /// compact live-output view, and that view has no on-disk representation:
+    /// #225 defers the `ScriptLive` row format to #226 Q5, which is still
+    /// choosing the locator. Until a live store exists, a node configured
+    /// `utxo` would build no `Funding`/`Spending` rows (those families are
+    /// claimed only under `script_history`), publish no `ScriptHistory`
+    /// watermark, and then have every `ScriptIndexQuery` method —
+    /// `unspent_outputs` included — gate on
+    /// `IndexCapabilities::SCRIPT_HISTORY` and report `Retry` forever. That is
+    /// an advertised capability with nothing behind it.
+    ///
+    /// `Disabled` trivially has every store it claims, which is none.
+    #[must_use]
+    pub const fn has_live_store(self) -> bool {
+        !matches!(self, Self::Utxo)
     }
 
     /// Parses a mode from a configuration value.
@@ -483,6 +511,12 @@ impl Config {
                 "blockfilterindex requires prune disabled"
             );
         }
+        ensure!(
+            self.script_index.has_live_store(),
+            "scriptindex=utxo is not yet usable: the compact live-output store it \
+             requires does not exist (#225). Only `full` and `disabled` are accepted. \
+             Blocked on #226 Q5, which selects the ScriptLive locator format."
+        );
         match (&self.g2_muhash_samples, self.g2_muhash_tip_height) {
             (Some(_), Some(0)) => bail!("g2_muhash_tip_height must be greater than zero"),
             (Some(_), None) => bail!("g2_muhash_samples requires g2_muhash_tip_height"),
