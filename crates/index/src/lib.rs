@@ -12,10 +12,12 @@ pub use index::{
     BlockSource, ConsumerCursorUpdate, INDEX_FORMAT_VERSION, IndexCapabilities, IndexCapability,
     IndexError, IndexFormat, IndexReader, IndexRowCounts, IndexWatermark, IndexWatermarks,
     IndexWriteFence, IndexWriter, Indexer, IndexerLike, PreparedBatch, PreparedBatchLimits,
-    PreparedBlock, ScriptHistoryEntry, TxIndexScan, TxIndexScanRow, TxIndexSnapshot,
+    PreparedBlock, ScriptHistoryEntry, SpentCoinScripts, MAX_LIVE_SCRIPT_SIZE, NoSpentScripts,
+    TxIndexScan, TxIndexScanRow,
+    TxIndexSnapshot,
 };
 pub use mempool::{MempoolRowCounts, MempoolRowWriter};
 pub use types::{
     HASH_PREFIX_LEN, HASH_PREFIX_ROW_SIZE, HEADER_ROW_SIZE, HashPrefix, HashPrefixRow, HeaderRow,
-    ScriptHash, ScriptHashRow, SpendingPrefixRow, TxidRow,
+    SCRIPT_LIVE_ROW_SIZE, ScriptHash, ScriptHashRow, ScriptLiveRow, SpendingPrefixRow, TxidRow,
 };

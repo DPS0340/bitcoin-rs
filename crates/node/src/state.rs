@@ -967,6 +967,7 @@ fn tx_index_capabilities(config: &NodeConfig) -> bitcoin_rs_index::IndexCapabili
         // RPCs only for an explicit --txindex configuration.
         tx_lookup: config.txindex || config.script_index.is_enabled(),
         script_history: config.script_index.keeps_history(),
+        script_live: config.script_index.is_enabled(),
     }
 }
 

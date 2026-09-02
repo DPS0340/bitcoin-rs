@@ -1695,6 +1695,7 @@ impl Worker {
             IndexCapabilities {
                 tx_lookup: tx == Some(selected) && needs_rollback(selected),
                 script_history: script_index == Some(selected) && needs_rollback(selected),
+                script_live: false,
             },
             selected,
         ))
@@ -1740,6 +1741,7 @@ impl Worker {
                 script_history: script_index.is_some_and(|watermark| {
                     needs_forward(watermark) && start_height(watermark) == selected_start
                 }),
+                script_live: false,
             },
             selected_watermark,
         ))
