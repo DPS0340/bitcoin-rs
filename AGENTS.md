@@ -1,7 +1,3 @@
-# AGENTS.md
-
-CONCEPTS.md is the repository common vocabulary, utilize and manipulate it when you need it.
-
 ## Consensus
 
 - Consensus authority is `libbitcoinkernel`. The Rust `Interpreter`
@@ -51,19 +47,6 @@ CONCEPTS.md is the repository common vocabulary, utilize and manipulate it when 
 - One logical record has exactly one byte string: minimal varints, narrowest
   directory width, compact/escape amount forms as exact complements.
 
-## Engineering
+## Vocab
 
-- Clean cutover: when an interface, RPC schema, or data layout changes, delete
-  the old path in the same change-set. No shims, aliases, transitional flags.
-- MSRV bumps require a forced dependency floor or consensus/performance need
-  and update `rust-toolchain.toml`, `Cargo.toml`, and the policy doc together;
-  member-crate deps live in `[workspace.dependencies]`.
-- Fan-out is decided by measured per-item cost, not loop shape: sub-µs items
-  (UTXO lookups) get no rayon; the global rayon pool stays capped at
-  `GLOBAL_RAYON_THREADS`. Windows are count-and-byte bounded.
-- Stall detection uses window-blocked detection, never `applied_tip+1`
-  stagnation, and does not blame a peer when our own backpressure binds.
-- Benchmarks: production-matched binary (mimalloc, same features), report
-  CPU-seconds alongside wall, both arms in one run, at-scale window; when
-  harnesses disagree publish the conservative number. Retained benches exercise
-  the shipped path on a product-shaped workload only.
+CONCEPTS.md is the repository common vocabulary, utilize and manipulate it when you need it.
