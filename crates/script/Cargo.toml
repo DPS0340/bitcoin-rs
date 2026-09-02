@@ -16,6 +16,8 @@ default = []
 rocksdb = []
 fjall = []
 redb = []
+kernel = ["bitcoin-rs-consensus/kernel"]
+
 
 [dependencies]
 bitcoin-rs-primitives.workspace = true
@@ -33,3 +35,4 @@ serde.workspace = true
 bitcoin.workspace = true
 serde_json.workspace = true
 proptest.workspace = true
+bitcoin-rs-consensus = { workspace = true }

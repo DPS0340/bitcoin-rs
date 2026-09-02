@@ -474,6 +474,7 @@ name = "bitcoin-rs-script"
 version = "0.4.0"
 dependencies = [
  "bitcoin",
+ "bitcoin-rs-consensus",
  "bitcoin-rs-primitives",
  "bytemuck",
  "parking_lot",
