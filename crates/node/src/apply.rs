@@ -14,8 +14,8 @@ use bitcoin_rs_primitives::{
 };
 use bitcoin_rs_rpc::context::{BlockLog, BlockRecord};
 use bitcoin_rs_utxo::{
-    LiveOutput, LiveOutputMeta, UtxoSet,
-    set::{BorrowedBlockChanges, BorrowedUtxoAdd},
+    LiveOutput, LiveOutputMeta, UtxoSet, is_coinbase_tx,
+    connect::{BlockChangeError, BlockValueTotals, SpentOutputLookup, build_block_changes},
 };
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -46,13 +46,6 @@ const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 const SERIALIZED_BLOCK_METADATA_PREFIX_LEN: usize = SERIALIZED_BLOCK_HEADER_LEN + 9;
 const LOCAL_OVERLAY_TXID_SET_THRESHOLD: usize = 8;
-
-/// Returns true when `tx` is a coinbase: one input with the null outpoint.
-fn is_coinbase_tx(tx: &Tx) -> bool {
-    tx.inputs.len() == 1
-        && tx.inputs[0].previous_output.txid == Txid::default()
-        && tx.inputs[0].previous_output.vout == u32::MAX
-}
 
 /// Double SHA256, kept next to the witness merkle reduction its only remaining
 /// caller (a test fixture helper) uses.
@@ -2286,14 +2279,20 @@ fn apply_block_admitted<'b>(
     );
 
     let utxo_changes_started = quanta::Instant::now();
-    let (changes, undo, value_totals) = build_utxo_changes(
+    let (utxo_add_capacity, utxo_remove_capacity) = scratch.utxo_change_capacity();
+    let (changes, undo, value_totals) = build_block_changes(
         block,
         height,
-        &scratch,
-        &resolved,
+        scratch.txids(),
+        scratch.same_block_spent(),
+        utxo_add_capacity,
+        utxo_remove_capacity,
+        resolved.as_ref(),
         bitcoin_rs_consensus::bip30::is_bip30_exception(height, block_hash)
             .then(|| handles.utxo.as_ref()),
-    )?;
+        MAX_SCRIPT_SIZE,
+    )
+    .map_err(map_block_change_error)?;
     let utxo_changes_dur = utxo_changes_started.elapsed();
     metrics::histogram!("node.apply_block.utxo_changes_seconds")
         .record(utxo_changes_dur.as_secs_f64());
@@ -2303,7 +2302,7 @@ fn apply_block_admitted<'b>(
     // check structure, and per-transaction verification exempts the coinbase
     // because it has no inputs to weigh its outputs against.
     //
-    // Placed here because `build_utxo_changes` has just gathered the totals for
+    // Placed here because `build_block_changes` has just gathered the totals for
     // free, and still before `persist_undo` -- the first write of any kind --
     // so a rejected block leaves nothing behind. Genesis is skipped for the
     // same reason its transactions are not connected.
@@ -2690,7 +2689,7 @@ struct BlockTxPlan {
 impl BlockTxPlan {
     /// Outpoints this block both creates and spends, empty when it has none.
     ///
-    /// The overlay nets these out exactly as `build_utxo_changes` does: such an
+    /// The overlay nets these out exactly as `build_block_changes` does: such an
     /// output never reaches the committed set, so a view carrying it would
     /// resolve a later spend the real set would refuse.
     fn same_block_spent_set(&self) -> &SameBlockSpentSet {
@@ -2900,6 +2899,12 @@ impl UtxoView for ResolvedUtxoView {
     }
 }
 
+
+impl SpentOutputLookup for ResolvedUtxoView {
+    fn entry(&self, outpoint: &OutPoint) -> Option<&LiveOutput> {
+        self.entry(outpoint)
+    }
+}
 /// Resolves every transaction's prevouts serially in block order into an owned
 /// `Vec<Vec<Option<TxOut>>>` (coinbase -> empty inner Vec). This is the only
 /// order-sensitive step of full script verification: the overlay walk advances
@@ -3488,154 +3493,15 @@ fn apply_nbits_error(error: bitcoin_rs_chain::ChainError) -> ApplyError {
     }
 }
 
-/// What a block pays its coinbase and what it earned in fees.
-///
-/// Gathered by `build_utxo_changes` because that walk already visits exactly
-/// the right two sets. Outputs created and spent inside the same block are
-/// skipped there, and they cancel in the fee sum -- a same-block output is one
-/// transaction's output and another's input -- so leaving both out is exact,
-/// not an approximation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct BlockValueTotals {
-    /// Total value the coinbase outputs claim.
-    pub(crate) coinbase_out: u64,
-    /// Input value of the block's non-coinbase transactions, same-block
-    /// spends excluded.
-    pub(crate) spent_in: u64,
-    /// Output value of the block's non-coinbase transactions, outputs spent
-    /// in the same block excluded.
-    pub(crate) created_out: u64,
-}
-
-impl BlockValueTotals {
-    /// Fees the block earned, or `None` if the totals are inconsistent.
-    ///
-    /// Returns `None` rather than saturating: outputs exceeding inputs is a
-    /// consensus failure that per-transaction verification should already have
-    /// rejected, and silently reporting zero fees would let it through here.
-    pub(crate) const fn fees(self) -> Option<u64> {
-        self.spent_in.checked_sub(self.created_out)
-    }
-}
-
-fn build_utxo_changes<'a>(
-    block: &'a Block,
-    height: u32,
-    scratch: &ApplyScratch,
-    resolved: &ResolvedUtxoView,
-    overwritten: Option<&UtxoSet>,
-) -> core::result::Result<
-    (
-        BorrowedBlockChanges<'a>,
-        bitcoin_rs_utxo::UndoBatch,
-        BlockValueTotals,
-    ),
-    ApplyError,
-> {
-    // Bitcoin Core indexes genesis but does not connect its transactions into
-    // CoinsView; its coinbase is unspendable and absent from UTXO/MuHash state.
-    if height == 0 {
-        return Ok((
-            BorrowedBlockChanges::default(),
-            bitcoin_rs_utxo::UndoBatch::default(),
-            BlockValueTotals::default(),
-        ));
-    }
-
-    let (add_capacity, remove_capacity) = scratch.utxo_change_capacity();
-    let mut changes = BorrowedBlockChanges::with_capacity(add_capacity, remove_capacity);
-    let mut undo = bitcoin_rs_utxo::UndoBatch::default();
-    let mut totals = BlockValueTotals::default();
-    let net_same_block_spends = scratch.has_same_block_spends();
-    for (tx, txid) in block.txs.iter().zip(scratch.txids()) {
-        let txid = *txid;
-        let coinbase = is_coinbase_tx(tx);
-        for (vout_idx, txout) in tx.outputs.iter().enumerate() {
-            // Before the unspendable-output skip below: an OP_RETURN output
-            // never enters the UTXO set, but the transaction that created it
-            // still paid for it, so it counts against the fee.
-            let value = txout.value;
-            if coinbase {
-                totals.coinbase_out = totals
-                    .coinbase_out
-                    .checked_add(value)
-                    .ok_or(ApplyError::BlockValueOverflow)?;
-            } else if !(net_same_block_spends
-                && scratch.contains_same_block_spent(&OutPoint::new(
-                    txid,
-                    u32::try_from(vout_idx).map_err(|_| ApplyError::HeightOverflow(height))?,
-                )))
-            {
-                totals.created_out = totals
-                    .created_out
-                    .checked_add(value)
-                    .ok_or(ApplyError::BlockValueOverflow)?;
-            }
-            if txout.script_pubkey.first() == Some(&0x6a)
-                || txout.script_pubkey.len() > MAX_SCRIPT_SIZE
-            {
-                continue;
-            }
-            let outpoint = OutPoint::new(
-                txid,
-                u32::try_from(vout_idx).map_err(|_| ApplyError::HeightOverflow(height))?,
-            );
-            if net_same_block_spends && scratch.contains_same_block_spent(&outpoint) {
-                continue;
-            }
-            // At a BIP30 exception height the coinbase reuses an earlier txid
-            // whose outputs are still live, so this add OVERWRITES a coin
-            // rather than creating one. `overwritten` is `Some` only at those
-            // two mainnet heights, so every other block pays no lookup.
-            let replaced = overwritten.and_then(|set| set.get_entry(&outpoint));
-            changes.add(BorrowedUtxoAdd::new(outpoint, txout, coinbase, height));
-            match replaced {
-                // The inverse of overwriting is writing the old coin back, not
-                // deleting the outpoint. Emitting a remove as well would depend
-                // on `undo_block` applying restores after removes, and it does
-                // the opposite, so the older coin would be lost and the rewound
-                // UTXO set, MuHash, and coinstats would not match the parent.
-                Some(previous) => undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
-                    outpoint,
-                    previous.txout,
-                    previous.coinbase,
-                    previous.height,
-                )),
-                // Disconnecting the block deletes what it created.
-                None => undo.remove(outpoint),
-            }
-        }
-
-        if !coinbase {
-            for tx_input in &tx.inputs {
-                let previous_output = tx_input.previous_output;
-                if net_same_block_spends && scratch.contains_same_block_spent(&previous_output) {
-                    continue;
-                }
-                changes.remove(previous_output);
-                // ...and restores what it spent. A spend with no resolved
-                // prevout would make the record unable to restore that output,
-                // so refuse rather than persist an undo that silently loses it.
-                let spent = resolved.entry(&tx_input.previous_output).ok_or(
-                    ApplyError::UndoPrevoutMissing {
-                        txid: previous_output.txid,
-                        vout: previous_output.vout,
-                    },
-                )?;
-                totals.spent_in = totals
-                    .spent_in
-                    .checked_add(spent.txout.value)
-                    .ok_or(ApplyError::BlockValueOverflow)?;
-                undo.restore(bitcoin_rs_utxo::UtxoAdd::new(
-                    previous_output,
-                    spent.txout.clone(),
-                    spent.coinbase,
-                    spent.height,
-                ));
-            }
+/// Converts UTXO connect accounting errors into apply errors.
+fn map_block_change_error(error: BlockChangeError) -> ApplyError {
+    match error {
+        BlockChangeError::BlockValueOverflow => ApplyError::BlockValueOverflow,
+        BlockChangeError::HeightOverflow(height) => ApplyError::HeightOverflow(height),
+        BlockChangeError::UndoPrevoutMissing { txid, vout } => {
+            ApplyError::UndoPrevoutMissing { txid, vout }
         }
     }
-    Ok((changes, undo, totals))
 }
 
 #[must_use]
@@ -4533,8 +4399,18 @@ mod consensus_rule_tests {
         let txid = coinbase.txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, false);
-        let (changes, _undo, _totals) =
-            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
+        let (add_cap, rem_cap) = scratch.utxo_change_capacity();
+        let (changes, _undo, _totals) = build_block_changes(
+            &block,
+            1,
+            scratch.txids(),
+            scratch.same_block_spent(),
+            add_cap,
+            rem_cap,
+            &ResolvedUtxoView::empty(),
+            None,
+            MAX_SCRIPT_SIZE,
+        )?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x72; 32]))?;
@@ -4558,8 +4434,18 @@ mod consensus_rule_tests {
         let txid = coinbase.txid();
         let block = block_with_transaction(coinbase);
         let scratch = ApplyScratch::new(&block, false);
-        let (changes, _undo, _totals) =
-            build_utxo_changes(&block, 1, &scratch, &ResolvedUtxoView::empty(), None)?;
+        let (add_cap, rem_cap) = scratch.utxo_change_capacity();
+        let (changes, _undo, _totals) = build_block_changes(
+            &block,
+            1,
+            scratch.txids(),
+            scratch.same_block_spent(),
+            add_cap,
+            rem_cap,
+            &ResolvedUtxoView::empty(),
+            None,
+            MAX_SCRIPT_SIZE,
+        )?;
         let utxo = UtxoSet::new();
 
         utxo.commit_borrowed_block(&changes, &Hash256::from_le_bytes(&[0x73; 32]))?;
@@ -4588,7 +4474,18 @@ mod consensus_rule_tests {
         // resolved view that spend came from. An empty view would now be
         // rejected, which is the point of UndoPrevoutMissing.
         let resolved = ResolvedUtxoView::resolve(utxo.as_ref(), &block, &tx_plan(&block));
-        let (changes, undo, _totals) = build_utxo_changes(&block, 2, &scratch, &resolved, None)?;
+        let (add_cap, rem_cap) = scratch.utxo_change_capacity();
+        let (changes, undo, _totals) = build_block_changes(
+            &block,
+            2,
+            scratch.txids(),
+            scratch.same_block_spent(),
+            add_cap,
+            rem_cap,
+            &resolved,
+            None,
+            MAX_SCRIPT_SIZE,
+        )?;
         assert_eq!(
             undo.restores().len(),
             1,
@@ -6377,12 +6274,17 @@ mod consensus_rule_tests {
         utxo.commit_block(&seed, &Hash256::from_le_bytes(&[0x30; 32]))?;
 
         let scratch = ApplyScratch::new(&block, false);
-        let (_changes, undo, _totals) = build_utxo_changes(
+        let (add_cap, rem_cap) = scratch.utxo_change_capacity();
+        let (_changes, undo, _totals) = build_block_changes(
             &block,
             91_842,
-            &scratch,
+            scratch.txids(),
+            scratch.same_block_spent(),
+            add_cap,
+            rem_cap,
             &ResolvedUtxoView::empty(),
             Some(utxo.as_ref()),
+            MAX_SCRIPT_SIZE,
         )?;
 
         assert!(
