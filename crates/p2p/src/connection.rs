@@ -575,10 +575,11 @@ mod tests {
         // admissible into a queue whose byte cap equals the reserve. If the
         // reserve did not match the authoritative constant, a real 4 MB
         // block would be silently refused or the queue would over-reserve.
-        let worst_case_wire = crate::wire::HEADER_LEN
-            + usize::try_from(crate::MAX_BLOCK_SERIALIZED_SIZE).unwrap();
+        let worst_case_wire =
+            crate::wire::HEADER_LEN + usize::try_from(crate::MAX_BLOCK_SERIALIZED_SIZE).unwrap();
         assert_eq!(
-            super::BLOCK_PRODUCTION_RESERVE_BYTES, worst_case_wire,
+            super::BLOCK_PRODUCTION_RESERVE_BYTES,
+            worst_case_wire,
             "reserve must equal header + authoritative max block size"
         );
         let budget = super::OutboundBudget::with_block_reserve(

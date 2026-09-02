@@ -36,8 +36,9 @@ pub use inbound::{InboundBlock, InboundHeaders};
 pub use listener::spawn_outbound_connection;
 pub use peer::{
     AddNodeError, AddedNodeInfo, BanError, ConnectedPeer, ConnectionCounts, DnsResolver,
-    MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, NetworkControls, NodeAddress, Peer, PeerManager,
-    PeerState, SystemDnsResolver, TrafficTotals, UPLOAD_TIMEFRAME_SECS, UploadTarget,
+    MAX_BLOCK_SERIALIZED_SIZE, MAX_BLOCK_SERIALIZED_SIZE_USIZE, NetworkActivity, NetworkControls,
+    NodeAddress, Peer, PeerManager, PeerState, SystemDnsResolver, TrafficTotals,
+    UPLOAD_TIMEFRAME_SECS, UploadTarget,
 };
 pub use peer_info::PeerInfo;
 pub use subnet::{BannedSubnet, IpSubnet, SubnetParseError};
