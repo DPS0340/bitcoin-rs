@@ -34,8 +34,7 @@ real time, and what was concluded. Five areas, `architecture-patterns`,
 `best-practices`, `logic-errors`, `performance`, and `performance-issues`.
 
 Search it before debugging a recurring problem or designing in an area someone
-has already touched. Several entries record approaches that were measured and
-rejected, which is the cheapest kind of result to reuse.
+has already touched.
 
 
 ## Known gaps
