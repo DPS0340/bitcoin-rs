@@ -5,7 +5,7 @@
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use bitcoin_rs_primitives::encode::double_sha256;
@@ -15,7 +15,16 @@ use bitcoin_rs_primitives::{
 use bitcoin_rs_script::script::push_int;
 // seam: getdata inventory items stay rust-bitcoin at the p2p wire boundary.
 use bitcoin::hashes::Hash as _;
+use bitcoin::secp256k1::{All, Message as SecpMessage, Secp256k1, SecretKey};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+use bitcoin::{
+    Amount, OutPoint as OracleOutPoint, ScriptBuf as OracleScriptBuf, Sequence as OracleSequence,
+    Transaction as OracleTx, TxIn as OracleTxIn, TxOut as OracleTxOut, Txid as OracleTxid,
+    Witness, absolute, opcodes, script::Builder as OracleBuilder, transaction,
+};
 use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin_rs_primitives::deserialize;
+use parking_lot::Mutex as ParkingMutex;
 use bitcoin_rs_chain::{BlockTree, NodeStatus, TipSnapshot};
 use bitcoin_rs_index::BlockSource as _;
 use bitcoin_rs_mempool::{Mempool, MempoolLimits};
@@ -125,6 +134,53 @@ fn sync_pipeline_apply_proxy(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+}
+
+/// Signed-spend proxy benchmark: the same 117-block skeleton as
+/// `spend_heavy_proxy_blocks`, but every spend input carries a real ECDSA
+/// signature verified by the script engine. Spend classes are P2PKH (legacy
+/// ECDSA), P2WPKH (BIP143), and P2WSH 2-of-3 multisig (BIP143). Signatures are
+/// produced with rust-bitcoin 0.32's `SighashCache` + secp256k1 as an
+/// independent oracle, then consensus-serialized and decoded into native
+/// `Tx` (the `to_native` pattern from `crates/script/tests/proptest.rs`).
+///
+/// Criterion 0.8 cannot report p95/p99/max, so a manual timed sample loop
+/// collects per-sweep durations and prints the percentile table; Criterion
+/// keeps the headline median for comparability with the existing docs.
+fn sync_pipeline_apply_signed_spend_proxy(c: &mut Criterion) {
+    let blocks = signed_spend_proxy_blocks();
+    print_signed_spend_proxy_summary(&blocks);
+
+    const SIGNED_SPEND_SAMPLES: usize = 30;
+    let samples: ParkingMutex<Vec<Duration>> = ParkingMutex::new(Vec::with_capacity(
+        SIGNED_SPEND_SAMPLES.saturating_mul(4),
+    ));
+
+    c.bench_function("sync_pipeline_apply_signed_spend_proxy", |b| {
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let (_dir, state) = open_regtest_state();
+                let sweep_start = Instant::now();
+                for block in &blocks {
+                    state
+                        .apply_block(black_box(block))
+                        .unwrap_or_else(|error| panic!("signed-spend apply failed: {error}"));
+                }
+                samples.lock().push(sweep_start.elapsed());
+                black_box(
+                    state
+                        .applied_tip()
+                        .load_full()
+                        .unwrap_or_else(|| panic!("signed-spend proxy did not publish a tip"))
+                        .height,
+                );
+            }
+            start.elapsed()
+        })
+    });
+
+    print_percentiles("signed_spend_proxy", &samples.lock());
 }
 
 fn deterministic_initial_sync_proxy(c: &mut Criterion) {
@@ -1336,9 +1392,527 @@ fn pow_met(bits: u32, hash: &BlockHash) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Signed-spend corpus: real ECDSA signatures verified by the script engine.
+// ---------------------------------------------------------------------------
+
+/// BIP141 witness commitment prefix: `OP_RETURN OP_PUSH36 BIP141_COMMITMENT_TAG`.
+const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+/// BIP141 reserved witness value for the coinbase input.
+const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
+
+/// Signing keys for the three spend classes, all derived deterministically.
+struct SigningKeys {
+    secp: Secp256k1<All>,
+    /// P2PKH: one key per funded output.
+    p2pkh: Vec<bitcoin::PublicKey>,
+    /// P2WPKH: one compressed key per funded output.
+    p2wpkh: Vec<bitcoin::PublicKey>,
+    /// P2WSH 2-of-3: three keys shared across all P2WSH outputs.
+    p2wsh: Vec<bitcoin::PublicKey>,
+}
+
+impl SigningKeys {
+    fn new() -> Self {
+        let secp = Secp256k1::new();
+        let p2pkh = (0..SPEND_PROXY_FANOUT)
+            .map(|i| secret_pubkey(&secp, 0xA0 + i as u8))
+            .collect();
+        let p2wpkh = (0..SPEND_PROXY_FANOUT)
+            .map(|i| secret_pubkey(&secp, 0xB0 + i as u8))
+            .collect();
+        let p2wsh = (0..3).map(|i| secret_pubkey(&secp, 0xC0 + i)).collect();
+        Self {
+            secp,
+            p2pkh,
+            p2wpkh,
+            p2wsh,
+        }
+    }
+}
+
+fn secret_pubkey(secp: &Secp256k1<All>, byte: u8) -> bitcoin::PublicKey {
+    let secret = SecretKey::from_slice(&[byte; 32])
+        .unwrap_or_else(|e| panic!("invalid secret key: {e}"));
+    bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(secp, &secret))
+}
+
+fn secret_key(byte: u8) -> SecretKey {
+    SecretKey::from_slice(&[byte; 32]).unwrap_or_else(|e| panic!("invalid secret key: {e}"))
+}
+
+/// Builds the 117-block signed-spend corpus.
+///
+/// Heights 1..100: fanout coinbase blocks funding 64 outputs split across P2PKH,
+/// P2WPKH, and P2WSH script classes. Heights 101..116: spend blocks that consume
+/// the coinbase outputs from 100 blocks back, each carrying a real ECDSA signature.
+/// Witness-bearing blocks carry a BIP141 commitment output on the coinbase.
+fn signed_spend_proxy_blocks() -> Vec<Block> {
+    let keys = SigningKeys::new();
+    let spend_start = SPEND_PROXY_COINBASE_MATURITY.saturating_add(1);
+    let spend_end = spend_start
+        .saturating_add(SPEND_PROXY_SPEND_BLOCKS)
+        .saturating_sub(1);
+    let capacity = usize::try_from(spend_end.saturating_add(1))
+        .unwrap_or_else(|e| panic!("invalid spend capacity: {e}"));
+    let genesis = Network::Regtest.genesis_block();
+    let mut blocks = Vec::with_capacity(capacity);
+    blocks.push(genesis.clone());
+    let mut parent = genesis;
+    for height in 1..=spend_end {
+        let block = if height < spend_start {
+            child_signed_fanout_coinbase_block(&parent, height, &keys)
+        } else {
+            let source_height = height.saturating_sub(SPEND_PROXY_COINBASE_MATURITY);
+            let source_index = usize::try_from(source_height)
+                .unwrap_or_else(|e| panic!("invalid source height: {e}"));
+            child_signed_spend_fanout_block(&parent, height, &blocks[source_index], &keys)
+        };
+        parent = block.clone();
+        blocks.push(block);
+    }
+    blocks
+}
+
+/// Coinbase block funding 64 outputs across P2PKH, P2WPKH, and P2WSH.
+///
+/// The first 22 outputs are P2PKH (legacy), the next 22 are P2WPKH (segwit v0),
+/// and the remaining 20 are P2WSH 2-of-3 multisig. Because this block carries
+/// witness-paying outputs, the coinbase includes a BIP141 witness commitment
+/// output and a 32-byte reserved witness element.
+fn child_signed_fanout_coinbase_block(parent: &Block, height: u32, keys: &SigningKeys) -> Block {
+    let coinbase = signed_fanout_coinbase_transaction(height, keys);
+    let mut block = Block {
+        header: Header {
+            version: 1,
+            prev_blockhash: parent.block_hash(),
+            merkle_root: Hash256::default(),
+            time: parent.header.time.saturating_add(1),
+            bits: 0x207f_ffff,
+            nonce: 0,
+        },
+        txs: vec![coinbase],
+    };
+    block.header.merkle_root = block_merkle_root(&block);
+    mine_block_to_declared_target(&mut block);
+    block
+}
+
+fn signed_fanout_coinbase_transaction(height: u32, keys: &SigningKeys) -> Tx {
+    let mut outputs = Vec::with_capacity(SPEND_PROXY_FANOUT as usize + 1);
+    // P2PKH outputs (indices 0..22).
+    for i in 0..22u32 {
+        let pkh = keys.p2pkh[usize::try_from(i).unwrap()].pubkey_hash();
+        let script = OracleScriptBuf::new_p2pkh(&pkh);
+        outputs.push(TxOut {
+            value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+            script_pubkey: script.as_bytes().to_vec(),
+        });
+    }
+    // P2WPKH outputs (indices 22..44).
+    for i in 0..22u32 {
+    let pkh = keys.p2wpkh[usize::try_from(i).unwrap()].wpubkey_hash().unwrap();
+        let script = OracleScriptBuf::new_p2wpkh(&pkh);
+        outputs.push(TxOut {
+            value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+            script_pubkey: script.as_bytes().to_vec(),
+        });
+    }
+    // P2WSH 2-of-3 outputs (indices 44..64).
+    for i in 0..20u32 {
+        let redeem = p2wsh_2of3_redeem_script(keys, i);
+        let script_hash = redeem.wscript_hash();
+        let script = OracleScriptBuf::new_p2wsh(&script_hash);
+        outputs.push(TxOut {
+            value: SPEND_PROXY_COINBASE_OUTPUT_VALUE,
+            script_pubkey: script.as_bytes().to_vec(),
+        });
+    }
+    // BIP141 witness commitment output.
+    let commitment = witness_commitment_for_coinbase(&outputs);
+    outputs.push(TxOut {
+        value: 0,
+        script_pubkey: witness_commitment_script_pubkey(&commitment),
+    });
+
+    Tx {
+        version: 2,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(Txid::default(), u32::MAX),
+            script_sig: coinbase_script_sig(height),
+            sequence: u32::MAX,
+            witness: vec![WITNESS_RESERVED_VALUE.to_vec()],
+        }],
+        outputs,
+    }
+}
+
+/// P2WSH 2-of-3 multisig redeem script: `OP_2 PK1 PK2 PK3 OP_3 OP_CHECKMULTISIG`.
+fn p2wsh_2of3_redeem_script(keys: &SigningKeys, _index: u32) -> OracleScriptBuf {
+    OracleBuilder::new()
+        .push_int(2)
+        .push_key(&keys.p2wsh[0])
+        .push_key(&keys.p2wsh[1])
+        .push_key(&keys.p2wsh[2])
+        .push_int(3)
+        .push_opcode(opcodes::all::OP_CHECKMULTISIG)
+        .into_script()
+}
+
+/// Computes the BIP141 witness commitment for a coinbase that has no witness
+/// transactions besides itself. The witness merkle root uses all-zero for the
+/// coinbase leaf and the wtxid of every other transaction — but the coinbase is
+/// the only transaction in these blocks, so the root is all-zero and the
+/// commitment is `SHA256d(zeros || reserved)`.
+fn witness_commitment_for_coinbase(_outputs: &[TxOut]) -> Hash256 {
+    // Single-tx block: witness merkle root = [0; 32].
+    let root = [0u8; 32];
+    let mut buffer = [0u8; 64];
+    buffer[..32].copy_from_slice(&root);
+    buffer[32..].copy_from_slice(&WITNESS_RESERVED_VALUE);
+    double_sha256(&buffer)
+}
+
+/// Builds the BIP141 witness commitment scriptPubKey: `6a24aa21a9ed || commitment`.
+fn witness_commitment_script_pubkey(commitment: &Hash256) -> Vec<u8> {
+    let mut script = Vec::with_capacity(38);
+    script.extend_from_slice(&WITNESS_COMMITMENT_PREFIX);
+    script.extend_from_slice(commitment.as_byte_array());
+    script
+}
+
+/// Spend block consuming 64 coinbase outputs from 100 blocks back, each with a
+/// real signature. The spend transactions are built as rust-bitcoin oracle
+/// transactions, signed, then converted to native `Tx` via consensus
+/// serialization.
+fn child_signed_spend_fanout_block(
+    parent: &Block,
+    height: u32,
+    source_block: &Block,
+    keys: &SigningKeys,
+) -> Block {
+    let source_coinbase = source_block
+        .txs
+        .first()
+        .unwrap_or_else(|| panic!("signed-spend source block missing coinbase"));
+    let source_txid = source_coinbase.txid();
+    let mut txs = Vec::with_capacity(SPEND_PROXY_FANOUT as usize + 1);
+    // Coinbase for this spend block (witness-bearing, with commitment).
+    txs.push(signed_fanout_coinbase_transaction(height, keys));
+    // 64 spend transactions, one per funded output.
+    for vout in 0..SPEND_PROXY_FANOUT {
+        let prevout_value = SPEND_PROXY_COINBASE_OUTPUT_VALUE;
+        let spend_tx = build_signed_spend_tx(source_txid, vout, prevout_value, keys);
+        txs.push(spend_tx);
+    }
+    let mut block = Block {
+        header: Header {
+            version: 1,
+            prev_blockhash: parent.block_hash(),
+            merkle_root: Hash256::default(),
+            time: parent.header.time.saturating_add(1),
+            bits: 0x207f_ffff,
+            nonce: 0,
+        },
+        txs,
+    };
+    block.header.merkle_root = block_merkle_root(&block);
+    // Recompute the coinbase witness commitment now that the full tx set is known.
+    let commitment = block_witness_commitment(&block.txs);
+    let coinbase = &mut block.txs[0];
+    // Replace the placeholder commitment output (last output) with the real one.
+    let last = coinbase
+        .outputs
+        .last_mut()
+        .unwrap_or_else(|| panic!("coinbase missing commitment output"));
+    last.script_pubkey = witness_commitment_script_pubkey(&commitment);
+    // Recompute merkle root after updating the commitment.
+    block.header.merkle_root = block_merkle_root(&block);
+    mine_block_to_declared_target(&mut block);
+    block
+}
+
+/// Computes the BIP141 witness commitment for a block's transaction set.
+/// Coinbase leaf is all-zero; every other leaf is the transaction's wtxid.
+fn block_witness_commitment(txs: &[Tx]) -> Hash256 {
+    let mut leaves: Vec<[u8; 32]> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            if i == 0 {
+                [0u8; 32]
+            } else {
+                *tx.wtxid().as_bytes()
+            }
+        })
+        .collect();
+    let root = merkle_root_bytes(&mut leaves);
+    let mut buffer = [0u8; 64];
+    buffer[..32].copy_from_slice(&root);
+    buffer[32..].copy_from_slice(&WITNESS_RESERVED_VALUE);
+    double_sha256(&buffer)
+}
+
+/// Pairwise double-SHA256 merkle root with last-leaf duplication on odd levels.
+fn merkle_root_bytes(leaves: &mut Vec<[u8; 32]>) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    while leaves.len() > 1 {
+        let len = leaves.len();
+        let mut next = Vec::with_capacity(len.div_ceil(2));
+        for pos in 0..len.div_ceil(2) {
+            let left = leaves[2 * pos];
+            let right = leaves[(2 * pos + 1).min(len - 1)];
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(&left);
+            pair[32..].copy_from_slice(&right);
+            next.push(double_sha256(&pair).to_le_bytes());
+        }
+        *leaves = next;
+    }
+    leaves[0]
+}
+
+/// Builds and signs a single spend transaction for output `vout` of
+/// `source_txid`. The spend class is determined by the output index:
+/// 0..22 = P2PKH, 22..44 = P2WPKH, 44..64 = P2WSH 2-of-3.
+fn build_signed_spend_tx(
+    source_txid: Txid,
+    vout: u32,
+    prevout_value: u64,
+    keys: &SigningKeys,
+) -> Tx {
+    let oracle_txid = OracleTxid::from_byte_array(*source_txid.as_bytes());
+    if vout < 22 {
+        build_signed_p2pkh_spend(oracle_txid, vout, prevout_value, keys, usize::try_from(vout).unwrap())
+    } else if vout < 44 {
+        build_signed_p2wpkh_spend(oracle_txid, vout, prevout_value, keys, usize::try_from(vout - 22).unwrap())
+    } else {
+        build_signed_p2wsh_spend(oracle_txid, vout, prevout_value, keys)
+    }
+}
+
+/// P2PKH spend: scriptSig = `<sig> <pubkey>`, signed with legacy sighash.
+fn build_signed_p2pkh_spend(
+    source_txid: OracleTxid,
+    vout: u32,
+    _prevout_value: u64,
+    keys: &SigningKeys,
+    key_index: usize,
+) -> Tx {
+    let pubkey = keys.p2pkh[key_index];
+    let pkh = pubkey.pubkey_hash();
+    let script_pubkey = OracleScriptBuf::new_p2pkh(&pkh);
+    let mut tx = OracleTx {
+        version: transaction::Version(2),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![OracleTxIn {
+            previous_output: OracleOutPoint {
+                txid: source_txid,
+                vout,
+            },
+            script_sig: OracleScriptBuf::new(),
+            sequence: OracleSequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![OracleTxOut {
+            value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
+            script_pubkey: OracleBuilder::new().push_int(1).into_script(),
+        }],
+    };
+    let cache = SighashCache::new(&tx);
+    let sighash = cache
+        .legacy_signature_hash(0, &script_pubkey, EcdsaSighashType::All as u32)
+        .unwrap_or_else(|e| panic!("p2pkh sighash: {e}"));
+    let secret = secret_key(0xA0 + key_index as u8);
+    let message = SecpMessage::from_digest(*sighash.as_byte_array());
+    let mut sig = keys.secp.sign_ecdsa(&message, &secret);
+    sig.normalize_s();
+    let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    let mut script_sig = Vec::with_capacity(sig_bytes.len() + 35);
+    script_sig.push(sig_bytes.len() as u8);
+    script_sig.extend_from_slice(&sig_bytes);
+    let pubkey_bytes = pubkey.inner.serialize();
+    script_sig.push(pubkey_bytes.len() as u8);
+    script_sig.extend_from_slice(&pubkey_bytes);
+    tx.input[0].script_sig = OracleScriptBuf::from_bytes(script_sig);
+    to_native_tx(&tx)
+}
+
+/// P2WPKH spend: empty scriptSig, witness = `[sig, pubkey]`, signed with BIP143.
+fn build_signed_p2wpkh_spend(
+    source_txid: OracleTxid,
+    vout: u32,
+    prevout_value: u64,
+    keys: &SigningKeys,
+    key_index: usize,
+) -> Tx {
+    let pubkey = keys.p2wpkh[key_index];
+    let wpkh = pubkey.wpubkey_hash().unwrap();
+    let script_pubkey = OracleScriptBuf::new_p2wpkh(&wpkh);
+    let mut tx = OracleTx {
+        version: transaction::Version(2),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![OracleTxIn {
+            previous_output: OracleOutPoint {
+                txid: source_txid,
+                vout,
+            },
+            script_sig: OracleScriptBuf::new(),
+            sequence: OracleSequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![OracleTxOut {
+            value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
+            script_pubkey: OracleBuilder::new().push_int(1).into_script(),
+        }],
+    };
+    let mut cache = SighashCache::new(&tx);
+    let sighash = cache
+        .p2wpkh_signature_hash(
+            0,
+            &script_pubkey,
+            Amount::from_sat(prevout_value),
+            EcdsaSighashType::All,
+        )
+        .unwrap_or_else(|e| panic!("p2wpkh sighash: {e}"));
+    let secret = secret_key(0xB0 + key_index as u8);
+    let message = SecpMessage::from_digest(*sighash.as_byte_array());
+    let mut sig = keys.secp.sign_ecdsa(&message, &secret);
+    sig.normalize_s();
+    let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+    sig_bytes.push(EcdsaSighashType::All as u8);
+    tx.input[0].witness = Witness::from_slice(&[
+        sig_bytes,
+        pubkey.inner.serialize().to_vec(),
+    ]);
+    to_native_tx(&tx)
+}
+
+/// P2WSH 2-of-3 multisig spend: witness = `[empty_dummy, sig1, sig2, redeem_script]`,
+/// signed with BIP143 using the redeem script as the witness script.
+fn build_signed_p2wsh_spend(
+    source_txid: OracleTxid,
+    vout: u32,
+    prevout_value: u64,
+    keys: &SigningKeys,
+) -> Tx {
+    let redeem = p2wsh_2of3_redeem_script(keys, 0);
+    let script_hash = redeem.wscript_hash();
+    let _script_pubkey = OracleScriptBuf::new_p2wsh(&script_hash);
+    let mut tx = OracleTx {
+        version: transaction::Version(2),
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![OracleTxIn {
+            previous_output: OracleOutPoint {
+                txid: source_txid,
+                vout,
+            },
+            script_sig: OracleScriptBuf::new(),
+            sequence: OracleSequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![OracleTxOut {
+            value: Amount::from_sat(SPEND_PROXY_SPEND_OUTPUT_VALUE),
+            script_pubkey: OracleBuilder::new().push_int(1).into_script(),
+        }],
+    };
+    let mut cache = SighashCache::new(&tx);
+    let sighash = cache
+        .p2wsh_signature_hash(
+            0,
+            &redeem,
+            Amount::from_sat(prevout_value),
+            EcdsaSighashType::All,
+        )
+        .unwrap_or_else(|e| panic!("p2wsh sighash: {e}"));
+    // Sign with the first two keys.
+    let mut sigs = Vec::with_capacity(2);
+    for &key_byte in &[0xC0u8, 0xC1] {
+        let secret = secret_key(key_byte);
+        let message = SecpMessage::from_digest(*sighash.as_byte_array());
+        let mut sig = keys.secp.sign_ecdsa(&message, &secret);
+        sig.normalize_s();
+        let mut sig_bytes = sig.serialize_der().as_ref().to_vec();
+        sig_bytes.push(EcdsaSighashType::All as u8);
+        sigs.push(sig_bytes);
+    }
+    // BIP147: empty dummy element before the signatures.
+    let witness_items: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        sigs[0].clone(),
+        sigs[1].clone(),
+        redeem.as_bytes().to_vec(),
+    ];
+    tx.input[0].witness = Witness::from_slice(&witness_items);
+    to_native_tx(&tx)
+}
+
+/// Consensus-bytes round-trip from rust-bitcoin oracle types to native `Tx`.
+fn to_native_tx(tx: &OracleTx) -> Tx {
+    let bytes = bitcoin::consensus::serialize(tx);
+    deserialize(&bytes)
+        .unwrap_or_else(|e| panic!("oracle transaction must decode natively: {e}"))
+}
+
+fn print_signed_spend_proxy_summary(blocks: &[Block]) {
+    let (_dir, state) = open_regtest_state();
+    let started = Instant::now();
+    for block in blocks {
+        state
+            .apply_block(block)
+            .unwrap_or_else(|e| panic!("signed-spend summary apply failed: {e}"));
+    }
+    let elapsed = started.elapsed();
+    let applied_height = state
+        .applied_tip()
+        .load_full()
+        .unwrap_or_else(|| panic!("signed-spend summary did not publish a tip"))
+        .height;
+    let transaction_count: usize = blocks.iter().map(|b| b.txs.len()).sum();
+    println!(
+        "sync_pipeline_apply_signed_spend_proxy blocks={} txs={transaction_count} elapsed={elapsed:?}",
+        applied_height.saturating_add(1),
+    );
+}
+
+/// Prints p50/p95/p99/max from the collected per-sweep durations.
+fn print_percentiles(label: &str, samples: &[Duration]) {
+    if samples.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<Duration> = samples.to_vec();
+    sorted.sort();
+    let n = sorted.len();
+    let percentile = |p: f64| -> Duration {
+        let rank = p * (n as f64 - 1.0) / 100.0;
+        let lower = rank.floor() as usize;
+        let upper = rank.ceil() as usize;
+        if lower == upper {
+            sorted[lower]
+        } else {
+            let frac = rank - lower as f64;
+            let lo = sorted[lower].as_nanos() as f64;
+            let hi = sorted[upper].as_nanos() as f64;
+            Duration::from_nanos((lo + (hi - lo) * frac) as u64)
+        }
+    };
+    println!(
+        "{label} samples={n} p50={:?} p95={:?} p99={:?} max={:?}",
+        percentile(50.0),
+        percentile(95.0),
+        percentile(99.0),
+        sorted[n - 1],
+    );
+}
+
 criterion_group!(
     benches,
     sync_pipeline_apply_proxy,
+    sync_pipeline_apply_signed_spend_proxy,
     deterministic_initial_sync_proxy,
     block_source_height_lookup
 );
