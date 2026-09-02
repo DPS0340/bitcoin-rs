@@ -789,3 +789,156 @@ fn known_non_active_submit_is_duplicate_inconclusive() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Acceptance tests: mempool-sequence wake remainder (ING-R5)
+// ---------------------------------------------------------------------------
+//
+// `publish_generation_from` builds the generation key from `applied_tip` plus
+// a caller-supplied sequence and never takes the mempool read lock. The
+// mempool observer routes through it to avoid a reentrant pool read that can
+// deadlock under the gateway's publish mutex. Long-poll waiters must return
+// immediately on that wake, not wait LONG_POLL_SLICE (1 s).
+
+/// Two threads looping `publish_generation` (tip path) and
+/// `publish_generation_from` (mempool path) must not deadlock within a 200 ms
+/// watchdog.
+#[test]
+fn concurrent_publish_generation_paths_do_not_deadlock() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = Arc::new(coordinator(&state));
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mining_tip = Arc::clone(&mining);
+    let stop_tip = Arc::clone(&stop);
+    let tip_thread = thread::spawn(move || {
+        while !stop_tip.load(Ordering::Relaxed) {
+            mining_tip.publish_generation();
+        }
+    });
+
+    let mining_seq = Arc::clone(&mining);
+    let stop_seq = Arc::clone(&stop);
+    let seq_thread = thread::spawn(move || {
+        let mut seq = 1_u64;
+        while !stop_seq.load(Ordering::Relaxed) {
+            mining_seq.publish_generation_from(seq);
+            seq = seq.wrapping_add(1);
+        }
+    });
+
+    // 200 ms watchdog — if either thread is stuck, the joins below time out.
+    thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::Relaxed);
+
+    tip_thread
+        .join()
+        .unwrap_or_else(|_| panic!("tip publish_generation thread deadlocked"));
+    seq_thread
+        .join()
+        .unwrap_or_else(|_| panic!("sequence publish_generation_from thread deadlocked"));
+    Ok(())
+}
+
+/// `publish_generation_from` must not take the mempool read lock: holding the
+/// pool write lock and calling it must return immediately, not deadlock.
+#[test]
+fn publish_generation_from_does_not_take_mempool_lock() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+    let mining = coordinator(&state);
+
+    // Hold the mempool write lock for the duration of the call — a reentrant
+    // read would deadlock (parking_lot RwLock is not reentrant).
+    let mempool = state.mempool();
+    let _write_guard = mempool.write();
+
+    let (done_tx, done_rx) = bounded::<()>(1);
+    let handle = thread::spawn(move || {
+        mining.publish_generation_from(1);
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_millis(200))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "publish_generation_from deadlocked under the mempool write lock \
+                 — it must not take the mempool read lock"
+            )
+        })?;
+    handle
+        .join()
+        .unwrap_or_else(|_| panic!("publish_generation_from thread panicked"));
+    Ok(())
+}
+
+/// A long-poll waiter must return in well under 1 s after a mempool-sequence
+/// wake, even when `mempool_update_wait` is non-zero. The waiter returns as
+/// soon as the published generation key differs from the waited key — no
+/// `LONG_POLL_SLICE` (1 s) recheck delay.
+#[test]
+fn long_poll_returns_quickly_on_mempool_sequence_wake() -> anyhow::Result<()> {
+    let state = open_regtest()?;
+    apply_genesis(&state)?;
+
+    // Non-zero cooldown: the old code would wait up to `mempool_update_wait`
+    // before returning on a mempool-only change. The fix returns immediately.
+    let mining = Arc::new(
+        MiningCoordinator::new(
+            state.config().network,
+            state.applied_tip(),
+            state.block_tree(),
+            state.mempool(),
+            state.apply_handles(),
+            Vec::new(),
+            state.shutdown(),
+        )
+        .with_mempool_update_wait(Duration::from_secs(10)),
+    );
+    mining.publish_generation();
+    let current = expect_template(mining.get_block_template(template_request(None))?);
+    let long_poll_id = CompactString::from(current.candidate.template_id.as_str());
+
+    let (started_tx, started_rx) = bounded::<()>(1);
+    let mining_wait = Arc::clone(&mining);
+    let waiter = thread::spawn(move || {
+        started_tx
+            .send(())
+            .unwrap_or_else(|error| panic!("start signal failed: {error}"));
+        mining_wait.get_block_template(template_request(Some(long_poll_id)))
+    });
+
+    started_rx.recv_timeout(Duration::from_secs(2))?;
+    thread::sleep(Duration::from_millis(50));
+
+    // Advance the mempool sequence and wake via the lock-free path.
+    advance_mempool_sequence(&state)?;
+    let seq = state.mempool().read().sequence_number();
+    mining.publish_generation_from(seq);
+
+    let wake_start = std::time::Instant::now();
+    let result = waiter
+        .join()
+        .unwrap_or_else(|_| panic!("mempool long-poll waiter panicked"))
+        .unwrap_or_else(|error| panic!("mempool long poll failed: {error}"));
+    let elapsed = wake_start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "long-poll waiter returned in {elapsed:?}, expected well under 1 s"
+    );
+    let template = expect_template(result);
+    assert_ne!(
+        template.candidate.mempool_sequence,
+        current.candidate.mempool_sequence
+    );
+    assert_eq!(
+        template.candidate.previous_block_hash,
+        current.candidate.previous_block_hash
+    );
+    assert_eq!(template.submit_old, Some(true));
+    Ok(())
+}

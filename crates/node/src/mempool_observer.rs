@@ -97,7 +97,13 @@ impl MempoolObserver for NodeMutationObserver {
         if let Some(sequence) = &self.sequence {
             sequence.on_mutation(result);
         }
-        self.mining_generation.publish_generation();
+        // The last change's sequence is the pool's current sequence after this
+        // mutation. Thread it directly so the coordinator never takes the
+        // mempool read lock from the observer path.
+        let wake_sequence = result
+            .sequence_of(result.changes.len().saturating_sub(1))
+            .unwrap_or(result.sequence_base);
+        self.mining_generation.publish_generation_from(wake_sequence);
     }
 }
 
@@ -295,7 +301,7 @@ mod tests {
     /// mutation that bypassed the gateway would satisfy neither assertion.
     #[test]
     fn node_mutation_observer_fans_out_to_sequence_and_mining_wake() {
-        use crate::mining::MiningGenerationSignal;
+        use crate::mining::{MiningGenerationSignal, MempoolSequenceWake};
         use bitcoin_rs_primitives::Block;
         use bitcoin_rs_rpc::context::{
             BlockTemplateRequest, BlockTemplateResult, MiningControl, MiningControlError,
@@ -304,6 +310,7 @@ mod tests {
 
         struct RecordingControl {
             published: Mutex<usize>,
+            published_from: Mutex<Vec<u64>>,
         }
 
         fn unavailable() -> MiningControlError {
@@ -337,6 +344,12 @@ mod tests {
             }
         }
 
+        impl MempoolSequenceWake for RecordingControl {
+            fn publish_generation_from(&self, sequence: u64) {
+                self.published_from.lock().push(sequence);
+            }
+        }
+
         let (publisher, bodies) = {
             let publisher = Arc::new(RecordingPublisher::default());
             (publisher.clone(), Arc::clone(&publisher))
@@ -344,9 +357,12 @@ mod tests {
         let signal = Arc::new(MiningGenerationSignal::new());
         let control = Arc::new(RecordingControl {
             published: Mutex::new(0),
+            published_from: Mutex::new(Vec::new()),
         });
         let control_dyn: Arc<dyn MiningControl> = control.clone();
+        let wake_dyn: Arc<dyn MempoolSequenceWake> = control.clone();
         signal.attach(&control_dyn);
+        signal.attach_sequence_wake(&wake_dyn);
 
         let sequence = MempoolSequenceObserver::new(publisher);
         let sequence: Arc<dyn MempoolObserver> = Arc::new(sequence);
@@ -366,9 +382,14 @@ mod tests {
             "the sequence leg publishes the admission's A frame"
         );
         assert_eq!(
+            *control.published_from.lock(),
+            vec![1],
+            "the mining leg wakes the coordinator with the mutation's sequence"
+        );
+        assert_eq!(
             *control.published.lock(),
-            1,
-            "the mining leg wakes the coordinator exactly once per committed mutation"
+            0,
+            "the lock-free path is used, not the publish_generation fallback"
         );
     }
 }
