@@ -33,7 +33,7 @@ Language and toolchain settings are locked centrally in `rust-toolchain.toml` an
 - `[dev-dependencies]` are exempt. They do not reach the shipped binary, so a version skew between two crates' test harnesses cannot produce a runtime conflict, and centralizing them buys nothing. Twelve member manifests declare `tempfile = "3"` directly under `[dev-dependencies]` and there is no workspace entry for it; that is intended, not drift.
 - Centralize a dev-dependency anyway when two crates must agree on a type that crosses between them in tests.
 - Do not add dependencies for functionality available in the Rust standard library or existing workspace crates.
-- Prohibited dependencies: `tokio`, `async-std`, or any async runtime. The node architecture uses a synchronous crossbeam-channel event loop (`PLAN.md`).
+- Prohibited dependencies: `tokio`, `async-std`, or any async runtime. The node architecture uses a synchronous crossbeam-channel event loop.
 
 ### 3.2 Major Version Bumps
 - Upgrading a workspace dependency to a new major version requires:
@@ -68,7 +68,7 @@ All crates in `bitcoin-rs` share a single workspace version managed by `[workspa
 ## 5. Anti-Shim Principle and Deprecation Policy
 
 ### 5.1 The Anti-Shim Principle
-`bitcoin-rs` operates on a strict **clean cutover** principle (`PLAN.md`). The project rejects:
+`bitcoin-rs` operates on a strict **clean cutover** principle. The project rejects:
 - Backward-compatibility shims.
 - Deprecated wrapper functions or type aliases.
 - Transitional configuration flags or legacy fallback paths.

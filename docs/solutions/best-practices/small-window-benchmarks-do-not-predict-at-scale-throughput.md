@@ -73,8 +73,6 @@ refresh.
    the posture in the artifact.
 Single-machine criterion trust (rebuild codegen drift, CLI baseline flags, allocator parity)
 is its own note: [criterion-bench-trust-rebuild-drift-baselines-allocator](criterion-bench-trust-rebuild-drift-baselines-allocator.md).
-Process hygiene for stale blockers is in
-[re-probe-stale-external-blockers-before-reasserting](re-probe-stale-external-blockers-before-reasserting.md).
 
 ## Why This Matters
 
@@ -106,7 +104,3 @@ entropy.
 - [multi-peer-block-download-requires-core-stalling-disconnect](../architecture-patterns/multi-peer-block-download-requires-core-stalling-disconnect.md)
   — the download-regime analysis this learning's live-IBD numbers confirm; its points 2(b)
   and 8 are refresh candidates contradicted/superseded by this measurement.
-- [script-verification-delegated-to-core-c-no-rust-headroom](../architecture-patterns/script-verification-delegated-to-core-c-no-rust-headroom.md)
-  — why script verification itself offers no headroom vs Core.
-- [utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path](../architecture-patterns/utxo-commit-borrowed-removal-win-is-off-the-coalescing-event-path.md)
-  — the intra-crate instance of the same bench-fidelity skepticism.

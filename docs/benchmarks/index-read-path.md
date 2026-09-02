@@ -393,8 +393,7 @@ On an x86 host *with* SHA-NI that 634 µs would fall by roughly 3-5x, taking the
 `before` arm to somewhere near 520 µs and the ratio at that fixture from ~490x
 to ~250x. Two things keep this from undermining the result: it is still two and
 a half orders of magnitude, and the project's own reference host is a **Xeon
-Gold 6138, which `processing-bound-sync-performance-evolution.md` records as
-having no SHA-NI** — the same scalar regime measured here.
+Gold 6138, which has no SHA-NI** — the same scalar regime measured here.
 
 **The file-I/O gap is closed.** An earlier revision of this section flagged that
 the harness served ranges from memory. It now uses a real `FlatFileBlockStore`,

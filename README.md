@@ -203,7 +203,6 @@ does not emit mempool `A`/`R` events. `docs/README.md` lists the rest.
 - [docs/getting-started.md](docs/getting-started.md) — clone to synced node
 - [docs/](docs/README.md) — the documentation index
 - [CONCEPTS.md](CONCEPTS.md) — project vocabulary
-- [PLAN.md](PLAN.md) — roadmap and the G1-G15 verification gates
 
 ## License
 
