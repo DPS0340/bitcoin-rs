@@ -898,10 +898,10 @@ mod tests {
     /// Wraps `txs` and its resolved prevouts in the parse-once view the node
     /// hands to verification, with identities computed once from the same
     /// transactions.
-    fn block_view_for<'a>(
-        txs: &'a [Tx],
+    fn block_view_for(
+        txs: &[Tx],
         resolved: Vec<Vec<Option<TxOut>>>,
-    ) -> crate::block_view::BlockView<'a> {
+    ) -> crate::block_view::BlockView<'_> {
         let mut view = crate::block_view::BlockView::new(txs, txs.iter().map(Tx::txid).collect());
         view.set_resolved(resolved);
         view

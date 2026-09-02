@@ -123,6 +123,11 @@ fn parse_core_asm(asm: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Maps a Core opcode name (with or without `OP_` prefix) to its byte value.
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat opcode-name table mirroring Core's script.h; splitting it by \
+              category would hide which names are covered"
+)]
 fn resolve_opcode(name: &str) -> Option<u8> {
     use bitcoin_rs_script::opcode::*;
     let bare = name.strip_prefix("OP_").unwrap_or(name);
@@ -242,7 +247,7 @@ fn resolve_opcode(name: &str) -> Option<u8> {
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(format!("odd length: {}", hex.len()));
     }
     (0..hex.len())
