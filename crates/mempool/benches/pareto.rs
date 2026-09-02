@@ -1,19 +1,8 @@
 //! Production-path mempool priority-index benchmark.
 //!
-//! Both arms run over one identical fixture in one process, so the before/after
-//! ratio comes from a single run and cannot be confounded by the rebuild and
-//! baseline drift recorded in
-//! CONCEPTS.md → *Paired-arm benchmark*.
-//!
-//! `before_sorted` is `SortedParetoFront`, the flat vector that did a linear
-//! `remove` and a full `sort_by` on every insert. `after_ordered` is
-//! `ParetoFront`, the ordered set that replaced it.
-//!
 //! `mempool_insert_entry` is the end-to-end path an attacker actually drives:
 //! `Mempool::insert_entry` calls `recompute_all_metadata`, which rebuilds the
-//! whole priority index for every accepted transaction. It is benchmarked at
-//! smaller sizes than the index arms because that outer rebuild is quadratic
-//! *independently* of the index — which is the point of measuring it separately.
+//! whole priority index for every accepted transaction.
 // PERF: Criterion emits public harness items whose docs are irrelevant here.
 #![allow(missing_docs)]
 // A fixture that fails to build has no meaningful degraded mode: a fill that
@@ -23,7 +12,7 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits, ParetoFront, SortedParetoFront};
+use bitcoin_rs_mempool::{Mempool, MempoolEntry, MempoolLimits};
 use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
 use criterion::{Criterion, criterion_group, criterion_main};
 

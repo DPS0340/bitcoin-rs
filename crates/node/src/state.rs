@@ -1204,41 +1204,7 @@ impl NodeState {
         };
         let checkpoint_load =
             crate::checkpoint::load_checkpoint_from_dir(&checkpoint_data_dir, checkpoint_config)?;
-        let g2_muhash_sampler = config
-            .g2_muhash_samples
-            .clone()
-            .map(|path| crate::g2_muhash::G2MuhashSampler::open(path, config.g2_muhash_tip_height))
-            .transpose()
-            .context("open G2 MuHash sample writer")?
-            .map(Arc::new);
-        let g14_utxo_commit_sampler = match (
-            config.g14_utxo_commit_samples.as_ref(),
-            config.g14_utxo_commit_ibd_start_height,
-            config.g14_utxo_commit_ibd_stop_height,
-            config.g14_utxo_commit_ibd_start_hash.as_ref(),
-            config.g14_utxo_commit_ibd_stop_hash.as_ref(),
-        ) {
-            (None, None, None, None, None) => None,
-            (
-                Some(path),
-                Some(start_height),
-                Some(stop_height),
-                Some(start_hash),
-                Some(stop_hash),
-            ) => Some(Arc::new(
-                crate::g14_utxo_commit::G14UtxoCommitSampler::open(
-                    path.clone(),
-                    start_height,
-                    stop_height,
-                    start_hash.clone(),
-                    stop_hash.clone(),
-                )
-                .context("open G14 UTXO commit sample writer")?,
-            )),
-            _ => {
-                bail!("g14_utxo_commit_samples requires complete G14 UTXO commit IBD window fields")
-            }
-        };
+
         // Divide the process cache budget across the persistent namespaces
         // that exist in this deployment. The filter share applies when the
         // blockfilterindex extension is enabled; a disabled namespace's
@@ -1720,7 +1686,6 @@ impl NodeState {
             utxo: Arc::clone(&self.utxo),
             coin_stats: Arc::clone(&self.coin_stats),
             chain_tx_count: Arc::clone(&self.chain_tx_count),
-            g2_muhash_samples: self.config.g2_muhash_samples.is_some(),
             data_dir: self.data_dir.clone(),
             chain_events: Arc::clone(&self.chain_events),
             durable_tip_height: Arc::clone(&self.durable_tip_height),
@@ -3670,12 +3635,9 @@ mod tests {
     fn rolling_coinstats_resume_continues_through_next_block() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path().join("node-g2");
-        let samples = dir.path().join("g2.samples");
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = data_dir.clone();
         config.p2p_listen.clear();
-        config.g2_muhash_samples = Some(samples.clone());
-        config.g2_muhash_tip_height = Some(2);
         let state = NodeState::open(config, None)?;
         let genesis = bitcoin_rs_primitives::Network::Regtest.genesis_block();
         state.apply_block(&genesis)?;
@@ -3686,8 +3648,6 @@ mod tests {
         let mut reopen_config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         reopen_config.data_dir = data_dir;
         reopen_config.p2p_listen.clear();
-        reopen_config.g2_muhash_samples = Some(samples);
-        reopen_config.g2_muhash_tip_height = Some(2);
         let resumed = NodeState::open(reopen_config, None)?;
         assert_eq!(resumed.coin_stats().snapshot(), before);
         resumed.apply_block(&mined_regtest_child(genesis.block_hash())?)?;

@@ -39,7 +39,7 @@ pub use mutation::{
     AdmissionOrigin, MutationChange, MutationEnvelope, MutationOutcome, MutationResult, PeerToken,
     RemovalReason,
 };
-pub use pareto::{ParetoFront, SortedParetoFront};
+pub use pareto::ParetoFront;
 pub use policy::{MempoolLimits, MempoolPolicySnapshot, PolicyError};
 pub use pool::{
     Mempool, MempoolError, MempoolMiningSnapshot, MempoolStats, PrioritiseError, ScriptHash,

@@ -102,7 +102,7 @@ pub(crate) struct CheckpointPublisher {
     pub(crate) utxo: Arc<UtxoSet>,
     pub(crate) coin_stats: Arc<CoinStatsListener>,
     pub(crate) chain_tx_count: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) g2_muhash_samples: bool,
+
     pub(crate) data_dir: PathBuf,
     pub(crate) chain_events: Arc<ChainEventPublisher>,
     pub(crate) durable_tip_height: Arc<std::sync::atomic::AtomicU32>,
@@ -140,7 +140,6 @@ impl CheckpointPublisher {
             applied_tip.as_deref(),
             self.chain_tx_count
                 .load(std::sync::atomic::Ordering::Relaxed),
-            self.g2_muhash_samples,
         )?;
         // A2: Only after `CheckpointWrite::Published` and root fsync, write
         // the applied-tip witness for the same captured tip.

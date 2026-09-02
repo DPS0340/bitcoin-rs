@@ -2455,20 +2455,7 @@ fn apply_block_admitted<'b>(
         .record(utxo_commit_dur.as_secs_f64());
     utxo_commit_result.map_err(ApplyError::UtxoCommit)?;
 
-    if needs_g14_sample {
-        if let Some(sampler) = &handles.g14_utxo_commit_sampler {
-            if let Err(error) =
-                sampler.record(height, block_hash, block_bytes.len(), utxo_commit_dur)
-            {
-                metrics::counter!("node.apply_block.g14_utxo_commit_sample_errors").increment(1);
-                tracing::warn!(
-                    height,
-                    %error,
-                    "G14 UTXO commit sample emission failed; evidence file incomplete"
-                );
-            }
-        }
-    }
+
 
     // Everything past the UTXO commit publishes values prepared above and
     // cannot fail: the tip snapshot was resolved from the tree before the
@@ -2581,19 +2568,7 @@ fn apply_block_admitted<'b>(
             .zmq_publisher
             .publish_sequence(crate::zmq_publisher::SequenceEvent::Connected(tip.hash));
     }
-    if let Some(sampler) = &handles.g2_muhash_sampler
-        && sampler.wants_height(height)
-    {
-        let snapshot = handles.coin_stats.snapshot();
-        if let Err(error) = sampler.record(&snapshot) {
-            metrics::counter!("node.apply_block.g2_muhash_sample_errors").increment(1);
-            tracing::warn!(
-                height,
-                %error,
-                "G2 MuHash sample emission failed after tip publication; evidence file incomplete"
-            );
-        }
-    }
+
     // Persist crash-recovery progress: the block body is on disk, so the
     // state at this height is reconstructable from the last checkpoint plus
     if let Some(meta_path) = &handles.recovery_meta_path {
