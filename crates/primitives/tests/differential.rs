@@ -317,7 +317,8 @@ fn legacy_sighash_matches_core_vectors() -> Result<()> {
         .expect("sighash.json is an array")
         .clone();
 
-    let mut checked = 0_usize;
+    let mut matched = 0_usize;
+    let mut skipped_codeseparator = 0_usize;
     for vector in vectors.iter().skip(1) {
         let tx_hex = vector.get(0).and_then(|v| v.as_str()).expect("tx hex");
         let script_hex = vector.get(1).and_then(|v| v.as_str()).unwrap_or("");
@@ -374,18 +375,24 @@ fn legacy_sighash_matches_core_vectors() -> Result<()> {
         // assumes the interpreter-level codesep strip; rust-bitcoin's oracle (and this
         // crate, whose interpreter strips codeseps before signing) hash the script
         // as-is, so those entries are compared oracle-to-oracle only.
-        if !script.contains(&0xab) {
-            assert_eq!(
-                native_hash.to_string_be(),
-                expected,
-                "vector {expected}: native sighash (oracle {oracle_hash})"
-            );
+        if script.contains(&0xab) {
+            skipped_codeseparator = skipped_codeseparator.saturating_add(1);
+            continue;
         }
-        checked += 1;
+        assert_eq!(
+            native_hash.to_string_be(),
+            expected,
+            "vector {expected}: native sighash (oracle {oracle_hash})"
+        );
+        matched = matched.saturating_add(1);
     }
-    assert!(
-        checked > 400,
-        "expected the full Core vector set, got {checked}"
+    assert_eq!(
+        matched, 290,
+        "Core sighash.json non-OP_CODESEPARATOR rows must keep matching; skipped {skipped_codeseparator}"
+    );
+    assert_eq!(
+        skipped_codeseparator, 210,
+        "OP_CODESEPARATOR skip count drifted; matched {matched}"
     );
     Ok(())
 }
