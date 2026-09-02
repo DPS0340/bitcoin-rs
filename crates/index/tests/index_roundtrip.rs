@@ -226,6 +226,7 @@ fn ingest_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 funding: 1,
                 spending: 0,
                 headers: 1,
+                live: 0,
             },
         ),
         (
@@ -235,6 +236,7 @@ fn ingest_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 funding: 3,
                 spending: 1,
                 headers: 1,
+                live: 0,
             },
         ),
         (
@@ -244,6 +246,7 @@ fn ingest_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
                 funding: 3_740,
                 spending: 5_192,
                 headers: 1,
+                live: 0,
             },
         ),
     ];
@@ -553,6 +556,7 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
             script_history: None,
+            script_live: None,
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -575,6 +579,7 @@ fn capability_commits_own_only_their_rows_and_watermarks() -> Result<(), Box<dyn
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
             script_history: Some(watermark),
+            script_live: None,
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -590,7 +595,7 @@ fn aligned_capabilities_share_one_atomic_commit() -> Result<(), Box<dyn std::err
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
     let hash = block_hash(&body);
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, hash, &body)?;
+    let block = writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, hash, &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -606,6 +611,7 @@ fn aligned_capabilities_share_one_atomic_commit() -> Result<(), Box<dyn std::err
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(watermark),
             script_history: Some(watermark),
+            script_live: None,
         }
     );
     Ok(())
@@ -618,7 +624,7 @@ fn script_index_reset_preserves_tx_lookup_and_shared_identity()
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
     let hash = block_hash(&body);
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, hash, &body)?;
+    let block = writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, hash, &body)?;
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,
@@ -633,6 +639,7 @@ fn script_index_reset_preserves_tx_lookup_and_shared_identity()
         bitcoin_rs_index::IndexWatermarks {
             tx_lookup: Some(IndexWatermark { height: 0, hash }),
             script_history: None,
+            script_live: None,
         }
     );
     assert_eq!(store.count(ColumnFamily::TxConfirmed), 1);
@@ -650,8 +657,10 @@ fn rollback_preserves_shared_ancestors_for_a_disabled_capability()
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body0 = read_fixture(0)?;
     let body1 = read_fixture(1)?;
-    let block0 = writer.prepare_block_for(IndexCapabilities::ALL, 0, block_hash(&body0), &body0)?;
-    let block1 = writer.prepare_block_for(IndexCapabilities::ALL, 1, block_hash(&body1), &body1)?;
+    let block0 =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, block_hash(&body0), &body0)?;
+    let block1 =
+        writer.prepare_block_for(IndexCapabilities::HISTORICAL, 1, block_hash(&body1), &body1)?;
     let watermark0 = block0.watermark();
     let mut batch = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
@@ -698,7 +707,7 @@ fn open_resumes_interrupted_capability_reset() -> Result<(), Box<dyn std::error:
     let mut writer = IndexWriter::open(Arc::clone(&store))?;
     let body = read_fixture(0)?;
     let hash = block_hash(&body);
-    let block = writer.prepare_block_for(IndexCapabilities::ALL, 0, hash, &body)?;
+    let block = writer.prepare_block_for(IndexCapabilities::HISTORICAL, 0, hash, &body)?;
     let mut prepared = PreparedBatch::new(PreparedBatchLimits {
         max_rows: 100,
         max_bytes: 1_000_000,

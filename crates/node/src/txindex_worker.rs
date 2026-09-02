@@ -231,6 +231,7 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         Ok(IndexWatermarks {
             tx_lookup: watermark,
             script_history: watermark,
+            script_live: None,
         })
     }
     fn prepare_block(
@@ -653,6 +654,7 @@ impl Worker {
             IndexCapabilities {
                 tx_lookup: tx == Some(selected) && needs_rollback(selected),
                 script_history: script_index == Some(selected) && needs_rollback(selected),
+                script_live: false,
             },
             selected,
         ))
@@ -698,6 +700,7 @@ impl Worker {
                 script_history: script_index.is_some_and(|watermark| {
                     needs_forward(watermark) && start_height(watermark) == selected_start
                 }),
+                script_live: false,
             },
             selected_watermark,
         ))

@@ -95,6 +95,7 @@ impl TxIndexSnapshot for QuerySnapshot {
                 ScriptHistoryWatermark::MatchTx => Some(self.watermark),
                 ScriptHistoryWatermark::Override(watermark) => watermark,
             },
+            IndexCapability::ScriptLive => None,
         })
     }
 

@@ -758,6 +758,10 @@ fn tx_index_capabilities(config: &Config) -> bitcoin_rs_index::IndexCapabilities
         // RPCs only for an explicit --txindex configuration.
         tx_lookup: config.txindex || config.script_index,
         script_history: config.script_index,
+        // The live view arrives with #225's mode configuration; nothing
+        // enables it yet, so existing deployments build exactly what they
+        // built before.
+        script_live: false,
     }
 }
 
