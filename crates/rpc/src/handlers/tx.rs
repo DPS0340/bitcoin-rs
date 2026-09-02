@@ -14,7 +14,9 @@ use bitcoin_rs_mempool::standardness::{
     AcceptanceRejectReason, PackageTxContext as MempoolPackageTxContext,
     evaluate_package_acceptance_all,
 };
-use bitcoin_rs_mempool::{AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome};
+use bitcoin_rs_mempool::{
+    AdmissionOrigin, AdmissionRequest, AdmitError, AdmitOutcome, MutationResult,
+};
 use bitcoin_rs_primitives::{
     Block as NativeBlock, Hash256, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     deserialize as native_deserialize,
@@ -425,6 +427,101 @@ pub(crate) fn verifytxoutproof(_ctx: &Arc<Context>, params: &Value) -> Result<Va
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     typed_to_sonic(&v31::VerifyTxOutProof(result))
+}
+
+/// Admits one transaction through the R4 generation-revalidated gateway.
+///
+/// This is the shared typed admission operation: `sendrawtransaction` and
+/// the embedded `Node::broadcast` both run it. Each attempt reads a fresh
+/// stable generation, captures the exact mempool sequence under a read
+/// guard, resolves UTXO data without the guard, then calls
+/// [`MempoolGateway::admit_transaction`] with both tokens. A chain change
+/// or mempool mutation between capture and commit returns a transient
+/// error and the loop retries with fresh facts.
+///
+/// An already-known transaction succeeds with an empty [`MutationResult`],
+/// matching Core's `sendrawtransaction` already-known success.
+///
+/// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap, matching
+/// `sendrawtransaction`'s `maxfeerate=0` behavior.
+///
+/// # Errors
+///
+/// Returns the policy rejection string (Core rejection strings) or the
+/// failure verbatim; nothing is inserted when this fails.
+pub(crate) fn admit_transaction(
+    ctx: &Context,
+    tx: Tx,
+    max_feerate_sat_per_kvb: Option<u64>,
+) -> Result<MutationResult, String> {
+    let txid = tx.txid();
+
+    // A tx already confirmed in the chain is always "known" — no
+    // generation or mempool guard needed.
+    if ctx.transactions.read().contains_key(&txid) {
+        return Ok(MutationResult::empty());
+    }
+
+    // Bounded retry: each attempt reads a fresh stable generation, captures
+    // the exact mempool sequence under a read guard, resolves UTXO data
+    // without the guard, then calls admit_transaction with both tokens. A
+    // chain change or mempool mutation between capture and commit returns a
+    // transient error and the loop retries with fresh facts — it never
+    // re-uses a captured even generation.
+    #[allow(clippy::items_after_statements)]
+    const MAX_ADMISSION_RETRIES: usize = 4;
+    for _ in 0..MAX_ADMISSION_RETRIES {
+        let Some(generation) = ctx.mempool.stable_generation() else {
+            continue; // chain change active or failed — retry
+        };
+
+        // Under one gateway read guard: already-known lookup, capture exact
+        // sequence, snapshot policy, resolve mempool-dependent context.
+        let (sequence, _policy, mempool_prevouts) = {
+            let pool = ctx.mempool.read();
+            if pool.contains_txid(&txid) {
+                return Ok(MutationResult::empty());
+            }
+            let sequence = pool.sequence_number();
+            let policy = pool.policy_snapshot();
+            let mempool_prevouts = resolve_mempool_prevouts(&pool, &tx);
+            (sequence, policy, mempool_prevouts)
+        };
+
+        // Without a pool guard: resolve UTXO data and combine with the
+        // mempool-dependent prevouts captured above.
+        let context = resolve_full_context(ctx, &tx, &mempool_prevouts);
+
+        let request = AdmissionRequest {
+            tx: Arc::new(tx.clone()),
+            context,
+            max_feerate_sat_per_kvb,
+            time: unix_time_secs(),
+            height: ctx.applied_height(),
+            origin: AdmissionOrigin::Rpc,
+            expected_generation: generation,
+            expected_sequence: sequence,
+        };
+
+        match ctx.mempool.admit_transaction(request) {
+            Ok(AdmitOutcome::Committed(result)) => {
+                let _ = ctx.add_transaction(tx);
+                return Ok(result);
+            }
+            Ok(AdmitOutcome::AlreadyKnown) => {
+                // The exact transaction was added between our read-guard
+                // check and the write-guard commit. Return normal success
+                // without a second add_transaction.
+                return Ok(MutationResult::empty());
+            }
+            Err(AdmitError::GenerationChanged | AdmitError::MempoolChanged) => continue,
+            Err(AdmitError::Policy(reason)) => {
+                return Err(reason.to_string());
+            }
+        }
+    }
+
+    Err("admission retry exhausted: chain or mempool changed during submission".to_owned())
 }
 
 pub(crate) fn sendrawtransaction(ctx: &Arc<Context>, params: &Value) -> Result<Value, RpcError> {

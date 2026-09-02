@@ -1055,6 +1055,7 @@ fn apply_handles(
         tx_index_runtime,
         mempool,
         mempool_gateway,
+        Arc::new(bitcoin_rs_node::mining::MiningGenerationSignal::new()),
         Arc::new(RwLock::new(BlockLog::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
         Arc::new(NoOpZmqPublisher),

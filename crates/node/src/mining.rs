@@ -124,6 +124,53 @@ impl CoordinatorState {
         }
     }
 }
+/// Wake seam between authoritative mutations and the template coordinator.
+///
+/// [`MiningCoordinator::publish_generation`] documents that every long-poll
+/// waiter must observe each authoritative applied-tip or mempool mutation,
+/// but the coordinator is built after node state, so it cannot be referenced
+/// from the apply path or the mempool gateway directly. This signal is
+/// created with the node state, wired into the gateway's mutation observer
+/// and the apply-path tip publication points, and the coordinator attaches
+/// itself at startup: [`Self::publish_generation`] then forwards to the live
+/// coordinator. With nothing attached it is a no-op — there is no waiter to
+/// wake before the coordinator exists.
+#[derive(Default)]
+pub struct MiningGenerationSignal {
+    coordinator: RwLock<Option<std::sync::Weak<dyn MiningControl>>>,
+}
+
+impl MiningGenerationSignal {
+    /// Creates a detached signal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Points the signal at `coordinator` without extending its ownership.
+    ///
+    /// The RPC context owns the coordinator; this wake seam must not create
+    /// an ownership cycle through `MiningCoordinator::apply_handles`, which
+    /// carries the same signal back. A weak reference keeps the seam
+    /// observational: the coordinator's lifetime is the context's, and a
+    /// wake against a torn-down coordinator is a no-op.
+    pub fn attach(&self, coordinator: &Arc<dyn MiningControl>) {
+        *self.coordinator.write() = Some(Arc::downgrade(coordinator));
+    }
+
+    /// Forwards one authoritative-mutation wake to the attached coordinator.
+    pub fn publish_generation(&self) {
+        if let Some(coordinator) = self
+            .coordinator
+            .read()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            coordinator.publish_generation();
+        }
+    }
+}
+
 /// Production mining coordinator owned by the node process.
 ///
 /// `coinbase_script` is immutable coordinator configuration captured at
@@ -940,5 +987,77 @@ mod generation_key_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_signal_tests {
+    use super::MiningGenerationSignal;
+    use bitcoin_rs_primitives::Block;
+    use bitcoin_rs_rpc::context::{
+        BlockTemplateRequest, BlockTemplateResult, MiningControl, MiningControlError,
+    };
+    use compact_str::CompactString;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    /// Records `publish_generation` calls; every other control operation is
+    /// unsupported in these tests.
+    #[derive(Default)]
+    struct RecordingControl {
+        published: Mutex<usize>,
+    }
+
+    fn unavailable() -> MiningControlError {
+        MiningControlError::Unavailable(CompactString::from("not wired in this test"))
+    }
+
+    impl MiningControl for RecordingControl {
+        fn get_block_template(
+            &self,
+            _request: BlockTemplateRequest,
+        ) -> Result<BlockTemplateResult, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn mining_info(&self) -> Result<bitcoin_rs_rpc::context::MiningInfo, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn submit_block(
+            &self,
+            _block: Block,
+        ) -> Result<bitcoin_rs_rpc::context::BlockValidationResult, MiningControlError> {
+            Err(unavailable())
+        }
+
+        fn publish_generation(&self) {
+            *self.published.lock() += 1;
+        }
+    }
+
+    #[test]
+    fn detached_signal_is_a_noop() {
+        let signal = MiningGenerationSignal::new();
+        // No coordinator attached: nothing to wake, nothing panics.
+        signal.publish_generation();
+        signal.publish_generation();
+    }
+
+    #[test]
+    fn attached_signal_forwards_every_generation_publication() {
+        let signal = MiningGenerationSignal::new();
+        let control = Arc::new(RecordingControl::default());
+        let control_dyn: Arc<dyn MiningControl> = control.clone();
+        signal.attach(&control_dyn);
+
+        assert_eq!(*control.published.lock(), 0);
+        signal.publish_generation();
+        signal.publish_generation();
+        assert_eq!(
+            *control.published.lock(),
+            2,
+            "every authoritative-mutation wake must reach the coordinator"
+        );
     }
 }

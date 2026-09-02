@@ -16,7 +16,7 @@ use std::error::Error;
 use bitcoin_rs_mempool::eviction::mempool_min_fee_sat_per_kvb;
 use bitcoin_rs_mempool::{
     AdmissionOrigin, Mempool, MempoolEntry, MempoolGateway, MempoolLimits, MempoolObserver,
-    MutationEnvelope, MutationOutcome, PolicyError, RbfError, RemovalReason, ReplacementCandidate,
+    MutationOutcome, MutationResult, PolicyError, RbfError, RemovalReason, ReplacementCandidate,
 };
 use bitcoin_rs_node::reorg::{ReorgError, invalidate_block};
 use bitcoin_rs_node::{Config, Network, state::NodeState};
@@ -622,18 +622,18 @@ fn sendrawtransaction_applies_an_rbf_replacement_and_sweeps_the_conflicts()
     Ok(())
 }
 
-/// Records every published change as `(origin, sequence, txid, outcome)`.
+/// Records every published change as `(sequence, txid, outcome)`.
 #[derive(Default)]
 struct RecordingGatewayObserver {
-    changes: parking_lot::Mutex<Vec<(AdmissionOrigin, u64, Hash256, MutationOutcome)>>,
+    changes: parking_lot::Mutex<Vec<(u64, Hash256, MutationOutcome)>>,
 }
 
 impl MempoolObserver for RecordingGatewayObserver {
-    fn on_mutation(&self, envelope: &MutationEnvelope) {
+    fn on_mutation(&self, result: &MutationResult) {
         let mut changes = self.changes.lock();
-        for (offset, change) in envelope.result.changes.iter().enumerate() {
-            let sequence = envelope.result.sequence_of(offset).unwrap_or(u64::MAX);
-            changes.push((envelope.origin, sequence, change.txid, change.outcome));
+        for (offset, change) in result.changes.iter().enumerate() {
+            let sequence = result.sequence_of(offset).unwrap_or(u64::MAX);
+            changes.push((sequence, change.txid, change.outcome));
         }
     }
 }
@@ -645,13 +645,8 @@ impl MempoolObserver for RecordingGatewayObserver {
 /// publishing, exactly like the apply path's raw sweep.
 #[test]
 fn sendrawtransaction_publishes_admission_through_gateway() -> Result<(), Box<dyn Error>> {
-    let ctx = Arc::new(Context::new());
     let observer = Arc::new(RecordingGatewayObserver::default());
-    assert!(
-        ctx.mempool.install_observer(observer.clone()).is_ok(),
-        "fresh harness gateway has no observer yet"
-    );
-
+    let ctx = Arc::new(Context::new_with_mempool_observer(observer.clone()));
     // Plain admission: exactly one Accepted change for the txid.
     let plain = tx(fund_utxo(&ctx, 0x51, 100_000), 90_000, 0xffff_ffff);
     let plain_txid = rpc_txid(&plain);
@@ -661,13 +656,8 @@ fn sendrawtransaction_publishes_admission_through_gateway() -> Result<(), Box<dy
         let changes = observer.changes.lock();
         assert_eq!(
             *changes,
-            vec![(
-                AdmissionOrigin::Rpc,
-                1,
-                Hash256::from(plain_txid),
-                MutationOutcome::Accepted,
-            )],
-            "the first production A event: one Accepted change, origin Rpc"
+            vec![(1, Hash256::from(plain_txid), MutationOutcome::Accepted)],
+            "the first production A event: one Accepted change"
         );
     }
 
@@ -697,25 +687,22 @@ fn sendrawtransaction_publishes_admission_through_gateway() -> Result<(), Box<dy
         *changes,
         vec![
             (
-                AdmissionOrigin::Rpc,
                 4,
                 Hash256::from(original_txid),
                 MutationOutcome::Removed(RemovalReason::Replaced),
             ),
             (
-                AdmissionOrigin::Rpc,
                 5,
                 Hash256::from(child_txid),
                 MutationOutcome::Removed(RemovalReason::Descendant),
             ),
             (
-                AdmissionOrigin::Rpc,
                 6,
                 Hash256::from(replacement_txid),
                 MutationOutcome::Accepted,
             ),
         ],
-        "one envelope, commit order: conflicts first (parent before descendant), then the replacement"
+        "one result, commit order: conflicts first (parent before descendant), then the replacement"
     );
     Ok(())
 }

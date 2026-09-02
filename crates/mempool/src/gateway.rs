@@ -1,24 +1,28 @@
 //! The single mutation gateway in front of the mempool.
 //!
 //! Every production mempool mutation routes through [`MempoolGateway`]: it
-//! owns the pool's write lock, commits the mutation, and then publishes the
-//! ordered [`MutationResult`] to the optional [`MempoolObserver`] — always in
-//! commit order, by construction. After this, no production code outside the
-//! gateway takes the mempool write lock — lookups go through the
-//! [`MempoolGateway::read`] passthrough. One pool, one gateway:
-//! [`MempoolGateway::shared`] interns a single [`MempoolGateway`] per pool
-//! `Arc` identity, so every route to a pool shares one publish mutex and
-//! one observer slot.
+//! owns the pool's write lock, commits the mutation, and then enqueues the
+//! ordered [`MutationResult`] for the optional [`MempoolObserver`] — always
+//! in commit order, by construction. Publication is eventual: a nested or
+//! concurrent mutation call may return before its callback runs, and the
+//! elected drainer completes every queued callback exactly once, in
+//! sequence order, with no gateway lock held. After this, no production
+//! code outside the gateway takes the mempool write lock — lookups go
+//! through the [`MempoolGateway::read`] passthrough. One pool, one
+//! gateway: [`MempoolGateway::shared`] interns a single
+//! [`MempoolGateway`] per pool `Arc` identity, so every route to a pool
+//! shares one publish queue and one observer slot.
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use bitcoin_rs_primitives::{Tx, Txid};
 use hashbrown::HashSet;
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, OnceLock};
 
 /// Why a chain-change reservation or finish failed.
 ///
@@ -110,25 +114,28 @@ pub enum AdmitError {
 /// and `shared` shrinks to run-time composition plus tests.
 use crate::EntryId;
 use crate::entry::MempoolEntry;
-use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationResult};
+use crate::mutation::{AdmissionOrigin, MutationResult};
 use crate::pool::{Mempool, MempoolError, PrioritiseError};
 use crate::rbf::{RbfError, ReplacementCandidate};
 
 static REGISTRY: LazyLock<Mutex<Vec<Weak<MempoolGateway>>>> =
     LazyLock::new(|| Mutex::new(alloc::vec::Vec::new()));
 
-/// Receives every committed mempool mutation, in commit order.
+/// Receives every committed mempool mutation, exactly once, in sequence
+/// order.
 ///
-/// Observers are best-effort mirrors: they run after the mutation is already
-/// committed, so their failures never affect pool state, and a panic in
-/// `on_mutation` is contained by the gateway. An observer must never take
-/// the mempool lock in ANY mode, because the next mutator holds the pool
-/// write lock while waiting for the publish mutex, and a pending writer
-/// blocks new readers; everything an observer needs arrives in the
-/// envelope.
+/// Observers are best-effort mirrors: they run after the mutation is
+/// already committed, so their failures never affect pool state, and a
+/// panic in `on_mutation` is contained by the gateway — the drainer
+/// records it and continues with the remaining queued batches. Callbacks
+/// run with no gateway lock held, so an observer may route mutations back
+/// through the gateway: a nested call commits, enqueues, and returns
+/// immediately, and its publication completes after the in-flight callback
+/// — possibly after the nested call itself has already returned to its
+/// caller.
 pub trait MempoolObserver: Send + Sync {
-    /// Called once per committed, non-empty [`MutationEnvelope`].
-    fn on_mutation(&self, envelope: &MutationEnvelope);
+    /// Called once per committed, non-empty [`MutationResult`].
+    fn on_mutation(&self, result: &MutationResult);
 }
 
 /// Fans one committed mutation out to several named observers.
@@ -141,7 +148,11 @@ pub trait MempoolObserver: Send + Sync {
 /// touching the mempool lock.
 #[derive(Default)]
 pub struct CompositeObserver {
-    legs: Vec<(&'static str, Arc<dyn MempoolObserver>)>,
+    /// Guarded because a subsystem may attach its leg after the gateway is
+    /// interned. Publication clones the list under this lock and releases it
+    /// before calling any leg, so a leg re-entering the gateway cannot
+    /// deadlock against an attach.
+    legs: Mutex<Vec<(&'static str, Arc<dyn MempoolObserver>)>>,
 }
 
 impl CompositeObserver {
@@ -149,14 +160,14 @@ impl CompositeObserver {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            legs: alloc::vec::Vec::new(),
+            legs: Mutex::new(alloc::vec::Vec::new()),
         }
     }
 
     /// Appends a named leg. Names identify the leg in failure logs and
     /// metrics only; order is publication order.
-    pub fn add_leg(&mut self, name: &'static str, leg: Arc<dyn MempoolObserver>) {
-        self.legs.push((name, leg));
+    pub fn add_leg(&self, name: &'static str, leg: Arc<dyn MempoolObserver>) {
+        self.legs.lock().push((name, leg));
     }
 }
 
@@ -186,10 +197,13 @@ fn panic_message_and_dispose(panic_payload: Box<dyn core::any::Any + Send>) -> (
 }
 
 impl MempoolObserver for CompositeObserver {
-    fn on_mutation(&self, envelope: &MutationEnvelope) {
-        for (name, leg) in &self.legs {
+    fn on_mutation(&self, result: &MutationResult) {
+        // Clone the roster, then release: a leg is free to re-enter the
+        // gateway, and a re-entrant attach must not deadlock behind us.
+        let legs = self.legs.lock().clone();
+        for (name, leg) in &legs {
             let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
-                leg.on_mutation(envelope);
+                leg.on_mutation(result);
             }));
             if let Err(panic_payload) = outcome {
                 metrics::counter!("mempool_observer_leg_failed_total", "leg" => *name).increment(1);
@@ -205,30 +219,55 @@ impl MempoolObserver for CompositeObserver {
     }
 }
 
+/// The mutation publication queue state, protected by the `publish` mutex.
+///
+/// Non-empty results are enqueued under the pool write lock; one drainer is
+/// elected if none exists. The drainer pops batches one at a time —
+/// releasing the publish-state lock before every observer call — and
+/// returns the state to idle only once the queue is empty.
+struct PublishState {
+    /// Committed, non-empty batches awaiting their observer callback, in
+    /// commit order.
+    queue: VecDeque<MutationResult>,
+    /// Whether exactly one caller is draining the queue.
+    draining: bool,
+}
+
 /// Owns the mempool's write lock and publishes ordered mutation events.
 ///
 /// # Ordering invariant
 ///
-/// Every publishing mutation flows through exactly one path, [`Self::commit`],
+/// Every mutating method flows through exactly one path, [`Self::commit`],
 /// which runs, in this exact order:
 ///
 /// 1. take the pool write lock,
 /// 2. mutate and assign per-change mempool sequences,
-/// 3. construct the publication envelope,
-/// 4. acquire the process-wide publish mutex while still holding the pool lock,
-/// 5. drop the pool write lock,
-/// 6. call the observer under the publish mutex,
-/// 7. release the publish mutex.
+/// 3. while still holding the write lock, enqueue the non-empty result on
+///    the publish state's FIFO queue and elect a drainer if none exists,
+/// 4. release the write lock and the publish-state lock,
+/// 5. the elected drainer pops batches one at a time — releasing the
+///    publish-state lock before every observer call — and returns the
+///    publish state to idle only once the queue is empty.
 ///
-/// Taking the publish mutex before releasing the pool lock makes commit order
-/// and publication order identical. Observer code still runs without the pool
-/// lock. Observers must not re-enter the pool: a later mutator can hold its
-/// write lock while waiting for the publish mutex. Every observer receives the
-/// complete envelope; failures and panics never affect the committed mutation.
+/// Commits serialize under the write lock and step 3 enqueues under that
+/// same ownership, so the queue order is the commit order and the sequence
+/// order: every committed, non-empty batch is published exactly once, in
+/// order, even across nested and concurrent callers. Publication is
+/// eventual, not synchronous: a nested or concurrent mutation enqueues
+/// and returns while a drainer exists, and its callback may run after
+/// that call has returned. No gateway lock is ever held across an
+/// observer call, so observers may re-enter the gateway freely. An
+/// observer panic is caught and recorded; the drainer continues with
+/// the remaining queue and only then returns to idle. Empty results and
+/// an absent observer enqueue nothing, allocate nothing, and spawn no
+/// thread.
 pub struct MempoolGateway {
     pool: Arc<RwLock<Mempool>>,
-    observer: OnceLock<Arc<dyn MempoolObserver>>,
-    publish: Mutex<()>,
+    /// The one observer slot, held as the composite so a second subsystem
+    /// can attach its own named leg after construction. An absent composite
+    /// means nobody is listening and the publish path stays allocation-free.
+    observer: Option<Arc<CompositeObserver>>,
+    publish: Mutex<PublishState>,
     /// Even means stable; odd means a chain change is active or a failed
     /// chain change has closed admission. Initialized to `0` (even/stable)
     /// in [`Self::shared`]. Compare only for exact equality — never order or
@@ -240,16 +279,55 @@ impl core::fmt::Debug for MempoolGateway {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MempoolGateway")
             .field("pool", &self.pool)
-            .field("observer", &self.observer.get().map(|_| "installed"))
+            .field("observer", &self.observer.as_ref().map(|_| "installed"))
             .finish_non_exhaustive()
     }
 }
 
 impl MempoolGateway {
+    /// Wraps `pool` and optionally installs `observer`.
+    ///
+    /// Pass `None` — or use the node's no-op publisher behind its observer —
+    /// when no `--zmq-pub-sequence` endpoint is configured.
+    #[must_use]
+    pub fn new(pool: Arc<RwLock<Mempool>>, observer: Option<Arc<dyn MempoolObserver>>) -> Self {
+        let composite = observer.map(|observer| {
+            let composite = CompositeObserver::new();
+            composite.add_leg("primary", observer);
+            Arc::new(composite)
+        });
+        Self {
+            pool,
+            observer: composite,
+            publish: Mutex::new(PublishState {
+                queue: VecDeque::new(),
+                draining: false,
+            }),
+            chain_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Attaches another named leg to this gateway's observer slot.
+    ///
+    /// Returns `Err` when the gateway was built without an observer: there
+    /// is no composite to extend, and silently creating one here would
+    /// diverge from the slot the production wiring installed.
+    pub fn attach_observer_leg(
+        &self,
+        name: &'static str,
+        leg: Arc<dyn MempoolObserver>,
+    ) -> Result<(), &'static str> {
+        let Some(composite) = self.observer.as_ref() else {
+            return Err("gateway has no observer slot to extend");
+        };
+        composite.add_leg(name, leg);
+        Ok(())
+    }
+
     /// Returns the one gateway interned for `pool`.
     ///
     /// Two callers holding clones of the same pool `Arc` get the same
-    /// gateway — one publish mutex, one observer slot. Distinct pools get
+    /// gateway — one publish queue, one observer slot. Distinct pools get
     /// distinct gateways. Dead entries are pruned on every call. Lookup
     /// upgrades the weak reference FIRST and only then compares pool
     /// pointers: a live gateway pins its pool alive, so two live `Arc`s
@@ -265,26 +343,42 @@ impl MempoolGateway {
                 }
             }
         }
-        let gateway = Arc::new(Self {
-            pool,
-            observer: OnceLock::new(),
-            publish: Mutex::new(()),
-            chain_generation: AtomicU64::new(0),
-        });
+        let gateway = Arc::new(Self::new(pool, None));
         gateways.push(Arc::downgrade(&gateway));
         gateway
     }
 
-    /// Installs the process-wide observer, set-once.
+    /// Returns the one gateway interned for `pool`, constructed with
+    /// `observer`.
     ///
-    /// `run` composes the observer legs once, before any worker spawns;
-    /// a second install is a composition bug and returns `Err` with the
-    /// rejected observer.
-    pub fn install_observer(
-        &self,
+    /// Like [`Self::shared`] but the newly created gateway carries the
+    /// supplied observer. If a gateway is already interned for `pool`, it
+    /// is returned as-is (its observer is unchanged). The caller is
+    /// expected to be the first interner — production code constructs the
+    /// gateway through [`crate::state::NodeState`] before any `shared`
+    /// call — so the observer lands on the one interned instance.
+    pub fn shared_with(
+        pool: Arc<RwLock<Mempool>>,
         observer: Arc<dyn MempoolObserver>,
-    ) -> Result<(), Arc<dyn MempoolObserver>> {
-        self.observer.set(observer)
+    ) -> Arc<Self> {
+        let mut gateways = REGISTRY.lock();
+        gateways.retain(|weak| weak.upgrade().is_some());
+        for weak in &*gateways {
+            if let Some(candidate) = weak.upgrade() {
+                if Arc::ptr_eq(&candidate.pool, &pool) {
+                    return candidate;
+                }
+            }
+        }
+        let gateway = Arc::new(Self::new(pool, Some(observer)));
+        gateways.push(Arc::downgrade(&gateway));
+        gateway
+    }
+
+    /// Returns `true` when the gateway was constructed with an observer.
+    #[must_use]
+    pub fn has_observer(&self) -> bool {
+        self.observer.is_some()
     }
 
     /// Raw pool access for test fixture staging and read-side composition
@@ -516,15 +610,19 @@ impl MempoolGateway {
                 }
             })?;
 
-        // 6. Publish via the existing seam.
-        let envelope = MutationEnvelope {
-            origin: request.origin,
-            result,
-        };
-        let publish = self.acquire_publish_lock();
+        // 6. Enqueue for publication and elect a drainer if needed.
+        let mut elected = false;
+        if !result.changes.is_empty() && self.observer.is_some() {
+            let mut publish = self.publish.lock();
+            publish.queue.push_back(result.clone());
+            elected = !publish.draining;
+            publish.draining = true;
+        }
         drop(pool);
-        self.publish(&envelope, publish);
-        Ok(AdmitOutcome::Committed(envelope.result))
+        if elected {
+            self.drain();
+        }
+        Ok(AdmitOutcome::Committed(result))
     }
 
     /// Commits `pool.remove_entry_and_descendants` and publishes its result.
@@ -591,25 +689,24 @@ impl MempoolGateway {
         origin: AdmissionOrigin,
         mutate: impl FnOnce(&mut Mempool) -> Result<MutationResult, E>,
     ) -> Result<MutationResult, E> {
-        // Move-through: the result becomes the envelope, the envelope is
-        // published by reference, and only `envelope.result` is handed back
-        // — no clone, no allocation beyond the envelope itself.
-        let mut pool = self.pool.write();
-        let result = mutate(&mut pool)?;
-        let envelope = MutationEnvelope { origin, result };
-        let publish = self.acquire_publish_lock();
-        drop(pool);
-        self.publish(&envelope, publish);
-        Ok(envelope.result)
-    }
-
-    /// The sole publish-mutex acquisition seam. The test-only causal hook
-    /// lives inside this operation immediately before locking, so moving
-    /// acquisition under the pool guard necessarily moves the hook with it.
-    fn acquire_publish_lock(&self) -> MutexGuard<'_, ()> {
-        #[cfg(test)]
-        ordering_gate::park_if_armed(std::ptr::from_ref(self).expose_provenance());
-        self.publish.lock()
+        let _ = origin; // origin retained for API compatibility; the queue
+        // publishes results without it.
+        let mut elected = false;
+        let result = {
+            let mut pool = self.pool.write();
+            let result = mutate(&mut pool)?;
+            if !result.changes.is_empty() && self.observer.is_some() {
+                let mut publish = self.publish.lock();
+                publish.queue.push_back(result.clone());
+                elected = !publish.draining;
+                publish.draining = true;
+            }
+            result
+        };
+        if elected {
+            self.drain();
+        }
+        Ok(result)
     }
 
     /// The same path for pool methods that cannot fail.
@@ -624,28 +721,41 @@ impl MempoolGateway {
         result
     }
 
-    /// Invokes the observer for a committed, non-empty envelope while the
-    /// process-wide `publish` guard is held. Empty results publish nothing.
-    /// A panicking observer is contained: the mutation already committed,
+    /// Publishes queued batches until the queue is empty, then returns
+    /// the publish state to idle. Exactly one drainer runs at a time: the
+    /// election in [`Self::commit`] is the only place `draining` turns
+    /// true, and the idle transition happens under the same mutex only
+    /// when the queue is empty, so no enqueue is lost. No gateway lock is
+    /// held across an observer call: a nested or concurrent mutation
+    /// commits, enqueues, and returns while this loop runs. A panicking
+    /// observer is contained per batch — the mutation already committed,
     /// and the panic must not take the caller down with it. The default
     /// panic hook still prints the panic before it is caught here.
-    fn publish(&self, envelope: &MutationEnvelope, _publish: MutexGuard<'_, ()>) {
-        if envelope.result.changes.is_empty() {
-            return;
-        }
-        let Some(observer) = self.observer.get() else {
-            return;
-        };
-        let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
-            observer.on_mutation(envelope);
-        }));
-        if let Err(panic_payload) = outcome {
-            let (message, payload_disposal_panicked) = panic_message_and_dispose(panic_payload);
-            tracing::warn!(
-                message = %message,
-                payload_disposal_panicked,
-                "mempool observer panicked; the committed mutation stands"
-            );
+    fn drain(&self) {
+        loop {
+            let result = {
+                let mut publish = self.publish.lock();
+                if let Some(result) = publish.queue.pop_front() {
+                    result
+                } else {
+                    publish.draining = false;
+                    return;
+                }
+            };
+            let Some(observer) = self.observer.as_ref() else {
+                continue;
+            };
+            let outcome = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+                observer.on_mutation(&result);
+            }));
+            if let Err(panic_payload) = outcome {
+                let (message, payload_disposal_panicked) = panic_message_and_dispose(panic_payload);
+                tracing::warn!(
+                    message = %message,
+                    payload_disposal_panicked,
+                    "mempool observer panicked; the committed mutation stands"
+                );
+            }
         }
     }
 }
@@ -773,54 +883,19 @@ pub fn reset_admission_park() {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::ordering_gate;
-    use super::{AdmissionRequest, AdmitError, AdmitOutcome};
-    use super::{ChainChangeError, CompositeObserver, MempoolGateway, MempoolObserver};
-    use crate::mutation::{AdmissionOrigin, MutationEnvelope, MutationOutcome, RemovalReason};
+    use super::{
+        AdmissionRequest, AdmitError, AdmitOutcome, ChainChangeError, CompositeObserver,
+        MempoolGateway, MempoolObserver,
+    };
+    use crate::mutation::{AdmissionOrigin, MutationOutcome, MutationResult, RemovalReason};
     use crate::standardness::PackageTxContext;
     use crate::{Mempool, MempoolEntry, MempoolLimits};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use bitcoin_rs_primitives::{Hash256, OutPoint, Tx, TxIn, TxOut, Txid};
+    use core::sync::atomic::Ordering;
     use parking_lot::{Mutex, RwLock};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-
-    struct GatedRecorder {
-        stream: Arc<Mutex<Vec<(u64, Hash256, MutationOutcome)>>>,
-        gated: AtomicBool,
-        entered: Mutex<Option<mpsc::Sender<()>>>,
-        release: Mutex<Option<mpsc::Receiver<()>>>,
-    }
-
-    impl MempoolObserver for GatedRecorder {
-        fn on_mutation(&self, envelope: &MutationEnvelope) {
-            {
-                let mut stream = self.stream.lock();
-                for (offset, change) in envelope.result.changes.iter().enumerate() {
-                    let sequence = envelope
-                        .result
-                        .sequence_of(offset)
-                        .expect("in-bounds sequence");
-                    stream.push((sequence, change.txid, change.outcome));
-                }
-            }
-            if !self.gated.swap(true, Ordering::SeqCst) {
-                self.entered
-                    .lock()
-                    .take()
-                    .expect("entered armed once")
-                    .send(())
-                    .expect("test waits for the first publication");
-                self.release
-                    .lock()
-                    .take()
-                    .expect("release armed once")
-                    .recv()
-                    .expect("test thread alive to release the observer");
-            }
-        }
-    }
 
     fn tx(label: u8) -> Tx {
         Tx {
@@ -839,8 +914,53 @@ mod tests {
         }
     }
 
-    /// Builds a tx with a standard P2PKH output for admission tests that
-    /// pass `evaluate_one`'s standardness check.
+    fn entry(tx: &Tx) -> MempoolEntry {
+        MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7)
+    }
+
+    fn hash(txid: &Txid) -> Hash256 {
+        Hash256::from_le_bytes(txid.as_bytes())
+    }
+
+    /// Records the txid and outcome of every change the observer sees.
+    #[derive(Default)]
+    struct RecordingObserver {
+        seen: Mutex<Vec<(Hash256, MutationOutcome)>>,
+    }
+
+    impl MempoolObserver for RecordingObserver {
+        fn on_mutation(&self, result: &MutationResult) {
+            let mut seen = self.seen.lock();
+            for change in &result.changes {
+                seen.push((change.txid, change.outcome));
+            }
+        }
+    }
+
+    struct PanickingObserver;
+
+    impl MempoolObserver for PanickingObserver {
+        fn on_mutation(&self, _result: &MutationResult) {
+            panic!("observer exploded");
+        }
+    }
+
+    fn gateway_with(observer: Option<Arc<dyn MempoolObserver>>) -> Arc<MempoolGateway> {
+        Arc::new(MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            observer,
+        ))
+    }
+
+    /// Clones a concrete observer as its trait object without an `as` cast.
+    fn dyn_observer<T: MempoolObserver + 'static>(observer: &Arc<T>) -> Arc<dyn MempoolObserver> {
+        observer.clone()
+    }
+
+    fn removed(reason: RemovalReason) -> MutationOutcome {
+        MutationOutcome::Removed(reason)
+    }
+
     fn standard_tx(label: u8) -> Tx {
         let mut script = Vec::with_capacity(25);
         script.push(0x76); // OP_DUP
@@ -865,73 +985,6 @@ mod tests {
         }
     }
 
-    fn entry(tx: &Tx) -> MempoolEntry {
-        MempoolEntry::new(Arc::new(tx.clone()), 100, 1_000, 1, 7)
-    }
-
-    fn hash(txid: &Txid) -> Hash256 {
-        Hash256::from_le_bytes(txid.as_bytes())
-    }
-
-    /// Records the txid, outcome, and envelope origin of everything the
-    /// observer sees.
-    #[derive(Default)]
-    struct RecordingObserver {
-        seen: Mutex<Vec<(Hash256, MutationOutcome)>>,
-        origins: Mutex<Vec<AdmissionOrigin>>,
-    }
-
-    impl MempoolObserver for RecordingObserver {
-        fn on_mutation(&self, envelope: &MutationEnvelope) {
-            self.origins.lock().push(envelope.origin);
-            let mut seen = self.seen.lock();
-            for change in &envelope.result.changes {
-                seen.push((change.txid, change.outcome));
-            }
-        }
-    }
-
-    struct PanickingDropPayload;
-
-    impl Drop for PanickingDropPayload {
-        fn drop(&mut self) {
-            panic!("panic payload drop exploded");
-        }
-    }
-
-    struct PanickingObserver;
-
-    impl MempoolObserver for PanickingObserver {
-        fn on_mutation(&self, _envelope: &MutationEnvelope) {
-            std::panic::panic_any(PanickingDropPayload);
-        }
-    }
-
-    fn gateway_with(observer: Option<Arc<dyn MempoolObserver>>) -> Arc<MempoolGateway> {
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
-        if let Some(observer) = observer {
-            assert!(
-                gateway.install_observer(observer).is_ok(),
-                "fresh test gateway accepts one observer"
-            );
-        }
-        gateway
-    }
-
-    /// Clones a concrete observer as its trait object without an `as` cast.
-    fn dyn_observer<T: MempoolObserver + 'static>(observer: &Arc<T>) -> Arc<dyn MempoolObserver> {
-        observer.clone()
-    }
-
-    fn removed(reason: RemovalReason) -> MutationOutcome {
-        MutationOutcome::Removed(reason)
-    }
-
-    /// Builds an `AdmissionRequest` for `tx` with the gateway's current
-    /// stable generation and pool sequence, a standard context (1 000 sat
-    /// fee, 100 vbyte, 0 sigop, no missing inputs), and the given origin.
     fn admit_request(
         gateway: &MempoolGateway,
         tx: &Tx,
@@ -956,6 +1009,760 @@ mod tests {
             expected_generation: generation,
             expected_sequence: sequence,
         }
+    }
+
+    #[test]
+    fn accepted_and_removed_events_arrive_in_commit_order() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+
+        let parent = tx(1);
+        let parent_txid = parent.txid();
+        let mut child = tx(2);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
+            .expect("parent in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
+            .expect("child in");
+        gateway.remove_by_txid(AdmissionOrigin::Rpc, &parent_txid);
+
+        let seen = observer.seen.lock();
+        assert_eq!(
+            *seen,
+            vec![
+                (hash(&parent_txid), MutationOutcome::Accepted),
+                (hash(&child.txid()), MutationOutcome::Accepted),
+                (hash(&parent_txid), removed(RemovalReason::Explicit)),
+                // The child sweeps with its parent, after it.
+                (hash(&child.txid()), removed(RemovalReason::Explicit)),
+            ],
+            "one event per change, in commit order"
+        );
+    }
+
+    #[test]
+    fn remove_for_block_reports_block_inclusion_not_explicit() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+
+        let mined = tx(3);
+        let mined_txid = mined.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&mined))
+            .expect("in");
+        observer.seen.lock().clear();
+        gateway.remove_for_block(AdmissionOrigin::Rpc, &[&mined], &[mined_txid], 8);
+
+        let seen = observer.seen.lock();
+        assert_eq!(
+            *seen,
+            vec![(hash(&mined_txid), removed(RemovalReason::BlockInclusion))],
+        );
+    }
+
+    #[test]
+    fn failed_insert_and_noop_remove_publish_nothing() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let before = gateway.read().sequence_number();
+
+        // Below the default min-relay floor (1_000 sat/kvB): rejected before
+        // any commit.
+        let poor = MempoolEntry::new(Arc::new(tx(4)), 100, 50, 1, 7);
+        assert!(gateway.insert_entry(AdmissionOrigin::Rpc, poor).is_err());
+        let stranger = tx(5);
+        gateway.remove_by_txid(AdmissionOrigin::Rpc, &stranger.txid());
+        gateway.clear(AdmissionOrigin::Rpc);
+
+        assert!(observer.seen.lock().is_empty());
+        assert_eq!(
+            gateway.read().sequence_number(),
+            before,
+            "no change may move the sequence"
+        );
+    }
+
+    #[test]
+    fn replacement_tags_direct_conflicts_and_descendants() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+
+        let parent = tx(6);
+        let parent_txid = parent.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
+            .expect("parent in");
+        let mut child = tx(7);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        child.inputs[0].sequence = 0xFFFF_FFFD;
+        let child_txid = child.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
+            .expect("child in");
+        let mut grandchild = tx(8);
+        grandchild.inputs[0].previous_output = OutPoint::new(child_txid, 0);
+        grandchild.inputs[0].sequence = 0xFFFF_FFFD;
+        let grandchild_txid = grandchild.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&grandchild))
+            .expect("grandchild in");
+        observer.seen.lock().clear();
+
+        // The replacement double-spends the child's input, so the child is
+        // the direct conflict (Replaced) and the grandchild sweeps with it
+        // (Descendant). The parent survives.
+        let mut replacement = tx(9);
+        replacement.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        replacement.inputs[0].sequence = 0xFFFF_FFFD;
+        let replacement_txid = replacement.txid();
+        let result = gateway
+            .replace_transaction(
+                AdmissionOrigin::Rpc,
+                crate::ReplacementCandidate::new(Arc::new(replacement), 100, 5_000, 1),
+                1,
+                7,
+                0,
+            )
+            .expect("replacement lands");
+
+        assert_eq!(result.changes.len(), 3);
+        assert_eq!(
+            result.changes,
+            vec![
+                crate::mutation::change(&child_txid, removed(RemovalReason::Replaced)),
+                crate::mutation::change(&grandchild_txid, removed(RemovalReason::Descendant),),
+                crate::mutation::change(&replacement_txid, MutationOutcome::Accepted),
+            ],
+            "conflicts first (parent before descendant), then the replacement"
+        );
+        let seen = observer.seen.lock();
+        assert_eq!(
+            &*seen,
+            &result
+                .changes
+                .iter()
+                .map(|c| (c.txid, c.outcome))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn observer_panic_does_not_roll_back_the_mutation() {
+        let gateway = gateway_with(Some(Arc::new(PanickingObserver)));
+
+        let committed = tx(9);
+        let committed_txid = committed.txid();
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&committed))
+            .expect("still returns");
+
+        assert!(
+            gateway.read().contains_txid(&committed_txid),
+            "the mutation stands after the observer panicked"
+        );
+    }
+
+    #[test]
+    fn no_observer_still_mutates() {
+        let gateway = gateway_with(None);
+        let result = gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(10)))
+            .expect("in");
+        assert_eq!(result.changes.len(), 1);
+        assert_eq!(result.sequence_base, 1);
+        assert_eq!(gateway.read().sequence_number(), 1);
+    }
+
+    #[test]
+    fn sequence_base_matches_per_change_assignment() {
+        let gateway = gateway_with(None);
+        let parent = tx(11);
+        let parent_txid = parent.txid();
+        let mut child = tx(12);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
+            .expect("in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
+            .expect("in");
+        let removed = gateway.remove_by_txid(AdmissionOrigin::Rpc, &parent_txid);
+
+        assert_eq!(removed.changes.len(), 2);
+        assert_eq!(removed.sequence_base, 3);
+        assert_eq!(removed.sequence_of(0), Some(3));
+        assert_eq!(removed.sequence_of(1), Some(4));
+        assert_eq!(gateway.read().sequence_number(), 4);
+    }
+
+    #[test]
+    fn insert_reports_accepted_then_policy_evictions() {
+        let observer = Arc::new(RecordingObserver::default());
+        // 150-byte budget, 100 vbyte entries at 0 min-relay: the second
+        // insert overflows and evicts the lowest-fee package.
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 150,
+                ..MempoolLimits::default()
+            }))),
+            Some(dyn_observer(&observer)),
+        );
+
+        let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
+        let high = MempoolEntry::new(Arc::new(tx(14)), 100, 900, 1, 7);
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, low)
+            .expect("low in");
+        let result = gateway
+            .insert_entry(AdmissionOrigin::Rpc, high)
+            .expect("high in");
+
+        assert_eq!(
+            result.changes.len(),
+            2,
+            "the eviction is part of the insert"
+        );
+        assert_eq!(result.changes[0].outcome, MutationOutcome::Accepted);
+        assert_eq!(result.changes[0].txid, hash(&tx(14).txid()));
+        assert_eq!(
+            result.changes[1].outcome,
+            MutationOutcome::Removed(RemovalReason::PolicyEviction)
+        );
+        assert_eq!(result.changes[1].txid, hash(&tx(13).txid()));
+        // Sequences are contiguous across the batch and assigned in order.
+        assert_eq!(result.sequence_base, 2);
+        assert_eq!(result.sequence_of(1), Some(3));
+        assert!(
+            observer.seen.lock().ends_with(
+                &result
+                    .changes
+                    .iter()
+                    .map(|change| (change.txid, change.outcome))
+                    .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
+    fn clear_reports_every_entry_and_empty_clear_moves_nothing() {
+        let gateway = gateway_with(None);
+        let first = tx(15);
+        let second = tx(16);
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&first))
+            .expect("in");
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&second))
+            .expect("in");
+        let before = gateway.read().sequence_number();
+
+        let cleared = gateway.clear(AdmissionOrigin::Rpc);
+        assert_eq!(cleared.changes.len(), 2);
+        assert!(
+            cleared
+                .changes
+                .iter()
+                .all(|change| { change.outcome == MutationOutcome::Removed(RemovalReason::Clear) })
+        );
+        assert_eq!(cleared.sequence_base, before + 1);
+        assert_eq!(gateway.read().sequence_number(), before + 2);
+
+        let empty = gateway.clear(AdmissionOrigin::Rpc);
+        assert!(empty.is_empty());
+        assert_eq!(empty.sequence_base, 0);
+        assert_eq!(
+            gateway.read().sequence_number(),
+            before + 2,
+            "clear-on-empty assigns nothing"
+        );
+    }
+
+    /// A test observer whose first `on_mutation` records the batch and then
+    /// blocks until released.
+    struct GatedObserver {
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        stream: Mutex<Vec<u64>>,
+    }
+
+    impl MempoolObserver for GatedObserver {
+        fn on_mutation(&self, result: &MutationResult) {
+            let mut stream = self.stream.lock();
+            let first_call = stream.is_empty();
+            for index in 0..result.len() {
+                stream.push(result.sequence_of(index).unwrap_or(u64::MAX));
+            }
+            drop(stream);
+            if first_call {
+                self.entered
+                    .lock()
+                    .take()
+                    .expect("entered sender armed once")
+                    .send(())
+                    .expect("main thread still waiting");
+                self.release
+                    .lock()
+                    .take()
+                    .expect("release receiver armed once")
+                    .recv()
+                    .expect("main thread still alive to release us");
+            }
+        }
+    }
+
+    /// Pins the observable signature of the publication state machine.
+    /// While the first observer call is gated — holding no gateway lock —
+    /// a concurrent mutation must complete its commit-and-enqueue and its
+    /// thread must return with the batch's own result; nothing holds the
+    /// pool write lock or the publish-state lock across a callback. After
+    /// the gate opens, the elected drainer publishes the queued batch
+    /// next: the callback stream is exactly [1, 2], the sequence order,
+    /// and both mutations are in the pool.
+    #[test]
+    fn gated_callback_lets_concurrent_mutation_enqueue_and_return() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
+        let observer = Arc::new(GatedObserver {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            stream: Mutex::new(Vec::new()),
+        });
+        let gateway = Arc::new(MempoolGateway::new(
+            Arc::clone(&pool),
+            Some(dyn_observer(&observer)),
+        ));
+
+        let first_txid = tx(20).txid();
+        let first = Arc::clone(&gateway);
+        let first_handle = std::thread::spawn(move || {
+            first
+                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(20)))
+                .expect("first in")
+        });
+        entered_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("first observer call started");
+
+        let second_txid = tx(21).txid();
+        let second = Arc::clone(&gateway);
+        let second_handle = std::thread::spawn(move || {
+            let result = second
+                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(21)))
+                .expect("second in");
+            let _ = done_tx.send(result);
+        });
+
+        // The concurrent mutation must enqueue and return while the first
+        // callback is still gated: its thread hands back the committed
+        // result with the next sequence even though nothing has published.
+        let queued_result = done_rx
+            .recv_timeout(core::time::Duration::from_secs(10))
+            .expect("the concurrent mutation must return while the callback is gated");
+        assert_eq!(
+            queued_result.sequence_base, 2,
+            "the enqueued batch keeps its committed sequence"
+        );
+
+        // Nothing may publish while the gate is closed.
+        assert_eq!(
+            observer.stream.lock().len(),
+            1,
+            "only the gated first batch is published so far"
+        );
+
+        release_tx.send(()).expect("gate thread alive");
+        first_handle.join().expect("first publisher");
+        second_handle.join().expect("second publisher");
+
+        assert_eq!(
+            *observer.stream.lock(),
+            vec![1, 2],
+            "publish order matches sequence order"
+        );
+        let pool_read = gateway.read();
+        assert!(pool_read.contains_txid(&first_txid));
+        assert!(pool_read.contains_txid(&second_txid));
+    }
+
+    /// An observer that re-enters the gateway from its first callback and
+    /// records the nested call's returned result.
+    struct ReentrantObserver {
+        gateway: Mutex<Option<Arc<MempoolGateway>>>,
+        stream: Mutex<Vec<u64>>,
+        nested: Mutex<Vec<MutationResult>>,
+    }
+
+    impl MempoolObserver for ReentrantObserver {
+        fn on_mutation(&self, result: &MutationResult) {
+            {
+                let mut stream = self.stream.lock();
+                for index in 0..result.len() {
+                    stream.push(result.sequence_of(index).unwrap_or(u64::MAX));
+                }
+            }
+            if result.sequence_base == 1 {
+                let gateway = self.gateway.lock().clone();
+                if let Some(gateway) = gateway {
+                    let nested = gateway
+                        .insert_entry(AdmissionOrigin::Rpc, entry(&tx(99)))
+                        .expect("nested in");
+                    self.nested.lock().push(nested);
+                }
+            }
+        }
+    }
+
+    /// A re-entrant mutation from inside a callback must commit, enqueue,
+    /// and return — never deadlock — and its callback completes afterwards
+    /// in sequence order: the recorded stream is exactly [1, 2] and the
+    /// nested call already returned sequence 2 while the outer callback
+    /// was still running.
+    #[test]
+    fn reentrant_observer_mutation_completes_with_callback_sequence_1_2() {
+        let observer = Arc::new(ReentrantObserver {
+            gateway: Mutex::new(None),
+            stream: Mutex::new(Vec::new()),
+            nested: Mutex::new(Vec::new()),
+        });
+        let gateway = Arc::new(MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            Some(dyn_observer(&observer)),
+        ));
+        *observer.gateway.lock() = Some(Arc::clone(&gateway));
+
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(50)))
+            .expect("first in");
+
+        let nested = observer.nested.lock();
+        assert_eq!(
+            nested.len(),
+            1,
+            "the nested mutation completed and returned"
+        );
+        assert_eq!(
+            nested[0].sequence_base, 2,
+            "the nested mutation took the next sequence"
+        );
+        assert_eq!(nested[0].len(), 1);
+        drop(nested);
+        assert_eq!(
+            *observer.stream.lock(),
+            vec![1, 2],
+            "callbacks run exactly once per batch, in sequence order"
+        );
+    }
+
+    /// An observer that re-enters the gateway on some batches while other
+    /// threads commit concurrently.
+    struct ContiguityObserver {
+        gateway: Mutex<Option<Arc<MempoolGateway>>>,
+        stream: Mutex<Vec<u64>>,
+        nested_vout: std::sync::atomic::AtomicU32,
+    }
+
+    /// A nested-insert transaction unique for every trigger: the vout of
+    /// its only prevout varies, so each nested txid differs and the pool
+    /// never refuses one as a duplicate of an earlier nested insert.
+    fn nested_tx(vout: u32) -> Tx {
+        let mut nested = tx(5);
+        nested.inputs[0].previous_output =
+            OutPoint::new(Txid(Hash256::from_le_bytes(&[5; 32])), vout);
+        nested
+    }
+
+    impl MempoolObserver for ContiguityObserver {
+        fn on_mutation(&self, result: &MutationResult) {
+            {
+                let mut stream = self.stream.lock();
+                for index in 0..result.len() {
+                    stream.push(result.sequence_of(index).unwrap_or(u64::MAX));
+                }
+            }
+            if result.sequence_base % 16 == 1 {
+                let gateway = self.gateway.lock().clone();
+                if let Some(gateway) = gateway {
+                    let vout = self
+                        .nested_vout
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    gateway
+                        .insert_entry(AdmissionOrigin::Rpc, entry(&nested_tx(vout)))
+                        .expect("nested in");
+                }
+            }
+        }
+    }
+
+    /// Concurrent mutators plus a re-entering observer: even though some
+    /// batches are enqueued from inside other batches' callbacks and may
+    /// publish after their calls returned, the published stream must be
+    /// exactly the contiguous sequence range — no gap, no duplicate, no
+    /// reorder — and the pool sequence must match the stream length.
+    #[test]
+    fn concurrent_reentrant_stream_is_contiguous() {
+        const CYCLES: usize = 60;
+        const THREAD_BASES: [u8; 4] = [10, 70, 130, 190];
+        let observer = Arc::new(ContiguityObserver {
+            gateway: Mutex::new(None),
+            stream: Mutex::new(Vec::new()),
+            nested_vout: std::sync::atomic::AtomicU32::new(0),
+        });
+        let gateway = Arc::new(MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            Some(dyn_observer(&observer)),
+        ));
+        *observer.gateway.lock() = Some(Arc::clone(&gateway));
+
+        let handles: Vec<_> = THREAD_BASES
+            .iter()
+            .map(|&base| {
+                let gateway = Arc::clone(&gateway);
+                std::thread::spawn(move || {
+                    for cycle in 0..CYCLES {
+                        // Distinct txids per cycle: a repeated txid would
+                        // be a DuplicateTransaction, not an ordering test.
+                        let label = base + u8::try_from(cycle).expect("label fits in u8");
+                        gateway
+                            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(label)))
+                            .expect("admitted");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("mutator thread");
+        }
+
+        // Publication is eventual: the last elected drainer may still be
+        // finishing after the mutators return. Wait until the published
+        // stream has caught up with the pool sequence and stays stable.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(10);
+        loop {
+            let sequence = gateway.read().sequence_number();
+            let published = u64::try_from(observer.stream.lock().len()).expect("length fits u64");
+            if published == sequence {
+                std::thread::sleep(core::time::Duration::from_millis(20));
+                if u64::try_from(observer.stream.lock().len()).expect("length fits u64") == sequence
+                {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication never settled: {published} of {sequence} batches published"
+            );
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+
+        let stream = observer.stream.lock();
+        let expected: Vec<u64> =
+            (1..=u64::try_from(stream.len()).expect("length fits u64")).collect();
+        assert_eq!(
+            *stream, expected,
+            "the published stream must be exactly the contiguous sequence range"
+        );
+        assert_eq!(
+            u64::try_from(stream.len()).expect("length fits u64"),
+            gateway.read().sequence_number(),
+            "every committed change was published exactly once"
+        );
+    }
+
+    /// Records every change sequence the observer sees, in publish order.
+    #[derive(Default)]
+    struct SequenceStreamObserver {
+        stream: Mutex<Vec<u64>>,
+    }
+
+    impl MempoolObserver for SequenceStreamObserver {
+        fn on_mutation(&self, result: &MutationResult) {
+            let mut stream = self.stream.lock();
+            for index in 0..result.len() {
+                stream.push(result.sequence_of(index).unwrap_or(u64::MAX));
+            }
+        }
+    }
+
+    /// Races mutations from several threads and requires the published
+    /// stream to be exactly the full sequence range in order. Sequences
+    /// are assigned in commit order under the write lock and enqueued
+    /// under that same ownership, so an in-order stream proves publish
+    /// order == commit order regardless of which caller is elected to
+    /// drain the queue.
+    #[test]
+    fn concurrent_mutations_publish_in_sequence_order() {
+        const CYCLES: usize = 1_500;
+        const MEMBER_LABELS: [u8; 4] = [20, 21, 22, 23];
+        let observer = Arc::new(SequenceStreamObserver::default());
+        let gateway = Arc::new(gateway_with(Some(dyn_observer(&observer))));
+
+        let handles: Vec<_> = MEMBER_LABELS
+            .iter()
+            .map(|&label| {
+                let gateway = Arc::clone(&gateway);
+                std::thread::spawn(move || {
+                    let member = tx(label);
+                    let member_txid = member.txid();
+                    for _ in 0..CYCLES {
+                        gateway
+                            .insert_entry(AdmissionOrigin::Rpc, entry(&member))
+                            .expect("admitted");
+                        gateway.remove_by_txid(AdmissionOrigin::Rpc, &member_txid);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("mutator thread");
+        }
+
+        let total = u64::try_from(MEMBER_LABELS.len() * CYCLES * 2).expect("change count fits u64");
+        let stream = observer.stream.lock();
+        assert_eq!(
+            u64::try_from(stream.len()).expect("stream length fits u64"),
+            total,
+            "every committed change published exactly once"
+        );
+        let expected: Vec<u64> = (1..=total).collect();
+        assert_eq!(*stream, expected, "publish order must equal commit order");
+    }
+
+    #[test]
+    fn reconsider_disconnected_admits_in_order_once_per_candidate() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let parent = tx(30);
+        let parent_txid = parent.txid();
+        let mut child = tx(31);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+
+        let committed =
+            gateway.reconsider_disconnected(AdmissionOrigin::Rpc, [entry(&parent), entry(&child)]);
+
+        assert_eq!(committed.len(), 2, "one committed result per candidate");
+        for result in &committed {
+            assert_eq!(result.changes.len(), 1);
+        }
+        assert_eq!(gateway.read().sequence_number(), 2);
+        let seen = observer.seen.lock();
+        assert_eq!(seen.len(), 2, "one publish per committed candidate");
+        assert_eq!(seen[0].0, hash(&parent_txid), "parent commits first");
+        assert_eq!(seen[1].0, hash(&child.txid()), "child commits second");
+    }
+
+    #[test]
+    fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
+        let gateway = gateway_with(None);
+        let parent = tx(32);
+        let parent_txid = parent.txid();
+        let mut child = tx(33);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        // Fee 50 over 100 vbytes is 500 sat/kvB, under the 1 000 sat/kvB
+        // floor; the child itself is fine and only the refused parent can
+        // keep it out.
+        let refused_parent = MempoolEntry::new(Arc::new(parent), 100, 50, 1, 7);
+
+        let committed =
+            gateway.reconsider_disconnected(AdmissionOrigin::Rpc, [refused_parent, entry(&child)]);
+
+        assert!(
+            committed.is_empty(),
+            "a refused parent must keep its descendant out"
+        );
+        assert!(!gateway.read().contains_txid(&parent_txid));
+        assert!(!gateway.read().contains_txid(&child.txid()));
+    }
+
+    #[test]
+    fn reconsider_disconnected_withholds_descendants_of_an_immediately_evicted_parent() {
+        let observer = Arc::new(RecordingObserver::default());
+        // A 150-byte pool already holding 100 vbytes of high-fee filler: the
+        // parent's own insert succeeds and then immediately evicts the parent
+        // as the lowest-fee package. The child pays far more than everything
+        // else, so once admitted it fits and survives — only the parent's
+        // eviction inside the parent's own MutationResult can keep it out.
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 150,
+                ..MempoolLimits::default()
+            }))),
+            Some(dyn_observer(&observer)),
+        );
+        let filler_txid = tx(36).txid();
+        gateway
+            .insert_entry(
+                AdmissionOrigin::Rpc,
+                MempoolEntry::new(Arc::new(tx(36)), 100, 9_000, 1, 7),
+            )
+            .expect("filler in");
+        // The filler's own publication predates the scenario under test.
+        observer.seen.lock().clear();
+
+        let parent = tx(34);
+        let parent_txid = parent.txid();
+        let mut child = tx(35);
+        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
+        let child_txid = child.txid();
+        let parent = MempoolEntry::new(Arc::new(parent), 100, 100, 1, 7);
+        let child = MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 7);
+
+        let committed = gateway.reconsider_disconnected(AdmissionOrigin::Rpc, [parent, child]);
+
+        assert_eq!(
+            committed.len(),
+            1,
+            "only the parent's insert commits; the child is withheld"
+        );
+        assert_eq!(
+            committed[0].changes,
+            vec![
+                crate::mutation::change(&parent_txid, MutationOutcome::Accepted),
+                crate::mutation::change(&parent_txid, removed(RemovalReason::PolicyEviction)),
+            ],
+            "the parent was admitted and immediately evicted by its own insert"
+        );
+        let pool = gateway.read();
+        assert!(!pool.contains_txid(&parent_txid));
+        assert!(
+            !pool.contains_txid(&child_txid),
+            "an evicted parent must not admit its descendant"
+        );
+        assert!(
+            pool.contains_txid(&filler_txid),
+            "no orphan replaced the parent"
+        );
+        assert_eq!(
+            pool.sequence_number(),
+            3,
+            "the withheld child assigns nothing"
+        );
+        assert_eq!(
+            *observer.seen.lock(),
+            vec![
+                (hash(&parent_txid), MutationOutcome::Accepted),
+                (hash(&parent_txid), removed(RemovalReason::PolicyEviction)),
+            ],
+            "the parent's two changes publish once each; the child publishes nothing"
+        );
+    }
+
+    #[test]
+    fn reconsider_disconnected_no_ops_on_an_empty_batch() {
+        let observer = Arc::new(RecordingObserver::default());
+        let gateway = gateway_with(Some(dyn_observer(&observer)));
+        let before = gateway.read().sequence_number();
+
+        let committed = gateway.reconsider_disconnected(AdmissionOrigin::Rpc, []);
+
+        assert!(committed.is_empty());
+        assert_eq!(gateway.read().sequence_number(), before);
+        assert!(observer.seen.lock().is_empty(), "nothing may publish");
     }
 
     #[test]
@@ -1172,597 +1979,9 @@ mod tests {
     }
 
     #[test]
-    fn accepted_and_removed_events_arrive_in_commit_order() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-
-        let parent = tx(1);
-        let parent_txid = parent.txid();
-        let mut child = tx(2);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
-            .expect("parent in");
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
-            .expect("child in");
-        gateway.remove_by_txid(AdmissionOrigin::Rpc, &parent_txid);
-
-        let seen = observer.seen.lock();
-        assert_eq!(
-            *seen,
-            vec![
-                (hash(&parent_txid), MutationOutcome::Accepted),
-                (hash(&child.txid()), MutationOutcome::Accepted),
-                (hash(&parent_txid), removed(RemovalReason::Explicit)),
-                // The child sweeps with its parent, after it.
-                (hash(&child.txid()), removed(RemovalReason::Explicit)),
-            ],
-            "one event per change, in commit order"
-        );
-    }
-
-    #[test]
-    fn remove_for_block_reports_block_inclusion_not_explicit() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-
-        let mined = tx(3);
-        let mined_txid = mined.txid();
-        gateway
-            .insert_entry(AdmissionOrigin::Block, entry(&mined))
-            .expect("in");
-        observer.seen.lock().clear();
-        gateway.remove_for_block(AdmissionOrigin::Block, &[&mined], &[mined_txid], 8);
-
-        let seen = observer.seen.lock();
-        assert_eq!(
-            *seen,
-            vec![(hash(&mined_txid), removed(RemovalReason::BlockInclusion))],
-        );
-    }
-
-    #[test]
-    fn failed_insert_and_noop_remove_publish_nothing() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-        let before = gateway.read().sequence_number();
-
-        // Below the default min-relay floor (1_000 sat/kvB): rejected before
-        // any commit.
-        let poor = MempoolEntry::new(Arc::new(tx(4)), 100, 50, 1, 7);
-        assert!(gateway.insert_entry(AdmissionOrigin::Rpc, poor).is_err());
-        let stranger = tx(5);
-        gateway.remove_by_txid(AdmissionOrigin::Rpc, &stranger.txid());
-        gateway.clear(AdmissionOrigin::Rpc);
-
-        assert!(observer.seen.lock().is_empty());
-        assert_eq!(
-            gateway.read().sequence_number(),
-            before,
-            "no change may move the sequence"
-        );
-    }
-
-    #[test]
-    fn replacement_tags_direct_conflicts_and_descendants() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-
-        let parent = tx(6);
-        let parent_txid = parent.txid();
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
-            .expect("parent in");
-        let mut child = tx(7);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        child.inputs[0].sequence = 0xFFFF_FFFD;
-        let child_txid = child.txid();
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
-            .expect("child in");
-        let mut grandchild = tx(8);
-        grandchild.inputs[0].previous_output = OutPoint::new(child_txid, 0);
-        grandchild.inputs[0].sequence = 0xFFFF_FFFD;
-        let grandchild_txid = grandchild.txid();
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&grandchild))
-            .expect("grandchild in");
-        observer.seen.lock().clear();
-
-        // The replacement double-spends the child's input, so the child is
-        // the direct conflict (Replaced) and the grandchild sweeps with it
-        // (Descendant). The parent survives.
-        let mut replacement = tx(9);
-        replacement.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        replacement.inputs[0].sequence = 0xFFFF_FFFD;
-        let replacement_txid = replacement.txid();
-        let result = gateway
-            .replace_transaction(
-                AdmissionOrigin::Rpc,
-                crate::ReplacementCandidate::new(Arc::new(replacement), 100, 5_000, 1),
-                1,
-                7,
-                0,
-            )
-            .expect("replacement lands");
-
-        assert_eq!(result.changes.len(), 3);
-        assert_eq!(
-            result.changes,
-            vec![
-                crate::mutation::change(&child_txid, removed(RemovalReason::Replaced)),
-                crate::mutation::change(&grandchild_txid, removed(RemovalReason::Descendant),),
-                crate::mutation::change(&replacement_txid, MutationOutcome::Accepted),
-            ],
-            "conflicts first (parent before descendant), then the replacement"
-        );
-        let seen = observer.seen.lock();
-        assert_eq!(
-            &*seen,
-            &result
-                .changes
-                .iter()
-                .map(|c| (c.txid, c.outcome))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn observer_panic_does_not_roll_back_the_mutation() {
-        let gateway = gateway_with(Some(Arc::new(PanickingObserver)));
-
-        let committed = tx(9);
-        let committed_txid = committed.txid();
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&committed))
-            .expect("still returns");
-
-        assert!(
-            gateway.read().contains_txid(&committed_txid),
-            "the mutation stands after the observer panicked"
-        );
-    }
-
-    #[test]
-    fn no_observer_still_mutates() {
-        let gateway = gateway_with(None);
-        let result = gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(10)))
-            .expect("in");
-        assert_eq!(result.changes.len(), 1);
-        assert_eq!(result.sequence_base, 1);
-        assert_eq!(gateway.read().sequence_number(), 1);
-    }
-
-    #[test]
-    fn sequence_base_matches_per_change_assignment() {
-        let gateway = gateway_with(None);
-        let parent = tx(11);
-        let parent_txid = parent.txid();
-        let mut child = tx(12);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&parent))
-            .expect("in");
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&child))
-            .expect("in");
-        let removed = gateway.remove_by_txid(AdmissionOrigin::Rpc, &parent_txid);
-
-        assert_eq!(removed.changes.len(), 2);
-        assert_eq!(removed.sequence_base, 3);
-        assert_eq!(removed.sequence_of(0), Some(3));
-        assert_eq!(removed.sequence_of(1), Some(4));
-        assert_eq!(gateway.read().sequence_number(), 4);
-    }
-
-    #[test]
-    fn insert_reports_accepted_then_policy_evictions() {
-        let observer = Arc::new(RecordingObserver::default());
-        // 150-byte budget, 100 vbyte entries at 0 min-relay: the second
-        // insert overflows and evicts the lowest-fee package.
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-            min_relay_fee_sat_per_kvb: 0,
-            max_total_bytes: 150,
-            ..MempoolLimits::default()
-        }))));
-        assert!(
-            gateway.install_observer(dyn_observer(&observer)).is_ok(),
-            "fresh test gateway accepts one observer"
-        );
-
-        let low = MempoolEntry::new(Arc::new(tx(13)), 100, 100, 1, 7);
-        let high = MempoolEntry::new(Arc::new(tx(14)), 100, 900, 1, 7);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, low)
-            .expect("low in");
-        let result = gateway
-            .insert_entry(AdmissionOrigin::Rpc, high)
-            .expect("high in");
-
-        assert_eq!(
-            result.changes.len(),
-            2,
-            "the eviction is part of the insert"
-        );
-        assert_eq!(result.changes[0].outcome, MutationOutcome::Accepted);
-        assert_eq!(result.changes[0].txid, hash(&tx(14).txid()));
-        assert_eq!(
-            result.changes[1].outcome,
-            MutationOutcome::Removed(RemovalReason::PolicyEviction)
-        );
-        assert_eq!(result.changes[1].txid, hash(&tx(13).txid()));
-        // Sequences are contiguous across the batch and assigned in order.
-        assert_eq!(result.sequence_base, 2);
-        assert_eq!(result.sequence_of(1), Some(3));
-        assert!(
-            observer.seen.lock().ends_with(
-                &result
-                    .changes
-                    .iter()
-                    .map(|change| (change.txid, change.outcome))
-                    .collect::<Vec<_>>()
-            )
-        );
-    }
-
-    #[test]
-    fn clear_reports_every_entry_and_empty_clear_moves_nothing() {
-        let gateway = gateway_with(None);
-        let first = tx(15);
-        let second = tx(16);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&first))
-            .expect("in");
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&second))
-            .expect("in");
-        let before = gateway.read().sequence_number();
-
-        let cleared = gateway.clear(AdmissionOrigin::Rpc);
-        assert_eq!(cleared.changes.len(), 2);
-        assert!(
-            cleared
-                .changes
-                .iter()
-                .all(|change| { change.outcome == MutationOutcome::Removed(RemovalReason::Clear) })
-        );
-        assert_eq!(cleared.sequence_base, before + 1);
-        assert_eq!(gateway.read().sequence_number(), before + 2);
-
-        let empty = gateway.clear(AdmissionOrigin::Rpc);
-        assert!(empty.is_empty());
-        assert_eq!(empty.sequence_base, 0);
-        assert_eq!(
-            gateway.read().sequence_number(),
-            before + 2,
-            "clear-on-empty assigns nothing"
-        );
-    }
-
-    /// A test observer whose first `on_mutation` records the batch and then
-    /// blocks until released.
-    struct GatedObserver {
-        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-        stream: Mutex<Vec<u64>>,
-    }
-
-    impl MempoolObserver for GatedObserver {
-        fn on_mutation(&self, envelope: &MutationEnvelope) {
-            let mut stream = self.stream.lock();
-            let first_call = stream.is_empty();
-            for index in 0..envelope.result.len() {
-                stream.push(envelope.result.sequence_of(index).unwrap_or(u64::MAX));
-            }
-            drop(stream);
-            if first_call {
-                self.entered
-                    .lock()
-                    .take()
-                    .expect("entered sender armed once")
-                    .send(())
-                    .expect("main thread still waiting");
-                self.release
-                    .lock()
-                    .take()
-                    .expect("release receiver armed once")
-                    .recv()
-                    .expect("main thread still alive to release us");
-            }
-        }
-    }
-
-    /// Pins the observable signature of the ordering invariant. While the
-    /// first observer call is gated on the publish mutex, the next
-    /// mutation's `commit` has already taken the write lock and parks on
-    /// the publish mutex while still holding it — so a `try_read` on the
-    /// pool fails for as long as the gate is closed. Under the old
-    /// release-the-write-lock-then-take-the-publish-mutex shape the write
-    /// lock was free here, and this test fails at the engagement check.
-    /// After the gate opens, the queued batch publishes next: publish order
-    /// matches sequence order, and both mutations are in the pool.
-    #[test]
-    fn gated_observer_pins_the_write_lock_and_keeps_publish_order() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let observer = Arc::new(GatedObserver {
-            entered: Mutex::new(Some(entered_tx)),
-            release: Mutex::new(Some(release_rx)),
-            stream: Mutex::new(Vec::new()),
-        });
-        let gateway = MempoolGateway::shared(Arc::clone(&pool));
-        assert!(
-            gateway.install_observer(dyn_observer(&observer)).is_ok(),
-            "fresh test gateway accepts one observer"
-        );
-
-        let first_txid = tx(20).txid();
-        let first = Arc::clone(&gateway);
-        let first_handle = std::thread::spawn(move || {
-            first
-                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(20)))
-                .expect("first in")
-        });
-        entered_rx
-            .recv_timeout(core::time::Duration::from_secs(10))
-            .expect("first observer call started");
-
-        let second_txid = tx(21).txid();
-        let second = Arc::clone(&gateway);
-        let second_handle = std::thread::spawn(move || {
-            second
-                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(21)))
-                .expect("second in")
-        });
-
-        // Wait until the second mutation has engaged: it holds the write
-        // lock while parked on the publish mutex behind the gated observer.
-        // `try_read` failing continuously for 50ms — far longer than any
-        // in-lock mutation work — proves the hold is the gate, not a window.
-        let engaged = std::time::Instant::now() + core::time::Duration::from_secs(10);
-        loop {
-            if pool.try_read().is_none() {
-                let since = std::time::Instant::now();
-                while since.elapsed() < core::time::Duration::from_millis(50) {
-                    assert!(
-                        pool.try_read().is_none(),
-                        "write lock freed while the observer is still gated"
-                    );
-                    std::thread::sleep(core::time::Duration::from_millis(1));
-                }
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < engaged,
-                "the next mutation never took the write lock behind the gate"
-            );
-            std::thread::sleep(core::time::Duration::from_millis(1));
-        }
-
-        // Nothing may publish while the gate is closed.
-        assert_eq!(
-            observer.stream.lock().len(),
-            1,
-            "only the gated first batch is published so far"
-        );
-
-        release_tx.send(()).expect("gate thread alive");
-        first_handle.join().expect("first publisher");
-        second_handle.join().expect("second publisher");
-
-        assert_eq!(
-            *observer.stream.lock(),
-            vec![1, 2],
-            "publish order matches sequence order"
-        );
-        let pool_read = gateway.read();
-        assert!(pool_read.contains_txid(&first_txid));
-        assert!(pool_read.contains_txid(&second_txid));
-    }
-
-    /// Records every change sequence the observer sees, in publish order.
-    #[derive(Default)]
-    struct SequenceStreamObserver {
-        stream: Mutex<Vec<u64>>,
-    }
-
-    impl MempoolObserver for SequenceStreamObserver {
-        fn on_mutation(&self, envelope: &MutationEnvelope) {
-            let mut stream = self.stream.lock();
-            for index in 0..envelope.result.len() {
-                stream.push(envelope.result.sequence_of(index).unwrap_or(u64::MAX));
-            }
-        }
-    }
-
-    /// Races mutations from several threads and requires the published
-    /// stream to be exactly the full sequence range in order. Sequences are
-    /// assigned in commit order under the write lock, so an in-order stream
-    /// proves publish order == commit order. Under the old
-    /// release-the-write-lock-then-take-the-publish-mutex shape, a thread
-    /// slipping from its write-lock release into the publish mutex while
-    /// another thread completes a whole mutation cycle in between published
-    /// out of order; since the invariant is now enforced inside `commit`,
-    /// the publish mutex is always taken before the write lock is released,
-    /// which makes that interleaving impossible rather than merely unlikely.
-    #[test]
-    fn concurrent_mutations_publish_in_sequence_order() {
-        const CYCLES: usize = 1_500;
-        const MEMBER_LABELS: [u8; 4] = [20, 21, 22, 23];
-        let observer = Arc::new(SequenceStreamObserver::default());
-        let gateway = Arc::new(gateway_with(Some(dyn_observer(&observer))));
-
-        let handles: Vec<_> = MEMBER_LABELS
-            .iter()
-            .map(|&label| {
-                let gateway = Arc::clone(&gateway);
-                std::thread::spawn(move || {
-                    let member = tx(label);
-                    let member_txid = member.txid();
-                    for _ in 0..CYCLES {
-                        gateway
-                            .insert_entry(AdmissionOrigin::Rpc, entry(&member))
-                            .expect("admitted");
-                        gateway.remove_by_txid(AdmissionOrigin::Rpc, &member_txid);
-                    }
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle.join().expect("mutator thread");
-        }
-
-        let total = u64::try_from(MEMBER_LABELS.len() * CYCLES * 2).expect("change count fits u64");
-        let stream = observer.stream.lock();
-        assert_eq!(
-            u64::try_from(stream.len()).expect("stream length fits u64"),
-            total,
-            "every committed change published exactly once"
-        );
-        let expected: Vec<u64> = (1..=total).collect();
-        assert_eq!(*stream, expected, "publish order must equal commit order");
-    }
-
-    #[test]
-    fn reconsider_disconnected_admits_in_order_once_per_candidate() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-        let parent = tx(30);
-        let parent_txid = parent.txid();
-        let mut child = tx(31);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-
-        let committed = gateway
-            .reconsider_disconnected(AdmissionOrigin::Reorg, [entry(&parent), entry(&child)]);
-
-        assert_eq!(committed.len(), 2, "one committed result per candidate");
-        for result in &committed {
-            assert_eq!(result.changes.len(), 1);
-        }
-        assert_eq!(gateway.read().sequence_number(), 2);
-        let seen = observer.seen.lock();
-        assert_eq!(seen.len(), 2, "one publish per committed candidate");
-        assert_eq!(seen[0].0, hash(&parent_txid), "parent commits first");
-        assert_eq!(seen[1].0, hash(&child.txid()), "child commits second");
-    }
-
-    #[test]
-    fn reconsider_disconnected_withholds_descendants_of_a_refused_parent() {
-        let gateway = gateway_with(None);
-        let parent = tx(32);
-        let parent_txid = parent.txid();
-        let mut child = tx(33);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        // Fee 50 over 100 vbytes is 500 sat/kvB, under the 1 000 sat/kvB
-        // floor; the child itself is fine and only the refused parent can
-        // keep it out.
-        let refused_parent = MempoolEntry::new(Arc::new(parent), 100, 50, 1, 7);
-
-        let committed = gateway
-            .reconsider_disconnected(AdmissionOrigin::Reorg, [refused_parent, entry(&child)]);
-
-        assert!(
-            committed.is_empty(),
-            "a refused parent must keep its descendant out"
-        );
-        assert!(!gateway.read().contains_txid(&parent_txid));
-        assert!(!gateway.read().contains_txid(&child.txid()));
-    }
-
-    #[test]
-    fn reconsider_disconnected_withholds_descendants_of_an_immediately_evicted_parent() {
-        let observer = Arc::new(RecordingObserver::default());
-        // A 150-byte pool already holding 100 vbytes of high-fee filler: the
-        // parent's own insert succeeds and then immediately evicts the parent
-        // as the lowest-fee package. The child pays far more than everything
-        // else, so once admitted it fits and survives — only the parent's
-        // eviction inside the parent's own MutationResult can keep it out.
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-            min_relay_fee_sat_per_kvb: 0,
-            max_total_bytes: 150,
-            ..MempoolLimits::default()
-        }))));
-        assert!(
-            gateway.install_observer(dyn_observer(&observer)).is_ok(),
-            "fresh test gateway accepts one observer"
-        );
-        let filler_txid = tx(36).txid();
-        let filler = MempoolEntry::new(Arc::new(tx(36)), 100, 9_000, 1, 7);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, filler)
-            .expect("filler in");
-        observer.seen.lock().clear();
-
-        let parent = tx(34);
-        let parent_txid = parent.txid();
-        let mut child = tx(35);
-        child.inputs[0].previous_output = OutPoint::new(parent_txid, 0);
-        let child_txid = child.txid();
-        let parent = MempoolEntry::new(Arc::new(parent), 100, 100, 1, 7);
-        let child = MempoolEntry::new(Arc::new(child), 100, 9_000, 1, 7);
-
-        let committed = gateway.reconsider_disconnected(AdmissionOrigin::Reorg, [parent, child]);
-
-        assert_eq!(
-            committed.len(),
-            1,
-            "only the parent's insert commits; the child is withheld"
-        );
-        assert_eq!(
-            committed[0].changes,
-            vec![
-                crate::mutation::change(&parent_txid, MutationOutcome::Accepted),
-                crate::mutation::change(&parent_txid, removed(RemovalReason::PolicyEviction)),
-            ],
-            "the parent was admitted and immediately evicted by its own insert"
-        );
-        let pool = gateway.read();
-        assert!(!pool.contains_txid(&parent_txid));
-        assert!(
-            !pool.contains_txid(&child_txid),
-            "an evicted parent must not admit its descendant"
-        );
-        assert!(
-            pool.contains_txid(&filler_txid),
-            "no orphan replaced the parent"
-        );
-        assert_eq!(
-            pool.sequence_number(),
-            3,
-            "the withheld child assigns nothing"
-        );
-        assert_eq!(
-            *observer.seen.lock(),
-            vec![
-                (hash(&parent_txid), MutationOutcome::Accepted),
-                (hash(&parent_txid), removed(RemovalReason::PolicyEviction)),
-            ],
-            "the parent's two changes publish once each; the child publishes nothing"
-        );
-    }
-
-    #[test]
-    fn reconsider_disconnected_no_ops_on_an_empty_batch() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-        let before = gateway.read().sequence_number();
-
-        let committed = gateway.reconsider_disconnected(AdmissionOrigin::Reorg, []);
-
-        assert!(committed.is_empty());
-        assert_eq!(gateway.read().sequence_number(), before);
-        assert!(observer.seen.lock().is_empty(), "nothing may publish");
-    }
-
-    /// A composite whose first leg panics must not take the later legs
-    /// down: the recorder still sees the envelope, and the mutation stands.
-    #[test]
     fn composite_isolates_a_panicking_leg() {
         let recorder = Arc::new(RecordingObserver::default());
-        let mut composite = CompositeObserver::new();
+        let composite = CompositeObserver::new();
         composite.add_leg("panicker", Arc::new(PanickingObserver));
         composite.add_leg("recorder", dyn_observer(&recorder));
         let composite = Arc::new(composite);
@@ -1784,6 +2003,7 @@ mod tests {
             "the leg after the panicking one still recorded"
         );
     }
+
     #[test]
     fn gateway_contains_a_panicking_payload_destructor() {
         let gateway = gateway_with(Some(Arc::new(PanickingObserver)));
@@ -1798,35 +2018,6 @@ mod tests {
         assert!(gateway.read().contains_txid(&committed_txid));
     }
 
-    /// Every published envelope carries the origin its mutator passed.
-    #[test]
-    fn envelope_carries_origin() {
-        let observer = Arc::new(RecordingObserver::default());
-        let gateway = gateway_with(Some(dyn_observer(&observer)));
-
-        let admitted = tx(41);
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&admitted))
-            .expect("in");
-        let reorged = tx(42);
-        gateway
-            .insert_entry(AdmissionOrigin::Reorg, entry(&reorged))
-            .expect("in");
-        gateway.remove_by_txid(AdmissionOrigin::Reorg, &admitted.txid());
-
-        let origins = observer.origins.lock();
-        assert_eq!(
-            *origins,
-            vec![
-                AdmissionOrigin::Rpc,
-                AdmissionOrigin::Reorg,
-                AdmissionOrigin::Reorg,
-            ],
-            "each published envelope carries the origin the mutator passed"
-        );
-    }
-
-    /// Same pool `Arc`, same gateway; distinct pools, distinct gateways.
     #[test]
     fn shared_interns_one_gateway_per_pool() {
         let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
@@ -1844,144 +2035,6 @@ mod tests {
             !Arc::ptr_eq(&first, &other),
             "distinct pools must get distinct gateways"
         );
-    }
-
-    /// The observer slot is set-once: the first install wins, a second
-    /// install returns the rejected observer.
-    #[test]
-    fn install_observer_is_set_once() {
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
-        let first = Arc::new(RecordingObserver::default());
-        assert!(
-            gateway.install_observer(dyn_observer(&first)).is_ok(),
-            "fresh gateway accepts the first observer"
-        );
-
-        let second = Arc::new(RecordingObserver::default());
-        let rejected = gateway
-            .install_observer(dyn_observer(&second))
-            .expect_err("second install must be rejected");
-        let second_dyn = dyn_observer(&second);
-        assert!(
-            Arc::ptr_eq(&rejected, &second_dyn),
-            "the rejected observer is returned to the caller"
-        );
-
-        gateway
-            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(43)))
-            .expect("in");
-        assert_eq!(
-            first.seen.lock().len(),
-            1,
-            "the first observer stays installed"
-        );
-        assert!(
-            second.seen.lock().is_empty(),
-            "the rejected observer never ran"
-        );
-    }
-
-    /// Two mutators race through one shared gateway. Batch 1 blocks inside
-    /// its observer while holding the publish mutex. Batch 2 sequences under
-    /// the pool write lock and parks immediately before acquiring that mutex.
-    /// While parked it must still hold the pool write guard and must not have
-    /// published. This pins the lock handoff that makes commit order equal
-    /// publication order. Releasing batch 1's observer and then batch 2's
-    /// barrier yields the exact contiguous stream [1, 2].
-    /// No sleeps, polling, or blocking pool reads occur before release.
-    #[test]
-    fn concurrent_mutators_publish_in_commit_order() {
-        ordering_gate::reset();
-
-        let pool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let gateway = MempoolGateway::shared(Arc::clone(&pool));
-        let stream = Arc::new(Mutex::new(Vec::new()));
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (observer_release_tx, observer_release_rx) = mpsc::channel();
-        assert!(
-            gateway
-                .install_observer(Arc::new(GatedRecorder {
-                    stream: Arc::clone(&stream),
-                    gated: AtomicBool::new(false),
-                    entered: Mutex::new(Some(entered_tx)),
-                    release: Mutex::new(Some(observer_release_rx)),
-                }))
-                .is_ok(),
-            "fresh shared gateway accepts one observer"
-        );
-
-        // Mutator A: commits batch 1, publishes, and parks inside the
-        // observer while holding the publish mutex.
-        let first_txid = tx(50).txid();
-        let mutator_a = Arc::clone(&gateway);
-        let a_handle = std::thread::spawn(move || {
-            mutator_a
-                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(50)))
-                .expect("first in")
-        });
-        entered_rx
-            .recv_timeout(core::time::Duration::from_secs(10))
-            .expect("first publication reached the observer");
-
-        // Arm the gate, then race mutator B: it must sequence under the
-        // write lock and park before the publish mutex.
-        let (parked_tx, parked_rx) = mpsc::channel();
-        let (gate_release_tx, gate_release_rx) = mpsc::channel();
-        ordering_gate::arm(
-            Arc::as_ptr(&gateway).expose_provenance(),
-            parked_tx,
-            gate_release_rx,
-        );
-
-        let second_txid = tx(51).txid();
-        let mutator_b = Arc::clone(&gateway);
-        let b_handle = std::thread::spawn(move || {
-            mutator_b
-                .insert_entry(AdmissionOrigin::Rpc, entry(&tx(51)))
-                .expect("second in")
-        });
-        parked_rx
-            .recv_timeout(core::time::Duration::from_secs(10))
-            .expect("second mutator parked at the publish-lock seam");
-
-        // Batch 2 must retain the pool write guard until it owns the publish
-        // mutex. Releasing the guard here would let batch 3 commit and race
-        // batch 2 to publication.
-        assert!(
-            pool.try_write().is_none(),
-            "parked mutator must retain the pool write guard"
-        );
-        assert_eq!(
-            stream.lock().len(),
-            1,
-            "only batch 1 is published while batch 2 is parked"
-        );
-
-        // Release the observer, then release B's barrier.
-        observer_release_tx.send(()).expect("observer thread alive");
-        gate_release_tx
-            .send(())
-            .expect("parked mutator thread alive");
-        a_handle.join().expect("first publisher");
-        b_handle.join().expect("second publisher");
-
-        let stream_lock = stream.lock();
-        assert_eq!(
-            *stream_lock,
-            vec![
-                (1, hash(&first_txid), MutationOutcome::Accepted),
-                (2, hash(&second_txid), MutationOutcome::Accepted),
-            ],
-            "publish order is commit order: batch 1 then batch 2, contiguous sequences"
-        );
-        drop(stream_lock);
-        let pool_read = gateway.read();
-        assert!(pool_read.contains_txid(&first_txid));
-        assert!(pool_read.contains_txid(&second_txid));
-        drop(pool_read);
-        ordering_gate::reset();
     }
 
     #[test]

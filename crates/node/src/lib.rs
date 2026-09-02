@@ -26,6 +26,9 @@ pub mod config;
 pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
+/// Typed in-process node lifecycle: the embedding surface over the same
+/// service graph the daemon wires.
+pub mod embed;
 /// Central synchronous event loop.
 pub mod event_loop;
 /// Extension registry: descriptors, validation, capability report.
@@ -71,10 +74,10 @@ mod window_overlay;
 /// ZMQ publisher trait + implementations for the notification subsystem.
 pub mod zmq_publisher;
 
-pub use bip9_context::BlockTreeContext;
 pub use bitcoin_rs_primitives::Network;
 pub use block_source::NodeBlockSource;
 pub use config::{Auth, Config, ScriptIndexMode};
+pub use embed::{Node, NodeError, SyncProgress};
 pub use mining::{GenerationKey, MiningCoordinator};
 pub use p2p_chain::NodeP2pChainQuery;
 pub use run::run;

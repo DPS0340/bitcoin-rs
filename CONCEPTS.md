@@ -29,6 +29,15 @@ metadata. The router therefore returns `503` if the applied-tip identity is not
 the same when composition finishes, rather than mixing independently valid
 answers from opposite sides of a reorg.
 
+### Embedded node
+The typed in-process surface (`bitcoin_rs_node::Node`) over the same
+lifecycle the daemon runs: start against a data dir on the caller's
+Tokio runtime, typed snapshot/progress/capability reads, mempool
+statistics, fee estimates, gateway-routed broadcast, and a consuming
+shutdown that publishes the clean checkpoint. No second lifecycle exists —
+the daemon's `run()` is a signal wrapper around the identical start and
+shutdown path (see `docs/contracts/embedding.md`).
+
 ## Initial Block Download
 
 ### Initial Block Download (IBD)

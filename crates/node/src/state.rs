@@ -1143,6 +1143,10 @@ pub struct NodeState {
     zmq_publisher: Arc<dyn crate::ZmqPublisher>,
     active_zmq_notifications: Vec<ZmqNotification>,
     mempool: Arc<RwLock<Mempool>>,
+    /// The single mutation gateway in front of `mempool`.
+    mempool_gateway: Arc<bitcoin_rs_mempool::MempoolGateway>,
+    /// Template-coordinator wake for authoritative mutations and tip moves.
+    mining_generation: Arc<crate::mining::MiningGenerationSignal>,
     chain_tip: Arc<ArcSwapOption<TipSnapshot>>,
     applied_tip: Arc<ArcSwapOption<TipSnapshot>>,
     /// Cumulative transaction count through `applied_tip`, `0` when unknown.
@@ -1520,6 +1524,39 @@ impl NodeState {
             crossbeam_channel::bounded::<bitcoin_rs_p2p::InboundBlock>(INBOUND_BLOCK_CHANNEL_LIMIT);
         let inbound_blocks_rx = Arc::new(Mutex::new(inbound_blocks_rx_raw));
         let chain_event_hints_rx = Arc::new(Mutex::new(chain_event_hints_rx_raw));
+        // The template-coordinator wake exists from node birth so the apply
+        // path and the gateway can fire it before `run` builds the
+        // coordinator; the coordinator attaches itself once constructed.
+        let mining_generation = Arc::new(crate::mining::MiningGenerationSignal::new());
+        // One node-owned gateway: every admission (RPC sendrawtransaction,
+        // embedded broadcast, reorg re-admission, block-connect eviction)
+        // mutates through this instance, so publication order equals commit
+        // order process-wide. The sequence observer rides along only when a
+        // `--zmq-pub-sequence` endpoint is configured; the mining
+        // generation wake always does.
+        let mempool_gateway = {
+            let publisher = Arc::clone(&zmq_publisher);
+            let sequence: Option<Arc<dyn bitcoin_rs_mempool::MempoolObserver>> =
+                if publisher.wants_notifications() {
+                    let observer: Arc<dyn bitcoin_rs_mempool::MempoolObserver> = Arc::new(
+                        crate::mempool_observer::MempoolSequenceObserver::new(publisher),
+                    );
+                    Some(observer)
+                } else {
+                    config.mempool_observer.clone()
+                };
+            let observer = crate::mempool_observer::NodeMutationObserver::new(
+                sequence,
+                Arc::clone(&mining_generation),
+            );
+            // Intern it: one gateway per pool, so every route that resolves
+            // the pool - including a test attaching its own observer leg -
+            // reaches this instance and its observer slot.
+            bitcoin_rs_mempool::MempoolGateway::shared_with(
+                Arc::clone(&mempool),
+                Arc::new(observer),
+            )
+        };
         let apply_handles = crate::apply::ApplyHandles {
             network: config.network,
             chain_tip: Arc::clone(&chain_tip),
@@ -1530,7 +1567,8 @@ impl NodeState {
             coin_stats: Arc::clone(&coin_stats),
             tx_index_runtime: tx_index_runtime.clone(),
             mempool: Arc::clone(&mempool),
-            mempool_gateway: bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool)),
+            mempool_gateway: Arc::clone(&mempool_gateway),
+            mining_generation: Arc::clone(&mining_generation),
             blocks: Arc::clone(&blocks),
             transactions: Arc::clone(&transactions),
             zmq_publisher: Arc::clone(&zmq_publisher),
@@ -1603,6 +1641,8 @@ impl NodeState {
             zmq_publisher,
             active_zmq_notifications,
             mempool,
+            mempool_gateway,
+            mining_generation,
             chain_tip,
             applied_tip,
             chain_tx_count: Arc::clone(&chain_tx_count),
@@ -1821,6 +1861,24 @@ impl NodeState {
     #[must_use]
     pub fn mempool(&self) -> Arc<RwLock<Mempool>> {
         Arc::clone(&self.mempool)
+    }
+
+    /// Returns the node-owned mutation gateway in front of `mempool`.
+    ///
+    /// Every mempool mutation in this process — RPC admission, embedded
+    /// broadcast, reorg re-admission, block-connect eviction — commits
+    /// through this one instance, so observers observe a single ordered
+    /// stream.
+    #[must_use]
+    pub fn mempool_gateway(&self) -> Arc<bitcoin_rs_mempool::MempoolGateway> {
+        Arc::clone(&self.mempool_gateway)
+    }
+
+    /// Returns the mining generation wake shared with the apply path and the
+    /// gateway observer. The template coordinator attaches itself here.
+    #[must_use]
+    pub fn mining_generation_signal(&self) -> Arc<crate::mining::MiningGenerationSignal> {
+        Arc::clone(&self.mining_generation)
     }
 
     /// Returns the shared best-chain tip handle.
@@ -2115,7 +2173,6 @@ impl Drop for NodeState {
         let _admission = self.apply_handles.admission.close();
         // Safety net: if `bounded_index_shutdown` was not called (e.g. in
         // tests that drop `NodeState` directly), still request shutdown and
-        // join. In normal operation these are already `None` because
         // `bounded_index_shutdown` took them.
         if let Some(runtime) = &self.tx_index_runtime {
             runtime.request_shutdown();

@@ -7451,6 +7451,7 @@ mod tests {
     ) -> ApplyHandles {
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
         let mempool_gateway = bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool));
+        let mining_generation = Arc::new(crate::mining::MiningGenerationSignal::new());
         ApplyHandles::new(
             Network::Regtest,
             chain_tip,
@@ -7463,6 +7464,7 @@ mod tests {
             None,
             mempool,
             mempool_gateway,
+            mining_generation,
             Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
             Arc::new(crate::NoOpZmqPublisher),

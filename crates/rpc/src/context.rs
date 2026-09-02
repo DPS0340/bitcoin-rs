@@ -8,7 +8,7 @@ use arc_swap::ArcSwapOption;
 use bitcoin_rs_chain::TipSnapshot;
 use bitcoin_rs_ext_api::CapabilityProvider;
 use bitcoin_rs_index::ScriptHash;
-use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits};
+use bitcoin_rs_mempool::{Mempool, MempoolGateway, MempoolLimits, MempoolObserver, MutationResult};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Network, OutPoint, Tx, Txid, consensus_bytes,
 };
@@ -23,6 +23,13 @@ const SERIALIZED_BLOCK_HEADER_LEN: usize = 80;
 /// Bitcoin Core's `DEFAULT_MAX_TIP_AGE`, 24 hours. Core exposes it as
 /// `-maxtipage`; this node has no such option yet, so the default stands.
 const MAX_TIP_AGE_SECONDS: u64 = 24 * 60 * 60;
+
+/// Core `sendrawtransaction` default `maxfeerate`: 0.1 BTC/kvB in sat/kvB.
+///
+/// The node applies the identical cap to every admission surface, including
+/// the embedded [`bitcoin_rs_node::Node::broadcast`], via
+/// [`Context::admit_transaction`].
+pub const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 
 /// Full-block REST responses materialize the block and a response buffer.
 /// Bound concurrent materializations independently of socket connections.
@@ -1271,6 +1278,60 @@ impl Context {
             rollback_warnings: None,
         }
     }
+
+    /// Builds an empty context whose mempool gateway carries `observer`.
+    ///
+    /// Like [`Self::new`] but the gateway is constructed with the supplied
+    /// observer instead of `None`. Test-only: production wiring constructs
+    /// the gateway through `NodeState::open`.
+    #[must_use]
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn new_with_mempool_observer(observer: Arc<dyn MempoolObserver>) -> Self {
+        let coin_stats_listener = bitcoin_rs_utxo::stats::CoinStatsListener::new(
+            bitcoin_rs_utxo::stats::CoinStats::default(),
+        );
+        let mut utxo = bitcoin_rs_utxo::UtxoSet::new();
+        utxo.set_listener(Box::new(coin_stats_listener.clone()));
+        let coin_stats = Arc::new(coin_stats_listener);
+        let mempool = MempoolGateway::shared_with(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            observer,
+        );
+        Self {
+            chain_tip: Arc::new(ArcSwapOption::empty()),
+            applied_tip: Arc::new(ArcSwapOption::empty()),
+            chain_transition: Arc::new(Mutex::new(())),
+            chain_tx_count: Arc::new(core::sync::atomic::AtomicU64::new(0)),
+            left_initial_block_download: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            mempool,
+            blocks: Arc::new(RwLock::new(BlockLog::new())),
+            transactions: Arc::new(RwLock::new(HashMap::new())),
+            utxo: Arc::new(utxo),
+            coin_stats,
+            tx_index: None,
+            esplora_tx_index: None,
+            script_index: None,
+            filter_index: None,
+            capabilities: None,
+            prune_service: None,
+            chain_control: None,
+            peer_outbound: Arc::new(RwLock::new(HashMap::new())),
+            network_active: Arc::new(core::sync::atomic::AtomicBool::new(true)),
+            mining_control: None,
+            network: Arc::new(RwLock::new(NetworkState::default())),
+            chain_network: Network::Mainnet,
+            peers: Arc::new(RwLock::new(Vec::new())),
+            block_tree: Arc::new(parking_lot::RwLock::new(bitcoin_rs_chain::BlockTree::new())),
+            block_body_source: None,
+            p2p_outbound_sender: None,
+            banned: Arc::new(RwLock::new(Vec::new())),
+            added_nodes: Arc::new(RwLock::new(Vec::new())),
+            zmq_notifications: Arc::from(Vec::<ZmqNotification>::new()),
+            debug_log_path: None,
+            rest_render_budget: Arc::new(RestRenderBudget::new()),
+            rollback_warnings: None,
+        }
+    }
     /// Builds a context that shares pre-existing handles owned elsewhere.
     #[must_use]
     pub fn from_handles(handles: ContextHandles) -> Self {
@@ -1477,6 +1538,40 @@ impl Context {
         let txid = tx.txid();
         self.transactions.write().insert(txid, tx);
         txid
+    }
+
+    /// Admits one transaction through the full policy stack, then mutates
+    /// the mempool only through the node's one [`MempoolGateway`].
+    ///
+    /// This is the shared typed admission operation: `sendrawtransaction`
+    /// and the embedded `Node::broadcast` both run it. The gateway's
+    /// [`MempoolGateway::admit_transaction`] holds the pool write lock
+    /// across the entire mempool-dependent policy evaluation — the
+    /// already-known check, prevout-resolved fee/vsize/sigop context,
+    /// standardness policy, the live min-relay / mempool-min floor, the
+    /// caller's max-feerate cap, BIP125 replacement analysis, and package
+    /// limits — and commits the authorized
+    /// [`MempoolGateway::replace_transaction`] inside that same lock
+    /// interval, so no concurrent admission can invalidate the verdict
+    /// before it lands.
+    ///
+    /// The pool and transaction-cache fast paths here remain best-effort
+    /// pre-checks for the "already known" no-op; the authoritative
+    /// already-known re-check runs inside the locked evaluation.
+    ///
+    /// `max_feerate_sat_per_kvb` of `None` disables the max-fee cap,
+    /// matching `sendrawtransaction`'s `maxfeerate=0` behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns the policy rejection verbatim (Core rejection strings) or
+    /// the failure verbatim; nothing is inserted when this fails.
+    pub fn admit_transaction(
+        &self,
+        tx: Tx,
+        max_feerate_sat_per_kvb: Option<u64>,
+    ) -> Result<MutationResult, String> {
+        crate::handlers::tx::admit_transaction(self, tx, max_feerate_sat_per_kvb)
     }
 
     /// Returns the current tip height, or zero before initial sync publishes one.

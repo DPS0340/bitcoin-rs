@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use bitcoin_rs_mempool::{
-    AdmissionOrigin, MempoolGateway, MempoolObserver, MutationEnvelope, MutationOutcome,
-};
+use bitcoin_rs_mempool::{MempoolGateway, MempoolObserver, MutationOutcome, MutationResult};
 use bitcoin_rs_node::{Config, MiningCoordinator, Network, state::NodeState};
 use bitcoin_rs_primitives::encode::double_sha256;
 use bitcoin_rs_primitives::{
@@ -654,18 +652,18 @@ fn invalidateblock_readmits_parent_before_child_in_dependency_order() -> Result<
     Ok(())
 }
 
-/// Records every published change as `(origin, sequence, txid, outcome)`.
+/// Records every published change as `(sequence, txid, outcome)`.
 #[derive(Default)]
 struct RecordingMempoolObserver {
-    changes: Mutex<Vec<(AdmissionOrigin, u64, Hash256, MutationOutcome)>>,
+    changes: Mutex<Vec<(u64, Hash256, MutationOutcome)>>,
 }
 
 impl MempoolObserver for RecordingMempoolObserver {
-    fn on_mutation(&self, envelope: &MutationEnvelope) {
+    fn on_mutation(&self, result: &MutationResult) {
         let mut changes = self.changes.lock();
-        for (offset, change) in envelope.result.changes.iter().enumerate() {
-            let sequence = envelope.result.sequence_of(offset).unwrap_or(u64::MAX);
-            changes.push((envelope.origin, sequence, change.txid, change.outcome));
+        for (offset, change) in result.changes.iter().enumerate() {
+            let sequence = result.sequence_of(offset).unwrap_or(u64::MAX);
+            changes.push((sequence, change.txid, change.outcome));
         }
     }
 }
@@ -681,14 +679,17 @@ fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Re
     let seed_tip_hash = seed_chain(&state, SEED_BLOCKS)?;
 
     // Interning returns the one gateway every production route reaches
-    // through this pool Arc; the observer installs before the invalidate.
-    let gateway = MempoolGateway::shared(state.mempool());
+    // The gateway is constructed with the observer so publication runs
+    // through the same path production uses.
     let observer = Arc::new(RecordingMempoolObserver::default());
+    let gateway = state.apply_handles().mempool_gateway;
     assert!(
-        gateway.install_observer(observer.clone()).is_ok(),
-        "fresh regtest gateway has no observer yet"
+        Arc::ptr_eq(&gateway, &MempoolGateway::shared(state.mempool())),
+        "the node's gateway must be the one interned for its pool"
     );
-
+    gateway
+        .attach_observer_leg("test-recorder", observer.clone())
+        .unwrap_or_else(|error| panic!("the node installs an observer slot to extend: {error}"));
     let parent = seed_coinbase_spend();
     let parent_txid = parent.txid();
     let child = Tx {
@@ -718,20 +719,10 @@ fn invalidateblock_readmission_publishes_a_events_through_shared_gateway() -> Re
     assert_eq!(
         *changes,
         vec![
-            (
-                AdmissionOrigin::Reorg,
-                1,
-                Hash256::from(parent_txid),
-                MutationOutcome::Accepted,
-            ),
-            (
-                AdmissionOrigin::Reorg,
-                2,
-                Hash256::from(child_txid),
-                MutationOutcome::Accepted,
-            ),
+            (1, Hash256::from(parent_txid), MutationOutcome::Accepted,),
+            (2, Hash256::from(child_txid), MutationOutcome::Accepted,),
         ],
-        "parent before child, origin Reorg, contiguous sequences"
+        "parent before child, contiguous sequences"
     );
     Ok(())
 }

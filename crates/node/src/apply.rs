@@ -756,6 +756,8 @@ pub struct ApplyHandles {
     /// from the weak registry. The raw `mempool` field stays for read-only
     /// node code that still needs the pool.
     pub mempool_gateway: Arc<MempoolGateway>,
+    /// Template-coordinator wake; fired on authoritative tip moves.
+    pub(crate) mining_generation: Arc<crate::mining::MiningGenerationSignal>,
     /// Shared block records exposed to RPC handlers.
     pub blocks: Arc<RwLock<BlockLog>>,
     /// Shared transaction map exposed to RPC handlers.
@@ -824,6 +826,7 @@ impl ApplyHandles {
         tx_index_runtime: Option<Arc<crate::txindex_worker::TxIndexRuntime>>,
         mempool: Arc<RwLock<Mempool>>,
         mempool_gateway: Arc<MempoolGateway>,
+        mining_generation: Arc<crate::mining::MiningGenerationSignal>,
         blocks: Arc<RwLock<BlockLog>>,
         transactions: Arc<RwLock<HashMap<Txid, Tx>>>,
         zmq_publisher: Arc<dyn crate::ZmqPublisher>,
@@ -837,9 +840,10 @@ impl ApplyHandles {
             block_tree,
             utxo,
             coin_stats,
-            tx_index_runtime,
             mempool,
+            tx_index_runtime,
             mempool_gateway,
+            mining_generation,
             blocks,
             transactions,
             zmq_publisher,
@@ -1172,6 +1176,8 @@ pub(crate) fn disconnect_block_admitted(
     );
     rewind_chain_tx_count(handles, tx_count_delta);
     handles.wake_tx_index();
+    // The applied tip moved: every template long-poll waiter must observe it.
+    handles.mining_generation.publish_generation();
 
     if handles.zmq_publisher.wants_notifications() {
         handles
@@ -2505,6 +2511,8 @@ fn apply_block_admitted<'b>(
         .record(crate::state::HintKind::Connected, tip.height, tip.hash);
     advance_chain_tx_count(handles, height, tx_count_delta_for(block));
     handles.wake_tx_index();
+    // The applied tip moved: every template long-poll waiter must observe it.
+    handles.mining_generation.publish_generation();
     if handles.zmq_publisher.wants_notifications() {
         handles
             .zmq_publisher
@@ -3653,7 +3661,6 @@ mod consensus_rule_tests {
         BlockTree,
         node::{ChainWork, NodeStatus},
     };
-    use bitcoin_rs_mempool::{Mempool, MempoolLimits};
     use bitcoin_rs_primitives::{BlockHash, Hash256, Header, OutPoint, TxIn};
     use bitcoin_rs_script::script::{push_data, push_int};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
@@ -9302,8 +9309,11 @@ mod consensus_rule_tests {
         network: Network,
         utxo: Arc<UtxoSet>,
     ) -> ApplyHandles {
-        let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
-        let mempool_gateway = MempoolGateway::shared(Arc::clone(&mempool));
+        let mempool: Arc<RwLock<bitcoin_rs_mempool::Mempool>> = Arc::new(RwLock::new(
+            bitcoin_rs_mempool::Mempool::new(bitcoin_rs_mempool::MempoolLimits::default()),
+        ));
+        let mempool_gateway = bitcoin_rs_mempool::MempoolGateway::shared(Arc::clone(&mempool));
+        let mining_generation = Arc::new(crate::mining::MiningGenerationSignal::new());
         ApplyHandles::new(
             network,
             Arc::new(ArcSwapOption::empty()),
@@ -9316,6 +9326,7 @@ mod consensus_rule_tests {
             None,
             mempool,
             mempool_gateway,
+            mining_generation,
             Arc::new(RwLock::new(BlockLog::new())),
             Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
             Arc::new(crate::NoOpZmqPublisher),
@@ -9428,6 +9439,83 @@ mod consensus_rule_tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn empty_utxo() -> Arc<UtxoSet> {
         Arc::new(UtxoSet::new())
+    }
+
+    use bitcoin_rs_rpc::context::MiningControlError;
+    use compact_str::CompactString;
+
+    /// A fake template coordinator recording generation publications.
+    struct RecordingGenerationControl {
+        published: Mutex<usize>,
+    }
+
+    fn generation_unavailable() -> MiningControlError {
+        MiningControlError::Unavailable(CompactString::from("not wired in this test"))
+    }
+
+    impl bitcoin_rs_rpc::context::MiningControl for RecordingGenerationControl {
+        fn get_block_template(
+            &self,
+            _request: bitcoin_rs_rpc::context::BlockTemplateRequest,
+        ) -> Result<bitcoin_rs_rpc::context::BlockTemplateResult, MiningControlError> {
+            Err(generation_unavailable())
+        }
+
+        fn mining_info(&self) -> Result<bitcoin_rs_rpc::context::MiningInfo, MiningControlError> {
+            Err(generation_unavailable())
+        }
+
+        fn submit_block(
+            &self,
+            _block: Block,
+        ) -> Result<bitcoin_rs_rpc::context::BlockValidationResult, MiningControlError> {
+            Err(generation_unavailable())
+        }
+
+        fn publish_generation(&self) {
+            *self.published.lock() += 1;
+        }
+    }
+
+    /// Authoritative applied-tip moves must reach the template coordinator's
+    /// long-poll waiters through the shared `MiningGenerationSignal`: one
+    /// wake per connect and one per disconnect, fired after the tip is
+    /// published.
+    #[test]
+    fn connect_and_disconnect_wake_the_mining_generation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let genesis = Network::Regtest.genesis_block();
+        let utxo = Arc::new(UtxoSet::new());
+        let handles = apply_handles_without_tx_index(Network::Regtest, Arc::clone(&utxo));
+        let control = Arc::new(RecordingGenerationControl {
+            published: Mutex::new(0),
+        });
+        let control_dyn: Arc<dyn bitcoin_rs_rpc::context::MiningControl> = control.clone();
+        handles.mining_generation.attach(&control_dyn);
+        assert_eq!(*control.published.lock(), 0, "nothing ran yet");
+
+        let genesis_hash = Hash256::from(genesis.block_hash());
+        let genesis_tip = applied_header_tip(&handles, genesis_hash, &genesis, 0)?;
+        handles.applied_tip.store(Some(Arc::new(genesis_tip)));
+
+        let block = mined_block_with_prev_hash_and_transactions(
+            genesis.block_hash(),
+            vec![coinbase_transaction(1)],
+        )?;
+        apply_block(&handles, &block)?;
+        assert_eq!(
+            *control.published.lock(),
+            1,
+            "the connect's tip publication must wake the coordinator once"
+        );
+
+        disconnect_block(&handles, &block)?;
+        assert_eq!(
+            *control.published.lock(),
+            2,
+            "the disconnect's tip publication must wake the coordinator once"
+        );
+        Ok(())
     }
     /// Failure-injecting undo store: every persist fails, everything else
     /// delegates to a real in-memory store.
@@ -9916,7 +10004,7 @@ mod chain_tx_count_tests {
 mod chain_generation_tests {
     use std::sync::Arc;
 
-    use bitcoin_rs_mempool::{MempoolObserver, MutationEnvelope};
+    use bitcoin_rs_mempool::{MempoolObserver, MutationResult};
     use bitcoin_rs_primitives::{BlockHash, Network, OutPoint, Tx, TxIn, TxOut, Txid};
     use bitcoin_rs_utxo::UtxoSet;
     use parking_lot::Mutex;
@@ -9935,7 +10023,7 @@ mod chain_generation_tests {
     }
 
     impl MempoolObserver for GatewayGenerationRecorder {
-        fn on_mutation(&self, _envelope: &MutationEnvelope) {
+        fn on_mutation(&self, _result: &MutationResult) {
             self.seen.lock().push(self.gateway.stable_generation());
         }
     }
@@ -10068,18 +10156,21 @@ mod chain_generation_tests {
 
     #[test]
     fn observer_sees_none_during_connect() {
-        let (handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
-
+        let (mut handles, genesis, _genesis_hash) = setup_regtest_with_genesis();
         let gateway = Arc::clone(&handles.mempool_gateway);
         let recorder = Arc::new(GatewayGenerationRecorder {
             gateway,
             seen: Mutex::new(Vec::new()),
         });
         let observer: Arc<dyn MempoolObserver> = recorder.clone();
-        assert!(
-            handles.mempool_gateway.install_observer(observer).is_ok(),
-            "install observer"
-        );
+        // Replace the shared gateway with one that has the observer installed
+        // at construction time (the new PublishState design sets the observer
+        // in `new`, not via `install_observer`).
+        let pool = handles.mempool_gateway.pool().clone();
+        handles.mempool_gateway = Arc::new(bitcoin_rs_mempool::MempoolGateway::new(
+            pool,
+            Some(observer),
+        ));
 
         let block = mined_block_with_prev_hash_and_transactions(
             genesis.block_hash(),

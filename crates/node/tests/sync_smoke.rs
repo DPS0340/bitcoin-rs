@@ -566,6 +566,7 @@ fn apply_handles_with_coin_stats_and_utxo(
         None,
         mempool,
         mempool_gateway,
+        Arc::new(bitcoin_rs_node::mining::MiningGenerationSignal::new()),
         Arc::new(RwLock::new(bitcoin_rs_rpc::context::BlockLog::new())),
         Arc::new(RwLock::new(HashMap::<Txid, Tx>::new())),
         Arc::new(bitcoin_rs_node::NoOpZmqPublisher),

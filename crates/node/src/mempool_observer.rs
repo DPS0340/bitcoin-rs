@@ -1,22 +1,22 @@
 //! Node-side mempool mutation observer.
 //!
-//! Bridges committed [`MutationEnvelope`]s from the [`MempoolGateway`] onto
+//! Bridges committed [`MutationResult`]s from the [`MempoolGateway`] onto
 //! Core's unified `sequence` ZMQ topic: accepted changes publish `A` events,
 //! removals publish `R` events — except block-inclusion removals, which Core
 //! suppresses because the block's own `C` event covers the departure.
 
 use std::sync::Arc;
 
-use bitcoin_rs_mempool::{MempoolObserver, MutationEnvelope, MutationOutcome, RemovalReason};
+use bitcoin_rs_mempool::{MempoolObserver, MutationOutcome, MutationResult, RemovalReason};
 use bitcoin_rs_primitives::Txid;
 
 use crate::zmq_publisher::{SequenceEvent, ZmqPublisher};
 
 /// Publishes every committed mempool mutation as `A`/`R` sequence events.
 ///
-/// Install the composed observer during node startup. When no
-/// `--zmq-pub-sequence` endpoint is configured, the composite has no legs and
-/// publishes nothing; sealing that empty slot prevents a later replacement.
+/// Install behind the [`MempoolGateway`] observer slot only when a
+/// `--zmq-pub-sequence` endpoint is configured; otherwise the gateway runs
+/// observer-less and publishes nothing.
 pub struct MempoolSequenceObserver {
     publisher: Arc<dyn ZmqPublisher>,
 }
@@ -38,9 +38,9 @@ impl MempoolSequenceObserver {
 }
 
 impl MempoolObserver for MempoolSequenceObserver {
-    fn on_mutation(&self, envelope: &MutationEnvelope) {
-        for (offset, change) in envelope.result.changes.iter().enumerate() {
-            let Some(sequence) = envelope.result.sequence_of(offset) else {
+    fn on_mutation(&self, result: &MutationResult) {
+        for (offset, change) in result.changes.iter().enumerate() {
+            let Some(sequence) = result.sequence_of(offset) else {
                 continue;
             };
             let txid = Txid(change.txid);
@@ -58,6 +58,46 @@ impl MempoolObserver for MempoolSequenceObserver {
                 }
             }
         }
+    }
+}
+
+/// The node's one mutation observer: every committed mempool mutation fans
+/// out to the `sequence` wire events and the mining generation wake, in that
+/// order, under the gateway's publish mutex.
+///
+/// Installed exactly once, on the node-owned [`MempoolGateway`] at
+/// [`crate::state::NodeState::open`], so both fan-outs stay ordered with the
+/// single commit stream. The sequence leg is present only when a
+/// `--zmq-pub-sequence` endpoint is configured; the mining leg always is,
+/// because a mutation that changes the generation key must reach the
+/// coordinator whenever one exists.
+pub(crate) struct NodeMutationObserver {
+    /// Core unified-`sequence` ZMQ events; `None` without an endpoint.
+    sequence: Option<Arc<dyn MempoolObserver>>,
+    /// Template-coordinator wake; a no-op until the coordinator attaches.
+    mining_generation: Arc<crate::mining::MiningGenerationSignal>,
+}
+
+impl NodeMutationObserver {
+    /// Composes the fan-out from its two legs.
+    #[must_use]
+    pub(crate) fn new(
+        sequence: Option<Arc<dyn MempoolObserver>>,
+        mining_generation: Arc<crate::mining::MiningGenerationSignal>,
+    ) -> Self {
+        Self {
+            sequence,
+            mining_generation,
+        }
+    }
+}
+
+impl MempoolObserver for NodeMutationObserver {
+    fn on_mutation(&self, result: &MutationResult) {
+        if let Some(sequence) = &self.sequence {
+            sequence.on_mutation(result);
+        }
+        self.mining_generation.publish_generation();
     }
 }
 
@@ -137,17 +177,14 @@ mod tests {
         expected
     }
 
-    fn wired_gateway() -> (Arc<MempoolGateway>, Arc<RecordingPublisher>) {
+    fn wired_gateway() -> (MempoolGateway, Arc<RecordingPublisher>) {
         let publisher = Arc::new(RecordingPublisher::default());
         let publisher_dyn = Arc::clone(&publisher);
         let observer: Arc<dyn MempoolObserver> =
             Arc::new(MempoolSequenceObserver::new(publisher_dyn));
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(
-            MempoolLimits::default(),
-        ))));
-        assert!(
-            gateway.install_observer(observer).is_ok(),
-            "fresh test gateway accepts one observer"
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            Some(observer),
         );
         (gateway, publisher)
     }
@@ -207,7 +244,7 @@ mod tests {
             .expect("in");
         publisher.sequence_bodies.lock().clear();
 
-        gateway.remove_for_block(AdmissionOrigin::Block, &[&mined], &[mined_txid], 8);
+        gateway.remove_for_block(AdmissionOrigin::Rpc, &[&mined], &[mined_txid], 8);
 
         assert!(
             publisher.sequence_bodies.lock().is_empty(),
@@ -222,14 +259,13 @@ mod tests {
         let publisher_dyn = Arc::clone(&publisher);
         let observer: Arc<dyn MempoolObserver> =
             Arc::new(MempoolSequenceObserver::new(publisher_dyn));
-        let gateway = MempoolGateway::shared(Arc::new(RwLock::new(Mempool::new(MempoolLimits {
-            min_relay_fee_sat_per_kvb: 0,
-            max_total_bytes: 150,
-            ..MempoolLimits::default()
-        }))));
-        assert!(
-            gateway.install_observer(observer).is_ok(),
-            "fresh test gateway accepts one observer"
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits {
+                min_relay_fee_sat_per_kvb: 0,
+                max_total_bytes: 150,
+                ..MempoolLimits::default()
+            }))),
+            Some(observer),
         );
         let low = MempoolEntry::new(Arc::new(tx(5)), 100, 100, 1, 7);
         let high = MempoolEntry::new(Arc::new(tx(6)), 100, 900, 1, 7);
@@ -250,6 +286,89 @@ mod tests {
                 expected_body(&tx(5).txid(), b'R', 3),
             ],
             "accepted commits first, then its policy eviction"
+        );
+    }
+
+    /// The node's one mutation observer must fire both legs per committed
+    /// mutation, in order: the `sequence` wire event first, then the mining
+    /// generation wake. This is the wiring `NodeState::open` installs — a
+    /// mutation that bypassed the gateway would satisfy neither assertion.
+    #[test]
+    fn node_mutation_observer_fans_out_to_sequence_and_mining_wake() {
+        use crate::mining::MiningGenerationSignal;
+        use bitcoin_rs_primitives::Block;
+        use bitcoin_rs_rpc::context::{
+            BlockTemplateRequest, BlockTemplateResult, MiningControl, MiningControlError,
+        };
+        use compact_str::CompactString;
+
+        struct RecordingControl {
+            published: Mutex<usize>,
+        }
+
+        fn unavailable() -> MiningControlError {
+            MiningControlError::Unavailable(CompactString::from("not wired in this test"))
+        }
+
+        impl MiningControl for RecordingControl {
+            fn get_block_template(
+                &self,
+                _request: BlockTemplateRequest,
+            ) -> Result<BlockTemplateResult, MiningControlError> {
+                Err(unavailable())
+            }
+
+            fn mining_info(
+                &self,
+            ) -> Result<bitcoin_rs_rpc::context::MiningInfo, MiningControlError> {
+                Err(unavailable())
+            }
+
+            fn submit_block(
+                &self,
+                _block: Block,
+            ) -> Result<bitcoin_rs_rpc::context::BlockValidationResult, MiningControlError>
+            {
+                Err(unavailable())
+            }
+
+            fn publish_generation(&self) {
+                *self.published.lock() += 1;
+            }
+        }
+
+        let (publisher, bodies) = {
+            let publisher = Arc::new(RecordingPublisher::default());
+            (publisher.clone(), Arc::clone(&publisher))
+        };
+        let signal = Arc::new(MiningGenerationSignal::new());
+        let control = Arc::new(RecordingControl {
+            published: Mutex::new(0),
+        });
+        let control_dyn: Arc<dyn MiningControl> = control.clone();
+        signal.attach(&control_dyn);
+
+        let sequence = MempoolSequenceObserver::new(publisher);
+        let sequence: Arc<dyn MempoolObserver> = Arc::new(sequence);
+        let observer = super::NodeMutationObserver::new(Some(sequence), Arc::clone(&signal));
+        let gateway = MempoolGateway::new(
+            Arc::new(RwLock::new(Mempool::new(MempoolLimits::default()))),
+            Some(Arc::new(observer)),
+        );
+
+        gateway
+            .insert_entry(AdmissionOrigin::Rpc, entry(&tx(7)))
+            .expect("the fixture admission must commit");
+
+        assert_eq!(
+            bodies.sequence_bodies.lock().len(),
+            1,
+            "the sequence leg publishes the admission's A frame"
+        );
+        assert_eq!(
+            *control.published.lock(),
+            1,
+            "the mining leg wakes the coordinator exactly once per committed mutation"
         );
     }
 }

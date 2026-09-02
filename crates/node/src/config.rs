@@ -279,6 +279,9 @@ pub struct Config {
     pub assume_valid_height: u32,
     #[serde(skip)]
     pub(crate) shutdown_signal: Option<Receiver<()>>,
+    /// Test-only observer installed on the node-owned mempool gateway.
+    #[serde(skip)]
+    pub(crate) mempool_observer: Option<std::sync::Arc<dyn bitcoin_rs_mempool::MempoolObserver>>,
 }
 
 impl fmt::Debug for Config {
@@ -389,6 +392,7 @@ impl Config {
                 .assume_valid_anchor()
                 .map_or(0, |(height, _)| height),
             shutdown_signal: None,
+            mempool_observer: None,
         }
     }
 
@@ -436,6 +440,16 @@ impl Config {
     #[must_use]
     pub fn with_shutdown_receiver(mut self, rx: Receiver<()>) -> Self {
         self.shutdown_signal = Some(rx);
+        self
+    }
+
+    /// Returns a copy whose node-owned mempool gateway publishes to `observer`.
+    #[must_use]
+    pub fn with_mempool_observer(
+        mut self,
+        observer: std::sync::Arc<dyn bitcoin_rs_mempool::MempoolObserver>,
+    ) -> Self {
+        self.mempool_observer = Some(observer);
         self
     }
 
