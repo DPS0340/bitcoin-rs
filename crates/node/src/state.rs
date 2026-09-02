@@ -606,33 +606,28 @@ impl NodeStorage {
     fn block_body_store(
         &self,
         files: Arc<FlatFileBlockStore>,
-        data_dir: &Path,
-    ) -> Result<Arc<dyn crate::apply::PruneBodyStore>> {
+    ) -> Arc<dyn crate::apply::PruneBodyStore> {
         match self {
             #[cfg(feature = "rocksdb")]
-            Self::RocksDb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::RocksDb(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "fjall")]
-            Self::Fjall(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Fjall(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "redb")]
-            Self::Redb(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Redb(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
             #[cfg(feature = "mdbx")]
-            Self::Mdbx(store) => Ok(Arc::new(crate::apply::FlatFilePruneBodyStore::open(
+            Self::Mdbx(store) => Arc::new(crate::apply::FlatFilePruneBodyStore::open(
                 Arc::clone(store),
                 files,
-                data_dir,
-            )?)),
+            )),
         }
     }
 
@@ -773,7 +768,6 @@ const STALE_RESTORE_ERROR_THRESHOLD: u32 = 1000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResumeSource {
     Cold,
-    HeadersOnly,
     Checkpoint,
 }
 
@@ -1291,8 +1285,7 @@ impl NodeState {
         }
         let block_files =
             Arc::new(FlatFileBlockStore::open(&config.data_dir).map_err(anyhow::Error::new)?);
-        let block_body_store =
-            storage.block_body_store(Arc::clone(&block_files), &config.data_dir)?;
+        let block_body_store = storage.block_body_store(Arc::clone(&block_files));
 
         let zmq_publications = config.zmq_publications();
         let active_zmq_notifications: Vec<_> = zmq_publications
@@ -1317,37 +1310,21 @@ impl NodeState {
             Arc::new(crate::NoOpZmqPublisher)
         };
         let (
-            mut utxo_set,
+            utxo_set,
             initial_coin_stats,
             block_tree_value,
             restored_applied_tip,
             restored_chain_tx_count,
             resume_source,
         ) = match checkpoint_load {
-            crate::checkpoint::CheckpointLoad::Cold { reason } => {
-                if let Some(reason) = reason {
-                    tracing::warn!(%reason, "chainstate checkpoint rejected; starting cold");
-                }
-                (
-                    bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_utxo::stats::CoinStats::default(),
-                    bitcoin_rs_chain::BlockTree::new(),
-                    None,
-                    0,
-                    ResumeSource::Cold,
-                )
-            }
-            crate::checkpoint::CheckpointLoad::HeadersOnly { tree, reason } => {
-                tracing::warn!(%reason, "chainstate payload rejected; retaining validated headers only");
-                (
-                    bitcoin_rs_utxo::UtxoSet::new(),
-                    bitcoin_rs_utxo::stats::CoinStats::default(),
-                    tree,
-                    None,
-                    0,
-                    ResumeSource::HeadersOnly,
-                )
-            }
+            crate::checkpoint::CheckpointLoad::Cold => (
+                bitcoin_rs_utxo::UtxoSet::new(),
+                bitcoin_rs_utxo::stats::CoinStats::default(),
+                bitcoin_rs_chain::BlockTree::new(),
+                None,
+                0,
+                ResumeSource::Cold,
+            ),
             crate::checkpoint::CheckpointLoad::Complete(restored) => {
                 tracing::info!(
                     height = restored.applied_tip.height,
@@ -1440,14 +1417,6 @@ impl NodeState {
         };
         let coin_stats_listener =
             bitcoin_rs_utxo::stats::CoinStatsListener::new(initial_coin_stats);
-        // The rolling coin-stats listener does per-coin MuHash + event work on
-        // the block-apply hot path. Bitcoin Core does not maintain rolling UTXO
-        // stats during IBD by default; gettxoutsetinfo scans on demand instead
-        // (see scan_coin_stats). Only register the listener when G2 MuHash
-        // sampling needs the rolling accumulator.
-        if config.g2_muhash_samples.is_some() {
-            utxo_set.set_listener(Box::new(coin_stats_listener.clone()));
-        }
         let utxo = Arc::new(utxo_set);
         let coin_stats = Arc::new(coin_stats_listener);
         let mempool = Arc::new(RwLock::new(Mempool::new(MempoolLimits::default())));
@@ -1600,8 +1569,6 @@ impl NodeState {
             chain_events: Arc::clone(&chain_events),
             block_body_store: Some(Arc::clone(&block_body_store)),
             undo_store,
-            g2_muhash_sampler,
-            g14_utxo_commit_sampler,
             admission: Arc::new(crate::apply::ApplyAdmission::new()),
             shutdown: Arc::clone(&shutdown),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -1811,7 +1778,6 @@ impl NodeState {
             applied_tip.as_deref(),
             self.chain_tx_count
                 .load(core::sync::atomic::Ordering::Relaxed),
-            self.config.g2_muhash_samples.is_some(),
         )?;
         // A2: Only after `CheckpointWrite::Published` and root fsync, write
         // the applied-tip witness for the same captured tip. A witness failure
@@ -2831,33 +2797,46 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "fjall")]
     #[test]
-    fn legacy_block_body_datadir_is_refused() -> anyhow::Result<()> {
+    fn new_datadir_initializes_current_schema_before_storage() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::Config::default_for_network(crate::Network::Regtest);
+        config.data_dir = dir.path().join("node");
+        config.p2p_listen.clear();
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(config.data_dir.join(".CURRENT_SCHEMA.tmp"), b"partial")?;
+
+        let _state = NodeState::open(config.clone())?;
+        assert_eq!(
+            std::fs::read(
+                config
+                    .data_dir
+                    .join(crate::checkpoint_fs::CURRENT_SCHEMA_FILE)
+            )?,
+            crate::checkpoint_fs::current_schema_bytes()
+        );
+        assert!(!config.data_dir.join(".CURRENT_SCHEMA.tmp").exists());
+        assert!(config.data_dir.join("chainstate").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unmarked_nonempty_datadir_adopts_baseline_schema() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut config = crate::NodeConfig::default_for_network(crate::Network::Regtest);
         config.data_dir = dir.path().join("legacy-node");
         config.p2p_listen.clear();
-        std::fs::create_dir_all(config.data_dir.join("chainstate"))?;
-        let store = bitcoin_rs_storage::FjallStore::open(config.data_dir.join("chainstate"))?;
-        store.put(
-            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
-            &bitcoin_rs_storage::pruning::block_body_key(
-                1,
-                bitcoin_rs_primitives::Hash256::from_le_bytes(&[1_u8; 32]),
-            ),
-            b"legacy-inline-body",
-        )?;
-        drop(store);
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::write(config.data_dir.join("legacy-state"), b"old")?;
 
         let datadir = config.data_dir.display().to_string();
         let Err(error) = NodeState::open(config, None) else {
             anyhow::bail!("legacy inline block body unexpectedly opened");
         };
-        let message = error.to_string();
-        assert!(message.contains(&datadir));
-        assert!(message.contains("predates the flat-file block store"));
-        assert!(message.contains("must be resynced"));
+        let message = format!("{error:#}");
+        assert!(message.contains("CURRENT_SCHEMA is not the current datadir schema epoch"));
+        assert!(message.contains("full resync"));
+        assert!(!config.data_dir.join("chainstate").exists());
         Ok(())
     }
 
@@ -3113,6 +3092,7 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
+        std::fs::create_dir_all(&config.data_dir)?;
         let blocks_dir = config.data_dir.join("blocks");
         std::fs::create_dir_all(&blocks_dir)?;
         let prunable_file = blocks_dir.join("blk00000.dat");
@@ -3186,6 +3166,8 @@ mod tests {
         config.data_dir = dir.path().join("node");
         config.p2p_listen.clear();
         config.prune_target_mb = 1;
+
+        std::fs::create_dir_all(&config.data_dir)?;
 
         // Two files present before the store opens, so the earlier one is not
         // the append target and is therefore prunable. Same shape as
@@ -3628,7 +3610,7 @@ mod tests {
         rescanned.tx_count = listener_after_apply.tx_count;
         assert_ne!(
             listener_after_apply.total_amount, rescanned.total_amount,
-            "G2-disabled resume must not receive rolling UTXO notifications"
+            "default resume must not receive rolling UTXO notifications"
         );
         resumed.write_clean_checkpoint()?;
 
@@ -3639,10 +3621,6 @@ mod tests {
             .get("directory")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| std::io::Error::other("CURRENT has no generation directory"))?;
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            root.join(directory).join("manifest-v1.json"),
-        )?)?;
-        assert_eq!(manifest["utxo"]["trailer_kind"], "scanned");
         let snapshot_file = std::fs::File::open(root.join(directory).join("utxo-v4.dat"))?;
         let mut snapshot_reader = std::io::BufReader::new(snapshot_file);
         let snapshot = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut snapshot_reader)?;

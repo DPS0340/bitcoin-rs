@@ -127,7 +127,6 @@ pub struct TxIndexRuntime {
     wake_tx: Sender<()>,
     failure_message: RwLock<Option<CompactString>>,
 }
-
 impl TxIndexRuntime {
     /// Creates a runtime attached to `wake_tx`.
     #[must_use]

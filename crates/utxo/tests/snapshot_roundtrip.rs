@@ -1,12 +1,106 @@
 //! Snapshot dump/load round-trip coverage.
 use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut, Txid};
 use bitcoin_rs_utxo::{
-    BlockChanges, UtxoAdd, UtxoChangeEvents, UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey,
-    UtxoRemoved, UtxoSet, hash_serialized_3, read_snapshot, write_snapshot,
+    BlockChanges, SnapshotCoin, SnapshotCoinObserver, UtxoAdd, UtxoChangeEvents,
+    UtxoChangeListener, UtxoError, UtxoInserted, UtxoKey, UtxoRemoved, UtxoSet, hash_serialized_3,
+    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
+    write_snapshot_observed,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read, Seek};
 use tempfile::tempfile;
+
+fn txid(seed: u64) -> Hash256 {
+    let mut bytes = [0_u8; 32];
+    bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    bytes[8..16].copy_from_slice(&seed.rotate_left(23).to_le_bytes());
+    bytes[16..24].copy_from_slice(&seed.wrapping_mul(0x94d0_49bb_1331_11eb).to_le_bytes());
+    bytes[24..32].copy_from_slice(&seed.wrapping_add(0x0123_4567_89ab_cdef).to_le_bytes());
+    Hash256::from_le_bytes(&bytes)
+}
+
+fn txout(seed: u64) -> TxOut {
+    TxOut {
+        value: Amount::from_sat(2_000 + seed),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51, u8::try_from(seed % 256).unwrap_or(0)]),
+    }
+}
+
+#[test]
+fn snapshot_roundtrip_preserves_vout_and_metadata_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let set = UtxoSet::new();
+    let live_txid = txid(42_000);
+    let low = OutPoint::new(live_txid, 63);
+    let high = OutPoint::new(live_txid, 64);
+    let max = OutPoint::new(live_txid, u32::MAX);
+    let low_txout = txout(42_001);
+    let high_txout = txout(42_002);
+    let max_txout = TxOut {
+        value: Amount::from_sat(42_003),
+        script_pubkey: ScriptBuf::new(),
+    };
+    let mut changes = BlockChanges::default();
+    changes.add(UtxoAdd::new(low, low_txout.clone(), false, 400));
+    changes.add(UtxoAdd::new(high, high_txout.clone(), true, 401));
+    changes.add(UtxoAdd::new(max, max_txout.clone(), false, u32::MAX));
+    set.commit_block(&changes, &txid(42_004))?;
+
+    let expected_hash = hash_serialized_3(&set)?;
+    let mut file = tempfile()?;
+    write_snapshot(&set, &txid(42_005), u32::MAX, &mut file)?;
+    file.rewind()?;
+    let loaded = read_snapshot_strict_v4(&mut file)?;
+
+    assert_eq!(loaded.tip_hash, txid(42_005));
+    assert_eq!(loaded.height, u32::MAX);
+    assert_eq!(loaded.set.get(&low), Some(low_txout));
+    assert_eq!(loaded.set.get(&high), Some(high_txout));
+    assert_eq!(loaded.set.get(&max), Some(max_txout));
+    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
+    assert!(
+        !loaded
+            .set
+            .get_entry(&low)
+            .ok_or("missing low entry")?
+            .coinbase
+    );
+    assert!(
+        loaded
+            .set
+            .get_entry(&high)
+            .ok_or("missing high entry")?
+            .coinbase
+    );
+    assert_eq!(
+        loaded
+            .set
+            .get_entry(&max)
+            .ok_or("missing max entry")?
+            .height,
+        u32::MAX
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_v4_snapshot_requires_complete_exact_input() -> Result<(), Box<dyn std::error::Error>> {
+    let mut snapshot = Vec::new();
+    write_snapshot(&UtxoSet::new(), &txid(64_100), 64, &mut snapshot)?;
+
+    let loaded = read_snapshot_strict_v4(&mut Cursor::new(&snapshot))?;
+    assert_eq!(loaded.tip_hash, txid(64_100));
+    assert_eq!(loaded.height, 64);
+    assert_eq!(loaded.muhash_trailer, [0_u8; 384]);
+
+    assert!(read_snapshot_strict_v4(&mut Cursor::new(&snapshot[..snapshot.len() - 384])).is_err());
+    assert!(read_snapshot_strict_v4(&mut Cursor::new(&snapshot[..snapshot.len() - 1])).is_err());
+
+    let mut trailing = snapshot;
+    trailing.push(0);
+    assert!(read_snapshot_strict_v4(&mut Cursor::new(trailing)).is_err());
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeenSnapshotCoin {
@@ -25,8 +119,8 @@ struct RecordingSnapshotObserver {
     trailer_calls: usize,
 }
 
-impl bitcoin_rs_utxo::SnapshotCoinObserver for RecordingSnapshotObserver {
-    fn observe_coin(&mut self, coin: bitcoin_rs_utxo::SnapshotCoin<'_>) {
+impl SnapshotCoinObserver for RecordingSnapshotObserver {
+    fn observe_coin(&mut self, coin: SnapshotCoin<'_>) {
         self.coins.push(SeenSnapshotCoin {
             txid: coin.txid,
             vout: coin.vout,
@@ -85,11 +179,17 @@ fn max_script_txout(seed: u64) -> TxOut {
         script_pubkey: vec![0xAB; usize::from(u16::MAX)],
     }
 }
-
 #[test]
-fn snapshot_roundtrip_preserves_full_outpoints_hash_and_trailer()
--> Result<(), Box<dyn std::error::Error>> {
+fn observed_snapshot_traversal_matches_the_current_reader() -> Result<(), Box<dyn std::error::Error>>
+{
     let set = UtxoSet::new();
+    let first_txid = txid(200_000);
+    let second_txid = txid(200_001);
+    let first = txout(200_010);
+    let second = TxOut {
+        value: Amount::from_sat(200_011),
+        script_pubkey: ScriptBuf::new(),
+    };
     let mut changes = BlockChanges::default();
 
     for i in 0_u64..10_000 {
@@ -102,14 +202,8 @@ fn snapshot_roundtrip_preserves_full_outpoints_hash_and_trailer()
     let first_collision_txout = txout(20_001);
     let second_collision_txout = txout(20_002);
     changes.add(UtxoAdd::new(
-        first_collision,
-        first_collision_txout.clone(),
-        true,
-        201,
-    ));
-    changes.add(UtxoAdd::new(
-        second_collision,
-        second_collision_txout.clone(),
+        OutPoint::new(first_txid, 0),
+        first.clone(),
         false,
         202,
     ));
@@ -220,7 +314,7 @@ fn snapshot_v4_encoding_is_stable() -> Result<(), Box<dyn std::error::Error>> {
         OutPoint::new(txid(2).into(), 64),
         txout(22),
         true,
-        41,
+        2001,
     ));
     set.commit_block(&changes, &txid(3))?;
 
@@ -352,10 +446,7 @@ fn strict_v4_snapshot_rejects_record_count_that_overflows_usize() {
         error,
         UtxoError::SnapshotRecordCountTooLarge { count: u64::MAX }
     ));
-}
-// ─────────────────────────────────────────────────────────────────────────────
-//  Task 2: adversarial / boundary coverage
-// ─────────────────────────────────────────────────────────────────────────────
+    set.commit_block(&changes, &txid(200_002))?;
 
 /// Single txid with 12 outputs crosses the legacy 8-inline threshold.
 /// Pins: header bytes, record header at file offset 52, `output_count` at offset 93,
@@ -379,9 +470,10 @@ fn snapshot_roundtrip_high_fanout_overflow_record_pins_byte_layout()
     }
     set.commit_block(&changes, &txid(60_999))?;
 
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(61_000), 2010, &mut file)?;
-    file.rewind()?;
+    assert_eq!(observed, ordinary);
+    assert_eq!(observed_trailer, ordinary_trailer);
+    assert_eq!(writer_observer.trailer_calls, 1);
+    assert_eq!(writer_observer.coins.len(), 3);
 
     // ── Header ──────────────────────────────────────────────────────────────
     let mut header = [0u8; 52];
@@ -452,395 +544,6 @@ fn snapshot_roundtrip_high_fanout_overflow_record_pins_byte_layout()
     Ok(())
 }
 
-/// Removes one inline output (vout 0) and one overflow output (vout 9),
-/// then re-adds both with different `TxOuts`. After roundtrip all 12 vouts
-/// must survive with correct values; no ordering assumptions.
-#[test]
-fn snapshot_roundtrip_inline_overflow_remove_readd_preserves_vouts()
--> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(70_000);
-
-    // ── Phase 1: add all 12 outputs ────────────────────────────────────────
-    {
-        let mut changes = BlockChanges::default();
-        for vout_n in 0u32..12 {
-            let op = OutPoint::new(live_txid.into(), vout_n);
-            changes.add(UtxoAdd::new(
-                op,
-                txout(70_100 + u64::from(vout_n)),
-                false,
-                1000,
-            ));
-        }
-        set.commit_block(&changes, &txid(70_099))?;
-    }
-    assert_eq!(set.len(), 12);
-
-    // ── Phase 2: remove inline (vout 0) and overflow (vout 9) ─────────────
-    {
-        let mut changes = BlockChanges::default();
-        changes.remove(OutPoint::new(live_txid.into(), 0));
-        changes.remove(OutPoint::new(live_txid.into(), 9));
-        set.commit_block(&changes, &txid(70_100))?;
-    }
-    assert_eq!(set.len(), 10);
-
-    // ── Phase 3: re-add both with new values ────────────────────────────────
-    let new0 = TxOut {
-        value: 9_999_000,
-        script_pubkey: vec![0xDE, 0xAD, 0xBE, 0xEF],
-    };
-    let new9 = TxOut {
-        value: 9_999_009,
-        script_pubkey: vec![0xFE, 0xED],
-    };
-    {
-        let mut changes = BlockChanges::default();
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid.into(), 0),
-            new0.clone(),
-            false,
-            1000,
-        ));
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid.into(), 9),
-            new9.clone(),
-            false,
-            1000,
-        ));
-        set.commit_block(&changes, &txid(70_101))?;
-    }
-    assert_eq!(set.len(), 12);
-
-    // ── Snapshot and roundtrip ──────────────────────────────────────────────
-    let expected_hash = hash_serialized_3(&set)?;
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(70_102), 1100, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.set.len(), 12);
-    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
-
-    // New values for re-added outputs
-    assert_eq!(
-        loaded.set.get(&OutPoint::new(live_txid.into(), 0)),
-        Some(new0)
-    );
-    assert_eq!(
-        loaded.set.get(&OutPoint::new(live_txid.into(), 9)),
-        Some(new9)
-    );
-
-    // Original values for untouched outputs
-    for vout_n in [1u32, 2, 3, 4, 5, 6, 7, 8, 10, 11] {
-        let op = OutPoint::new(live_txid.into(), vout_n);
-        assert_eq!(
-            loaded.set.get(&op),
-            Some(txout(70_100 + u64::from(vout_n))),
-            "vout {vout_n}: original value corrupted"
-        );
-    }
-    Ok(())
-}
-
-/// 64 distinct txids in the same shard (prefix `0x0102_0304_0506_0708`), each
-/// with 4 outputs (vouts 0–3). Verifies `record_count`, len, `hash_serialized_3`
-/// parity, and individual lookups — without asserting `HashTable` iteration order.
-#[test]
-fn snapshot_roundtrip_multiple_records_per_shard_preserves_all_outpoints()
--> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let shard_prefix = 0x0102_0304_0506_0708_u64;
-    let mut changes = BlockChanges::default();
-
-    for suffix in 0u64..64 {
-        let txid = txid_with_prefix(shard_prefix, suffix);
-        let base_seed = suffix * 100;
-        for vout_n in 0u32..4 {
-            let op = OutPoint::new(txid.into(), vout_n);
-            changes.add(UtxoAdd::new(
-                op,
-                txout(base_seed + u64::from(vout_n)),
-                false,
-                300,
-            ));
-        }
-    }
-    set.commit_block(&changes, &txid(1))?;
-
-    let expected_hash = hash_serialized_3(&set)?;
-    assert_eq!(set.len(), 256, "pre-condition: 64 txids × 4 outputs");
-    assert_eq!(set.record_count(), 64, "pre-condition: 64 records");
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(2), 300, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.set.len(), 256);
-    assert_eq!(loaded.set.record_count(), 64);
-    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
-
-    // Spot-check a handful of outpoints via get, avoiding any HashTable order
-    for (suffix, vout_n) in [(7u64, 2u32), (31, 0), (31, 3), (63, 1)] {
-        let txid = txid_with_prefix(shard_prefix, suffix);
-        let op = OutPoint::new(txid.into(), vout_n);
-        let expect = txout(suffix * 100 + u64::from(vout_n));
-        assert_eq!(loaded.set.get(&op), Some(expect));
-    }
-    Ok(())
-}
-
-// u32::MAX is a valid vout (>= 64, stored in u32 LE). This record contains
-// only the u32::MAX output so vout=0 is absent — v3 has no bitmap constraint.
-#[test]
-fn snapshot_roundtrip_preserves_vout_u32_max() -> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(80_000);
-    let op = OutPoint::new(live_txid.into(), u32::MAX);
-    let txout = txout(80_001);
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(op, txout.clone(), true, 500_000));
-    set.commit_block(&changes, &txid(80_099))?;
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(80_100), 500_000, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.set.len(), 1);
-    assert_eq!(loaded.set.get(&op), Some(txout));
-    let entry = loaded
-        .set
-        .get_entry(&op)
-        .ok_or_else(|| std::io::Error::other("entry must exist"))?;
-    assert!(entry.coinbase);
-    assert_eq!(entry.height, 500_000);
-    Ok(())
-}
-
-// Both coinbase states at height u32::MAX survive roundtrip independently.
-// The coinbase byte is the 17th byte of the output header (offset + 16).
-#[test]
-fn snapshot_roundtrip_preserves_height_u32_max_both_coinbase_states()
--> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(90_000);
-    let op0 = OutPoint::new(live_txid.into(), 0);
-    let op1 = OutPoint::new(live_txid.into(), 1);
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(op0, txout(90_001), false, u32::MAX));
-    changes.add(UtxoAdd::new(op1, txout(90_002), true, u32::MAX));
-    set.commit_block(&changes, &txid(90_099))?;
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(90_100), u32::MAX, &mut file)?;
-    file.rewind()?;
-
-    // Read the coinbase byte of each output directly from the file.
-    // Output 0 starts at 97: snapshot header 52 + record header 45.
-    let mut cb0 = [0u8; 1];
-    file.seek(std::io::SeekFrom::Start(97 + 16))?;
-    file.read_exact(&mut cb0)?;
-    // Output 1 starts after output 0's 19-byte header and 12-byte script.
-    let mut cb1 = [0u8; 1];
-    file.seek(std::io::SeekFrom::Start(128 + 16))?;
-    file.read_exact(&mut cb1)?;
-
-    assert_eq!(
-        cb0[0], 0u8,
-        "coinbase byte for vout=0 should be 0 (not coinbase)"
-    );
-    assert_eq!(
-        cb1[0], 1u8,
-        "coinbase byte for vout=1 should be 1 (coinbase)"
-    );
-
-    // Verify full roundtrip
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-    assert_eq!(loaded.set.len(), 2);
-    let e0 = loaded
-        .set
-        .get_entry(&op0)
-        .ok_or_else(|| std::io::Error::other("vout 0 entry"))?;
-    let e1 = loaded
-        .set
-        .get_entry(&op1)
-        .ok_or_else(|| std::io::Error::other("vout 1 entry"))?;
-    assert!(!e0.coinbase);
-    assert!(e1.coinbase);
-    assert_eq!(e0.height, u32::MAX);
-    assert_eq!(e1.height, u32::MAX);
-    Ok(())
-}
-
-// Empty script_pubkey (length 0) is valid on-chain. Roundtrip must preserve it.
-#[test]
-fn snapshot_roundtrip_preserves_empty_script_pubkey() -> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(100_000);
-    let op = OutPoint::new(live_txid.into(), 0);
-    let expect = empty_script_txout(100_001);
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(op, expect.clone(), false, 600));
-    set.commit_block(&changes, &txid(100_099))?;
-
-    // Pin the script_len bytes (u16 LE = 0, 0) at file offset 111.
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(100_100), 600, &mut file)?;
-    file.rewind()?;
-    let mut script_len_bytes = [0u8; 2];
-    file.seek(std::io::SeekFrom::Start(94 + 17))?;
-    file.read_exact(&mut script_len_bytes)?;
-    assert_eq!(
-        &script_len_bytes,
-        &0u16.to_le_bytes(),
-        "script_len must be 0 for empty script"
-    );
-
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-    assert_eq!(loaded.set.len(), 1);
-    let got = loaded
-        .set
-        .get(&op)
-        .ok_or_else(|| std::io::Error::other("outpoint must exist"))?;
-    assert_eq!(got, expect);
-    // script_pubkey comparison compares inner bytes
-    assert!(got.script_pubkey.as_slice().is_empty());
-    Ok(())
-}
-
-// u16::MAX-length script fits in the record's u16 script_len field.
-#[test]
-fn snapshot_roundtrip_preserves_max_length_script() -> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(110_000);
-    let op = OutPoint::new(live_txid.into(), 0);
-    let expect = max_script_txout(110_001);
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(op, expect.clone(), false, 700));
-    set.commit_block(&changes, &txid(110_099))?;
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(110_100), 700, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(loaded.set.len(), 1);
-    let got = loaded
-        .set
-        .get(&op)
-        .ok_or_else(|| std::io::Error::other("outpoint must exist"))?;
-    assert_eq!(got.value, expect.value);
-    assert_eq!(got.script_pubkey.as_slice().len(), usize::from(u16::MAX));
-    assert_eq!(
-        got.script_pubkey.as_slice(),
-        expect.script_pubkey.as_slice()
-    );
-    Ok(())
-}
-
-// Rejects at commit time, before the codec, because the script is too large
-// for the record's u16 script_len field.
-#[test]
-fn commit_block_rejects_oversized_script_pubkey() -> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let op = OutPoint::new(txid(1).into(), 0);
-    let bad = TxOut {
-        value: 1,
-        script_pubkey: vec![0xFF; usize::from(u16::MAX) + 1],
-    };
-    let mut changes = BlockChanges::default();
-    changes.add(UtxoAdd::new(op, bad, false, 1));
-    let err = set
-        .commit_block(&changes, &txid(2))
-        .err()
-        .ok_or_else(|| std::io::Error::other("expected error"))?;
-    assert!(
-        matches!(err, UtxoError::ScriptTooLarge { len } if len == usize::from(u16::MAX) + 1),
-        "expected ScriptTooLarge({}), got {err:?}",
-        usize::from(u16::MAX) + 1
-    );
-    Ok(())
-}
-
-// hash_serialized_3 is the authoritative UTXO-set commitment and must remain
-// identical after remove/readd churn.
-#[test]
-fn snapshot_roundtrip_hash_serialized_3_parity_after_churn()
--> Result<(), Box<dyn std::error::Error>> {
-    let set = UtxoSet::new();
-    let live_txid = txid(120_000);
-
-    // Phase 1: add 3 outputs
-    {
-        let mut changes = BlockChanges::default();
-        for vout_n in 0u32..3 {
-            changes.add(UtxoAdd::new(
-                OutPoint::new(live_txid.into(), vout_n),
-                txout(120_100 + u64::from(vout_n)),
-                false,
-                800,
-            ));
-        }
-        set.commit_block(&changes, &txid(120_099))?;
-    }
-    let hash_before_churn = hash_serialized_3(&set)?;
-
-    // Phase 2: remove all 3 and re-add with new values
-    {
-        let mut changes = BlockChanges::default();
-        changes.remove(OutPoint::new(live_txid.into(), 0));
-        changes.remove(OutPoint::new(live_txid.into(), 1));
-        changes.remove(OutPoint::new(live_txid.into(), 2));
-        set.commit_block(&changes, &txid(120_100))?;
-    }
-    {
-        let mut changes = BlockChanges::default();
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid.into(), 0),
-            txout(120_200),
-            false,
-            801,
-        ));
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid.into(), 1),
-            txout(120_201),
-            false,
-            801,
-        ));
-        changes.add(UtxoAdd::new(
-            OutPoint::new(live_txid.into(), 2),
-            txout(120_202),
-            false,
-            801,
-        ));
-        set.commit_block(&changes, &txid(120_101))?;
-    }
-
-    let expected_hash = hash_serialized_3(&set)?;
-    assert_ne!(
-        expected_hash, hash_before_churn,
-        "churn should change hash_serialized_3"
-    );
-
-    let mut file = tempfile()?;
-    write_snapshot(&set, &txid(120_102), 801, &mut file)?;
-    file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-
-    assert_eq!(hash_serialized_3(&loaded.set)?, expected_hash);
-    assert_eq!(loaded.set.len(), 3);
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Listener / MuHash trailer coverage
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct StaticTrailer {
     trailer: [u8; 384],
@@ -855,8 +558,6 @@ impl UtxoChangeListener for StaticTrailer {
     }
 }
 
-// When a listener provides a MuHash trailer, write_snapshot returns it and
-// read_snapshot preserves it verbatim.
 #[test]
 fn snapshot_trailer_round_trips_through_listener() -> Result<(), Box<dyn std::error::Error>> {
     let trailer: [u8; 384] = core::array::from_fn(|i| u8::try_from(i % 256).unwrap_or_default());
@@ -871,33 +572,11 @@ fn snapshot_trailer_round_trips_through_listener() -> Result<(), Box<dyn std::er
 
     let mut file = tempfile()?;
     let returned_trailer = write_snapshot(&set, &txid(130_100), 900, &mut file)?;
-    assert_eq!(
-        &returned_trailer, &trailer,
-        "write_snapshot must return the listener's trailer"
-    );
-
+    assert_eq!(returned_trailer, trailer);
     file.rewind()?;
-    let loaded = read_snapshot(&mut file)?;
-    assert_eq!(
-        &loaded.muhash_trailer, &trailer,
-        "loaded snapshot must preserve the listener's trailer"
-    );
+    let loaded = read_snapshot_strict_v4(&mut file)?;
+    assert_eq!(loaded.muhash_trailer, trailer);
     Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Malformed snapshot fixture tests  (hand-rolled bytes, mirrors
-//  `legacy_v2_snapshot_rejects_vout_64` pattern)
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn v3_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(52);
-    bytes.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes()); // magic
-    bytes.extend_from_slice(&3_u32.to_le_bytes()); // version 3
-    bytes.extend_from_slice(&tip_hash.to_le_bytes());
-    bytes.extend_from_slice(&height.to_le_bytes());
-    bytes.extend_from_slice(&record_count.to_le_bytes());
-    bytes
 }
 
 fn v4_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
@@ -910,25 +589,6 @@ fn v4_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
     bytes
 }
 
-fn v2_header(tip_hash: Hash256, height: u32, record_count: u64) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(52);
-    bytes.extend_from_slice(&0x55_54_58_4f_u32.to_le_bytes());
-    bytes.extend_from_slice(&2_u32.to_le_bytes());
-    bytes.extend_from_slice(&tip_hash.to_le_bytes());
-    bytes.extend_from_slice(&height.to_le_bytes());
-    bytes.extend_from_slice(&record_count.to_le_bytes());
-    bytes
-}
-
-fn v3_record_body(key: UtxoKey, txid_bytes: &[u8; 32], vout_count: u8) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(key.shard());
-    bytes.extend_from_slice(&key.to_prefix());
-    bytes.extend_from_slice(txid_bytes);
-    bytes.push(vout_count);
-    bytes
-}
-
 fn v4_record_body(key: UtxoKey, txid_bytes: &[u8; 32], output_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.push(key.shard());
@@ -938,29 +598,17 @@ fn v4_record_body(key: UtxoKey, txid_bytes: &[u8; 32], output_count: u32) -> Vec
     bytes
 }
 
-// Writes a v2 record body with the given bitmap and vout_count.
-fn v2_record_body(key: UtxoKey, txid_bytes: &[u8; 32], bitmap: u64, vout_count: u8) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(key.shard());
-    bytes.extend_from_slice(&key.to_prefix());
-    bytes.extend_from_slice(txid_bytes);
-    bytes.extend_from_slice(&bitmap.to_le_bytes());
-    bytes.push(vout_count);
-    bytes
-}
-
 #[test]
 fn snapshot_read_rejects_invalid_magic() {
-    let mut bytes = v3_header(txid(1), 100, 0);
-    bytes[0..4].copy_from_slice(&0xDE_AD_BE_EF_u32.to_le_bytes()); // overwrite magic
-    let err = match read_snapshot(&mut Cursor::new(bytes)) {
-        Err(e) => e,
-        Ok(_) => panic!("expected read_snapshot error"),
+    let mut bytes = v4_header(txid(1), 100, 0);
+    bytes[0..4].copy_from_slice(&0xDE_AD_BE_EF_u32.to_le_bytes());
+    let Err(error) = read_snapshot_strict_v4(&mut Cursor::new(bytes)) else {
+        panic!("invalid magic was accepted");
     };
-    assert!(
-        matches!(err, UtxoError::InvalidSnapshotMagic { actual } if actual == 0xDE_AD_BE_EF),
-        "{err:?}"
-    );
+    assert!(matches!(
+        error,
+        UtxoError::InvalidSnapshotMagic { actual } if actual == 0xDE_AD_BE_EF
+    ));
 }
 
 #[test]
@@ -1051,13 +699,13 @@ fn legacy_snapshot_duplicate_precedes_later_truncation() {
         };
         assert!(matches!(
             error,
-            UtxoError::SnapshotDuplicateVout { vout: 7 }
+            UtxoError::UnsupportedSnapshotVersion { version: actual } if actual == version
         ));
     }
 }
 
 #[test]
-fn snapshot_read_v4_reports_first_duplicate_in_record_order() {
+fn snapshot_read_rejects_duplicate_vouts_in_a_v4_record() {
     let record_txid = txid(160_010);
     let key = UtxoKey::from_txid(&Txid::from(record_txid));
     let mut bytes = v4_header(txid(160_011), 1601, 1);
@@ -1067,9 +715,8 @@ fn snapshot_read_v4_reports_first_duplicate_in_record_order() {
     }
     bytes.extend_from_slice(&[0_u8; 384]);
 
-    let error = match read_snapshot(&mut Cursor::new(bytes)) {
-        Err(error) => error,
-        Ok(_) => panic!("expected duplicate vout error"),
+    let Err(error) = read_snapshot_strict_v4(&mut Cursor::new(bytes)) else {
+        panic!("duplicate vout was accepted");
     };
     assert!(matches!(
         error,
@@ -1289,11 +936,8 @@ fn strict_v4_rejects_empty_records_but_compatibility_reader_accepts_them()
     bytes.extend_from_slice(&v4_record_body(key, &record_txid.to_le_bytes(), 0));
     bytes.extend_from_slice(&[0_u8; 384]);
 
-    let compatibility = read_snapshot(&mut Cursor::new(&bytes))?;
-    assert!(compatibility.set.is_empty());
-    let Err(error) = bitcoin_rs_utxo::snapshot::read_snapshot_strict_v4(&mut Cursor::new(bytes))
-    else {
-        return Err("strict snapshot accepted an empty record".into());
+    let Err(error) = read_snapshot_strict_v4(&mut Cursor::new(bytes)) else {
+        panic!("record count mismatch was accepted");
     };
     assert!(matches!(
         error,
@@ -1353,14 +997,11 @@ fn strict_v4_observer_is_dropped_on_error() {
     };
 
     struct DropObserver {
-        observed: usize,
         dropped: Arc<AtomicBool>,
     }
 
-    impl bitcoin_rs_utxo::SnapshotCoinObserver for DropObserver {
-        fn observe_coin(&mut self, _: bitcoin_rs_utxo::SnapshotCoin<'_>) {
-            self.observed = self.observed.saturating_add(1);
-        }
+    impl SnapshotCoinObserver for DropObserver {
+        fn observe_coin(&mut self, _: SnapshotCoin<'_>) {}
     }
 
     impl Drop for DropObserver {
@@ -1378,7 +1019,7 @@ fn strict_v4_observer_is_dropped_on_error() {
             &mut bytes,
             vout,
             4_000 + u64::from(vout),
-            2040,
+            1800,
             false,
             &[0x51],
         );
@@ -1386,11 +1027,9 @@ fn strict_v4_observer_is_dropped_on_error() {
     bytes.extend_from_slice(&[0_u8; 384]);
 
     let dropped = Arc::new(AtomicBool::new(false));
-
-    let result = bitcoin_rs_utxo::read_snapshot_strict_v4_observed(
+    let result = read_snapshot_strict_v4_observed(
         &mut Cursor::new(bytes),
         DropObserver {
-            observed: 0,
             dropped: Arc::clone(&dropped),
         },
     );
@@ -1409,9 +1048,7 @@ fn append_snapshot_output(
     coinbase: bool,
     script_pubkey: &[u8],
 ) {
-    let Ok(script_len) = u16::try_from(script_pubkey.len()) else {
-        panic!("test script does not fit snapshot encoding");
-    };
+    let script_len = u16::try_from(script_pubkey.len()).expect("test script fits v4 encoding");
     bytes.extend_from_slice(&vout.to_le_bytes());
     bytes.extend_from_slice(&value.to_le_bytes());
     bytes.extend_from_slice(&height.to_le_bytes());

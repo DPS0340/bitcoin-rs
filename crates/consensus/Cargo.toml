@@ -14,7 +14,6 @@ workspace = true
 [features]
 default = ["kernel"]
 kernel = ["dep:bitcoinkernel"]
-checksig-census = ["kernel"]
 rocksdb = []
 fjall = []
 redb = []
@@ -39,13 +38,5 @@ bitcoin.workspace = true
 sonic-rs.workspace = true
 
 [[bench]]
-name = "verify_tx"
-harness = false
-
-[[bench]]
 name = "merkle"
 harness = false
-
-[[example]]
-name = "kernel_verify_spike"
-required-features = ["kernel"]

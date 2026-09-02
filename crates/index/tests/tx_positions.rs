@@ -1,13 +1,9 @@
-//! Tests for the transaction-position row values written by both ingest paths.
+//! Tests for the persisted transaction-position row values.
 //!
-//! Two properties matter here and neither is obvious from reading the code:
-//!
-//! 1. The zero-copy path measures each transaction's byte range directly from
-//!    the block slice, while the decoded path derives it arithmetically from
-//!    `Transaction::total_size()`. Those are different computations of the same
-//!    number, and nothing but a test keeps them equal.
-//! 2. A position is only useful if slicing the block at that range yields the
-//!    transaction the row was written for.
+//! A position is only useful if slicing the canonical block bytes at that range
+//! yields the transaction the row was written for. The row encoding is a
+//! persisted-index contract; ingest implementation parity
+//! is intentionally not tested here.
 // A malformed fixture is a test failure; panicking reports it at the call site.
 #![allow(clippy::expect_used)]
 
@@ -16,12 +12,12 @@ mod common;
 use std::sync::Arc;
 
 use bitcoin_rs_index::types::{TxPosition, TxPositionValue};
-use bitcoin_rs_index::{IndexFormat, Indexer, ScriptHash};
+use bitcoin_rs_index::{Indexer, ScriptHash};
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
     deserialize,
 };
-use bitcoin_rs_storage::{ColumnFamily, KvStore, WriteBatch as _};
+use bitcoin_rs_storage::{ColumnFamily, KvStore};
 use proptest::prelude::*;
 
 use common::MemoryStore;
@@ -107,36 +103,7 @@ fn rows_with_values(store: &MemoryStore, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<
 }
 
 #[test]
-fn both_ingest_paths_write_identical_row_values() {
-    let block = mixed_block();
-    let bytes = consensus_bytes(&block);
-    let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
 
-    let zero_copy = Arc::new(MemoryStore::default());
-    Indexer::new(Arc::clone(&zero_copy))
-        .ingest_block(&bytes, HEIGHT)
-        .expect("zero-copy ingest");
-
-    let decoded = Arc::new(MemoryStore::default());
-    Indexer::new(Arc::clone(&decoded))
-        .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-        .expect("decoded ingest");
-
-    for cf in [
-        ColumnFamily::Funding,
-        ColumnFamily::TxConfirmed,
-        ColumnFamily::Spending,
-        ColumnFamily::BlockHeaders,
-    ] {
-        assert_eq!(
-            rows_with_values(&zero_copy, cf),
-            rows_with_values(&decoded, cf),
-            "ingest paths disagree in {cf:?}"
-        );
-    }
-}
-
-#[test]
 fn funding_positions_address_the_transactions_that_funded_the_script() {
     let block = mixed_block();
     let bytes = consensus_bytes(&block);
@@ -203,132 +170,6 @@ fn txid_positions_address_their_own_transaction() {
     }
 }
 
-/// The decoded ingest path computes the block prefix as
-/// `header || varint(tx_count)`, and that varint is 1 byte below 253
-/// transactions and 3 bytes at 253 or above. Every other fixture here is small
-/// enough that a hardcoded 1 would pass, so without this case the arithmetic is
-/// untested for real blocks — mainnet blocks carry thousands of transactions.
-///
-/// Verified by mutation: replacing `VarInt::from(len).size()` with a literal `1`
-/// leaves every other test in this file green and fails only this one.
-#[test]
-fn both_ingest_paths_agree_across_the_transaction_count_varint_boundary() {
-    for tx_count in [252_usize, 253, 254] {
-        let txs = (0..tx_count)
-            .map(|index| {
-                let seed = u8::try_from(index % 256).unwrap_or(0);
-                tx(
-                    seed,
-                    vec![out(script(u8::try_from(index % 7).unwrap_or(0)), 1_000)],
-                    index % 3 == 0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let block = Block {
-            header: header(),
-            txs,
-        };
-        let bytes = consensus_bytes(&block);
-        let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
-
-        let zero_copy = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&zero_copy))
-            .ingest_block(&bytes, HEIGHT)
-            .expect("zero-copy ingest");
-
-        let decoded = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&decoded))
-            .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-            .expect("decoded ingest");
-
-        for cf in [ColumnFamily::Funding, ColumnFamily::TxConfirmed] {
-            assert_eq!(
-                rows_with_values(&zero_copy, cf),
-                rows_with_values(&decoded, cf),
-                "ingest paths disagree in {cf:?} at {tx_count} transactions"
-            );
-        }
-    }
-}
-
-#[test]
-fn an_empty_index_adopts_the_current_format() {
-    let store = Arc::new(MemoryStore::default());
-    let indexer = Indexer::new(Arc::clone(&store));
-
-    assert_eq!(
-        indexer.ensure_format_version().expect("read format"),
-        IndexFormat::Current
-    );
-    // The marker persists, so a later open reports the same without re-deciding.
-    assert_eq!(
-        Indexer::new(store).ensure_format_version().expect("reopen"),
-        IndexFormat::Current
-    );
-}
-
-#[test]
-fn a_populated_index_without_a_marker_is_legacy() {
-    // Rows but no marker is exactly what a database written before this format
-    // looks like. Adopting the current version here would claim positions that
-    // are not in those rows.
-    let store = Arc::new(MemoryStore::default());
-    let mut indexer = Indexer::new(Arc::clone(&store));
-    indexer
-        .ingest_block(&consensus_bytes(&mixed_block()), HEIGHT)
-        .expect("ingest");
-    // Undo the marker the ingest path never writes, in case a future change adds
-    // one: this test is about the no-marker state specifically.
-    let mut batch = store.new_batch();
-    batch.delete(ColumnFamily::UtxoMeta, b"index:format_version");
-    store.write(batch).expect("clear marker");
-
-    assert_eq!(
-        indexer.ensure_format_version().expect("read format"),
-        IndexFormat::Legacy { found: None }
-    );
-}
-
-/// None of these may be trusted as current, and an unreadable marker must be
-/// distinguishable from a genuine version 0.
-///
-/// Both take the scan path, so the distinction is not behavioural — it is
-/// diagnostic. Reporting damaged bytes as "version 0" sends the operator to
-/// delete the index directory, which destroys the only evidence of whatever
-/// wrote them.
-#[test]
-fn an_older_marker_is_legacy_and_an_unreadable_one_is_reported_as_such() {
-    let store = Arc::new(MemoryStore::default());
-    let indexer = Indexer::new(Arc::clone(&store));
-
-    for (bytes, expected) in [
-        (vec![0_u8; 4], IndexFormat::Legacy { found: Some(0) }),
-        (
-            99_u32.to_le_bytes().to_vec(),
-            IndexFormat::Legacy { found: Some(99) },
-        ),
-        (vec![1_u8], IndexFormat::UnreadableMarker { len: 1 }),
-        (vec![1_u8; 9], IndexFormat::UnreadableMarker { len: 9 }),
-        (Vec::new(), IndexFormat::UnreadableMarker { len: 0 }),
-    ] {
-        let mut batch = store.new_batch();
-        batch.put(ColumnFamily::UtxoMeta, b"index:format_version", &bytes);
-        store.write(batch).expect("write marker");
-        assert_eq!(
-            indexer.ensure_format_version().expect("read format"),
-            expected,
-            "marker {bytes:?} must not be trusted as current"
-        );
-    }
-}
-
-#[test]
-fn an_empty_value_decodes_to_none() {
-    // Rows written before this format carry an empty value. A reader must treat
-    // that as "no positions available, scan the block", never as "this block has
-    // zero matching transactions".
-    assert!(TxPositionValue::decode(&[]).is_none());
-}
 
 #[test]
 fn a_partial_position_decodes_to_none() {
@@ -359,42 +200,5 @@ proptest! {
         prop_assert_eq!(decoded, positions.as_slice());
     }
 
-    /// The two ingest paths must agree on every block shape, not just the
-    /// hand-written one. The varint boundary at 253 transactions is covered
-    /// separately by `both_ingest_paths_agree_across_the_transaction_count_varint_boundary`,
-    /// because generating blocks that large under proptest is too slow to be
-    /// worth it here.
-    #[test]
-    fn both_ingest_paths_agree_on_random_blocks(
-        shapes in proptest::collection::vec((0_u8..4, any::<bool>()), 1..8),
-    ) {
-        let txdata = shapes
-            .iter()
-            .enumerate()
-            .map(|(index, (tag, witness))| {
-                let seed = u8::try_from(index % 256).unwrap_or(0);
-                tx(seed, vec![out(script(*tag), u64::from(*tag) + 1)], *witness)
-            })
-            .collect();
-        let block = Block { header: header(), txs: txdata };
-        let bytes = consensus_bytes(&block);
-        let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
 
-        let zero_copy = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&zero_copy))
-            .ingest_block(&bytes, HEIGHT)
-            .expect("zero-copy ingest");
-
-        let decoded = Arc::new(MemoryStore::default());
-        Indexer::new(Arc::clone(&decoded))
-            .ingest_decoded_block_with_verified_txids(&block, &bytes, HEIGHT, &txids)
-            .expect("decoded ingest");
-
-        for cf in [ColumnFamily::Funding, ColumnFamily::TxConfirmed] {
-            prop_assert_eq!(
-                rows_with_values(&zero_copy, cf),
-                rows_with_values(&decoded, cf)
-            );
-        }
-    }
 }

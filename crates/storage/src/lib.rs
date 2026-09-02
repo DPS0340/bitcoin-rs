@@ -9,8 +9,6 @@ pub mod block_file;
 pub mod cache_budget;
 /// Logical column-family names shared by all storage backends.
 pub mod column_families;
-/// Streaming length-prefixed Core frame reader and writer.
-pub mod corpus;
 /// Storage error type.
 pub mod error;
 /// Retention and deletion of block bodies and undo rows.
@@ -36,10 +34,6 @@ pub use block_file::{
 };
 pub use cache_budget::{CacheBudgetShare, clamp_dbcache_bytes, split_cache_budget};
 pub use column_families::ColumnFamily;
-pub use corpus::{
-    CORE_FRAME_HEADER_LEN, CORE_FRAME_MAGIC_LEN, CoreFrameError, CoreFrameMetadata,
-    CoreFrameReader, CoreFrameRecord, CoreFrameWriter,
-};
 pub use error::StorageError;
 pub use trait_::{
     KvIter, KvPair, KvSnapshot, KvStore, PrefixScan, PrefixScanLimit, WriteBatch, WriteCondition,

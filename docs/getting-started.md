@@ -95,8 +95,14 @@ funding/spending history exposed via Esplora-compatible HTTP endpoints.
 Address and scripthash routes return HTTP 503 until `--scriptindex` catches up,
 or when it is disabled.
 
-Change the RPC credentials before exposing the port. The defaults are a
-development convenience, not a secret. Pass `--rpc-cookie` to use a Core-style
+The datadir schema marker covers the transaction and script indexes as well as
+chainstate. An unmarked or incompatible datadir fails before any derived index
+store opens; the operator must replace or quarantine it and resync. A marked
+current datadir can then build `--scriptindex` and `--txindex` state from the
+active chain.
+
+Change the RPC credentials before exposing the port anywhere. The defaults are
+a development convenience, not a secret. `--rpc-cookie` takes a Core-style
 cookie file instead.
 
 ## Step 4: check sync progress

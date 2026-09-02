@@ -21,9 +21,8 @@ core.*
 .env
 
 # Agent task scratch is temporary; acceptance criteria belong in issues/PRs.
-.agent-tasks/
-!DEVIATIONS.md
 .antigravitycli/
+.agent-tasks/
 
 # lean-ctx local tooling cache
 .lean-ctx/

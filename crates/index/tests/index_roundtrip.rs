@@ -83,14 +83,6 @@ impl MemoryStore {
         let guard = self.cfs.read();
         guard[cf.index()].len()
     }
-
-    fn rows(&self, cf: ColumnFamily) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let guard = self.cfs.read();
-        guard[cf.index()]
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
-    }
 }
 
 impl KvStore for MemoryStore {
@@ -557,46 +549,6 @@ fn ingest_golden_blocks_writes_expected_electrs_rows() -> Result<(), Box<dyn std
     Ok(())
 }
 
-#[test]
-fn ingest_with_precomputed_txids_matches_standard_ingest() -> Result<(), Box<dyn std::error::Error>>
-{
-    let height = 170_u32;
-    let block_bytes = read_fixture(height)?;
-    let block = Block::consensus_decode(&block_bytes)?;
-    let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
-
-    assert_precomputed_ingest_matches_standard(&block_bytes, height, &txids)
-}
-
-#[test]
-fn ingest_with_verified_txids_matches_standard_ingest() -> Result<(), Box<dyn std::error::Error>> {
-    let height = 170_u32;
-    let block_bytes = read_fixture(height)?;
-    let block = Block::consensus_decode(&block_bytes)?;
-    let txids = block.txs.iter().map(Tx::txid).collect::<Vec<_>>();
-
-    assert_verified_ingest_matches_standard(&block_bytes, height, &txids)
-}
-
-#[test]
-fn ingest_with_mismatched_precomputed_txids_falls_back_to_standard_ingest()
--> Result<(), Box<dyn std::error::Error>> {
-    let height = 170_u32;
-    let block_bytes = read_fixture(height)?;
-
-    assert_precomputed_ingest_matches_standard(&block_bytes, height, &[])
-}
-
-#[test]
-fn ingest_with_same_length_wrong_precomputed_txids_falls_back_to_standard_ingest()
--> Result<(), Box<dyn std::error::Error>> {
-    let height = 170_u32;
-    let block_bytes = read_fixture(height)?;
-    let block = Block::consensus_decode(&block_bytes)?;
-    let stale_txids = vec![Txid(Hash256::from_le_bytes(&[0x42; 32])); block.txs.len()];
-
-    assert_precomputed_ingest_matches_standard(&block_bytes, height, &stale_txids)
-}
 
 fn read_fixture(height: u32) -> Result<Vec<u8>, std::io::Error> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -605,47 +557,6 @@ fn read_fixture(height: u32) -> Result<Vec<u8>, std::io::Error> {
     std::fs::read(path)
 }
 
-fn assert_precomputed_ingest_matches_standard(
-    block: &[u8],
-    height: u32,
-    txids: &[Txid],
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert_ingest_matches_standard(block, height, |indexer| {
-        indexer.ingest_block_with_txids(block, height, txids)
-    })
-}
-
-fn assert_verified_ingest_matches_standard(
-    block: &[u8],
-    height: u32,
-    txids: &[Txid],
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert_ingest_matches_standard(block, height, |indexer| {
-        indexer.ingest_block_with_verified_txids(block, height, txids)
-    })
-}
-
-fn assert_ingest_matches_standard(
-    block: &[u8],
-    height: u32,
-    ingest: impl FnOnce(
-        &mut Indexer<MemoryStore>,
-    ) -> Result<IndexRowCounts, bitcoin_rs_index::IndexError>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let standard_store = std::sync::Arc::new(MemoryStore::default());
-    let mut standard_indexer = Indexer::new(std::sync::Arc::clone(&standard_store));
-    let candidate_store = std::sync::Arc::new(MemoryStore::default());
-    let mut candidate_indexer = Indexer::new(std::sync::Arc::clone(&candidate_store));
-
-    let standard_counts = standard_indexer.ingest_block(block, height)?;
-    let candidate_counts = ingest(&mut candidate_indexer)?;
-
-    assert_eq!(candidate_counts, standard_counts);
-    for &cf in ColumnFamily::ALL {
-        assert_eq!(candidate_store.rows(cf), standard_store.rows(cf));
-    }
-    Ok(())
-}
 
 fn block_hash(body: &[u8]) -> [u8; 32] {
     double_sha256(&body[..80]).to_le_bytes()
@@ -673,70 +584,9 @@ fn watermark_roundtrip_and_invalid_rejection() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
-fn format_version_rejection() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[4, 0, 0, 0],
-    )?;
-    assert!(matches!(
-        IndexWriter::open(store, 1),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 4 })
-    ));
-    Ok(())
-}
 
-#[test]
-fn unversioned_rows_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    let mut indexer = Indexer::new(Arc::clone(&store));
-    let body = read_fixture(0)?;
-    indexer.ingest_block(&body, 0)?;
-
-    assert!(matches!(
-        IndexWriter::open(Arc::clone(&store), 1),
-        Err(IndexError::LegacyCursorlessIndex)
-    ));
-    Ok(())
-}
-
-#[test]
-fn reset_index_replaces_an_incompatible_derived_format() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &2_u32.to_le_bytes(),
-    )?;
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::TxConfirmed,
-        b"old",
-        b"row",
-    )?;
-
-    IndexWriter::reset_index(store.as_ref(), 1)?;
-
-    assert!(
-        IndexWriter::open(Arc::clone(&store), 1)?
-            .watermark()?
-            .is_none()
-    );
-    assert_eq!(
-        store.count(bitcoin_rs_storage::ColumnFamily::TxConfirmed),
-        0
-    );
-    Ok(())
-}
-
-#[test]
 fn invalid_watermark_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],
@@ -1869,33 +1719,13 @@ fn batch_caps_admit_oversized_first_block() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn format_version_requires_exact_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let store = Arc::new(MemoryStore::default());
-    // Extra trailing byte must be rejected even though the prefix is version 3.
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0, 0],
-    )?;
-    assert!(matches!(
-        IndexWriter::open(store, 1),
-        Err(IndexError::UnsupportedTxIndexFormatVersion { version: 3 })
-    ));
-    Ok(())
-}
 
-#[test]
 fn commit_forward_accepts_terminal_height() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(MemoryStore::default());
     let current = IndexWatermark {
         height: u32::MAX - 1,
         hash: [0; 32],
     };
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],
@@ -1931,11 +1761,6 @@ fn commit_forward_rejects_height_overflow() -> Result<(), Box<dyn std::error::Er
         height: u32::MAX,
         hash: [0xab; 32],
     };
-    store.put(
-        bitcoin_rs_storage::ColumnFamily::UtxoMeta,
-        &[0x00, b'V'],
-        &[3, 0, 0, 0],
-    )?;
     store.put(
         bitcoin_rs_storage::ColumnFamily::UtxoMeta,
         &[0x00, b'T'],

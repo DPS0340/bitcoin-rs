@@ -333,8 +333,8 @@ impl TxPositionValue {
 
     /// Decodes a row value into its positions.
     ///
-    /// Returns `None` for an empty value (a row predating this format) and for a
-    /// malformed one, which mean the same thing to a reader.
+    /// Returns `None` for an empty or malformed value. The resolver treats an
+    /// unavailable position list as a signal to use its all-or-scan safety path.
     #[must_use]
     pub fn decode(value: &[u8]) -> Option<&[TxPosition]> {
         if value.is_empty() {

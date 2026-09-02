@@ -155,15 +155,6 @@ pub(crate) const fn compress_amount(amount: u64) -> Result<u64, UtxoError> {
     }
 }
 
-// Counts `decompress_amount` calls so tests can assert *how much work* a record
-// read does, instead of timing it. A wall-clock assertion in a test suite is a
-// flake generator; this is the same claim made deterministically. Compiled only
-// under `cfg(test)`, so production pays nothing.
-#[cfg(test)]
-thread_local! {
-    pub(crate) static DECOMPRESS_CALLS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-}
-
 /// The powers of ten the transform can factor out, indexed by exponent.
 ///
 /// Replaces a `while` loop of up to nine dependent multiplies. Decoding an
@@ -197,9 +188,6 @@ const POW10: [u64; 10] = [
 /// covers. Together they leave each amount exactly one spelling.
 #[inline]
 pub(crate) fn decompress_amount(compressed: u64) -> Option<u64> {
-    #[cfg(test)]
-    DECOMPRESS_CALLS.with(|calls| calls.set(calls.get() + 1));
-
     if compressed == 0 {
         return Some(0);
     }

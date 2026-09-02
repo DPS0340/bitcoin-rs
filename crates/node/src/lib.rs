@@ -24,8 +24,6 @@ mod checkpoint_fs;
 mod checkpoint_worker;
 /// Layered node configuration.
 pub mod config;
-/// Block corpus manifest for contiguous archive integrity.
-pub mod corpus;
 /// Startup crash recovery.
 pub mod crash_recovery;
 /// Typed in-process node lifecycle: the embedding surface over the same
@@ -37,8 +35,6 @@ pub mod event_loop;
 pub mod extensions;
 /// BIP157/158 filter index reconciliation worker and query engine.
 mod filterindex_worker;
-mod g14_utxo_commit;
-mod g2_muhash;
 /// Block import pipeline.
 pub mod import;
 /// Tracing initialization.

@@ -9,9 +9,8 @@ use hashbrown::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+
 use bitcoin_rs_chain::{ChainWork, NodeId, NodeStatus, TipSnapshot};
-use bitcoin_rs_mempool::MempoolEntry;
-use bitcoin_rs_mining::{Candidate, TemplateId};
 use bitcoin_rs_p2p::PeerInfo;
 use bitcoin_rs_primitives::{
     Block, BlockHash, Hash256, Header, Network, OutPoint, Tx, TxIn, TxOut, Txid, consensus_bytes,
@@ -165,7 +164,6 @@ fn all_required_handlers_return_core_shapes() -> Result<(), Box<dyn std::error::
     }
     Ok(())
 }
-
 #[cfg(feature = "zmq")]
 #[test]
 fn getzmqnotifications_dispatches_compiled_notifications() -> Result<(), Box<dyn std::error::Error>>
@@ -869,7 +867,6 @@ impl Fixture {
         })
     }
 }
-
 #[allow(clippy::arc_with_non_send_sync)]
 fn context_with_peers(peers: Arc<RwLock<Vec<PeerInfo>>>) -> Arc<Context> {
     let mut ctx = Context::new();
@@ -893,7 +890,6 @@ fn tx(label: u8, script_pubkey: Vec<u8>) -> Tx {
         }],
     }
 }
-
 fn outpoint(label: u8) -> OutPoint {
     OutPoint::new(Txid(Hash256::from_le_bytes(&[label; 32])), 0)
 }

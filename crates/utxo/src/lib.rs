@@ -29,7 +29,7 @@ pub mod undo_codec;
 pub mod connect;
 
 pub use key::{UtxoBuildHasher, UtxoKey};
-pub use record::{OneUtxoOut, RecordCodec, UtxoRecord};
+pub use record::{OneUtxoOut, UtxoRecord};
 pub use set::{
     BlockChanges, ScannedUtxo, UndoBatch, UtxoAdd, UtxoChangeEvents, UtxoChangeListener,
     UtxoCommittedEvent, UtxoError, UtxoInserted, UtxoMemoryReport, UtxoRemoved, UtxoScan, UtxoSet,
@@ -39,7 +39,8 @@ pub use connect::{BlockChangeError, BlockValueTotals, SpentOutputLookup, is_coin
 pub use shard::{LiveOutput, LiveOutputMeta};
 pub use snapshot::{
     SnapshotCoin, SnapshotCoinObserver, SnapshotLoad, aggregate_hash, hash_serialized_3,
-    read_snapshot, read_snapshot_strict_v4_observed, write_snapshot, write_snapshot_observed,
+    read_snapshot_strict_v4, read_snapshot_strict_v4_observed, write_snapshot,
+    write_snapshot_observed,
 };
 pub use undo_codec::{
     UNDO_FORMAT_VERSION, UndoCodecError, decode as decode_undo, encode as encode_undo,

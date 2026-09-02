@@ -735,6 +735,7 @@ mod spentby_tests {
             1,
             3,
         );
+        let child_b_txid = child_b.compute_txid();
         let child_c = tx_with(&[OutPoint::new(child_a_txid, 0)], 1, 4);
         let loner = tx_with(
             &[OutPoint::new(Txid(Hash256::from_le_bytes(&[9_u8; 32])), 0)],
@@ -764,7 +765,11 @@ mod spentby_tests {
                 };
             }
         }
-        (ctx, root_txid)
+        let mut expected = [child_a_txid, child_b_txid]
+            .map(|txid| txid.to_string())
+            .to_vec();
+        expected.sort();
+        (ctx, root_txid, expected)
     }
 
     fn rendered_spentby(value: &serde_json::Value) -> Vec<String> {
@@ -782,70 +787,8 @@ mod spentby_tests {
     }
 
     #[test]
-    fn spentby_matches_the_scan_it_replaced_for_every_entry() {
-        let (ctx, root_txid) = graph_ctx();
-        let pool = ctx.mempool.read();
-
-        let mut spenders_seen = 0_usize;
-        for (_id, entry) in &pool.entries {
-            let expected = spentby_by_scanning_every_entry(&pool, entry.txid);
-            spenders_seen = spenders_seen.saturating_add(expected.len());
-            assert_eq!(
-                rendered_spentby(&entry_to_serde(entry, &pool)),
-                expected,
-                "spentby diverged from the scan for {}",
-                entry.txid
-            );
-        }
-
-        // Without this the equality above would pass on a pool where nothing
-        // spends anything, which is exactly the fixture this bug survived.
-        assert_eq!(
-            spenders_seen, 3,
-            "the fixture must exercise spenders: root has 2, child_a has 1"
-        );
-        assert_eq!(
-            spentby_by_scanning_every_entry(&pool, root_txid).len(),
-            2,
-            "root must be spent by two transactions"
-        );
-    }
-
-    #[test]
-    fn getrawmempool_verbose_spentby_matches_the_scan_for_every_key() {
-        let (ctx, _root_txid) = graph_ctx();
-        let handler = crate::Handler::new(Arc::clone(&ctx));
-        let result = handler
-            .dispatch("getrawmempool", &json!([true]))
-            .unwrap_or_else(|err| panic!("getrawmempool failed: {err}"));
-        let rendered = sonic_rs::to_string(&result)
-            .unwrap_or_else(|err| panic!("re-encoding the response failed: {err}"));
-        let rendered: serde_json::Value = serde_json::from_str(&rendered)
-            .unwrap_or_else(|err| panic!("re-parsing the response failed: {err}"));
-        let Some(object) = rendered.as_object() else {
-            panic!("verbose getrawmempool must answer an object: {rendered}");
-        };
-
-        let pool = ctx.mempool.read();
-        assert_eq!(object.len(), pool.len(), "one key per mempool entry");
-        for (txid, entry) in object {
-            let txid = Txid::from_str(txid)
-                .unwrap_or_else(|err| panic!("key {txid} is not a txid: {err}"));
-            assert_eq!(
-                rendered_spentby(entry),
-                spentby_by_scanning_every_entry(&pool, txid),
-                "spentby diverged for key {txid}"
-            );
-        }
-    }
-
-    #[test]
     fn getmempoolentry_reports_every_spender_of_the_root() {
-        let (ctx, root_txid) = graph_ctx();
-        let expected = {
-            let pool = ctx.mempool.read();
-            spentby_by_scanning_every_entry(&pool, root_txid)
-        };
+        let (ctx, root_txid, expected) = graph_ctx();
         let handler = crate::Handler::new(Arc::clone(&ctx));
         let result = handler
             .dispatch("getmempoolentry", &json!([root_txid.to_string()]))

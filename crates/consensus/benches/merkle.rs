@@ -4,6 +4,7 @@
 
 use std::hint::black_box;
 
+
 use bitcoin_rs_consensus::verify_block::block_merkle_root_matches_txids;
 use bitcoin_rs_primitives::{Block, Hash256, Header, Txid, encode::double_sha256};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -107,19 +108,13 @@ fn merkle_tree(c: &mut Criterion) {
         validate_benchmark_input(&block, &input);
         let mut scratch = input.clone();
         group.bench_function(
-            BenchmarkId::new("avx2_dispatch_parents", parent_count),
+            BenchmarkId::new("current_dispatch_parents", parent_count),
             |b| {
                 b.iter(|| {
                     black_box(block_merkle_root_matches_txids(&block, &input));
                 });
             },
         );
-        group.bench_function(BenchmarkId::new("scalar_parents", parent_count), |b| {
-            b.iter(|| {
-                scratch.clone_from(&input);
-                black_box(scalar_merkle(&mut scratch));
-            });
-        });
     }
     group.finish();
 }

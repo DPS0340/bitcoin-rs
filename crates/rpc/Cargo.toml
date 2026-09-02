@@ -46,20 +46,3 @@ bitcoin-rs-mempool = { workspace = true, features = ["test-seam"] }
 proptest.workspace = true
 tempfile = "3"
 rustix.workspace = true
-criterion.workspace = true
-# Bench-only backend: `txoutproof` benchmarks `gettxoutproof` against a real
-# on-disk index. This is a dev-dependency feature, not a passthrough: the rpc
-# crate itself exposes no backend feature and gates no code on one.
-bitcoin-rs-storage = { workspace = true, features = ["rocksdb"] }
-
-[[bench]]
-name = "chaininfo"
-harness = false
-
-[[bench]]
-name = "blocklookup"
-harness = false
-
-[[bench]]
-name = "txoutproof"
-harness = false

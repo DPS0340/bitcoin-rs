@@ -12,8 +12,6 @@ use crate::{
 
 const SNAPSHOT_MAGIC: u32 = 0x55_54_58_4f;
 const SNAPSHOT_WRITE_VERSION: u32 = 4;
-const SNAPSHOT_V3_VERSION: u32 = 3;
-const SNAPSHOT_V2_VERSION: u32 = 2;
 const MUHASH_TRAILER_LEN: usize = 384;
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -24,25 +22,6 @@ struct SnapshotHeader {
     tip_hash: [u8; 32],
     height: u32,
     record_count: u64,
-}
-
-#[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-#[repr(C, packed)]
-struct SnapshotRecordHeader {
-    shard_idx: u8,
-    key_prefix: [u8; 8],
-    txid: [u8; 32],
-    vout_bitmap: u64,
-    vout_count: u8,
-}
-
-#[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-#[repr(C, packed)]
-struct SnapshotRecordHeaderV3 {
-    shard_idx: u8,
-    key_prefix: [u8; 8],
-    txid: [u8; 32],
-    vout_count: u8,
 }
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -203,12 +182,6 @@ pub fn write_snapshot_observed<O: SnapshotCoinObserver>(
     })
 }
 
-/// Streams a native bitcoin-rs UTXO snapshot from `reader` into a fresh set.
-pub fn read_snapshot(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
-    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::Legacy, ())
-        .map(|(snapshot, ())| snapshot)
-}
-
 /// Strictly decodes a complete v4 snapshot for a chainstate checkpoint.
 pub fn read_snapshot_strict_v4(reader: &mut impl Read) -> Result<SnapshotLoad, UtxoError> {
     read_snapshot_strict_v4_observed(reader, ()).map(|(snapshot, ())| snapshot)
@@ -220,20 +193,6 @@ pub fn read_snapshot_strict_v4(reader: &mut impl Read) -> Result<SnapshotLoad, U
 /// Callbacks can precede a later error, so they must not publish external state.
 pub fn read_snapshot_strict_v4_observed<O: SnapshotCoinObserver>(
     reader: &mut impl Read,
-    observer: O,
-) -> Result<(SnapshotLoad, O), UtxoError> {
-    read_snapshot_with_policy_observed(reader, SnapshotReadPolicy::StrictV4, observer)
-}
-
-#[derive(Copy, Clone)]
-enum SnapshotReadPolicy {
-    Legacy,
-    StrictV4,
-}
-
-fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
-    reader: &mut impl Read,
-    policy: SnapshotReadPolicy,
     mut observer: O,
 ) -> Result<(SnapshotLoad, O), UtxoError> {
     let header_bytes = read_array::<{ core::mem::size_of::<SnapshotHeader>() }>(reader)?;
@@ -242,14 +201,7 @@ fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
         return Err(UtxoError::InvalidSnapshotMagic { actual: magic });
     }
     let version = read_u32(&header_bytes, 4);
-    let accepts_version = match policy {
-        SnapshotReadPolicy::Legacy => matches!(
-            version,
-            SNAPSHOT_V2_VERSION | SNAPSHOT_V3_VERSION | SNAPSHOT_WRITE_VERSION
-        ),
-        SnapshotReadPolicy::StrictV4 => version == SNAPSHOT_WRITE_VERSION,
-    };
-    if !accepts_version {
+    if version != SNAPSHOT_WRITE_VERSION {
         return Err(UtxoError::UnsupportedSnapshotVersion { version });
     }
     let mut tip_hash = [0_u8; 32];
@@ -264,12 +216,7 @@ fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
     let set = UtxoSet::new();
     let mut seen_vouts = HashSet::new();
     for _ in 0..record_count_usize {
-        let (key, txid, outputs) = match version {
-            SNAPSHOT_V2_VERSION => read_snapshot_record_v2(reader, &mut seen_vouts)?,
-            SNAPSHOT_V3_VERSION => read_snapshot_record_v3(reader, &mut seen_vouts)?,
-            SNAPSHOT_WRITE_VERSION => read_snapshot_record_v4(reader, &mut seen_vouts)?,
-            _ => unreachable!("snapshot version was validated"),
-        };
+        let (key, txid, outputs) = read_snapshot_record_v4(reader, &mut seen_vouts)?;
         set.insert_snapshot_record(key, txid, &outputs)?;
         for output in &outputs {
             observer.observe_coin(SnapshotCoin {
@@ -283,34 +230,23 @@ fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
         }
     }
 
-    if matches!(policy, SnapshotReadPolicy::StrictV4) {
-        let actual = set.record_count();
-        if actual != record_count_usize {
-            return Err(UtxoError::SnapshotRecordCountMismatch {
-                declared: record_count,
-                actual,
-            });
-        }
+    let actual = set.record_count();
+    if actual != record_count_usize {
+        return Err(UtxoError::SnapshotRecordCountMismatch {
+            declared: record_count,
+            actual,
+        });
     }
 
     let mut muhash_trailer = [0_u8; MUHASH_TRAILER_LEN];
-    match policy {
-        SnapshotReadPolicy::Legacy => match reader.read_exact(&mut muhash_trailer) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
-            Err(error) => return Err(error.into()),
-        },
-        SnapshotReadPolicy::StrictV4 => {
-            reader.read_exact(&mut muhash_trailer)?;
-            let mut trailing = [0_u8; 1];
-            if reader.read(&mut trailing)? != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "snapshot has trailing bytes",
-                )
-                .into());
-            }
-        }
+    reader.read_exact(&mut muhash_trailer)?;
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot has trailing bytes",
+        )
+        .into());
     }
 
     Ok((
@@ -322,55 +258,6 @@ fn read_snapshot_with_policy_observed<O: SnapshotCoinObserver>(
         },
         observer,
     ))
-}
-
-fn read_snapshot_record_v2(
-    reader: &mut impl Read,
-    seen_vouts: &mut HashSet<u32>,
-) -> Result<(UtxoKey, Hash256, Vec<OwnedUtxoOut>), UtxoError> {
-    let record_header_bytes =
-        read_array::<{ core::mem::size_of::<SnapshotRecordHeader>() }>(reader)?;
-    let (key, txid) = decode_record_identity(&record_header_bytes)?;
-    let vout_bitmap = read_u64(&record_header_bytes, 41);
-    let vout_count = record_header_bytes[49];
-    if vout_bitmap.count_ones() != u32::from(vout_count) {
-        return Err(UtxoError::SnapshotVoutCountMismatch {
-            bitmap: vout_bitmap,
-            vout_count,
-        });
-    }
-
-    seen_vouts.clear();
-    let mut outputs = Vec::with_capacity(usize::from(vout_count));
-    for _ in 0..vout_count {
-        let output = read_snapshot_output(reader)?;
-        if output.vout >= 64 {
-            return Err(UtxoError::VoutOutOfRange { vout: output.vout });
-        }
-        let bit = 1_u64 << output.vout;
-        if vout_bitmap & bit == 0 {
-            return Err(UtxoError::SnapshotVoutBitmapMismatch {
-                bitmap: vout_bitmap,
-                vout: output.vout,
-            });
-        }
-        if !seen_vouts.insert(output.vout) {
-            return Err(UtxoError::SnapshotDuplicateVout { vout: output.vout });
-        }
-        outputs.push(output);
-    }
-    Ok((key, txid, outputs))
-}
-
-fn read_snapshot_record_v3(
-    reader: &mut impl Read,
-    seen_vouts: &mut HashSet<u32>,
-) -> Result<(UtxoKey, Hash256, Vec<OwnedUtxoOut>), UtxoError> {
-    let record_header_bytes =
-        read_array::<{ core::mem::size_of::<SnapshotRecordHeaderV3>() }>(reader)?;
-    let (key, txid) = decode_record_identity(&record_header_bytes)?;
-    let outputs = read_snapshot_outputs(reader, u32::from(record_header_bytes[41]), seen_vouts)?;
-    Ok((key, txid, outputs))
 }
 
 fn read_snapshot_record_v4(

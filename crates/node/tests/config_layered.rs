@@ -1,10 +1,9 @@
 //! Integration tests for the bitcoin-rs node.
 
 use anyhow::Result;
-use bitcoin_rs_node::{Auth, Network, NodeConfig, ScriptIndexMode};
+use bitcoin_rs_node::{Auth, Config, Network};
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 type EnvPair = (&'static str, &'static str);
 
@@ -41,7 +40,7 @@ rpc_password = "toml-pass"
         ("BITCOIN_RS_DBCACHE_MB", "1024"),
         ("BITCOIN_RS_LOG_LEVEL", "warn"),
     ];
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         Some(&toml_path),
         Some(&bitcoin_conf_path),
         env,
@@ -70,7 +69,7 @@ rpc_password = "toml-pass"
 fn cli_can_override_socket_and_vector_fields() -> Result<()> {
     let listen: SocketAddr = "127.0.0.1:18444".parse()?;
     let metrics: SocketAddr = "127.0.0.1:19090".parse()?;
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -97,7 +96,7 @@ fn cli_can_override_socket_and_vector_fields() -> Result<()> {
 #[test]
 fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
     let peer = "127.0.0.1:8333".to_owned();
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -113,7 +112,7 @@ fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Mainnet);
-    assert_eq!(config.p2p_magic, [0xec, 0xa5, 0xd4, 0x34]);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x34]);
     assert_eq!(config.connect, vec![peer]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
@@ -121,7 +120,7 @@ fn p2p_magic_override_preserves_consensus_network() -> Result<()> {
 
 #[test]
 fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_NETWORK", "drynet4")],
@@ -129,7 +128,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Mainnet);
-    assert_eq!(config.p2p_magic, [0xec, 0xa5, 0xd4, 0x04]);
+    assert_eq!(config.p2p_magic(), [0xec, 0xa5, 0xd4, 0x04]);
     assert_eq!(config.connect, vec!["drynet4.drivechain.dev:8533"]);
     assert!(!config.dns_seeds_enabled);
     Ok(())
@@ -137,7 +136,7 @@ fn drynet4_network_applies_atomic_p2p_profile() -> Result<()> {
 
 #[test]
 fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<()> {
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         [
@@ -147,7 +146,7 @@ fn explicit_fields_override_network_defaults_within_the_same_layer() -> Result<(
         ["bitcoin-rs-node", "--p2p-magic", "01020304"],
     )?;
 
-    assert_eq!(config.p2p_magic, [1, 2, 3, 4]);
+    assert_eq!(config.p2p_magic(), [1, 2, 3, 4]);
     assert_eq!(config.connect, vec!["127.0.0.1:8333"]);
     Ok(())
 }
@@ -166,7 +165,7 @@ connect = ["127.0.0.1:18444"]
 "#,
     )?;
 
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -189,7 +188,7 @@ connect = ["127.0.0.1:18444"]
 
 #[test]
 fn standard_network_uses_builtin_defaults() -> Result<()> {
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_NETWORK", "testnet4")],
@@ -197,7 +196,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
     )?;
 
     assert_eq!(config.network, Network::Testnet4);
-    assert_eq!(config.p2p_magic, Network::Testnet4.magic());
+    assert_eq!(config.p2p_magic(), Network::Testnet4.magic());
     assert!(config.connect.is_empty());
     assert!(config.dns_seeds_enabled);
     Ok(())
@@ -205,7 +204,7 @@ fn standard_network_uses_builtin_defaults() -> Result<()> {
 
 #[test]
 fn p2p_magic_override_requires_an_explicit_peer() {
-    let result = NodeConfig::from_layered_sources(
+    let result = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -222,9 +221,8 @@ fn p2p_magic_override_requires_an_explicit_peer() {
 
 #[test]
 fn script_index_is_valid_without_core_txindex() -> Result<()> {
-    let mut config = NodeConfig::default_for_network(Network::Regtest);
-    config.script_index = ScriptIndexMode::Full;
-
+    let mut config = Config::default_for_network(Network::Regtest);
+    config.script_index = true;
     config.txindex = false;
 
     config.validate()?;
@@ -233,20 +231,20 @@ fn script_index_is_valid_without_core_txindex() -> Result<()> {
 
 #[test]
 fn scriptindex_cli_flag_enables_the_index() -> Result<()> {
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
         ["bitcoin-rs-node", "--scriptindex"],
     )?;
 
-    assert_eq!(config.script_index, ScriptIndexMode::Full);
+    assert!(config.script_index);
     Ok(())
 }
 
 #[test]
 fn scriptindex_environment_enables_the_index() -> Result<()> {
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         None,
         None,
         [
@@ -255,140 +253,10 @@ fn scriptindex_environment_enables_the_index() -> Result<()> {
         ],
         ["bitcoin-rs-node"],
     )?;
+
     assert!(!config.txindex);
-    assert_eq!(config.script_index, ScriptIndexMode::Full);
+    assert!(config.script_index);
     Ok(())
-}
-
-// `utxo` is a named, parsed mode but is not yet usable: #225 defers the
-// compact live-output store to #226 Q5. It must therefore parse (so the
-// variant and its plumbing stay ready and testable) but be rejected at
-// validation, rather than starting a node that advertises a view nothing
-// backs. `full` is accepted.
-#[test]
-fn scriptindex_utxo_parses_but_is_rejected_until_a_live_store_exists() {
-    let parsed = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex=utxo"],
-    );
-    // `from_layered_sources` runs `NodeConfig::validate`, so reaching the enum
-    // value at all requires inspecting the variant before validation. The
-    // parse half is pinned separately by `ScriptIndexMode::parse`.
-    assert!(
-        parsed.is_err_and(|error| error
-            .to_string()
-            .contains("scriptindex=utxo is not yet usable")),
-        "`utxo` must be refused while no live store backs it"
-    );
-    assert_eq!(
-        ScriptIndexMode::parse("utxo"),
-        Some(ScriptIndexMode::Utxo),
-        "the `utxo` variant must stay parsed and named for when #226 Q5 lands"
-    );
-}
-
-#[test]
-fn scriptindex_full_is_accepted() -> Result<()> {
-    let full = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex=full"],
-    )?;
-    assert_eq!(full.script_index, ScriptIndexMode::Full);
-    full.validate()?;
-    Ok(())
-}
-
-/// The boolean spellings must keep meaning `full`, so an existing
-/// `--scriptindex` / `BITCOIN_RS_SCRIPTINDEX=true` deployment keeps its
-/// historical behaviour after the mode split.
-#[test]
-fn boolean_scriptindex_spellings_mean_full_not_utxo() -> Result<()> {
-    let bare = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex"],
-    )?;
-    assert_eq!(
-        bare.script_index,
-        ScriptIndexMode::Full,
-        "bare --scriptindex must stay `full`, not `utxo`"
-    );
-
-    let explicit_true = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex=true"],
-    )?;
-    assert_eq!(explicit_true.script_index, ScriptIndexMode::Full);
-
-    let env_true = NodeConfig::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_SCRIPTINDEX", "true")],
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(env_true.script_index, ScriptIndexMode::Full);
-
-    let disabled = NodeConfig::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_SCRIPTINDEX", "false")],
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(disabled.script_index, ScriptIndexMode::Disabled);
-    Ok(())
-}
-
-/// Only `full` maintains history. `utxo` deliberately avoids the storage cost
-/// of historical script indexing, and `disabled` maintains nothing. This is
-/// the capability selection #225's endpoint matrix gates on.
-///
-/// `has_live_store` is the guard that keeps `utxo` from being offered while
-/// the compact live-output store is still being designed in #226 Q5.
-#[test]
-fn mode_capability_predicates_select_history_and_live() {
-    assert!(!ScriptIndexMode::Disabled.is_enabled());
-    assert!(!ScriptIndexMode::Disabled.keeps_history());
-    assert!(
-        ScriptIndexMode::Disabled.has_live_store(),
-        "disabled claims no view, so it trivially backs all of them"
-    );
-
-    assert!(ScriptIndexMode::Utxo.is_enabled());
-    assert!(
-        !ScriptIndexMode::Utxo.keeps_history(),
-        "utxo mode must not maintain historical funding/spending rows"
-    );
-    assert!(
-        !ScriptIndexMode::Utxo.has_live_store(),
-        "utxo must not claim readiness until a live store exists"
-    );
-
-    assert!(ScriptIndexMode::Full.is_enabled());
-    assert!(ScriptIndexMode::Full.keeps_history());
-    assert!(ScriptIndexMode::Full.has_live_store());
-}
-
-/// An unrecognised mode must be rejected rather than silently degrading to a
-/// default, or an operator typo would quietly disable a configured index.
-#[test]
-fn an_unrecognised_scriptindex_mode_is_rejected() {
-    let result = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node", "--scriptindex=history-only"],
-    );
-    assert!(
-        result.is_err_and(|error| error.to_string().contains("invalid scriptindex value")),
-        "a typo must be an error, not a silent default"
-    );
 }
 
 #[test]
@@ -421,7 +289,7 @@ zmqpubsequencehwm = 13
         ),
         ("BITCOIN_RS_ZMQPUBRAWTXHWM", "11"),
     ];
-    let config = NodeConfig::from_layered_sources(
+    let config = Config::from_layered_sources(
         Some(&toml_path),
         Some(&bitcoin_conf_path),
         env,
@@ -473,129 +341,6 @@ zmqpubsequencehwm = 13
 }
 
 #[test]
-fn g2_muhash_sample_path_layers_use_cli_env_toml_precedence() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let toml_path = temp.path().join("node.toml");
-
-    fs::write(
-        &toml_path,
-        r#"
-g2_muhash_samples = "toml.samples"
-g2_muhash_tip_height = 10000
-"#,
-    )?;
-
-    let toml_config = NodeConfig::from_layered_sources(
-        Some(&toml_path),
-        None,
-        core::iter::empty::<EnvPair>(),
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        toml_config.g2_muhash_samples,
-        Some(PathBuf::from("toml.samples"))
-    );
-    assert_eq!(toml_config.g2_muhash_tip_height, Some(10_000));
-
-    let env_config = NodeConfig::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        ["bitcoin-rs-node"],
-    )?;
-    assert_eq!(
-        env_config.g2_muhash_samples,
-        Some(PathBuf::from("env.samples"))
-    );
-    assert_eq!(env_config.g2_muhash_tip_height, Some(20_000));
-
-    let cli_config = NodeConfig::from_layered_sources(
-        Some(&toml_path),
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "env.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "20000"),
-        ],
-        [
-            "bitcoin-rs-node",
-            "--g2-muhash-samples",
-            "cli.samples",
-            "--g2-muhash-tip-height",
-            "30000",
-        ],
-    )?;
-    assert_eq!(
-        cli_config.g2_muhash_samples,
-        Some(PathBuf::from("cli.samples"))
-    );
-    assert_eq!(cli_config.g2_muhash_tip_height, Some(30_000));
-    Ok(())
-}
-
-#[test]
-fn g2_muhash_tip_height_requires_sample_path() {
-    let result = NodeConfig::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "10000")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("tip height without sample path must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height requires g2_muhash_samples")
-    );
-}
-
-#[test]
-fn g2_muhash_sample_path_requires_tip_height() {
-    let result = NodeConfig::from_layered_sources(
-        None,
-        None,
-        [("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples")],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("sample path without tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_samples requires g2_muhash_tip_height")
-    );
-}
-
-#[test]
-fn g2_muhash_tip_height_must_be_positive() {
-    let result = NodeConfig::from_layered_sources(
-        None,
-        None,
-        [
-            ("BITCOIN_RS_G2_MUHASH_SAMPLES", "g2.samples"),
-            ("BITCOIN_RS_G2_MUHASH_TIP_HEIGHT", "0"),
-        ],
-        ["bitcoin-rs-node"],
-    );
-    let Err(error) = result else {
-        panic!("zero G2 tip height must be rejected");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("g2_muhash_tip_height must be greater than zero")
-    );
-}
-
-#[test]
 fn assume_valid_height_layers_use_cli_env_toml_precedence() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let toml_path = temp.path().join("node.toml");
@@ -607,7 +352,7 @@ assume_valid_height = 10000
 ",
     )?;
 
-    let toml_config = NodeConfig::from_layered_sources(
+    let toml_config = Config::from_layered_sources(
         Some(&toml_path),
         None,
         core::iter::empty::<EnvPair>(),
@@ -615,7 +360,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(toml_config.assume_valid_height, 10_000);
 
-    let env_config = NodeConfig::from_layered_sources(
+    let env_config = Config::from_layered_sources(
         Some(&toml_path),
         None,
         [("BITCOIN_RS_ASSUME_VALID_HEIGHT", "20000")],
@@ -623,7 +368,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(env_config.assume_valid_height, 20_000);
 
-    let cli_config = NodeConfig::from_layered_sources(
+    let cli_config = Config::from_layered_sources(
         Some(&toml_path),
         None,
         [("BITCOIN_RS_ASSUME_VALID_HEIGHT", "20000")],
@@ -631,7 +376,7 @@ assume_valid_height = 10000
     )?;
     assert_eq!(cli_config.assume_valid_height, 30_000);
 
-    let default_config = NodeConfig::from_layered_sources(
+    let default_config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -648,7 +393,7 @@ assume_valid_height = 10000
 
 #[test]
 fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
-    let cli_config = NodeConfig::from_layered_sources(
+    let cli_config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -660,7 +405,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(cli_config.connect, vec!["127.0.0.1:8333", "10.0.0.2:8333"]);
 
-    let env_config = NodeConfig::from_layered_sources(
+    let env_config = Config::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_CONNECT", "192.0.2.5:8333")],
@@ -668,7 +413,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(env_config.connect, vec!["192.0.2.5:8333"]);
 
-    let hostname_config = NodeConfig::from_layered_sources(
+    let hostname_config = Config::from_layered_sources(
         None,
         None,
         [("BITCOIN_RS_CONNECT", "localhost:18444")],
@@ -676,7 +421,7 @@ fn connect_layers_parse_cli_and_env_peer_lists() -> Result<()> {
     )?;
     assert_eq!(hostname_config.connect, vec!["localhost:18444"]);
 
-    let default_config = NodeConfig::from_layered_sources(
+    let default_config = Config::from_layered_sources(
         None,
         None,
         core::iter::empty::<EnvPair>(),
@@ -691,26 +436,4 @@ fn assert_auth_user(auth: &Auth, expected: &str) {
         Auth::Basic { user, .. } => assert_eq!(user, expected),
         Auth::Cookie { .. } => panic!("expected basic auth"),
     }
-}
-
-#[test]
-fn g14_utxo_commit_sample_path_requires_window_fields() {
-    let result = NodeConfig::from_layered_sources(
-        None,
-        None,
-        core::iter::empty::<EnvPair>(),
-        [
-            "bitcoin-rs-node",
-            "--g14-utxo-commit-samples",
-            "utxo.samples.json",
-        ],
-    );
-    let Err(error) = result else {
-        panic!("g14 sample path without window fields must be rejected");
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("g14_utxo_commit_samples requires")
-    );
 }

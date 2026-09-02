@@ -27,9 +27,4 @@ mdbx = []
 
 [dev-dependencies]
 proptest.workspace = true
-criterion.workspace = true
 bitcoin.workspace = true
-
-[[bench]]
-name = "candidate"
-harness = false

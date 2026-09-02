@@ -24,7 +24,6 @@ bitcoin-rs-consensus.workspace = true
 bitcoin-rs-script.workspace = true
 sha2.workspace = true
 hashbrown.workspace = true
-tinyvec.workspace = true
 smallvec.workspace = true
 parking_lot.workspace = true
 metrics.workspace = true
@@ -35,13 +34,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
-serde_json.workspace = true
 criterion.workspace = true
 
-[[bench]]
-name = "spentby"
-harness = false
 [[bench]]
 name = "pareto"
 harness = false

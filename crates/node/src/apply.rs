@@ -199,6 +199,21 @@ enum PositionLookup {
     },
 }
 
+fn decode_body_position(
+    height: u32,
+    encoded: Option<&[u8]>,
+) -> Result<Option<BlockFilePosition>, StorageError> {
+    encoded
+        .map(|bytes| {
+            BlockFilePosition::decode(bytes).ok_or_else(|| {
+                StorageError::IncompatibleData(format!(
+                    "block-body index row for height {height} is not a 16-byte flat-file position"
+                ))
+            })
+        })
+        .transpose()
+}
+
 struct FlatFilePruneBodyReader<'a> {
     index: Box<dyn KvSnapshot + 'a>,
     files: FlatFileBlockReader,
@@ -234,13 +249,10 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
             .copied()
             .zip(values)
             .map(|((height, hash), value)| {
-                (
-                    height,
-                    hash,
-                    value.as_deref().and_then(BlockFilePosition::decode),
-                )
+                let position = decode_body_position(height, value.as_deref())?;
+                Ok((height, hash, position))
             })
-            .collect();
+            .collect::<Result<Vec<_>, StorageError>>()?;
         self.positions = PositionLookup::Prefetched { entries, next: 0 };
         Ok(())
     }
@@ -253,13 +265,10 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
         let position = match &mut self.positions {
             PositionLookup::Direct => {
                 let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-                let Some(encoded) = self
+                let encoded = self
                     .index
-                    .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-                else {
-                    return Ok(None);
-                };
-                BlockFilePosition::decode(&encoded)
+                    .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?;
+                decode_body_position(height, encoded.as_deref())?
             }
             PositionLookup::Prefetched { entries, next } => {
                 let Some(&(expected_height, expected_hash, position)) = entries.get(*next) else {
@@ -284,25 +293,14 @@ impl PruneBodyReader for FlatFilePruneBodyReader<'_> {
 }
 
 impl<S: KvStore> FlatFilePruneBodyStore<S> {
-    pub(crate) fn open(
-        index: Arc<S>,
-        files: Arc<FlatFileBlockStore>,
-        data_dir: &std::path::Path,
-    ) -> Result<Self, StorageError> {
-        for row in index.iter_prefix(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, b"b")? {
-            let (key, value) = row?;
-            if key.len() == 37 && value.len() != BlockFilePosition::ENCODED_LEN {
-                return Err(StorageError::IncompatibleData(format!(
-                    "datadir {} predates the flat-file block store and must be resynced",
-                    data_dir.display()
-                )));
-            }
-        }
-        Ok(Self { index, files })
+    pub(crate) fn open(index: Arc<S>, files: Arc<FlatFileBlockStore>) -> Self {
+        Self { index, files }
     }
-
     /// Resolves the flat-file position of a block body, or `None` when the
-    /// block is unknown or its index row is not a decodable position.
+    /// block is unknown. An index row that is not a decodable 16-byte
+    /// flat-file position is `IncompatibleData`, never a silent `None`: the
+    /// row's presence means the body must exist, so treating a decode failure
+    /// as absence would hide a schema mismatch behind a missing-block answer.
     ///
     /// Every read path starts here, so it is written once rather than three
     /// times: divergence between the whole-body, ranged, and metadata lookups
@@ -314,13 +312,12 @@ impl<S: KvStore> FlatFilePruneBodyStore<S> {
         hash: bitcoin_rs_primitives::Hash256,
     ) -> Result<Option<BlockFilePosition>, StorageError> {
         let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-        let Some(encoded) = self
-            .index
-            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-        else {
-            return Ok(None);
-        };
-        Ok(BlockFilePosition::decode(&encoded))
+        decode_body_position(
+            height,
+            self.index
+                .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+                .as_deref(),
+        )
     }
 }
 
@@ -336,17 +333,12 @@ impl<S: KvStore> PruneBodyStore for FlatFilePruneBodyStore<S> {
         body: &[u8],
     ) -> Result<(), StorageError> {
         let key = bitcoin_rs_storage::pruning::block_body_key(height, hash);
-        let existing = self
-            .index
-            .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
-            .map(|bytes| {
-                BlockFilePosition::decode(&bytes).ok_or_else(|| {
-                    StorageError::IncompatibleData(
-                        "block-body index row is not a 16-byte flat-file position".to_owned(),
-                    )
-                })
-            })
-            .transpose()?;
+        let existing = decode_body_position(
+            height,
+            self.index
+                .get(bitcoin_rs_storage::pruning::BLOCK_DATA_CF, &key)?
+                .as_deref(),
+        )?;
         let position = self
             .files
             .persist(existing, height, *hash.as_byte_array(), body)?;
@@ -451,7 +443,7 @@ mod body_position_prefetch_tests {
             temp.path().join("index"),
         )?);
         let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
-        let store = FlatFilePruneBodyStore::open(index, files, temp.path())?;
+        let store = FlatFilePruneBodyStore::open(index, files);
         let hash1 = Hash256::from_le_bytes(&[1_u8; 32]);
         let hash2 = Hash256::from_le_bytes(&[2_u8; 32]);
         store.persist_block_body(1, hash1, b"first body")?;
@@ -479,6 +471,83 @@ mod body_position_prefetch_tests {
                 "prefetched body positions are exhausted"
             ))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_body_row_is_incompatible_not_missing() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            temp.path().join("index"),
+        )?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = FlatFilePruneBodyStore::open(index.clone(), files);
+        let hash = Hash256::from_le_bytes(&[9_u8; 32]);
+        store.persist_block_body(7, hash, b"body")?;
+        // Overwrite the position row with a legacy inline body: same key, not
+        // a decodable flat-file position.
+        let key = bitcoin_rs_storage::pruning::block_body_key(7, hash);
+        let mut batch = index.new_batch();
+        batch.put(
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+            &key,
+            b"legacy-inline-body",
+        );
+        index.write(batch)?;
+        let Err(error) = store.load_block_body(7, hash) else {
+            return Err("malformed body row must fail closed".into());
+        };
+        assert!(matches!(error, StorageError::IncompatibleData(_)));
+
+        let mut reader = store.reader()?;
+        let Err(error) = reader.load_block_body(7, hash) else {
+            return Err("malformed body row must fail closed in the direct reader".into());
+        };
+        assert!(matches!(error, StorageError::IncompatibleData(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_prefetched_body_row_is_missing_not_incompatible()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            temp.path().join("index"),
+        )?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = FlatFilePruneBodyStore::open(index, files);
+        let hash = Hash256::from_le_bytes(&[8_u8; 32]);
+        let mut reader = store.reader()?;
+
+        reader.prefetch_positions(&[(7, hash)])?;
+        assert_eq!(reader.load_block_body(7, hash)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_prefetched_body_row_is_incompatible_not_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let index = Arc::new(bitcoin_rs_storage::FjallStore::open(
+            temp.path().join("index"),
+        )?);
+        let files = Arc::new(FlatFileBlockStore::open(temp.path())?);
+        let store = FlatFilePruneBodyStore::open(index.clone(), files);
+        let hash = Hash256::from_le_bytes(&[7_u8; 32]);
+        let key = bitcoin_rs_storage::pruning::block_body_key(7, hash);
+        let mut batch = index.new_batch();
+        batch.put(
+            bitcoin_rs_storage::pruning::BLOCK_DATA_CF,
+            &key,
+            b"legacy-inline-body",
+        );
+        index.write(batch)?;
+
+        let mut reader = store.reader()?;
+        let Err(error) = reader.prefetch_positions(&[(7, hash)]) else {
+            return Err("malformed prefetched body row must fail closed".into());
+        };
+        assert!(matches!(error, StorageError::IncompatibleData(_)));
         Ok(())
     }
 }
@@ -727,9 +796,8 @@ pub struct ApplyHandles {
     /// Bitcoin Core's `CBlockIndex::m_chain_tx_count`, including its convention
     /// that zero means *unset* rather than *empty* (`HaveNumChainTxs()`). Only a
     /// chain applied from genesis by a node that maintains this counter can know
-    /// it; a datadir written before it existed restores as unknown and stays
-    /// unknown, because nothing short of re-reading every block body could
-    /// recover the history.
+    /// it; a cold start before genesis or an arithmetic inconsistency leaves it
+    /// unknown until the chain is applied again.
     ///
     /// Kept beside `applied_tip` and moved with it, so the pair is always
     /// consistent: a count that lagged its tip would be worse than no count.
@@ -762,8 +830,6 @@ pub struct ApplyHandles {
     pub(crate) block_body_store: Option<Arc<dyn PruneBodyStore>>,
     /// Undo storage. Mandatory: see [`UndoStore`].
     pub(crate) undo_store: Arc<dyn UndoStore>,
-    pub(crate) g2_muhash_sampler: Option<Arc<crate::g2_muhash::G2MuhashSampler>>,
-    pub(crate) g14_utxo_commit_sampler: Option<Arc<crate::g14_utxo_commit::G14UtxoCommitSampler>>,
     pub(crate) admission: Arc<ApplyAdmission>,
     /// Process-wide shutdown signal shared by all runtime workers.
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -847,8 +913,6 @@ impl ApplyHandles {
             chain_events,
             block_body_store: None,
             undo_store: Arc::new(InMemoryUndoStore::default()),
-            g2_muhash_sampler: None,
-            g14_utxo_commit_sampler: None,
             admission: Arc::new(ApplyAdmission::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             chain_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -2263,10 +2327,6 @@ fn apply_block_admitted<'b>(
     bip68_result?;
     let wants_rawtx = handles.zmq_publisher.wants_rawtx();
     let wants_rawblock = handles.zmq_publisher.wants_rawblock();
-    let needs_g14_sample = handles
-        .g14_utxo_commit_sampler
-        .as_ref()
-        .is_some_and(|sampler| sampler.wants_height(height));
     let (txids, scratch_capacities, same_block_spent, same_block_spent_input_count) =
         tx_plan.into_scratch_parts(view.into_txids());
     let scratch = ApplyScratch::from_prepared_parts(
@@ -2338,8 +2398,7 @@ fn apply_block_admitted<'b>(
     let block_bytes: bytes::Bytes = {
         let needs_body = handles.block_body_store.is_some()
             || handles.tx_index_runtime.is_some()
-            || wants_rawblock
-            || needs_g14_sample;
+            || wants_rawblock;
         if needs_body {
             // The preserved P2P wire payload is byte-identical to the canonical
             // block serialization: the decoder rejects every non-canonical
@@ -3552,6 +3611,9 @@ mod consensus_rule_tests {
     use bitcoin_rs_script::script::{push_data, push_int};
     use bitcoin_rs_utxo::{BlockChanges, UtxoAdd, UtxoSet};
     use hashbrown::HashMap;
+    use metrics::{
+        Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
     use parking_lot::{Mutex, RwLock};
 
     use super::*;
@@ -3561,6 +3623,40 @@ mod consensus_rule_tests {
     const MAINNET_POW_LIMIT_BITS: u32 = 0x1d00_ffff;
     const MAINNET_POW_LIMIT_DIV_4_BITS: u32 = 0x1c3f_ffc0;
     const DAA_ANCHOR_TIME: u32 = 1_600_000_000;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TestRecorder;
+
+    impl Recorder for TestRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            Gauge::noop()
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    fn test_recorder() -> TestRecorder {
+        TestRecorder
+    }
 
     /// Parses `block` the way production does, so tests exercise the real
     /// one-shot kernel parse rather than a stand-in.
@@ -6157,13 +6253,6 @@ mod consensus_rule_tests {
             "a skipped block must carry AssumeValidSkipped, not script proof: the proof branch \
              bypasses the trust-gate re-read at commit, so a gate that flips in between would let \
              an unverified block through"
-        );
-        assert_eq!(
-            metrics_handle
-                .snapshot()
-                .get("node.window.verify_success_total"),
-            None,
-            "an empty verification dispatch must not count as script verification",
         );
         let mut entries = prove_window(&handles, &[&block], core::slice::from_ref(&raw));
         let Some(skipped) = entries.pop() else {
