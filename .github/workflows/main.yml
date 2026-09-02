@@ -1,0 +1,91 @@
+name: ci-main
+
+# Deep lanes for backend, kernel, benchmark, and portable validation. Never
+# triggered by pull requests; `ci.yml` is the PR gate.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Same design as ci.yml's concurrency block: one group per run, so `main`
+# pushes never queue against each other and so are never cancelled (a pending
+# run in a shared group would be cancelled by a third push and leave the
+# commit with no CI record). This workflow never sees pull_request events, so
+# there is nothing to cancel-in-progress.
+concurrency:
+  group: ci-main-${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  # Full-node production feature set: all four storage backends plus the
+  # bitcoinkernel script-verification engine (the kernel is built from C++ --
+  # this workflow is the only place that installs its prerequisites).
+  FULL_NODE_FEATURES: "rocksdb,fjall,redb,mdbx,kernel"
+
+jobs:
+  full-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The kernel engine is built from C++ (cmake + libboost-dev); the
+      # full-node feature set includes it, so this lane installs the
+      # prerequisites up front.
+      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # Node / binary tests run with the full-node feature set. -p is
+      # required because `--workspace --features` silently ignores --features
+      # in a virtual workspace (no root [package] section in the top-level
+      # Cargo.toml).
+      - run: |
+          cargo test -p bitcoin-rs --no-fail-fast \
+            --no-default-features --features "${FULL_NODE_FEATURES}"
+      # Full-node feature lint surface. In a virtual workspace (no root
+      # [package]), `--features` flags are not forwarded to library crates; use
+      # `-p bitcoin-rs` so the binary's feature table propagates all backends
+      # and the kernel to bitcoin-rs-node and its deps.
+      - run: |
+          cargo clippy -p bitcoin-rs --all-targets \
+            --no-default-features --features "${FULL_NODE_FEATURES}" \
+            -- -D warnings
+          # -p bitcoin-rs-node catches node test-target lints.
+          cargo clippy -p bitcoin-rs-node --all-targets -- -D warnings
+          cargo clippy -p bitcoin-rs-consensus --all-targets -- -D warnings
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: |
+          cargo bench -p bitcoin-rs --no-run \
+            --no-default-features --features "${FULL_NODE_FEATURES}"
+      # Crate-level bench targets are unreachable from -p bitcoin-rs.
+      - run: cargo bench -p bitcoin-rs-utxo --no-run
+
+  kernel-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo test -p bitcoin-rs-consensus --no-fail-fast -- --include-ignored
+
+  portable-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - run: cargo check -p bitcoin-rs-consensus --no-default-features
+      - run: cargo test -p bitcoin-rs-consensus --no-default-features
+      - run: cargo test -p bitcoin-rs-script
+      - run: cargo check -p bitcoin-rs-node --no-default-features --features fjall

@@ -23,20 +23,19 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Fast PR gate: fmt, pure-Rust clippy/tests, and dependency checks. Full-node,
+# kernel, benchmark, and portable validation run in `main.yml` on main only.
 env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
-  # Full-node production feature set: all four storage backends plus the
-  # bitcoinkernel script-verification engine (the kernel is the default build).
-  FULL_NODE_FEATURES: "rocksdb,fjall,redb,mdbx,kernel"
 
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -44,104 +43,50 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      # The kernel engine is built from C++ (cmake + libboost-dev); the default
-      # feature set now includes it, so every production lane installs the
-      # prerequisites up front.
-      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
-      # In a virtual workspace (no root [package]), `--features` flags are not
-      # forwarded to library crates; use `-p bitcoin-rs` so the binary's feature
-      # table propagates all backends and the kernel to bitcoin-rs-node and its deps.
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # consensus and node default to the C++ kernel feature. Exclude them from
+      # the workspace pass and lint their pure-Rust feature surfaces separately.
       - run: |
-          cargo clippy -p bitcoin-rs --all-targets \
-            --no-default-features --features "${FULL_NODE_FEATURES}" \
+          cargo clippy --workspace \
+            --exclude bitcoin-rs --exclude bitcoin-rs-consensus \
+            --exclude bitcoin-rs-node \
             -- -D warnings
-          # -p bitcoin-rs-node catches test-target lints invisible to the line above
-          # (virtual workspace: -p bitcoin-rs does not forward features to node's own
-          # test targets, so their lints are silently skipped without this step).
-          cargo clippy -p bitcoin-rs-node --all-targets -- -D warnings
+          cargo clippy -p bitcoin-rs-consensus \
+            --no-default-features -- -D warnings
+          cargo clippy -p bitcoin-rs-node \
+            --no-default-features --features fjall,zmq -- -D warnings
+          cargo clippy -p bitcoin-rs \
+            --no-default-features --features fjall,zmq -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      # The kernel engine is built from C++ (cmake + libboost-dev); the default
-      # feature set now includes it, so every production lane installs the
-      # prerequisites up front.
-      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
-      # Library unit tests run with each crate's own default features.
-      - run: cargo test --workspace --no-fail-fast
-      # Isolated so node's default `zmq` feature cannot unify this package on.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # Keep the PR test gate free of the C++ kernel build. consensus and node
+      # are excluded because their defaults include kernel.
+      - run: |
+          cargo test --workspace --no-fail-fast \
+            --exclude bitcoin-rs --exclude bitcoin-rs-consensus \
+            --exclude bitcoin-rs-node
+          cargo test -p bitcoin-rs-consensus --no-default-features --no-fail-fast
+          cargo test -p bitcoin-rs-node \
+            --no-default-features --features fjall,zmq --no-fail-fast
+          cargo test -p bitcoin-rs \
+            --no-default-features --features fjall,zmq --no-fail-fast
+      # Isolate the RPC feature surface from node's `zmq` feature.
       - run: cargo test -p bitcoin-rs-rpc --no-default-features --no-fail-fast
-      # Node / binary tests run with the full-node feature set.  -p is
-      # required because `--workspace --features` silently ignores --features in
-      # a virtual workspace (no root [package] section in the top-level Cargo.toml).
-      - run: |
-          cargo test -p bitcoin-rs --no-fail-fast \
-            --no-default-features --features "${FULL_NODE_FEATURES}"
-
-  bench-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      # The kernel engine is built from C++ (cmake + libboost-dev); the default
-      # feature set now includes it, so every production lane installs the
-      # prerequisites up front.
-      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
-      - run: |
-          cargo bench -p bitcoin-rs --no-run \
-            --no-default-features --features "${FULL_NODE_FEATURES}"
-      # Crate-level UTXO bench target is unreachable from -p bitcoin-rs; compile
-      # the production-allocator benchmark so bench breakage is visible to CI.
-      - run: cargo bench -p bitcoin-rs-utxo --no-run
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
         with:
           rust-version: "1.95.0"
-          arguments: --workspace --no-default-features --features ${{ env.FULL_NODE_FEATURES }}
-
-  # Kernel-default parity gate (plan 2026-06-10-001 R5): the consensus parity
-  # suite (committed fixture corpus, --include-ignored by design) and clippy on
-  # both package roots — all under the production default build.
-  # The kernel is the default engine, so no special feature selection is needed
-  # on this lane; binary tests and the four-backend storage surface are covered
-  # by the `test` job and the no-C++ posture by `portable-check` below.
-  kernel-parity:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libboost-dev cmake
-      - uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: |
-          cargo test -p bitcoin-rs-consensus --no-fail-fast -- --include-ignored
-      - run: cargo clippy -p bitcoin-rs --all-targets -- -D warnings
-      - run: cargo clippy -p bitcoin-rs-consensus --all-targets -- -D warnings
-
-  # Explicit no-C++ lane: proves the workspace still compiles and tests with
-  # the kernel engine disabled (per-crate `--no-default-features`). Deliberately
-  # no apt step — its point is that this lane needs no CMake/Boost toolchain.
-  portable-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p bitcoin-rs-consensus --no-default-features
-      - run: cargo test -p bitcoin-rs-consensus --no-default-features
-      - run: cargo test -p bitcoin-rs-script
-      - run: cargo check -p bitcoin-rs-node --no-default-features --features fjall
+          arguments: --workspace
