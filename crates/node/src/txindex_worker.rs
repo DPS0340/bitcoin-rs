@@ -223,6 +223,44 @@ impl Drop for TxIndexWorker {
     }
 }
 
+/// Spent-coin scripts for one block, read from its persisted undo record.
+///
+/// The undo record's restores are exactly the coins the block spent from the
+/// committed UTXO set, each carrying its full `TxOut` -- which makes it the
+/// durable script anchor #225 requires for `ScriptLive` deletes on connect and
+/// re-inserts on disconnect. Intra-block spends are absent by construction
+/// (they never entered the set), matching the index's same-block cancellation.
+pub(crate) struct UndoScripts {
+    scripts: hashbrown::HashMap<([u8; 32], u32), Vec<u8>>,
+}
+
+impl UndoScripts {
+    /// Decodes the undo record for the block identified by `hash`.
+    ///
+    /// The codec itself refuses a record bound to a different block, so a
+    /// stale row from an abandoned branch cannot anchor the wrong scripts.
+    pub(crate) fn from_undo_bytes(
+        bytes: &[u8],
+        hash: Hash256,
+    ) -> Result<Self, bitcoin_rs_utxo::undo_codec::UndoCodecError> {
+        let batch = bitcoin_rs_utxo::undo_codec::decode(bytes, hash)?;
+        let mut scripts = hashbrown::HashMap::with_capacity(batch.restores().len());
+        for add in batch.restores() {
+            scripts.insert(
+                (add.outpoint.txid.to_le_bytes(), add.outpoint.vout),
+                add.txout.script_pubkey.to_bytes(),
+            );
+        }
+        Ok(Self { scripts })
+    }
+}
+
+impl bitcoin_rs_index::SpentCoinScripts for UndoScripts {
+    fn script_bytes(&self, txid: &[u8; 32], vout: u32) -> Option<&[u8]> {
+        self.scripts.get(&(*txid, vout)).map(Vec::as_slice)
+    }
+}
+
 /// Erased prepared-index writer used by the worker and stored in `NodeState`.
 pub(crate) trait TxIndexWriter: Send + Sync {
     fn watermark(&self) -> Result<Option<IndexWatermark>, IndexError>;
@@ -250,12 +288,33 @@ pub(crate) trait TxIndexWriter: Send + Sync {
         let _ = capabilities;
         self.prepare_block(height, hash, body)
     }
+    fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        let _ = spent_scripts;
+        self.prepare_block_for(capabilities, height, hash, body)
+    }
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError>;
     fn commit_rollback_one(
         &self,
         prev: Option<IndexWatermark>,
         body: &[u8],
     ) -> Result<(), IndexError>;
+    fn commit_rollback_one_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<(), IndexError> {
+        let _ = spent_scripts;
+        self.commit_rollback_one_for(capabilities, prev, body)
+    }
     fn commit_rollback_one_for(
         &self,
         capabilities: IndexCapabilities,
@@ -303,6 +362,23 @@ where
             .prepare_block_for(capabilities, height, hash, body)
     }
 
+    fn prepare_block_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<PreparedBlock, IndexError> {
+        self.lock().prepare_block_with_spent_scripts(
+            capabilities,
+            height,
+            hash,
+            body,
+            spent_scripts,
+        )
+    }
+
     fn commit_forward(&self, batch: PreparedBatch) -> Result<IndexWatermark, IndexError> {
         self.lock().commit_forward(batch)
     }
@@ -323,6 +399,17 @@ where
     ) -> Result<(), IndexError> {
         self.lock()
             .commit_rollback_one_for(capabilities, prev, body)
+    }
+
+    fn commit_rollback_one_with_spent_scripts(
+        &self,
+        capabilities: IndexCapabilities,
+        prev: Option<IndexWatermark>,
+        body: &[u8],
+        spent_scripts: &dyn bitcoin_rs_index::SpentCoinScripts,
+    ) -> Result<(), IndexError> {
+        self.lock()
+            .commit_rollback_one_with_spent_scripts(capabilities, prev, body, spent_scripts)
     }
 
     fn reset_capabilities(&self, capabilities: IndexCapabilities) -> Result<(), IndexError> {
@@ -642,10 +729,15 @@ impl Worker {
             .script_history
             .then_some(watermarks.script_history)
             .flatten();
+        let script_live = self
+            .enabled
+            .script_live
+            .then_some(watermarks.script_live)
+            .flatten();
         let needs_rollback = |watermark: IndexWatermark| {
             target.is_none_or(|target| !self.watermark_is_on_target_chain(watermark, target))
         };
-        let selected = [tx, script_index]
+        let selected = [tx, script_index, script_live]
             .into_iter()
             .flatten()
             .filter(|watermark| needs_rollback(*watermark))
@@ -654,7 +746,7 @@ impl Worker {
             IndexCapabilities {
                 tx_lookup: tx == Some(selected) && needs_rollback(selected),
                 script_history: script_index == Some(selected) && needs_rollback(selected),
-                script_live: false,
+                script_live: script_live == Some(selected) && needs_rollback(selected),
             },
             selected,
         ))
@@ -670,13 +762,20 @@ impl Worker {
             .enabled
             .script_history
             .then_some(watermarks.script_history);
+        // An absent live cursor means "advance from genesis" here, the same as
+        // any other capability: the anchored prepare reads each block's undo
+        // record, which exists for every applied block. Boot-time seeding from
+        // the restored UTXO set stamps the cursor at the restored tip first
+        // wherever a complete checkpoint exists, so this genesis walk is the
+        // cold-start and headers-only path, not the upgrade path.
+        let script_live = self.enabled.script_live.then_some(watermarks.script_live);
         let needs_forward = |watermark: Option<IndexWatermark>| {
             watermark.is_none_or(|watermark| watermark.height < target.height)
         };
         let start_height = |watermark: Option<IndexWatermark>| {
             watermark.map_or(0, |watermark| watermark.height.saturating_add(1))
         };
-        let selected_start = [tx, script_index]
+        let selected_start = [tx, script_index, script_live]
             .into_iter()
             .flatten()
             .filter(|watermark| needs_forward(*watermark))
@@ -686,7 +785,7 @@ impl Worker {
             None
         } else {
             let height = selected_start - 1;
-            [tx, script_index]
+            [tx, script_index, script_live]
                 .into_iter()
                 .flatten()
                 .flatten()
@@ -700,7 +799,9 @@ impl Worker {
                 script_history: script_index.is_some_and(|watermark| {
                     needs_forward(watermark) && start_height(watermark) == selected_start
                 }),
-                script_live: false,
+                script_live: script_live.is_some_and(|watermark| {
+                    needs_forward(watermark) && start_height(watermark) == selected_start
+                }),
             },
             selected_watermark,
         ))
@@ -834,10 +935,12 @@ impl Worker {
                     return Ok(ReconcileAction::Stalled);
                 };
 
-                let prepared = self
-                    .writer
-                    .prepare_block_for(capabilities, identity.height, identity.hash, &body)
-                    .map_err(TxIndexWorkerError::Index)?;
+                let prepared = self.prepare_for_capabilities(
+                    capabilities,
+                    identity.height,
+                    identity.hash,
+                    &body,
+                )?;
                 drop(body);
                 if self.runtime.should_stop() {
                     return Ok(ReconcileAction::Stalled);
@@ -914,10 +1017,12 @@ impl Worker {
         let prev = if watermark.height == 0 {
             None
         } else {
-            let prepared = self
-                .writer
-                .prepare_block_for(capabilities, watermark.height, watermark.hash, &body)
-                .map_err(TxIndexWorkerError::Index)?;
+            let prepared = self.prepare_for_capabilities(
+                capabilities,
+                watermark.height,
+                watermark.hash,
+                &body,
+            )?;
             Some(IndexWatermark {
                 height: watermark.height.saturating_sub(1),
                 hash: prepared.parent_hash,
@@ -927,10 +1032,66 @@ impl Worker {
         if self.runtime.should_stop() {
             return Err(TxIndexWorkerError::Stopped);
         }
-        self.writer
-            .commit_rollback_one_for(capabilities, prev, &body)
-            .map_err(TxIndexWorkerError::Index)?;
+        if capabilities.script_live {
+            let anchor = self.live_anchor(watermark.height, watermark_hash)?;
+            self.writer
+                .commit_rollback_one_with_spent_scripts(capabilities, prev, &body, &anchor)
+                .map_err(TxIndexWorkerError::Index)?;
+        } else {
+            self.writer
+                .commit_rollback_one_for(capabilities, prev, &body)
+                .map_err(TxIndexWorkerError::Index)?;
+        }
         Ok(prev)
+    }
+
+    /// Loads and decodes the undo-record anchor a `ScriptLive` transition
+    /// needs for `height`/`hash`.
+    ///
+    /// Fails closed rather than degrading: a live-selecting step without its
+    /// anchor cannot know which outputs the block spent, and guessing is how a
+    /// spent output stays visible. The record exists for every applied block
+    /// (`apply` persists it before publishing the tip), so absence here means
+    /// pruning removed it or the store is damaged -- both are conditions the
+    /// operator must see, not conditions to paper over.
+    fn live_anchor(&self, height: u32, hash: Hash256) -> Result<UndoScripts, TxIndexWorkerError> {
+        let Some(store) = self.body_store.as_deref() else {
+            return Err(TxIndexWorkerError::NoBodyStore);
+        };
+        let bytes = store
+            .undo_record(height, hash)
+            .map_err(TxIndexWorkerError::Storage)?
+            .ok_or_else(|| TxIndexWorkerError::UndoUnavailable {
+                height,
+                reason: "no undo record".to_owned(),
+            })?;
+        UndoScripts::from_undo_bytes(&bytes, hash).map_err(|error| {
+            TxIndexWorkerError::UndoUnavailable {
+                height,
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Prepares one block for `capabilities`, attaching the undo anchor when
+    /// the live view is selected.
+    fn prepare_for_capabilities(
+        &self,
+        capabilities: IndexCapabilities,
+        height: u32,
+        hash: [u8; 32],
+        body: &[u8],
+    ) -> Result<PreparedBlock, TxIndexWorkerError> {
+        if capabilities.script_live {
+            let anchor = self.live_anchor(height, Hash256::from_le_bytes(&hash))?;
+            self.writer
+                .prepare_block_with_spent_scripts(capabilities, height, hash, body, &anchor)
+                .map_err(TxIndexWorkerError::Index)
+        } else {
+            self.writer
+                .prepare_block_for(capabilities, height, hash, body)
+                .map_err(TxIndexWorkerError::Index)
+        }
     }
 
     fn load_body(&self, height: u32, hash: Hash256) -> Result<Vec<u8>, TxIndexWorkerError> {
@@ -994,6 +1155,8 @@ enum TxIndexWorkerError {
     Index(#[from] IndexError),
     #[error("txindex worker: missing body at height {height}, hash {hash}")]
     MissingBody { height: u32, hash: Hash256 },
+    #[error("txindex worker: undo record for height {height} is missing or undecodable: {reason}")]
+    UndoUnavailable { height: u32, reason: String },
     #[error("txindex worker: body store missing")]
     NoBodyStore,
     #[error("txindex worker: target chain node missing at height {height}")]
@@ -1725,3 +1888,62 @@ impl ScriptIndexQuery for TxIndexQueryEngine {
 #[cfg(test)]
 #[path = "txindex_worker_query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+mod undo_scripts_tests {
+    use bitcoin_rs_index::SpentCoinScripts as _;
+    use bitcoin_rs_primitives::{Hash256, OutPoint, TxOut};
+    use bitcoin_rs_utxo::UtxoAdd;
+    use bitcoin_rs_utxo::set::UndoBatch;
+
+    use super::UndoScripts;
+
+    fn hash(tag: u8) -> Hash256 {
+        Hash256::from_le_bytes(&[tag; 32])
+    }
+
+    /// The anchor answers exactly the coins the undo record restores --
+    /// which are exactly the block's external spends -- and nothing else.
+    #[test]
+    fn anchor_serves_the_records_restored_scripts() {
+        let mut batch = UndoBatch::default();
+        let outpoint = OutPoint {
+            txid: hash(3),
+            vout: 7,
+        };
+        let script = vec![0x51_u8, 0x99];
+        batch.restore(UtxoAdd {
+            outpoint,
+            txout: TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: script.clone().into(),
+            },
+            coinbase: false,
+            height: 5,
+        });
+        let bytes = bitcoin_rs_utxo::undo_codec::encode(&batch, hash(9));
+
+        let anchor = UndoScripts::from_undo_bytes(&bytes, hash(9))
+            .unwrap_or_else(|error| panic!("decode failed: {error}"));
+        assert_eq!(
+            anchor.script_bytes(&hash(3).to_le_bytes(), 7),
+            Some(script.as_slice())
+        );
+        assert_eq!(
+            anchor.script_bytes(&hash(3).to_le_bytes(), 8),
+            None,
+            "a vout the record does not restore must answer nothing"
+        );
+    }
+
+    /// A record bound to a different block refuses to become an anchor, so a
+    /// stale row from an abandoned branch cannot supply the wrong scripts.
+    #[test]
+    fn anchor_refuses_a_record_for_another_block() {
+        let bytes = bitcoin_rs_utxo::undo_codec::encode(&UndoBatch::default(), hash(1));
+        assert!(
+            UndoScripts::from_undo_bytes(&bytes, hash(2)).is_err(),
+            "block-hash binding must be enforced at the anchor boundary"
+        );
+    }
+}
