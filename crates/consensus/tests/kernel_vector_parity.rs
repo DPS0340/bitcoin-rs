@@ -323,12 +323,17 @@ fn load_vectors(name: &str, expected: Verdict) -> Result<Vec<VectorRow>, Box<dyn
             let hash_hex = spec[0]
                 .as_str()
                 .ok_or_else(|| format!("row {index}: bad prevout hash"))?;
-            let vout = u32::try_from(
-                spec[1]
-                    .as_i64()
-                    .ok_or_else(|| format!("row {index}: bad prevout vout"))?,
-            )
-            .map_err(|_| format!("row {index}: prevout vout does not fit in u32"))?;
+            let vout_signed = spec[1]
+                .as_i64()
+                .ok_or_else(|| format!("row {index}: bad prevout vout"))?;
+            // Core writes the null prevout index as -1 in these vectors, the
+            // signed reading of COutPoint's 0xffffffff sentinel.
+            let vout = if vout_signed == -1 {
+                u32::MAX
+            } else {
+                u32::try_from(vout_signed)
+                    .map_err(|_| format!("row {index}: prevout vout does not fit in u32"))?
+            };
             let script_asm = spec[2]
                 .as_str()
                 .ok_or_else(|| format!("row {index}: bad prevout script"))?;
