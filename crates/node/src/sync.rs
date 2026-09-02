@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 mod stage;
-mod window;
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
@@ -25,113 +24,26 @@ use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use self::stage::{BlockStager, DrainedBlock, StagedBlock};
-use self::window::DownloadWindow;
-pub use self::window::SyncBudget;
+#[allow(unused_imports)]
+use bitcoin_rs_p2p::download_window::{
+    configure_request_mode, default_sync_budget, statically_fanout_eligible, DownloadWindow,
+    FanoutCandidate, SyncPeer, SyncPeerSelection, GETDATA_BATCH_SIZE,
+    INBOUND_BLOCK_STAGE_CHUNK, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_SERIALIZED_BLOCK_SIZE,
+    PENDING_BLOCK_BYTE_ESTIMATE, PENDING_BUDGET, PENDING_BYTE_BUDGET,
+    PENDING_TIMEOUT, PEER_INFLIGHT_BUDGET, RECEIVED_BLOCK_BUDGET, RECEIVED_BLOCK_BYTE_BUDGET,
+    RECEIVED_BLOCK_TIMEOUT, BLOCK_STALLING_TIMEOUT, BLOCK_STALLING_TIMEOUT_MAX, STALLER_COOLDOWN,
+};
+pub use bitcoin_rs_p2p::download_window::SyncBudget;
+pub(crate) use bitcoin_rs_p2p::download_window::MIN_PEERS_FOR_FANOUT;
 
 /// Maximum number of locator entries we ever send.
 const LOCATOR_MAX_ENTRIES: usize = 32;
 /// Wire protocol version we advertise on outbound `getheaders`.
 const PROTOCOL_VERSION: u32 = 70_016;
-/// Maximum number of block inventory entries we request per tick.
-///
-/// Keep the private default at the full pending window so a healthy peer can
-/// fill it in one tick; `DownloadWindow` still caps requests by pending bytes,
-/// block budget, and per-peer inflight budget.
-const GETDATA_BATCH_SIZE: usize = PENDING_BUDGET;
 /// Time after which an unanswered `getheaders` request may be retried.
 const HEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time after which a pending getdata is considered stuck and re-requestable.
-const PENDING_TIMEOUT: Duration = Duration::from_mins(1);
-/// Maximum number of in-flight getdata requests we'll track per `BlockSync`.
-const PENDING_BUDGET: usize = 128;
-/// Time after which a received out-of-order block is discarded.
-const RECEIVED_BLOCK_TIMEOUT: Duration = Duration::from_mins(1);
-/// Maximum number of received blocks waiting for their predecessor.
-const RECEIVED_BLOCK_BUDGET: usize = 128;
-/// Mainnet-oriented block-size estimate for sizing the in-flight request window.
-const PENDING_BLOCK_BYTE_ESTIMATE: usize = 2 * 1024 * 1024;
-/// Maximum estimated bytes in the in-flight request window.
-const PENDING_BYTE_BUDGET: usize = PENDING_BUDGET * PENDING_BLOCK_BYTE_ESTIMATE;
-/// Maximum serialized bytes staged in memory while waiting for predecessors.
-///
-/// Defined as [`PENDING_BYTE_BUDGET`] so the in-flight and staged byte bounds
-/// stay one consistent pair: a full download window (`PENDING_BUDGET` blocks
-/// at the high-height `PENDING_BLOCK_BYTE_ESTIMATE`) always fits in staging
-/// without eviction. At the 150k acceptance window this bound rarely binds —
-/// blocks there are far below the per-slot estimate.
-const RECEIVED_BLOCK_BYTE_BUDGET: usize = PENDING_BYTE_BUDGET;
-/// Consensus-maximum serialized block size in bytes: a witness-serialized
-/// block cannot exceed its 4,000,000 weight, so no valid block is larger.
-const MAX_SERIALIZED_BLOCK_SIZE: usize = 4_000_000;
-// Staller-arming reachability invariant (Phase 1 of the staller arming
-// redesign): the stall episode arms on a staged-count fraction
-// (`received >= max_received_blocks / 2`, `window_blocked_on` term 3), so the
-// staged byte budget must admit at least half the staged count window even at
-// consensus-maximum block size. If a depth bump (e.g. the w256 re-attempt)
-// outgrows the byte budget, byte backpressure would silently hold the staged
-// count below the arming fraction and byte-shaped wedges would stop arming at
-// production budgets, degrading to the 60s pending-timeout fallback. Rebalance
-// both constants together; this assertion turns silent drift into a build
-// failure. (Margin today: 128 * 2 MiB >= 64 * 4 MB, ~4.6%.)
-const _: () = assert!(
-    RECEIVED_BLOCK_BYTE_BUDGET >= RECEIVED_BLOCK_BUDGET / 2 * MAX_SERIALIZED_BLOCK_SIZE,
-    "staged byte budget must admit half the staged count window at max block size"
-);
-/// Maximum decoded inbound blocks held before handing them to `BlockStager`,
-/// sized from the same byte budget that bounds retained staged blocks.
-const INBOUND_BLOCK_STAGE_CHUNK: usize =
-    at_least_one(RECEIVED_BLOCK_BYTE_BUDGET / PENDING_BLOCK_BYTE_ESTIMATE);
-/// Maximum block requests one peer may own at once outside fan-out.
-///
-/// Keep the fallback per-peer cap equal to the global cap so the bounded
-/// scheduler needs only one healthy peer to fill the whole window — this IS
-/// the shipped single-peer behavior and stays bit-identical when fewer than
-/// [`MIN_PEERS_FOR_FANOUT`] eligible peers exist.
-const PEER_INFLIGHT_BUDGET: usize = PENDING_BUDGET;
-/// Per-peer in-flight cap while fan-out is active, mirroring Bitcoin Core's
-/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` (16, `net_processing.cpp`). A deep
-/// per-peer pipeline under fan-out reproduces the recorded head-of-line
-/// collapse; a shallow stripe without the fallback reproduces the early-height
-/// under-fill regression — both were established by a live-tested and reverted
-/// attempt (commit 5608279, recoverable from git history).
-const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
-/// Minimum peer population that can fill the 128-block window at Core's
-/// 16-block per-peer floor. Below this count, one healthy peer's deep
-/// sequential pipeline beats fragmented stripes on real mainnet peers; the
-/// bounded cold-front hedge handles a silent owner without under-filling.
-pub(crate) const MIN_PEERS_FOR_FANOUT: usize = PENDING_BUDGET / MAX_BLOCKS_IN_TRANSIT_PER_PEER;
-/// Initial window-blocked stalling threshold, mirroring Bitcoin Core's
-/// `BLOCK_STALLING_TIMEOUT_DEFAULT` (2s, `net_processing.cpp`): when the
-/// window front has been in flight to one peer this long with the apply
-/// frontier idle and no other download progress possible, that peer is
-/// disconnected and its blocks re-queued (R8).
-const BLOCK_STALLING_TIMEOUT: Duration = Duration::from_secs(2);
-/// Adaptive ceiling for the stalling threshold, mirroring Core's
-/// `BLOCK_STALLING_TIMEOUT_MAX` (64s): the threshold doubles per staller
-/// disconnect so a sudden bandwidth drop cannot cascade into disconnecting
-/// every peer at the 2s floor, and decays by x0.85 per window-front arrival
-/// (never snapping back) so the elevation survives a peer rotation.
-const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
-/// How long a disconnected staller stays excluded from fan-out eligibility
-/// and non-last-resort block requests. Sized to the threshold ceiling: a
-/// staller flapping through reconnects can capture the window front at most
-/// once per cooldown, and the (window-global) doubled threshold bounds each
-/// capture — Core has no equivalent only because its reconnecting peer
-/// cannot re-acquire in-flight assignments this cheaply.
-const STALLER_COOLDOWN: Duration = BLOCK_STALLING_TIMEOUT_MAX;
-
-// The apply-side cache horizon (`expected_apply_horizon`) stays within the
-// inline capacity below only because the staging budget equals the in-flight
-// budget; a drift would silently spill every cached run to the heap. The
-// byte-budget pair needs no twin assertion: `RECEIVED_BLOCK_BYTE_BUDGET` is
-// `PENDING_BYTE_BUDGET` by definition.
-const _: () = assert!(PENDING_BUDGET == RECEIVED_BLOCK_BUDGET);
 
 type ExpectedBlockHashes = SmallVec<[Hash256; RECEIVED_BLOCK_BUDGET]>;
-
-const fn at_least_one(value: usize) -> usize {
-    if value == 0 { 1 } else { value }
-}
 
 /// Block download orchestrator.
 pub struct BlockSync {
@@ -146,70 +58,6 @@ pub struct BlockSync {
     expected_apply_cache: Arc<Mutex<Option<ExpectedApplyCache>>>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct SyncPeer {
-    addr: SocketAddr,
-    start_height: i32,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SyncPeerSelection {
-    header_peer: Option<SyncPeer>,
-    request_peers: Vec<SyncPeer>,
-    probe_peers: Vec<SyncPeer>,
-}
-
-/// A height-eligible sync candidate annotated with its fan-out eligibility
-/// (KTD6 predicate, finalized across `statically_fanout_eligible` and the
-/// window's soft-demotion check) and with whether the window currently
-/// soft-blocks it for block requests (expired pendings or staller cooldown).
-#[derive(Clone, Copy, Debug)]
-struct FanoutCandidate {
-    peer: SyncPeer,
-    fanout_eligible: bool,
-    soft_blocked: bool,
-}
-
-/// Connection-level clauses of the fan-out eligibility predicate (KTD6):
-/// outbound and witness-serving (`NODE_WITNESS`), per Bitcoin Core's
-/// block-download peer criteria in `net_processing.cpp` (Core requests blocks
-/// only from witness peers post-segwit, and inbound peers are
-/// attacker-chosen — counting them toward fan-out is the recorded under-fill
-/// regression). The height clause lives in the candidate filter and the
-/// soft-demotion clause in [`DownloadWindow::peer_has_expired_pending`].
-fn statically_fanout_eligible(peer: &PeerInfo) -> bool {
-    let witness = bitcoin::p2p::ServiceFlags::WITNESS.to_u64();
-    !peer.inbound && peer.services & witness != 0
-}
-
-fn configure_request_mode(
-    window: &mut DownloadWindow,
-    candidates: &[FanoutCandidate],
-    now: Instant,
-) -> Option<SyncPeer> {
-    let eligible = candidates
-        .iter()
-        .filter(|candidate| candidate.fanout_eligible)
-        .count();
-    let preferred_addr = window.preferred_peer();
-    let preferred_candidate = preferred_addr.and_then(|addr| {
-        candidates
-            .iter()
-            .find(|candidate| candidate.peer.addr == addr)
-    });
-    let preferred = preferred_candidate
-        .filter(|candidate| !candidate.soft_blocked)
-        .map(|candidate| candidate.peer);
-    if eligible < window.min_peers_for_fanout() && preferred_candidate.is_some() {
-        window.set_fanout_eligible_peers(0, now);
-        return preferred;
-    }
-    if preferred_addr.is_some() {
-        window.clear_preferred_peer();
-    }
-    window.set_fanout_eligible_peers(eligible, now);
-    None
-}
 
 #[derive(Clone, Copy, Debug)]
 struct PendingHeaderRequest {
@@ -1710,24 +1558,6 @@ fn metric_count(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-/// Returns the production `SyncBudget` used by `BlockSync::new`.
-pub const fn default_sync_budget() -> SyncBudget {
-    SyncBudget {
-        max_pending_blocks: PENDING_BUDGET,
-        max_pending_bytes: PENDING_BYTE_BUDGET,
-        max_received_blocks: RECEIVED_BLOCK_BUDGET,
-        max_received_bytes: RECEIVED_BLOCK_BYTE_BUDGET,
-        max_peer_inflight: PEER_INFLIGHT_BUDGET,
-        fanout_peer_inflight: MAX_BLOCKS_IN_TRANSIT_PER_PEER,
-        min_peers_for_fanout: MIN_PEERS_FOR_FANOUT,
-        getdata_batch_limit: GETDATA_BATCH_SIZE,
-        pending_timeout: PENDING_TIMEOUT,
-        received_timeout: RECEIVED_BLOCK_TIMEOUT,
-        stall_timeout_initial: BLOCK_STALLING_TIMEOUT,
-        stall_timeout_max: BLOCK_STALLING_TIMEOUT_MAX,
-        staller_cooldown: STALLER_COOLDOWN,
-    }
-}
 
 #[cfg(test)]
 mod tests {
