@@ -1148,11 +1148,13 @@ impl<S: KvStore> Indexer<S> {
     /// `ScriptHistoryEntry::confirmed` for every transaction in that block that has
     /// at least one output matching `scripthash` exactly.
     ///
-    /// Entries are returned in store iteration order (lexicographic by key
-    /// bytes). Because the height suffix is little-endian, this is **not**
-    /// numeric height order within a prefix; callers needing chronological
-    /// order must sort by numeric height. Heights not resolvable by `source`
-    /// are skipped.
+    /// Entries are returned sorted by numeric height (ascending). The underlying
+    /// store iterates rows in lexicographic key-byte order, and because the
+    /// 4-byte height suffix is little-endian, that order does **not** match
+    /// numeric height order within one prefix (height 256 sorts before height
+    /// 1). This method sorts the final entry list by numeric height so callers
+    /// receive chronological order regardless of the on-disk key encoding.
+    /// Heights not resolvable by `source` are skipped.
     ///
     /// The lossy 8-byte prefix is exact-resolved here: only transactions whose
     /// output scripthash matches the full 32-byte `scripthash` are emitted.
@@ -1170,6 +1172,7 @@ impl<S: KvStore> Indexer<S> {
                 None => scan_height_history(scripthash, height, source, &mut entries),
             }
         }
+        entries.sort_by_key(|entry| entry.height);
         Ok(entries)
     }
 
@@ -1180,6 +1183,9 @@ impl<S: KvStore> Indexer<S> {
     /// equivalence tests, as the `before` arm of the `resolve_script_history`
     /// benchmark group, and as the live fallback for rows written before row
     /// values carried transaction positions.
+    ///
+    /// Like [`Self::resolve_script_history`], this sorts the final entry list by
+    /// numeric height so the reference and the optimized resolver agree on order.
     pub fn resolve_script_history_scan<B: BlockSource>(
         &self,
         scripthash: crate::ScriptHash,
@@ -1211,6 +1217,7 @@ impl<S: KvStore> Indexer<S> {
                 }
             }
         }
+        entries.sort_by_key(|entry| entry.height);
         Ok(entries)
     }
 
@@ -1280,9 +1287,11 @@ impl<S: KvStore> Indexer<S> {
 
     /// Same as `resolve_unspent_outputs` but each tuple carries the funding height.
     ///
-    /// Returns `(txid, vout, value_sats, funding_height)` quadruples. Use this
-    /// when callers need the confirmation height (e.g. `ScriptIndex` `listunspent`
-    /// emits the height for each unspent output).
+    /// Returns `(txid, vout, value_sats, funding_height)` quadruples sorted by
+    /// funding height (ascending). Use this when callers need the confirmation
+    /// height (e.g. `ScriptIndex` `listunspent` emits the height for each
+    /// unspent output). The sort mirrors [`Self::resolve_script_history`]:
+    /// store iteration order is LE byte order, not numeric height order.
     pub fn resolve_unspent_outputs_with_height<B: BlockSource>(
         &self,
         scripthash: crate::ScriptHash,
@@ -1297,6 +1306,7 @@ impl<S: KvStore> Indexer<S> {
                 None => scan_height_unspent_outputs(scripthash, height, source, &mut outputs),
             }
         }
+        outputs.sort_by_key(|&(_, _, _, height)| height);
         Ok(outputs)
     }
 
@@ -1308,7 +1318,9 @@ impl<S: KvStore> Indexer<S> {
     /// `before` arm of the `resolve_unspent` benchmark group.
     ///
     /// Not a fallback path — [`Self::resolve_unspent_outputs_with_height`] is
-    /// always correct and always faster. Call that one.
+    /// always correct and always faster. Call that one. Like the fast path,
+    /// this sorts by funding height so the reference and the optimized resolver
+    /// agree on order.
     pub fn resolve_unspent_outputs_with_height_scan<B: BlockSource>(
         &self,
         scripthash: crate::ScriptHash,
@@ -1340,6 +1352,7 @@ impl<S: KvStore> Indexer<S> {
                 }
             }
         }
+        outputs.sort_by_key(|&(_, _, _, height)| height);
         Ok(outputs)
     }
 
@@ -1348,6 +1361,12 @@ impl<S: KvStore> Indexer<S> {
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the outpoint's
     /// spending scan prefix, decoded from `ColumnFamily::Spending`. The 8-byte
     /// prefix is lossy as above.
+    ///
+    /// **Height ordering caveat:** same as [`Self::iter_funding_rows`]: the
+    /// 4-byte height suffix is little-endian, so lexicographic byte order does
+    /// **not** match numeric height order within one prefix. Callers needing
+    /// chronological order must sort by numeric height after exact-resolving
+    /// rows.
     pub fn iter_spending_rows(
         &self,
         outpoint: &OutPoint,
@@ -1362,6 +1381,12 @@ impl<S: KvStore> Indexer<S> {
     /// Returns every `HashPrefixRow` whose 8-byte prefix matches the txid's scan
     /// prefix, decoded from `ColumnFamily::TxConfirmed`. The 8-byte prefix is
     /// lossy; multiple txids can share a prefix.
+    ///
+    /// **Height ordering caveat:** same as [`Self::iter_funding_rows`]: the
+    /// 4-byte height suffix is little-endian, so lexicographic byte order does
+    /// **not** match numeric height order within one prefix. Callers needing
+    /// chronological order must sort by numeric height after exact-resolving
+    /// rows.
     pub fn iter_txid_rows(&self, txid: &Txid) -> Result<Vec<crate::HashPrefixRow>, IndexError> {
         let prefix = TxidRow::scan_prefix(txid);
         let iter = self.store.iter_prefix(ColumnFamily::TxConfirmed, &prefix)?;
